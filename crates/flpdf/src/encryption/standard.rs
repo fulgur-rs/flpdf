@@ -584,6 +584,15 @@ pub(crate) fn check_owner_password(
     password: &[u8],
     inputs: &StandardHandlerInputs<'_>,
 ) -> Result<Vec<u8>> {
+    check_owner_password_with_user_password(password, inputs).map(|(file_key, _)| file_key)
+}
+
+/// Authenticate an owner password and retain the recovered padded user
+/// password for qpdf's `getTrimmedUserPassword` inspection contract.
+pub(crate) fn check_owner_password_with_user_password(
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let n = validate_inputs(inputs)?;
 
     // Steps 1-2: derive the RC4 key from the (padded) owner password.
@@ -606,7 +615,8 @@ pub(crate) fn check_owner_password(
     }
 
     // Step 4: Use the recovered candidate as the user password in Algorithm 6.
-    check_user_password(&candidate, inputs)
+    let file_key = check_user_password(&candidate, inputs)?;
+    Ok((file_key, candidate.to_vec()))
 }
 
 /// PDF 1.7 §7.6.3.3 Algorithm 7 for V=4/R=4 Standard handler inputs.
@@ -614,6 +624,14 @@ pub(crate) fn check_owner_password_v4(
     password: &[u8],
     inputs: &StandardHandlerInputs<'_>,
 ) -> Result<Vec<u8>> {
+    check_owner_password_v4_with_user_password(password, inputs).map(|(file_key, _)| file_key)
+}
+
+/// V=4/R=4 counterpart of [`check_owner_password_with_user_password`].
+pub(crate) fn check_owner_password_v4_with_user_password(
+    password: &[u8],
+    inputs: &StandardHandlerInputs<'_>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let n = validate_v4_inputs(inputs)?;
     let padded_owner = pad_password(password);
     let mut digest = md5(&padded_owner);
@@ -627,7 +645,28 @@ pub(crate) fn check_owner_password_v4(
         let mut cipher = Rc4::new(&xor_key)?;
         cipher.process_in_place(&mut candidate);
     }
-    check_user_password_v4(&candidate, inputs)
+    let file_key = check_user_password_v4(&candidate, inputs)?;
+    Ok((file_key, candidate.to_vec()))
+}
+
+/// qpdf `QPDF::trim_user_password` (`QPDF_encryption.cc:138-161`).
+///
+/// The padding suffix is removed only when it begins at a `0x28` byte and the
+/// remaining bytes match the corresponding prefix of the PDF password padding
+/// constant. Otherwise the original bytes are preserved.
+pub(crate) fn trim_user_password(password: &[u8]) -> Vec<u8> {
+    if password.len() < PASSWORD_PADDING.len() {
+        return password.to_vec();
+    }
+    for index in 0..password.len() {
+        if password[index] == PASSWORD_PADDING[0]
+            && password.len() - index <= PASSWORD_PADDING.len()
+            && password[index..] == PASSWORD_PADDING[..password.len() - index]
+        {
+            return password[..index].to_vec();
+        }
+    }
+    password.to_vec()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2073,6 +2112,27 @@ mod tests {
         assert_eq!(PASSWORD_PADDING[1], 0xBF);
         assert_eq!(PASSWORD_PADDING[31], 0x7A);
         assert_eq!(PASSWORD_PADDING.len(), 32);
+    }
+
+    #[test]
+    fn trim_user_password_matches_qpdf_padding_recovery() {
+        let mut padded = b"secret".to_vec();
+        padded.extend_from_slice(&PASSWORD_PADDING[..PASSWORD_PADDING.len() - padded.len()]);
+        assert_eq!(trim_user_password(&padded), b"secret");
+    }
+
+    #[test]
+    fn trim_user_password_does_not_slice_past_padding_for_long_input() {
+        let mut long = vec![b'A'; 40];
+        long[0] = PASSWORD_PADDING[0];
+        assert_eq!(trim_user_password(&long), long);
+    }
+
+    #[test]
+    fn trim_user_password_preserves_short_password_starting_with_padding() {
+        // qpdf leaves passwords shorter than the full key width untouched;
+        // this is a real password, not a truncated padding suffix.
+        assert_eq!(trim_user_password(b"("), b"(");
     }
 
     // ── Test fixture constants ────────────────────────────────────────────────

@@ -9,9 +9,35 @@
 
 use assert_cmd::Command;
 use flpdf::{Pdf, PdfOpenOptions};
+use predicates::prelude::*;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
+
+/// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
+/// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
+/// translates every `\n` write to `\r\n`; flpdf's CLI writes plain `\n`
+/// everywhere, matching qpdf's C++ source (`cout << "...\n"`) rather than
+/// that platform-specific translation. Comparing raw bytes on Windows would
+/// therefore flag a line-ending artifact of the oracle process, not a real
+/// content difference (see the identical pattern already established in
+/// `cli_logger_routing.rs`/`cli_attachment_lifecycle.rs`).
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+
+    normalized
+}
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
@@ -437,10 +463,13 @@ fn top_level_encrypt_v5_r6_aes256_round_trips_via_qpdf() {
     );
 }
 
-/// flpdf's own `show-encryption` reports the V=5 R=6 AES-256 scheme for a
-/// `--encrypt … 256` output. No qpdf dependency — pins flpdf's self-view.
+/// The native `show-encryption` subcommand shares the qpdf-verbatim report
+/// route with the top-level qpdf-shaped flag.
 #[test]
 fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("encrypted-v5.pdf");
 
@@ -452,6 +481,17 @@ fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
         .assert()
         .success();
 
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-pw"])
+        .arg(&output)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
     let show = Command::cargo_bin("flpdf")
         .unwrap()
         .args(["show-encryption"])
@@ -459,12 +499,226 @@ fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
         .arg("--password=user-pw")
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
-    for needle in ["V = 5", "Length = 256", "R = 6", "AESv3"] {
-        assert!(
-            stdout.contains(needle),
-            "flpdf show-encryption must report {needle:?} for V=5 R=6 output: {stdout}"
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stdout),
+            normalize_text_newlines(&qpdf.stdout)
         );
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(show.get_output().stdout, qpdf.stdout);
+        assert_eq!(show.get_output().stderr, qpdf.stderr);
+    }
+}
+
+/// The qtest shim forwards qpdf's option-shaped inspection command unchanged.
+/// This is the first RED test for the top-level QPDFJob route: the native
+/// `show-encryption` subcommand is not an equivalent parser surface.
+#[test]
+fn top_level_show_encryption_matches_qpdf_for_user_password() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-v2"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=user-v2"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
+fn top_level_show_encryption_recovers_v2_user_password_for_owner_password() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=owner-v2"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption with owner password");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=owner-v2"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption with owner password");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
+fn top_level_show_encryption_reports_wrong_password_without_failing() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption with wrong password");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption with wrong password");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
+fn top_level_show_encryption_matches_qpdf_for_plaintext() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture(UNENCRYPTED_FIXTURE);
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg("--show-encryption")
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption on plaintext");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption on plaintext");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
+fn top_level_show_encryption_matches_qpdf_for_r5_without_write_opt_in() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v5-aes-256-r5.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-v5-r5"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption on R5 fixture");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=user-v5-r5"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption on R5 fixture");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
     }
 }
 
@@ -1804,10 +2058,12 @@ fn copy_encryption_wrong_password_is_rejected() {
 
 // ── --force-R5 tests (flpdf-9hc.4.15) ──────────────────────────────────────
 
-/// `--force-R5` produces V=5 R=5 AES-256 output as reported by flpdf's own
-/// `show-encryption` — no qpdf dependency, pins flpdf's self-view.
+/// `--force-R5` produces the qpdf-verbatim V=5 R=5 AES-256 report.
 #[test]
 fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("r5.pdf");
 
@@ -1828,6 +2084,17 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
         .assert()
         .success();
 
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-pw"])
+        .arg(&output)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
     let show = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -1838,18 +2105,19 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
         .arg(&output)
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
-    for needle in ["V = 5", "R = 5", "Length = 256", "AESv3"] {
-        assert!(
-            stdout.contains(needle),
-            "flpdf show-encryption must report {needle:?} for --force-R5 output: {stdout}"
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stdout),
+            normalize_text_newlines(&qpdf.stdout)
         );
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(show.get_output().stdout, qpdf.stdout);
+        assert_eq!(show.get_output().stderr, qpdf.stderr);
     }
-    // Explicitly verify R=6 is NOT reported
-    assert!(
-        !stdout.contains("R = 6"),
-        "flpdf show-encryption must NOT report R=6 for --force-R5 output: {stdout}"
-    );
 }
 
 /// `--force-R5` is a 256-bit-only flag; KEY-LEN=128 must be rejected with a
@@ -2701,4 +2969,146 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
              --static-aes-iv invocation must be byte-identical to each other"
         );
     }
+}
+
+// ── Round-2 Codex review findings on the top-level --show-encryption ──────
+// surface (dispatch conflicts, --no-warn threading, --update-from-json
+// routing). Verified against qpdf 11.9.0 directly (see comments below).
+
+/// `--check-linearization` must reject `--show-encryption`: without this
+/// clap conflict, `check_linearization` wins the dispatch chain in `main()`
+/// and `--show-encryption` is silently dropped rather than surfaced as a
+/// usage error.
+#[test]
+fn top_level_check_linearization_conflicts_with_show_encryption() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check-linearization", "--show-encryption"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `--json` must reject `--show-encryption` for the same reason: `run_json`
+/// wins the dispatch chain in `main()`, so the combination would otherwise
+/// silently run JSON mode and drop `--show-encryption`.
+#[test]
+fn top_level_json_conflicts_with_show_encryption() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json", "--show-encryption"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `--overlay`/`--underlay` are rewrite-output modifiers; the top-level
+/// dispatch predicate that decides whether the target is a rewrite must
+/// exclude `--show-encryption`, or the overlay would be silently dropped
+/// instead of producing the usage-error diagnostic.
+#[test]
+fn top_level_overlay_rejected_with_show_encryption() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--overlay")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg("--")
+        .arg("--show-encryption")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--overlay/--underlay can only be used with rewrite output",
+        ));
+}
+
+/// `--show-encryption` must reject an output file argument outright, matching
+/// qpdf: `QPDFJob::Config::showEncryption()` sets `require_outfile = false`
+/// (`QPDFJob_config.cc:554-559`), and `checkConfiguration()`
+/// (`QPDFJob.cc:593-594`) turns any output filename into a hard usage error
+/// ("no output file may be given for this option", exit 2) regardless of
+/// what other flags accompany it -- verified directly against `qpdf
+/// --show-encryption --password=... in.pdf out.pdf` (exit 2, same message).
+/// Without this clap conflict, flpdf silently accepted and ignored the
+/// output argument (exit 0, no file written), which is the wrong axis: the
+/// gap is not specific to `--linearize` or any other rewrite-only flag, it
+/// is any output filename at all.
+#[test]
+fn top_level_show_encryption_rejects_output_file() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--show-encryption")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg("/tmp/flpdf-show-encryption-output-must-be-rejected.pdf")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `--update-from-json` combined with `--show-encryption` must route through
+/// the JSON-input-inspection consumer (which applies the update before
+/// rendering the report), not the plain file-backed `--show-encryption`
+/// path (which would silently ignore `--update-from-json` entirely). A
+/// nonexistent `--update-from-json` path distinguishes the two: routed
+/// correctly, opening that path fails; silently ignored, the command would
+/// succeed and print the encryption report as if `--update-from-json` had
+/// never been given.
+#[test]
+fn top_level_show_encryption_honors_update_from_json_routing() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--update-from-json=/nonexistent/does-not-exist.json")
+        .arg("--show-encryption")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure();
+}
+
+/// `--no-warn` must suppress *all* diagnostic output for `--show-encryption`
+/// on a damaged-but-repairable input, matching qpdf's `--no-warn
+/// --show-encryption` (verified: `qpdf --no-warn --show-encryption
+/// repairable_input.pdf` prints only "File is not encrypted", with no
+/// `WARNING: ...` lines and no trailing "operation succeeded with warnings"
+/// summary) -- unlike `--check`, `--show-encryption` has no report body that
+/// defers and conditionally replays collected diagnostics, so `--no-warn`
+/// must drop them at open time instead.
+#[test]
+fn top_level_show_encryption_no_warn_suppresses_all_warning_output() {
+    let damaged = "../../tests/fixtures/test_driver/repairable_input.pdf";
+
+    let with_warnings = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", damaged])
+        .output()
+        .unwrap();
+    assert_eq!(with_warnings.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&with_warnings.stderr).contains("WARNING"),
+        "sanity check: the undamaged-path run must still show warnings live: {:?}",
+        String::from_utf8_lossy(&with_warnings.stderr)
+    );
+
+    let no_warn = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--no-warn", "--show-encryption", damaged])
+        .output()
+        .unwrap();
+    assert_eq!(no_warn.status.code(), Some(3));
+    assert!(
+        no_warn.stderr.is_empty(),
+        "--no-warn must suppress all --show-encryption diagnostic output \
+         (live WARNING lines and the trailing summary), matching qpdf: {:?}",
+        String::from_utf8_lossy(&no_warn.stderr)
+    );
+    assert_eq!(
+        normalize_text_newlines(&no_warn.stdout),
+        b"File is not encrypted\n",
+        "--no-warn --show-encryption must print only the qpdf report body"
+    );
 }

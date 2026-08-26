@@ -991,6 +991,60 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
     }
 }
 
+#[test]
+fn encryption_inspection_retains_parameters_after_bad_password_without_key() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+    let bytes = std::fs::read(path).expect("encrypted fixture");
+    let mut pdf = Pdf::open_for_encryption_inspection(
+        std::io::Cursor::new(bytes),
+        PdfOpenOptions {
+            password: b"wrong".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("inspection must retain qpdf's parsed state after BadPassword");
+
+    let info = pdf
+        .encryption_info()
+        .expect("encryption inspection info")
+        .expect("fixture is encrypted");
+    assert!(pdf.is_encrypted());
+    assert_eq!(info.r, 3);
+    assert_eq!(info.v, 2);
+    assert!(!info.user_password_matched);
+    assert!(!info.owner_password_matched);
+    assert!(info.user_password.is_empty());
+    assert!(pdf.encryption_file_key().is_none());
+}
+
+/// `uses_weak_crypto()` must still classify a document as weak (RC4) after a
+/// `BadPassword` open via `open_for_encryption_inspection`, which never
+/// populates the authenticated `EncryptionState` `uses_weak_crypto` would
+/// otherwise read -- it must fall back to the pre-authentication
+/// `EncryptionInspectionState`, which computes the same RC4/R=5
+/// classification from the parsed (password-independent) `/Encrypt` fields.
+#[test]
+fn uses_weak_crypto_reports_rc4_after_bad_password_inspection_open() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+    let bytes = std::fs::read(path).expect("encrypted fixture");
+    let pdf = Pdf::open_for_encryption_inspection(
+        std::io::Cursor::new(bytes),
+        PdfOpenOptions {
+            password: b"wrong".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("inspection must retain qpdf's parsed state after BadPassword");
+
+    assert!(
+        pdf.uses_weak_crypto(),
+        "RC4 must still be reported as weak crypto after a failed password, \
+         from the retained inspection state alone"
+    );
+}
+
 /// A `/V 5` document whose `/CF` names `/CFM /V2` is an RC4 crypt filter on a
 /// modern revision. qpdf accepts it and reports RC4 rather than refusing the
 /// document:

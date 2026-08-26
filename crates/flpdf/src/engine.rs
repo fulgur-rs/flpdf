@@ -93,10 +93,25 @@ impl<R: Read + Seek> Pdf<R> {
     ///   encryption is readable; qpdf's `--allow-weak-crypto` is a write-only
     ///   policy.
     pub fn open_with_options(reader: R, options: PdfOpenOptions) -> Result<Self> {
-        Self::open_with_repair_mode(reader, options)
+        Self::open_with_repair_mode(reader, options, false)
     }
 
-    fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
+    /// Open a document for qpdf's read-only encryption inspection path.
+    ///
+    /// Unlike [`Pdf::open_with_options`], this retains the parsed encryption
+    /// parameters and returns a document when password authentication fails
+    /// with [`EncryptedError::BadPassword`]. The returned document is only
+    /// suitable for encryption inspection; its authenticated decryption state
+    /// remains absent.
+    pub fn open_for_encryption_inspection(reader: R, options: PdfOpenOptions) -> Result<Self> {
+        Self::open_with_repair_mode(reader, options, true)
+    }
+
+    fn open_with_repair_mode(
+        mut reader: R,
+        options: PdfOpenOptions,
+        allow_bad_password: bool,
+    ) -> Result<Self> {
         let warning_options = ResolverWarningOptions::new(
             options
                 .logger
@@ -187,8 +202,20 @@ impl<R: Read + Seek> Pdf<R> {
             ever_called_get_all_pages: false,
             page_list_cache: None,
             encryption,
+            encryption_inspection: Rc::new(RefCell::new(None)),
         };
         pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
+        if let Err(error) = pdf.initialize_encryption_inspection() {
+            // Same diagnostic-wrapping boundary as the authentication
+            // failure below: xref recovery may have already recorded
+            // repair warnings, and a consumer like `run_check` (which
+            // suppresses live open-time warnings and replays them via
+            // `Error::OpenFailure`/`report_open_failure`) must not lose
+            // them just because a malformed `/Encrypt` entry fails this
+            // password-independent parse before authentication even runs.
+            let diagnostics = pdf.repair_diagnostics();
+            return Err(Error::with_open_diagnostics(error, diagnostics));
+        }
         if let Err(error) = pdf.authenticate_if_encrypted(&options) {
             // qpdf reconstructs and records warnings before
             // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises
@@ -196,6 +223,10 @@ impl<R: Read + Seek> Pdf<R> {
             // Preserve that warning stream alongside the terminal
             // password/encryption error so file-backed helpers can emit it
             // before the final diagnostic.
+            if allow_bad_password && matches!(error, Error::Encrypted(EncryptedError::BadPassword))
+            {
+                return Ok(pdf);
+            }
             let diagnostics = pdf.repair_diagnostics();
             return Err(Error::with_open_diagnostics(error, diagnostics));
         }
@@ -446,6 +477,76 @@ impl Pdf<Cursor<Vec<u8>>> {
 mod tests {
     use super::*;
     use crate::{Object, ObjectRef};
+
+    /// A classic-xref PDF whose trailer `/Encrypt` dictionary is missing
+    /// `/V` (so `initialize_encryption_inspection` fails before
+    /// authentication ever runs), and whose xref table header is corrupted
+    /// (so reconstruction records a repair warning before that failure).
+    fn damaged_xref_with_malformed_encrypt_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        // Missing /V (and /R): `required_version` fails first, inside
+        // `parse_inspection_state`, before `/Filter` is even checked.
+        pdf.extend_from_slice(b"4 0 obj\n<< /Filter /Standard >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        // Corrupt the object-count digit ("4" -> "X"), matching the
+        // established damaged-xref-header technique used elsewhere in this
+        // crate's tests: the classic-xref parser fails to read this header
+        // and falls back to line-scan reconstruction, recording a repair
+        // warning before the trailer (and its /Encrypt entry) is ever read.
+        let mut xref = String::from("xref\n0 X\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Encrypt 4 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn open_preserves_repair_warnings_when_encryption_inspection_initialization_fails() {
+        let bytes = damaged_xref_with_malformed_encrypt_bytes();
+        let error = Pdf::open_mem_owned(bytes)
+            .err()
+            .expect("a malformed /Encrypt dictionary must fail the open");
+        let (source, diagnostics) = error.open_failure().unwrap_or_else(|| {
+            // cov:ignore-start: diagnostic panic reachable only if this
+            // regression test itself starts failing in an unexpected shape;
+            // the passing-suite path always takes `Some(..)` here.
+            panic!(
+                "the terminal error must be wrapped with the repair diagnostics \
+                 accumulated during xref reconstruction, not returned bare: {error}"
+            )
+            // cov:ignore-end
+        });
+        assert!(
+            !diagnostics.entries().is_empty(),
+            "xref reconstruction must have recorded at least one repair warning"
+        );
+        assert!(
+            matches!(source, Error::Missing(_) | Error::Encrypted(_)),
+            "the wrapped terminal error must still be the /Encrypt parse failure: {source:?}"
+        );
+    }
 
     #[test]
     fn empty_returns_canonical_minimal_document() {

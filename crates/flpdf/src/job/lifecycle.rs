@@ -634,6 +634,45 @@ impl QPDFJob {
         Ok(pdf)
     }
 
+    /// Open a file-backed document for qpdf's read-only encryption inspection
+    /// path. This is the Rust counterpart of `QPDFJob::createQPDF` retaining
+    /// the partially initialized document after `qpdf_e_password` so
+    /// `showEncryption` can report the parsed parameters.
+    pub fn open_for_encryption_inspection<R>(
+        &mut self,
+        source: R,
+        input_name: impl Into<String>,
+        mut options: PdfOpenOptions,
+    ) -> Result<Pdf<R>>
+    where
+        R: Read + Seek,
+    {
+        let input_name = input_name.into();
+        self.input_name = input_name.clone();
+        options.logger = Some(self.logger.clone());
+        options.description = input_name;
+        let mut pdf = Pdf::open_for_encryption_inspection(source, options)?;
+        // `--password-is-hex-key` (raw key) authentication intentionally
+        // leaves both user/owner password-match flags false on success --
+        // it bypasses password derivation entirely -- so those flags alone
+        // cannot distinguish a genuinely failed open from a successful
+        // raw-key one. `encryption_file_key()` is populated only on
+        // successful authentication (any mode); `is_encrypted()` separately
+        // distinguishes a plaintext document (no /Encrypt at all, so this
+        // must be `false` regardless of key presence) from a genuinely
+        // failed encrypted one.
+        let authentication_failed = pdf.is_encrypted() && pdf.encryption_file_key().is_none();
+        // qpdf's createQPDF returns from its password-error catch before the
+        // ordinary post-open root walk. Do not resolve an encrypted root in
+        // the same partial state; successful/plaintext opens keep the normal
+        // QPDFJob root initialization and warning boundary.
+        if !authentication_failed {
+            pdf.root_handle()?;
+        }
+        self.record_document_warnings(&pdf);
+        Ok(pdf)
+    }
+
     /// Apply a partial JSON update before the job's output or inspection
     /// stage, matching qpdf's update-before-transform order.
     pub fn update_from_json<R, S>(
@@ -840,6 +879,66 @@ mod tests {
                 PdfOpenOptions::default(),
             )
             .is_ok());
+    }
+
+    /// `--password-is-hex-key` authentication intentionally leaves both
+    /// user/owner password-match flags false even on success (it bypasses
+    /// password derivation entirely). `open_for_encryption_inspection` must
+    /// still run the normal post-open root walk for a successful raw-key
+    /// open, the same way it does for a successful password-based one --
+    /// distinguishing genuine `BadPassword` failure from raw-key success by
+    /// whether a file key was installed, not by the password-match flags.
+    #[test]
+    fn open_for_encryption_inspection_walks_the_root_after_successful_raw_key_auth() {
+        let mut source = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/encrypted/v5-aes-256-r6.pdf"),
+        )
+        .expect("committed encrypted fixture");
+        // Corrupt the trailer's /Root reference to a dangling object number
+        // (the fixture's /Size is 4, so object 9 cannot exist) -- same
+        // length substitution, no xref/offset shift needed. This is the
+        // only way to make the raw-key-vs-password-flags distinction this
+        // predicate exists to draw actually observable from outside.
+        let needle = b"/Root 1 0 R";
+        let at = source
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("fixture has a /Root 1 0 R trailer reference");
+        source[at..at + needle.len()].copy_from_slice(b"/Root 9 0 R");
+
+        // Known raw file key for this committed fixture (verified with
+        // `qpdf --show-encryption-key --password=… tests/fixtures/encrypted/
+        // v5-aes-256-r6.pdf`, matching the constant already established in
+        // `crates/flpdf-cli/tests/cli_password_hex_key_tests.rs`).
+        let hex_key = b"fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290".to_vec();
+
+        let mut job = QPDFJob::new();
+        let result = job.open_for_encryption_inspection(
+            Cursor::new(source),
+            "dangling-root-hex-key.pdf",
+            PdfOpenOptions {
+                password: hex_key,
+                password_is_hex_key: true,
+                ..PdfOpenOptions::default()
+            },
+        );
+
+        match result {
+            Err(Error::System(message)) => assert_eq!(message, "unable to find /Root dictionary"),
+            // cov:ignore-start: diagnostic panic arms reachable only if this
+            // regression test itself starts failing in an unexpected shape;
+            // the passing-suite path always takes the arm above.
+            Err(other) => {
+                panic!("expected the dangling-/Root error, got a different error: {other}")
+            }
+            Ok(_) => panic!(
+                "a successful raw-key open must still surface a dangling /Root, \
+                 proving the root walk ran rather than being skipped as a \
+                 (mis-detected) authentication failure"
+            ),
+            // cov:ignore-end
+        }
     }
 
     #[test]

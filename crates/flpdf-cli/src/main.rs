@@ -308,6 +308,7 @@ struct Cli {
             "show_pages",
             "show_xref",
             "show_linearization",
+            "show_encryption",
             "job_json_file",
             "json",
             "json_input",
@@ -365,6 +366,18 @@ struct Cli {
     show_xref: bool,
     #[arg(long)]
     show_linearization: bool,
+    /// Show encryption parameters on the qpdf-compatible top-level surface.
+    /// This is the argv form used by qtest (`qpdf --show-encryption FILE`);
+    /// the native `show-encryption` subcommand dispatches to the same
+    /// inspection implementation below.
+    ///
+    /// qpdf marks `showEncryption()` as `require_outfile = false`
+    /// (`QPDFJob_config.cc:554-559`), so `checkConfiguration()`
+    /// (`QPDFJob.cc:593-594`) rejects an output file argument outright with
+    /// "no output file may be given for this option", regardless of what
+    /// other flags accompany it.
+    #[arg(long = "show-encryption", conflicts_with = "output")]
+    show_encryption: bool,
 
     /// Run a complete qpdf job JSON file through the production QPDFJob
     /// lifecycle (qpdf `--job-json-file`).
@@ -390,7 +403,8 @@ struct Cli {
           conflicts_with_all = [
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
               "show_object",
-              "show_npages", "show_pages", "show_xref", "show_linearization", "output",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption",
               "add_attachment", "remove_attachment", "list_attachments",
@@ -542,6 +556,7 @@ struct Cli {
           conflicts_with_all = [
               "check", "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
           ])]
     remove_restrictions: bool,
     /// Strip the `/Encrypt` dictionary from the output (top-level alias of
@@ -562,6 +577,7 @@ struct Cli {
           conflicts_with_all = [
               "check", "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
           ])]
     decrypt: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
@@ -637,6 +653,7 @@ struct Cli {
           conflicts_with_all = [
               "check", "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
               "linearize", "pages", "rotate", "split_pages", "empty",
@@ -793,6 +810,7 @@ struct Cli {
         conflicts_with_all = [
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
+            "show_encryption",
             "remove_restrictions", "decrypt",
             "copy_encryption",
         ],
@@ -818,6 +836,7 @@ struct Cli {
             "encrypt",
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
+            "show_encryption",
             "remove_restrictions", "decrypt",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption); \
@@ -974,17 +993,10 @@ Print a parseable, greppable encryption report for FILE.
 The qpdf `--show-encryption` lines are emitted verbatim (`R = `, `P = `,
 the `extract/print/modify ...: allowed|not allowed` block, and the
 `stream/string/file encryption method:` lines for V>=4) so scripts that
-grep qpdf output also work here. flpdf adds extra leading lines
-(`V = `, `Length = `, `Filter = `, `EncryptMetadata = `, and per-named
-`CF /<name> = <method>`) before the qpdf block.
-
-Divergences from qpdf, by design: flpdf does not recover
-the cleartext user password, so qpdf's `User password = <value>` line is
-omitted (a grep for it simply misses rather than getting wrong data).
-`Supplied password is owner/user password` is printed from the
-authenticated state. If FILE is not encrypted, prints qpdf's
-`File is not encrypted` and exits 0. Requires a correct password to open
-the document (same as the other inspection subcommands)."
+including `User password = ...` and V<5 owner-password recovery. If the
+password is wrong, qpdf's `Incorrect password supplied` line is emitted
+before the parsed encryption report. If FILE is not encrypted, prints qpdf's
+`File is not encrypted` and exits 0."
     )]
     ShowEncryption(EncryptionInspectCommand),
     #[command(
@@ -1866,6 +1878,7 @@ fn main() {
                     && !args.show_xref
                     && !args.check_linearization
                     && !args.show_linearization
+                    && !args.show_encryption
                     && !args.check
                     && !args.list_attachments
                     && args.show_attachment.is_none()
@@ -1884,7 +1897,11 @@ fn main() {
     }
 
     let json_input_inspection = (args.json_input || args.update_from_json.is_some())
-        && (args.check || args.show_npages || args.show_pages || args.show_xref);
+        && (args.check
+            || args.show_npages
+            || args.show_pages
+            || args.show_xref
+            || args.show_encryption);
 
     // JSON-input/update inspection is routed through the already-created job
     // document before the ordinary file-backed inspection branches. qpdf
@@ -1919,6 +1936,11 @@ fn main() {
         run_check_linearization(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_linearization {
         run_show_linearization(args.input)
+    } else if args.show_encryption {
+        match args.input.as_ref() {
+            Some(input) => run_show_encryption(input, args.repair, &args.password, args.no_warn),
+            None => Err("--show-encryption requires an input file".into()),
+        }
     } else if args.check {
         run_check(args.input, args.repair, &args.password, args.no_warn)
     } else if args.list_attachments {
@@ -2413,6 +2435,13 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
         // diagnostics once in its check report rather than delivering them
         // during input creation.
         options.suppress_warnings = true;
+    } else if cli.show_encryption {
+        // `--show-encryption` has no deferred-replay report body (unlike
+        // `--check`): open-time diagnostics are either delivered live
+        // (matching qpdf's un-suppressed `--show-encryption` output) or, with
+        // `--no-warn`, dropped entirely (matching qpdf, which prints no
+        // WARNING lines at all in that case; see `run_show_encryption`).
+        options.suppress_warnings = cli.no_warn;
     }
     let mut pdf = match job.open(BufReader::new(file), input.display().to_string(), options) {
         Ok(pdf) => pdf,
@@ -2441,6 +2470,9 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     }
     if cli.show_xref {
         return finish_job_exit_status(job.show_xref(pdf)?);
+    }
+    if cli.show_encryption {
+        return render_show_encryption_report(job, pdf, cli.password.password_is_hex_key);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
 }
@@ -2540,7 +2572,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         ),
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
-        Commands::ShowEncryption(cmd) => run_show_encryption(&cmd.input, cmd.repair, &cmd.password),
+        Commands::ShowEncryption(cmd) => {
+            run_show_encryption(&cmd.input, cmd.repair, &cmd.password, false)
+        }
         Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair, cmd.recovery),
         Commands::RequiresPassword(cmd) => {
             run_requires_password(&cmd.input, cmd.repair, &cmd.password)
@@ -5594,63 +5628,94 @@ fn run_show_encryption_key(
             logger_info(format!("{}\n", hex_lower(&key)))?;
             finish_operation_warnings(&pdf, false)
         }
-        None => {
-            // qpdf --show-encryption-key requires an encrypted file; exit 2.
-            Err("file is not encrypted; no encryption key to show".into())
-        }
+        None if pdf.is_encrypted() => Err("encrypted PDF: incorrect password".into()),
+        None => Err("file is not encrypted; no encryption key to show".into()),
     }
 }
 
 /// `show-encryption FILE [--password ...]`: qpdf `--show-encryption`.
 ///
-/// See the subcommand `long_about` for the exact format and the documented
-/// divergences from qpdf (no recovered cleartext user password). Weak-crypto
+/// The report is the qpdf `QPDFJob::showEncryption` format. Weak-crypto
 /// (RC4 / R=5) files are inspectable with the correct password and no
-/// `--allow-weak-crypto`, matching qpdf's read-only treatment (see
-/// [`open_pdf_for_inspection`]).
-fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+/// `--allow-weak-crypto`, matching qpdf's read-only treatment.
+///
+/// Opens through its own job (rather than the shared
+/// [`open_pdf_for_inspection`] helper) so `--no-warn` reaches
+/// `QPDFJob::set_suppress_warnings`, matching `run_check`/
+/// `run_check_linearization`'s pattern.
+fn run_show_encryption(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+    no_warn: bool,
+) -> CliResult<()> {
+    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
+    let mut options = pdf_open_options(repair, password)?;
+    // qpdf's `--no-warn` drops open-time repair diagnostics entirely for
+    // `--show-encryption` (no deferred replay, unlike `--check`'s report
+    // body); verified against `qpdf --no-warn --show-encryption` on a
+    // damaged fixture, which prints no WARNING lines at all. Without this,
+    // `job.set_suppress_warnings(no_warn)` above only gates the trailing
+    // "operation succeeded with warnings" summary while the live
+    // `WARNING: ...` lines from `Pdf::open_for_encryption_inspection` still
+    // print unconditionally.
+    options.suppress_warnings = no_warn;
+    let mut pdf = job
+        .open_for_encryption_inspection(BufReader::new(file), input.display().to_string(), options)
+        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    render_show_encryption_report(&mut job, &mut pdf, password.password_is_hex_key)
+}
+
+/// Render the qpdf-verbatim `--show-encryption` report for an already-open
+/// document, shared by [`run_show_encryption`] (file-backed open) and the
+/// JSON-input/update inspection route ([`run_job_inspection_on_pdf`]), which
+/// must render the report from the job-owned, already-updated document
+/// rather than reopening the original file.
+///
+/// Completes the warning/exit-status boundary on `job` itself (rather than
+/// the disconnected fresh-`QPDFJob` [`finish_operation_warnings`] helper) so
+/// `--no-warn` -- already applied to `job` via `set_suppress_warnings` by
+/// both callers -- also gates the trailing "operation succeeded with
+/// warnings" summary here, matching `--check`'s `finish_check_job(job.check(pdf))`.
+fn render_show_encryption_report<R: Read + Seek>(
+    job: &mut QPDFJob,
+    pdf: &mut Pdf<R>,
+    password_is_hex_key: bool,
+) -> CliResult<()> {
     // qpdf prints "File is not encrypted" and exits 0 for plaintext files.
-    // open_pdf_for_inspection succeeds for plaintext input, so detect that
-    // case first.
-    let mut pdf = open_pdf_for_inspection(input, repair, password)?;
     let Some(info) = pdf.encryption_info()? else {
         logger_info("File is not encrypted\n")?;
-        return finish_operation_warnings(&pdf, false);
+        job.record_document_warnings(pdf);
+        return finish_job_exit_status(job.complete(false)?);
     };
 
-    let mut output = String::new();
+    // Built as raw bytes, not a `String`: qpdf's `getTrimmedUserPassword()`
+    // is a `std::string` of arbitrary bytes (reachable via `--password-file`
+    // or a byte-preserving password mode) and `QPDFJob::showEncryption`
+    // writes it verbatim to stdout. `String::from_utf8_lossy` would replace
+    // invalid UTF-8 with U+FFFD, diverging from qpdf's byte-for-byte report.
+    let mut output = Vec::new();
 
-    // ── flpdf-specific leading lines (placed BEFORE the qpdf block so a
-    //    qpdf-compatible grep still matches the qpdf lines verbatim) ──
-    output.push_str(&format!("V = {}\n", info.v));
-    output.push_str(&format!("Length = {}\n", info.length_bits));
-    output.push_str(&format!("Filter = {}\n", info.filter));
-    output.push_str(&format!(
-        "EncryptMetadata = {}\n",
-        if info.encrypt_metadata {
-            "true"
-        } else {
-            "false"
-        }
-    ));
-    let mut cf_names: Vec<_> = info.named_crypt_filters.clone();
-    cf_names.sort();
-    for (name, method) in &cf_names {
-        output.push_str(&format!("CF /{name} = {method}\n"));
+    if !info.user_password_matched && !info.owner_password_matched && !password_is_hex_key {
+        output.extend_from_slice(b"Incorrect password supplied\n");
     }
 
-    // ── Verbatim qpdf `--show-encryption` lines (source:
-    //    qpdf libqpdf/QPDFJob.cc QPDFJob::showEncryption) ──
-    output.push_str(&format!("R = {}\n", info.r));
-    output.push_str(&format!("P = {}\n", info.permissions.raw()));
-    // qpdf prints `User password = <recovered cleartext>` here; flpdf does
-    // not recover the cleartext user password (documented divergence), so
-    // that line is intentionally omitted.
-    if pdf.owner_password_matched() {
-        output.push_str("Supplied password is owner password\n"); // cov:ignore: exercised by show-encryption subprocess integration tests
+    // Verbatim qpdf `--show-encryption` lines (source:
+    // libqpdf/QPDFJob.cc QPDFJob::showEncryption).
+    output.extend_from_slice(format!("R = {}\n", info.r).as_bytes());
+    output.extend_from_slice(format!("P = {}\n", info.permissions.raw()).as_bytes());
+    output.extend_from_slice(b"User password = ");
+    output.extend_from_slice(&info.user_password);
+    output.push(b'\n');
+    if info.owner_password_matched {
+        output.extend_from_slice(b"Supplied password is owner password\n"); // cov:ignore: exercised by show-encryption subprocess integration tests
     }
-    if pdf.user_password_matched() {
-        output.push_str("Supplied password is user password\n");
+    if info.user_password_matched {
+        output.extend_from_slice(b"Supplied password is user password\n");
     }
 
     // qpdf's allow* booleans are revision-dependent. Replicate the exact
@@ -5671,48 +5736,45 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
         && allow_modify_other
         && (r < 3 || (allow_modify_form && allow_modify_assembly));
     let show = |v: bool| if v { "allowed" } else { "not allowed" };
-    output.push_str(&format!(
-        "extract for accessibility: {}\n",
-        show(allow_accessibility)
-    ));
-    output.push_str(&format!(
-        "extract for any purpose: {}\n",
-        show(allow_extract_all)
-    ));
-    output.push_str(&format!(
-        "print low resolution: {}\n",
-        show(allow_print_low)
-    ));
-    output.push_str(&format!(
-        "print high resolution: {}\n",
-        show(allow_print_high)
-    ));
-    output.push_str(&format!(
-        "modify document assembly: {}\n",
-        show(allow_modify_assembly)
-    ));
-    output.push_str(&format!("modify forms: {}\n", show(allow_modify_form)));
-    output.push_str(&format!(
-        "modify annotations: {}\n",
-        show(allow_modify_annotation)
-    ));
-    output.push_str(&format!("modify other: {}\n", show(allow_modify_other)));
-    output.push_str(&format!("modify anything: {}\n", show(allow_modify_all)));
+    output.extend_from_slice(
+        format!("extract for accessibility: {}\n", show(allow_accessibility)).as_bytes(),
+    );
+    output.extend_from_slice(
+        format!("extract for any purpose: {}\n", show(allow_extract_all)).as_bytes(),
+    );
+    output
+        .extend_from_slice(format!("print low resolution: {}\n", show(allow_print_low)).as_bytes());
+    output.extend_from_slice(
+        format!("print high resolution: {}\n", show(allow_print_high)).as_bytes(),
+    );
+    output.extend_from_slice(
+        format!(
+            "modify document assembly: {}\n",
+            show(allow_modify_assembly)
+        )
+        .as_bytes(),
+    );
+    output.extend_from_slice(format!("modify forms: {}\n", show(allow_modify_form)).as_bytes());
+    output.extend_from_slice(
+        format!("modify annotations: {}\n", show(allow_modify_annotation)).as_bytes(),
+    );
+    output.extend_from_slice(format!("modify other: {}\n", show(allow_modify_other)).as_bytes());
+    output.extend_from_slice(format!("modify anything: {}\n", show(allow_modify_all)).as_bytes());
     if info.v >= 4 {
-        output.push_str(&format!(
-            "stream encryption method: {}\n",
-            info.stream_method
-        ));
-        output.push_str(&format!(
-            "string encryption method: {}\n",
-            info.string_method
-        ));
+        output.extend_from_slice(
+            format!("stream encryption method: {}\n", info.stream_method).as_bytes(),
+        );
+        output.extend_from_slice(
+            format!("string encryption method: {}\n", info.string_method).as_bytes(),
+        );
         // qpdf prints the embedded-file ("file") method; the no-/EFF fallback
         // to the stream method happens where `cf_file` is resolved, not here.
-        output.push_str(&format!("file encryption method: {}\n", info.eff_method));
+        output
+            .extend_from_slice(format!("file encryption method: {}\n", info.eff_method).as_bytes());
     }
     logger_info(output)?;
-    finish_operation_warnings(&pdf, false)
+    job.record_document_warnings(pdf);
+    finish_job_exit_status(job.complete(false)?)
 }
 
 /// Lowercase hex encoding (qpdf `--show-encryption-key` format).
@@ -5819,7 +5881,7 @@ fn open_pdf_from_file(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_file_impl(input, file, repair, password, false)
+    open_pdf_file_impl(input, file, repair, password, false, false)
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,
@@ -5828,14 +5890,15 @@ fn open_pdf_from_file(
 /// qpdf treats these as read-only inspections rather than a write policy: it
 /// derives and prints the key / encryption block for a weak file with the
 /// correct password and emits no weak-crypto warning (verified qpdf 11.9.0).
-/// Authentication still runs first, so a wrong password fails exactly as
-/// before.
+/// A wrong password retains qpdf's parsed encryption state so show-encryption
+/// can report it rather than failing before the report.
 fn open_pdf_for_inspection(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, false)
+    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    open_pdf_file_impl(input, file, repair, password, false, true)
 }
 
 /// Open for `--update-from-json --check`'s generic job-inspection route.
@@ -5863,7 +5926,7 @@ fn open_pdf_impl(
     suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
-    open_pdf_file_impl(input, file, repair, password, suppress_warnings)
+    open_pdf_file_impl(input, file, repair, password, suppress_warnings, false)
 }
 
 fn open_pdf_file_impl(
@@ -5872,6 +5935,7 @@ fn open_pdf_file_impl(
     repair: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
+    encryption_inspection: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let mut options = pdf_open_options(repair, password)?;
     if suppress_warnings {
@@ -5880,9 +5944,16 @@ fn open_pdf_file_impl(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
-    let pdf = job
-        .open(BufReader::new(file), input.display().to_string(), options)
-        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    let pdf = if encryption_inspection {
+        job.open_for_encryption_inspection(
+            BufReader::new(file),
+            input.display().to_string(),
+            options,
+        )
+    } else {
+        job.open(BufReader::new(file), input.display().to_string(), options)
+    }
+    .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     Ok(pdf)
 }
 

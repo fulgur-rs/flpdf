@@ -275,8 +275,7 @@ fn show_encryption_key_weak_wrong_password_still_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// show-encryption: parseable, contains the DESIGN-required fields, and the
-// qpdf `--show-encryption` lines are emitted verbatim.
+// show-encryption: the qpdf `--show-encryption` report is emitted verbatim.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -299,15 +298,11 @@ fn show_encryption_v4_aes_lists_required_fields() {
         .clone();
     let text = String::from_utf8(out).unwrap();
 
-    // DESIGN-mandated minimum fields (parseable / greppable).
+    // qpdf's report fields (parseable / greppable).
     for needle in [
-        "V = 4",
         "R = 4",
-        "Length = 128",
         "P = -4",
-        "EncryptMetadata = true",
-        "Filter = Standard",
-        "CF /StdCF = AESv2",
+        "User password = user-v4-aes",
         "stream encryption method: AESv2",
         "string encryption method: AESv2",
         "file encryption method: AESv2",
@@ -322,14 +317,14 @@ fn show_encryption_v4_aes_lists_required_fields() {
 
 #[test]
 fn show_encryption_qpdf_lines_match_qpdf_verbatim() {
-    // The qpdf `--show-encryption` block (everything except flpdf's leading
-    // V/Length/Filter/EncryptMetadata/CF lines and qpdf's omitted
-    // "User password = …" line) must match qpdf byte-for-byte so scripts
-    // grepping qpdf output keep working. Hard-coded from qpdf 11.9.0:
+    // The complete qpdf `--show-encryption` report must match qpdf byte-for-
+    // byte so scripts grepping qpdf output keep working. Hard-coded from
+    // qpdf 11.9.0:
     //   qpdf --show-encryption --password=user-v4-aes v4-aes-128-r4.pdf
     let expected_qpdf_block = "\
 R = 4
 P = -4
+User password = user-v4-aes
 Supplied password is user password
 extract for accessibility: allowed
 extract for any purpose: allowed
@@ -352,15 +347,8 @@ file encryption method: AESv2
         .stdout
         .clone();
     let text = String::from_utf8(out).unwrap();
-    // Drop flpdf's leading lines; the remainder must equal the qpdf block.
-    let qpdf_part: String = text
-        .lines()
-        .skip_while(|l| !l.starts_with("R = "))
-        .collect::<Vec<_>>()
-        .join("\n");
     assert_eq!(
-        format!("{qpdf_part}\n"),
-        expected_qpdf_block,
+        text, expected_qpdf_block,
         "qpdf-compatible block diverged from qpdf 11.9.0 output"
     );
 }
