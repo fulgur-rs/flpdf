@@ -1,14 +1,15 @@
 //! qpdf correspondence: `ResourceFinder.cc`.
 //!
 //! Records the last name before resource-consuming content operators. This is
-//! intentionally a direct `ParserCallbacks` consumer, rather than an
-//! operation accumulator, to preserve qpdf's parser event semantics.
+//! intentionally a direct `ObjectHandleParserCallbacks` consumer, rather than
+//! an operation accumulator, to preserve qpdf's parser event semantics
+//! (`libqpdf/ResourceFinder.cc:3-56`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl, ParserCallbacks};
+use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::ObjectHandle;
-use crate::{Object, Result};
+use crate::Result;
 
 pub(crate) type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeSet<usize>>>;
 
@@ -44,10 +45,6 @@ impl ResourceFinder {
 
     pub(crate) fn has_pending_operands(&self) -> bool {
         self.pending_operands
-    }
-
-    pub(crate) fn last_name(&self) -> Option<&[u8]> {
-        self.last_name.as_ref().map(|(name, _)| name.as_slice())
     }
 
     pub(crate) fn record_resource_name(
@@ -103,34 +100,8 @@ impl ResourceFinder {
         self.names.insert(name);
     }
 
-    pub(crate) fn handle_object_borrowed(
-        &mut self,
-        object: &Object,
-        offset: usize,
-        _length: usize,
-    ) -> Result<ParseControl> {
-        match object {
-            Object::Name(name) => {
-                self.pending_operands = true;
-                self.last_name = Some((name.clone(), offset));
-            }
-            Object::Operator(operator) => {
-                self.last_operator_started_at_boundary = !self.pending_operands;
-                self.pending_operands = false;
-                if let Some(resource_type) = operator_resource_type(operator) {
-                    self.record_last_name(resource_type);
-                }
-            }
-            Object::InlineImage(_) => {}
-            _ => self.pending_operands = true,
-        }
-        Ok(ParseControl::Continue)
-    }
-
-    /// Canonical ObjectHandle-native counterpart of
-    /// [`Self::handle_object_borrowed`]. Resource pruning uses this callback
-    /// with `PageObjectHelper::parse_contents` so page content never crosses
-    /// through the legacy `Object` materialization boundary.
+    /// Canonical ObjectHandle-native callback used by page and Form resource
+    /// pruning. Parsed content never crosses the legacy `Object` boundary.
     pub(crate) fn handle_object_handle(
         &mut self,
         object: &ObjectHandle,
@@ -169,26 +140,6 @@ fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
     }
 }
 
-impl ParserCallbacks for ResourceFinder {
-    fn handle_object(
-        &mut self,
-        object: Object,
-        offset: usize,
-        length: usize,
-    ) -> Result<ParseControl> {
-        self.handle_object_borrowed(&object, offset, length)
-    }
-
-    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
-        self.had_diagnostics = true;
-        Ok(())
-    }
-
-    fn handle_eof(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 impl ObjectHandleParserCallbacks for ResourceFinder {
     fn handle_object(
         &mut self,
@@ -217,49 +168,13 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::content_stream::{
-        parse_content_stream_data, parse_content_stream_data_recovering_inline_image_eof,
-    };
+    use crate::content_stream::parse_content_stream_handles;
     use crate::Result;
 
     fn find(input: &[u8]) -> Result<ResourceFinder> {
         let mut finder = ResourceFinder::default();
-        parse_content_stream_data(input, &mut finder)?;
+        parse_content_stream_handles(input, None, &mut finder)?;
         Ok(finder)
-    }
-
-    #[test]
-    fn borrowed_large_operand_remains_owned_by_the_caller() {
-        let operand = Object::String(vec![b'x'; 1024 * 1024]);
-        let original_ptr = operand.as_string().unwrap().as_ptr();
-        let mut finder = ResourceFinder::default();
-
-        finder
-            .handle_object_borrowed(&operand, 17, 1024 * 1024)
-            .unwrap();
-
-        assert!(finder.has_pending_operands());
-        assert_eq!(operand.as_string().unwrap().as_ptr(), original_ptr);
-        assert_eq!(operand.as_string().unwrap().len(), 1024 * 1024);
-    }
-
-    #[test]
-    fn borrowed_name_is_retained_for_the_following_operator() {
-        let name = Object::Name(b"F1".to_vec());
-        let operator = Object::Operator(b"Tf".to_vec());
-        let mut finder = ResourceFinder::default();
-
-        finder.handle_object_borrowed(&name, 23, 3).unwrap();
-        finder.handle_object_borrowed(&operator, 27, 2).unwrap();
-
-        assert_eq!(name.as_name(), Some(b"F1".as_slice()));
-        assert!(finder
-            .names_by_resource_type()
-            .get(b"Font".as_slice())
-            .unwrap()
-            .get(b"F1".as_slice())
-            .unwrap()
-            .contains(&23));
     }
 
     #[test]
@@ -306,7 +221,7 @@ mod tests {
 
     fn dump_flpdf_resource_finder(input: &[u8]) -> String {
         let mut finder = ResourceFinder::default();
-        parse_content_stream_data_recovering_inline_image_eof(input, &mut finder).unwrap();
+        parse_content_stream_handles(input, None, &mut finder).unwrap();
         let mut records = String::new();
         for name in finder.names() {
             writeln!(records, "name\t{}", qpdf_name_hex(name)).unwrap();

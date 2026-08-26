@@ -179,26 +179,12 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
 /// after `ID`, an unterminated inline image, or invalid tokenizer state.
 /// Callback errors are propagated unchanged.
 pub fn parse_content_stream_data(input: &[u8], callbacks: &mut impl ParserCallbacks) -> Result<()> {
-    parse_content_stream_data_impl(input, callbacks, false)
-}
-
-/// Parse content while recovering from qpdf's warning-only inline-image EOF.
-///
-/// This is intentionally crate-private and narrowly used by consumers that,
-/// like qpdf's AcroForm resource replacer, can safely act on callback state
-/// collected before an incomplete inline image. The public strict parser and
-/// conservative resource-pruning route retain their existing error boundary.
-pub(crate) fn parse_content_stream_data_recovering_inline_image_eof(
-    input: &[u8],
-    callbacks: &mut impl ParserCallbacks,
-) -> Result<()> {
-    parse_content_stream_data_impl(input, callbacks, true)
+    parse_content_stream_data_impl(input, callbacks)
 }
 
 fn parse_content_stream_data_impl(
     input: &[u8],
     callbacks: &mut impl ParserCallbacks,
-    recover_inline_image_eof: bool,
 ) -> Result<()> {
     callbacks.content_size(input.len())?;
 
@@ -233,11 +219,6 @@ fn parse_content_stream_data_impl(
             // to scan to EI, and leaves EI for the normal parser.
             // libqpdf/QPDFObjectHandle.cc:1820-1843.
             if let Err(error) = tokenizer.consume_one_byte() {
-                if recover_inline_image_eof {
-                    callbacks
-                        .handle_diagnostic(input.len(), "EOF found while reading inline image")?;
-                    break;
-                }
                 return Err(error);
             }
             let inline_offset = tokenizer.position();
@@ -255,13 +236,6 @@ fn parse_content_stream_data_impl(
             // cov:ignore-end
             let image = tokenizer.read_token(true, 0)?;
             if image.token_type == TokenType::Bad {
-                if recover_inline_image_eof {
-                    callbacks.handle_diagnostic(
-                        image.error_offset,
-                        "EOF found while reading inline image",
-                    )?;
-                    break;
-                }
                 return Err(Error::parse(
                     image.error_offset,
                     "EOF found while reading inline image",
@@ -340,46 +314,5 @@ where
         operands: Vec::new(),
         on_operation,
     };
-    parse_content_stream_data_impl(input, &mut callbacks, false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct FailingDiagnosticCallbacks;
-
-    impl ParserCallbacks for FailingDiagnosticCallbacks {
-        fn handle_object(
-            &mut self,
-            _object: Object,
-            _offset: usize,
-            _length: usize,
-        ) -> Result<ParseControl> {
-            Ok(ParseControl::Continue)
-        }
-
-        fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
-            Err(Error::Internal("diagnostic callback failed".to_string()))
-        }
-
-        // cov:ignore-start: the diagnostic callback error must short-circuit before EOF
-        fn handle_eof(&mut self) -> Result<()> {
-            panic!("diagnostic callback failure must stop before EOF")
-        }
-        // cov:ignore-end
-    }
-
-    #[test]
-    fn recovering_inline_image_eof_propagates_diagnostic_callback_error() {
-        let error = parse_content_stream_data_recovering_inline_image_eof(
-            b"ID unterminated",
-            &mut FailingDiagnosticCallbacks,
-        )
-        .expect_err("callback error should propagate");
-        assert!(matches!(
-            error,
-            Error::Internal(ref message) if message == "diagnostic callback failed"
-        ));
-    }
+    parse_content_stream_data_impl(input, &mut callbacks)
 }

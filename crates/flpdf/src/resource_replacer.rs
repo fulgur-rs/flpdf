@@ -1,8 +1,11 @@
 //! qpdf correspondence: `QPDFAcroFormDocumentHelper.cc` `ResourceReplacer`.
+//! Resource-name discovery uses the live `ObjectHandle` content callback route
+//! (`QPDFObjectHandle.cc:1776-1847`, `ResourceFinder.cc:3-56`) before the
+//! exact-byte token filter rewrites source names.
 
 use std::collections::BTreeMap;
 
-use crate::content_stream::parse_content_stream_data_recovering_inline_image_eof;
+use crate::content_stream::parse_content_stream_handles;
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
@@ -94,7 +97,7 @@ pub(crate) fn replace_resource_names(
     }
 
     let mut finder = ResourceFinder::default();
-    if parse_content_stream_data_recovering_inline_image_eof(input, &mut finder).is_err() {
+    if parse_content_stream_handles(input, None, &mut finder).is_err() {
         return Ok(None);
     }
 

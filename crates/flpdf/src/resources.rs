@@ -4,7 +4,9 @@
 //! The canonical route parses one page or Form at a time, then shallow-copies
 //! and prunes only its `/Font` and `/XObject` dictionaries. Document-level
 //! callers own the page iteration; the `Auto` decision is the separate qpdf
-//! job-level `shouldRemoveUnreferencedResources` heuristic below.
+//! job-level `shouldRemoveUnreferencedResources` heuristic below. Both the
+//! Form pre-pass and the ResourceReplacer name scan use the canonical
+//! `ObjectHandleParserCallbacks` content route.
 //!
 //! Deviation: locating a Form XObject in a `/XObject` category chases
 //! through a [`Pdf::set_object`] bare-reference redirect to its terminal via
@@ -15,12 +17,14 @@
 //! compensation elsewhere in the crate, and the inline deviation-marker
 //! comments below for the exact call sites.
 
-use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+use crate::content_stream::{
+    parse_content_stream_handles, ObjectHandleParserCallbacks, ParseControl,
+};
 use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::object_handle::ObjectHandleIdentity;
 use crate::page_object_helper::PageObjectHelper;
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
-use crate::{Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek};
 
@@ -406,10 +410,9 @@ fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
     let mut callbacks = ResourceCallbacks {
         finder: ResourceFinder::default(),
         inline_header: None,
-        valid_xobjects: BTreeMap::new(),
         complete: true,
     };
-    let complete = parse_content_stream_data(stream_bytes, &mut callbacks).is_ok()
+    let complete = parse_content_stream_handles(stream_bytes, None, &mut callbacks).is_ok()
         && !callbacks.finder.had_diagnostics()
         && callbacks.complete;
     if complete {
@@ -624,21 +627,20 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
 /// here without recreating byte or token boundaries.
 struct ResourceCallbacks {
     finder: ResourceFinder,
-    inline_header: Option<Vec<Object>>,
-    valid_xobjects: BTreeMap<Vec<u8>, usize>,
+    inline_header: Option<Vec<ObjectHandle>>,
     complete: bool,
 }
 
 impl ResourceCallbacks {
-    fn finish_inline_header(&mut self, header: Vec<Object>, offset: usize) -> bool {
+    fn finish_inline_header(&mut self, header: &[ObjectHandle], offset: usize) -> bool {
         let mut chunks = header.chunks_exact(2);
         let mut color_space = None;
         for pair in &mut chunks {
             let Some(key) = pair[0].as_name() else {
                 return false;
             };
-            if matches!(key, b"CS" | b"ColorSpace") {
-                color_space = pair[1].as_name().map(<[u8]>::to_vec);
+            if key.as_slice() == b"CS" || key.as_slice() == b"ColorSpace" {
+                color_space = pair[1].as_name();
             }
         }
         if !chunks.remainder().is_empty() {
@@ -658,7 +660,7 @@ impl ResourceCallbacks {
     }
 }
 
-impl ParserCallbacks for ResourceCallbacks {
+impl ObjectHandleParserCallbacks for ResourceCallbacks {
     fn handle_diagnostic(&mut self, offset: usize, message: &str) -> Result<()> {
         self.finder.handle_diagnostic(offset, message)?;
         self.complete = false;
@@ -667,49 +669,40 @@ impl ParserCallbacks for ResourceCallbacks {
 
     fn handle_object(
         &mut self,
-        object: Object,
+        object: ObjectHandle,
         offset: usize,
         length: usize,
     ) -> Result<ParseControl> {
-        self.finder
-            .handle_object_borrowed(&object, offset, length)?;
-        match object {
-            Object::Operator(operator) if self.inline_header.is_some() => {
+        self.finder.handle_object_handle(&object, offset, length)?;
+        if let Some(operator) = object.as_operator() {
+            if self.inline_header.is_some() {
                 let header = self
                     .inline_header
                     .take()
                     .expect("inline_header guard guarantees a header");
-                if operator != b"ID" || !self.finish_inline_header(header, offset) {
+                if operator != b"ID" || !self.finish_inline_header(&header, offset) {
                     return self.stop_incomplete();
                 }
-                Ok(ParseControl::Continue)
+                return Ok(ParseControl::Continue);
             }
-            Object::Operator(operator) if operator == b"BI" => {
+            if operator == b"BI" {
                 if !self.finder.last_operator_started_at_boundary() {
                     return self.stop_incomplete();
                 }
                 self.inline_header = Some(Vec::new());
-                Ok(ParseControl::Continue)
+                return Ok(ParseControl::Continue);
             }
-            Object::Operator(operator) if operator == b"ID" => self.stop_incomplete(),
-            Object::Operator(operator) => {
-                if operator == b"Do" && self.complete {
-                    if let Some(name) = self.finder.last_name() {
-                        if !self.valid_xobjects.contains_key(name) {
-                            self.valid_xobjects.insert(name.to_vec(), offset);
-                        }
-                    }
-                }
-                Ok(ParseControl::Continue)
-            }
-            Object::InlineImage(_) => Ok(ParseControl::Continue),
-            operand => {
-                if let Some(header) = &mut self.inline_header {
-                    header.push(operand);
-                }
-                Ok(ParseControl::Continue)
+            if operator == b"ID" {
+                return self.stop_incomplete();
             }
         }
+        if object.as_inline_image().is_some() {
+            return Ok(ParseControl::Continue);
+        }
+        if let Some(header) = &mut self.inline_header {
+            header.push(object);
+        }
+        Ok(ParseControl::Continue)
     }
 
     fn handle_eof(&mut self) -> Result<()> {
