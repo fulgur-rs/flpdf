@@ -890,11 +890,7 @@ fn qtest_test_39_uses_the_canonical_page_resource_route() {
             "qtest test_39 still contains the raw resource route marker {legacy:?}"
         );
     }
-    for canonical in [
-        "get_resources(false)",
-        "resolve_to_terminal",
-        "as_dictionary",
-    ] {
+    for canonical in ["get_resources(false)", "resolve_once", "as_dictionary"] {
         assert!(
             production.contains(canonical),
             "qtest test_39 must use the canonical handle route {canonical:?}"
