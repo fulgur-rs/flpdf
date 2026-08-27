@@ -46,8 +46,10 @@ fn resolved_key<R: Read + Seek>(
     parent: &ObjectHandle,
     key: &[u8],
 ) -> flpdf::Result<ObjectHandle> {
+    pdf.resolve(parent)?;
     let child = parent.get_key(key);
-    pdf.resolve_to_terminal(&child)
+    pdf.resolve(&child)?;
+    Ok(child)
 }
 
 /// `QPDFObjectHandle::isScalar` (`libqpdf/QPDFObjectHandle.cc:450-453`):
@@ -401,7 +403,8 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     // later `assert(oh.getOwningQPDF() == nullptr)` (test_driver.cc:3218)
     // are not ported; every other assertion in this test is.
     let root_h = root_handle(&mut qpdf);
-    let root = qpdf.resolve_to_terminal(&root_h)?;
+    qpdf.resolve(&root_h)?;
+    let root = root_h.clone();
     assert!(root.is_indirect());
     assert!(root.as_dictionary().is_some());
 
@@ -414,7 +417,8 @@ pub(crate) fn run_test_92<R: Read + Seek>(
         .first()
         .cloned()
         .expect("minimal.pdf's /Kids has at least one page");
-    let page1 = qpdf.resolve_to_terminal(&first_kid)?;
+    qpdf.resolve(&first_kid)?;
+    let page1 = first_kid.clone();
     assert!(page1.is_indirect());
     assert!(page1.as_dictionary().is_some());
 
@@ -676,6 +680,59 @@ pub(crate) fn run_test_98<R: Read + Seek>(
     // than against an independent oracle, so even a partial port here would
     // be a self-comparison on top of being unreachable.
     Ok(())
+}
+
+#[cfg(test)]
+mod test_92_tests {
+    use super::run_test_92;
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn test_92_resolves_the_destroyed_document_fixture_through_handles() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        std::fs::write(
+            directory.path().join("minimal.pdf"),
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf"),
+        )
+        .expect("write minimal fixture");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open source fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_92(
+            &mut pdf,
+            b"source.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 92");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
 }
 
 #[cfg(test)]
