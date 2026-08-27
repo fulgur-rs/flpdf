@@ -9637,12 +9637,12 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(CountingReader::new(bytes)).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         // `Pdf::open`'s own xref load has already pulled; only the resolution
         // is under test.
         let before = pdf.resolver.with_reader_mut(|reader| reader.reads);
 
-        handle.try_dereference().expect("resolve");
+        pdf.resolve(&handle).expect("resolve");
 
         let pulls = pdf.resolver.with_reader_mut(|reader| reader.reads) - before;
         assert!(
