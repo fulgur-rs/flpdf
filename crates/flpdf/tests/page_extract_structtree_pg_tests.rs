@@ -10,7 +10,7 @@
 
 use flpdf::{
     drop_struct_elem_dangling_pg, prune_after_subset, rebuild_page_tree, remap_outline_and_dests,
-    Object, ObjectRef, Pdf, RemoveUnreferencedResources,
+    ObjectHandle, ObjectRef, Pdf, RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -93,12 +93,12 @@ fn dangling_pg_dropped_and_page_gced() {
     let mut pdf = run_subset(&[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
 
     // The StructElem pointing at the removed page loses its /Pg key entirely.
-    let elem = pdf.resolve_object(ObjectRef::new(21, 0)).expect("elem 21");
-    let elem = elem.as_dict().expect("elem 21 is a dict");
+    let elem: ObjectHandle = pdf.get_object_handle(ObjectRef::new(21, 0));
+    pdf.resolve(&elem).expect("elem 21");
+    assert!(elem.as_dictionary().is_some(), "elem 21 is a dict");
     assert!(
-        elem.get("Pg").is_none(),
-        "StructElem 21 /Pg (removed page) must be dropped, got {:?}",
-        elem.get("Pg")
+        !elem.has_key(b"/Pg"),
+        "StructElem 21 /Pg (removed page) must be dropped"
     );
 
     // The /Pg drop leaves the removed page unreferenced, so the existing GC
@@ -110,11 +110,11 @@ fn dangling_pg_dropped_and_page_gced() {
     );
 
     // The StructElem pointing at a surviving page keeps its /Pg.
-    let elem = pdf.resolve_object(ObjectRef::new(22, 0)).expect("elem 22");
-    let elem = elem.as_dict().expect("elem 22 is a dict");
+    let elem: ObjectHandle = pdf.get_object_handle(ObjectRef::new(22, 0));
+    pdf.resolve(&elem).expect("elem 22");
+    assert!(elem.as_dictionary().is_some(), "elem 22 is a dict");
     assert!(
-        matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 3),
-        "StructElem 22 /Pg (surviving page 1) must be kept, got {:?}",
-        elem.get("Pg")
+        elem.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(3, 0)),
+        "StructElem 22 /Pg (surviving page 1) must be kept"
     );
 }
