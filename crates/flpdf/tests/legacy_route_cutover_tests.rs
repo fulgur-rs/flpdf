@@ -991,3 +991,64 @@ fn outline_remap_updates_an_existing_direct_destination_handle() {
         "qpdf-style mutation must update the existing direct destination handle"
     );
 }
+
+#[test]
+fn structure_tree_page_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/struct_tree_pg.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("struct_tree_pg has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_ref_chain",
+        "terminal_ref_of_chain",
+        "resolve_to_terminal",
+        "Object::",
+        "set_object(",
+        "materialize(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "structure tree production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "pdf.resolve(", "replace_key(", "remove_key("] {
+        assert!(
+            production.contains(canonical),
+            "structure tree production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
+fn objr_annotation_page_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/objr_obj_annot_p.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("objr_obj_annot_p has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_ref_chain",
+        "resolve_to_terminal",
+        "Object::",
+        "set_object(",
+        "materialize(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "OBJR annotation production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "pdf.resolve(", "replace_key(", "remove_key("] {
+        assert!(
+            production.contains(canonical),
+            "OBJR annotation production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
