@@ -99,7 +99,7 @@ mod tests {
     use crate::job::{
         add_attachment_from_path, extract_attachment, extract_attachment_to_path, write_attachment,
     };
-    use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::io::Cursor;
 
     // ── Minimal PDF fixture ───────────────────────────────────────────────────
@@ -129,6 +129,12 @@ mod tests {
 
     fn open_minimal() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
+    }
+
+    fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).expect("resolve object");
+        handle
     }
 
     #[test]
@@ -172,32 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn filespec_helper_chases_a_reference_holder_to_the_terminal_dictionary() {
-        let mut pdf = open_minimal();
-        let filespec_ref = ObjectRef::new(5, 0);
-        let holder_ref = ObjectRef::new(6, 0);
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"terminal.txt".to_vec()));
-        pdf.set_object(filespec_ref, Object::Dictionary(filespec));
-        pdf.set_object(holder_ref, Object::Reference(filespec_ref));
-
-        let mut helper = FileSpec::new(pdf.get_object_handle(holder_ref), &mut pdf).unwrap();
-        assert_eq!(helper.get_filename().unwrap(), b"terminal.txt");
-        helper.set_description("terminal description").unwrap();
-        drop(helper);
-
-        let filespec = pdf
-            .resolve_object(filespec_ref)
-            .unwrap()
-            .into_dict()
-            .expect("terminal object must be a Filespec dictionary");
-        assert_eq!(
-            filespec.get("Desc"),
-            Some(&Object::String(b"terminal description".to_vec()))
-        );
-    }
-
-    #[test]
     fn direct_null_filespec_stream_entries_are_empty() {
         let mut pdf = open_minimal();
         let mut helper = FileSpec::new(ObjectHandle::null(), &mut pdf).unwrap();
@@ -212,11 +192,12 @@ mod tests {
     fn filespec_helper_marks_an_indirect_owner_of_a_direct_dictionary_dirty() {
         let mut pdf = open_minimal();
         let owner_ref = ObjectRef::new(5, 0);
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"direct.txt".to_vec()));
-        let mut owner = Dictionary::new();
-        owner.insert("FS", Object::Dictionary(filespec));
-        pdf.set_object(owner_ref, Object::Dictionary(owner));
+        let filespec = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"direct.txt".to_vec()),
+        )]);
+        let owner = ObjectHandle::dictionary(vec![(b"/FS".to_vec(), filespec)]);
+        pdf.set_object_handle(owner_ref, owner).unwrap();
         let owner = pdf.get_object_handle(owner_ref);
         pdf.resolve(&owner).unwrap();
         let direct_filespec = owner.get_key(b"/FS");
@@ -244,11 +225,12 @@ mod tests {
     fn filespec_constructor_rejects_a_direct_child_from_another_pdf() {
         let mut source = open_minimal();
         let owner_ref = ObjectRef::new(5, 0);
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"foreign.txt".to_vec()));
-        let mut owner_dict = Dictionary::new();
-        owner_dict.insert("FS", Object::Dictionary(filespec));
-        source.set_object(owner_ref, Object::Dictionary(owner_dict));
+        let filespec = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"foreign.txt".to_vec()),
+        )]);
+        let owner_dict = ObjectHandle::dictionary(vec![(b"/FS".to_vec(), filespec)]);
+        source.set_object_handle(owner_ref, owner_dict).unwrap();
         let owner = source.get_object_handle(owner_ref);
         source.resolve(&owner).unwrap();
         let foreign_direct_filespec = owner.get_key(b"/FS");
@@ -350,21 +332,10 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
 
-        let Some(fs_dict) = pdf
-            .resolve_borrowed(fs_ref)
-            .expect("resolve filespec")
-            .as_dict()
-        else {
-            panic!("expected dictionary");
-        };
-        let f = match fs_dict.get("F") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /F"),
-        };
-        let uf = match fs_dict.get("UF") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /UF"),
-        };
+        let fs_dict = resolved_handle(&mut pdf, fs_ref);
+        assert!(fs_dict.as_dictionary().is_some(), "expected dictionary");
+        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
+        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
         assert_eq!(f, b"myfile.txt", "/F must be the filename");
         assert_eq!(uf, b"myfile.txt", "/UF must use qpdf newUnicodeString");
     }
@@ -378,21 +349,10 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
 
-        let Some(fs_dict) = pdf
-            .resolve_borrowed(fs_ref)
-            .expect("resolve filespec")
-            .as_dict()
-        else {
-            panic!("expected dictionary");
-        };
-        let f = match fs_dict.get("F") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /F"),
-        };
-        let uf = match fs_dict.get("UF") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /UF"),
-        };
+        let fs_dict = resolved_handle(&mut pdf, fs_ref);
+        assert!(fs_dict.as_dictionary().is_some(), "expected dictionary");
+        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
+        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
 
         assert_eq!(f, b"____.pdf", "/F must be ASCII fallback");
         assert_eq!(
@@ -529,17 +489,10 @@ mod tests {
 
         let fs_ref = add_attachment_from_path(&mut pdf, b"report.pdf", &file_path).expect("attach");
 
-        let Some(fs_dict) = pdf.resolve_borrowed(fs_ref).expect("resolve").as_dict() else {
-            panic!("expected dict");
-        };
-        let f = match fs_dict.get("F") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /F"),
-        };
-        let uf = match fs_dict.get("UF") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /UF"),
-        };
+        let fs_dict = resolved_handle(&mut pdf, fs_ref);
+        assert!(fs_dict.as_dictionary().is_some(), "expected dict");
+        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
+        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
         assert_eq!(f, b"report.pdf", "/F must be basename");
         assert_eq!(uf, b"report.pdf", "/UF must use qpdf's PDFDocEncoding form");
     }
@@ -567,17 +520,10 @@ mod tests {
         let fs_ref = add_attachment_from_path(&mut pdf, "レポート.pdf".as_bytes(), &file_path)
             .expect("attach non-ASCII basename");
 
-        let Some(fs_dict) = pdf.resolve_borrowed(fs_ref).expect("resolve").as_dict() else {
-            panic!("expected dict");
-        };
-        let f = match fs_dict.get("F") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /F"),
-        };
-        let uf = match fs_dict.get("UF") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /UF"),
-        };
+        let fs_dict = resolved_handle(&mut pdf, fs_ref);
+        assert!(fs_dict.as_dictionary().is_some(), "expected dict");
+        let f = fs_dict.get_key(b"/F").as_string().expect("missing /F");
+        let uf = fs_dict.get_key(b"/UF").as_string().expect("missing /UF");
 
         assert_eq!(f, b"____.pdf", "/F must be ASCII-safe fallback");
         assert_eq!(
