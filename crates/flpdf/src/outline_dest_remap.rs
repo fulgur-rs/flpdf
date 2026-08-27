@@ -265,7 +265,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
 /// A duplicate-page selection (e.g. `--pages . 1,1`) produces several surviving
 /// pages that share the same indirect annotation object, so the same annotation
 /// reference can appear under more than one page. A `visited` set (bounded-
-/// traversal guard, as in [`remap_outline_tree`] / [`remap_name_tree`]) processes
+/// traversal guard, as in [`remap_outline_tree`] / `remap_name_tree_handle`) processes
 /// each shared annot reference — and each shared *indirect* `/Annots` array
 /// object — exactly once, so a shared destination is not re-remapped on a later
 /// pass (avoiding redundant rewrites). Correctness does not rest on the dedup
