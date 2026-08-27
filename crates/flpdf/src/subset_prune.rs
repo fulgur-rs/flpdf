@@ -285,7 +285,7 @@ mod tests {
     use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     // ── Inline-depth guard ───────────────────────────────────────────────────
 
@@ -319,6 +319,50 @@ mod tests {
         }
         walk_refs(&o, 0, &mut queue).unwrap();
         assert_eq!(queue, vec![ObjectRef::new(9, 0)]);
+    }
+
+    struct FailAtOffset {
+        inner: Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl Read for FailAtOffset {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() == self.fail_at {
+                return Err(std::io::Error::other("injected reachability read failure"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailAtOffset {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn collect_reachable_keeps_a_seed_when_resolution_fails() {
+        // Let the catalog resolve and then fail while resolving a child object.
+        // The reachability pass must conservatively keep both visited refs and
+        // continue without turning the I/O error into a GC failure.
+        let bytes =
+            build_pdf_from_bodies(&[b"<< /Type /Catalog >>".to_vec(), b"<< /Value 1 >>".to_vec()]);
+        let child_offset = bytes
+            .windows(b"2 0 obj\n".len())
+            .position(|window| window == b"2 0 obj\n")
+            .expect("child object offset") as u64;
+        let mut pdf = Pdf::open(FailAtOffset {
+            inner: Cursor::new(bytes),
+            fail_at: child_offset,
+        })
+        .expect("xref parsing should succeed before lazy child resolution");
+
+        let reachable =
+            collect_reachable(&mut pdf, ObjectRef::new(1, 0), vec![ObjectRef::new(2, 0)])
+                .expect("resolution errors are swallowed by the conservative GC walk");
+        assert!(reachable.contains(&ObjectRef::new(1, 0)));
+        assert!(reachable.contains(&ObjectRef::new(2, 0)));
     }
 
     // ── Fixture builders ─────────────────────────────────────────────────────
