@@ -10846,11 +10846,9 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
-            .expect("repair the bad framing length");
+        pdf.resolve(&handle).expect("repair the bad framing length");
 
         let diagnostics: Vec<_> = pdf
             .repair_diagnostics()
@@ -10892,11 +10890,9 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
-            .expect("repair the bad framing length");
+        pdf.resolve(&handle).expect("repair the bad framing length");
 
         let diagnostics: Vec<_> = pdf
             .repair_diagnostics()
