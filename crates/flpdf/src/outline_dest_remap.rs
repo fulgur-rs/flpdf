@@ -432,22 +432,6 @@ fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) 
     Ok(())
 }
 
-/// Remap a `/Names`-leaf name tree (or descend its `/Kids`) in place, keeping
-/// every entry. A surviving-page dest is remapped; a removed-page dest is left
-/// verbatim (its target page object was already nulled by [`null_removed_pages`]).
-/// `/Limits` is never recomputed.
-fn remap_name_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
-    surviving: &Surviving,
-    depth: usize,
-    max_depth: usize,
-    visited: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let node = pdf.get_object_handle(node_ref);
-    remap_name_tree_handle(pdf, &node, surviving, depth, max_depth, visited)
-}
-
 /// Remap a name-tree node represented by its live handle. Direct roots and
 /// indirect child nodes use the same accessor/mutation path.
 fn remap_name_tree_handle<R: Read + Seek>(
@@ -2326,68 +2310,6 @@ mod tests {
             0,
             3,
             &surviving,
-            &mut visited,
-        )
-        .expect_err("depth limit must be enforced");
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn remap_name_tree_kids_cycle_terminates() {
-        // /Kids back-edge cycle: node 50 /Kids [51], node 51 /Kids [50]. The
-        // shared `visited` set stops at the revisited node instead of recursing
-        // forever.
-        let bytes = build_min_pdf(
-            &[
-                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-                (50, "<< /Kids [51 0 R] >>"),
-                (51, "<< /Kids [50 0 R] >>"),
-            ],
-            "",
-        );
-        let mut pdf = open(bytes);
-        let surviving = Surviving::default();
-        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-        remap_name_tree(
-            &mut pdf,
-            ObjectRef::new(50, 0),
-            &surviving,
-            0,
-            100,
-            &mut visited,
-        )
-        .expect("cyclic /Kids chain must terminate gracefully");
-        assert!(visited.contains(&ObjectRef::new(50, 0)));
-        assert!(visited.contains(&ObjectRef::new(51, 0)));
-    }
-
-    #[test]
-    fn remap_name_tree_deep_kids_chain_hits_depth_limit() {
-        // A /Kids chain deeper than max_depth must error. Depths entered:
-        // 50@0, 51@1, 52@2, 53@3 -> limit (3) fires before node 53 is read.
-        let bytes = build_min_pdf(
-            &[
-                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-                (50, "<< /Kids [51 0 R] >>"),
-                (51, "<< /Kids [52 0 R] >>"),
-                (52, "<< /Kids [53 0 R] >>"),
-                (53, "<< /Names [(z) [3 0 R /Fit]] >>"),
-            ],
-            "",
-        );
-        let mut pdf = open(bytes);
-        let surviving = Surviving::default();
-        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-        let err = remap_name_tree(
-            &mut pdf,
-            ObjectRef::new(50, 0),
-            &surviving,
-            0,
-            3,
             &mut visited,
         )
         .expect_err("depth limit must be enforced");
