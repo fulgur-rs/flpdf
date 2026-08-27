@@ -39,15 +39,14 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // resolved ("a no-op unless both `self` and `other` are dictionaries",
     // checked via `as_dictionary`, which "never performs resolution
     // itself") -- unlike qpdf's `mergeResources`, whose `isDictionary()`/
-    // `getKey()` calls dereference implicitly. Resolving into separate
-    // handles here does not change *which* object gets mutated:
-    // `resolve_to_terminal_ref` returns the pdf's own
-    // canonical, shared handle for an indirect value, so mutating it
-    // through `d1`/`d2` mutates the exact same object `d1_handle`/
-    // `d2_handle` still refer to (and, for a *direct* `/Dict1`/`/Dict2`,
-    // the "resolved" handle is a plain clone of the same shared state).
-    let (d1, _) = pdf.resolve_to_terminal_ref(&d1_handle)?;
-    let (d2, _) = pdf.resolve_to_terminal_ref(&d2_handle)?;
+    // `getKey()` calls dereference implicitly. Resolve each handle once,
+    // then mutate the same canonical handles that came from the trailer;
+    // qpdf's merge operation never replaces an indirect identity with a
+    // copied terminal value.
+    pdf.resolve(&d1_handle)?;
+    pdf.resolve(&d2_handle)?;
+    let d1 = d1_handle.clone();
+    let d2 = d2_handle.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     d1.merge_resources(&d2, None)?;
@@ -76,7 +75,8 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // resolved type, matching `merge_resources`'s own no-op contract for a
     // non-dictionary `other`.
     let d2_k1_handle = d2.get_key(b"/k1");
-    let (d2_k1, _) = pdf.resolve_to_terminal_ref(&d2_k1_handle)?;
+    pdf.resolve(&d2_k1_handle)?;
+    let d2_k1 = d2_k1_handle.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     d1.merge_resources(&d2_k1, None)?;
     pdf.mark_object_handle_dirty(&d1)?;
@@ -92,7 +92,7 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     Ok(())
 }
 
-/// Resolve one array item that qpdf would traverse via `getArrayItem`,
+/// Resolve one handle hop that qpdf would traverse via `getArrayItem`,
 /// draining any repair diagnostics the resolution itself surfaces before
 /// the caller reads the resolved value -- matching `test_0_1.rs`'s own
 /// resolve-then-drain pattern.
@@ -104,9 +104,9 @@ fn resolve_and_drain<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<(ObjectHandle, Option<flpdf::ObjectRef>)> {
-    let resolved = pdf.resolve_to_terminal_ref(handle)?;
+    pdf.resolve(handle)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    Ok(resolved)
+    Ok((handle.clone(), handle.object_ref()))
 }
 
 /// test_driver.cc:1955-1997 (`test_51`). Radio button and checkbox field
