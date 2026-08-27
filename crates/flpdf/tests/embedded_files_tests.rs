@@ -1195,26 +1195,26 @@ fn delete_last_entry_through_two_hop_names() {
     );
 }
 
-// ── Site 1: remove_attachment retains a 2-hop /AF array ──────────────────────
+// ── Site 1: remove_attachment retains an indirect /AF array ──────────────────
 //
 // qpdf follows the name-tree removal with Filespec null replacement only; it
-// does not rewrite the /AF carrier or its array elements.
+// does not rewrite the indirect /AF array or its elements.
 
 /// Object layout:
-///   1 0 R  Catalog  (/Names 2 0 R, /AF 6 0 R)
+///   1 0 R  Catalog  (/Names 2 0 R, /AF 7 0 R)
 ///   2 0 R  /Names dict  (/EmbeddedFiles 3 0 R)   [1-hop so collect finds it]
 ///   3 0 R  leaf node  (/Names [(gone) 4 0 R])
 ///   4 0 R  Filespec for "gone" (the attachment to remove)
 ///   5 0 R  Filespec kept as an unrelated /AF entry
-///   6 0 R  bare reference 7 0 R                   (first /AF hop)
-///   7 0 R  array [4 0 R 5 0 R]                    (terminal /AF array)
-fn build_two_hop_af_pdf() -> Vec<u8> {
+///   6 0 R  unrelated null object (xref filler)
+///   7 0 R  array [4 0 R 5 0 R]                    (indirect /AF array)
+fn build_indirect_af_pdf() -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
     let mut off: BTreeMap<u32, u64> = BTreeMap::new();
 
     off.insert(1, out.len() as u64);
     out.extend_from_slice(
-        b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R /AF 6 0 R >>\nendobj\n",
+        b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R /AF 7 0 R >>\nendobj\n",
     );
 
     off.insert(2, out.len() as u64);
@@ -1230,7 +1230,7 @@ fn build_two_hop_af_pdf() -> Vec<u8> {
     out.extend_from_slice(b"5 0 obj\n<< /Type /Filespec /F (kept.txt) >>\nendobj\n");
 
     off.insert(6, out.len() as u64);
-    out.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+    out.extend_from_slice(b"6 0 obj\nnull\nendobj\n");
 
     off.insert(7, out.len() as u64);
     out.extend_from_slice(b"7 0 obj\n[ 4 0 R 5 0 R ]\nendobj\n");
@@ -1240,14 +1240,10 @@ fn build_two_hop_af_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn remove_attachment_preserves_two_hop_af_array_and_nulls_filespec() {
+fn remove_attachment_preserves_indirect_af_array_and_nulls_filespec() {
     use flpdf::{remove_attachment, Object};
 
-    let mut pdf = open(build_two_hop_af_pdf());
-    pdf.set_object(
-        ObjectRef::new(6, 0),
-        Object::Reference(ObjectRef::new(7, 0)),
-    );
+    let mut pdf = open(build_indirect_af_pdf());
 
     let removed = remove_attachment(&mut pdf, b"gone").expect("remove");
     assert!(removed, "existing attachment must report removed");
@@ -1256,7 +1252,7 @@ fn remove_attachment_preserves_two_hop_af_array_and_nulls_filespec() {
     // the removed Filespec object is replaced with null.
     let Object::Array(af) = pdf
         .resolve_object(ObjectRef::new(7, 0))
-        .expect("terminal /AF array must still resolve (carrier not orphaned)")
+        .expect("indirect /AF array must still resolve")
     else {
         panic!("object 7 must be the terminal /AF array");
     };

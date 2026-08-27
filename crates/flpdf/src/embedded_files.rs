@@ -1867,17 +1867,14 @@ mod tests {
         );
     }
 
-    // ── Test: empty removal preserves a 2-hop /Names holder chain (flpdf-3x23)
+    // ── Test: empty removal preserves an indirect /Names dict ────────────────
     //
     // When the last /EmbeddedFiles entry is removed and the /Names dict still
     // carries a surviving sibling (here /Dests), the empty-rebuild path rewrites
-    // the terminal names dict in place. If /Names is reached through two hops
-    // (catalog → carrier → terminal), the catalog must be re-pointed straight at
-    // the terminal — otherwise it keeps pointing at the carrier, leaving the
-    // mutated dict unreachable and the chain un-normalized. This mirrors the
-    // non-empty rebuild path's collapse.
+    // the indirect names dict in place. The qpdf-shaped catalog reaches the
+    // terminal directly through its indirect /Names child.
     #[test]
-    fn empty_remove_preserves_two_hop_names_with_surviving_sibling() {
+    fn empty_remove_preserves_indirect_names_with_surviving_sibling() {
         let mut pdf = open_minimal();
 
         // Register an attachment so /Names /EmbeddedFiles holds a real entry.
@@ -1904,15 +1901,10 @@ mod tests {
         let mut dests = Dictionary::new();
         dests.insert("X", Object::Reference(fs_ref));
         terminal.insert("Dests", Object::Dictionary(dests));
-        let next = next_object_number(&mut pdf);
-        let terminal_ref = ObjectRef::new(next + 1, 0);
+        let terminal_ref = ObjectRef::new(next_object_number(&mut pdf) + 1, 0);
         pdf.set_object(terminal_ref, Object::Dictionary(terminal));
 
-        // Insert a bare-reference carrier so the catalog reaches /Names through
-        // two hops: catalog → carrier → terminal.
-        let carrier_ref = ObjectRef::new(next + 2, 0);
-        pdf.set_object(carrier_ref, Object::Reference(terminal_ref));
-        catalog.insert("Names", Object::Reference(carrier_ref));
+        catalog.insert("Names", Object::Reference(terminal_ref));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         // Remove the last (only) embedded file → empty rebuild with a surviving
@@ -1920,8 +1912,7 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"only.txt").expect("remove only");
         assert!(removed, "remove_attachment must return true");
 
-        // qpdf preserves the original holder chain while modifying the terminal
-        // names dictionary in place.
+        // qpdf modifies the indirect names dictionary in place.
         let catalog_after = pdf
             .resolve_object(catalog_ref)
             .expect("resolve catalog after")
@@ -1931,7 +1922,7 @@ mod tests {
             .get("Names")
             .and_then(Object::as_ref_id)
             .expect("catalog /Names must still be indirect");
-        assert_eq!(names_after, carrier_ref);
+        assert_eq!(names_after, terminal_ref);
 
         // The terminal retains its sibling and an empty EmbeddedFiles tree.
         let resolved = pdf
