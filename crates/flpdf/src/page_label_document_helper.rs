@@ -7,8 +7,6 @@
 //! display APIs.
 
 use crate::nntree::DEFAULT_MAX_TREE_DEPTH;
-#[cfg(test)]
-use crate::{Dictionary, Object};
 use crate::{Error, ObjectHandle, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -67,38 +65,6 @@ pub struct LabelRange {
 }
 
 impl LabelRange {
-    /// Parse a label dictionary (`/S`, `/P`, `/St`). Unrecognised/absent `/S`
-    /// → [`LabelStyle::None`]; absent `/St` → 1; `/P` decoded via
-    /// `crate::json_inspect::decode_pdf_text_string` with lossy fallback.
-    ///
-    /// This does **not** resolve indirect `/S`/`/P`/`/St` values (it has no
-    /// `Pdf` handle): an indirect inner value falls through to its default.
-    /// Callers reading a live document should go through
-    /// [`PageLabelDocumentHelper::ranges`], which reads the canonical
-    /// `ObjectHandle` graph; this plain form is for the
-    /// non-resolving JSON-inspection path.
-    #[cfg(test)]
-    pub fn from_dict(dict: &Dictionary) -> Self {
-        let style = match dict.get("S") {
-            Some(Object::Name(bytes)) => LabelStyle::from_name(bytes),
-            _ => LabelStyle::None,
-        };
-        let prefix = match dict.get("P") {
-            Some(Object::String(bytes)) => crate::json_inspect::decode_pdf_text_string(bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
-            _ => String::new(),
-        };
-        let start = match dict.get("St") {
-            Some(Object::Integer(n)) => *n,
-            _ => 1,
-        };
-        LabelRange {
-            style,
-            prefix,
-            start,
-        }
-    }
-
     /// Decode a live qpdf-shaped label dictionary without materializing it as
     /// a legacy [`crate::Object`]. Unknown `/S` names remain unknown to the raw
     /// handle, while this typed compatibility view retains the historical
@@ -130,49 +96,6 @@ impl LabelRange {
             prefix,
             start,
         }))
-    }
-
-    /// Build a label dictionary mirroring qpdf `pageLabelDict`: `/S` name when
-    /// the style is not [`LabelStyle::None`]; `/P` only when non-empty; `/St`
-    /// only when `!= 1`.
-    ///
-    /// Prefixes use qpdf's `newUnicodeString` encoding: PDFDocEncoding when
-    /// lossless, otherwise a PDF UTF-16BE text string. Emitting the Rust
-    /// `String`'s raw UTF-8 bytes verbatim would be misread by
-    /// PDFDocEncoding-only readers — a source `§` (`c2 a7`) would come back as
-    /// `Â§`.
-    #[cfg(test)]
-    pub fn to_dict(&self) -> Dictionary {
-        let mut d = Dictionary::new();
-        if let Some(name) = self.style.to_name() {
-            d.insert("S", Object::Name(name.into()));
-        }
-        if !self.prefix.is_empty() {
-            let bytes = crate::pdf_string::new_unicode_string(self.prefix.as_bytes());
-            d.insert("P", Object::String(bytes));
-        }
-        if self.start != 1 {
-            d.insert("St", Object::Integer(self.start));
-        }
-        d
-    }
-
-    /// Build a label dictionary in the shape qpdf's
-    /// `QPDFPageLabelDocumentHelper::getLabelForPage` reconstruction produces:
-    /// `/S` and `/P` are included on the same terms as [`Self::to_dict`], but
-    /// `/St` is **always** present — never omitted for the default value `1`.
-    ///
-    /// Use this (via
-    /// [`PageLabelDocumentHelper::write_reconstructed_labels`]) for entries
-    /// coming from [`PageLabelDocumentHelper::labels_for_page_range`] / a page-subset or -split
-    /// operation; use [`Self::to_dict`] for a directly authored range (qpdf's
-    /// `--set-page-labels` shape), where the default `/St 1` is omitted for
-    /// brevity.
-    #[cfg(test)]
-    pub(crate) fn to_reconstructed_dict(&self) -> Dictionary {
-        let mut d = self.to_dict();
-        d.insert("St", Object::Integer(self.start));
-        d
     }
 
     /// Render the display label for `value` (§12.4.2): `prefix` followed by the
@@ -849,7 +772,6 @@ impl<R: Read + Seek> Pdf<R> {
 mod tests {
     use super::*;
     use crate::json::Json;
-    use crate::ObjectRef;
     use std::io::Cursor;
 
     /// A minimal one-page PDF with no `/PageLabels` key at all (as opposed to
@@ -876,61 +798,58 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("open")
     }
 
-    fn pdf_with_pagelabels(nums: Vec<Object>) -> Pdf<Cursor<Vec<u8>>> {
-        // Minimal one-page PDF; then attach an inline /PageLabels leaf via set_object.
+    fn install_page_labels(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) {
+        let catalog_ref = pdf.root_ref().expect("one-page fixture has a catalog root");
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog
+            .replace_key(b"/PageLabels", value)
+            .expect("install catalog page labels");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
+    }
+
+    fn pdf_with_pagelabels(nums: Vec<ObjectHandle>) -> Pdf<Cursor<Vec<u8>>> {
+        // Minimal one-page PDF; then attach an indirect /PageLabels leaf via
+        // the canonical handle allocation and catalog mutation boundary.
         let mut pdf = bare_one_page_pdf();
-        // /PageLabels root leaf at obj 10, catalog points to it.
-        let pl_ref = ObjectRef::new(10, 0);
-        let mut leaf = Dictionary::new();
-        leaf.insert("Nums", Object::Array(nums));
-        pdf.set_object(pl_ref, Object::Dictionary(leaf));
-        let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        catalog.insert("PageLabels", Object::Reference(pl_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let leaf = ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
+        let leaf = pdf
+            .make_indirect_from_object_handle(leaf)
+            .expect("promote page-label leaf");
+        install_page_labels(&mut pdf, leaf);
         pdf
     }
 
-    fn pdf_with_catalog_pagelabels(value: Object) -> Pdf<Cursor<Vec<u8>>> {
+    fn pdf_with_catalog_pagelabels(value: ObjectHandle) -> Pdf<Cursor<Vec<u8>>> {
         let mut pdf = bare_one_page_pdf();
-        let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        catalog.insert("PageLabels", value);
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        install_page_labels(&mut pdf, value);
         pdf
     }
 
-    fn label_dict(style: &str, st: Option<i64>, prefix: Option<&str>) -> Object {
-        let mut d = Dictionary::new();
-        d.insert("S", Object::Name(style.into()));
+    fn label_dict(style: &str, st: Option<i64>, prefix: Option<&str>) -> ObjectHandle {
+        let mut entries = vec![(
+            b"/S".to_vec(),
+            ObjectHandle::name(style.as_bytes().to_vec()),
+        )];
         if let Some(s) = st {
-            d.insert("St", Object::Integer(s));
+            entries.push((b"/St".to_vec(), ObjectHandle::integer(s)));
         }
         if let Some(p) = prefix {
-            d.insert("P", Object::String(p.as_bytes().to_vec()));
+            entries.push((b"/P".to_vec(), ObjectHandle::string(p.as_bytes().to_vec())));
         }
-        Object::Dictionary(d)
+        ObjectHandle::dictionary(entries)
     }
 
     #[test]
     fn label_string_multi_range_matches_spec() {
         // /Nums [0 <</S /r>> 3 <</S /D /St 1>> 6 <</S /D /P "A-" /St 1>>]
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("r", None, None),
-            Object::Integer(3),
+            ObjectHandle::integer(3),
             label_dict("D", Some(1), None),
-            Object::Integer(6),
+            ObjectHandle::integer(6),
             label_dict("D", Some(1), Some("A-")),
         ]);
         let mut h = pdf.page_labels();
@@ -946,7 +865,10 @@ mod tests {
 
     #[test]
     fn ranges_does_not_dirty_a_valid_indirect_tree() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("D", Some(1), None),
+        ]);
         for object_ref in pdf.dirty_object_refs() {
             pdf.clear_dirty(object_ref);
         }
@@ -959,8 +881,10 @@ mod tests {
 
     #[test]
     fn label_for_page_offsets_start() {
-        let mut pdf =
-            pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(10), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("D", Some(10), None),
+        ]);
         let mut h = pdf.page_labels();
         let lab = h.label_for_page(2).unwrap().expect("range applies");
         assert_eq!(lab.start, 12, "/St 10 + offset 2");
@@ -969,19 +893,19 @@ mod tests {
 
     #[test]
     fn get_label_for_page_preserves_qpdf_raw_dictionary_keys() {
-        let mut unknown_with_empty_prefix = Dictionary::new();
-        unknown_with_empty_prefix.insert("S", Object::Name(b"Z".to_vec()));
-        unknown_with_empty_prefix.insert("P", Object::String(Vec::new()));
-        unknown_with_empty_prefix.insert("St", Object::Integer(3));
-
-        let mut decimal_without_prefix = Dictionary::new();
-        decimal_without_prefix.insert("S", Object::Name(b"D".to_vec()));
+        let unknown_with_empty_prefix = ObjectHandle::dictionary(vec![
+            (b"/S".to_vec(), ObjectHandle::name(b"Z".to_vec())),
+            (b"/P".to_vec(), ObjectHandle::string(Vec::new())),
+            (b"/St".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let decimal_without_prefix =
+            ObjectHandle::dictionary(vec![(b"/S".to_vec(), ObjectHandle::name(b"D".to_vec()))]);
 
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            Object::Dictionary(unknown_with_empty_prefix),
-            Object::Integer(2),
-            Object::Dictionary(decimal_without_prefix),
+            ObjectHandle::integer(0),
+            unknown_with_empty_prefix,
+            ObjectHandle::integer(2),
+            decimal_without_prefix,
         ]);
         let mut h = pdf.page_labels();
 
@@ -1017,16 +941,20 @@ mod tests {
 
     #[test]
     fn get_label_for_page_preserves_indirect_member_identity() {
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name(b"D".to_vec()));
-        label.insert("P", Object::String(b"prefix".to_vec()));
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            Object::Reference(ObjectRef::new(11, 0)),
-        ]);
-        pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(label));
+        let mut pdf = bare_one_page_pdf();
+        let label = pdf
+            .make_indirect_from_object_handle(label_dict("D", None, Some("prefix")))
+            .expect("promote label dictionary");
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(0), label.clone()]),
+        )]);
+        let leaf = pdf
+            .make_indirect_from_object_handle(leaf)
+            .expect("promote page-label leaf");
+        install_page_labels(&mut pdf, leaf);
 
-        let source = pdf.get_object_handle(ObjectRef::new(11, 0));
+        let source = label.clone();
         pdf.resolve(&source).unwrap();
         let source_style = source.try_get_key(b"/S").unwrap();
         let source_prefix = source.try_get_key(b"/P").unwrap();
@@ -1083,21 +1011,22 @@ mod tests {
 
     #[test]
     fn get_labels_for_page_range_accumulates_effective_raw_entries() {
-        let mut empty_prefix = Dictionary::new();
-        empty_prefix.insert("S", Object::Name(b"D".to_vec()));
-        empty_prefix.insert("P", Object::String(Vec::new()));
-
-        let mut decimal = Dictionary::new();
-        decimal.insert("S", Object::Name(b"D".to_vec()));
-        decimal.insert("St", Object::Integer(10));
+        let empty_prefix = ObjectHandle::dictionary(vec![
+            (b"/S".to_vec(), ObjectHandle::name(b"D".to_vec())),
+            (b"/P".to_vec(), ObjectHandle::string(Vec::new())),
+        ]);
+        let decimal = ObjectHandle::dictionary(vec![
+            (b"/S".to_vec(), ObjectHandle::name(b"D".to_vec())),
+            (b"/St".to_vec(), ObjectHandle::integer(10)),
+        ]);
 
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("r", None, None),
-            Object::Integer(2),
-            Object::Dictionary(empty_prefix),
-            Object::Integer(4),
-            Object::Dictionary(decimal),
+            ObjectHandle::integer(2),
+            empty_prefix,
+            ObjectHandle::integer(4),
+            decimal,
         ]);
         let mut h = pdf.page_labels();
         let mut labels = Vec::new();
@@ -1133,7 +1062,8 @@ mod tests {
 
     #[test]
     fn get_labels_for_page_range_skips_redundant_accumulated_leading_entry() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", None, None)]);
+        let mut pdf =
+            pdf_with_pagelabels(vec![ObjectHandle::integer(0), label_dict("D", None, None)]);
         let mut h = pdf.page_labels();
         let prior =
             PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(LabelStyle::Decimal, 1, "");
@@ -1174,10 +1104,10 @@ mod tests {
     #[test]
     fn get_labels_for_page_range_skips_non_dictionary_explicit_entries() {
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("D", None, None),
-            Object::Integer(1),
-            Object::Integer(99),
+            ObjectHandle::integer(1),
+            ObjectHandle::integer(99),
         ]);
         let mut h = pdf.page_labels();
         let mut labels = Vec::new();
@@ -1195,9 +1125,9 @@ mod tests {
     #[test]
     fn get_labels_for_page_range_rejects_output_index_overflow() {
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("D", Some(1), None),
-            Object::Integer(1),
+            ObjectHandle::integer(1),
             label_dict("R", Some(1), None),
         ]);
         let error = pdf
@@ -1210,7 +1140,7 @@ mod tests {
     #[test]
     fn labels_for_selection_reconstructs_effective_and_default_ranges() {
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(5),
+            ObjectHandle::integer(5),
             label_dict("R", Some(2), Some("P-")),
         ]);
         let mut h = pdf.page_labels();
@@ -1245,9 +1175,9 @@ mod tests {
     #[test]
     fn labels_for_selection_with_prefix_presence_preserves_raw_prefix_presence() {
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("D", Some(1), Some("")),
-            Object::Integer(1),
+            ObjectHandle::integer(1),
             label_dict("D", Some(1), None),
         ]);
         let labels = pdf
@@ -1289,7 +1219,8 @@ mod tests {
 
     #[test]
     fn labels_for_selection_rejects_output_index_overflow() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", None, None)]);
+        let mut pdf =
+            pdf_with_pagelabels(vec![ObjectHandle::integer(0), label_dict("D", None, None)]);
         let error = pdf
             .page_labels()
             .labels_for_selection(&[0, 1], i64::MAX)
@@ -1310,7 +1241,7 @@ mod tests {
     #[test]
     fn get_label_for_page_rejects_checked_start_overflow() {
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("D", Some(i64::MAX), None),
         ]);
         let error = pdf
@@ -1322,7 +1253,7 @@ mod tests {
 
     #[test]
     fn get_label_for_page_reports_qpdf_short_number_tree_error() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0)]);
+        let mut pdf = pdf_with_pagelabels(vec![ObjectHandle::integer(0)]);
         let error = pdf
             .page_labels()
             .get_label_for_page(0)
@@ -1339,7 +1270,8 @@ mod tests {
 
     #[test]
     fn get_label_for_page_ignores_non_dictionary_values() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), Object::Integer(99)]);
+        let mut pdf =
+            pdf_with_pagelabels(vec![ObjectHandle::integer(0), ObjectHandle::integer(99)]);
         assert!(pdf.page_labels().get_label_for_page(0).unwrap().is_none());
     }
 
@@ -1354,7 +1286,7 @@ mod tests {
 
     #[test]
     fn direct_null_page_labels_key_is_absent() {
-        let mut pdf = pdf_with_catalog_pagelabels(Object::Null);
+        let mut pdf = pdf_with_catalog_pagelabels(ObjectHandle::null());
         let mut helper = pdf.page_labels();
 
         assert!(!helper.has_page_labels().unwrap());
@@ -1365,9 +1297,11 @@ mod tests {
 
     #[test]
     fn indirect_null_page_labels_key_is_absent() {
-        let null_ref = ObjectRef::new(10, 0);
-        let mut pdf = pdf_with_catalog_pagelabels(Object::Reference(null_ref));
-        pdf.set_object(null_ref, Object::Null);
+        let mut pdf = bare_one_page_pdf();
+        let null_handle = pdf
+            .make_indirect_from_object_handle(ObjectHandle::null())
+            .expect("promote null page-label value");
+        install_page_labels(&mut pdf, null_handle);
         let mut helper = pdf.page_labels();
 
         assert!(!helper.has_page_labels().unwrap());
@@ -1378,7 +1312,10 @@ mod tests {
 
     #[test]
     fn page_before_first_range_defaults_to_decimal() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(3), label_dict("R", Some(1), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(3),
+            label_dict("R", Some(1), None),
+        ]);
         let mut h = pdf.page_labels();
         assert_eq!(
             h.label_string_for_page(0).unwrap(),
@@ -1392,9 +1329,9 @@ mod tests {
     fn labels_for_page_range_renumbers_and_copies_explicit() {
         // ranges at 0 (roman) and 5 (decimal). Extract pages 3..=6 to new_start 0.
         let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
+            ObjectHandle::integer(0),
             label_dict("r", Some(1), None),
-            Object::Integer(5),
+            ObjectHandle::integer(5),
             label_dict("D", Some(1), None),
         ]);
         let mut h = pdf.page_labels();
@@ -1472,45 +1409,22 @@ mod tests {
     }
 
     #[test]
-    fn label_range_dict_round_trip() {
-        let r = LabelRange {
-            style: LabelStyle::RomanUpper,
-            prefix: "App-".into(),
-            start: 5,
-        };
-        let dict = r.to_dict();
-        assert_eq!(dict.get("S"), Some(&Object::Name("R".into())));
-        assert_eq!(dict.get("St"), Some(&Object::Integer(5)));
-        assert_eq!(LabelRange::from_dict(&dict), r);
-        // Defaults omitted: St=1 and empty prefix and None style produce empty dict.
-        let bare = LabelRange {
-            style: LabelStyle::None,
-            prefix: String::new(),
-            start: 1,
-        };
-        assert!(
-            bare.to_dict().iter().next().is_none(),
-            "all-default range => empty dict"
-        );
-    }
-
-    #[test]
     fn ranges_resolves_indirect_inner_st() {
-        let mut pdf = pdf_with_pagelabels(vec![]); // empty root; we set a custom tree below
-                                                   // Put an indirect /St value: label dict {/S /D /St 11 0 R}, 11 0 obj = Integer(7).
-        let st_ref = ObjectRef::new(11, 0);
-        pdf.set_object(st_ref, Object::Integer(7));
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name("D".into()));
-        label.insert("St", Object::Reference(st_ref));
-        let pl_ref = ObjectRef::new(10, 0);
-        let mut leaf = Dictionary::new();
-        leaf.insert(
-            "Nums",
-            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
-        );
-        pdf.set_object(pl_ref, Object::Dictionary(leaf));
-        // catalog already points /PageLabels -> 10 0 R from pdf_with_pagelabels.
+        // Put an indirect /St value in a live label dictionary.
+        let mut pdf = bare_one_page_pdf();
+        let st = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .expect("promote /St value");
+        let label = label_dict("D", None, None);
+        label.replace_key(b"/St", st).unwrap();
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(0), label]),
+        )]);
+        let leaf = pdf
+            .make_indirect_from_object_handle(leaf)
+            .expect("promote page-label leaf");
+        install_page_labels(&mut pdf, leaf);
         let mut h = pdf.page_labels();
         let ranges = h.ranges().unwrap();
         assert_eq!(ranges.len(), 1);
@@ -1551,66 +1465,25 @@ mod tests {
     }
 
     #[test]
-    fn from_dict_non_name_style_is_none() {
-        let mut d = Dictionary::new();
-        d.insert("S", Object::Integer(0)); // /S not a Name -> LabelStyle::None
-        assert_eq!(LabelRange::from_dict(&d).style, LabelStyle::None);
-    }
-
-    /// PDFDocEncoding-representable prefixes use qpdf's compact encoding while
-    /// remaining lossless through a to_dict → from_dict round trip.
-    #[test]
-    fn to_dict_pdfdoc_prefix_uses_the_compact_qpdf_encoding() {
-        let r = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: "§".into(),
-            start: 1,
-        };
-        let d = r.to_dict();
-        let re_read = LabelRange::from_dict(&d);
-        assert_eq!(re_read.prefix, r.prefix, "round-trip must preserve prefix");
-        let Object::String(bytes) = d.get("P").expect("/P present") else {
-            panic!("/P must be a string"); // cov:ignore: test-shape guard, unreachable given to_dict emits Object::String
-        };
-        assert_eq!(bytes, &[0xa7]);
-    }
-
-    /// ASCII-only prefixes stay verbatim (avoiding a needless UTF-16BE
-    /// re-encoding when ASCII is safe under both PDFDocEncoding and UTF-8).
-    #[test]
-    fn to_dict_ascii_prefix_stays_verbatim() {
-        let r = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: "App-".into(),
-            start: 1,
-        };
-        let d = r.to_dict();
-        let Object::String(bytes) = d.get("P").expect("/P present") else {
-            panic!("/P must be a string"); // cov:ignore: test-shape guard, unreachable given to_dict emits Object::String
-        };
-        assert_eq!(bytes, b"App-", "pure ASCII must stay verbatim");
-    }
-
-    #[test]
     fn ranges_handles_indirect_and_non_dict_values() {
         // entry 0: indirect ref to a label dict; entry 5: a non-dict value (skipped).
-        let mut pdf = pdf_with_pagelabels(vec![]);
-        let lab_ref = ObjectRef::new(20, 0);
-        let mut lab = Dictionary::new();
-        lab.insert("S", Object::Name("D".into()));
-        pdf.set_object(lab_ref, Object::Dictionary(lab));
-        let pl_ref = ObjectRef::new(10, 0);
-        let mut leaf = Dictionary::new();
-        leaf.insert(
-            "Nums",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Reference(lab_ref), // indirect entry value -> resolve
-                Object::Integer(5),
-                Object::Integer(99), // non-dict entry value -> skipped
+        let mut pdf = bare_one_page_pdf();
+        let lab = pdf
+            .make_indirect_from_object_handle(label_dict("D", None, None))
+            .expect("promote indirect label dictionary");
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                lab, // indirect entry value -> resolve
+                ObjectHandle::integer(5),
+                ObjectHandle::integer(99), // non-dict entry value -> skipped
             ]),
-        );
-        pdf.set_object(pl_ref, Object::Dictionary(leaf));
+        )]);
+        let leaf = pdf
+            .make_indirect_from_object_handle(leaf)
+            .expect("promote page-label leaf");
+        install_page_labels(&mut pdf, leaf);
         let mut h = pdf.page_labels();
         let ranges = h.ranges().unwrap();
         assert_eq!(ranges.len(), 1, "non-dict value skipped");
@@ -1622,16 +1495,18 @@ mod tests {
     fn ranges_non_name_style_resolves_to_none() {
         // A label dict whose /S is not a Name maps to LabelStyle::None via
         // the canonical handle-to-typed compatibility view.
-        let mut pdf = pdf_with_pagelabels(vec![]);
-        let pl_ref = ObjectRef::new(10, 0);
-        let mut lab = Dictionary::new();
-        lab.insert("S", Object::Integer(0)); // non-Name /S
-        let mut leaf = Dictionary::new();
-        leaf.insert(
-            "Nums",
-            Object::Array(vec![Object::Integer(0), Object::Dictionary(lab)]),
-        );
-        pdf.set_object(pl_ref, Object::Dictionary(leaf));
+        let mut pdf = bare_one_page_pdf();
+        let lab = ObjectHandle::dictionary(vec![
+            (b"/S".to_vec(), ObjectHandle::integer(0)), // non-Name /S
+        ]);
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(0), lab]),
+        )]);
+        let leaf = pdf
+            .make_indirect_from_object_handle(leaf)
+            .expect("promote page-label leaf");
+        install_page_labels(&mut pdf, leaf);
         let mut h = pdf.page_labels();
         let ranges = h.ranges().unwrap();
         assert_eq!(ranges.len(), 1);
@@ -1641,7 +1516,10 @@ mod tests {
     #[test]
     fn labels_for_page_range_fabricates_default_when_first_unlabeled() {
         // Only an explicit range at index 5; extract starting before it (idx 0).
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("D", Some(1), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(5),
+            label_dict("D", Some(1), None),
+        ]);
         let mut h = pdf.page_labels();
         let out = h.labels_for_page_range(0, 6, 0).unwrap();
         // First entry fabricated: no /S (LabelStyle::None), start = new_start(0) + 1 = 1.
@@ -1660,7 +1538,10 @@ mod tests {
         // --split-pages=1 or a chunk's last page) must not panic: the
         // internal `explicit.range((start_idx+1)..=end_idx)` bound would
         // otherwise be inverted, which `BTreeSet::range` panics on.
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("D", Some(1), None),
+        ]);
         let mut h = pdf.page_labels();
         let out = h.labels_for_page_range(4, 4, 0).unwrap();
         assert_eq!(out, vec![(0, dec(5))], "St 1 + offset 4 = 5");
@@ -1670,7 +1551,8 @@ mod tests {
     fn helper_tolerates_non_dict_catalog() {
         let mut pdf = pdf_with_pagelabels(vec![]);
         let catalog_ref = pdf.root_ref().unwrap();
-        pdf.set_object(catalog_ref, Object::Integer(0)); // catalog no longer a dict
+        pdf.replace_object_handle(catalog_ref, ObjectHandle::integer(0))
+            .unwrap(); // catalog no longer a dict
         let mut h = pdf.page_labels();
         assert!(
             !h.has_page_labels().unwrap(),
@@ -1720,33 +1602,6 @@ mod tests {
         }
     }
 
-    // ── reconstructed-label serialization ────────────────────────────────
-
-    #[test]
-    fn to_reconstructed_dict_always_includes_st() {
-        // Unlike to_dict, /St is present even at the default value 1 — qpdf's
-        // getLabelForPage-reconstructed dicts always carry an explicit /St.
-        let bare = LabelRange {
-            style: LabelStyle::None,
-            prefix: String::new(),
-            start: 1,
-        };
-        let dict = bare.to_reconstructed_dict();
-        assert_eq!(dict.get("St"), Some(&Object::Integer(1)));
-        assert_eq!(dict.get("S"), None, "None style => no /S key");
-        assert_eq!(dict.get("P"), None, "empty prefix => no /P key");
-
-        let full = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: "A-".into(),
-            start: 5,
-        };
-        let dict2 = full.to_reconstructed_dict();
-        assert_eq!(dict2.get("S"), Some(&Object::Name("D".into())));
-        assert_eq!(dict2.get("P"), Some(&Object::String(b"A-".to_vec())));
-        assert_eq!(dict2.get("St"), Some(&Object::Integer(5)));
-    }
-
     #[test]
     fn write_reconstructed_labels_installs_direct_nums_dict() {
         // Installed as a direct dict — not an indirect number tree — and
@@ -1768,40 +1623,23 @@ mod tests {
             .unwrap();
         }
         let catalog_ref = pdf.root_ref().unwrap();
-        let catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        let Some(Object::Dictionary(page_labels)) = catalog.get("PageLabels") else {
-            panic!("/PageLabels must be a direct dictionary, got {catalog:?}"); // cov:ignore: defensive — write_reconstructed_labels always installs a direct dict
-        };
-        let Some(Object::Array(nums)) = page_labels.get("Nums") else {
-            panic!("/Nums must be a direct array"); // cov:ignore: defensive — write_reconstructed_labels always installs a direct array
-        };
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).unwrap();
+        let page_labels = catalog.get_key(b"/PageLabels");
+        assert!(page_labels.as_dictionary().is_some());
+        assert!(!page_labels.is_indirect(), "/PageLabels must be direct");
+        let nums = page_labels.get_key(b"/Nums");
+        let nums = nums.as_array().expect("/Nums must be a direct array");
         assert_eq!(nums.len(), 4, "2 entries * (index, dict)");
-        assert_eq!(nums[0], Object::Integer(0));
+        assert_eq!(nums[0].as_integer(), Some(0));
+        assert_eq!(nums[1].get_key(b"/St").as_integer(), Some(1));
+        assert!(!nums[1].try_has_key(b"/S").unwrap());
+        assert_eq!(nums[2].as_integer(), Some(3));
         assert_eq!(
-            nums[1],
-            Object::Dictionary({
-                let mut d = Dictionary::new();
-                d.insert("St", Object::Integer(1));
-                d
-            }),
-            "no /S for a None-style fabricated entry"
+            nums[3].get_key(b"/S").try_as_name().unwrap(),
+            Some(b"D".to_vec())
         );
-        assert_eq!(nums[2], Object::Integer(3));
-        assert_eq!(
-            nums[3],
-            Object::Dictionary({
-                let mut d = Dictionary::new();
-                d.insert("S", Object::Name("D".into()));
-                d.insert("St", Object::Integer(1));
-                d
-            }),
-            "/St 1 stays explicit, unlike to_dict"
-        );
+        assert_eq!(nums[3].get_key(b"/St").as_integer(), Some(1));
 
         // The high-level reader round-trips the installed entries too.
         let mut h = pdf.page_labels();
@@ -1851,16 +1689,20 @@ mod tests {
 
     #[test]
     fn label_prefix_presence_distinguishes_empty_and_absent_prefixes() {
-        let mut explicit_empty =
-            pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), Some(""))]);
+        let mut explicit_empty = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("D", Some(1), Some("")),
+        ]);
         let mut helper = explicit_empty.page_labels();
         assert!(helper.label_prefix_is_present(0).unwrap());
 
         let mut empty_tree = pdf_with_pagelabels(vec![]);
         assert!(!empty_tree.page_labels().label_prefix_is_present(0).unwrap());
 
-        let mut absent =
-            pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        let mut absent = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("D", Some(1), None),
+        ]);
         assert!(!absent.page_labels().label_prefix_is_present(0).unwrap());
 
         let mut no_tree = bare_one_page_pdf();
@@ -1883,46 +1725,35 @@ mod tests {
             .unwrap();
 
         let catalog_ref = pdf.root_ref().unwrap();
-        let catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        let Object::Dictionary(page_labels) = catalog.get("PageLabels").unwrap() else {
-            panic!("PageLabels must be a direct dictionary"); // cov:ignore: test-shape guard, the helper always installs a dictionary
-        };
-        let Object::Array(nums) = page_labels.get("Nums").unwrap() else {
-            panic!("PageLabels /Nums must be an array"); // cov:ignore: test-shape guard, the helper always installs an array
-        };
-        let Object::Dictionary(first) = &nums[1] else {
-            panic!("first label must be a dictionary"); // cov:ignore: test-shape guard, the helper yields dictionaries
-        };
-        let Object::Dictionary(second) = &nums[3] else {
-            panic!("second label must be a dictionary"); // cov:ignore: test-shape guard, the helper yields dictionaries
-        };
-        assert_eq!(first.get("P"), Some(&Object::String(Vec::new())));
-        assert_eq!(second.get("P"), None);
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).unwrap();
+        let page_labels = catalog.get_key(b"/PageLabels");
+        let nums = page_labels
+            .get_key(b"/Nums")
+            .as_array()
+            .expect("PageLabels /Nums must be an array");
+        assert_eq!(nums[1].get_key(b"/P").as_string(), Some(Vec::new()));
+        assert!(!nums[3].try_has_key(b"/P").unwrap());
     }
 
     #[test]
     fn write_reconstructed_labels_replaces_existing_indirect_tree() {
         // A pre-existing indirect /PageLabels root is unconditionally replaced
         // by a fresh direct dict (qpdf never merges).
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("R", Some(1), None)]);
+        let mut pdf = pdf_with_pagelabels(vec![
+            ObjectHandle::integer(0),
+            label_dict("R", Some(1), None),
+        ]);
         {
             let mut h = pdf.page_labels();
             h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         }
         let catalog_ref = pdf.root_ref().unwrap();
-        let catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).unwrap();
+        let page_labels = catalog.get_key(b"/PageLabels");
         assert!(
-            matches!(catalog.get("PageLabels"), Some(Object::Dictionary(_))),
+            page_labels.as_dictionary().is_some() && !page_labels.is_indirect(),
             "/PageLabels must now be a direct dict, not the old indirect ref"
         );
     }
@@ -1953,7 +1784,8 @@ mod tests {
     fn write_reconstructed_labels_noop_on_non_dict_catalog() {
         let mut pdf = bare_one_page_pdf();
         let catalog_ref = pdf.root_ref().unwrap();
-        pdf.set_object(catalog_ref, Object::Integer(0)); // catalog no longer a dict
+        pdf.replace_object_handle(catalog_ref, ObjectHandle::integer(0))
+            .unwrap(); // catalog no longer a dict
         let mut h = pdf.page_labels();
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
