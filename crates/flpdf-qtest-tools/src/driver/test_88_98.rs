@@ -633,26 +633,26 @@ pub(crate) fn run_test_97<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let container = pdf.trailer_key_handle(b"Nulls");
-    let container = pdf.resolve_to_terminal(&container)?;
+    pdf.resolve(&container)?;
     let container_items = container
         .as_array()
         .expect("many-nulls.pdf's /Nulls trailer entry is an array");
     // GAP(QPDFObjectHandle::getArrayItem): see `run_test_89`'s own GAP
     // comment for the missing single-item read-with-dereference-and-warning
     // accessor; `container_items.first()` substitutes the whole-array read
-    // this crate does provide, resolved to terminal below the same way
-    // qpdf's own `getArrayItem` dereferences internally.
+    // this crate does provide, and the canonical resolver below performs the
+    // same one-hop dereference qpdf's own `getArrayItem` performs internally.
     let first_item = container_items
         .first()
         .cloned()
         .expect("many-nulls.pdf's /Nulls trailer array has at least one element");
-    let nulls = pdf.resolve_to_terminal(&first_item)?;
-    let items = nulls
+    pdf.resolve(&first_item)?;
+    let items = first_item
         .as_array()
         .expect("many-nulls.pdf's /Nulls[0] is a large direct array of nulls");
     assert!(items.len() > 10000);
-    let nulls2 = nulls.shallow_copy()?;
-    assert_eq!(nulls.unparse(), nulls2.unparse());
+    let nulls2 = first_item.shallow_copy()?;
+    assert_eq!(first_item.unparse(), nulls2.unparse());
     Ok(())
 }
 
@@ -680,6 +680,50 @@ pub(crate) fn run_test_98<R: Read + Seek>(
     // than against an independent oracle, so even a partial port here would
     // be a self-comparison on top of being unreachable.
     Ok(())
+}
+
+#[cfg(test)]
+mod test_97_tests {
+    use super::run_test_97;
+    use flpdf::{ObjectHandle, Pdf};
+
+    fn many_nulls_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::empty().expect("create empty PDF");
+        let inner = ObjectHandle::array(
+            (0..=10_000)
+                .map(|_| ObjectHandle::null())
+                .collect::<Vec<_>>(),
+        );
+        let top = ObjectHandle::array(vec![inner]);
+        let top = pdf
+            .make_indirect_from_object_handle(top)
+            .expect("promote /Nulls container");
+        pdf.trailer()
+            .replace_key(b"/Nulls", top)
+            .expect("install /Nulls trailer entry");
+        pdf
+    }
+
+    #[test]
+    fn test_97_shallow_copies_the_large_array_through_canonical_handles() {
+        let mut pdf = many_nulls_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_97(
+            &mut pdf,
+            b"many-nulls.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 97");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
 }
 
 #[cfg(test)]
