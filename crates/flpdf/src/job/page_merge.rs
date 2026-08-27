@@ -1127,7 +1127,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 #[cfg(test)]
 mod tests {
     use super::{merge_documents, unique_field_name, MergeInput};
-    use crate::{Object, Pdf};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
@@ -1212,6 +1212,15 @@ mod tests {
         );
     }
 
+    fn resolved_handle<R: std::io::Read + std::io::Seek>(
+        pdf: &mut Pdf<R>,
+        object_ref: ObjectRef,
+    ) -> ObjectHandle {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).expect("resolve object");
+        handle
+    }
+
     /// A malformed indirect document-level root may itself be an unselected
     /// page. It is still copied so the catalog carrier can point at a null page
     /// boundary, but generic root traversal must stop there rather than pulling
@@ -1239,17 +1248,17 @@ mod tests {
         }];
         let mut merged = merge_documents(&mut inputs).unwrap();
         let catalog_ref = merged.root_ref().unwrap();
-        let catalog = merged
-            .resolve_object(catalog_ref)
-            .unwrap()
-            .into_dict()
-            .unwrap();
+        let catalog = resolved_handle(&mut merged, catalog_ref);
+        assert!(
+            catalog.as_dictionary().is_some(),
+            "catalog must be a dictionary"
+        );
         let open_action_ref = catalog
-            .get_ref("OpenAction")
+            .get_key(b"/OpenAction")
+            .object_ref()
             .expect("indirect /OpenAction carrier is retained");
-        assert_eq!(
-            merged.resolve_object(open_action_ref).unwrap(),
-            Object::Null,
+        assert!(
+            resolved_handle(&mut merged, open_action_ref).is_null(),
             "the unselected page root is copied and nulled"
         );
     }
@@ -1326,35 +1335,36 @@ mod tests {
         let mut merged = merge_documents(&mut inputs).unwrap();
 
         let catalog_ref = merged.root_ref().unwrap();
-        let catalog = merged
-            .resolve_object(catalog_ref)
-            .unwrap()
-            .into_dict()
-            .unwrap();
-        let acroform_ref = catalog.get_ref("AcroForm").expect("/AcroForm");
-        let acroform = merged
-            .resolve_object(acroform_ref)
-            .unwrap()
-            .into_dict()
-            .unwrap();
+        let catalog = resolved_handle(&mut merged, catalog_ref);
+        assert!(
+            catalog.as_dictionary().is_some(),
+            "catalog must be a dictionary"
+        );
+        let acroform_ref = catalog
+            .get_key(b"/AcroForm")
+            .object_ref()
+            .expect("/AcroForm");
+        let acroform = resolved_handle(&mut merged, acroform_ref);
+        assert!(
+            acroform.as_dictionary().is_some(),
+            "AcroForm must be a dictionary"
+        );
         let fields = acroform
-            .get("Fields")
-            .and_then(Object::as_array)
+            .get_key(b"/Fields")
+            .as_array()
             .expect("/Fields array");
         let names: Vec<Vec<u8>> = fields
             .iter()
             .map(|field| {
-                let field_ref = field.as_ref_id().expect("field is an indirect ref");
-                let field_dict = merged
-                    .resolve_object(field_ref)
-                    .unwrap()
-                    .into_dict()
-                    .unwrap();
-                field_dict
-                    .get("T")
-                    .and_then(Object::as_string)
-                    .expect("/T string")
-                    .to_vec()
+                let field_ref = field.object_ref().expect("field is an indirect ref");
+                let field_dict = resolved_handle(&mut merged, field_ref);
+                assert!(
+                    field_dict.as_dictionary().is_some(),
+                    "field must be a dictionary"
+                );
+                let name = field_dict.get_key(b"/T");
+                merged.resolve(&name).expect("resolve /T");
+                name.as_string().expect("/T string")
             })
             .collect();
 
