@@ -125,7 +125,7 @@ pub(crate) fn run_test_19<R: Read + Seek + 'static>(
     Ok(())
 }
 
-pub(crate) fn run_test_20<R: Read + Seek>(
+pub(crate) fn run_test_20<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&OsStr>,
@@ -144,11 +144,14 @@ pub(crate) fn run_test_20<R: Read + Seek>(
     let size = trailer.get_key(b"/Size").shallow_copy()?;
     copy.append_array_item(size)?;
 
-    // GAP(test_20 follow-on): the remaining trailer replacement and final
-    // writer comparison are kept for a separate driver slice. The live
-    // trailer handle is already writer-visible; this function simply keeps
-    // its bounded implementation scope at the currently covered read half.
-    Ok(())
+    // qpdf/test_driver.cc:846-849 installs the copied array in the live
+    // trailer and writes it with static identifiers and preserved streams.
+    trailer.replace_key(b"/QTest2", copy)?;
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_stream_data_mode(StreamDataMode::Preserve);
+    writer.write()
 }
 
 pub(crate) fn run_test_21<R: Read + Seek + 'static>(
@@ -466,5 +469,89 @@ mod test_24_tests {
         assert!(!output
             .windows(b" /Array1 ".len())
             .any(|window| window == b" /Array1 "));
+    }
+}
+
+#[cfg(test)]
+mod test_20_tests {
+    use super::run_test_20;
+    use flpdf::{ObjectRef, Pdf, PdfOpenOptions};
+    use std::collections::BTreeMap;
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    fn shallow_array_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.3\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, b"<< /Pages 2 0 R /Type /Catalog >>".as_slice()),
+            (2, b"<< /Count 0 /Kids [ ] /Type /Pages >>".as_slice()),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for number in 1..=2 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 3 /Root 1 0 R /QTest [ /A 1 0 R /B ] >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn shallow_copy_array_driver_mutates_live_trailer_and_writes_qpdf_shape() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(shallow_array_pdf(), PdfOpenOptions::default())
+                .expect("open shallow-copy fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_20(
+            &mut pdf,
+            b"shallow_array.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 20 should write a.pdf");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        let output = std::fs::read("a.pdf").expect("test 20 output");
+        let mut written = Pdf::open_mem_owned(output).expect("reopen test 20 output");
+        let qtest2 = written.trailer_key_handle(b"QTest2");
+        written.resolve(&qtest2).expect("resolve /QTest2");
+        let items = qtest2.as_array().expect("/QTest2 is an array");
+        assert_eq!(items.len(), 4, "unexpected /QTest2 items: {items:?}");
+        assert_eq!(items[0].as_name(), Some(b"A".to_vec()));
+        assert_eq!(items[1].object_ref(), Some(ObjectRef::new(1, 0)));
+        assert_eq!(items[2].as_name(), Some(b"B".to_vec()));
+        assert_eq!(items[3].as_integer(), Some(3));
     }
 }
