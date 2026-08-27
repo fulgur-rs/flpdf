@@ -2169,9 +2169,9 @@ mod tests {
     //   - remap_outline_tree walks the outline sibling/child chains.
     //   - remap_name_tree walks the name-tree /Kids.
     // The tests below are load-bearing — each one hangs or errors for the
-    // wrong reason if its guard is removed. Dest resolution
-    // (dest_page_ref_resolved / remap_dest_value / resolve_ref_chain) is
-    // covered by `cyclic_indirect_dest_terminates_without_overflow` above.
+    // wrong reason if its guard is removed. Destination resolution and
+    // live-handle mutation are covered by the focused destination tests
+    // above.
     // -----------------------------------------------------------------------
 
     #[test]
