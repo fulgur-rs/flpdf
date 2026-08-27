@@ -4,13 +4,11 @@
 // through `super::emit_new_diagnostics`, and how deep qpdf-source-line
 // comments justify each translation decision.
 //
-// `run_test_20` and `run_test_25` retain bounded GAP comments for their own
-// follow-on driver work. The canonical `Pdf::trailer` handle is live and is
-// consumed by the current writer path; `run_test_24` exercises that complete
-// writer-visible route because qpdf's reserved-object sequence reaches its
-// final `QPDFWriter` call in this slice.
+// The canonical `Pdf::trailer` handle is live and is consumed by the writer
+// path. The foreign-copy and reserved-object tests below exercise that
+// writer-visible route with qpdf's own final `QPDFWriter` settings.
 //
-// Six functions here (`run_test_18`, `19`, `21`, `22`, `23`, `24`) bound their
+// Seven functions here (`run_test_18`, `19`, `21`, `22`, `23`, `24`, `25`) bound their
 // generic reader as `R: Read + Seek + 'static` rather than the bare
 // `R: Read + Seek` used elsewhere in this crate: both `PageDocumentHelper`
 // and `PdfWriter` are themselves defined as `<R: Read + Seek + 'static>`
@@ -364,7 +362,7 @@ pub(crate) fn run_test_24<R: Read + Seek + 'static>(
     writer.write()
 }
 
-pub(crate) fn run_test_25<R: Read + Seek>(
+pub(crate) fn run_test_25<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
     arg2: Option<&OsStr>,
@@ -386,27 +384,42 @@ pub(crate) fn run_test_25<R: Read + Seek>(
     // `pdf` itself (`test_driver.cc:3491-3493`), never for a separately
     // constructed `QPDF` like `oldpdf` here. This opens with repair enabled
     // unconditionally, independent of whatever test number dispatched here.
-    let bytes = std::fs::read(arg2)?;
-    let options = PdfOpenOptions {
-        repair: true,
-        ..PdfOpenOptions::default()
-    };
-    let mut oldpdf = Pdf::open_mem_owned_with_options(bytes, options)?;
+    {
+        let bytes = std::fs::read(arg2)?;
+        let options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut oldpdf = Pdf::open_mem_owned_with_options(bytes, options)?;
 
-    // qpdf's `oldpdf.getTrailer().getKey("/QTest")`; `Pdf::trailer_handle`
-    // is the direct equivalent of `QPDF::getTrailer` (both own docs).
-    let oldpdf_trailer = oldpdf.trailer();
-    let qtest = oldpdf_trailer.get_key(b"/QTest");
-    let copied = pdf.copy_foreign_object(&qtest)?;
+        // qpdf's `oldpdf.getTrailer().getKey("/QTest")`; `Pdf::trailer_handle`
+        // is the direct equivalent of `QPDF::getTrailer` (both own docs).
+        let oldpdf_trailer = oldpdf.trailer();
+        let qtest = oldpdf_trailer.get_key(b"/QTest");
+        let copied = pdf.copy_foreign_object(&qtest)?;
+        let trailer = pdf.trailer();
+        trailer.replace_key(b"/QTest", copied)?;
+
+        // qpdf's oldpdf.getRoot().getKey("/Pages") first obtains the live root
+        // handle and then asks for its Pages child. trailer_key_handle lifts only
+        // /Root; resolving that handle once reproduces qpdf's root dereference
+        // without routing through the legacy terminal resolver.
+        let oldpdf_root = oldpdf.trailer_key_handle(b"Root");
+        oldpdf.resolve(&oldpdf_root)?;
+        let pages = oldpdf_root.get_key(b"/Pages");
+        let copied_pages = pdf.copy_foreign_object(&pages)?;
+        assert!(copied_pages.is_null());
+    }
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    // GAP(test_25 follow-on): the trailer replacement, `/Pages` null-copy
-    // assertion, and final writer comparison remain a separate driver slice.
-    // `copied` is intentionally retained here so the translated source order
-    // ends at the same boundary without introducing a second mutation route.
-    let _copied = copied;
-    Ok(())
+    // qpdf/test_driver.cc:970-973 writes only after the old document leaves
+    // scope, with static identifiers and preserved stream data.
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_stream_data_mode(StreamDataMode::Preserve);
+    writer.write()
 }
 
 #[cfg(test)]
@@ -586,5 +599,99 @@ mod test_21_tests {
         assert_eq!(error.to_string(), "stream objects cannot be cloned");
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod test_25_tests {
+    use super::run_test_25;
+    use flpdf::Pdf;
+    use std::collections::BTreeMap;
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    fn foreign_copy_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.3\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>".as_slice()),
+            (3, b"<< /Type /Page /Parent 2 0 R >>".as_slice()),
+            (4, b"<< /Child 5 0 R /Pages 2 0 R >>".as_slice()),
+            (5, b"[ /Leaf ]".as_slice()),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for number in 1..=5 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 1 0 R /QTest 4 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn foreign_copy_driver_replaces_qtest_and_writes_pages_boundary() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+        std::fs::write("foreign.pdf", foreign_copy_pdf()).expect("write foreign fixture");
+
+        let mut pdf = Pdf::empty().expect("create target PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_25(
+            &mut pdf,
+            b"minimal.pdf",
+            Some(std::ffi::OsStr::new("foreign.pdf")),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 25 should complete and write a.pdf");
+
+        assert!(stdout.is_empty());
+        let warning = String::from_utf8_lossy(&stderr);
+        assert!(
+            warning.contains(
+                "unexpected reference to /Pages object while copying foreign object; replacing with null"
+            ),
+            "unexpected diagnostic: {warning}"
+        );
+
+        let output = std::fs::read("a.pdf").expect("test 25 output");
+        let mut written = Pdf::open_mem_owned(output).expect("reopen test 25 output");
+        let qtest = written.trailer_key_handle(b"QTest");
+        written.resolve(&qtest).expect("resolve copied QTest");
+        assert!(qtest.get_key(b"/Pages").is_null());
+
+        let child = qtest.get_key(b"/Child");
+        written.resolve(&child).expect("resolve copied child");
+        let items = child.as_array().expect("copied child is an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_name(), Some(b"Leaf".to_vec()));
     }
 }

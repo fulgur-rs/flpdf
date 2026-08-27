@@ -255,7 +255,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 
         if let Some(source_ref) = foreign.object_ref() {
             let Some(&target_ref) = self.object_map.get(&source_ref) else {
-                self.target.resolver.push_warning(
+                self.target.resolver.push_damaged_warning(
                     "unexpected reference to /Pages object while copying foreign object; replacing with null",
                 )?;
                 return Ok(ObjectHandle::null());

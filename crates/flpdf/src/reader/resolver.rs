@@ -265,6 +265,10 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// The teardown walk moved with it: [`ResolverHandle::disconnect_all`] is
     /// what `Pdf::drop` now calls.
     object_cache: BTreeMap<ObjectRef, ObjectHandle>,
+    /// qpdf m->last_object_description (QPDF.hh:1457), retained for
+    /// damaged-PDF warnings raised after a cache-preparing operation such as
+    /// QPDF::nextObjGen (QPDF.cc:1873-1879).
+    last_object_description: String,
     /// Object-cache entries created by qpdf-shaped allocation/replacement,
     /// rather than by looking up an unresolved reference. qpdf keeps both
     /// cases in `m->obj_cache`, but the provenance is needed by the Pdf
@@ -799,6 +803,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 header_offset,
                 source_xref_entries,
                 object_cache: BTreeMap::new(),
+                last_object_description: String::new(),
                 allocated_object_refs: BTreeSet::new(),
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
@@ -1083,6 +1088,52 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`libqpdf/QPDF.cc:1297-1310,1331-1355,2641-2644`). Keeping that
     /// location in the diagnostic text also lets the qtest driver add only
     /// the filename, as qpdf's warning formatter does.
+    fn set_last_object_description(&self, object_ref: ObjectRef) {
+        self.core.borrow_mut().last_object_description =
+            format!("object {} {}", object_ref.number, object_ref.generation);
+    }
+
+    /// Append a generic damaged-PDF warning with the current object
+    /// description and input offset. The location is formatted into the
+    /// diagnostic when an object description exists so the qtest driver can
+    /// add only its filename, matching qpdf's warning formatter.
+    pub(crate) fn push_damaged_warning(&self, message: impl Into<String>) -> Result<()> {
+        let message = message.into();
+        let (diagnostic_message, diagnostic_offset, logger, suppress_warnings, description) = {
+            let mut core = self.core.borrow_mut();
+            let offset = core.input.last_offset();
+            let object = core.last_object_description.clone();
+            let (diagnostic_message, diagnostic_offset) = if object.is_empty() {
+                (message.clone(), (offset > 0).then_some(offset))
+            } else {
+                let offset_text = if offset > 0 {
+                    format!(", offset {offset}")
+                } else {
+                    String::new()
+                };
+                (format!("({object}{offset_text}): {message}"), None)
+            };
+            core.repair_diagnostics.push(Diagnostic::warning(
+                diagnostic_message.clone(),
+                diagnostic_offset,
+            ));
+            (
+                diagnostic_message,
+                diagnostic_offset,
+                core.logger.clone(),
+                core.suppress_warnings,
+                core.description.clone(),
+            )
+        };
+        route_warning(
+            &logger,
+            suppress_warnings,
+            &description,
+            diagnostic_offset,
+            &diagnostic_message,
+        )
+    }
+
     fn expected_endobj_warning(object_ref: ObjectRef, offset: u64) -> String {
         format!(
             "(object {} {}, offset {offset}): expected endobj",
@@ -1974,6 +2025,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .map_err(|_| Error::parse(0, "object stream member offset is too large"))?;
             let description_template =
                 self.object_stream_description_template(stream_number, object_ref);
+            self.set_last_object_description(object_ref);
             let mut handles = ChildHandles {
                 resolver: self,
                 description_template: description_template.clone(),
@@ -2625,6 +2677,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         capture_end_offsets: bool,
         try_recovery: bool,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
+        if expected.number != 0 {
+            self.set_last_object_description(expected);
+        }
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
         let (found, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
