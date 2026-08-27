@@ -12188,9 +12188,8 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         // First resolution triggers reconstruction and sets reconstructed_xref = true
-        let _ = pdf
-            .get_object_handle(ObjectRef::new(1, 0))
-            .try_dereference();
+        let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let _ = pdf.resolve(&recovery_trigger);
         assert!(pdf.reconstructed_xref());
 
         // Simulate a second recovery trigger by invoking reconstruct_xref_and_retry directly
@@ -12243,9 +12242,8 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned_with_options(malformed_recovery_pdf(), options)
             .expect("open malformed-object fixture");
 
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle)
             .expect("the reconstructed stream must recover its length");
         assert_eq!(
             handle
