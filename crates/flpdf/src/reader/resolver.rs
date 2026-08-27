@@ -1083,11 +1083,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
-    /// qpdf's `damagedPDF("expected endobj")` is rendered with the object
-    /// identity and the input source's last offset already in the message
-    /// (`libqpdf/QPDF.cc:1297-1310,1331-1355,2641-2644`). Keeping that
-    /// location in the diagnostic text also lets the qtest driver add only
-    /// the filename, as qpdf's warning formatter does.
+    /// Keep qpdf's current object description for later generic damaged-PDF
+    /// warnings (QPDF.hh:1457).
     fn set_last_object_description(&self, object_ref: ObjectRef) {
         self.core.borrow_mut().last_object_description =
             format!("object {} {}", object_ref.number, object_ref.generation);
@@ -1134,6 +1131,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    /// qpdf's `damagedPDF("expected endobj")` is rendered with the object
+    /// identity and the input source's last offset already in the message
+    /// (`libqpdf/QPDF.cc:1297-1310,1331-1355,2641-2644`). Keeping that
+    /// location in the diagnostic text also lets the qtest driver add only
+    /// the filename, as qpdf's warning formatter does.
     fn expected_endobj_warning(object_ref: ObjectRef, offset: u64) -> String {
         format!(
             "(object {} {}, offset {offset}): expected endobj",
@@ -4728,6 +4730,43 @@ mod tests {
         assert_eq!(
             output.lock().unwrap().as_slice(),
             b"WARNING: input.pdf (object 5 0, offset 123): expected endobj\n"
+        );
+    }
+
+    #[test]
+    fn damaged_warning_keeps_object_context_without_positive_offset() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, String::new()),
+            0,
+        );
+        {
+            let mut core = resolver.core.borrow_mut();
+            core.last_object_description = "object 7 0".to_owned();
+            core.input.last_offset.set(0);
+        }
+
+        resolver
+            .push_damaged_warning("no offset")
+            .expect("warning delivery");
+
+        assert_eq!(
+            resolver.repair_diagnostics().entries()[0].message,
+            "(object 7 0): no offset"
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: (object 7 0): no offset\n"
         );
     }
 
