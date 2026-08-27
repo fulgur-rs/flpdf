@@ -28,22 +28,17 @@ use crate::output::write_bytes;
 // This crate's `ObjectHandle` accessors deliberately do not (see e.g.
 // `ObjectHandle::get_key`'s own doc: "Never performs resolution itself"), so
 // every qpdf `getKey(...)`/array-item step that is followed by a further
-// accessor call needs an explicit chase here to observe the same value qpdf
-// would. `resolve_to_terminal` (not the single-hop
-// `resolve`) is used throughout, matching the precedent
-// `driver/test_0_1.rs` itself established (see that file's own doc on
-// `resolve_to_terminal_ref`): it degrades to a plain one-hop
-// resolve for ordinary parsed PDF content (where a resolved object's own
-// value is never itself `ObjectValue::Reference` -- that state is reachable
-// only through this crate's own `Pdf::set_object` test seam, per
-// `ObjectHandle::type_code`'s own doc), while still matching qpdf's
-// self-referential-object cycle handling (`libqpdf/QPDF.cc:1699-1712`) for
-// the pathological case where it is.
+// accessor call needs an explicit one-hop resolution here to observe the same
+// value qpdf would. Parsed qpdf objects never store an indirect object as a
+// bare reference value: `QPDF::replaceObject` rejects that shape
+// (`libqpdf/QPDF.cc:1980-1991`). The canonical `Pdf::resolve` operation is
+// therefore sufficient here; the separate legacy redirect chase is not part
+// of this qpdf test-driver translation.
 // ---------------------------------------------------------------------------
 
-/// Resolve `handle` to its terminal value and drain any repair diagnostics
-/// that dereference produced, mirroring qpdf's synchronous per-dereference
-/// warning emission to stderr.
+/// Resolve one canonical handle hop and drain any repair diagnostics that
+/// resolution produced, mirroring qpdf's synchronous per-dereference warning
+/// emission to stderr.
 fn resolved_terminal<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
@@ -52,9 +47,20 @@ fn resolved_terminal<R: Read + Seek>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<ObjectHandle> {
-    let resolved = pdf.resolve_to_terminal(handle)?;
+    let resolved = resolve_once(pdf, handle)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(resolved)
+}
+
+/// Resolve one canonical handle hop without changing the caller's diagnostic
+/// policy. This is used by test paths whose qpdf source does not drain the
+/// document-wide repair channel at that point.
+fn resolve_once<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+) -> flpdf::Result<ObjectHandle> {
+    pdf.resolve(handle)?;
+    Ok(handle.clone())
 }
 
 /// `handle.getKey(key)` plus the implicit dereference of the *returned*
@@ -149,7 +155,7 @@ fn version_prefix_major_minor(version: &str) -> (i64, i64) {
 /// references at each step, defaulting to `0` whenever a link in that chain
 /// is absent or the wrong type. This does not reuse `Pdf::adobe_extension_level`:
 /// that convenience method starts from `self.trailer_dictionary().get_ref("Root")`,
-/// which requires `/Root` to be a *literal* `Object::Reference` in the
+/// which requires `/Root` to be a *literal* indirect reference in the
 /// trailer and silently returns `None` (defaulting to `0`) for a direct
 /// `/Root` dictionary -- unlike qpdf's own `getRoot()`, and unlike
 /// `root_handle` above, both of which accept `/Root` either way. Using the
@@ -714,11 +720,11 @@ pub(crate) fn run_test_39<R: Read + Seek>(
         // `/Resources` down onto every page -- a side effect test_39's own
         // qpdf source never has.
         let resources = PageObjectHelper::new(page_ref, pdf).get_resources(false)?;
-        let resources = pdf.resolve_to_terminal(&resources)?;
+        let resources = resolve_once(pdf, &resources)?;
         if resources.is_null() {
             continue;
         }
-        let xobject = pdf.resolve_to_terminal(&resources.get_key(b"/XObject"))?;
+        let xobject = resolve_once(pdf, &resources.get_key(b"/XObject"))?;
         let Some(xobject) = xobject.as_dictionary() else {
             continue;
         };
@@ -727,7 +733,7 @@ pub(crate) fn run_test_39<R: Read + Seek>(
         // `:375-384`) iterates in ascending XObject-name order; the canonical
         // handle dictionary snapshot is BTreeMap-ordered and does the same.
         for (_key, value) in xobject {
-            let value = pdf.resolve_to_terminal(&value)?;
+            let value = resolve_once(pdf, &value)?;
             let Some(object_ref) = value.object_ref() else {
                 continue;
             };
@@ -738,12 +744,8 @@ pub(crate) fn run_test_39<R: Read + Seek>(
             let dict = handle
                 .as_stream_dict()
                 .expect("is_image(true) already confirmed a stream value");
-            let filter = pdf
-                .resolve_to_terminal(&dict.get_key(b"/Filter"))?
-                .unparse_resolved();
-            let color_space = pdf
-                .resolve_to_terminal(&dict.get_key(b"/ColorSpace"))?
-                .unparse_resolved();
+            let filter = resolve_once(pdf, &dict.get_key(b"/Filter"))?.unparse_resolved();
+            let color_space = resolve_once(pdf, &dict.get_key(b"/ColorSpace"))?.unparse_resolved();
             write!(stdout, "filter: ")?;
             write_bytes(stdout, &filter)?;
             write!(stdout, ", color space: ")?;
@@ -839,4 +841,95 @@ pub(crate) fn run_test_41<R: Read + Seek>(
     writer.set_static_id(true);
     writer.write()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolved_terminal, run_test_39};
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    fn pdf_with_image_xobject() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources 4 0 R /Contents 6 0 R >>",
+            ),
+            (4, b"<< /XObject << /Im1 5 0 R >> >>"),
+            (
+                5,
+                b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n\0\0\0\nendstream",
+            ),
+            (6, b"<< /Length 0 >>\nstream\n\nendstream"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 7];
+        for &(number, body) in objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn resolved_terminal_uses_the_canonical_one_hop_resolver() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture");
+        let root = pdf.trailer_key_handle(b"Root");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        let resolved = resolved_terminal(
+            &mut pdf,
+            &root,
+            b"minimal.pdf",
+            &mut diagnostics_written,
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("resolve root");
+
+        assert!(resolved.as_dictionary().is_some());
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn image_enumeration_resolves_resources_and_image_children_once() {
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(pdf_with_image_xobject(), PdfOpenOptions::default())
+                .expect("open image fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_39(
+            &mut pdf,
+            b"image.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 39");
+
+        assert_eq!(stdout, b"page 1\nfilter: null, color space: /DeviceRGB\n");
+        assert!(stderr.is_empty());
+    }
 }
