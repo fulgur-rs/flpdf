@@ -10416,9 +10416,8 @@ mod tests {
                 },
             )
             .expect("open repair fixture");
-            let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-            handle
-                .try_dereference()
+            let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+            pdf.resolve(&handle)
                 .expect("repair mode recovers an unusable stream length");
 
             let messages: Vec<_> = pdf
@@ -10476,9 +10475,8 @@ mod tests {
                 },
             )
             .expect("open strict malformed-length fixture");
-            let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-            handle
-                .try_dereference()
+            let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+            pdf.resolve(&handle)
                 .expect("qpdf catches the strict malformed-length failure");
             assert!(handle.is_null());
 
