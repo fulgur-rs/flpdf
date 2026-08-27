@@ -10712,10 +10712,9 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("a long rejected candidate still finds nested endstream");
         assert_eq!(
             handle
@@ -10746,10 +10745,9 @@ mod tests {
         )
         .expect("open repair fixture");
         let before = pdf.resolver.with_reader_mut(|reader| reader.seeks);
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("recovery must scan a long non-prefix payload");
 
         let seeks = pdf.resolver.with_reader_mut(|reader| reader.seeks) - before;
