@@ -182,6 +182,7 @@ pub(crate) fn run_test_21<R: Read + Seek + 'static>(
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
+    pdf.resolve(&contents)?;
     contents.shallow_copy()?;
     writeln!(stdout, "you can't see this")?;
     Ok(())
@@ -553,5 +554,37 @@ mod test_20_tests {
         assert_eq!(items[1].object_ref(), Some(ObjectRef::new(1, 0)));
         assert_eq!(items[2].as_name(), Some(b"B".to_vec()));
         assert_eq!(items[3].as_integer(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod test_21_tests {
+    use super::run_test_21;
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    #[test]
+    fn shallow_copy_stream_driver_resolves_before_qpdf_error() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open one-page fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        let error = run_test_21(
+            &mut pdf,
+            b"one-page.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect_err("test 21 must fail while copying a stream");
+
+        assert_eq!(error.to_string(), "stream objects cannot be cloned");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
     }
 }
