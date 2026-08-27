@@ -513,3 +513,70 @@ pub(crate) fn run_test_33<R: Read + Seek>(
     std::fs::write("a.pdf", &bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::run_test_30;
+    use flpdf::{EncryptParams, Pdf, PdfWriter};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore test current directory");
+        }
+    }
+
+    #[test]
+    fn test_30_consumes_the_canonical_copy_encryption_source() {
+        let _lock = CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let secondary = directory.path().join("secondary.pdf");
+
+        let mut donor = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open donor PDF");
+        let mut donor_writer = PdfWriter::new(&mut donor);
+        donor_writer
+            .set_output_file(&secondary)
+            .expect("configure donor output");
+        donor_writer.set_static_id(true);
+        donor_writer.set_encryption_parameters(EncryptParams::v4_aes128(
+            b"user".to_vec(),
+            b"owner".to_vec(),
+        ));
+        donor_writer.write().expect("write encrypted donor");
+
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut target = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open target PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_30(
+            &mut target,
+            b"target.pdf",
+            Some(Path::new(&secondary).as_os_str()),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 30");
+
+        assert!(directory.path().join("b.pdf").is_file());
+    }
+}
