@@ -14,7 +14,7 @@
 use flpdf::{
     drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, extract_pages, pages,
     prune_acroform_after_subset, prune_after_subset, rebuild_page_tree, remap_outline_and_dests,
-    Object, ObjectRef, Pdf, RemoveUnreferencedResources,
+    ObjectHandle, ObjectRef, Pdf, RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -121,18 +121,17 @@ fn dangling_bead_p_dropped_and_page_gced() {
     let mut pdf = run_subset(&[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
 
     // The bead pointing at the removed page loses its /P key entirely.
-    let bead = pdf.resolve_object(ObjectRef::new(12, 0)).expect("bead 12");
-    let bead = bead.as_dict().expect("bead 12 is a dict");
+    let bead: ObjectHandle = pdf.get_object_handle(ObjectRef::new(12, 0));
+    pdf.resolve(&bead).expect("bead 12");
+    assert!(bead.as_dictionary().is_some(), "bead 12 is a dict");
     assert!(
-        bead.get("P").is_none(),
-        "bead 12 /P (removed page) must be dropped, got {:?}",
-        bead.get("P")
+        !bead.has_key(b"/P"),
+        "bead 12 /P (removed page) must be dropped"
     );
     // The bead itself and its ring links survive (qpdf keeps the bead).
     assert!(
-        matches!(bead.get("N"), Some(Object::Reference(r)) if r.number == 13),
-        "bead 12 /N must be kept, got {:?}",
-        bead.get("N")
+        bead.get_key(b"/N").object_ref() == Some(ObjectRef::new(13, 0)),
+        "bead 12 /N must be kept"
     );
 
     // The /P drop leaves the removed page unreferenced, so the existing GC
@@ -149,12 +148,12 @@ fn dangling_bead_p_dropped_and_page_gced() {
     );
 
     // Beads on surviving pages keep their /P.
-    let bead = pdf.resolve_object(ObjectRef::new(11, 0)).expect("bead 11");
-    let bead = bead.as_dict().expect("bead 11 is a dict");
+    let bead: ObjectHandle = pdf.get_object_handle(ObjectRef::new(11, 0));
+    pdf.resolve(&bead).expect("bead 11");
+    assert!(bead.as_dictionary().is_some(), "bead 11 is a dict");
     assert!(
-        matches!(bead.get("P"), Some(Object::Reference(r)) if r.number == 3),
-        "bead 11 /P (surviving page 1) must be kept, got {:?}",
-        bead.get("P")
+        bead.get_key(b"/P").object_ref() == Some(ObjectRef::new(3, 0)),
+        "bead 11 /P (surviving page 1) must be kept"
     );
 }
 
@@ -177,15 +176,13 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
 
     // Both copies' /B reference the same bead object (shallow clone shares /B).
     let bead_ref_of = |doc: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef| -> ObjectRef {
-        let page = doc
-            .resolve_object(r)
-            .expect("page")
-            .into_dict()
-            .expect("dict");
-        match page.get("B") {
-            Some(Object::Array(a)) => a[0].as_ref_id().expect("/B[0] is an indirect ref"),
-            other => panic!("expected /B array, got {other:?}"),
-        }
+        let page: ObjectHandle = doc.get_object_handle(r);
+        doc.resolve(&page).expect("page");
+        assert!(page.as_dictionary().is_some(), "page is a dictionary");
+        page.get_key(b"/B")
+            .as_array()
+            .and_then(|items| items.first().and_then(ObjectHandle::object_ref))
+            .expect("/B[0] is an indirect ref")
     };
     let bead0 = bead_ref_of(&mut out, page_refs[0]);
     let bead1 = bead_ref_of(&mut out, page_refs[1]);
@@ -195,14 +192,12 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
     );
 
     // The single shared bead's /P targets the FIRST occurrence.
-    let bead = out
-        .resolve_object(bead0)
-        .expect("bead")
-        .into_dict()
-        .expect("dict");
+    let bead: ObjectHandle = out.get_object_handle(bead0);
+    out.resolve(&bead).expect("bead");
+    assert!(bead.as_dictionary().is_some(), "bead is a dictionary");
     assert_eq!(
-        bead.get("P"),
-        Some(&Object::Reference(page_refs[0])),
+        bead.get_key(b"/P").object_ref(),
+        Some(page_refs[0]),
         "shared bead /P must point at the first occurrence's page ref"
     );
 }
@@ -219,12 +214,12 @@ fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
         &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
     );
 
-    let bead = pdf.resolve_object(ObjectRef::new(12, 0)).expect("bead 12");
-    let bead = bead.as_dict().expect("bead 12 is a dict");
+    let bead: ObjectHandle = pdf.get_object_handle(ObjectRef::new(12, 0));
+    pdf.resolve(&bead).expect("bead 12");
+    assert!(bead.as_dictionary().is_some(), "bead 12 is a dict");
     assert!(
-        bead.get("P").is_none(),
-        "bead 12 /P (removed page) must be dropped via /B seeding, got {:?}",
-        bead.get("P")
+        !bead.has_key(b"/P"),
+        "bead 12 /P (removed page) must be dropped via /B seeding"
     );
 
     let live = pdf.live_object_refs();
