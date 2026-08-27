@@ -320,7 +320,7 @@ fn is_objr(dict: &ObjectHandle) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Dictionary, Object, Pdf};
+    use crate::{ObjectHandle, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
@@ -403,14 +403,14 @@ mod tests {
         }
     }
 
-    fn elem_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
-        match pdf
-            .resolve_object(ObjectRef::new(num, 0))
-            .expect("resolve elem")
-        {
-            Object::Dictionary(d) => d,
-            other => panic!("object {num} is not a dictionary: {other:?}"),
-        }
+    fn elem_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> ObjectHandle {
+        let elem = pdf.get_object_handle(ObjectRef::new(num, 0));
+        pdf.resolve(&elem).expect("resolve elem");
+        assert!(
+            elem.as_dictionary().is_some(),
+            "object {num} is not a dictionary"
+        );
+        elem
     }
 
     // -----------------------------------------------------------------------
@@ -439,9 +439,8 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg drop");
         let elem = elem_dict(&mut pdf, 20);
         assert!(
-            matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 7),
-            "surviving /Pg must be remapped to the new ref, got {:?}",
-            elem.get("Pg")
+            elem.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(7, 0)),
+            "surviving /Pg must be remapped to the new ref"
         );
     }
 
@@ -468,23 +467,18 @@ mod tests {
         );
 
         let elem = elem_dict(&mut pdf, 20);
-        let kids = elem.get("K").and_then(|k| k.as_array()).expect("kids");
-        let mcr = kids[0].as_dict().expect("inline MCR");
-        let mcr_pg = mcr.get("Pg");
+        let kids = elem.get_key(b"/K").as_array().expect("kids");
+        let mcr = kids[0].clone();
         assert!(
-            mcr_pg.is_none(),
-            "MCR dangling /Pg must be dropped, got {mcr_pg:?}"
+            mcr.as_dictionary().is_some(),
+            "inline MCR must be a dictionary"
         );
+        assert!(!mcr.has_key(b"/Pg"), "MCR dangling /Pg must be dropped");
         let objr = elem_dict(&mut pdf, 21);
-        let objr_pg = objr.get("Pg");
+        assert!(!objr.has_key(b"/Pg"), "OBJR dangling /Pg must be dropped");
         assert!(
-            objr_pg.is_none(),
-            "OBJR dangling /Pg must be dropped, got {objr_pg:?}"
-        );
-        let objr_obj = objr.get("Obj");
-        assert!(
-            matches!(objr_obj, Some(Object::Reference(r)) if r.number == 5),
-            "OBJR /Obj must be kept, got {objr_obj:?}"
+            objr.get_key(b"/Obj").object_ref() == Some(ObjectRef::new(5, 0)),
+            "OBJR /Obj must be kept"
         );
     }
 
@@ -565,18 +559,20 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg remap");
 
         let elem = elem_dict(&mut pdf, 20);
-        let kids = elem.get("K").and_then(|k| k.as_array()).expect("kids");
-        let mcr = kids[0].as_dict().expect("inline MCR");
-        let mcr_pg = mcr.get("Pg");
+        let kids = elem.get_key(b"/K").as_array().expect("kids");
+        let mcr = kids[0].clone();
         assert!(
-            matches!(mcr_pg, Some(Object::Reference(r)) if r.number == 7),
-            "MCR surviving /Pg must be remapped to the new ref, got {mcr_pg:?}"
+            mcr.as_dictionary().is_some(),
+            "inline MCR must be a dictionary"
+        );
+        assert!(
+            mcr.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(7, 0)),
+            "MCR surviving /Pg must be remapped to the new ref"
         );
         let objr = elem_dict(&mut pdf, 21);
-        let objr_pg = objr.get("Pg");
         assert!(
-            matches!(objr_pg, Some(Object::Reference(r)) if r.number == 7),
-            "OBJR surviving /Pg must be remapped to the new ref, got {objr_pg:?}"
+            objr.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(7, 0)),
+            "OBJR surviving /Pg must be remapped to the new ref"
         );
     }
 
@@ -590,8 +586,10 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("non-page /Pg");
 
         let elem = elem_dict(&mut pdf, 20);
-        let pg = elem.get("Pg");
-        assert!(matches!(pg, Some(Object::Reference(r)) if r.number == 30));
+        assert_eq!(
+            elem.get_key(b"/Pg").object_ref(),
+            Some(ObjectRef::new(30, 0))
+        );
     }
 
     #[test]
@@ -607,8 +605,10 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("orphan-page /Pg");
 
         let elem = elem_dict(&mut pdf, 20);
-        let pg = elem.get("Pg");
-        assert!(matches!(pg, Some(Object::Reference(r)) if r.number == 30));
+        assert_eq!(
+            elem.get_key(b"/Pg").object_ref(),
+            Some(ObjectRef::new(30, 0))
+        );
     }
 
     #[test]
@@ -636,11 +636,14 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
 
         let root = elem_dict(&mut pdf, 10);
-        let kid = root.get("K").and_then(|k| k.as_dict()).expect("direct kid");
+        let kid = root.get_key(b"/K");
         assert!(
-            kid.get("Pg").is_none(),
-            "direct-dict kid's dangling /Pg must be dropped and written back, got {:?}",
-            kid.get("Pg")
+            kid.as_dictionary().is_some(),
+            "direct kid must be a dictionary"
+        );
+        assert!(
+            !kid.has_key(b"/Pg"),
+            "direct-dict kid's dangling /Pg must be dropped and written back"
         );
     }
 
@@ -663,9 +666,8 @@ mod tests {
 
         let elem = elem_dict(&mut pdf, 21);
         assert!(
-            elem.get("Pg").is_none(),
-            "kid reached through an indirect /K array must have /Pg dropped, got {:?}",
-            elem.get("Pg")
+            !elem.has_key(b"/Pg"),
+            "kid reached through an indirect /K array must have /Pg dropped"
         );
     }
 
@@ -684,10 +686,7 @@ mod tests {
 
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("cycle must terminate");
         let elem = elem_dict(&mut pdf, 20);
-        assert!(
-            elem.get("Pg").is_none(),
-            "dangling /Pg dropped despite cycle"
-        );
+        assert!(!elem.has_key(b"/Pg"), "dangling /Pg dropped despite cycle");
     }
 
     #[test]
@@ -708,15 +707,19 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
 
         let catalog = elem_dict(&mut pdf, 1);
-        let root = catalog
-            .get("StructTreeRoot")
-            .and_then(|r| r.as_dict())
-            .expect("direct root");
-        let kid = root.get("K").and_then(|k| k.as_dict()).expect("direct kid");
+        let root = catalog.get_key(b"/StructTreeRoot");
         assert!(
-            kid.get("Pg").is_none(),
-            "dangling /Pg under a catalog-direct /StructTreeRoot must be dropped, got {:?}",
-            kid.get("Pg")
+            root.as_dictionary().is_some(),
+            "direct root must be a dictionary"
+        );
+        let kid = root.get_key(b"/K");
+        assert!(
+            kid.as_dictionary().is_some(),
+            "direct kid must be a dictionary"
+        );
+        assert!(
+            !kid.has_key(b"/Pg"),
+            "dangling /Pg under a catalog-direct /StructTreeRoot must be dropped"
         );
     }
 
@@ -780,22 +783,19 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
 
         let typeless = elem_dict(&mut pdf, 21);
-        let typeless_pg = typeless.get("Pg");
         assert!(
-            typeless_pg.is_none(),
-            "typeless StructElem must still have its dangling /Pg dropped, got {typeless_pg:?}"
+            !typeless.has_key(b"/Pg"),
+            "typeless StructElem must still have its dangling /Pg dropped"
         );
         let mcr = elem_dict(&mut pdf, 22);
-        let mcr_pg = mcr.get("Pg");
         assert!(
-            mcr_pg.is_none(),
-            "MCR (indirect /Type) dangling /Pg must be dropped, got {mcr_pg:?}"
+            !mcr.has_key(b"/Pg"),
+            "MCR (indirect /Type) dangling /Pg must be dropped"
         );
         let unwalked_kid = elem_dict(&mut pdf, 23);
-        let unwalked_pg = unwalked_kid.get("Pg");
         assert!(
-            matches!(unwalked_pg, Some(Object::Reference(r)) if r.number == 4),
-            "kid under an MCR (indirect /Type) must not be walked, so its /Pg stays, got {unwalked_pg:?}"
+            unwalked_kid.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(4, 0)),
+            "kid under an MCR (indirect /Type) must not be walked, so its /Pg stays"
         );
     }
 
@@ -818,20 +818,21 @@ mod tests {
 
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
 
-        let arr = match pdf.resolve_object(ObjectRef::new(25, 0)).expect("array") {
-            Object::Array(items) => items,
-            other => panic!("object 25 is not an array: {other:?}"),
-        };
-        let kid = arr[0].as_dict().expect("direct kid");
+        let arr_handle = pdf.get_object_handle(ObjectRef::new(25, 0));
+        pdf.resolve(&arr_handle).expect("array");
+        let arr = arr_handle.as_array().expect("object 25 is not an array");
+        let kid = arr[0].clone();
         assert!(
-            kid.get("Pg").is_none(),
-            "direct-dict kid in an indirect /K array must have /Pg dropped, got {:?}",
-            kid.get("Pg")
+            kid.as_dictionary().is_some(),
+            "direct kid must be a dictionary"
         );
         assert!(
-            matches!(&arr[1], Object::String(s) if s == b"noise"),
-            "non-kid array entry must round-trip unchanged, got {:?}",
-            arr[1]
+            !kid.has_key(b"/Pg"),
+            "direct-dict kid in an indirect /K array must have /Pg dropped"
+        );
+        assert!(
+            arr[1].as_string() == Some(b"noise".to_vec()),
+            "non-kid array entry must round-trip unchanged"
         );
     }
 

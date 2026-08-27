@@ -167,7 +167,7 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Dictionary, Object, Pdf};
+    use crate::{ObjectHandle, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
@@ -201,13 +201,7 @@ mod tests {
     }
 
     fn open(objs: &BTreeMap<u32, String>) -> Pdf<Cursor<Vec<u8>>> {
-        let mut pdf = Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture");
-        for (&number, body) in objs {
-            if let Ok(Object::Reference(target)) = crate::parse_object(body.as_bytes()) {
-                pdf.set_object(ObjectRef::new(number, 0), Object::Reference(target));
-            }
-        }
-        pdf
+        Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture")
     }
 
     /// Base: catalog (1), pages root (2) /Kids [3 4 5], three pages (3,4,5).
@@ -240,11 +234,14 @@ mod tests {
         }
     }
 
-    fn annot(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
-        pdf.resolve_object(ObjectRef::new(num, 0))
-            .expect("resolve annot")
-            .into_dict()
-            .expect("annot object is a dictionary")
+    fn annot(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> ObjectHandle {
+        let annot = pdf.get_object_handle(ObjectRef::new(num, 0));
+        pdf.resolve(&annot).expect("resolve annot");
+        assert!(
+            annot.as_dictionary().is_some(),
+            "annot object is not a dictionary"
+        );
+        annot
     }
 
     #[test]
@@ -258,7 +255,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            annot(&mut pdf, 30).get("P").is_none(),
+            !annot(&mut pdf, 30).has_key(b"/P"),
             "removed-page /P must be dropped"
         );
     }
@@ -274,7 +271,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 3),
+            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(3, 0)),
             "surviving-page /P must be kept",
         );
     }
@@ -297,7 +294,7 @@ mod tests {
         };
         drop_objr_obj_annot_dangling_p(&mut pdf, &result, &[ObjectRef::new(30, 0)]).expect("drop");
         assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 7),
+            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(7, 0)),
             "surviving-page /P must be remapped to the new ref",
         );
     }
@@ -314,7 +311,7 @@ mod tests {
             .expect("drop");
         let a = annot(&mut pdf, 30);
         assert!(
-            a.get("P").is_none() && a.get("Subtype").is_some(),
+            !a.has_key(b"/P") && a.has_key(b"/Subtype"),
             "non-/P annot untouched"
         );
     }
@@ -325,10 +322,7 @@ mod tests {
         objs.insert(30, "<< /Type /Annot /Subtype /Text /P 4 0 R >>".into());
         let mut pdf = open(&objs);
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[]).expect("noop");
-        assert!(
-            annot(&mut pdf, 30).get("P").is_some(),
-            "no targets ⇒ no change"
-        );
+        assert!(annot(&mut pdf, 30).has_key(b"/P"), "no targets ⇒ no change");
     }
 
     #[test]
@@ -365,7 +359,7 @@ mod tests {
         )
         .expect("drop");
         assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 7),
+            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(7, 0)),
             "remapped /P 7 must survive the duplicate target; dedup guard prevents re-drop",
         );
     }
@@ -379,9 +373,11 @@ mod tests {
         let mut pdf = open(&objs);
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("non-dict target skipped");
+        let target = pdf.get_object_handle(ObjectRef::new(30, 0));
+        pdf.resolve(&target).expect("resolve");
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(30, 0)).expect("resolve"),
-            Object::Integer(42),
+            target.as_integer(),
+            Some(42),
             "a non-dict OBJR /Obj target must be left unchanged",
         );
     }
@@ -399,7 +395,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Integer(999))),
+            annot(&mut pdf, 30).get_key(b"/P").as_integer() == Some(999),
             "a non-reference /P must be left unchanged",
         );
     }
@@ -421,7 +417,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
+            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(60, 0)),
             "a /P resolving to a non-page object must be left unchanged",
         );
     }
@@ -443,7 +439,7 @@ mod tests {
             .expect("orphan-page /P");
 
         assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
+            annot(&mut pdf, 30).get_key(b"/P").object_ref() == Some(ObjectRef::new(60, 0)),
             "a /P to a page outside the original page tree must be left unchanged",
         );
     }
@@ -453,7 +449,7 @@ mod tests {
         // A removed page that a surviving outline / named destination still
         // references is replaced with `null` in place by the earlier null-out
         // pass (crate::outline_dest_remap) BEFORE this pass runs. The /P then
-        // resolves to Object::Null rather than a /Type /Page dict — but it is
+        // resolves to a null object rather than a /Type /Page dict — but it is
         // still a removed page, and qpdf drops the annotation's /P. Object 4 is
         // `null` and is not in `surviving`, so /P must be dropped (matching qpdf;
         // requiring /Type /Page here would wrongly keep the dangling /P).
@@ -467,29 +463,26 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("drop");
         assert!(
-            annot(&mut pdf, 30).get("P").is_none(),
+            !annot(&mut pdf, 30).has_key(b"/P"),
             "a /P to a removed page nulled by the dest null-out pass must still be dropped",
         );
     }
 
     #[test]
     fn stream_target_skipped() {
-        // An OBJR /Obj can reference a stream (e.g. an XObject). Object::into_dict
-        // returns None for a stream, so the target is skipped via the
-        // `else { continue; }` arm with no stream-body corruption and no error.
+        // An OBJR /Obj can reference a stream (e.g. an XObject). A stream is
+        // not a dictionary, so the target is skipped via the `else { continue; }`
+        // arm with no stream-body corruption and no error.
         let mut objs = base();
         objs.insert(30, "<< /Length 3 >>\nstream\nabc\nendstream".into());
         let mut pdf = open(&objs);
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("stream target skipped without error");
+        let target = pdf.get_object_handle(ObjectRef::new(30, 0));
+        pdf.resolve(&target).expect("resolve stream target");
         assert!(
-            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
-            matches!(
-                // cov:ignore-end
-                pdf.resolve_object(ObjectRef::new(30, 0)),
-                Ok(Object::Stream(_))
-            ),
-            "a stream OBJR /Obj target must be left unchanged",
+            target.as_stream_dict().is_some(),
+            "a stream OBJR /Obj target must be left unchanged"
         );
     }
 }
