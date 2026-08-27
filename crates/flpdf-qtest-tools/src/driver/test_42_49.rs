@@ -764,6 +764,44 @@ mod tests {
         bytes
     }
 
+    fn pdf_with_name_trees() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 3];
+        for &(number, body) in objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        let trailer = concat!(
+            "trailer\n<< /Size 3 /Root 1 0 R ",
+            "/QTest << /Names [",
+            "(07 sev\\200n) (seven!) ",
+            "(11 elephant) (elephant?) ",
+            "(29 twenty-nine) (twenty-nine!)] >> ",
+            "/Bad1 << /Names [(A) (a)] >> ",
+            "/Bad2 << /Names [(B) (b)] >> ",
+            "/Bad3 << /Names [] >> ",
+            "/Bad4 << /Names [(C) (c)] >> ",
+            "/Bad5 << /Names [(D) (d)] >> ",
+            "/Bad6 << /Names [] >> ",
+            "/Empty1 << /Names [] >> ",
+            "/Empty2 << /Names [] >> >>\n",
+        );
+        bytes.extend_from_slice(trailer.as_bytes());
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
     #[test]
     fn tree_helpers_resolve_canonical_handles_one_hop() {
         let mut pdf = minimal_pdf();
@@ -823,5 +861,30 @@ mod tests {
         let root = pdf.trailer_key_handle(b"Root");
         let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
         assert!(!kids_item_0_is_indirect(&mut pdf, &pages).expect("inspect /Kids"));
+    }
+
+    #[test]
+    fn name_tree_last_value_uses_the_canonical_resolver() {
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(pdf_with_name_trees(), PdfOpenOptions::default())
+                .expect("open name tree fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        super::run_test_48(
+            &mut pdf,
+            b"name-tree.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 48");
+
+        assert!(stdout
+            .windows(b"29 twenty-nine -> ".len())
+            .any(|window| window == b"29 twenty-nine -> "));
+        assert!(stderr.is_empty());
     }
 }
