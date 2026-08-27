@@ -10365,9 +10365,8 @@ mod tests {
             },
         )
         .expect("open strict mismatch fixture");
-        let requested = pdf.get_object_handle(ObjectRef::new(2, 0));
-        requested
-            .try_dereference()
+        let requested: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&requested)
             .expect("qpdf resolves the requested slot to null after warning");
 
         assert!(requested.is_null());
