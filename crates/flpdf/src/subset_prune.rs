@@ -283,7 +283,7 @@ mod tests {
     use crate::pages::page_refs;
     use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{Object, ObjectRef, Pdf};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
@@ -582,35 +582,44 @@ mod tests {
         page_ref: ObjectRef,
         category: &str,
     ) -> Vec<String> {
-        let page = pdf.resolve_object(page_ref).expect("page should resolve");
-        let resources = match page {
-            Object::Dictionary(page) => match page.get("Resources").cloned() {
-                Some(Object::Reference(resources_ref)) => pdf
-                    .resolve_object(resources_ref)
-                    .expect("resources should resolve"),
-                Some(Object::Dictionary(resources)) => Object::Dictionary(resources),
-                other => panic!("page resources should be a dictionary or reference: {other:?}"), // cov:ignore: fixture-shape guard
-            },
-            other => panic!("page should be a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
-        };
-        let category = match resources {
-            Object::Dictionary(resources) => match resources.get(category).cloned() {
-                Some(Object::Reference(category_ref)) => pdf
-                    .resolve_object(category_ref)
-                    .expect("resource category should resolve"),
-                Some(Object::Dictionary(category)) => Object::Dictionary(category),
-                None => return Vec::new(),
-                other => panic!("resource category should be a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
-            },
-            other => panic!("resources should be a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
-        };
-        let Object::Dictionary(category) = category else {
-            panic!("resolved resource category should be a dictionary"); // cov:ignore: fixture-shape guard
-        };
+        let page: ObjectHandle = resolved_handle(pdf, page_ref);
+        assert!(
+            page.as_dictionary().is_some(),
+            "page should be a dictionary"
+        );
+
+        let resources = page.get_key(b"/Resources");
+        pdf.resolve(&resources).expect("resources should resolve");
+        assert!(
+            resources.as_dictionary().is_some(),
+            "page resources should be a dictionary or reference"
+        );
+
+        let category_key = format!("/{category}").into_bytes();
+        if !resources.has_key(&category_key) {
+            return Vec::new();
+        }
+        let category = resources.get_key(&category_key);
+        pdf.resolve(&category)
+            .expect("resource category should resolve");
         category
-            .iter()
-            .map(|(name, _)| String::from_utf8(name.to_vec()).expect("resource name is UTF-8"))
+            .as_dictionary()
+            .expect("resolved resource category should be a dictionary")
+            .keys()
+            .map(|name| {
+                String::from_utf8(name.clone())
+                    .expect("resource name is UTF-8")
+                    .strip_prefix('/')
+                    .unwrap_or_default()
+                    .to_owned()
+            })
             .collect()
+    }
+
+    fn resolved_handle<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> ObjectHandle {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).expect("resolve object");
+        handle
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────
@@ -787,21 +796,27 @@ mod tests {
         );
 
         // Name-level: page1's direct /Resources copy should have F1 but not F2.
-        let page1 = match pdf.resolve_borrowed(ObjectRef::new(4, 0)).unwrap() {
-            Object::Dictionary(d) => d,
-            other => panic!("page1 not a dict: {other:?}"),
-        };
-        let res_dict = match page1.get("Resources") {
-            Some(Object::Dictionary(d)) => d.clone(),
-            other => panic!("page1 /Resources was not materialized directly: {other:?}"), // cov:ignore: fixture-shape guard
-        };
-        let font_dict = match res_dict.get("Font") {
-            Some(Object::Dictionary(d)) => d.clone(),
-            other => panic!("page1 /Font not a dict: {other:?}"),
-        };
+        let page1 = resolved_handle(&mut pdf, ObjectRef::new(4, 0));
+        assert!(page1.as_dictionary().is_some(), "page1 not a dict");
+        let res_dict = page1.get_key(b"/Resources");
+        pdf.resolve(&res_dict).expect("resolve page1 resources");
+        assert!(
+            res_dict.as_dictionary().is_some(),
+            "page1 /Resources was not materialized directly"
+        );
+        let font_dict = res_dict.get_key(b"/Font");
+        pdf.resolve(&font_dict).expect("resolve page1 fonts");
         let font_keys: Vec<String> = font_dict
-            .iter()
-            .map(|(k, _)| String::from_utf8(k.to_vec()).unwrap())
+            .as_dictionary()
+            .expect("page1 /Font not a dict")
+            .keys()
+            .map(|k| {
+                String::from_utf8(k.clone())
+                    .unwrap()
+                    .strip_prefix('/')
+                    .unwrap_or_default()
+                    .to_owned()
+            })
             .collect();
         assert!(
             font_keys.contains(&"F1".to_string()),
@@ -833,13 +848,14 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[page_ref]).unwrap();
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
 
-        let page = pdf.resolve_object(page_ref).unwrap();
-        let Object::Dictionary(page) = page else {
-            panic!("selected page should remain a dictionary"); // cov:ignore: fixture-shape guard
-        };
+        let page = resolved_handle(&mut pdf, page_ref);
+        assert!(
+            page.as_dictionary().is_some(),
+            "selected page should remain a dictionary"
+        );
         assert_eq!(
-            page.get("Resources"),
-            Some(&Object::Reference(resources_ref)),
+            page.get_key(b"/Resources").object_ref(),
+            Some(resources_ref),
             "parse failure must leave the page's indirect /Resources ownership unchanged"
         );
         assert!(
