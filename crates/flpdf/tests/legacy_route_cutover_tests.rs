@@ -1015,7 +1015,12 @@ fn structure_tree_page_production_uses_the_canonical_handle_route() {
             "structure tree production still contains the raw route marker {legacy:?}"
         );
     }
-    for canonical in ["ObjectHandle", "pdf.resolve(", "replace_key(", "remove_key("] {
+    for canonical in [
+        "ObjectHandle",
+        "pdf.resolve(",
+        "replace_key(",
+        "remove_key(",
+    ] {
         assert!(
             production.contains(canonical),
             "structure tree production must use the canonical handle marker {canonical:?}"
@@ -1045,10 +1050,32 @@ fn objr_annotation_page_production_uses_the_canonical_handle_route() {
             "OBJR annotation production still contains the raw route marker {legacy:?}"
         );
     }
-    for canonical in ["ObjectHandle", "pdf.resolve(", "replace_key(", "remove_key("] {
+    for canonical in [
+        "ObjectHandle",
+        "pdf.resolve(",
+        "replace_key(",
+        "remove_key(",
+    ] {
         assert!(
             production.contains(canonical),
             "OBJR annotation production must use the canonical handle marker {canonical:?}"
         );
     }
+}
+
+#[test]
+fn page_selection_reference_chain_bridge_has_no_production_primitive() {
+    let source = include_str!("../src/ref_chain.rs");
+    assert!(
+        !source.contains("pub fn resolve_ref_chain"),
+        "ref_chain must not retain the qpdf-less value-chasing primitive"
+    );
+    assert!(
+        !source.contains("pub(crate) fn terminal_ref_of_chain"),
+        "ref_chain must not retain the qpdf-less terminal-ref primitive"
+    );
+    assert!(
+        source.contains("MAX_REF_CHAIN_DEPTH"),
+        "the reader cleanup slice still needs the shared bound until its bridge is removed"
+    );
 }

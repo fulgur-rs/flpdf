@@ -54,11 +54,19 @@
 //!   structure element's parent) is left unchanged. A `/P` resolving to `null`
 //!   *is* treated as a removed page and dropped (see the note above).
 
+use crate::object_handle::ObjectHandle;
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
+
+/// Return a dictionary entry without hiding an indirect value that currently
+/// resolves to null; its object reference is the page-membership identity.
+fn raw_child(parent: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
+    Ok(parent
+        .try_as_dictionary()?
+        .and_then(|entries| entries.get(key).cloned()))
+}
 
 /// Drop dangling `/P` references on annotations kept alive through a
 /// structure-tree OBJR `/Obj`, after a page-tree rebuild (qpdf `--pages`
@@ -72,9 +80,8 @@ use std::io::{Read, Seek};
 /// references collected during the structure-tree walk
 /// ([`crate::struct_tree_pg::drop_struct_elem_dangling_pg`]).
 ///
-/// Each target is resolved (reference-to-reference chains normalized to their
-/// terminal ref and deduplicated by a visited set). When the target is a
-/// dictionary whose `/P` is a reference to a removed page, the `/P` key is
+/// Each target is resolved through its canonical handle and deduplicated by its
+/// object reference. When the target is a dictionary whose `/P` is a reference to a removed page, the `/P` key is
 /// dropped so the page is garbage-collected by the subsequent subset sweep
 /// ([`crate::subset_prune::prune_after_subset`]); when `/P` points at a
 /// surviving page it is remapped to the page's new ref. A `/P` pointing at a
@@ -85,8 +92,8 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`] / [`Pdf::resolve_borrowed`] while
-/// resolving a target annotation or its `/P` chain.
+/// Any error propagated from [`Pdf::resolve`] while resolving a target
+/// annotation or its `/P` value.
 pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
@@ -106,21 +113,12 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
         if !visited.insert(start) {
             continue;
         }
-        // Normalize a reference chain so the visited key and the write-back
-        // target are the terminal annotation ref, never an intermediate holder.
-        let (concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(start))?;
-        let annot_ref = terminal.unwrap_or(start);
-        // A distinct start that resolves to an already-processed terminal is
-        // skipped too (two OBJR /Obj entries can reach the same annotation).
-        if annot_ref != start && !visited.insert(annot_ref) {
+        let annot = pdf.get_object_handle(start);
+        pdf.resolve(&annot)?;
+        if annot.try_as_dictionary()?.is_none() {
             continue;
         }
-        let Some(mut annot) = concrete.into_dict() else {
-            continue;
-        };
-        if remap_or_drop_annot_p(pdf, &mut annot, &surviving, removed_pages)? {
-            pdf.set_object(annot_ref, Object::Dictionary(annot));
-        }
+        remap_or_drop_annot_p(pdf, &annot, &surviving, removed_pages)?;
     }
     Ok(())
 }
@@ -136,30 +134,31 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
 /// is left unchanged, even if it resolves to a `/Type /Page` dictionary.
 fn remap_or_drop_annot_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    annot: &mut Dictionary,
+    annot: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
-    let p_ref = match annot.get("P") {
-        Some(Object::Reference(r)) => *r,
-        _ => return Ok(false),
+    let Some(p) = raw_child(annot, b"/P")? else {
+        return Ok(false);
     };
-    // Normalize a possible reference-to-reference chain to the terminal page ref.
-    let (_, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
-    let page_ref = terminal.unwrap_or(p_ref);
+    let Some(page_ref) = p.object_ref() else {
+        return Ok(false);
+    };
     if !surviving.contains_key(&page_ref) && !removed_pages.contains(&page_ref) {
         return Ok(false);
     }
     match surviving.get(&page_ref) {
         Some(&new) => {
             if new != page_ref {
-                annot.insert("P", Object::Reference(new));
+                annot.replace_key(b"/P", pdf.get_object_handle(new))?;
+                pdf.mark_object_handle_dirty(annot)?;
                 return Ok(true);
             }
             Ok(false)
         }
         None => {
-            annot.remove("P");
+            annot.remove_key(b"/P");
+            pdf.mark_object_handle_dirty(annot)?;
             Ok(true)
         }
     }
@@ -168,7 +167,7 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Pdf;
+    use crate::{Dictionary, Object, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
@@ -333,26 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn chained_obj_and_p_normalized() {
-        // Target is reached via a reference chain (40 → 30), and /P is itself a
-        // chain (50 → 4 removed). Both terminals must be resolved.
-        let mut objs = base();
-        objs.insert(
-            30,
-            "<< /Type /Annot /Subtype /Text /P 50 0 R /Rect [0 0 10 10] >>".into(),
-        );
-        objs.insert(40, "30 0 R".into());
-        objs.insert(50, "4 0 R".into());
-        let mut pdf = open(&objs);
-        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(40, 0)])
-            .expect("drop");
-        assert!(
-            annot(&mut pdf, 30).get("P").is_none(),
-            "chained /P to removed page must drop"
-        );
-    }
-
-    #[test]
     fn shared_target_deduped_non_identity() {
         // Same annot ref supplied twice with a NON-identity page remap (3 -> 7),
         // so the visited dedup guard is load-bearing. Pass 1 remaps /P 3 -> 7;
@@ -388,45 +367,6 @@ mod tests {
         assert!(
             matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 7),
             "remapped /P 7 must survive the duplicate target; dedup guard prevents re-drop",
-        );
-    }
-
-    #[test]
-    fn distinct_starts_to_same_terminal_deduped_non_identity() {
-        // Two DISTINCT start refs reach the same annotation: a direct one (30)
-        // and a holder chain (40 -> 30). With a NON-identity page remap (3 -> 7),
-        // the terminal-ref dedup is load-bearing. Pass for start 30 remaps /P
-        // 3 -> 7; the start-40 pass resolves to the already-processed terminal 30
-        // and must be skipped. Without the terminal dedup, the start-40 pass
-        // re-reads the remapped /P 7, finds no surviving entry keyed by 7, and
-        // would erroneously DROP /P.
-        let mut objs = base();
-        objs.insert(
-            7,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
-        );
-        objs.insert(
-            30,
-            "<< /Type /Annot /Subtype /Text /P 3 0 R /Rect [0 0 10 10] >>".into(),
-        );
-        objs.insert(40, "30 0 R".into());
-        let mut pdf = open(&objs);
-        let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
-        ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(7, 0)]);
-        let result = RebuildResult {
-            new_kids: vec![ObjectRef::new(7, 0)],
-            ref_map,
-            ..Default::default()
-        };
-        drop_objr_obj_annot_dangling_p(
-            &mut pdf,
-            &result,
-            &[ObjectRef::new(30, 0), ObjectRef::new(40, 0)],
-        )
-        .expect("drop");
-        assert!(
-            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 7),
-            "remapped /P 7 must survive a distinct start reaching the same terminal",
         );
     }
 
