@@ -9517,10 +9517,9 @@ mod tests {
         )
         .expect("open strict fixture");
         let object_ref = ObjectRef::new(2, 0);
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf catches the null /Length after the loop");
         assert!(handle.is_null());
 
@@ -9542,8 +9541,7 @@ mod tests {
             "the inner call caches qpdf's loop null through the same slot the \
              outer call was resolving"
         );
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("and that null is terminal, so nothing is re-read");
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
@@ -11337,10 +11335,9 @@ mod tests {
             },
         )
         .expect("open strict fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf catches the unusable outer /Length");
         assert!(handle.is_null());
 
