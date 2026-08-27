@@ -20,7 +20,7 @@ fn tree_string_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
 ) -> flpdf::Result<Vec<u8>> {
-    let value = pdf.resolve_to_terminal(value)?;
+    pdf.resolve(value)?;
     Ok(value.as_string().unwrap_or_default())
 }
 
@@ -35,9 +35,10 @@ fn chase_key<R: Read + Seek>(
     handle: &ObjectHandle,
     key: &[u8],
 ) -> flpdf::Result<ObjectHandle> {
-    let (chased, _) = pdf.resolve_to_terminal_ref(handle)?;
-    let child = chased.get_key(key);
-    Ok(pdf.resolve_to_terminal_ref(&child)?.0)
+    pdf.resolve(handle)?;
+    let child = handle.get_key(key);
+    pdf.resolve(&child)?;
+    Ok(child)
 }
 
 pub(crate) fn run_test_42<R: Read + Seek>(
@@ -55,13 +56,16 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     // literal markers for WARNING lines produced by the very wrong-type
     // accessors gapped below, so nothing observable is lost by stopping here.
     let qtest = pdf.trailer_key_handle(b"QTest");
-    let (qtest, _) = pdf.resolve_to_terminal_ref(&qtest)?;
+    pdf.resolve(&qtest)?;
+    let qtest = qtest.clone();
     let dictionary = qtest.get_key(b"/Dictionary");
-    let (dictionary, _) = pdf.resolve_to_terminal_ref(&dictionary)?;
+    pdf.resolve(&dictionary)?;
+    let dictionary = dictionary.clone();
     let key2 = dictionary.get_key(b"/Key2");
-    let (array, _) = pdf.resolve_to_terminal_ref(&key2)?;
+    pdf.resolve(&key2)?;
+    let array = key2.clone();
     let integer = qtest.get_key(b"/Integer");
-    let (_integer, _) = pdf.resolve_to_terminal_ref(&integer)?;
+    pdf.resolve(&integer)?;
     assert!(
         array.as_array().is_some(),
         "qpdf test_42 requires /Dictionary/Key2 to be an array"
@@ -106,9 +110,10 @@ pub(crate) fn run_test_43<R: Read + Seek>(
     let has_acroform = match pdf.root_ref() {
         Some(root_ref) => {
             let root = pdf.get_object_handle(root_ref);
-            let (root, _) = pdf.resolve_to_terminal_ref(&root)?;
+            pdf.resolve(&root)?;
+            let root = root.clone();
             let acroform = root.get_key(b"/AcroForm");
-            let (acroform, _) = pdf.resolve_to_terminal_ref(&acroform)?;
+            pdf.resolve(&acroform)?;
             !acroform.is_null()
         }
         None => false,
@@ -419,14 +424,16 @@ fn kids_item_0_is_indirect<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root: &ObjectHandle,
 ) -> flpdf::Result<bool> {
-    let root = pdf.resolve_to_terminal(root)?;
+    pdf.resolve(root)?;
+    let root = root.clone();
     let Some(dict) = root.as_dictionary() else {
         return Ok(false);
     };
     let Some(kids) = dict.get(b"/Kids".as_slice()) else {
         return Ok(false);
     };
-    let kids = pdf.resolve_to_terminal(kids)?;
+    pdf.resolve(kids)?;
+    let kids = kids.clone();
     let Some(items) = kids.as_array() else {
         return Ok(false);
     };
@@ -519,8 +526,8 @@ pub(crate) fn run_test_48<R: Read + Seek>(
         .current()
         .expect("name tree has a last entry");
     assert_eq!(last_key, b"29 twenty-nine");
-    let last_resolved = pdf.resolve_to_terminal(&last_value)?;
-    let last_raw = last_resolved.as_string().unwrap_or_default();
+    pdf.resolve(&last_value)?;
+    let last_raw = last_value.as_string().unwrap_or_default();
     assert_eq!(flpdf::pdf_string::utf8_value(&last_raw), b"twenty-nine!");
 
     let mut new1 = NameTree::new_empty(pdf, true)?;
@@ -715,4 +722,106 @@ pub(crate) fn run_test_49<R: Read + Seek>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, tree_string_value};
+    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+
+    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture")
+    }
+
+    fn pdf_with_object_types_qtest() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 3];
+        for &(number, body) in objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 3 /Root 1 0 R /QTest << /Dictionary << /Key2 [] >> /Integer 1 >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn tree_helpers_resolve_canonical_handles_one_hop() {
+        let mut pdf = minimal_pdf();
+        let value = ObjectHandle::string(b"value".to_vec());
+        assert_eq!(tree_string_value(&mut pdf, &value).unwrap(), b"value");
+
+        let root = pdf.trailer_key_handle(b"Root");
+        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        assert_eq!(
+            pages.object_ref().map(|object_ref| object_ref.number),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn object_type_and_form_presence_paths_use_canonical_resolution() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_object_types_qtest(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open object-types fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_42(
+            &mut pdf,
+            b"object-types.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 42");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_43(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 43");
+        assert_eq!(stdout, b"no forms\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn kids_item_probe_resolves_the_page_tree_handle_once() {
+        let mut pdf = minimal_pdf();
+        let root = pdf.trailer_key_handle(b"Root");
+        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        assert!(!kids_item_0_is_indirect(&mut pdf, &pages).expect("inspect /Kids"));
+    }
 }
