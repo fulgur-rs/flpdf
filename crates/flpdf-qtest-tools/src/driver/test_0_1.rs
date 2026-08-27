@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
-use flpdf::{Diagnostic, Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{Diagnostic, Error, ObjectHandle, ObjectRef, Pdf};
 
 use super::handle::{
-    resolve_chain, resolve_stream_dictionary, write_object, write_qpdf_object,
+    resolve_handle, resolve_stream_dictionary_handle, write_qpdf_object_handle,
     DecodeParmsWarningSource,
 };
 use super::{emit_new_diagnostics, write_warning};
@@ -59,7 +59,9 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     // nested sibling trailer entry would degrade `/QTest` to null here too,
     // even though `/QTest` itself is untouched.
     let original = pdf.trailer_key_handle(b"QTest");
-    let (chased, terminal_ref) = pdf.resolve_to_terminal_ref(&original)?;
+    pdf.resolve(&original)?;
+    let chased = original.clone();
+    let terminal_ref = original.object_ref();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     // qpdf's own `hasKey` treats a key resolving to null the same as a
@@ -93,50 +95,21 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     );
     details?;
 
-    // qpdf's `unparse()`/`unparseResolved()` for a dictionary omit any entry
-    // that resolves to null, eagerly re-resolving every entry (at every
-    // nesting depth) as they walk, regardless of what earlier steps above
-    // already resolved (`QPDF_Dictionary::unparse`,
-    // `libqpdf/QPDF_Dictionary.cc:59-69`). `write_qpdf_object` already
-    // implements exactly that eager, self-contained walk via `resolve_chain`
-    // — reused here via the legacy `Object` bridge rather than ported onto
-    // `ObjectHandle::unparse_resolved`, whose own null-omission depends on
-    // prior resolution state (`ObjectHandle::unparse_resolved`'s own doc)
-    // and would only coincidentally match for entries some earlier step
-    // happened to have already touched.
-    //
-    // `resolve_chain`'s own 64-hop count is spent starting from `original`'s
-    // *own* reference (its first loop iteration re-resolves it), while
-    // `resolve_to_terminal_ref` above already resolved
-    // `original` once for free before counting any redirects — so a chain
-    // landing exactly at that chase's own limit is one hop short of
-    // `resolve_chain`'s budget here and errors instead of completing
-    // (Codex Review on PR #610). Starting `resolve_chain` from `original`'s
-    // *content* — the same value its own first resolution already
-    // established — instead of re-spending that hop keeps both walks
-    // counting the same redirects.
-    let resolved = match original.object_ref() {
-        Some(reference) => {
-            let first_content = pdf.resolve_borrowed(reference)?.clone();
-            resolve_chain(pdf, first_content)?.0
-        }
-        None => {
-            let raw_qtest_value = pdf
-                .trailer_dictionary()
-                .get(b"QTest")
-                .cloned()
-                .unwrap_or(Object::Null);
-            resolve_chain(pdf, raw_qtest_value)?.0
-        }
+    // The canonical handle serializer performs qpdf's eager dictionary
+    // null-visibility walk while retaining indirect child identity. The
+    // `resolve` has already resolved the canonical root handle in place, so
+    // this helper reuses the same live object rather than materializing a
+    // second value model.
+    let (resolved, _, _) = resolve_handle(pdf, &original)?;
+    let unparse_bytes = if original.is_indirect() {
+        original.unparse()
+    } else {
+        write_qpdf_object_handle(pdf, &original)?
     };
-    let unparse_bytes = match original.object_ref() {
-        Some(reference) => write_object(&Object::Reference(reference)),
-        None => write_qpdf_object(pdf, &resolved)?,
-    };
-    let unparse_resolved_bytes = if matches!(resolved, Object::Stream(_)) {
+    let unparse_resolved_bytes = if resolved.as_stream_dict().is_some() {
         unparse_bytes.clone()
     } else {
-        write_qpdf_object(pdf, &resolved)?
+        write_qpdf_object_handle(pdf, &resolved)?
     };
 
     write!(stdout, "unparse: ")?;
@@ -148,13 +121,11 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     Ok(())
 }
 
-// `dict`'s entries, chasing each value (including any `Pdf::set_object`
-// redirect, not just a natural PDF reference) to its terminal to decide
-// null-omission, mirroring qpdf's own `hasKey`/`getKeys`/`ditems()` rule
+// `dict`'s entries are resolved once through the canonical object cache to
+// decide null-omission, mirroring qpdf's own `hasKey`/`getKeys`/`ditems()` rule
 // that a dictionary entry resolving to null is equivalent to a missing key
 // (`libqpdf/QPDF_Dictionary.cc:98-125`). Indirectness in the returned pairs
-// reflects the *original*, unresolved child handle — whether the entry's
-// own stored value was itself a reference — not the terminal value's.
+// reflects the child handle's own identity after that one cache resolution.
 fn dictionary_items<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &ObjectHandle,
@@ -164,8 +135,8 @@ fn dictionary_items<R: Read + Seek>(
         .ok_or_else(|| Error::System("dictionary access on non-dictionary object".to_string()))?;
     let mut items = Vec::new();
     for (key, child) in entries {
-        let (terminal, _terminal_ref) = pdf.resolve_to_terminal_ref(&child)?;
-        if !terminal.is_null() {
+        pdf.resolve(&child)?;
+        if !child.is_null() {
             items.push((key, child.object_ref().is_some()));
         }
     }
@@ -245,17 +216,10 @@ fn write_object_details<R: Read + Seek>(
             let dict_handle = chased
                 .as_stream_dict()
                 .expect("type_code confirmed a stream value");
-            let dict = match dict_handle.materialize()? {
-                Object::Dictionary(dict) => dict,
-                // A stream's own dictionary handle is always constructed as
-                // a direct dictionary value (`ObjectHandle::materialize`'s
-                // own doc).
-                _ => Dictionary::new(), // cov:ignore: unreachable per the invariant above
-            };
             let data = chased.get_raw_stream_data()?;
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
-            let dictionary = write_qpdf_object(pdf, &Object::Dictionary(dict.clone()))?;
-            let decode_dictionary = resolve_stream_dictionary(pdf, &dict)?;
+            let dictionary = write_qpdf_object_handle(pdf, &dict_handle)?;
+            let decode_dictionary = resolve_stream_dictionary_handle(pdf, &dict_handle)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write_bytes(stdout, &dictionary)?;
             writeln!(stdout)?;
@@ -431,9 +395,8 @@ fn write_object_details<R: Read + Seek>(
                 Err(_) => writeln!(stdout, "Stream data is not filterable.")?,
             }
         }
-        // 11 = operator, 12 = inline-image, 13 = unresolved (unreachable:
-        // `resolve_to_terminal_ref`'s own contract guarantees
-        // `chased`'s value is never itself `ObjectValue::Reference`).
+        // 11 = operator, 12 = inline-image, 13 = unresolved. Parsed PDF
+        // objects cannot carry a bare reference as their whole object value.
         _ => {
             writeln!(stdout, "/QTest is an unknown object")?;
         }
@@ -449,7 +412,7 @@ mod tests {
         run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
         write_object_details,
     };
-    use flpdf::{Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+    use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
     use std::io::{self, Write};
 
     struct WriteFailure;
@@ -605,8 +568,8 @@ mod tests {
         // limit (256) and the parser's own, higher, acceptance limit (500),
         // parses successfully and must be reported as the array it is, not
         // silently degraded to implicit/null by `trailer_key_handle`'s own
-        // lift bound being tighter than what `resolve_chain`/
-        // `resolve_borrowed` already accept for the same value.
+        // lift bound being tighter than what the canonical handle resolver
+        // already accepts for the same value.
         let mut deep = b"1".to_vec();
         for _ in 0..300 {
             deep = [b"[ ".as_slice(), &deep, b" ]".as_slice()].concat();
@@ -718,15 +681,6 @@ mod tests {
         };
         let mut pdf =
             Pdf::open_mem_owned_with_options(bytes, options).expect("open test_0_1 fixture");
-        for number in 100..=164 {
-            let value = if number == 164 {
-                Object::Boolean(true)
-            } else {
-                Object::Reference(ObjectRef::new(number + 1, 0))
-            };
-            pdf.set_object(ObjectRef::new(number, 0), value);
-        }
-
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
@@ -1221,9 +1175,9 @@ mod tests {
             .len();
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
             let original = pdf.trailer_key_handle(b"QTest");
-            let (qtest, terminal_ref) = pdf
-                .resolve_to_terminal_ref(&original)
-                .expect("resolve qtest");
+            pdf.resolve(&original).expect("resolve qtest");
+            let qtest = original.clone();
+            let terminal_ref = original.object_ref();
             let mut stdout = Vec::new();
             let capacity = if fail_on == 1 { 0 } else { first_warning_len };
             let mut storage = vec![0; capacity];
@@ -1271,9 +1225,9 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open warning fixture");
         let original = pdf.trailer_key_handle(b"QTest");
-        let (qtest, terminal_ref) = pdf
-            .resolve_to_terminal_ref(&original)
-            .expect("resolve qtest");
+        pdf.resolve(&original).expect("resolve qtest");
+        let qtest = original.clone();
+        let terminal_ref = original.object_ref();
         let mut stdout = Vec::new();
         let mut stderr = WriteFailure;
         let mut diagnostics_written = 0;
@@ -1306,9 +1260,9 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open codec-error fixture");
         let original = pdf.trailer_key_handle(b"QTest");
-        let (qtest, terminal_ref) = pdf
-            .resolve_to_terminal_ref(&original)
-            .expect("resolve qtest");
+        pdf.resolve(&original).expect("resolve qtest");
+        let qtest = original.clone();
+        let terminal_ref = original.object_ref();
         let mut stdout = Vec::new();
         let mut stderr = WriteFailure;
         let mut diagnostics_written = 0;
@@ -1399,93 +1353,6 @@ mod tests {
         assert_eq!(
             stderr,
             b"WARNING: fixture.pdf (offset 202): stream /DecodeParms length is inconsistent with filters\n"
-        );
-    }
-
-    #[test]
-    fn chained_stream_warning_uses_terminal_stream_offset() {
-        let stream = b"<< /Filter [ /FlateDecode /FlateDecode ] \
-                       /DecodeParms [ null ] /Length 3 >>\n\
-                       stream\nabc\nendstream"
-            .to_vec();
-        let bytes = pdf_with_qtest(b"6 0 R", &[(6, b"7 0 R".to_vec()), (7, stream)]);
-        let options = PdfOpenOptions {
-            repair: true,
-            ..PdfOpenOptions::default()
-        };
-        let mut pdf =
-            Pdf::open_mem_owned_with_options(bytes, options).expect("open chained stream fixture");
-        pdf.set_object(
-            flpdf::ObjectRef::new(6, 0),
-            Object::Reference(flpdf::ObjectRef::new(7, 0)),
-        );
-        let terminal_offset = pdf
-            .source_stream_data_offset(flpdf::ObjectRef::new(7, 0))
-            .expect("locate terminal stream")
-            .expect("terminal stream offset");
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
-
-        run_test_0_1(
-            &mut pdf,
-            b"fixture.pdf",
-            &mut stdout,
-            &mut stderr,
-            &mut diagnostics_written,
-        )
-        .expect("run chained stream fixture");
-
-        assert_eq!(
-            stderr,
-            format!(
-                "WARNING: fixture.pdf (offset {terminal_offset}): \
-                 stream /DecodeParms length is inconsistent with filters\n"
-            )
-            .into_bytes()
-        );
-    }
-
-    #[test]
-    fn a_redirect_chain_exactly_at_the_terminal_ref_chase_limit_still_unparses() {
-        // Codex Review on PR #610, follow-up: `resolve_to_terminal_ref`
-        // (used for type inspection above) resolves `/QTest`'s own reference
-        // once for free before counting any further `Pdf::set_object`
-        // redirects, but the legacy `resolve_chain` walk feeding the final
-        // unparse lines used to re-spend that first hop -- a chain landing
-        // exactly at the ObjectHandle chase's own 64-redirect limit was one
-        // hop short of `resolve_chain`'s own budget, so `run_test_0_1`
-        // returned an error after printing the type-inspection lines but
-        // before either unparse line.
-        let bytes = pdf_with_qtest(b"1064 0 R", &[]);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open redirect-chain fixture");
-        pdf.set_object(flpdf::ObjectRef::new(1000, 0), Object::Boolean(true));
-        for number in 1001..=1064 {
-            pdf.set_object(
-                flpdf::ObjectRef::new(number, 0),
-                Object::Reference(flpdf::ObjectRef::new(number - 1, 0)),
-            );
-        }
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
-
-        run_test_0_1(
-            &mut pdf,
-            b"fixture.pdf",
-            &mut stdout,
-            &mut stderr,
-            &mut diagnostics_written,
-        )
-        .expect("a chain exactly at the chase limit must not error");
-
-        assert!(stderr.is_empty());
-        assert_eq!(
-            stdout,
-            b"/QTest is indirect and has type boolean (3)\n\
-              /QTest is Boolean with value true\n\
-              unparse: 1064 0 R\n\
-              unparseResolved: true\n"
         );
     }
 
