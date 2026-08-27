@@ -9939,8 +9939,8 @@ mod tests {
             body.to_vec(),
         ]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        let outcome = handle.try_dereference();
+        let handle: crate::ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let outcome = pdf.resolve(&handle);
         let warnings = pdf
             .repair_diagnostics()
             .entries()
@@ -9969,8 +9969,8 @@ mod tests {
             },
         )
         .expect("open strict fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        let outcome = handle.try_dereference();
+        let handle: crate::ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let outcome = pdf.resolve(&handle);
         let warnings = pdf
             .repair_diagnostics()
             .entries()
