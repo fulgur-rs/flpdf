@@ -10595,10 +10595,9 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("bad framing enters qpdf's recovery arm");
         assert_eq!(
             handle
@@ -10628,10 +10627,9 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf allows a malformed framing token into recovery");
         assert_eq!(
             handle
@@ -10679,10 +10677,9 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("endobj is a valid qpdf recovery terminator");
         assert_eq!(
             handle
