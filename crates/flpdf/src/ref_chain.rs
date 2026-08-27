@@ -1,3 +1,4 @@
+// cov:ignore-start: this module intentionally contains only documentation and a compile-time constant; llvm-cov emits no executable record
 //! qpdf correspondence: no shared reference-to-reference chain primitive.
 //!
 //! qpdf resolves an indirect `QPDFObjectHandle` through its own canonical
@@ -8,3 +9,4 @@
 
 /// Temporary depth bound for the reader cleanup slice.
 pub(crate) const MAX_REF_CHAIN_DEPTH: usize = 64;
+// cov:ignore-end
