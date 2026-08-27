@@ -9560,8 +9560,8 @@ mod tests {
     fn resolving_a_well_formed_document_raises_no_warnings() {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
         for number in 1..=5 {
-            let handle = pdf.get_object_handle(ObjectRef::new(number, 0));
-            handle.try_dereference().expect("resolve");
+            let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(number, 0));
+            pdf.resolve(&handle).expect("resolve");
         }
 
         let messages: Vec<String> = pdf
@@ -9597,8 +9597,8 @@ mod tests {
         );
 
         let mut pdf = Pdf::open_mem_owned(pdf).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        handle.try_dereference().expect("resolve");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle).expect("resolve");
 
         assert_eq!(
             handle
