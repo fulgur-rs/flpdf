@@ -12093,9 +12093,8 @@ mod tests {
 
         assert!(!pdf.reconstructed_xref());
 
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle)
             .expect("qpdf catches a type-1 header mismatch");
         assert!(handle.is_null());
         assert!(pdf
@@ -12117,9 +12116,8 @@ mod tests {
 
         assert!(!pdf.reconstructed_xref());
 
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle)
             .expect("absent post-rebuild resolves to null without panicking");
         assert!(handle.is_null(), "absent post-rebuild must resolve to null");
 
@@ -12147,10 +12145,8 @@ mod tests {
         };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
-        let handle = pdf.get_object_handle(ObjectRef::new(99, 0));
-        handle
-            .try_dereference()
-            .expect("absent entry resolves to null");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(99, 0));
+        pdf.resolve(&handle).expect("absent entry resolves to null");
         assert!(handle.is_null(), "absent entry must resolve to null");
         assert!(
             !pdf.reconstructed_xref(),
@@ -12165,9 +12161,8 @@ mod tests {
         pdf.resolver
             .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 0 });
 
-        let handle = pdf.get_object_handle(object_ref);
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)
             .expect("qpdf treats an offset-zero object as null");
 
         assert!(handle.is_null(), "offset zero must resolve to null");
