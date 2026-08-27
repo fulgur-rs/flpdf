@@ -892,7 +892,7 @@ fn qtest_test_39_uses_the_canonical_page_resource_route() {
     }
     for canonical in [
         "get_resources(false)",
-        "resolve_to_terminal",
+        "resolve_once",
         "as_dictionary",
     ] {
         assert!(
