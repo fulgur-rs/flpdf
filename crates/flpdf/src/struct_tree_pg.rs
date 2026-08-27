@@ -527,7 +527,8 @@ mod tests {
         // A dictionary carrying an /Obj key but no /Type is not an OBJR, so its
         // /Obj target is not collected (exercises the is_objr no-/Type arm).
         let mut objs = base_objs();
-        objs.insert(20, "<< /S /P /Obj 5 0 R >>".into());
+        objs.insert(20, "<< /S /P /Obj 5 0 R /K 21 0 R >>".into());
+        objs.insert(21, "7".into());
         let mut pdf = open(&objs);
 
         let targets = drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("ok");
