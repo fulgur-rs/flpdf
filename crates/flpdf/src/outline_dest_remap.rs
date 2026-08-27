@@ -467,7 +467,7 @@ fn remap_name_tree<R: Read + Seek>(
             for child in items {
                 if child.object_ref().is_some() {
                     remap_name_tree(pdf, &child, surviving, depth + 1, max_depth, visited)?;
-                }
+                } // cov:ignore: llvm-cov attributes this syntactic closing line to the recursive call span
             }
         }
     }
