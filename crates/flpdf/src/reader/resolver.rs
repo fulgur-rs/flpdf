@@ -9699,9 +9699,9 @@ mod tests {
             b"2 0 obj\n<< (orphan) >>\nendobj\n".to_vec(),
         ]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle.try_dereference().expect("qpdf-style recovery");
+        pdf.resolve(&handle).expect("qpdf-style recovery");
 
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert_eq!(
