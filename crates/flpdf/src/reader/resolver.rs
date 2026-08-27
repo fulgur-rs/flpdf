@@ -9381,10 +9381,9 @@ mod tests {
     #[test]
     fn a_streams_indirect_length_resolves_mid_parse_and_raw_read_uses_the_restored_position() {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
-        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        let stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
 
-        stream
-            .try_dereference()
+        pdf.resolve(&stream)
             .expect("a stream with an indirect /Length resolves");
 
         assert!(
@@ -9405,13 +9404,18 @@ mod tests {
             "the original branch must use its stored parse-time length and \
              restored stream offset, not a fresh /Length lookup"
         );
-        let crate::Object::Stream(materialized) = stream.materialize().expect("materialize source")
-        else {
-            panic!("resolved stream materializes as a stream"); // cov:ignore: established by setup
-        };
+        let canonical_stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
+        assert!(
+            canonical_stream.is_same_object_as(&stream),
+            "re-fetching the stream must return the canonical handle"
+        );
         assert_eq!(
-            materialized.data, STREAM_PAYLOAD,
-            "legacy materialization reads the original source through the same raw boundary"
+            canonical_stream
+                .get_raw_stream_data()
+                .expect("canonical raw stream data")
+                .as_slice(),
+            STREAM_PAYLOAD,
+            "the canonical handle must retain the original source boundary"
         );
         assert!(
             pdf.get_object_handle(ObjectRef::new(5, 0)).is_resolved(),
@@ -9426,8 +9430,8 @@ mod tests {
     #[test]
     fn raw_stream_data_reports_a_short_original_source_as_unsupported() {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
-        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-        stream.try_dereference().expect("resolve stream");
+        let stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve(&stream).expect("resolve stream");
         let stream_dict = stream.as_stream_dict().expect("stream dictionary");
 
         // `read_stream` cannot produce this shape: it validates the declared
