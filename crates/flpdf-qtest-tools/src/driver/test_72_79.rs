@@ -827,3 +827,63 @@ pub(crate) fn run_test_79<R: Read + Seek>(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{chase_array_item, chase_key, resolve_once, run_test_73};
+    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+
+    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture")
+    }
+
+    #[test]
+    fn canonical_helpers_resolve_one_hop_and_preserve_handles() {
+        let mut pdf = minimal_pdf();
+        let root = pdf.trailer_key_handle(b"Root");
+        let resolved = resolve_once(&mut pdf, &root).expect("resolve root");
+        assert_eq!(resolved.object_ref(), root.object_ref());
+
+        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        assert_eq!(
+            pages.object_ref().map(|object_ref| object_ref.number),
+            Some(2)
+        );
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(7)]);
+        assert_eq!(
+            chase_array_item(&mut pdf, &array, 0)
+                .expect("resolve array item")
+                .as_integer(),
+            Some(7)
+        );
+        assert!(chase_array_item(&mut pdf, &array, 1)
+            .expect("resolve missing array item")
+            .is_null());
+    }
+
+    #[test]
+    fn test_73_resolves_root_and_pages_without_legacy_chasing() {
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_73(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 73");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+}
