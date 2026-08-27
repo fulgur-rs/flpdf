@@ -3038,6 +3038,79 @@ mod tests {
     }
 
     #[test]
+    fn malformed_route_shapes_are_handled_without_remapping_unrelated_values() {
+        // Exercise the defensive branches at every ObjectHandle boundary:
+        // malformed /Annots and name-pair containers, incomplete actions and
+        // destinations, empty/non-reference destination arrays, and a
+        // non-dictionary outline item. None of these shapes should make a
+        // page or an unrelated value look like a local destination.
+        let mut pdf = open(build_min_pdf(
+            &[
+                (
+                    1,
+                    "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names 11 0 R /OpenAction 12 0 R >>",
+                ),
+                (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [50 0 R 51 0 R 52 0 R 53 0 R 54 0 R 55 0 R] >>",
+                ),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots 61 0 R >>",
+                ),
+                (10, "<< /First 20 0 R >>"),
+                (11, "<< /Dests 30 0 R >>"),
+                (12, "<< /S /GoTo >>"),
+                (20, "42"),
+                (30, "<< /Kids [31 0 R 32 0 R] >>"),
+                (31, "<< /Names [(orphan)] >>"),
+                (32, "<< /Names 62 0 R >>"),
+                (50, "<< /Type /Annot /A [5 0 R /Fit] >>"),
+                (51, "<< /Type /Annot /A << /Type /Action >> >>"),
+                (52, "<< /Type /Annot /A << /S /GoTo >> >>"),
+                (53, "<< /Type /Annot /Dest << /Foo /Bar >> >>"),
+                (54, "<< /Type /Annot /Dest [] >>"),
+                (55, "<< /Type /Annot /Dest [17 /Fit] >>"),
+                (61, "7"),
+                (62, "17"),
+            ],
+            "",
+        ));
+        let mut ref_map = BTreeMap::new();
+        ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(3, 0)]);
+        ref_map.insert(ObjectRef::new(4, 0), vec![ObjectRef::new(4, 0)]);
+        let result = synthetic_result(
+            &mut pdf,
+            vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)],
+            ref_map,
+        );
+        remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+        assert!(matches!(
+            pdf.resolve_object(ObjectRef::new(20, 0)).unwrap(),
+            Object::Integer(42)
+        ));
+        assert!(matches!(
+            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
+            Object::Dictionary(_)
+        ));
+        let name_leaf = dict_of(&mut pdf, ObjectRef::new(31, 0));
+        assert_eq!(name_leaf.get("Names"), Some(&Object::Array(Vec::new())));
+
+        // `remap_annot_array` is also defensive when called with a malformed
+        // handle directly; the public page walker filters this shape first.
+        let mut visited = BTreeSet::new();
+        remap_annot_array(
+            &mut pdf,
+            &ObjectHandle::integer(1),
+            &Surviving::from_rebuild(&result),
+            &mut visited,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn legacy_indirect_catalog_dests_remapped_and_nulled() {
         // Legacy (PDF 1.1) /Catalog /Dests held as an INDIRECT reference (obj30),
         // exercising the `remap_legacy_dests` path. Keep page1 (obj3), remove
