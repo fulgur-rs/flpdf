@@ -26,6 +26,10 @@ pub(crate) mod test_72_79;
 pub(crate) mod test_80_87;
 pub(crate) mod test_88_98;
 
+#[cfg(test)]
+pub(crate) static CURRENT_DIR_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let whoami = args
         .first()

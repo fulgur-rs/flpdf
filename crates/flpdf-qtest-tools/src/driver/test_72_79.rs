@@ -886,4 +886,95 @@ mod tests {
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
+
+    fn pdf_with_erase_trees() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+            (8, b"<< /Names [(1A) (a) (1B) (b) (1C) (c) (1D) (d)] >>"),
+            (9, b"<< /Kids [10 0 R 11 0 R] >>"),
+            (10, b"<< /Kids [12 0 R 13 0 R] /Limits [210 220] >>"),
+            (
+                11,
+                b"<< /Limits [230 250] /Nums [230 (230) 240 (240) 250 (250)] >>",
+            ),
+            (12, b"<< /Limits [210 210] /Nums [210 (210)] >>"),
+            (13, b"<< /Limits [220 220] /Nums [220 (220)] >>"),
+            (14, b"<< /Kids [15 0 R] >>"),
+            (15, b"<< /Kids [16 0 R 17 0 R] /Limits [310 320] >>"),
+            (16, b"<< /Limits [310 310] /Nums [310 (310)] >>"),
+            (17, b"<< /Limits [320 320] /Nums [320 (320)] >>"),
+            (18, b"<< /Kids [19 0 R 20 0 R] >>"),
+            (19, b"<< /Kids [21 0 R 22 0 R] /Limits [410 420] >>"),
+            (20, b"<< /Limits [430 430] /Nums [430 (430)] >>"),
+            (21, b"<< /Limits [410 410] /Nums [410 (410)] >>"),
+            (22, b"<< /Limits [420 420] /Nums [420 (420)] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [None; 23];
+        for &(number, body) in objects {
+            offsets[number as usize] = Some(bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 23\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            match offset {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 00000 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 23 /Root 1 0 R /Erase1 8 0 R /Erase2 9 0 R /Erase3 14 0 R /Erase4 18 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn test_75_resolves_number_tree_limits_through_canonical_handles() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(pdf_with_erase_trees(), PdfOpenOptions::default())
+                .expect("open erase tree fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        super::run_test_75(
+            &mut pdf,
+            b"erase-nntree.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 75");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert!(directory.path().join("a.pdf").is_file());
+    }
 }
