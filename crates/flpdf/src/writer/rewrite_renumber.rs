@@ -1007,6 +1007,7 @@ fn enqueue(
 /// inline structural nesting exceeds [`MAX_INLINE_DEPTH`] (leaving an over-deep
 /// reference un-rewritten would point it at the wrong renumbered object, so we
 /// refuse rather than emit a corrupt PDF).
+#[allow(dead_code)] // retained for the final raw-value route removal slice
 pub(crate) fn renumber_qpdf_refs_in_place<R: Read + Seek, M: NewNumberLookup>(
     pdf: &mut Pdf<R>,
     obj: &mut Object,

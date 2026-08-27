@@ -68,6 +68,7 @@ impl EncryptedStringEmitter {
         Self::from_context_with_boxed_iv_generator(ctx, Box::new(aes_iv_generator))
     }
 
+    #[allow(dead_code)] // retained for the final raw-value route removal slice
     pub(crate) fn write_object(
         &mut self,
         out: &mut Vec<u8>,
@@ -238,6 +239,7 @@ impl EncryptedStringEmitter {
             })
     }
 
+    #[allow(dead_code)] // retained for the final raw-value route removal slice
     pub(crate) fn write_stream_dict(
         &mut self,
         out: &mut Vec<u8>,

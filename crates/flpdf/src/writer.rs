@@ -3497,6 +3497,7 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
 /// The returned bool feeds [`write_reencoded_object`], which only appends a
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
 /// already a lone `/FlateDecode`.
+#[allow(dead_code)] // retained for the final raw-value route removal slice
 pub(crate) fn reencode_stream_for_compress(
     mut stream: crate::Stream,
     options: &WriterOptions,
@@ -3622,11 +3623,13 @@ pub(crate) fn reencode_stream_for_compress(
 /// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
 /// its lexicographic order with `/Length` last. Non-stream objects serialize
 /// normally. Shared by the legacy excluded-mode writer and the plain pipeline.
+#[allow(dead_code)] // retained for the final raw-value route removal slice
 pub(crate) struct StreamEncryptionOptions<'a> {
     context: Option<&'a EncryptionContext>,
     encrypt_strings: bool,
 }
 
+#[allow(dead_code)] // retained for the final raw-value route removal slice
 impl<'a> StreamEncryptionOptions<'a> {
     pub(crate) const fn new(context: Option<&'a EncryptionContext>, encrypt_strings: bool) -> Self {
         Self {
@@ -3636,6 +3639,7 @@ impl<'a> StreamEncryptionOptions<'a> {
     }
 }
 
+#[allow(dead_code)] // retained for the final raw-value route removal slice
 fn write_reencoded_object(
     bytes: &mut Vec<u8>,
     reencoded: &Object,
@@ -5910,6 +5914,7 @@ fn filter_chain_is_decodable(
 /// Whether a stream's `/Filter` value is a lone `/FlateDecode` bare name.
 /// qpdf's `QPDFWriter.cc:1265-1269` fast path recognizes the name form
 /// (including qpdf's `/Fl` abbreviation), but not a single-element array.
+#[allow(dead_code)] // retained for the final raw-value route removal slice
 pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
     match filter {
         Some(Object::Name(name)) => name.as_slice() == b"FlateDecode" || name.as_slice() == b"Fl",
