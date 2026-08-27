@@ -1257,9 +1257,8 @@ mod tests {
             .get_key(b"/OpenAction")
             .object_ref()
             .expect("indirect /OpenAction carrier is retained");
-        assert_eq!(
+        assert!(
             resolved_handle(&mut merged, open_action_ref).is_null(),
-            true,
             "the unselected page root is copied and nulled"
         );
     }
