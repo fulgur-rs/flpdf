@@ -10060,10 +10060,9 @@ mod tests {
                 offset: appended_at,
             },
         );
-        let handle = pdf.get_object_handle(ObjectRef::new(9, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(9, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf catches EOF while recording the cache extent");
         assert!(handle.is_null());
         let messages: Vec<String> = pdf
@@ -10108,9 +10107,9 @@ mod tests {
             b"3 0 obj\n<< /Type /Filler >>\nendobj\n".to_vec(),
         ]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle.try_dereference().expect("resolve");
+        pdf.resolve(&handle).expect("resolve");
 
         assert_eq!(
             handle
@@ -10181,10 +10180,9 @@ mod tests {
         );
 
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf recovers a stray close parenthesis");
 
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
@@ -10220,9 +10218,8 @@ mod tests {
             .expect("the fixture must contain the malformed integer");
 
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&handle)
             .expect("qpdf catches a body parse failure and resolves to null");
         assert!(handle.is_null());
 
