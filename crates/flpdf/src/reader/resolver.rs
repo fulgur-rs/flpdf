@@ -12270,15 +12270,14 @@ mod tests {
             ..Default::default()
         };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open fixture");
-        pdf.get_object_handle(ObjectRef::new(1, 0))
-            .try_dereference()
+        let object_one: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&object_one)
             .expect("canonical resolution must recover object 1");
 
-        assert_eq!(
-            pdf.resolve_object(ObjectRef::new(2, 0))
-                .expect("legacy cache must use the rebuilt offset"),
-            crate::Object::Integer(22)
-        );
+        let object_two: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&object_two)
+            .expect("canonical cache must use the rebuilt offset");
+        assert_eq!(object_two.as_integer(), Some(22));
         assert!(pdf.reconstructed_xref());
     }
 
@@ -12393,17 +12392,6 @@ mod tests {
             other => panic!("object stream must have a type-1 xref entry, got {other:?}"), // cov:ignore: fixture invariant is asserted by this test
         };
         let root_ref = pdf.root_ref().expect("catalog ref");
-        let mut root = pdf
-            .resolve_object(root_ref)
-            .expect("catalog")
-            .into_dict()
-            .expect("catalog dictionary");
-        root.insert("Recovered", crate::Object::Reference(object_ref));
-        pdf.set_object(root_ref, crate::Object::Dictionary(root));
-
-        // This is the state immediately after editing a member that was
-        // originally in an object stream: `set_object` records the dirty
-        // value and its old compressed-parent provenance.
         pdf.resolver.insert_xref_entry(
             object_ref,
             XrefEntry::Compressed {
@@ -12412,7 +12400,34 @@ mod tests {
             },
         );
         pdf.cache.set_compressed(object_ref, stream_ref.number, 0);
-        pdf.set_object(object_ref, crate::Object::Integer(42));
+        let recovered = pdf.get_object_handle(object_ref);
+        pdf.resolve(&recovered)
+            .expect("resolve compressed member canonically");
+        // The canonical resolver carries this relationship in the type-2 xref
+        // entry. Seed the legacy compatibility projection explicitly so this
+        // test can continue to exercise its later reconstruction cleanup
+        // without re-entering the legacy `set_object` route.
+        pdf.compressed_member_parents.insert(
+            object_ref,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: stream_ref,
+                parent_index: 0,
+                source_stream: stream_ref.number,
+                source_index: 0,
+            },
+        );
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root).expect("catalog");
+        root.replace_key(b"/Recovered", recovered).unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
+
+        // This is the state immediately after editing a member that was
+        // originally in an object stream: the canonical replacement records
+        // the dirty value and its old compressed-parent provenance.
+        pdf.set_object_handle(object_ref, ObjectHandle::integer(42))
+            .unwrap();
+
+        // The pre-recovery edit must retain its original object-stream provenance.
         assert_eq!(
             pdf.compressed_parent(object_ref),
             Some((stream_ref, 0)),
@@ -12440,11 +12455,13 @@ mod tests {
         let output = writer.get_buffer().expect("take full-rewrite output");
 
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen full-rewrite output");
+        let emitted: ObjectHandle = reopened.get_object_handle(emitted_ref);
+        reopened
+            .resolve(&emitted)
+            .expect("resolve rewritten object");
         assert_eq!(
-            reopened
-                .resolve_object(emitted_ref)
-                .expect("resolve rewritten object"),
-            crate::Object::Integer(42),
+            emitted.as_integer(),
+            Some(42),
             "a recovered standalone object must be emitted outside the obsolete ObjStm"
         );
     }
