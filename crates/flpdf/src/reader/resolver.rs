@@ -9908,9 +9908,9 @@ mod tests {
 
         let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle.try_dereference().expect("resolve");
+        pdf.resolve(&handle).expect("resolve");
 
         assert_eq!(
             handle
