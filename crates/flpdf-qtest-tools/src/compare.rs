@@ -527,4 +527,87 @@ mod tests {
         assert_eq!(filter[0].as_name(), Some(b"FlateDecode".to_vec()));
         assert_eq!(dict.get_key(b"/DecodeParms").as_array().unwrap().len(), 1);
     }
+
+    #[test]
+    fn filter_name_resolution_preserves_array_positions_and_rejects_scalars() {
+        let mut pdf = dummy_pdf();
+        let array = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+                ObjectHandle::integer(7),
+            ]),
+        )]);
+        let names = resolved_filter_names_exact(&array, &mut pdf).expect("resolve filter array");
+
+        assert_eq!(names.names, vec![b"FlateDecode".to_vec(), Vec::new()]);
+
+        let scalar =
+            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
+        assert!(resolved_filter_names_exact(&scalar, &mut pdf)
+            .expect("inspect scalar filter")
+            .names
+            .is_empty());
+    }
+
+    #[test]
+    fn crypt_cleanup_handles_single_non_array_and_non_crypt_filters() {
+        let mut pdf = dummy_pdf();
+        let single = ObjectHandle::dictionary(vec![
+            (b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::dictionary(Vec::new()),
+            ),
+        ]);
+        remove_consumed_crypt_stages(&single, &mut pdf).expect("remove single Crypt stage");
+        assert!(!single.has_key(b"/Filter"));
+        assert!(!single.has_key(b"/DecodeParms"));
+
+        let scalar =
+            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
+        remove_consumed_crypt_stages(&scalar, &mut pdf).expect("ignore scalar filter");
+
+        let non_crypt = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"FlateDecode".to_vec())]),
+        )]);
+        remove_consumed_crypt_stages(&non_crypt, &mut pdf).expect("ignore non-Crypt filter");
+        assert!(non_crypt.has_key(b"/Filter"));
+    }
+
+    #[test]
+    fn crypt_cleanup_preserves_mismatched_decode_parameters_and_removes_all_crypt_stages() {
+        let mut pdf = dummy_pdf();
+        let mismatched = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"Crypt".to_vec()),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ]),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
+            ),
+        ]);
+        remove_consumed_crypt_stages(&mismatched, &mut pdf)
+            .expect("inspect mismatched Crypt parameters");
+        assert!(mismatched.has_key(b"/Filter"));
+
+        let all_crypt = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::name(b"Crypt".to_vec())]),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
+            ),
+        ]);
+        remove_consumed_crypt_stages(&all_crypt, &mut pdf).expect("remove the only Crypt stage");
+        assert!(!all_crypt.has_key(b"/Filter"));
+        assert!(!all_crypt.has_key(b"/DecodeParms"));
+    }
 }
