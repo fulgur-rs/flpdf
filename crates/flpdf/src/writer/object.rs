@@ -173,8 +173,16 @@ fn destroyed_unparse_error() -> Error {
 }
 
 fn write_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
-    out.push(b'/');
-    crate::object::write_name_escaped(out, legacy_dictionary_key(key));
+    if key.starts_with(b"/") {
+        out.push(b'/');
+        crate::object::write_name_escaped(out, legacy_dictionary_key(key));
+    } else {
+        // QPDF_Name::normalizeName preserves the first byte of a raw qpdf
+        // dictionary key (`libqpdf/QPDF_Name.cc:27-50`). In particular,
+        // `replaceKey("Array1", ...)` is intentionally emitted as the
+        // slashless token `Array1`; do not silently canonicalize it here.
+        crate::object::write_name_escaped(out, key);
+    }
 }
 
 impl ObjectWriterEmission for ObjectHandle {
@@ -3272,6 +3280,15 @@ fn write_id_style_value_handle_with_ref_map(
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    #[test]
+    fn dictionary_key_writer_preserves_qpdfs_first_byte() {
+        let mut out = Vec::new();
+        write_dictionary_key(&mut out, b"/Canonical");
+        out.push(b' ');
+        write_dictionary_key(&mut out, b"Raw");
+        assert_eq!(out, b"/Canonical Raw");
+    }
 
     #[test]
     fn direct_object_value_container_fallbacks_cover_plain_qdf_and_mapped_walkers() -> Result<()> {

@@ -1338,7 +1338,26 @@ impl ObjectHandle {
         parsed_offset: i64,
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
-        let value = canonicalize_object_value(value);
+        Self::new_direct_with_resolver_inner(
+            canonicalize_object_value(value),
+            parsed_offset,
+            resolver,
+        )
+    }
+
+    /// Construct the result of qpdf's `shallowCopy` without rewriting raw
+    /// dictionary keys. `QPDF_Name::normalizeName` preserves a key's first
+    /// byte, so a caller that supplied `replaceKey("Array1", ...)` must still
+    /// see that slashless key when the copied dictionary is later emitted.
+    fn new_direct_preserving_dictionary_keys(value: ObjectValue, parsed_offset: i64) -> Self {
+        Self::new_direct_with_resolver_inner(value, parsed_offset, None)
+    }
+
+    fn new_direct_with_resolver_inner(
+        value: ObjectValue,
+        parsed_offset: i64,
+        resolver: Option<Weak<dyn DocumentResolver>>,
+    ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             state: Rc::new(RefCell::new(value)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
@@ -2857,7 +2876,10 @@ impl ObjectHandle {
     /// that has not yet been resolved returns `None` too, the same as a
     /// resolved value of a different type. Cloning the returned map clones
     /// only the child `Rc` handles, not their subtrees. Dictionary keys use
-    /// qpdf's decoded canonical name strings, including the leading `/`.
+    /// qpdf's usual decoded name spelling with a leading `/` for
+    /// parser-created and factory-created dictionaries. A raw key supplied to
+    /// [`Self::replace_key`] retains its qpdf spelling, including a
+    /// deliberately slashless first byte.
     pub fn as_dictionary(&self) -> Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => Some(entries.clone()),
@@ -3670,7 +3692,10 @@ impl ObjectHandle {
         }
         stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
             self.with_value(|value| match value {
-                Some(v) => Ok(ObjectHandle::from_value(shallow_copy_value(v)?)),
+                Some(v) => Ok(ObjectHandle::new_direct_preserving_dictionary_keys(
+                    shallow_copy_value(v)?,
+                    NO_PARSED_OFFSET,
+                )),
                 None => Ok(ObjectHandle::null()),
             })
         })
@@ -5812,6 +5837,31 @@ impl ObjectHandle {
         // instead of letting it drop normally.
         unparse_drop_iteratively(materialized);
         out
+    }
+
+    /// This handle's resolved qpdf-syntax form through a fallible error
+    /// boundary, porting `QPDFObjectHandle::unparseResolved`
+    /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`). Unlike
+    /// [`Self::unparse_resolved`], this variant first resolves an unresolved
+    /// indirect handle and preserves qpdf's logic errors for reserved and
+    /// destroyed values (`QPDF_Reserved::unparse`,
+    /// `libqpdf/QPDF_Reserved.cc:22-26`; `QPDF_Destroyed::unparse`,
+    /// `libqpdf/QPDF_Destroyed.cc:24-29`).
+    ///
+    /// The existing nonfallible method remains the no-hidden-I/O
+    /// materialization convenience used by inspection paths. New qpdf-native
+    /// callers that must observe the source exception contract should use
+    /// this method instead.
+    pub fn try_unparse_resolved(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        self.with_value(|value| match value {
+            Some(ObjectValue::Reserved) => Err(reserved_unparse_error()),
+            Some(ObjectValue::Destroyed) => Err(destroyed_unparse_error()),
+            Some(ObjectValue::Unresolved) => Err(unresolved_unparse_error()),
+            Some(_) => Ok(()),
+            None => Ok(()), // cov:ignore: every ObjectHandle carries a value state
+        })?;
+        Ok(self.unparse_resolved())
     }
 
     /// Replace this handle's own value in place, preserving its identity
@@ -9866,6 +9916,15 @@ mod internal_state_value_tests {
         assert!(destroyed_copy
             .to_string()
             .contains("attempted to shallow copy QPDFObjectHandle from destroyed QPDF"));
+
+        let unresolved = ObjectHandle::from_value(ObjectValue::Unresolved);
+        assert_eq!(
+            unresolved
+                .try_unparse_resolved()
+                .expect_err("an unresolved value cannot be unparsed")
+                .to_string(),
+            "attempted to unparse an unresolved QPDFObjectHandle"
+        );
     }
 }
 
