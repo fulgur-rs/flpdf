@@ -513,3 +513,101 @@ pub(crate) fn run_test_33<R: Read + Seek>(
     std::fs::write("a.pdf", &bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{open_secondary_pdf, run_test_30};
+    use flpdf::{EncryptParams, Pdf, PdfWriter};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore test current directory");
+        }
+    }
+
+    #[test]
+    fn test_30_consumes_the_canonical_copy_encryption_source() {
+        let _lock = CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let secondary = directory.path().join("secondary.pdf");
+
+        let mut donor = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open donor PDF");
+        let mut donor_writer = PdfWriter::new(&mut donor);
+        donor_writer
+            .set_output_file(&secondary)
+            .expect("configure donor output");
+        donor_writer.set_static_id(true);
+        donor_writer.set_encryption_parameters(EncryptParams::v4_aes128(
+            b"user".to_vec(),
+            b"owner".to_vec(),
+        ));
+        donor_writer.write().expect("write encrypted donor");
+
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut target = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open target PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_30(
+            &mut target,
+            b"target.pdf",
+            Some(Path::new(&secondary).as_os_str()),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 30");
+
+        assert!(directory.path().join("b.pdf").is_file());
+        // qpdf's test_30 prints nothing to stdout when the copied output's
+        // page contents match; a non-empty stdout means the "oops -- page
+        // contents don't match" branch fired, which a silent
+        // copy_encryption_parameters regression must not slip past.
+        assert!(
+            stdout.is_empty(),
+            "test 30 must report no content mismatch: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+
+        // The whole point of test 30 is that `b.pdf` carries the donor's
+        // copied /Encrypt parameters, not that it merely exists: reopen it
+        // with the donor's user password and confirm it is still encrypted
+        // and that password still authenticates, so a
+        // copy_encryption_parameters regression that produced a plaintext
+        // (but otherwise page-identical) output is caught.
+        let copied = open_secondary_pdf(
+            Path::new(&directory.path().join("b.pdf")).as_os_str(),
+            b"user",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("reopen the copy-encryption output with the donor's user password");
+        assert!(
+            copied.is_encrypted(),
+            "test 30's output must still carry the donor's copied /Encrypt dictionary"
+        );
+        assert!(
+            copied.user_password_matched(),
+            "the donor's user password must still authenticate the copied output"
+        );
+    }
+}

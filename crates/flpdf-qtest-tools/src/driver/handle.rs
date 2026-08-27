@@ -295,13 +295,8 @@ fn crypt_decode_params_filterable_handle<R: Read + Seek>(
 fn resolve_decode_param_dict_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[Vec<u8>],
-    dictionary: &ObjectHandle,
+    entries: std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
 ) -> flpdf::Result<ObjectHandle> {
-    pdf.resolve(dictionary)?;
-    let dictionary = dictionary.clone();
-    let Some(entries) = dictionary.as_dictionary() else {
-        return Ok(ObjectHandle::dictionary(Vec::new()));
-    };
     let mut resolved = Vec::new();
     for (key, value) in entries {
         let consumed = filters.iter().any(|filter| {
@@ -326,8 +321,8 @@ fn resolve_decode_param_for_filters_handle<R: Read + Seek>(
     value: &ObjectHandle,
 ) -> flpdf::Result<(ObjectHandle, Option<ObjectRef>)> {
     let (value, _, terminal_ref) = resolve_handle(pdf, value)?;
-    let value = if value.as_dictionary().is_some() {
-        resolve_decode_param_dict_handle(pdf, filters, &value)?
+    let value = if let Some(entries) = value.as_dictionary() {
+        resolve_decode_param_dict_handle(pdf, filters, entries)?
     } else {
         value
     };
@@ -658,6 +653,141 @@ mod tests {
 
         assert!(!resolved.is_filterable());
         assert!(!resolved.filter_input_handle().has_key(b"/Filter"));
+    }
+
+    #[test]
+    fn object_serializer_inlines_a_direct_stream_dictionary() {
+        let mut pdf = handle_pdf();
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(3))]),
+            Rc::new(b"abc".to_vec()),
+        );
+
+        assert_eq!(
+            write_qpdf_object_handle(&mut pdf, &stream).expect("serialize stream"),
+            b"<< /Length 3 >>"
+        );
+    }
+
+    #[test]
+    fn stream_dictionary_without_a_filter_is_unfiltered() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(Vec::new());
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve stream dictionary without Filter");
+
+        assert!(resolved.is_filterable());
+        assert!(!resolved.filter_input_handle().has_key(b"/Filter"));
+    }
+
+    #[test]
+    fn an_indirect_filter_resolving_to_null_is_an_empty_filter_chain() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(99, 0)),
+        )]);
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve dangling Filter handle");
+
+        assert!(resolved.is_filterable());
+        assert!(resolved.filter_input_handle().get_key(b"/Filter").is_null());
+    }
+
+    #[test]
+    fn an_empty_decode_parameter_array_aligns_as_absent_parameters() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"/DecodeParms".to_vec(), ObjectHandle::array(Vec::new())),
+        ]);
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve empty DecodeParms array");
+
+        assert!(resolved.is_filterable());
+        assert!(resolved.decode_param_type_warnings().is_empty());
+    }
+
+    #[test]
+    fn crypt_null_decode_parameters_are_accepted() {
+        let mut pdf = handle_pdf();
+        let null = ObjectHandle::null();
+
+        assert!(crypt_decode_params_filterable_handle(&mut pdf, Some(&null))
+            .expect("inspect null Crypt DecodeParms"));
+    }
+
+    #[test]
+    fn crypt_scalar_decode_parameters_are_non_dictionary_warnings_but_filterable() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(vec![
+            (b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
+            (b"/DecodeParms".to_vec(), ObjectHandle::integer(42)),
+        ]);
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve scalar Crypt DecodeParms");
+
+        assert!(resolved.is_filterable());
+        assert_eq!(
+            resolved.decode_param_type_warnings()[0].object_type,
+            "integer"
+        );
+    }
+
+    #[test]
+    fn crypt_filter_array_removes_only_the_crypt_stage() {
+        let mut pdf = handle_pdf();
+        let source = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"Crypt".to_vec()),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ]),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::dictionary(Vec::new()),
+                    ObjectHandle::null(),
+                ]),
+            ),
+        ]);
+
+        let resolved = resolve_stream_dictionary_handle(&mut pdf, &source)
+            .expect("resolve a filter array containing Crypt");
+        let filters = resolved
+            .filter_input_handle()
+            .get_key(b"/Filter")
+            .as_array()
+            .expect("remaining filter array");
+
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].as_name(), Some(b"FlateDecode".to_vec()));
+
+        // The removed Crypt stage's /DecodeParms slot (index 0, the empty
+        // dictionary) must be dropped along with it, so the remaining
+        // FlateDecode stage still pairs with its own params (the trailing
+        // null, at the pre-removal index 1) rather than being shifted onto
+        // the wrong slot.
+        let decode_parms = resolved
+            .filter_input_handle()
+            .get_key(b"/DecodeParms")
+            .as_array()
+            .expect("remaining DecodeParms array");
+        assert_eq!(decode_parms.len(), 1);
+        assert!(
+            decode_parms[0].is_null(),
+            "the surviving FlateDecode stage must keep its own (null) params, not the \
+             removed Crypt stage's empty dictionary"
+        );
     }
 
     #[test]
