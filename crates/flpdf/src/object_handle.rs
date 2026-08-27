@@ -5854,12 +5854,14 @@ impl ObjectHandle {
     /// this method instead.
     pub fn try_unparse_resolved(&self) -> Result<Vec<u8>> {
         self.try_dereference()?;
-        self.with_value(|value| match value {
-            Some(ObjectValue::Reserved) => Err(reserved_unparse_error()),
-            Some(ObjectValue::Destroyed) => Err(destroyed_unparse_error()),
-            Some(ObjectValue::Unresolved) => Err(unresolved_unparse_error()),
-            Some(_) => Ok(()),
-            None => Ok(()), // cov:ignore: every ObjectHandle carries a value state
+        self.with_value(|value| {
+            let value = value.expect("every ObjectHandle carries a value state");
+            match value {
+                ObjectValue::Reserved => Err(reserved_unparse_error()),
+                ObjectValue::Destroyed => Err(destroyed_unparse_error()),
+                ObjectValue::Unresolved => Err(unresolved_unparse_error()),
+                _ => Ok(()),
+            }
         })?;
         Ok(self.unparse_resolved())
     }
