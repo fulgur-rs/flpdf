@@ -185,7 +185,8 @@ pub(crate) fn run_test_88<R: Read + Seek>(
 
     // Test errors (test_driver.cc:3155-3159).
     let root = root_handle(pdf);
-    let root = pdf.resolve_to_terminal(&root)?;
+    pdf.resolve(&root)?;
+    let root = root.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let arr2 = replace_key_and_get_new(&root, b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
     // GAP(QPDFObjectHandle::setObjectDescription): no public equivalent
@@ -240,13 +241,15 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let root = root_handle(pdf);
-    let root = pdf.resolve_to_terminal(&root)?;
+    pdf.resolve(&root)?;
+    let root = root.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     root.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let object5_ref = pdf.get_object_handle(ObjectRef::new(5, 0));
-    let object5 = pdf.resolve_to_terminal(&object5_ref)?;
+    pdf.resolve(&object5_ref)?;
+    let object5 = object5_ref.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     object5.replace_key(b"/X", null.clone())?;
 
@@ -673,4 +676,57 @@ pub(crate) fn run_test_98<R: Read + Seek>(
     // than against an independent oracle, so even a partial port here would
     // be a self-comparison on top of being unreachable.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run_test_88, run_test_89};
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture")
+    }
+
+    #[test]
+    fn test_88_resolves_the_root_before_qpdf_mutations() {
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_88(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 88");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_89_resolves_root_and_unknown_object_handles_once() {
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_89(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 89");
+    }
 }
