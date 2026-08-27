@@ -11984,28 +11984,29 @@ mod tests {
         let mut pdf =
             Pdf::open_mem_owned_with_options(synthetic_mismatch_pdf(true), options).expect("open");
 
+        let recovered: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&recovered)
+            .expect("public resolve must use the reconstructed xref");
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(1, 0))
-                .expect("public resolve must use the reconstructed xref"),
-            crate::Object::String(b"recovered".to_vec()),
-            "the legacy public resolver must not turn a recoverable object into null"
+            recovered.as_string(),
+            Some(b"recovered".to_vec()),
+            "canonical resolver must not turn a recoverable object into null"
         );
         assert!(pdf.reconstructed_xref());
 
-        let mut borrowed_pdf = Pdf::open_mem_owned_with_options(
+        let mut second_pdf = Pdf::open_mem_owned_with_options(
             synthetic_mismatch_pdf(true),
             crate::PdfOpenOptions {
                 repair: true,
                 ..Default::default()
             },
         )
-        .expect("open borrowed-resolve fixture");
-        assert_eq!(
-            borrowed_pdf
-                .resolve_borrowed(ObjectRef::new(1, 0))
-                .expect("public borrowed resolver must use the reconstructed xref"),
-            &crate::Object::String(b"recovered".to_vec())
-        );
+        .expect("open second recovery fixture");
+        let second_recovered: ObjectHandle = second_pdf.get_object_handle(ObjectRef::new(1, 0));
+        second_pdf
+            .resolve(&second_recovered)
+            .expect("canonical resolver must use the reconstructed xref");
+        assert_eq!(second_recovered.as_string(), Some(b"recovered".to_vec()));
     }
 
     #[test]
@@ -12018,13 +12019,10 @@ mod tests {
             },
         )
         .expect("open absent-recovery fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        assert_eq!(
-            pdf.resolve_object(ObjectRef::new(1, 0))
-                .expect("absent recovered object must resolve to null"),
-            crate::Object::Null
-        );
+        pdf.resolve(&handle)
+            .expect("absent recovered object must resolve to null");
         assert!(pdf.reconstructed_xref());
         assert!(handle.is_resolved());
         assert!(handle.is_null());
@@ -12043,11 +12041,10 @@ mod tests {
         )
         .expect("open");
 
-        assert_eq!(
-            pdf.resolve_object(object_ref)
-                .expect("an unindexed packed member must resolve to null"),
-            crate::Object::Null
-        );
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)
+            .expect("an unindexed packed member must resolve to null");
+        assert!(handle.is_null());
         assert!(pdf.reconstructed_xref());
     }
 
@@ -12068,10 +12065,17 @@ mod tests {
         )
         .expect("open malformed-recovery fixture");
 
-        let stream = pdf
-            .resolve_object(ObjectRef::new(1, 0))
+        let stream: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&stream)
             .expect("qpdf stream recovery must run after xref reconstruction");
-        assert_eq!(stream.as_stream().expect("recovered stream").data, b"abc\n");
+        assert!(stream.as_stream_dict().is_some(), "recovered stream");
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("recovered stream data")
+                .as_slice(),
+            b"abc\n"
+        );
         assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
             entry.message
                 == format!("(object 1 0, offset {stream_offset}): recovered stream length: 4")
