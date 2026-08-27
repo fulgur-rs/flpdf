@@ -7480,7 +7480,7 @@ mod tests {
     #[test]
     fn a_vended_handle_reaches_its_documents_resolver_rather_than_reporting_a_dropped_pdf() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
         handle.try_dereference().expect(
             "an attached resolver resolves an uncompressed object; \
@@ -9263,8 +9263,7 @@ mod tests {
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
         let before = pdf.resolver.with_reader_mut(|reader| reader.reads);
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("an uncompressed object resolves");
 
         let after_first = pdf.resolver.with_reader_mut(|reader| reader.reads);
@@ -9281,9 +9280,7 @@ mod tests {
             Some(b"Catalog".to_vec())
         );
 
-        handle
-            .try_dereference()
-            .expect("a resolved slot is terminal");
+        pdf.resolve(&handle).expect("a resolved slot is terminal");
 
         assert_eq!(
             pdf.resolver.with_reader_mut(|reader| reader.reads),
@@ -9308,8 +9305,8 @@ mod tests {
     fn a_nested_reference_resolves_to_the_documents_canonical_handle() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
 
-        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-        catalog.try_dereference().expect("resolve the catalog");
+        let catalog: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&catalog).expect("resolve the catalog");
         let minted_child = catalog
             .as_dictionary()
             .expect("the catalog is a dictionary")
@@ -9322,8 +9319,8 @@ mod tests {
         );
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pages.try_dereference().expect("resolve the page tree");
+        let pages: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&pages).expect("resolve the page tree");
         let kid = pages
             .as_dictionary()
             .expect("the page tree is a dictionary")
@@ -9348,8 +9345,8 @@ mod tests {
     fn the_canonical_resolver_records_qpdf_offsets_for_plain_and_stream_objects() {
         for object_ref in [ObjectRef::new(1, 0), ObjectRef::new(4, 0)] {
             let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
-            let handle = pdf.get_object_handle(object_ref);
-            handle.try_dereference().expect("canonical resolution");
+            let handle: ObjectHandle = pdf.get_object_handle(object_ref);
+            pdf.resolve(&handle).expect("canonical resolution");
             assert_ne!(
                 handle.get_parsed_offset(),
                 NO_PARSED_OFFSET,
