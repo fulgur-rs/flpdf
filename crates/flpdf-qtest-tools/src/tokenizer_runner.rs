@@ -294,8 +294,8 @@ fn process(
         // unfilterable stream: an flpdf-only choice with no qpdf
         // counterpart, not yet reconciled with qpdf's actual
         // abort-on-first-failure behavior. Keep the canonical handle and
-        // avoid Pdf::resolve_borrowed so a stream-length recovery emits
-        // only one warning sequence.
+        // avoid a second non-canonical reader lookup so a stream-length
+        // recovery emits only one warning sequence.
         let mut sink = ObjectStreamPipeline::default();
         let mut filtering_attempted = false;
         let piped = stream_handle.pipe_stream_data(
@@ -378,7 +378,8 @@ fn canonical_page_content_bytes<R: Read + Seek>(
 
     let contents = page.get_key(b"/Contents");
     let contents_was_indirect = contents.object_ref().is_some();
-    let (contents, _) = pdf.resolve_to_terminal_ref(&contents)?;
+    pdf.resolve(&contents)?;
+    let contents = contents.clone();
     if contents.is_null() {
         return Ok(Vec::new());
     }
@@ -413,7 +414,8 @@ fn collect_canonical_content_streams<R: Read + Seek>(
     streams: &mut Vec<ObjectHandle>,
     allow_array: bool,
 ) -> FlpdfResult<()> {
-    let (value, _) = pdf.resolve_to_terminal_ref(value)?;
+    pdf.resolve(value)?;
+    let value = value.clone();
     if value.as_stream_dict().is_some() {
         streams.push(value);
         return Ok(());
@@ -447,11 +449,11 @@ fn collect_canonical_content_streams<R: Read + Seek>(
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
     let type_handle = dict.get_key(b"/Type");
     // qpdf's getKey()/isName() dereference through the canonical object
-    // handle. Follow the complete holder chain here as well, while keeping
-    // the decode boundary below in its existing Dictionary-shaped form.
-    let Ok((type_handle, _)) = pdf.resolve_to_terminal_ref(&type_handle) else {
+    // handle. Resolve the parsed child once, while keeping the decode
+    // boundary below in its existing Dictionary-shaped form.
+    if pdf.resolve(&type_handle).is_err() {
         return false;
-    };
+    }
     matches!(type_handle.as_name(), Some(name) if name.as_slice() == b"ObjStm")
 }
 
@@ -578,7 +580,7 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flpdf::{Object, ObjectHandle, ObjectRef};
+    use flpdf::ObjectHandle;
 
     #[test]
     fn object_stream_pipeline_collects_bytes_and_has_qpdf_identifier() {
@@ -611,32 +613,10 @@ mod tests {
     #[test]
     fn resolve_objstm_type_true_for_single_hop_reference() {
         let mut pdf = open_minimal_pdf();
-        pdf.set_object(ObjectRef::new(100, 0), Object::Name(b"ObjStm".to_vec()));
-        let dict = ObjectHandle::dictionary(vec![(
-            b"Type".to_vec(),
-            pdf.get_object_handle(ObjectRef::new(100, 0)),
-        )]);
-        assert!(resolve_objstm_type(&mut pdf, &dict));
-    }
-
-    #[test]
-    fn resolve_objstm_type_true_for_two_hop_reference_chain() {
-        // A bare top-level object body of "N G R" parses as an Integer, not
-        // a Reference (qpdf does the same), so this exact holder chain
-        // (100 -> 101 -> /ObjStm) cannot arise from parsing raw PDF bytes.
-        // pdf.set_object constructs it directly to exercise the full
-        // resolve_ref_chain contract defensively, matching how every other
-        // flpdf consumer of that shared primitive is expected to behave.
-        let mut pdf = open_minimal_pdf();
-        pdf.set_object(
-            ObjectRef::new(100, 0),
-            Object::Reference(ObjectRef::new(101, 0)),
-        );
-        pdf.set_object(ObjectRef::new(101, 0), Object::Name(b"ObjStm".to_vec()));
-        let dict = ObjectHandle::dictionary(vec![(
-            b"Type".to_vec(),
-            pdf.get_object_handle(ObjectRef::new(100, 0)),
-        )]);
+        let object = pdf
+            .make_indirect_from_object_handle(ObjectHandle::name(b"ObjStm".to_vec()))
+            .expect("allocate an indirect type name");
+        let dict = ObjectHandle::dictionary(vec![(b"Type".to_vec(), object)]);
         assert!(resolve_objstm_type(&mut pdf, &dict));
     }
 
