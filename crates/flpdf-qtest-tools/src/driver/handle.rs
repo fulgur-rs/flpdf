@@ -149,8 +149,8 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
     let mut entries = source
         .as_dictionary()
         .ok_or_else(|| Error::System("stream dictionary access on non-dictionary object".into()))?;
-    if filter.is_some() {
-        entries.insert(b"/Filter".to_vec(), filter.expect("filter checked above"));
+    if let Some(filter) = filter {
+        entries.insert(b"/Filter".to_vec(), filter);
     }
     if !decode_params_value.is_null() || !resolved_decode_params.is_null() {
         entries.insert(b"/DecodeParms".to_vec(), resolved_decode_params);

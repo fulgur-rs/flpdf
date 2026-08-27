@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn clean_encryption_is_a_noop_without_encrypt() {
         let mut pdf = Pdf::open_mem_owned(
-            include_bytes!("../../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         )
         .expect("open fixture");
         let trailer = pdf.trailer();
