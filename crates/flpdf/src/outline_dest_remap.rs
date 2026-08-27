@@ -2192,15 +2192,8 @@ mod tests {
         let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         let first = pdf.get_object_handle(ObjectRef::new(40, 0));
-        remap_outline_tree(
-            &mut pdf,
-            first,
-            0,
-            100,
-            &surviving,
-            &mut visited,
-        )
-        .expect("cyclic /Next chain must terminate gracefully");
+        remap_outline_tree(&mut pdf, first, 0, 100, &surviving, &mut visited)
+            .expect("cyclic /Next chain must terminate gracefully");
         assert!(visited.contains(&ObjectRef::new(40, 0)));
         assert!(visited.contains(&ObjectRef::new(41, 0)));
     }
@@ -2225,15 +2218,8 @@ mod tests {
         let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         let first = pdf.get_object_handle(ObjectRef::new(40, 0));
-        let err = remap_outline_tree(
-            &mut pdf,
-            first,
-            0,
-            3,
-            &surviving,
-            &mut visited,
-        )
-        .expect_err("depth limit must be enforced");
+        let err = remap_outline_tree(&mut pdf, first, 0, 3, &surviving, &mut visited)
+            .expect_err("depth limit must be enforced");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
@@ -2256,15 +2242,8 @@ mod tests {
         let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         let root = pdf.get_object_handle(ObjectRef::new(50, 0));
-        remap_name_tree(
-            &mut pdf,
-            &root,
-            &surviving,
-            0,
-            100,
-            &mut visited,
-        )
-        .expect("cyclic /Kids chain must terminate gracefully");
+        remap_name_tree(&mut pdf, &root, &surviving, 0, 100, &mut visited)
+            .expect("cyclic /Kids chain must terminate gracefully");
         assert!(visited.contains(&ObjectRef::new(50, 0)));
         assert!(visited.contains(&ObjectRef::new(51, 0)));
     }
@@ -2289,15 +2268,8 @@ mod tests {
         let surviving = Surviving::default();
         let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
         let root = pdf.get_object_handle(ObjectRef::new(50, 0));
-        let err = remap_name_tree(
-            &mut pdf,
-            &root,
-            &surviving,
-            0,
-            3,
-            &mut visited,
-        )
-        .expect_err("depth limit must be enforced");
+        let err = remap_name_tree(&mut pdf, &root, &surviving, 0, 3, &mut visited)
+            .expect_err("depth limit must be enforced");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
