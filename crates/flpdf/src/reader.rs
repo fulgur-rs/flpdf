@@ -1588,16 +1588,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// through `updateCache`, whose existing cache slot adopts the replacement
     /// `QPDFValue` (`libqpdf/QPDF.cc:1986-1993,1843-1857`;
     /// `libqpdf/qpdf/QPDFObject_private.hh:117-120`). The canonical
-    /// [`Self::replace_object_handle`] primitive performs that same slot
+    /// `Self::replace_object_handle` primitive performs that same slot
     /// replacement while retaining the target handle identity.
     ///
     /// qpdf records the shared value transition itself rather than exposing a
     /// separate dirty bit. flpdf's writer still tracks dirty object references,
     /// so this setter deliberately delegates to the primitive that calls
-    /// [`Self::mark_object_handle_mutated`] after a successful replacement. As
+    /// `Self::mark_object_handle_mutated` after a successful replacement. As
     /// with [`Self::set_object`], every successful write-back marks the target
     /// dirty; callers that temporarily restore a previously clean value must
-    /// explicitly call [`Self::clear_dirty`] after the restore.
+    /// explicitly call `Self::clear_dirty` after the restore.
     ///
     /// The legacy [`Self::set_object`] API remains unchanged for consumers that
     /// still provide a materialized [`Object`].
