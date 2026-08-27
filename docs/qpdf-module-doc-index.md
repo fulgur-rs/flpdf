@@ -136,7 +136,7 @@
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |
 | `crates/flpdf/src/reader/resolver.rs` | correspondence | \`QPDF::resolve\` (\`libqpdf/QPDF.cc:1700-1753\`) and the \`QPDF::Members\` fields it touches |
-| `crates/flpdf/src/ref_chain.rs` | correspondence | QPDF.cc indirect-reference resolution represented as a bounded shared primitive |
+| `crates/flpdf/src/ref_chain.rs` | correspondence | no shared reference-to-reference chain primitive |
 | `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
