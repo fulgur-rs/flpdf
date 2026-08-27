@@ -11844,15 +11844,14 @@ mod tests {
         // (QPDF.cc:516-575,1194-1210). This source-derived private-method
         // contract is distinct from the public probe's removal_proxy, which
         // observes replaceObject(..., newNull()).
-        pdf.get_object_handle(ObjectRef::new(1, 0))
-            .try_dereference()
+        let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&recovery_trigger)
             .expect("the damaged header must recover object 1");
 
         assert!(pdf.reconstructed_xref());
         assert!(pdf.get_xref_table().contains_key(&removed_ref));
-        let recovered = pdf.get_object_handle(removed_ref);
-        recovered
-            .try_dereference()
+        let recovered: ObjectHandle = pdf.get_object_handle(removed_ref);
+        pdf.resolve(&recovered)
             .expect("reconstruction must mint a canonical handle");
         assert_eq!(recovered.as_integer(), Some(99));
         assert!(pdf.resolver.registered_handle(removed_ref).is_some());
@@ -11957,15 +11956,14 @@ mod tests {
         .expect("open recovery fixture");
         let removed_ref = ObjectRef::new(3, 0);
 
-        pdf.get_object_handle(ObjectRef::new(1, 0))
-            .try_dereference()
+        let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&recovery_trigger)
             .expect("the damaged header must recover object 1");
 
         assert!(pdf.reconstructed_xref());
         assert!(pdf.resolver.xref_entry(removed_ref).is_some());
-        let recovered = pdf.get_object_handle(removed_ref);
-        recovered
-            .try_dereference()
+        let recovered: ObjectHandle = pdf.get_object_handle(removed_ref);
+        pdf.resolve(&recovered)
             .expect("reconstruction must re-register the stale body after xref loading clears it");
         assert_eq!(recovered.as_integer(), Some(99));
         assert!(pdf
