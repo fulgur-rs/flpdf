@@ -1557,7 +1557,10 @@ mod tests {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/null-visible-matrix.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let root = pdf.root_ref().expect("root");
-        let original_root = pdf.resolve_object(root).expect("resolve root");
+        let original_root = pdf.get_object_handle(root);
+        pdf.resolve(&original_root).expect("resolve root");
+        let original_type = original_root.get_key(b"/Type").as_name();
+        let original_pages = original_root.get_key(b"/Pages");
 
         let map = canonical_build_for_test(&mut pdf, true).expect("build");
 
@@ -1575,10 +1578,22 @@ mod tests {
             ],
             "source order must match qpdf 11.9.0's standard object queue"
         );
+        let current_root = pdf.get_object_handle(root);
+        pdf.resolve(&current_root).unwrap();
+        assert!(
+            current_root.is_same_object_as(&original_root),
+            "source root must retain canonical identity"
+        );
         assert_eq!(
-            pdf.resolve_object(root).unwrap(),
-            original_root,
-            "visibility analysis must not mutate the source graph"
+            current_root.get_key(b"/Type").as_name(),
+            original_type,
+            "visibility analysis must not mutate the source root type"
+        );
+        assert!(
+            current_root
+                .get_key(b"/Pages")
+                .is_same_object_as(&original_pages),
+            "visibility analysis must not replace the source Pages handle"
         );
     }
 
