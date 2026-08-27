@@ -33,6 +33,16 @@ use crate::output::write_bytes;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve one canonical handle hop, matching qpdf's lazy accessor
+/// dereference without following the flpdf-only reference-as-value redirect.
+fn resolve_once<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+) -> flpdf::Result<ObjectHandle> {
+    pdf.resolve(handle)?;
+    Ok(handle.clone())
+}
+
 /// `handle.getKey(key)` plus the implicit dereference of the *returned*
 /// child that qpdf's next accessor call on it would perform
 /// (`QPDFObjectHandle::getKey`, `libqpdf/QPDFObjectHandle.cc:979-988`).
@@ -43,9 +53,9 @@ fn chase_key<R: Read + Seek>(
     handle: &ObjectHandle,
     key: &[u8],
 ) -> flpdf::Result<ObjectHandle> {
-    let (chased, _) = pdf.resolve_to_terminal_ref(handle)?;
+    let chased = resolve_once(pdf, handle)?;
     let child = chased.get_key(key);
-    Ok(pdf.resolve_to_terminal_ref(&child)?.0)
+    resolve_once(pdf, &child)
 }
 
 /// `handle.getArrayItem(index)` plus the same implicit dereference as
@@ -60,12 +70,12 @@ fn chase_array_item<R: Read + Seek>(
     handle: &ObjectHandle,
     index: usize,
 ) -> flpdf::Result<ObjectHandle> {
-    let (chased, _) = pdf.resolve_to_terminal_ref(handle)?;
+    let chased = resolve_once(pdf, handle)?;
     let item = chased
         .as_array()
         .and_then(|items| items.get(index).cloned())
         .unwrap_or_else(ObjectHandle::null);
-    Ok(pdf.resolve_to_terminal_ref(&item)?.0)
+    resolve_once(pdf, &item)
 }
 
 /// `QUtil::hex_encode` (`libqpdf/QUtil.cc:720-731`): lowercase hex, two
@@ -261,13 +271,13 @@ pub(crate) fn run_test_73<R: Read + Seek>(
     // its ability to *not* error is exercised, which the real call below
     // still exercises against the still-open reader.
     let root_seed = pdf.trailer_key_handle(b"Root");
-    let root = pdf.resolve_to_terminal(&root_seed)?;
+    let root = resolve_once(pdf, &root_seed)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     if root.as_dictionary().is_none() {
         return Err(Error::System("unable to find /Root dictionary".to_string()));
     }
     let pages_seed = root.get_key(b"/Pages");
-    let pages = pdf.resolve_to_terminal(&pages_seed)?;
+    let pages = resolve_once(pdf, &pages_seed)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let _ = pages.unparse_resolved();
     Ok(())
@@ -426,8 +436,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     let kid1 = chase_array_item(pdf, &kids, 1)?;
     let limits1 = chase_key(pdf, &kid1, b"/Limits")?;
     let limits1_items = limits1.as_array().unwrap_or_default();
-    let limit1_low = pdf.resolve_to_terminal(&limits1_items[0])?;
-    let limit1_high = pdf.resolve_to_terminal(&limits1_items[1])?;
+    let limit1_low = resolve_once(pdf, &limits1_items[0])?;
+    let limit1_high = resolve_once(pdf, &limits1_items[1])?;
     assert_eq!(limit1_low.as_integer(), Some(230));
     assert_eq!(limit1_high.as_integer(), Some(240));
 
@@ -444,8 +454,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     let kid0 = chase_array_item(pdf, &kids, 0)?;
     let limits0 = chase_key(pdf, &kid0, b"/Limits")?;
     let limits0_items = limits0.as_array().unwrap_or_default();
-    let limit0_low = pdf.resolve_to_terminal(&limits0_items[0])?;
-    let limit0_high = pdf.resolve_to_terminal(&limits0_items[1])?;
+    let limit0_low = resolve_once(pdf, &limits0_items[0])?;
+    let limit0_high = resolve_once(pdf, &limits0_items[1])?;
     assert_eq!(limit0_low.as_integer(), Some(220));
     assert_eq!(limit0_high.as_integer(), Some(220));
     let kid0_kids = chase_key(pdf, &kid0, b"/Kids")?;
@@ -816,4 +826,155 @@ pub(crate) fn run_test_79<R: Read + Seek>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chase_array_item, chase_key, resolve_once, run_test_73};
+    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+
+    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture")
+    }
+
+    #[test]
+    fn canonical_helpers_resolve_one_hop_and_preserve_handles() {
+        let mut pdf = minimal_pdf();
+        let root = pdf.trailer_key_handle(b"Root");
+        let resolved = resolve_once(&mut pdf, &root).expect("resolve root");
+        assert_eq!(resolved.object_ref(), root.object_ref());
+
+        let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
+        assert_eq!(
+            pages.object_ref().map(|object_ref| object_ref.number),
+            Some(2)
+        );
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(7)]);
+        assert_eq!(
+            chase_array_item(&mut pdf, &array, 0)
+                .expect("resolve array item")
+                .as_integer(),
+            Some(7)
+        );
+        assert!(chase_array_item(&mut pdf, &array, 1)
+            .expect("resolve missing array item")
+            .is_null());
+    }
+
+    #[test]
+    fn test_73_resolves_root_and_pages_without_legacy_chasing() {
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_73(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 73");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    fn pdf_with_erase_trees() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+            (8, b"<< /Names [(1A) (a) (1B) (b) (1C) (c) (1D) (d)] >>"),
+            (9, b"<< /Kids [10 0 R 11 0 R] >>"),
+            (10, b"<< /Kids [12 0 R 13 0 R] /Limits [210 220] >>"),
+            (
+                11,
+                b"<< /Limits [230 250] /Nums [230 (230) 240 (240) 250 (250)] >>",
+            ),
+            (12, b"<< /Limits [210 210] /Nums [210 (210)] >>"),
+            (13, b"<< /Limits [220 220] /Nums [220 (220)] >>"),
+            (14, b"<< /Kids [15 0 R] >>"),
+            (15, b"<< /Kids [16 0 R 17 0 R] /Limits [310 320] >>"),
+            (16, b"<< /Limits [310 310] /Nums [310 (310)] >>"),
+            (17, b"<< /Limits [320 320] /Nums [320 (320)] >>"),
+            (18, b"<< /Kids [19 0 R 20 0 R] >>"),
+            (19, b"<< /Kids [21 0 R 22 0 R] /Limits [410 420] >>"),
+            (20, b"<< /Limits [430 430] /Nums [430 (430)] >>"),
+            (21, b"<< /Limits [410 410] /Nums [410 (410)] >>"),
+            (22, b"<< /Limits [420 420] /Nums [420 (420)] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [None; 23];
+        for &(number, body) in objects {
+            offsets[number as usize] = Some(bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 23\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            match offset {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 00000 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 23 /Root 1 0 R /Erase1 8 0 R /Erase2 9 0 R /Erase3 14 0 R /Erase4 18 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn test_75_resolves_number_tree_limits_through_canonical_handles() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(pdf_with_erase_trees(), PdfOpenOptions::default())
+                .expect("open erase tree fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        super::run_test_75(
+            &mut pdf,
+            b"erase-nntree.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 75");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert!(directory.path().join("a.pdf").is_file());
+    }
 }

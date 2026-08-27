@@ -519,9 +519,7 @@ mod tests {
     use super::{open_secondary_pdf, run_test_30};
     use flpdf::{EncryptParams, Pdf, PdfWriter};
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
-
-    static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    use std::sync::Mutex;
 
     struct CurrentDirGuard(PathBuf);
 
@@ -533,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_30_consumes_the_canonical_copy_encryption_source() {
-        let _lock = CURRENT_DIR_LOCK
+        let _lock = super::super::CURRENT_DIR_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("acquire current-directory test lock");
