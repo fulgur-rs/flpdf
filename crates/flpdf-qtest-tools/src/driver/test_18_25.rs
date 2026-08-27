@@ -4,21 +4,13 @@
 // through `super::emit_new_diagnostics`, and how deep qpdf-source-line
 // comments justify each translation decision.
 //
-// Two of these eight tests (`run_test_20`, `run_test_25`) hit the same
-// primitive gap and stop short of qpdf's own `QPDFWriter` call: flpdf has no
-// public API that mutates `Pdf`'s own trailer in a way `PdfWriter` observes.
-// `Pdf::trailer` returns `&Dictionary` with no setter; `Pdf::trailer_handle`
-// lifts a *clone* of that dictionary into a separate `ObjectHandle` graph
-// (`trailer_handle_memo`, `crates/flpdf/src/pdf.rs:263-296`) that is never
-// written back; and every `PdfWriter` output path reads `pdf.trailer_dictionary()`
-// directly (e.g. `crates/flpdf/src/writer.rs:2725`, `:3774`), never the
-// handle graph. `self.trailer` itself is set once at construction and never
-// reassigned anywhere in the crate (`pdf.rs:270-271`'s own doc). Concretely:
-// `pdf.trailer().replace_key(...)` compiles and returns `Ok`, but has
-// no effect whatsoever on what `PdfWriter::write` emits. See each function's
-// own `GAP` comment for the exact stop point.
+// `run_test_20` and `run_test_25` retain bounded GAP comments for their own
+// follow-on driver work. The canonical `Pdf::trailer` handle is live and is
+// consumed by the current writer path; `run_test_24` exercises that complete
+// writer-visible route because qpdf's reserved-object sequence reaches its
+// final `QPDFWriter` call in this slice.
 //
-// Five functions here (`run_test_18`, `19`, `21`, `22`, `23`) bound their
+// Six functions here (`run_test_18`, `19`, `21`, `22`, `23`, `24`) bound their
 // generic reader as `R: Read + Seek + 'static` rather than the bare
 // `R: Read + Seek` used elsewhere in this crate: both `PageDocumentHelper`
 // and `PdfWriter` are themselves defined as `<R: Read + Seek + 'static>`
@@ -152,17 +144,10 @@ pub(crate) fn run_test_20<R: Read + Seek>(
     let size = trailer.get_key(b"/Size").shallow_copy()?;
     copy.append_array_item(size)?;
 
-    // GAP(QPDFObjectHandle::replaceKey on the trailer): qpdf's
-    // `trailer.replaceKey("/QTest2", copy)` installs `copy` as a *new*
-    // trailer entry that the subsequent `QPDFWriter` then serializes. See
-    // this file's module doc for why flpdf has no equivalent: there is no
-    // public mutator for `Pdf`'s own trailer that a `PdfWriter` output
-    // actually observes. `pdf.trailer().replace_key(b"/QTest2",
-    // copy)` would compile and return `Ok` while writing nothing through to
-    // the output, so it is not called here rather than being called and
-    // silently doing nothing. The remainder of qpdf's test_20 -- that
-    // `replaceKey` call and the final `QPDFWriter` write -- is not
-    // translated below this comment.
+    // GAP(test_20 follow-on): the remaining trailer replacement and final
+    // writer comparison are kept for a separate driver slice. The live
+    // trailer handle is already writer-visible; this function simply keeps
+    // its bounded implementation scope at the currently covered read half.
     Ok(())
 }
 
@@ -251,7 +236,7 @@ pub(crate) fn run_test_23<R: Read + Seek + 'static>(
     Ok(())
 }
 
-pub(crate) fn run_test_24<R: Read + Seek>(
+pub(crate) fn run_test_24<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&OsStr>,
@@ -259,12 +244,11 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // test_driver.cc:882-945 -- "Test behavior of reserved objects". None
-    // of `new_reserved`/`trailer_handle`/`replace_key`/`array`/
-    // `append_array_item`/`as_array`/`is_reserved`/`set_object`/
-    // `materialize` here triggers file I/O or repair (their own docs), so
-    // no new diagnostics can appear and `emit_new_diagnostics` is not
-    // called.
+    // test_driver.cc:882-945 -- "Test behavior of reserved objects".
+    // Reserved handles are document-owned construction sentinels. Their
+    // replacement, direct conversion errors, and subsequent circular access
+    // all stay on the canonical ObjectHandle graph and do not read the input
+    // file, so no repair diagnostics can appear here.
     let res1 = pdf.new_reserved()?;
     let res2 = pdf.new_reserved()?;
     let trailer = pdf.trailer();
@@ -275,11 +259,9 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     // matches that (its own doc: "this API does not normalize slashless
     // input"), so this reproduces the qpdf source's own key text exactly
     // rather than "fixing" it to "/Array1"/"/Array2". Per this file's
-    // module doc, neither entry ever reaches a `PdfWriter` in this port
-    // regardless (the `replaceReserved`/writer gap below stops this test before qpdf's
-    // own `QPDFWriter` call) -- unlike `run_test_20`/`run_test_25`'s
-    // trailer mutations, this pair is genuinely inert either way, but is
-    // translated here because it precedes the remaining replacement gap.
+    // module doc, neither entry reaches a writer in this driver slice. The
+    // entries nevertheless retain qpdf's source call order before the
+    // reserved replacement operations below.
     trailer.replace_key(b"Array1", res1.clone())?;
     trailer.replace_key(b"Array2", res2.clone())?;
 
@@ -299,19 +281,11 @@ pub(crate) fn run_test_24<R: Read + Seek>(
         writeln!(stdout, "res1 is still reserved after checking if array")?;
     }
 
-    // `QPDF::replaceReserved` is exactly `replaceObject(reserved.getObjGen(),
-    // replacement)` (`libqpdf/QPDF.cc:2008-2015`); `Pdf::set_object` is that
-    // same canonical cache-replacement boundary (its own doc). `array1`'s
-    // indirect child (`res2`) materializes to a plain `Object::Reference`
-    // without dereferencing it (`ObjectHandle::materialize`'s own
-    // `materialize_child` helper "never recurses" into an indirect child,
-    // matching qpdf's `QPDFWriter::unparseChild`), so this does not require
-    // `res2` to already be resolved -- `array1` itself is not reserved, so
-    // `materialize` does not hit its own `is_reserved` rejection either.
-    let res1_ref = res1
-        .object_ref()
-        .expect("new_reserved always allocates an indirect object");
-    pdf.set_object(res1_ref, array1.materialize()?);
+    // `QPDF::replaceReserved` is exactly
+    // `replaceObject(reserved.getObjGen(), replacement)`
+    // (`libqpdf/QPDF.cc:2008-2015`). It keeps the reserved handle's indirect
+    // identity while sharing the replacement's live value state.
+    pdf.replace_reserved(res1.clone(), array1.clone())?;
     if res1.is_reserved() {
         writeln!(stdout, "oops -- res1 is still reserved")?;
     } else {
@@ -320,32 +294,70 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     assert!(res1.as_array().is_some());
     writeln!(stdout, "res1 is an array")?;
 
-    // `res2.unparseResolved()` reaches the reserved throw through
-    // `QPDFObjectHandle::unparseResolved`'s own dereference
-    // (`libqpdf/QPDFObjectHandle.cc:1586-1592`) exactly the way
-    // `ObjectHandle::materialize`'s own top-level `is_reserved` check does
-    // -- that method's own doc draws this correspondence explicitly, "only
-    // when the reserved handle *is* the value being dereferenced there,
-    // mirroring where qpdf's own throw is actually reached". The message
-    // text matches `QPDF_Reserved::unparse`'s throw verbatim
-    // (`libqpdf/QPDF_Reserved.cc:22-26`:
-    // `"QPDFObjectHandle: attempting to unparse a reserved object"`).
-    match res2.materialize() {
+    // qpdf's `res2.unparseResolved()` throws from the reserved value
+    // (`libqpdf/QPDF_Reserved.cc:22-26`). Use the handle's fallible
+    // qpdf-shaped unparse entry point so this is the object-model operation,
+    // not a writer-only surrogate.
+    match res2.try_unparse_resolved() {
         Ok(_) => writeln!(stdout, "oops -- didn't throw")?,
         Err(error) => writeln!(stdout, "logic error: {error}")?,
     }
 
-    // GAP(QPDF::replaceReserved): `ObjectHandle::make_direct` now ports the
-    // recursive conversion and reserved-handle error above
-    // (`libqpdf/QPDFObjectHandle.cc:2091-2131`). The remaining qpdf sequence
-    // after `res2.makeDirect()` needs the document-owned
-    // `replaceReserved(res2, array2)` transition and its writer-visible
-    // reserved-slot identity. Per the port's stop-at-gap rule, the
-    // `res2.makeDirect()` try/catch's own print, `res2.assertArray()`, the
-    // circular `i1`/`i2` resolution check, and the final `QPDFWriter` write
-    // remain outside this helper slice. `array2` above is real,
-    // faithfully-translated qpdf source that precedes the replacement gap.
-    Ok(())
+    // `makeDirect` still rejects a reserved value
+    // (`libqpdf/QPDFObjectHandle.cc:2091-2131`) before the second
+    // `replaceReserved` installs the other array.
+    let mut res2_direct = res2.clone();
+    match res2_direct.make_direct(false) {
+        Ok(()) => writeln!(stdout, "oops -- didn't throw")?,
+        Err(error) => writeln!(stdout, "logic error: {error}")?,
+    }
+    pdf.replace_reserved(res2.clone(), array2.clone())?;
+    assert!(res2.as_array().is_some());
+    writeln!(stdout, "res2 is an array")?;
+
+    // qpdf's chained getArrayItem calls dereference each returned handle.
+    // Resolve those two hops explicitly through the canonical document
+    // resolver, then read the integer at the same array position.
+    let res1_first = res1
+        .as_array()
+        .and_then(|items| items.first().cloned())
+        .expect("res1 contains res2");
+    pdf.resolve(&res1_first)?;
+    let i1 = res1_first
+        .as_array()
+        .and_then(|items| items.get(1).and_then(ObjectHandle::as_integer))
+        .expect("res1/res2 circular access reaches integer 2");
+    let res2_first = res2
+        .as_array()
+        .and_then(|items| items.first().cloned())
+        .expect("res2 contains res1");
+    pdf.resolve(&res2_first)?;
+    let i2 = res2_first
+        .as_array()
+        .and_then(|items| items.get(1).and_then(ObjectHandle::as_integer))
+        .expect("res2/res1 circular access reaches integer 1");
+    if (i1, i2) == (2, 1) {
+        writeln!(stdout, "circular access and lazy resolution worked")?;
+    }
+
+    let trailer_entries = trailer
+        .as_dictionary()
+        .expect("test 24 trailer remains a dictionary");
+    assert!(trailer_entries.contains_key(b"Array1".as_slice()));
+    assert!(trailer_entries.contains_key(b"Array2".as_slice()));
+    assert!(!trailer_entries.contains_key(b"/Array1".as_slice()));
+    assert!(!trailer_entries.contains_key(b"/Array2".as_slice()));
+
+    // qpdf/test_driver.cc:942-945 writes the completed document with static
+    // identifiers and preserved stream data. The live trailer handle above is
+    // the writer's source for this canonical route, so the two intentionally
+    // slashless keys remain visible in the emitted trailer just as qpdf's
+    // `QPDF_Name::normalizeName` does.
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_stream_data_mode(StreamDataMode::Preserve);
+    writer.write()
 }
 
 pub(crate) fn run_test_25<R: Read + Seek>(
@@ -385,19 +397,74 @@ pub(crate) fn run_test_25<R: Read + Seek>(
 
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    // GAP(QPDFObjectHandle::replaceKey on the trailer): same root cause as
-    // `run_test_20`'s gap -- see this file's module doc. qpdf's
-    // `pdf.getTrailer().replaceKey("/QTest", pdf.copyForeignObject(qtest))`
-    // installs `copied` as the trailer's own `/QTest` entry, which the
-    // subsequent `QPDFWriter` then serializes; flpdf has no public mutator
-    // for `Pdf`'s own trailer that a `PdfWriter` output actually observes.
-    // `pdf.trailer().replace_key(b"/QTest", copied)` would compile
-    // and return `Ok` while writing nothing through to the output, so it is
-    // not called here. The remainder of qpdf's test_25 -- the
-    // `copyForeignObject(oldpdf.getRoot().getKey("/Pages")).isNull()`
-    // assertion and the final `QPDFWriter` write -- sits after this
-    // `replaceKey` in qpdf's own order and is not translated below this
-    // comment.
+    // GAP(test_25 follow-on): the trailer replacement, `/Pages` null-copy
+    // assertion, and final writer comparison remain a separate driver slice.
+    // `copied` is intentionally retained here so the translated source order
+    // ends at the same boundary without introducing a second mutation route.
     let _copied = copied;
     Ok(())
+}
+
+#[cfg(test)]
+mod test_24_tests {
+    use super::run_test_24;
+    use flpdf::Pdf;
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn reserved_object_driver_matches_qpdf_output_and_writes_a_pdf() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::empty().expect("create empty PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_24(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 24 should complete and write a.pdf");
+
+        assert_eq!(
+            stdout,
+            b"res1 is still reserved after checking if array\n\
+              res1 is no longer reserved\n\
+              res1 is an array\n\
+              logic error: QPDFObjectHandle: attempting to unparse a reserved object\n\
+              logic error: QPDFObjectHandle: attempting to make a reserved object handle direct\n\
+              res2 is an array\n\
+              circular access and lazy resolution worked\n"
+        );
+        assert!(stderr.is_empty());
+        let output = std::fs::read("a.pdf").expect("test 24 output must exist");
+        assert!(output.starts_with(b"%PDF-"));
+        assert!(
+            output
+                .windows(b" Array1 ".len())
+                .any(|window| window == b" Array1 "),
+            "unexpected test 24 output: {output:?}"
+        );
+        assert!(!output
+            .windows(b" /Array1 ".len())
+            .any(|window| window == b" /Array1 "));
+    }
 }

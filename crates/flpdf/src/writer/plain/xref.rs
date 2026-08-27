@@ -302,8 +302,7 @@ fn write_canonical_classic_trailer(
     bytes.extend_from_slice(b"<<");
     for (key, value) in entries {
         bytes.push(b' ');
-        bytes.push(b'/');
-        crate::object::write_name_escaped(bytes, key.strip_prefix(b"/").unwrap_or(&key));
+        write_qpdf_dictionary_key(bytes, &key);
         bytes.push(b' ');
         bytes.extend_from_slice(&value);
     }
@@ -331,6 +330,18 @@ fn write_canonical_classic_trailer(
         bytes.extend_from_slice(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes());
     }
     bytes.extend_from_slice(b" >>");
+}
+
+/// Emit a qpdf dictionary key without changing its first byte.
+/// `QPDF_Name::normalizeName` (`libqpdf/QPDF_Name.cc:27-50`) preserves a raw
+/// slashless key such as `Array1`, while canonical keys already carry `/`.
+fn write_qpdf_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+    if let Some(key) = key.strip_prefix(b"/") {
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+    } else {
+        crate::object::write_name_escaped(out, key);
+    }
 }
 
 fn write_hex(out: &mut Vec<u8>, bytes: &[u8]) {

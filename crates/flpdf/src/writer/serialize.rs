@@ -319,6 +319,16 @@ pub(crate) mod xref_stream {
         .expect("test xref row geometry is valid")
     }
 
+    #[cfg(test)]
+    #[test]
+    fn dictionary_key_preserves_qpdf_first_byte() {
+        let mut out = Vec::new();
+        write_qpdf_dictionary_key(&mut out, b"/Canonical");
+        out.push(b' ');
+        write_qpdf_dictionary_key(&mut out, b"Raw");
+        assert_eq!(out, b"/Canonical Raw");
+    }
+
     /// Stream-dictionary metadata for a cross-reference stream, in qpdf key order.
     pub(crate) struct XrefStreamDict<'a> {
         /// Whether `/Filter /FlateDecode` plus PNG `/Predictor 12` are declared.
@@ -426,13 +436,13 @@ pub(crate) mod xref_stream {
             entries.sort_by(|left, right| left.0.cmp(&right.0));
             for (key, value) in entries {
                 if qdf {
-                    // cov:ignore-start: QDF xref emission always supplies canonical trailer entries
-                    out.extend_from_slice(b"\n  /");
+                    // cov:ignore-start: QDF xref emission normally supplies canonical trailer entries
+                    out.extend_from_slice(b"\n  ");
                     // cov:ignore-end
                 } else {
-                    out.extend_from_slice(b" /");
+                    out.push(b' ');
                 }
-                crate::object::write_name_escaped(out, key.strip_prefix(b"/").unwrap_or(&key));
+                write_qpdf_dictionary_key(out, &key);
                 out.push(b' ');
                 out.extend_from_slice(&value);
                 if key == b"/Size" {
@@ -471,6 +481,15 @@ pub(crate) mod xref_stream {
                     }
                 }
             }
+        }
+    }
+
+    fn write_qpdf_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+        if let Some(key) = key.strip_prefix(b"/") {
+            out.push(b'/');
+            crate::object::write_name_escaped(out, key);
+        } else {
+            crate::object::write_name_escaped(out, key);
         }
     }
 

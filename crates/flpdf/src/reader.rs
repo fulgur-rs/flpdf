@@ -1529,6 +1529,35 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.new_reserved_handle()
     }
 
+    /// Replace a qpdf reserved object with a direct handle value.
+    ///
+    /// This is qpdf's `QPDF::replaceReserved`
+    /// (`libqpdf/QPDF.cc:2008-2016`): only a reserved or null handle is
+    /// accepted, and the replacement is installed into the existing object
+    /// slot so every alias of `reserved` observes the new value. qpdf also
+    /// accepts a direct null handle and passes its default `0 0` object
+    /// identity to `replaceObject`; preserve that edge case rather than
+    /// inventing a separate direct-null error path.
+    ///
+    /// The replacement keeps qpdf's `replaceObject` contract: it must be a
+    /// direct handle owned by this document. The target handle's object
+    /// identity is retained while its shared value state is rebound to the
+    /// replacement.
+    pub fn replace_reserved(
+        &mut self,
+        reserved: ObjectHandle,
+        replacement: ObjectHandle,
+    ) -> Result<()> {
+        if !reserved.is_reserved() && !reserved.is_null() {
+            return Err(Error::System(
+                "replaceReserved called with non-reserved object".to_owned(),
+            ));
+        }
+        let object_ref = reserved.object_ref().unwrap_or(ObjectRef::new(0, 0));
+        self.replace_object_handle(object_ref, replacement)
+            .map(|_| ())
+    }
+
     /// Create an owned stream and replace its data with the supplied buffer.
     ///
     /// This follows qpdf's buffer overload: the empty factory runs first and
