@@ -1064,6 +1064,35 @@ fn objr_annotation_page_production_uses_the_canonical_handle_route() {
 }
 
 #[test]
+fn subset_reachability_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/subset_prune.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("subset_prune has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_to_terminal",
+        "Object::",
+        "set_object(",
+        "materialize(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "subset reachability production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "pdf.resolve(", "delete_object"] {
+        assert!(
+            production.contains(canonical),
+            "subset reachability production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
 fn page_selection_reference_chain_bridge_has_no_production_primitive() {
     let source = include_str!("../src/ref_chain.rs");
     assert!(

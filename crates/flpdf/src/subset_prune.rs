@@ -46,9 +46,10 @@
 //! pruning **and** xref-level GC of unreachable objects.  `No` preserves both.
 
 use crate::object::MAX_INLINE_DEPTH;
+use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageObjectHelper;
 use crate::resources::RemoveUnreferencedResources;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -66,7 +67,7 @@ use std::io::{Read, Seek};
 ///    category before mutating it.
 ///
 /// 2. **xref-level GC** (`collect_reachable` + `delete_object`): walks every
-///    `Object::Reference` reachable from `/Root` (transitively), then calls
+///    indirect child handle reachable from `/Root` (transitively), then calls
 ///    [`Pdf::delete_object`] for every live object that was **not** reached.
 ///    This removes orphaned intermediate `/Pages` nodes left by
 ///    `rebuild_page_tree`, dropped-page content streams, and similar debris.
@@ -163,9 +164,9 @@ pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
         // entries into this handle after construction; the legacy
         // `trailer_dictionary()` snapshot would make those objects look
         // unreachable and delete them before the writer sees them.
-        let trailer_clone = pdf.trailer().materialize()?;
+        let trailer = pdf.trailer();
         let mut refs: Vec<ObjectRef> = Vec::new();
-        walk_refs(&trailer_clone, 0, &mut refs)?;
+        walk_refs(&trailer, 0, &mut refs)?;
         refs.extend(protect.iter().copied());
         refs
     };
@@ -185,8 +186,8 @@ pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
 // ── Reachability walker ───────────────────────────────────────────────────────
 
 /// Transitively collect every `ObjectRef` reachable from `start` (and any
-/// additional seeds in `extra_seeds`) by following all `Object::Reference`
-/// values encountered while resolving objects.
+/// additional seeds in `extra_seeds`) by following indirect child handles in
+/// the canonical object graph.
 ///
 /// `extra_seeds` is used to protect objects referenced by the PDF trailer
 /// (e.g. `/Info`, `/Encrypt`) that are NOT reachable through `/Root`.
@@ -217,7 +218,7 @@ fn collect_reachable<R: Read + Seek>(
         }
 
         // If `current` lives inside an /ObjStm, that container object must
-        // survive the sweep too: walk_refs only follows Object::Reference and
+        // survive the sweep too: walk_refs only follows child handles and
         // never sees the metadata-level compressed-parent link, so without
         // this, delete_object would drop the /ObjStm and make every compressed
         // member unrecoverable in the output.
@@ -226,52 +227,48 @@ fn collect_reachable<R: Read + Seek>(
         }
 
         // Resolve the object; skip on error (conservative — keeps the object).
-        let obj = match pdf.resolve_borrowed(current) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
+        let handle = pdf.get_object_handle(current);
+        if pdf.resolve(&handle).is_err() {
+            continue;
+        }
 
-        // Walk all ObjectRefs contained in the resolved object.
-        walk_refs(obj, 0, &mut queue)?;
+        // Walk all indirect handles contained in the resolved object.
+        walk_refs(&handle, 0, &mut queue)?;
     }
 
     Ok(visited)
 }
 
-/// Recursively push every `Object::Reference` found inside `obj` onto `queue`.
-///
-/// This is a pure structural walk — it does not resolve any references; the
-/// caller drives resolution in the BFS/DFS loop.
-fn walk_refs(obj: &Object, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
+/// Recursively push every indirect child handle found inside `object` onto
+/// `queue`. Direct containers are traversed in place; indirect children are
+/// queued by identity and resolved by [`collect_reachable`].
+fn walk_refs(object: &ObjectHandle, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
     }
-    match obj {
-        Object::Reference(r) => {
-            queue.push(*r);
+    if let Some(items) = object.try_as_array()? {
+        for item in items {
+            walk_child(&item, depth + 1, queue)?;
         }
-        Object::Array(arr) => {
-            for item in arr {
-                walk_refs(item, depth + 1, queue)?;
-            }
+    } else if let Some(entries) = object.try_as_dictionary()? {
+        for value in entries.values() {
+            walk_child(value, depth + 1, queue)?;
         }
-        Object::Dictionary(dict) => {
-            for (_, val) in dict.iter() {
-                walk_refs(val, depth + 1, queue)?;
-            }
-        }
-        Object::Stream(stream) => {
-            // Walk the stream dictionary; the stream data itself contains no
-            // nested PDF object references at the indirect-object level.
-            for (_, val) in stream.dict.iter() {
-                walk_refs(val, depth + 1, queue)?;
-            }
-        }
-        // Scalar values (null, boolean, integer, real, name, string) carry
-        // no references.
-        _ => {}
+    } else if let Some(stream_dict) = object.as_stream_dict() {
+        // Stream data contains no indirect PDF object references; its
+        // dictionary does.
+        walk_refs(&stream_dict, depth, queue)?;
+    }
+    Ok(())
+}
+
+fn walk_child(child: &ObjectHandle, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
+    if let Some(object_ref) = child.object_ref() {
+        queue.push(object_ref);
+    } else {
+        walk_refs(child, depth, queue)?;
     }
     Ok(())
 }
@@ -288,14 +285,14 @@ mod tests {
     use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     // ── Inline-depth guard ───────────────────────────────────────────────────
 
-    fn nested_arrays(depth: usize) -> Object {
-        let mut o = Object::Null;
+    fn nested_arrays(depth: usize) -> ObjectHandle {
+        let mut o = ObjectHandle::null();
         for _ in 0..depth {
-            o = Object::Array(vec![o]);
+            o = ObjectHandle::array(vec![o]);
         }
         o
     }
@@ -313,12 +310,59 @@ mod tests {
         // Bury one Reference so it is visited at exactly inline depth
         // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
         // guard); it must be collected, not errored.
-        let mut o = Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]);
+        let mut o = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
+            ObjectRef::new(9, 0),
+            -1,
+        )]);
         for _ in 0..(MAX_INLINE_DEPTH - 1) {
-            o = Object::Array(vec![o]);
+            o = ObjectHandle::array(vec![o]);
         }
         walk_refs(&o, 0, &mut queue).unwrap();
         assert_eq!(queue, vec![ObjectRef::new(9, 0)]);
+    }
+
+    struct FailAtOffset {
+        inner: Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl Read for FailAtOffset {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() == self.fail_at {
+                return Err(std::io::Error::other("injected reachability read failure"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for FailAtOffset {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn collect_reachable_keeps_a_seed_when_resolution_fails() {
+        // Let the catalog resolve and then fail while resolving a child object.
+        // The reachability pass must conservatively keep both visited refs and
+        // continue without turning the I/O error into a GC failure.
+        let bytes =
+            build_pdf_from_bodies(&[b"<< /Type /Catalog >>".to_vec(), b"<< /Value 1 >>".to_vec()]);
+        let child_offset = bytes
+            .windows(b"2 0 obj\n".len())
+            .position(|window| window == b"2 0 obj\n")
+            .expect("child object offset") as u64;
+        let mut pdf = Pdf::open(FailAtOffset {
+            inner: Cursor::new(bytes),
+            fail_at: child_offset,
+        })
+        .expect("xref parsing should succeed before lazy child resolution");
+
+        let reachable =
+            collect_reachable(&mut pdf, ObjectRef::new(1, 0), vec![ObjectRef::new(2, 0)])
+                .expect("resolution errors are swallowed by the conservative GC walk");
+        assert!(reachable.contains(&ObjectRef::new(1, 0)));
+        assert!(reachable.contains(&ObjectRef::new(2, 0)));
     }
 
     // ── Fixture builders ─────────────────────────────────────────────────────
