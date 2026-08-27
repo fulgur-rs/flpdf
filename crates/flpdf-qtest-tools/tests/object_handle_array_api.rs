@@ -1,20 +1,16 @@
 //! External-crate coverage for the public canonical array mutation boundary.
 
-use flpdf::{Object, ObjectHandle, ObjectRef, Pdf, PdfWriter};
+use flpdf::{ObjectHandle, Pdf, PdfWriter};
 
 #[test]
 fn external_consumer_can_mutate_an_indirect_array_in_place() {
-    let mut pdf = Pdf::empty().expect("create an empty PDF");
-    let array_ref = ObjectRef::new(9, 0);
-    pdf.set_object(
-        array_ref,
-        Object::Array(vec![
-            Object::String(b"keep".to_vec()),
-            Object::String(b"replace".to_vec()),
-        ]),
-    );
-
-    let array = pdf.get_object_handle(array_ref);
+    let pdf = Pdf::empty().expect("create an empty PDF");
+    let array = pdf
+        .make_indirect_from_object_handle(ObjectHandle::array(vec![
+            ObjectHandle::string(b"keep".to_vec()),
+            ObjectHandle::string(b"replace".to_vec()),
+        ]))
+        .expect("create a canonical indirect array");
     array
         .set_array_item(1, ObjectHandle::string(b"updated".to_vec()))
         .expect("external consumer can call the canonical mutator");
@@ -52,11 +48,18 @@ fn external_consumer_can_mark_a_direct_child_array_dirty_for_write_back() {
     };
 
     let mut reopened = Pdf::open_mem_owned(output).expect("reopen written PDF");
-    let catalog = reopened
-        .resolve_object(root_ref)
+    let catalog = reopened.get_object_handle(root_ref);
+    reopened
+        .resolve(&catalog)
         .expect("resolve the rewritten catalog");
-    assert_eq!(
-        catalog.as_dict().and_then(|dict| dict.get("DirectValues")),
-        Some(&Object::Array(vec![Object::Integer(1), Object::Integer(2)]))
-    );
+    let direct_values = catalog.get_key(b"/DirectValues");
+    reopened
+        .resolve(&direct_values)
+        .expect("resolve the direct child array");
+    let values = direct_values
+        .as_array()
+        .expect("rewritten catalog contains an array");
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].as_integer(), Some(1));
+    assert_eq!(values[1].as_integer(), Some(2));
 }
