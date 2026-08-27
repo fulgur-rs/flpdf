@@ -12482,8 +12482,8 @@ mod tests {
         assert!(!pdf.object_refs().contains(&discovered_ref));
         assert!(!pdf.live_object_refs().contains(&discovered_ref));
 
-        pdf.get_object_handle(recovered_ref)
-            .try_dereference()
+        let recovered: ObjectHandle = pdf.get_object_handle(recovered_ref);
+        pdf.resolve(&recovered)
             .expect("handle resolution must reconstruct the xref");
 
         assert!(pdf.reconstructed_xref());
@@ -12506,9 +12506,8 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned_with_options(recovered_objstm_member_pdf(), options)
             .expect("open object-stream recovery fixture");
 
-        let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve(&handle)
             .expect("an unindexed packed member must resolve to null");
         assert_eq!(
             handle.unparse_resolved(),
