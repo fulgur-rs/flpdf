@@ -913,3 +913,33 @@ fn embedded_files_tests_do_not_keep_the_raw_projection_helpers() {
         );
     }
 }
+
+#[test]
+fn outline_destination_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/outline_dest_remap.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("outline_dest_remap has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_ref_chain",
+        "resolve_to_terminal",
+        "Object::",
+        "set_object(",
+        "materialize(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "outline destination production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "pdf.resolve(", "mark_object_handle_dirty"] {
+        assert!(
+            production.contains(canonical),
+            "outline destination production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
