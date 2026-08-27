@@ -8,7 +8,7 @@
 //! structural parity check, not a byte-compare against qpdf (qpdf renumbers).
 
 use flpdf::{
-    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, Object, ObjectRef, Pdf,
+    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, ObjectHandle, ObjectRef, Pdf,
     RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
@@ -87,6 +87,12 @@ fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
     prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
     pdf
+}
+
+fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve(&handle).expect("resolve object");
+    handle
 }
 
 /// Serialize `objs` (object number -> body) as a minimal classic PDF.
@@ -178,17 +184,11 @@ fn referenced_removed_pages_nulled_unreferenced_absent() {
     // Referenced removed pages are nulled in place AND stay live (reachable via
     // their dests), matching qpdf's `N 0 obj null`.
     assert!(
-        matches!(
-            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
-            Object::Null
-        ),
+        resolved_handle(&mut pdf, ObjectRef::new(4, 0)).is_null(),
         "removed page 2 (referenced by dp2) must be null"
     );
     assert!(
-        matches!(
-            pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
-            Object::Null
-        ),
+        resolved_handle(&mut pdf, ObjectRef::new(6, 0)).is_null(),
         "removed page 4 (referenced by dp4) must be null"
     );
     let live = pdf.live_object_refs();
@@ -213,33 +213,38 @@ fn outline_and_names_retained_all_entries_kept() {
     let mut pdf = run_subset(&[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
 
     // Catalog keeps /Outlines and /Names.
-    let cat = pdf.resolve_object(pdf.root_ref().unwrap()).unwrap();
-    let cat = cat.as_dict().unwrap();
-    assert!(cat.get("Outlines").is_some(), "/Outlines retained");
-    assert!(cat.get("Names").is_some(), "/Names retained");
+    let root_ref = pdf.root_ref().unwrap();
+    let cat = resolved_handle(&mut pdf, root_ref);
+    assert!(
+        cat.as_dictionary().is_some(),
+        "catalog must be a dictionary"
+    );
+    assert!(cat.has_key(b"/Outlines"), "/Outlines retained");
+    assert!(cat.has_key(b"/Names"), "/Names retained");
 
     // All four named dests still present; /Limits unchanged.
-    let leaf = pdf.resolve_object(ObjectRef::new(30, 0)).unwrap();
-    let leaf = leaf.as_dict().unwrap();
-    let names = leaf.get("Names").and_then(Object::as_array).unwrap();
-    let keys: Vec<&[u8]> = names
+    let leaf = resolved_handle(&mut pdf, ObjectRef::new(30, 0));
+    let names = leaf.get_key(b"/Names").as_array().unwrap();
+    let keys: Vec<Vec<u8>> = names
         .iter()
         .step_by(2)
-        .filter_map(|o| match o {
-            Object::String(b) | Object::Name(b) => Some(b.as_slice()),
-            _ => None,
-        })
+        .filter_map(|o| o.as_string().or_else(|| o.as_name()))
         .collect();
-    assert_eq!(keys, vec![b"dp1".as_slice(), b"dp2", b"dp3", b"dp4"]);
-    assert!(
-        leaf.get("Limits").is_some(),
-        "/Limits not recomputed/removed"
+    assert_eq!(
+        keys,
+        vec![
+            b"dp1".to_vec(),
+            b"dp2".to_vec(),
+            b"dp3".to_vec(),
+            b"dp4".to_vec()
+        ]
     );
+    assert!(leaf.has_key(b"/Limits"), "/Limits not recomputed/removed");
 
     // Both outline items kept with their chain intact.
-    let i20 = pdf.resolve_object(ObjectRef::new(20, 0)).unwrap();
+    let i20 = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
     assert_eq!(
-        i20.as_dict().unwrap().get_ref("Next"),
+        i20.get_key(b"/Next").object_ref(),
         Some(ObjectRef::new(21, 0)),
         "outline chain not stitched"
     );
@@ -256,26 +261,23 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
 
     // Catalog still carries the navigation structures after the round trip.
     let root = re.root_ref().expect("root");
-    let cat = re.resolve_object(root).unwrap();
-    let cat = cat.as_dict().expect("catalog dict").clone();
-    assert!(
-        cat.get("Outlines").is_some(),
-        "/Outlines survives round trip"
-    );
-    let names_ref = cat.get_ref("Names").expect("/Names survives round trip");
+    let cat = resolved_handle(&mut re, root);
+    assert!(cat.as_dictionary().is_some(), "catalog dict");
+    assert!(cat.has_key(b"/Outlines"), "/Outlines survives round trip");
+    let names_ref = cat
+        .get_key(b"/Names")
+        .object_ref()
+        .expect("/Names survives round trip");
 
     // The Dests leaf still holds four entries; at least one resolves to null
     // (a removed-but-referenced page emitted as `N 0 obj null`).
-    let names_dict = re.resolve_object(names_ref).unwrap();
-    let dests_ref = names_dict.as_dict().unwrap().get_ref("Dests").unwrap();
-    let leaf = re.resolve_object(dests_ref).unwrap();
-    let pairs = leaf
-        .as_dict()
-        .unwrap()
-        .get("Names")
-        .and_then(Object::as_array)
-        .unwrap()
-        .to_vec();
+    let names_dict = resolved_handle(&mut re, names_ref);
+    let dests_ref = names_dict
+        .get_key(b"/Dests")
+        .object_ref()
+        .expect("/Dests survives round trip");
+    let leaf = resolved_handle(&mut re, dests_ref);
+    let pairs = leaf.get_key(b"/Names").as_array().unwrap();
     assert_eq!(
         pairs.len(),
         8,
@@ -283,9 +285,9 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
     );
     let mut null_targets = 0;
     for dest in pairs.iter().skip(1).step_by(2) {
-        if let Some(first) = dest.as_array().and_then(|a| a.first()) {
-            if let Some(r) = first.as_ref_id() {
-                if matches!(re.resolve_object(r).unwrap(), Object::Null) {
+        if let Some(first) = dest.as_array().and_then(|a| a.first().cloned()) {
+            if let Some(r) = first.object_ref() {
+                if resolved_handle(&mut re, r).is_null() {
                     null_targets += 1;
                 }
             }
@@ -318,10 +320,11 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
 
     // The signature field object (obj 7) is NOT nulled and stays live — it is
     // reachable through the `evil` named destination.
-    let sig_field = pdf.resolve_object(ObjectRef::new(7, 0)).unwrap();
+    let sig_field = resolved_handle(&mut pdf, ObjectRef::new(7, 0));
+    assert!(sig_field.as_dictionary().is_some(), "signature field dict");
     assert_eq!(
-        sig_field.as_dict().and_then(|d| d.get("FT")),
-        Some(&Object::Name(b"Sig".to_vec())),
+        sig_field.get_key(b"/FT").as_name(),
+        Some(b"Sig".to_vec()),
         "non-page dest target (signature field) must survive null-out"
     );
     assert!(
@@ -330,10 +333,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     );
     // The genuinely removed page (obj 4) IS nulled, matching qpdf.
     assert!(
-        matches!(
-            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
-            Object::Null
-        ),
+        resolved_handle(&mut pdf, ObjectRef::new(4, 0)).is_null(),
         "removed page (obj 4) is nulled"
     );
 
@@ -344,40 +344,30 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     let mut out: Vec<u8> = Vec::new();
     write_default(&mut pdf, &mut out).expect("write");
     let mut re = Pdf::open(Cursor::new(out)).expect("reopen");
-    let names_ref = re
-        .resolve_object(re.root_ref().unwrap())
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .get_ref("Names")
+    let root_ref = re.root_ref().unwrap();
+    let root = resolved_handle(&mut re, root_ref);
+    let names_ref = root
+        .get_key(b"/Names")
+        .object_ref()
         .expect("/Names survives");
-    let dests_ref = re
-        .resolve_object(names_ref)
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .get_ref("Dests")
+    let names = resolved_handle(&mut re, names_ref);
+    let dests_ref = names
+        .get_key(b"/Dests")
+        .object_ref()
         .expect("/Dests survives");
-    let pairs = re
-        .resolve_object(dests_ref)
-        .unwrap()
-        .as_dict()
-        .unwrap()
-        .get("Names")
-        .and_then(Object::as_array)
-        .unwrap()
-        .to_vec();
+    let leaf = resolved_handle(&mut re, dests_ref);
+    let pairs = leaf.get_key(b"/Names").as_array().unwrap();
     // pairs == [(evil) [<ref> /Fit] (dp2) [<ref> /Fit]]; the first dest's target
     // must still be the live signature field, not null.
     let evil_target = pairs[1]
         .as_array()
-        .and_then(|a| a.first())
-        .and_then(Object::as_ref_id)
+        .and_then(|a| a.first().and_then(ObjectHandle::object_ref))
         .expect("evil dest first element is a ref");
-    let resolved = re.resolve_object(evil_target).unwrap();
+    let resolved = resolved_handle(&mut re, evil_target);
+    assert!(resolved.as_dictionary().is_some(), "signature field dict");
     assert_eq!(
-        resolved.as_dict().and_then(|d| d.get("FT")),
-        Some(&Object::Name(b"Sig".to_vec())),
+        resolved.get_key(b"/FT").as_name(),
+        Some(b"Sig".to_vec()),
         "signature field survives the full rewrite (not nulled)"
     );
 }
@@ -404,10 +394,7 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
 
         // The removed page object (obj 4) is null, regardless of the indirection.
         assert!(
-            matches!(
-                pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
-                Object::Null
-            ),
+            resolved_handle(&mut pdf, ObjectRef::new(4, 0)).is_null(),
             "obj40={obj40}: removed page (obj 4) must be null"
         );
 
