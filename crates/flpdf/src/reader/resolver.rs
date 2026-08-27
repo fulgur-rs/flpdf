@@ -10798,8 +10798,8 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        handle.try_dereference().expect("flpdf recovery");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&handle).expect("flpdf recovery");
         assert_eq!(
             handle
                 .get_raw_stream_data()
