@@ -516,7 +516,7 @@ pub(crate) fn run_test_33<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::run_test_30;
+    use super::{open_secondary_pdf, run_test_30};
     use flpdf::{EncryptParams, Pdf, PdfWriter};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -578,5 +578,36 @@ mod tests {
         .expect("run test 30");
 
         assert!(directory.path().join("b.pdf").is_file());
+        // qpdf's test_30 prints nothing to stdout when the copied output's
+        // page contents match; a non-empty stdout means the "oops -- page
+        // contents don't match" branch fired, which a silent
+        // copy_encryption_parameters regression must not slip past.
+        assert!(
+            stdout.is_empty(),
+            "test 30 must report no content mismatch: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+
+        // The whole point of test 30 is that `b.pdf` carries the donor's
+        // copied /Encrypt parameters, not that it merely exists: reopen it
+        // with the donor's user password and confirm it is still encrypted
+        // and that password still authenticates, so a
+        // copy_encryption_parameters regression that produced a plaintext
+        // (but otherwise page-identical) output is caught.
+        let copied = open_secondary_pdf(
+            Path::new(&directory.path().join("b.pdf")).as_os_str(),
+            b"user",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("reopen the copy-encryption output with the donor's user password");
+        assert!(
+            copied.is_encrypted(),
+            "test 30's output must still carry the donor's copied /Encrypt dictionary"
+        );
+        assert!(
+            copied.user_password_matched(),
+            "the donor's user password must still authenticate the copied output"
+        );
     }
 }

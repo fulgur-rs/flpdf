@@ -771,6 +771,23 @@ mod tests {
 
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].as_name(), Some(b"FlateDecode".to_vec()));
+
+        // The removed Crypt stage's /DecodeParms slot (index 0, the empty
+        // dictionary) must be dropped along with it, so the remaining
+        // FlateDecode stage still pairs with its own params (the trailing
+        // null, at the pre-removal index 1) rather than being shifted onto
+        // the wrong slot.
+        let decode_parms = resolved
+            .filter_input_handle()
+            .get_key(b"/DecodeParms")
+            .as_array()
+            .expect("remaining DecodeParms array");
+        assert_eq!(decode_parms.len(), 1);
+        assert!(
+            decode_parms[0].is_null(),
+            "the surviving FlateDecode stage must keep its own (null) params, not the \
+             removed Crypt stage's empty dictionary"
+        );
     }
 
     #[test]
