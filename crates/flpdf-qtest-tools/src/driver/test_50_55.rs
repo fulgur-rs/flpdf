@@ -423,3 +423,94 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     // qpdf run -- no `a.pdf` capturing the repaired tree is ever written.
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_and_drain, run_test_50};
+    use flpdf::{Pdf, PdfOpenOptions};
+
+    fn pdf_with_merge_dictionaries() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 4 0 R >>"),
+            (2, b"<< /Font << /F1 5 0 R >> /XObject << >> >>"),
+            (3, b"<< /k1 true /Font << /F2 6 0 R >> >>"),
+            (4, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+            (5, b"<< >>"),
+            (6, b"<< >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = vec![0usize; 7];
+        for &(number, body) in objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 7 /Root 1 0 R /Dict1 2 0 R /Dict2 3 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn dictionary_merge_resolves_each_trailer_handle_once() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_merge_dictionaries(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open merge dictionary fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_50(
+            &mut pdf,
+            b"merge-dict.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 50");
+
+        assert!(stderr.is_empty());
+        assert!(!stdout.is_empty());
+    }
+
+    #[test]
+    fn resolve_and_drain_returns_the_canonical_handle_identity() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open minimal fixture");
+        let root = pdf.trailer_key_handle(b"Root");
+        let expected_ref = pdf.root_ref();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        let (resolved, object_ref) = resolve_and_drain(
+            &mut pdf,
+            &root,
+            b"minimal.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("resolve root");
+
+        assert_eq!(object_ref, expected_ref);
+        assert!(resolved.as_dictionary().is_some());
+        assert!(stderr.is_empty());
+        assert!(stdout.is_empty());
+    }
+}
