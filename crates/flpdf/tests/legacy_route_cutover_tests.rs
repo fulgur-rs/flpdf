@@ -1,4 +1,7 @@
-use flpdf::Pdf;
+use flpdf::{
+    pages::tree_rebuild::RebuildResult, remap_outline_and_dests, ObjectHandle, ObjectRef, Pdf,
+};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 #[test]
@@ -942,4 +945,49 @@ fn outline_destination_production_uses_the_canonical_handle_route() {
             "outline destination production must use the canonical handle marker {canonical:?}"
         );
     }
+}
+
+#[test]
+fn outline_remap_updates_an_existing_direct_destination_handle() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/objstm-lin-outlines-80-80.pdf").as_slice(),
+    ))
+    .unwrap();
+    let outline = pdf.get_object_handle(ObjectRef::new(6, 0));
+    pdf.resolve(&outline).unwrap();
+    outline
+        .replace_key(
+            b"/Dest",
+            ObjectHandle::array(vec![
+                pdf.get_object_handle(ObjectRef::new(3, 0)),
+                ObjectHandle::name(b"Fit".to_vec()),
+            ]),
+        )
+        .unwrap();
+    pdf.mark_object_handle_dirty(&outline).unwrap();
+    let destination = outline.get_key(b"/Dest");
+    assert_eq!(
+        destination
+            .as_array()
+            .and_then(|items| items.first().and_then(|handle| handle.object_ref())),
+        Some(ObjectRef::new(3, 0))
+    );
+
+    let mut ref_map = BTreeMap::new();
+    ref_map.insert(ObjectRef::new(3, 0), vec![ObjectRef::new(4, 0)]);
+    let result = RebuildResult {
+        new_kids: vec![ObjectRef::new(4, 0)],
+        ref_map,
+        ..Default::default()
+    };
+
+    remap_outline_and_dests(&mut pdf, &result).unwrap();
+
+    assert_eq!(
+        destination
+            .as_array()
+            .and_then(|items| items.first().and_then(|handle| handle.object_ref())),
+        Some(ObjectRef::new(4, 0)),
+        "qpdf-style mutation must update the existing direct destination handle"
+    );
 }
