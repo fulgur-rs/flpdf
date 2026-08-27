@@ -9863,8 +9863,8 @@ mod tests {
         );
 
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-        handle.try_dereference().expect("flpdf recovery");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&handle).expect("flpdf recovery");
         assert_eq!(
             pdf.repair_diagnostics()
                 .entries()
