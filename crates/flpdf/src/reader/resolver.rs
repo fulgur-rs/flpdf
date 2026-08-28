@@ -11115,9 +11115,9 @@ mod tests {
             calls: 0,
         })
         .expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(4, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
 
-        handle.try_dereference().expect("resolve");
+        pdf.resolve(&handle).expect("resolve");
 
         assert_eq!(
             handle
