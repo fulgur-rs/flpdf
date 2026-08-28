@@ -4798,6 +4798,13 @@ mod tests {
             parse_object_stream_entry(&Stream::new(missing_first, b"7 0".to_vec()), 0).is_err()
         );
 
+        let mut non_integer_first = Dictionary::new();
+        non_integer_first.insert("N", Object::Integer(1));
+        non_integer_first.insert("First", Object::Name(b"not-an-integer".to_vec()));
+        assert!(
+            parse_object_stream_entry(&Stream::new(non_integer_first, b"7 0".to_vec()), 0).is_err()
+        );
+
         let mut out_of_range = Dictionary::new();
         out_of_range.insert("N", Object::Integer(1));
         out_of_range.insert("First", Object::Integer(4));
