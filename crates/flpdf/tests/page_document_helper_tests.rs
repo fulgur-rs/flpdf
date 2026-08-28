@@ -1800,12 +1800,23 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     assert_eq!(pages[3], indirect_scalar_ref);
     assert_ne!(pages[0], ObjectRef::new(3, 0));
     assert_ne!(pages[1], indirect_scalar_ref);
+    assert_ne!(
+        pages[4],
+        ObjectRef::new(3, 0),
+        "qpdf clones the repeated page instead of returning the original reference twice"
+    );
 
     let minted_leaf = pdf.get_object_handle(pages[0]);
     pdf.resolve(&minted_leaf).unwrap();
+    let media_box = minted_leaf.get_key(b"/MediaBox");
+    pdf.resolve(&media_box).unwrap();
+    let media_box = media_box.as_array().unwrap();
     assert_eq!(
-        minted_leaf.get_key(b"/MediaBox").as_array().unwrap().len(),
-        4,
+        media_box
+            .iter()
+            .map(|item| item.as_integer())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(612), Some(792)],
         "qpdf supplies the default MediaBox before retaining the repaired leaf"
     );
     assert_eq!(

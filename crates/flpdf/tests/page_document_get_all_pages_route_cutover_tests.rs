@@ -22,7 +22,11 @@ fn test_block<'a>(source: &'a str, name: &str) -> &'a str {
         .find(&marker)
         .unwrap_or_else(|| panic!("missing PageDocumentHelper test {name}"));
     let rest = &source[start..];
-    let end = rest.find("\n#[test]\n").unwrap_or(rest.len());
+    let end = [rest.find("\n#[test]\n"), rest.find("\nfn ")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -47,6 +51,7 @@ fn get_all_pages_tests_use_only_canonical_handle_routes() {
         ".into_dict(",
         ".as_dict(",
         ".as_ref_id(",
+        "mark_object_dirty(",
     ] {
         assert!(
             !selected.contains(forbidden),
@@ -61,6 +66,7 @@ fn get_all_pages_tests_use_only_canonical_handle_routes() {
         "get_key(",
         "object_ref(",
         "replace_key(",
+        "mark_object_handle_dirty(",
     ] {
         assert!(
             selected.contains(required),
