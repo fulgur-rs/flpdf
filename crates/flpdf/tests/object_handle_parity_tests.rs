@@ -114,6 +114,43 @@ fn resolve_resolves_the_catalog_dictionary() {
 }
 
 #[test]
+fn get_all_objects_returns_live_indirect_handles_for_minimal_pdf() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    assert!(!pdf.get_all_objects().unwrap().is_empty());
+}
+
+#[test]
+fn trailer_returns_a_direct_handle_with_an_indirect_root() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+
+    assert!(pdf.trailer().is_direct());
+    assert!(pdf.trailer().get_key(b"/Root").is_indirect());
+}
+
+#[test]
+fn resolve_resolves_a_fresh_handle_in_place() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let root_ref = pdf.root_ref().unwrap();
+    let root = pdf.get_object_handle(root_ref);
+
+    assert!(
+        !root.is_resolved(),
+        "a fresh indirect handle starts unresolved"
+    );
+    pdf.resolve(&root).unwrap();
+
+    assert!(
+        root.is_resolved(),
+        "resolve must update the handle in place"
+    );
+    assert!(root.get_key(b"/Pages").is_indirect());
+}
+
+#[test]
 fn pdf_exposes_the_effective_qpdf_xref_table_without_free_rows() {
     let pdf = Pdf::open_mem(std::sync::Arc::from(compressed_entry_pdf())).unwrap();
 

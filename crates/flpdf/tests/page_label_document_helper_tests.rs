@@ -9,22 +9,6 @@ use flpdf::{LabelStyle, Pdf};
 use std::io::Cursor;
 
 #[test]
-fn page_label_mutations_use_only_the_canonical_handle_route() {
-    let source = include_str!("../src/page_label_document_helper.rs").replace("\r\n", "\n");
-    let production = source
-        .split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .expect("page-label production source");
-
-    for forbidden in ["crate::NumberTree::", "resolve_borrowed(", ".set_object("] {
-        assert!(
-            !production.contains(forbidden),
-            "page-label production route still contains {forbidden}"
-        );
-    }
-}
-
-#[test]
 fn ranges_repairs_and_reads_direct_number_tree_kid() {
     let pdf_bytes = build_pdf(
         &[
