@@ -152,38 +152,42 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
 
 /// Embed the existing page-tree root directly in the catalog, as qpdf permits.
 fn make_catalog_pages_root_direct(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
-    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Dictionary(pages));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&pages).unwrap();
+    let direct_pages = pages.shallow_copy().unwrap();
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog.replace_key(b"/Pages", direct_pages).unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 }
 
 fn assert_direct_catalog_pages_root(pdf: &mut Pdf<Cursor<Vec<u8>>>, expected_count: i64) {
-    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must remain a dictionary");
-    };
-    let Some(Object::Dictionary(pages)) = catalog.get("Pages") else {
-        panic!("catalog /Pages must remain direct");
-    };
-    assert_eq!(pages.get("Count"), Some(&Object::Integer(expected_count)));
-    let Some(Object::Array(kids)) = pages.get("Kids") else {
-        panic!("direct pages root must retain /Kids");
-    };
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    let pages = catalog.get_key(b"/Pages");
+    pdf.resolve(&pages).unwrap();
+    assert!(
+        pages.object_ref().is_none() && pages.as_dictionary().is_some(),
+        "catalog /Pages must remain a direct dictionary"
+    );
+    let count = pages.get_key(b"/Count");
+    pdf.resolve(&count).unwrap();
+    assert_eq!(count.as_integer(), Some(expected_count));
+    let kids = pages.get_key(b"/Kids");
+    pdf.resolve(&kids).unwrap();
+    let kids = kids
+        .as_array()
+        .expect("direct pages root must retain /Kids");
     assert_eq!(kids.len(), expected_count as usize);
-    let expected_parent = Object::Dictionary(pages.clone());
 
     for page in PageDocumentHelper::new(pdf).get_all_pages().unwrap() {
-        let Object::Dictionary(page) = pdf.resolve_object(page).unwrap() else {
-            panic!("page must remain a dictionary");
-        };
-        assert_eq!(
-            page.get("Parent"),
-            Some(&expected_parent),
-            "qpdf keeps the final direct root as each flattened leaf's /Parent"
+        let page = pdf.get_object_handle(page);
+        pdf.resolve(&page).unwrap();
+        let parent = page.get_key(b"/Parent");
+        pdf.resolve(&parent).unwrap();
+        assert!(
+            parent.is_same_object_as(&pages),
+            "qpdf keeps the final direct root identity as each flattened leaf's /Parent"
         );
     }
 }
@@ -2876,30 +2880,26 @@ fn remove_page_allows_an_empty_document() {
         .get_all_pages()
         .unwrap()
         .is_empty());
-    let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    assert_eq!(root.get("Kids"), Some(&Object::Array(Vec::new())));
-    assert_eq!(root.get("Count"), Some(&Object::Integer(0)));
+    let kids = pages_handle.get_key(b"/Kids");
+    pdf.resolve(&kids).unwrap();
+    assert!(kids.as_array().is_some_and(|items| items.is_empty()));
+    let count = pages_handle.get_key(b"/Count");
+    pdf.resolve(&count).unwrap();
+    assert_eq!(count.as_integer(), Some(0));
 }
 
 #[test]
 fn remove_page_allows_an_empty_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Dictionary(pages));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&pages).unwrap();
+    let direct_pages = pages.shallow_copy().unwrap();
     let catalog_handle = pdf.get_object_handle(ObjectRef::new(1, 0));
     pdf.resolve(&catalog_handle).unwrap();
-    let pages_handle = catalog_handle
-        .as_dictionary()
-        .and_then(|dict| dict.get(b"/Pages".as_slice()).cloned())
-        .expect("direct /Pages handle must be present");
+    catalog_handle.replace_key(b"/Pages", direct_pages).unwrap();
+    pdf.mark_object_handle_dirty(&catalog_handle).unwrap();
+    let pages_handle = catalog_handle.get_key(b"/Pages");
+    pdf.resolve(&pages_handle).unwrap();
 
     PageDocumentHelper::new(&mut pdf)
         .remove_page(ObjectRef::new(3, 0))
@@ -2924,14 +2924,17 @@ fn remove_page_allows_an_empty_direct_catalog_pages_root() {
         "canonical direct /Count must be zero before legacy resolution"
     );
 
-    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must remain a dictionary");
-    };
-    let Some(Object::Dictionary(pages)) = catalog.get("Pages") else {
-        panic!("catalog /Pages must remain direct");
-    };
-    assert_eq!(pages.get("Kids"), Some(&Object::Array(Vec::new())));
-    assert_eq!(pages.get("Count"), Some(&Object::Integer(0)));
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    let pages = catalog.get_key(b"/Pages");
+    pdf.resolve(&pages).unwrap();
+    assert!(pages.object_ref().is_none() && pages.as_dictionary().is_some());
+    let kids = pages.get_key(b"/Kids");
+    pdf.resolve(&kids).unwrap();
+    assert!(kids.as_array().is_some_and(|items| items.is_empty()));
+    let count = pages.get_key(b"/Count");
+    pdf.resolve(&count).unwrap();
+    assert_eq!(count.as_integer(), Some(0));
 }
 
 #[test]
@@ -3020,92 +3023,111 @@ fn add_page_preserves_direct_catalog_pages_root() {
 #[test]
 fn add_page_materializes_attributes_from_a_direct_parent() {
     let mut pdf = open(build_n_page_pdf(2));
-    let mut fonts = Dictionary::new();
-    fonts.insert("F1", Object::Dictionary(Dictionary::new()));
-    let mut resources = Dictionary::new();
-    resources.insert("Font", Object::Dictionary(fonts));
-
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    root.insert("Resources", Object::Dictionary(resources.clone()));
-    root.insert("Rotate", Object::Integer(90));
-    root.insert(
-        "MediaBox",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(200),
-            Object::Integer(300),
-        ]),
-    );
-    root.insert(
-        "CropBox",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(100),
-            Object::Integer(150),
-        ]),
-    );
-    let direct_parent = Object::Dictionary(root.clone());
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", direct_parent.clone());
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let resources = ObjectHandle::dictionary(vec![(
+        b"/Font".to_vec(),
+        ObjectHandle::dictionary(vec![(
+            b"/F1".to_vec(),
+            ObjectHandle::dictionary(Vec::new()),
+        )]),
+    )]);
+    let direct_parent = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+        (
+            b"/Kids".to_vec(),
+            ObjectHandle::array(vec![
+                pdf.get_object_handle(ObjectRef::new(3, 0)),
+                pdf.get_object_handle(ObjectRef::new(4, 0)),
+            ]),
+        ),
+        (b"/Count".to_vec(), ObjectHandle::integer(2)),
+        (b"/Resources".to_vec(), resources),
+        (b"/Rotate".to_vec(), ObjectHandle::integer(90)),
+        (
+            b"/MediaBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(200),
+                ObjectHandle::integer(300),
+            ]),
+        ),
+        (
+            b"/CropBox".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(100),
+                ObjectHandle::integer(150),
+            ]),
+        ),
+    ]);
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog
+        .replace_key(b"/Pages", direct_parent.clone())
+        .unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     for page_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
-        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).unwrap() else {
-            panic!("page must be a dictionary");
-        };
-        page.remove("MediaBox");
-        page.insert("Parent", direct_parent.clone());
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        page.remove_key(b"/MediaBox");
+        page.replace_key(b"/Parent", direct_parent.clone()).unwrap();
+        pdf.mark_object_handle_dirty(&page).unwrap();
     }
 
     PageDocumentHelper::new(&mut pdf)
         .add_page(PageInput::existing(ObjectRef::new(3, 0)), false)
         .unwrap();
 
-    let expected_media_box = Object::Array(vec![
-        Object::Integer(0),
-        Object::Integer(0),
-        Object::Integer(200),
-        Object::Integer(300),
-    ]);
-    let expected_crop_box = Object::Array(vec![
-        Object::Integer(0),
-        Object::Integer(0),
-        Object::Integer(100),
-        Object::Integer(150),
-    ]);
     for page_ref in PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap() {
-        let Object::Dictionary(page) = pdf.resolve_object(page_ref).unwrap() else {
-            panic!("page must be a dictionary");
-        };
-        let Some(Object::Reference(resources_ref)) = page.get("Resources") else {
-            panic!("qpdf promotes direct inherited /Resources to an indirect handle");
-        };
-        assert_eq!(
-            pdf.resolve_object(*resources_ref).unwrap(),
-            Object::Dictionary(resources.clone())
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let resources = page.get_key(b"/Resources");
+        pdf.resolve(&resources).unwrap();
+        assert!(
+            resources.object_ref().is_some() && resources.as_dictionary().is_some(),
+            "qpdf promotes direct inherited /Resources to an indirect handle"
         );
-        assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
-        let Some(Object::Reference(media_box_ref)) = page.get("MediaBox") else {
-            panic!("qpdf promotes direct inherited /MediaBox to an indirect handle");
-        };
         assert_eq!(
-            pdf.resolve_object(*media_box_ref).unwrap(),
-            expected_media_box.clone()
+            resources.unparse_resolved(),
+            b"<< /Font << /F1 << >> >> >>",
+            "qpdf must preserve the complete inherited /Resources dictionary"
         );
-        let Some(Object::Reference(crop_box_ref)) = page.get("CropBox") else {
-            panic!("qpdf promotes direct inherited /CropBox to an indirect handle");
-        };
-        assert_eq!(
-            pdf.resolve_object(*crop_box_ref).unwrap(),
-            expected_crop_box.clone()
+        let font = resources.get_key(b"/Font");
+        pdf.resolve(&font).unwrap();
+        let f1 = font.get_key(b"/F1");
+        pdf.resolve(&f1).unwrap();
+        assert!(f1.as_dictionary().is_some());
+        assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+
+        let media_box = page.get_key(b"/MediaBox");
+        pdf.resolve(&media_box).unwrap();
+        assert!(
+            media_box.object_ref().is_some(),
+            "qpdf promotes direct inherited /MediaBox to an indirect handle"
         );
+        let media_values = media_box
+            .as_array()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.as_integer())
+            .collect::<Vec<_>>();
+        assert_eq!(media_values, vec![Some(0), Some(0), Some(200), Some(300)]);
+
+        let crop_box = page.get_key(b"/CropBox");
+        pdf.resolve(&crop_box).unwrap();
+        assert!(
+            crop_box.object_ref().is_some(),
+            "qpdf promotes direct inherited /CropBox to an indirect handle"
+        );
+        let crop_values = crop_box
+            .as_array()
+            .unwrap()
+            .into_iter()
+            .map(|item| item.as_integer())
+            .collect::<Vec<_>>();
+        assert_eq!(crop_values, vec![Some(0), Some(0), Some(100), Some(150)]);
     }
 }
 
