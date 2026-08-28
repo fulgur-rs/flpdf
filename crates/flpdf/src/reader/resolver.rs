@@ -11152,10 +11152,9 @@ mod tests {
                 offset: truncated_at,
             },
         );
-        let handle = pdf.get_object_handle(ObjectRef::new(9, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(9, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf catches the missing endstream framing error");
         assert!(handle.is_null());
         let messages: Vec<String> = pdf
@@ -11208,10 +11207,9 @@ mod tests {
                 offset: appended_at,
             },
         );
-        let handle = pdf.get_object_handle(ObjectRef::new(9, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(9, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf catches EOF while recording the cache extent");
         assert!(handle.is_null());
         let messages: Vec<String> = pdf
