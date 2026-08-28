@@ -727,9 +727,8 @@ mod tests {
             1,
             "qpdf keeps the retained AF array element"
         );
-        assert_eq!(
+        assert!(
             resolved_handle(&mut pdf, filespec_ref).is_null(),
-            true,
             "qpdf replaces the removed Filespec with null"
         );
     }
@@ -1098,9 +1097,8 @@ mod tests {
             Some(af_array_ref),
             "catalog /AF must remain in place"
         );
-        assert_eq!(
+        assert!(
             resolved_handle(&mut pdf, fs_ref).is_null(),
-            true,
             "Filespec must be nulled, not removed"
         );
     }
@@ -1172,9 +1170,8 @@ mod tests {
             Some(af_array_ref),
             "page /AF must still point at the surviving shared array"
         );
-        assert_eq!(
+        assert!(
             resolved_handle(&mut pdf, fs_ref).is_null(),
-            true,
             "Filespec must be nulled, not removed"
         );
     }
