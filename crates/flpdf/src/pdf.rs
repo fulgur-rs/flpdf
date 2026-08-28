@@ -314,11 +314,21 @@ impl<R: Read + Seek> Pdf<R> {
     /// its `max_input_version`.
     pub fn adobe_extension_level(&mut self) -> Option<i64> {
         let root_ref = self.root_ref()?;
-        let catalog = self.resolve_object(root_ref).ok()?;
-        let extensions = resolve_object_value(self, catalog.as_dict()?.get("Extensions")?.clone())?;
-        let adbe = resolve_object_value(self, extensions.as_dict()?.get("ADBE")?.clone())?;
-        let level = resolve_object_value(self, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
-        level.as_integer()
+        let catalog = self.get_object_handle(root_ref);
+        self.resolve(&catalog).ok()?;
+        let extensions = catalog.try_get_key(b"/Extensions").ok()?;
+        self.resolve(&extensions).ok()?;
+        if extensions.try_as_dictionary().ok()?.is_none() {
+            return None;
+        }
+        let adbe = extensions.try_get_key(b"/ADBE").ok()?;
+        self.resolve(&adbe).ok()?;
+        if adbe.try_as_dictionary().ok()?.is_none() {
+            return None;
+        }
+        let level = adbe.try_get_key(b"/ExtensionLevel").ok()?;
+        self.resolve(&level).ok()?;
+        level.try_as_integer().ok().flatten()
     }
 
     /// The trailer dictionary (or the dictionary attached to the trailing xref stream
@@ -459,14 +469,5 @@ impl<R: Read + Seek> Pdf<R> {
             return Err(Error::System("unable to find /Root dictionary".into()));
         }
         Ok(root)
-    }
-}
-
-// Resolve `value` one level: follow an `Object::Reference` through `pdf`,
-// or return a non-reference value unchanged.
-fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
-    match value {
-        Object::Reference(reference) => pdf.resolve_object(reference).ok(),
-        other => Some(other),
     }
 }
