@@ -14,6 +14,22 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Extract the raw password bytes from an argv entry the way qpdf's C API
+/// receives them: as the platform's native `argv[]` bytes, with no forced
+/// UTF-8 validation. On Unix, `OsStr` already holds those bytes directly; a
+/// lossy `to_string_lossy()` conversion would replace any non-UTF-8 byte
+/// with U+FFFD before authentication, rejecting a legacy single-byte-encoded
+/// password (e.g. Latin-1) that qpdf's `qpdf_read` accepts unchanged.
+#[cfg(unix)]
+fn password_bytes(password_arg: &std::ffi::OsStr) -> Vec<u8> {
+    std::os::unix::ffi::OsStrExt::as_bytes(password_arg).to_vec()
+}
+
+#[cfg(not(unix))]
+fn password_bytes(password_arg: &std::ffi::OsStr) -> Vec<u8> {
+    password_arg.to_string_lossy().into_owned().into_bytes()
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().collect();
     match run(&args) {
@@ -53,11 +69,16 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
 /// replacement before it reaches the harness.
 fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Result<()> {
     let input = PathBuf::from(input_arg);
-    let password = password_arg.to_string_lossy().into_owned().into_bytes();
+    let password = password_bytes(password_arg);
     let mut pdf = Pdf::open_with_options(
         File::open(&input)?,
         PdfOpenOptions {
             password,
+            // qpdf's C API `qpdf_read` authenticates with a single attempt;
+            // the alternate-encoding retry loop is QPDFJob-only
+            // (`libqpdf/QPDFJob.cc:1744`, gated on `m->suppress_password_recovery`)
+            // and is never reached through the raw C API this test targets.
+            suppress_password_recovery: true,
             description: input.to_string_lossy().into_owned(),
             ..PdfOpenOptions::default()
         },
@@ -134,11 +155,14 @@ fn run_test19(
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
     let output = PathBuf::from(output_arg);
-    let password = password_arg.to_string_lossy().into_owned().into_bytes();
+    let password = password_bytes(password_arg);
     let mut pdf = Pdf::open_with_options(
         File::open(&input)?,
         PdfOpenOptions {
             password,
+            // See run_test1's identical setting: qpdf's C API authenticates
+            // with a single attempt, with no QPDFJob-only recovery retry.
+            suppress_password_recovery: true,
             description: input.to_string_lossy().into_owned(),
             ..PdfOpenOptions::default()
         },
@@ -153,4 +177,21 @@ fn run_test19(
     writer.write()?;
     println!("C test 19 done");
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::password_bytes;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn password_bytes_preserves_non_utf8_argv_bytes_on_unix() {
+        // qpdf's C API receives argv as raw bytes and never validates them as
+        // UTF-8, so a legacy single-byte-encoded password byte like 0xe9
+        // (é in Latin-1) must survive unchanged. `to_string_lossy()` would
+        // replace it with the 3-byte U+FFFD sequence instead.
+        let raw = [b'p', b'w', 0xe9, b'!'];
+        let arg = std::ffi::OsStr::from_bytes(&raw);
+        assert_eq!(password_bytes(arg), raw.to_vec());
+    }
 }
