@@ -656,7 +656,7 @@ fn get_all_pages_traverses_a_direct_catalog_pages_root() {
     let pages = catalog.get_key(b"/Pages");
     pdf.resolve(&pages).unwrap();
     assert!(
-        pages.as_dictionary().is_some(),
+        pages.object_ref().is_none() && pages.as_dictionary().is_some(),
         "qpdf keeps the catalog /Pages root direct"
     );
 }
@@ -1842,7 +1842,7 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     let kids = kids.as_array().unwrap();
     assert!(
         kids.first()
-            .is_some_and(|kid| kid.as_dictionary().is_some()),
+            .is_some_and(|kid| kid.object_ref().is_none() && kid.as_dictionary().is_some()),
         "qpdf leaves a direct intermediate /Pages dictionary direct"
     );
 }
