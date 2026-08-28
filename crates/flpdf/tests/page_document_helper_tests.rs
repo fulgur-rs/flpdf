@@ -87,6 +87,21 @@ fn build_n_page_pdf(n: u32) -> Vec<u8> {
     out
 }
 
+/// Build a PDF whose trailer `/Root` points to an indirect scalar. qpdf opens
+/// this file, but QPDF::getAllPages rejects the root before looking for pages.
+fn pdf_with_scalar_root() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let root_offset = out.len() as u64;
+    out.extend_from_slice(b"1 0 obj\n42\nendobj\n");
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    out.extend_from_slice(format!("{root_offset:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 fn build_pdf(page_extra: &str, extra_objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut out = b"%PDF-1.4\n".to_vec();
     let mut offsets = BTreeMap::new();
@@ -293,6 +308,49 @@ fn pdf_with_direct_pages_node_kids_holder() -> Vec<u8> {
     }
     out.extend_from_slice(
         format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+/// A serialized page tree with a direct intermediate node. Its `/Kids` mixes
+/// direct dictionaries/scalars with indirect page and scalar objects so the
+/// resolver sees the same warning-bearing handles as qpdf's parser.
+fn pdf_with_direct_intermediate_pages_node() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    let objects = [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [<< /Type /NotPages /Kids [<< /Type /NotPages /Kids [<< /Type /NotAPage >> 42 11 0 R 12 0 R 3 0 R] /Count 3 >>] /Count 3 >>] /Count 3 >>".as_slice(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".as_slice(),
+        ),
+        (
+            11,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        ),
+        (12, b"12".as_slice()),
+    ];
+    for (number, body) in objects {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 13\n0000000000 65535 f \n");
+    for number in 1..=12 {
+        match offsets.get(&number) {
+            Some(offset) => out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 00000 f \n"),
+        }
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 13 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
     out
 }
@@ -544,12 +602,11 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
 
     assert_eq!(pages, vec![ObjectRef::new(3, 0)]);
-    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must remain a dictionary");
-    };
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
     assert_eq!(
-        catalog.get("Pages"),
-        Some(&Object::Reference(ObjectRef::new(2, 0)))
+        catalog.get_key(b"/Pages").object_ref(),
+        Some(ObjectRef::new(2, 0))
     );
 }
 
@@ -558,36 +615,35 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
 #[test]
 fn get_all_pages_follows_parent_from_direct_catalog_page_value() {
     let mut pdf = open(build_n_page_pdf(2));
-    let direct_page = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", direct_page);
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let direct_page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve(&direct_page).unwrap();
+    let direct_page = direct_page.shallow_copy().unwrap();
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog.replace_key(b"/Pages", direct_page).unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
 
-    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must remain a dictionary");
-    };
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
     assert_eq!(
-        catalog.get("Pages"),
-        Some(&Object::Reference(ObjectRef::new(2, 0)))
+        catalog.get_key(b"/Pages").object_ref(),
+        Some(ObjectRef::new(2, 0))
     );
 }
 
 #[test]
 fn get_all_pages_traverses_a_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Dictionary(pages));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&pages).unwrap();
+    let pages = pages.shallow_copy().unwrap();
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog.replace_key(b"/Pages", pages).unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     assert_eq!(
         PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap(),
@@ -595,11 +651,12 @@ fn get_all_pages_traverses_a_direct_catalog_pages_root() {
         "qpdf traverses a direct catalog /Pages dictionary without materializing it"
     );
 
-    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must remain a dictionary");
-    };
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    let pages = catalog.get_key(b"/Pages");
+    pdf.resolve(&pages).unwrap();
     assert!(
-        matches!(catalog.get("Pages"), Some(Object::Dictionary(_))),
+        pages.object_ref().is_none() && pages.as_dictionary().is_some(),
         "qpdf keeps the catalog /Pages root direct"
     );
 }
@@ -635,11 +692,10 @@ fn push_inherited_attributes_marks_qpdf_json_observation() {
 #[test]
 fn get_all_pages_returns_empty_when_catalog_has_no_pages() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.remove("Pages");
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog.remove_key(b"/Pages");
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     assert!(
         PageDocumentHelper::new(&mut pdf)
@@ -653,11 +709,12 @@ fn get_all_pages_returns_empty_when_catalog_has_no_pages() {
 #[test]
 fn get_all_pages_returns_empty_when_catalog_pages_is_not_a_dictionary() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Integer(42));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog
+        .replace_key(b"/Pages", ObjectHandle::integer(42))
+        .unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     assert!(PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
@@ -1676,14 +1733,15 @@ fn helper_flatten_annotations_applies_no_rotate_using_leaf_rotate() {
 #[test]
 fn get_all_pages_rejects_a_pages_tree_cycle() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    pages.insert(
-        "Kids",
-        Object::Array(vec![Object::Reference(ObjectRef::new(2, 0))]),
-    );
-    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&pages).unwrap();
+    pages
+        .replace_key(
+            b"/Kids",
+            ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(2, 0))]),
+        )
+        .unwrap();
+    pdf.mark_object_handle_dirty(&pages).unwrap();
 
     let error = PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
@@ -1698,27 +1756,25 @@ fn get_all_pages_rejects_a_pages_tree_cycle() {
 fn get_all_pages_rejects_a_revisited_pages_subtree_like_qpdf() {
     let mut pdf = open(build_n_page_pdf(1));
 
-    let mut interior = Dictionary::new();
-    interior.insert("Type", Object::Name(b"Pages".to_vec()));
-    interior.insert(
-        "Kids",
-        Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
-    );
-    interior.insert("Count", Object::Integer(1));
-    pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(interior));
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    let interior = pdf
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::array(vec![page])),
+            (b"/Count".to_vec(), ObjectHandle::integer(1)),
+        ]))
+        .unwrap();
 
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    root.insert(
-        "Kids",
-        Object::Array(vec![
-            Object::Reference(ObjectRef::new(11, 0)),
-            Object::Reference(ObjectRef::new(11, 0)),
-        ]),
-    );
-    root.insert("Count", Object::Integer(2));
-    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+    let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&root).unwrap();
+    root.replace_key(
+        b"/Kids",
+        ObjectHandle::array(vec![interior.clone(), interior]),
+    )
+    .unwrap();
+    root.replace_key(b"/Count", ObjectHandle::integer(2))
+        .unwrap();
+    pdf.mark_object_handle_dirty(&root).unwrap();
 
     let error = PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
@@ -1731,105 +1787,73 @@ fn get_all_pages_rejects_a_revisited_pages_subtree_like_qpdf() {
 
 #[test]
 fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
-    let mut pdf = open(build_n_page_pdf(1));
-    let mut indirect_interior = Dictionary::new();
-    indirect_interior.insert("Type", Object::Name(b"Pages".to_vec()));
-    indirect_interior.insert(
-        "Kids",
-        Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
-    );
-    indirect_interior.insert("Count", Object::Integer(1));
-    pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(indirect_interior));
-    pdf.set_object(ObjectRef::new(12, 0), Object::Integer(12));
+    let mut pdf = open(pdf_with_direct_intermediate_pages_node());
+    let indirect_scalar_ref = ObjectRef::new(12, 0);
 
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    let mut direct_leaf = Dictionary::new();
-    direct_leaf.insert("Type", Object::Name(b"NotAPage".to_vec()));
-    let mut direct_interior = Dictionary::new();
-    direct_interior.insert("Type", Object::Name(b"NotPages".to_vec()));
-    direct_interior.insert(
-        "Kids",
-        Object::Array(vec![
-            Object::Dictionary(direct_leaf),
-            Object::Integer(42),
-            Object::Reference(ObjectRef::new(11, 0)),
-            Object::Reference(ObjectRef::new(12, 0)),
-            Object::Reference(ObjectRef::new(3, 0)),
-        ]),
-    );
-    direct_interior.insert("Count", Object::Integer(3));
-    let mut direct_outer = Dictionary::new();
-    direct_outer.insert("Type", Object::Name(b"NotPages".to_vec()));
-    direct_outer.insert(
-        "Kids",
-        Object::Array(vec![Object::Dictionary(direct_interior)]),
-    );
-    direct_outer.insert("Count", Object::Integer(3));
-    root.insert(
-        "Kids",
-        Object::Array(vec![Object::Dictionary(direct_outer)]),
-    );
-    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
-
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_eq!(
-        PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap(),
-        vec![
-            ObjectRef::new(13, 0),
-            ObjectRef::new(14, 0),
-            ObjectRef::new(3, 0),
-            ObjectRef::new(12, 0),
-            ObjectRef::new(15, 0),
-        ],
+        pages.len(),
+        5,
         "qpdf traverses direct nodes in place, promotes direct leaves, retains indirect scalar leaves, and clones duplicate leaves"
     );
+    assert_eq!(pages[2], ObjectRef::new(3, 0));
+    assert_eq!(pages[3], indirect_scalar_ref);
+    assert_ne!(pages[0], ObjectRef::new(3, 0));
+    assert_ne!(pages[1], indirect_scalar_ref);
+    assert_ne!(
+        pages[4],
+        ObjectRef::new(3, 0),
+        "qpdf clones the repeated page instead of returning the original reference twice"
+    );
 
-    let Object::Dictionary(minted_leaf) = pdf.resolve_object(ObjectRef::new(13, 0)).unwrap() else {
-        panic!("direct leaf must be made indirect");
-    };
+    let minted_leaf = pdf.get_object_handle(pages[0]);
+    pdf.resolve(&minted_leaf).unwrap();
+    let media_box = minted_leaf.get_key(b"/MediaBox");
+    pdf.resolve(&media_box).unwrap();
+    let media_box = media_box.as_array().unwrap();
     assert_eq!(
-        minted_leaf.get("MediaBox"),
-        Some(&Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(612),
-            Object::Integer(792),
-        ])),
+        media_box
+            .iter()
+            .map(|item| item.as_integer())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(612), Some(792)],
         "qpdf supplies the default MediaBox before retaining the repaired leaf"
     );
     assert_eq!(
-        minted_leaf.get("Type"),
-        Some(&Object::Name(b"Page".to_vec()))
+        minted_leaf.get_key(b"/Type").as_name(),
+        Some(b"Page".to_vec())
     );
 
+    let promoted_scalar = pdf.get_object_handle(pages[1]);
+    pdf.resolve(&promoted_scalar).unwrap();
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(14, 0)).unwrap(),
-        Object::Integer(42),
+        promoted_scalar.as_integer(),
+        Some(42),
         "qpdf promotes a direct scalar kid without changing its value"
     );
+    let indirect_scalar = pdf.get_object_handle(indirect_scalar_ref);
+    pdf.resolve(&indirect_scalar).unwrap();
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(12, 0)).unwrap(),
-        Object::Integer(12),
+        indirect_scalar.as_integer(),
+        Some(12),
         "qpdf includes an indirect scalar kid in the flattened page order"
     );
-    let Object::Dictionary(cloned_leaf) = pdf.resolve_object(ObjectRef::new(15, 0)).unwrap() else {
-        panic!("duplicate page must be copied as a dictionary");
-    };
+    let cloned_leaf = pdf.get_object_handle(pages[4]);
+    pdf.resolve(&cloned_leaf).unwrap();
     assert_eq!(
-        cloned_leaf.get("Type"),
-        Some(&Object::Name(b"Page".to_vec())),
+        cloned_leaf.get_key(b"/Type").as_name(),
+        Some(b"Page".to_vec()),
         "qpdf repairs the duplicate copy as a page"
     );
 
-    let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must remain a dictionary");
-    };
-    let Some(Object::Array(kids)) = root.get("Kids") else {
-        panic!("pages root must retain /Kids");
-    };
+    let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&root).unwrap();
+    let kids = root.get_key(b"/Kids");
+    pdf.resolve(&kids).unwrap();
+    let kids = kids.as_array().unwrap();
     assert!(
-        matches!(kids.first(), Some(Object::Dictionary(_))),
+        kids.first()
+            .is_some_and(|kid| kid.object_ref().is_none() && kid.as_dictionary().is_some()),
         "qpdf leaves a direct intermediate /Pages dictionary direct"
     );
 }
@@ -1869,18 +1893,18 @@ fn get_all_pages_resolves_an_indirect_kids_holder_under_a_direct_pages_node() {
 #[test]
 fn get_all_pages_rejects_an_overdeep_direct_pages_tree() {
     let mut pdf = open(build_n_page_pdf(1));
-    let mut child = Object::Reference(ObjectRef::new(3, 0));
+    let mut child = pdf.get_object_handle(ObjectRef::new(3, 0));
     for _ in 0..=flpdf::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
-        let mut direct_interior = Dictionary::new();
-        direct_interior.insert("Type", Object::Name(b"Pages".to_vec()));
-        direct_interior.insert("Kids", Object::Array(vec![child]));
-        child = Object::Dictionary(direct_interior);
+        child = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::array(vec![child])),
+        ]);
     }
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    root.insert("Kids", Object::Array(vec![child]));
-    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+    let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&root).unwrap();
+    root.replace_key(b"/Kids", ObjectHandle::array(vec![child]))
+        .unwrap();
+    pdf.mark_object_handle_dirty(&root).unwrap();
 
     let error = PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
@@ -1894,17 +1918,15 @@ fn get_all_pages_rejects_an_overdeep_direct_pages_tree() {
 #[test]
 fn get_all_pages_ignores_a_direct_pages_node_with_non_array_kids() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    let mut direct_interior = Dictionary::new();
-    direct_interior.insert("Type", Object::Name(b"Pages".to_vec()));
-    direct_interior.insert("Kids", Object::Integer(42));
-    root.insert(
-        "Kids",
-        Object::Array(vec![Object::Dictionary(direct_interior)]),
-    );
-    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+    let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&root).unwrap();
+    let direct_interior = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+        (b"/Kids".to_vec(), ObjectHandle::integer(42)),
+    ]);
+    root.replace_key(b"/Kids", ObjectHandle::array(vec![direct_interior]))
+        .unwrap();
+    pdf.mark_object_handle_dirty(&root).unwrap();
 
     assert!(
         PageDocumentHelper::new(&mut pdf)
@@ -3235,8 +3257,7 @@ fn get_all_pages_errors_on_a_non_dictionary_root() {
     // for a non-dictionary root (QPDF.cc:2355-2360). This is a hard error,
     // not the warning-tolerant empty-page-list path used for a merely
     // missing /Pages key.
-    let mut pdf = open(build_n_page_pdf(1));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Integer(42));
+    let mut pdf = open(pdf_with_scalar_root());
 
     let error = PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
