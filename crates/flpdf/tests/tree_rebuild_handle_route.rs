@@ -4,8 +4,12 @@
 fn tree_rebuild_tests_use_canonical_handles() {
     let source = include_str!("../src/pages/tree_rebuild.rs");
     let tests = source
-        .split_once("#[cfg(test)]\nmod tests {")
-        .map(|(_, tests)| tests)
+        .find("#[cfg(test)]")
+        .and_then(|start| {
+            source[start..]
+                .split_once("mod tests {")
+                .map(|(_, tests)| tests)
+        })
         .expect("tree_rebuild test module");
 
     for forbidden in [
