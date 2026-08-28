@@ -62,7 +62,19 @@ fn resolved_key(pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8
 fn has_entry(object: &ObjectHandle, key: &[u8]) -> bool {
     object
         .as_dictionary()
-        .is_some_and(|dictionary| dictionary.contains_key(key))
+        .expect("entry lookup requires a dictionary")
+        .contains_key(key)
+}
+
+fn assert_direct_dictionary(object: &ObjectHandle, description: &str) {
+    assert!(
+        object.object_ref().is_none(),
+        "{description} must retain direct identity"
+    );
+    assert!(
+        object.as_dictionary().is_some(),
+        "{description} must remain a dictionary"
+    );
 }
 
 fn key_name(pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8]) -> Option<Vec<u8>> {
@@ -867,24 +879,26 @@ fn set_value_marks_the_terminal_acroform_reference_as_needing_appearances() {
 fn default_resources_preserves_a_natural_indirect_holder_identity() {
     // qpdf's getDefaultResources returns the live value from /AcroForm/DR
     // without collapsing its indirect identity (`QPDFFormFieldObjectHelper.cc:
-    // 50-63,191-194`). The cycle is encoded in the PDF itself, so this
-    // exercises the same natural graph that qpdf parses without the removed
-    // set_object reference-value seam.
+    // 50-63,191-194`). The cycle is nested in valid dictionaries, so the
+    // traversal exercises the same natural graph that qpdf parses without the
+    // removed set_object reference-value seam.
     let bytes = doc_with_acroform(vec![
         (10, "<< >>".into()),
         (20, "<< /DR 21 0 R >>".into()),
-        (21, "22 0 R".into()),
-        (22, "21 0 R".into()),
+        (21, "<< /Font 22 0 R >>".into()),
+        (22, "<< /Font 21 0 R >>".into()),
     ]);
     let mut pdf = open(bytes);
 
     let resources = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .default_resources()
-        .expect("resolve malformed default resources");
-    assert_eq!(
-        resources.and_then(|resources| resources.object_ref()),
-        Some(ObjectRef::new(21, 0))
-    );
+        .expect("resolve default resources")
+        .expect("default resources handle");
+    assert_eq!(resources.object_ref(), Some(ObjectRef::new(21, 0)));
+    let nested = resolved_key(&mut pdf, &resources, b"/Font");
+    assert_eq!(nested.object_ref(), Some(ObjectRef::new(22, 0)));
+    let back = resolved_key(&mut pdf, &nested, b"/Font");
+    assert!(back.is_same_object_as(&resources));
 }
 
 #[test]
@@ -1050,10 +1064,7 @@ fn set_value_updates_a_checkbox_direct_kid_widget() {
         .as_array()
         .expect("checkbox must retain direct widget child");
     let widget = resolved_value(&mut pdf, kids.into_iter().next().expect("widget"));
-    assert!(
-        widget.as_dictionary().is_some(),
-        "widget must be a direct dictionary"
-    );
+    assert_direct_dictionary(&widget, "widget");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
         Some(b"Chosen".as_slice())
@@ -1091,10 +1102,7 @@ fn set_value_preserves_kids_order_when_direct_widget_precedes_a_reference() {
         .as_array()
         .expect("kids must be an array");
     let direct = resolved_value(&mut pdf, kids[0].clone());
-    assert!(
-        direct.as_dictionary().is_some(),
-        "first kid must stay direct"
-    );
+    assert_direct_dictionary(&direct, "first kid");
     assert_eq!(
         key_name(&mut pdf, &direct, b"/AS").as_deref(),
         Some(b"Direct".as_slice())
@@ -1264,18 +1272,12 @@ fn set_value_updates_a_radio_grandchild_widget_and_direct_kid_dictionaries() {
         .as_array()
         .expect("radio field must retain direct children");
     let child = resolved_value(&mut pdf, children.into_iter().next().expect("child field"));
-    assert!(
-        child.as_dictionary().is_some(),
-        "child field must be a direct dictionary"
-    );
+    assert_direct_dictionary(&child, "child field");
     let widgets = resolved_key(&mut pdf, &child, b"/Kids")
         .as_array()
         .expect("child field must retain direct widget children");
     let widget = resolved_value(&mut pdf, widgets.into_iter().next().expect("widget"));
-    assert!(
-        widget.as_dictionary().is_some(),
-        "widget must be a direct dictionary"
-    );
+    assert_direct_dictionary(&widget, "widget");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
         Some(b"On".as_slice())
@@ -1519,10 +1521,7 @@ fn checkbox_updates_a_direct_widget_through_an_indirect_kids_array() {
         .as_array()
         .expect("/Kids holder must remain an array");
     let widget = resolved_value(&mut pdf, kids[0].clone());
-    assert!(
-        widget.as_dictionary().is_some(),
-        "first /Kids item must remain a direct widget"
-    );
+    assert_direct_dictionary(&widget, "first /Kids item");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
         Some(b"Chosen".as_slice())
@@ -1585,9 +1584,10 @@ fn radio_keeps_direct_children_without_appearance_or_grandchildren() {
         .as_array()
         .expect("kids array");
     let first = resolved_value(&mut pdf, kids[0].clone());
-    assert!(first.as_dictionary().is_some());
+    assert_direct_dictionary(&first, "first radio child");
     assert!(!has_entry(&first, b"/AS"));
     let second = resolved_value(&mut pdf, kids[1].clone());
+    assert_direct_dictionary(&second, "second radio child");
     assert_eq!(
         key_name(&mut pdf, &second, b"/AS").as_deref(),
         Some(b"On".as_slice())
@@ -1735,7 +1735,7 @@ fn radio_preserves_unselectable_direct_and_indirect_grandchildren() {
         .object_ref()
         .is_some());
     let malformed = resolved_value(&mut pdf, items[2].clone());
-    assert!(malformed.as_dictionary().is_some());
+    assert_direct_dictionary(&malformed, "direct malformed child");
     assert!(!has_entry(&malformed, b"/AS"));
 }
 
@@ -1790,13 +1790,15 @@ fn value_updates_cover_non_button_and_checkbox_document_boundaries() {
         Some(b"raw".as_slice())
     );
 
-    let bytes = doc(vec![(10, "<< /FT /Tx >>".into()), (20, "<< >>".into())]);
+    let bytes = doc_with_root(
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << >> >>",
+        vec![(10, "<< /FT /Tx >>".into())],
+    );
     let mut pdf = open(bytes);
     let root = pdf.root_ref().unwrap();
     let catalog = resolved_handle(&mut pdf, root);
-    let acroform = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
-    catalog.replace_key(b"/AcroForm", acroform).unwrap();
-    pdf.mark_object_handle_dirty(&catalog).unwrap();
+    let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
+    assert_direct_dictionary(&acroform, "direct AcroForm");
     FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .set_value(ObjectHandle::name(b"raw".to_vec()), true)
         .unwrap();
@@ -1820,13 +1822,15 @@ fn value_updates_cover_non_button_and_checkbox_document_boundaries() {
 
 #[test]
 fn clear_need_appearances_handles_direct_and_non_dictionary_catalog_values() {
-    let bytes = doc(vec![(20, "<< /NeedAppearances true >>".into())]);
+    let bytes = doc_with_root(
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /NeedAppearances true >> >>",
+        Vec::new(),
+    );
     let mut pdf = open(bytes);
     let root = pdf.root_ref().unwrap();
     let catalog = resolved_handle(&mut pdf, root);
-    let acroform = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
-    catalog.replace_key(b"/AcroForm", acroform).unwrap();
-    pdf.mark_object_handle_dirty(&catalog).unwrap();
+    let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
+    assert_direct_dictionary(&acroform, "direct AcroForm");
     FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
     let acroform = resolved_key(&mut pdf, &catalog, b"/AcroForm");
     assert!(!has_entry(&acroform, b"/NeedAppearances"));
@@ -2153,10 +2157,7 @@ fn checkbox_updates_a_direct_kid_when_the_field_is_behind_multi_hop_holders() {
         .as_array()
         .expect("checkbox kids must stay an array");
     let widget = resolved_value(&mut pdf, kids[0].clone());
-    assert!(
-        widget.as_dictionary().is_some(),
-        "checkbox widget must stay direct"
-    );
+    assert_direct_dictionary(&widget, "checkbox widget");
     assert_eq!(
         key_name(&mut pdf, &widget, b"/AS").as_deref(),
         Some(b"Chosen".as_slice())
