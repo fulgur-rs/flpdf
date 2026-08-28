@@ -22,10 +22,10 @@ fn test_block<'a>(source: &'a str, name: &str) -> &'a str {
 
 #[test]
 fn add_page_tests_use_only_canonical_handle_routes() {
-    let source = include_str!("page_document_helper_tests.rs");
+    let source = include_str!("page_document_helper_tests.rs").replace("\r\n", "\n");
     let blocks = TARGETS
         .iter()
-        .map(|name| test_block(source, name))
+        .map(|name| test_block(&source, name))
         .collect::<Vec<_>>();
     let selected = blocks.join("\n");
 
