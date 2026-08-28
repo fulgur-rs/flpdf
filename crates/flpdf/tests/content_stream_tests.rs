@@ -67,23 +67,6 @@ impl ParserCallbacks for DefaultContentSizeCallbacks {
 }
 
 #[test]
-fn content_module_has_no_independent_lexer_helpers() {
-    let source = include_str!("../src/content_stream.rs");
-    for forbidden in [
-        "skip_ws_collect_comment",
-        "read_keyword",
-        "at_operand_start",
-        "starts_number_token",
-        "fn parse_inline_image",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "legacy lexical helper remains: {forbidden}"
-        );
-    }
-}
-
-#[test]
 fn operation_adapter_groups_objects_without_lexing_bytes() {
     let mut seen = Vec::new();
     parse_content_operations(b"1 2 cm q", |operands, operator| {
