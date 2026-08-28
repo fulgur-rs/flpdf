@@ -73,10 +73,9 @@ fn hex_key_v5_r6_check_succeeds_with_recovered_key() {
         ])
         .assert()
         .success()
-        // The recovered key opens the encrypted file, so the check block reports
-        // it as encrypted (interim single line; the detailed qpdf R/P block is
-        // tracked separately).
-        .stdout(predicates::str::contains("File is encrypted\n"))
+        // The recovered key opens the encrypted file, so the check block emits
+        // qpdf's detailed encryption report.
+        .stdout(predicates::str::contains("R = 6\n"))
         // This AES-256 fixture declares Adobe extension level 8 in its catalog;
         // the version banner must match qpdf byte-for-byte.
         .stdout(predicates::str::contains(
