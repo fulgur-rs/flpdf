@@ -6091,7 +6091,9 @@ mod tests {
         assert!(prepared.refs.contains(&stream_ref));
         assert!(pdf.object_refs().contains(&stream_ref));
         assert!(!pdf.live_object_refs().contains(&stream_ref));
-        assert_eq!(pdf.resolve_object(stream_ref).unwrap(), crate::Object::Null);
+        let stream_handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve(&stream_handle).unwrap();
+        assert!(stream_handle.as_stream_dict().is_some());
     }
 
     #[test]
@@ -6139,7 +6141,9 @@ mod tests {
             qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
             crate::Object::Stream(_)
         ));
-        assert_eq!(pdf.resolve_object(stream_ref).unwrap(), crate::Object::Null);
+        let stream_handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve(&stream_handle).unwrap();
+        assert!(stream_handle.as_stream_dict().is_some());
     }
 
     #[test]

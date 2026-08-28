@@ -2196,7 +2196,9 @@ pub(crate) fn collect_reachable_refs<R: Read + Seek>(
     }
     out.insert(object_ref);
 
-    let obj = pdf.resolve_object(object_ref)?;
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve(&handle)?;
+    let obj = handle.materialize()?;
     collect_refs_in_object(pdf, &obj, out, seen, depth, 0, skip_parent_key)
 }
 
@@ -2454,6 +2456,26 @@ mod tests {
         let obj = Object::Dictionary(dict(&[("S", stream), ("N", Object::Integer(1))]));
         collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0, true).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_reachable_refs_resolves_each_indirect_object_through_its_handle() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Child", Object::Reference(ObjectRef::new(6, 0)))])),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
+
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        collect_reachable_refs(&mut pdf, ObjectRef::new(5, 0), &mut out, &mut seen, 0, true)
+            .unwrap();
+
+        assert_eq!(
+            out,
+            BTreeSet::from([ObjectRef::new(5, 0), ObjectRef::new(6, 0)])
+        );
     }
 
     #[test]

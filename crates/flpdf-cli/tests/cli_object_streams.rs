@@ -5,6 +5,9 @@
 //!   - default (no flag) is preserve
 //!   - invalid values are rejected with an actionable error
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -76,7 +79,7 @@ fn object_streams_generate_is_accepted_and_emits_objstm() {
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     let mut found_objstm = false;
     for r in pdf.object_refs() {
-        if let Ok(Object::Stream(s)) = pdf.resolve_object(r) {
+        if let Ok(Object::Stream(s)) = pdf.resolve_canonical_object(r) {
             if let Some(Object::Name(n)) = s.dict.get("Type") {
                 if n.as_slice() == b"ObjStm" {
                     found_objstm = true;

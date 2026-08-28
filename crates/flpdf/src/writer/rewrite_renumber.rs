@@ -80,9 +80,9 @@ fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<Objec
 
 /// Catalog-first numbering over the live [`crate::ObjectHandle`] graph.
 ///
-/// This is the writer's canonical traversal boundary. It never calls
-/// `Pdf::resolve_borrowed`, so an in-place handle mutation is observed directly
-/// and no legacy `Object` snapshot is created. The enqueue order and
+/// This is the writer's canonical traversal boundary. It resolves and inspects
+/// ObjectHandles directly, so an in-place handle mutation is observed without
+/// creating a separate legacy `Object` snapshot. The enqueue order and
 /// null-visible edge rules mirror `QPDFWriter::enqueueObject` and
 /// `enqueueObjectsStandard` (`QPDFWriter.cc:1072-1141,2916-2924`).
 pub(crate) struct CanonicalCatalogFirstRenumber {

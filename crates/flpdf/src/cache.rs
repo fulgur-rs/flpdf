@@ -170,6 +170,7 @@ impl ObjectCache {
     /// [`resolve`](crate::Pdf::resolve) for the same ref then hits the
     /// `Reserved => Null` arm instead of recursing, breaking indirect cycles
     /// (e.g. cyclic stream `/Length` holder chains).
+    #[cfg(test)]
     pub(crate) fn set_reserved(&mut self, object_ref: ObjectRef) {
         self.entries.insert(object_ref, CacheEntry::Reserved);
     }
@@ -178,6 +179,7 @@ impl ObjectCache {
     /// undo a [`set_reserved`](Self::set_reserved) guard when a resolution
     /// attempt fails hard, so the entry does not linger as `Reserved` (which a
     /// later resolve would read as `Null`) and a retry re-errors consistently.
+    #[cfg(test)]
     pub(crate) fn set_unresolved(&mut self, object_ref: ObjectRef, offset: u64) {
         self.entries
             .insert(object_ref, CacheEntry::Unresolved { offset });

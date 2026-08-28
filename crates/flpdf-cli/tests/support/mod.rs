@@ -13,7 +13,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
 use assert_cmd::Command as CargoCommand;
+use flpdf::{Object, ObjectRef, Pdf, Result};
 use tempfile::TempDir;
+
+/// Canonical object access used by the compat harness after the library's
+/// owned raw-object resolver was removed.
+pub trait PdfCanonicalTestExt {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object>;
+}
+
+impl<R: std::io::Read + std::io::Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        let handle = self.get_object_handle(object_ref);
+        self.resolve(&handle)?;
+        handle.materialize()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fixture

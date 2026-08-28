@@ -2570,10 +2570,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// qpdf passes `allow_bad = true` (`QPDF::readToken`, `:1536-1539`), so a
     /// *malformed* token is returned as `tt_bad` and likewise reported as the
     /// missing keyword. Keep that policy here so the canonical stream path
-    /// can enter its recovery arm. qpdf's `QPDFTokenizer::nextToken` records
-    /// the input position before it skips whitespace and comments
-    /// (`libqpdf/QPDFTokenizer.cc:926-961`); return that attempted-read
-    /// position rather than the later token start for the same diagnostic.
+    /// can enter its recovery arm. qpdf's `QPDFTokenizer::nextToken` advances
+    /// its last offset while it skips whitespace and comments
+    /// (`libqpdf/QPDFTokenizer.cc:926-961`), so return the token start after
+    /// that skipped prefix rather than the attempted-read position.
     fn read_token_from_input(&self) -> Result<(Token, u64)> {
         let start = self.tell()?;
         self.scan_forward(|bytes| {
@@ -2582,7 +2582,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let token = tokenizer.read_token(true, 0)?;
             Ok((token, tokenizer.position()))
         })
-        .map(|token| (token, start))
+        .map(|token| {
+            let token_start = start.saturating_add(token.start as u64);
+            (token, token_start)
+        })
     }
 
     /// Read one byte from the current position, or `None` at EOF.
@@ -10867,8 +10870,8 @@ mod tests {
                 .position(|window| window == b"stream\n")
                 .expect("stream keyword")
             + b"stream\n".len();
-        let attempted_offset =
-            u64::try_from(stream_offset + 1).expect("fixture offset fits qpdf offset");
+        let attempted_offset = u64::try_from(stream_offset + b"x \n% ignored\n".len())
+            .expect("fixture offset fits qpdf offset");
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             body.to_vec(),
@@ -11009,7 +11012,7 @@ mod tests {
                         .as_slice(),
                     &b"abc"[..]
                 );
-                assert_eq!(warnings, ["(object 2 0, offset 89): expected endobj"]);
+                assert_eq!(warnings, ["(object 2 0, offset 90): expected endobj"]);
             },
         );
     }
@@ -12291,7 +12294,7 @@ mod tests {
         );
         pdf.resolver.core.borrow_mut().reconstructed_xref = true;
 
-        pdf.synchronize_legacy_resolution_state();
+        pdf.synchronize_cache_with_resolver_xref();
 
         assert_eq!(pdf.compressed_parent(changed_type), None);
         assert_eq!(pdf.compressed_parent(changed_parent), None);

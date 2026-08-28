@@ -67,7 +67,9 @@ impl Plan {
             let Item::Source { source, .. } = item else {
                 continue;
             };
-            let object = builder.pdf.resolve_object(source)?;
+            let source_handle = builder.pdf.get_object_handle(source);
+            builder.pdf.resolve(&source_handle)?;
+            let object = source_handle.materialize()?;
             builder.enqueue_value_with_stream_length_policy(&object)?;
         }
 
@@ -159,7 +161,9 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
             if !visited.insert(reference) {
                 return Ok(Object::Null);
             }
-            current = self.pdf.resolve_object(reference)?;
+            let handle = self.pdf.get_object_handle(reference);
+            self.pdf.resolve(&handle)?;
+            current = handle.materialize()?;
         }
     }
 
@@ -243,7 +247,9 @@ mod tests {
         })
         .expect("fixture must open");
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
-        let mut page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
+        let page_handle = pdf.get_object_handle(page);
+        pdf.resolve(&page_handle).unwrap();
+        let mut page_dict = page_handle.materialize().unwrap().into_dict().unwrap();
         let mut contents = crate::Dictionary::new();
         contents.insert("Broken", Object::Reference(ObjectRef::new(11, 0)));
         page_dict.insert("Contents", Object::Dictionary(contents));
@@ -258,7 +264,9 @@ mod tests {
     fn plan_enqueues_xobject_and_its_synthetic_transform() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
-        let mut page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
+        let page_handle = pdf.get_object_handle(page);
+        pdf.resolve(&page_handle).unwrap();
+        let mut page_dict = page_handle.materialize().unwrap().into_dict().unwrap();
         let mut xobjects = crate::Dictionary::new();
         xobjects.insert("Im0", Object::Reference(ObjectRef::new(99, 0)));
         let mut resources = crate::Dictionary::new();

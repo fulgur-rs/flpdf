@@ -45,7 +45,7 @@ pub(crate) struct CompressedMemberProvenance {
 ///
 /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
 /// println!("version {}", pdf.version());
-/// let catalog = pdf.resolve_object(pdf.root_ref().expect("root"))?;
+/// let catalog = pdf.root_handle()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
@@ -124,29 +124,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// rather than re-deriving a fresh one from `self.trailer` each time.
     /// Populated lazily on first request.
     pub(crate) trailer_handle_memo: Option<ObjectHandle>,
-    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: delete with
-    /// [`Pdf::resolve_borrowed`] after its callers move to canonical handle
-    /// accessors. Do not use this memo from the new resolver path.
-    ///
-    /// Memoized [`Object`] materialization of an already-resolved
-    /// [`ObjectHandle`] (`ObjectHandle::materialize`), keyed by `ObjectRef`.
-    /// This is [`Pdf::resolve_borrowed`]'s own cache, distinct from
-    /// `self.cache`: after the native-parse cutover, `self.cache` is not
-    /// guaranteed to hold a value that agrees with what the handle graph
-    /// would materialize (e.g. [`Pdf::set_object`] on an excessively deep
-    /// value writes an authoritative override here without a corresponding
-    /// handle-graph update — see that method's own comment). Populated
-    /// lazily by [`Pdf::resolve_borrowed`]; invalidated (removed, never
-    /// re-inserted with a stale value) by [`Pdf::set_object`] and
-    /// [`Pdf::delete_object`] so the next resolve re-derives from the
-    /// updated handle.
-    pub(crate) legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
-    /// Entries in [`Self::legacy_materialized_memo`] that are authoritative
-    /// caller-supplied replacements which still need to be lifted into the
-    /// canonical handle graph. Compatibility snapshots populated by
-    /// [`Pdf::resolve_borrowed`] are deliberately not included: reconciling
-    /// those must not materialize a lazy source stream just to compare it.
-    pub(crate) legacy_materialized_replacement_refs: BTreeSet<ObjectRef>,
     pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
@@ -170,20 +147,8 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// Dirty objects whose live ObjectHandle graph was changed directly, so
     /// the legacy object cache may no longer agree with it. `set_object`
     /// updates both representations and retains the stream zero-copy fast
-    /// path in `resolve_borrowed`.
+    /// path in the raw value cache.
     pub(crate) handle_mutated_object_refs: BTreeSet<ObjectRef>,
-    /// Exact source framing EOLs removed while a line-anchored `endstream`
-    /// scan remained authoritative. Rewriting restores this private metadata
-    /// before applying the selected stream policy, matching qpdf's recovered
-    /// raw stream bytes for missing, invalid, and unresolved `/Length` values.
-    pub(crate) recovered_stream_eols: BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>,
-    /// Streams whose cached representation has already accounted for source
-    /// framing. This includes actual decryption and selective explicit
-    /// `/Crypt` removal. Recovered framing must not be appended later in either
-    /// case: ciphertext framing is not plaintext, while explicit-filter
-    /// framing is consumed while transforming the declared chain. Metadata and
-    /// document-level Identity streams remain source-represented and absent.
-    pub(crate) transformed_stream_refs: BTreeSet<ObjectRef>,
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     pub(crate) qpdf_dangling_refs: BTreeSet<ObjectRef>,
@@ -314,11 +279,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// its `max_input_version`.
     pub fn adobe_extension_level(&mut self) -> Option<i64> {
         let root_ref = self.root_ref()?;
-        let catalog = self.resolve_object(root_ref).ok()?;
-        let extensions = resolve_object_value(self, catalog.as_dict()?.get("Extensions")?.clone())?;
-        let adbe = resolve_object_value(self, extensions.as_dict()?.get("ADBE")?.clone())?;
-        let level = resolve_object_value(self, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
-        level.as_integer()
+        let catalog = self.get_object_handle(root_ref);
+        self.resolve(&catalog).ok()?;
+        let extensions = catalog.try_get_key(b"/Extensions").ok()?;
+        self.resolve(&extensions).ok()?;
+        extensions.try_as_dictionary().ok()?.as_ref()?;
+        let adbe = extensions.try_get_key(b"/ADBE").ok()?;
+        self.resolve(&adbe).ok()?;
+        adbe.try_as_dictionary().ok()?.as_ref()?;
+        let level = adbe.try_get_key(b"/ExtensionLevel").ok()?;
+        self.resolve(&level).ok()?;
+        level.try_as_integer().ok().flatten()
     }
 
     /// The trailer dictionary (or the dictionary attached to the trailing xref stream
@@ -338,7 +309,7 @@ impl<R: Read + Seek> Pdf<R> {
     // depth error or panicking: the trailer is always fully parsed already, so
     // the handle bridge accepts the same `parser::MAX_PARSE_DEPTH` bound as the
     // parser itself. A value beyond that accepted bound is structurally
-    // unusable here, just as `resolve`/`resolve_borrowed` present an unusable
+    // unusable here, just as the canonical handle path presents an unusable
     // reference as `Object::Null` rather than erroring.
     //
     // Memoized in `self.trailer_handle_memo`, the same way `handle_registry`
@@ -415,7 +386,7 @@ impl<R: Read + Seek> Pdf<R> {
         // the trailer was already parsed successfully at the looser
         // `MAX_PARSE_DEPTH` bound, so a value nested between the two would
         // otherwise degrade to null *here* while the legacy `resolve_chain`/
-        // `resolve_borrowed` path (`MAX_PARSE_DEPTH`-bounded) still returns
+        // bounded source parsing still returns
         // it — the same divergence `resolve`'s own call to
         // `lift_bounded` documents and avoids for the analogous
         // compressed-member case.
@@ -459,14 +430,5 @@ impl<R: Read + Seek> Pdf<R> {
             return Err(Error::System("unable to find /Root dictionary".into()));
         }
         Ok(root)
-    }
-}
-
-// Resolve `value` one level: follow an `Object::Reference` through `pdf`,
-// or return a non-reference value unchanged.
-fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
-    match value {
-        Object::Reference(reference) => pdf.resolve_object(reference).ok(),
-        other => Some(other),
     }
 }

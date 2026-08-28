@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod common;
+use common::PdfCanonicalTestExt;
 use common::{write_with_settings_and_mapping, WriterTestSettings};
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
@@ -126,7 +127,9 @@ fn attachment_pdf_with_malformed_unrelated_object() -> Vec<u8> {
 #[test]
 fn embedded_file_resolves_indirect_ef_dictionary() {
     let mut pdf = open(build_attachment_pdf("", "", b"payload"));
-    let Object::Dictionary(mut fs_dict) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut fs_dict) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dict");
     };
     let ef_dict = fs_dict.get("EF").cloned().expect("/EF dict");
@@ -188,7 +191,9 @@ fn get_filename_prefers_uf_and_decodes_pdf_text() {
     // /UF, or if it exposes the stored UTF-16BE bytes rather than qpdf's
     // getUTF8Value() result.
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let Object::Dictionary(mut filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut filespec) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dictionary");
     };
     filespec.insert("F", Object::String(b"fallback.txt".to_vec()));
@@ -309,7 +314,7 @@ fn factories_allocate_after_handle_only_objects() {
     let embedded = EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").unwrap();
     assert_ne!(embedded.object_ref(), Some(handle_only_ref));
     assert_eq!(
-        pdf.resolve_object(handle_only_ref).unwrap(),
+        pdf.resolve_canonical_object(handle_only_ref).unwrap(),
         Object::Integer(17),
         "factory allocation must not clobber a handle-only object"
     );
@@ -350,7 +355,7 @@ fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     owner_dict.insert("Filespec", Object::Dictionary(Dictionary::new()));
     pdf.set_object(owner_ref, Object::Dictionary(owner_dict));
     let catalog_ref = pdf.root_ref().expect("fixture has a catalog");
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_canonical_object(catalog_ref).unwrap() else {
         panic!("fixture catalog must be a dictionary");
     };
     catalog.insert("TestOwner", Object::Reference(owner_ref));
@@ -372,7 +377,7 @@ fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     let owner_output = mapping[&owner_ref];
 
     let mut reopened = open(out);
-    let Object::Dictionary(owner) = reopened.resolve_object(owner_output).unwrap() else {
+    let Object::Dictionary(owner) = reopened.resolve_canonical_object(owner_output).unwrap() else {
         panic!("expected owner dictionary");
     };
     let Some(Object::Dictionary(filespec)) = owner.get("Filespec") else {
@@ -450,7 +455,7 @@ fn embedded_file_helper_chases_a_reference_holder_to_the_terminal_stream() {
     assert_eq!(embedded.payload().unwrap(), b"payload");
     embedded.set_subtype(b"application/pdf").unwrap();
     drop(embedded);
-    let Object::Stream(stream) = pdf.resolve_object(stream_ref).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_canonical_object(stream_ref).unwrap() else {
         panic!("expected stream");
     };
     assert_eq!(
@@ -464,7 +469,9 @@ fn get_filenames_returns_only_string_name_keys_as_utf8() {
     // This fails if a non-string name key leaks into qpdf's getFilenames
     // result, or if the qpdf UTF-8 text conversion is skipped.
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let Object::Dictionary(mut filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut filespec) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dictionary");
     };
     filespec.insert("UF", Object::String(encode_utf16be("日本語.txt")));
@@ -485,7 +492,9 @@ fn get_filenames_returns_only_string_name_keys_as_utf8() {
 #[test]
 fn get_filename_returns_none_when_no_recognized_entry_is_a_string() {
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let Object::Dictionary(mut filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut filespec) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dictionary");
     };
     filespec.insert("UF", Object::Integer(7));
@@ -542,7 +551,9 @@ fn get_embedded_file_stream_accepts_qpdf_filename_keys() {
 #[test]
 fn get_embedded_file_stream_returns_null_when_no_candidate_is_a_stream() {
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let Object::Dictionary(mut filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut filespec) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dictionary");
     };
     let mut entries = Dictionary::new();
@@ -559,7 +570,9 @@ fn qpdf_string_getters_preserve_invalid_utf8_bytes_without_panicking() {
     // QPDFObjectHandle::getUTF8Value() returns std::string, whose bytes need
     // not be valid UTF-8 when a stored string uses an explicit UTF-8 BOM.
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let Object::Dictionary(mut filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut filespec) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dictionary");
     };
     filespec.insert("Desc", Object::String(vec![0xef, 0xbb, 0xbf, 0xff]));
@@ -584,7 +597,9 @@ fn qpdf_string_getters_resolve_indirect_strings_before_selecting_names() {
         Object::String(b"fallback.txt".to_vec()),
     );
     pdf.set_object(ObjectRef::new(9, 0), Object::String(encode_utf16be("概要")));
-    let Object::Dictionary(mut filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut filespec) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dictionary");
     };
     filespec.insert("UF", Object::Reference(ObjectRef::new(7, 0)));
@@ -798,7 +813,8 @@ fn indirect_metadata_scalars_are_dereferenced() {
         "/CreationDate (D:20260101000000Z) /ModDate (D:20260202000000Z) /Size 95 /CheckSum <00112233445566778899aabbccddeeff>",
         b"data",
     ));
-    let Object::Stream(mut stream) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(mut stream) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap()
+    else {
         panic!("expected embedded-file stream");
     };
     let Object::Dictionary(mut params) = stream.dict.remove("Params").unwrap() else {
@@ -878,7 +894,7 @@ fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
         assert_eq!(ef.get_checksum().unwrap(), Vec::<u8>::new());
     }
 
-    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("expected embedded-file stream");
     };
     let Object::Dictionary(params) = stream.dict.get("Params").unwrap() else {
@@ -904,7 +920,7 @@ fn metadata_setter_invalidates_a_previously_materialized_stream() {
     // that handle, a later legacy resolve and the writer must not reuse the
     // pre-mutation materialized stream dictionary.
     let mut pdf = open(build_attachment_pdf("", "", b"payload"));
-    let Object::Stream(before) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(before) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("expected embedded-file stream");
     };
     assert!(before.dict.get("Subtype").is_none());
@@ -916,7 +932,7 @@ fn metadata_setter_invalidates_a_previously_materialized_stream() {
         embedded.set_subtype(b"application/pdf").unwrap();
     }
 
-    let Object::Stream(after) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(after) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("expected embedded-file stream");
     };
     assert_eq!(
@@ -931,7 +947,8 @@ fn embedded_file_setter_updates_indirect_params_dictionary() {
     let mut params = Dictionary::new();
     params.insert("Size", Object::Integer(4));
     pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(params));
-    let Object::Stream(mut stream) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(mut stream) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap()
+    else {
         panic!("expected embedded-file stream");
     };
     stream
@@ -948,7 +965,8 @@ fn embedded_file_setter_updates_indirect_params_dictionary() {
             .unwrap();
     }
 
-    let Object::Dictionary(params) = pdf.resolve_object(ObjectRef::new(7, 0)).unwrap() else {
+    let Object::Dictionary(params) = pdf.resolve_canonical_object(ObjectRef::new(7, 0)).unwrap()
+    else {
         panic!("expected indirect /Params dictionary");
     };
     assert_eq!(
@@ -961,7 +979,8 @@ fn embedded_file_setter_updates_indirect_params_dictionary() {
 fn embedded_file_setter_replaces_non_dictionary_indirect_params() {
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
     pdf.set_object(ObjectRef::new(7, 0), Object::Integer(4));
-    let Object::Stream(mut stream) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(mut stream) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap()
+    else {
         panic!("expected embedded-file stream");
     };
     stream
@@ -978,7 +997,7 @@ fn embedded_file_setter_replaces_non_dictionary_indirect_params() {
             .unwrap();
     }
 
-    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("expected embedded-file stream");
     };
     let Object::Dictionary(params) = stream.dict.get("Params").unwrap() else {
@@ -1000,7 +1019,7 @@ fn qpdf_factories_create_filespec_and_embedded_file_objects() {
     let filespec_handle = FileSpec::create_file_spec(&mut pdf, "report.txt", ef_handle).unwrap();
     let filespec_ref = filespec_handle.object_ref().unwrap();
 
-    let Object::Stream(ef) = pdf.resolve_object(ef_ref).unwrap() else {
+    let Object::Stream(ef) = pdf.resolve_canonical_object(ef_ref).unwrap() else {
         panic!("expected EmbeddedFile stream");
     };
     assert_eq!(
@@ -1016,7 +1035,7 @@ fn qpdf_factories_create_filespec_and_embedded_file_objects() {
         Some(&Object::String(md5_checksum(b"payload")))
     );
 
-    let Object::Dictionary(filespec) = pdf.resolve_object(filespec_ref).unwrap() else {
+    let Object::Dictionary(filespec) = pdf.resolve_canonical_object(filespec_ref).unwrap() else {
         panic!("expected Filespec dictionary");
     };
     assert_eq!(
@@ -1050,7 +1069,8 @@ fn filespec_setters_use_qpdf_unicode_and_compatibility_rules() {
             .unwrap();
     }
 
-    let Object::Dictionary(filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(filespec) = pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected Filespec dictionary");
     };
     assert_eq!(
@@ -1076,7 +1096,8 @@ fn filespec_set_filename_preserves_non_utf8_compatibility_bytes() {
             .unwrap();
     }
 
-    let Object::Dictionary(filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(filespec) = pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected Filespec dictionary");
     };
     assert_eq!(filespec.get("F"), Some(&Object::String(vec![0x80, 0xff])));
@@ -1090,7 +1111,8 @@ fn filespec_set_filename_normalizes_non_utf8_unicode_bytes_like_qpdf() {
         fs.set_filename([0xff], None).unwrap();
     }
 
-    let Object::Dictionary(filespec) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(filespec) = pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected Filespec dictionary");
     };
     assert_eq!(
@@ -1108,7 +1130,7 @@ fn builder_composes_helpers_for_qpdf_unicode_description() {
         .build(&mut pdf)
         .unwrap();
 
-    let Object::Dictionary(filespec) = pdf.resolve_object(filespec_ref).unwrap() else {
+    let Object::Dictionary(filespec) = pdf.resolve_canonical_object(filespec_ref).unwrap() else {
         panic!("expected Filespec dictionary");
     };
     assert_eq!(
@@ -1132,7 +1154,7 @@ fn qpdf_path_factories_read_payload_and_make_filespec() {
         .object_ref()
         .unwrap();
     assert_eq!(
-        pdf.resolve_object(ef_ref)
+        pdf.resolve_canonical_object(ef_ref)
             .unwrap()
             .as_stream()
             .unwrap()
@@ -1967,7 +1989,7 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
     // builder result to the catalog just as a caller would through the
     // embedded-files name tree before writing the document.
     let catalog_ref = pdf.root_ref().expect("minimal fixture has a catalog");
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_canonical_object(catalog_ref).unwrap() else {
         panic!("minimal fixture catalog must be a dictionary");
     };
     let mut embedded_files = Dictionary::new();
@@ -2033,7 +2055,8 @@ fn params_follows_holder_chain() {
     let mut pdf = open(build_pdf_with_params("/Size 42", b"data"));
     // Rewrite the EmbeddedFile stream's /Params to a two-hop carrier
     // 8 0 R -> 9 0 R -> << /Size 42 >>.
-    let Object::Stream(mut ef_stream) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(mut ef_stream) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap()
+    else {
         panic!("expected EmbeddedFile stream");
     };
     let params = ef_stream.dict.get("Params").cloned().expect("/Params");
@@ -2062,7 +2085,9 @@ fn params_follows_holder_chain() {
 #[test]
 fn embedded_file_ef_dict_follows_holder_chain() {
     let mut pdf = open(build_attachment_pdf("", "", b"ef-payload"));
-    let Object::Dictionary(mut fs_dict) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut fs_dict) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dict");
     };
     let ef_dict = fs_dict.get("EF").cloned().expect("/EF dict");
@@ -2090,7 +2115,9 @@ fn embedded_file_ef_dict_follows_holder_chain() {
 #[test]
 fn embedded_file_stream_entry_follows_holder_chain() {
     let mut pdf = open(build_attachment_pdf("", "", b"stream-payload"));
-    let Object::Dictionary(mut fs_dict) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(mut fs_dict) =
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("expected filespec dict");
     };
     // /EF stays a direct dict; only its stream entries become two-hop.

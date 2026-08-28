@@ -15,8 +15,7 @@ use crate::stream_filter::{
     decode_filter_specs_from_handle, encode_flate, encode_run_length,
     is_decoded_filter as stream_is_decoded_filter,
     passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
-    undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
-    FilterSpec, CRYPT_STAGE_UNSUPPORTED,
+    undecodable_filter_error, DecodeParams, FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED,
 };
 #[cfg(test)]
 use crate::{Dictionary, Object};
@@ -67,10 +66,6 @@ pub(crate) fn stream_filter_capabilities(
         capabilities.lossy_compression |= filter.is_lossy_compression();
     }
     Some(capabilities)
-}
-
-pub(crate) fn validate_filter_chain_len(filter_count: usize) -> Result<()> {
-    validate_filter_chain_count(filter_count, Some(MAX_FILTER_CHAIN_LEN))
 }
 
 /// Return a human-readable codec label if `filter_name` is one of the four

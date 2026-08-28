@@ -985,11 +985,18 @@ fn matrix_or_identity(dict: &Dictionary) -> Matrix {
 /// `/BBox` shorter than four elements is an error; an absent or malformed
 /// `/Matrix` is treated as the identity.
 #[cfg(test)]
+fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve(&handle)?;
+    handle.materialize()
+}
+
+#[cfg(test)]
 fn fo_bbox_and_matrix<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
 ) -> Result<(Rectangle, Matrix)> {
-    let obj = pdf.resolve_object(xobject_ref)?;
+    let obj = resolved_object(pdf, xobject_ref)?;
     let dict = match &obj {
         Object::Stream(s) => &s.dict,
         Object::Dictionary(d) => d,
@@ -1006,7 +1013,7 @@ fn fo_bbox_and_matrix<R: Read + Seek>(
         Error::Unsupported(format!("Form XObject {xobject_ref} has no /BBox array"))
     })?;
     let resolved_bbox = match bbox_entry {
-        Object::Reference(r) => pdf.resolve_object(*r)?,
+        Object::Reference(r) => resolved_object(pdf, *r)?,
         other => other.clone(),
     };
     let arr = resolved_bbox.as_array().ok_or_else(|| {
@@ -1134,6 +1141,15 @@ mod byte_gate {
     use crate::{Object, ObjectRef, Pdf, PdfWriter};
     use std::io::{Read, Seek};
     use std::path::Path;
+
+    fn resolved_object<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        object_ref: ObjectRef,
+    ) -> crate::Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
 
     fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1641,8 +1657,7 @@ mod byte_gate {
         let mut dest = fixture("link-annot-no-acroform.pdf");
         let mut source = fixture("one-page.pdf");
         let dest_page = page_refs(&mut dest).unwrap()[0];
-        let before = dest
-            .resolve_object(dest_page)
+        let before = resolved_object(&mut dest, dest_page)
             .unwrap()
             .into_dict()
             .unwrap()
@@ -1661,8 +1676,7 @@ mod byte_gate {
         )
         .unwrap();
 
-        let after = dest
-            .resolve_object(dest_page)
+        let after = resolved_object(&mut dest, dest_page)
             .unwrap()
             .into_dict()
             .unwrap()
@@ -1961,8 +1975,7 @@ mod byte_gate {
     #[test]
     fn overlay_hidden_collision_fixture_uses_initialized_empty_flate_stream() {
         let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
-        let stream = dest
-            .resolve_object(ObjectRef::new(8, 0))
+        let stream = resolved_object(&mut dest, ObjectRef::new(8, 0))
             .unwrap()
             .into_stream()
             .unwrap();
@@ -2636,7 +2649,7 @@ mod tests {
         .unwrap();
 
         // Page /Resources == { /XObject { /Fx0, /Fx1 } } only.
-        let page = pdf.resolve_object(page_ref).unwrap();
+        let page = resolved_object(&mut pdf, page_ref).unwrap();
         let page_dict = page.as_dict().unwrap();
         let res = page_dict.get("Resources").unwrap().as_dict().unwrap();
         let keys: Vec<&[u8]> = res.iter().map(|(k, _)| k).collect();
@@ -2655,8 +2668,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents should be a reference, got {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf
-            .resolve_object(contents_ref)
+        let stream = resolved_object(&mut pdf, contents_ref)
             .unwrap()
             .into_stream()
             .expect("Contents must be a stream");
@@ -2680,7 +2692,10 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Fx0 should be a reference, got {other:?}"), // cov:ignore: defensive — apply always inserts /Fx0 as a reference
         };
-        let fx0 = pdf.resolve_object(fx0_ref).unwrap().into_stream().unwrap();
+        let fx0 = resolved_object(&mut pdf, fx0_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
         assert_eq!(
             fx0.dict.get("Subtype").unwrap().as_name(),
             Some(b"Form".as_slice())
@@ -2762,7 +2777,7 @@ mod tests {
         )
         .unwrap();
 
-        let page = pdf.resolve_object(page_ref).unwrap();
+        let page = resolved_object(&mut pdf, page_ref).unwrap();
         let page_dict = page.as_dict().unwrap();
         let res = page_dict.get("Resources").unwrap().as_dict().unwrap();
         let xobj = res.get("XObject").unwrap().as_dict().unwrap();
@@ -2784,8 +2799,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf
-            .resolve_object(contents_ref)
+        let stream = resolved_object(&mut pdf, contents_ref)
             .unwrap()
             .into_stream()
             .unwrap();
@@ -2842,13 +2856,12 @@ mod tests {
         )
         .unwrap();
 
-        let page = pdf.resolve_object(page_ref).unwrap();
+        let page = resolved_object(&mut pdf, page_ref).unwrap();
         let contents_ref = match page.as_dict().unwrap().get("Contents") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf
-            .resolve_object(contents_ref)
+        let stream = resolved_object(&mut pdf, contents_ref)
             .unwrap()
             .into_stream()
             .unwrap();
@@ -2895,8 +2908,7 @@ mod tests {
             &mut dr_map,
         )
         .unwrap();
-        let contents_ref = match pdf
-            .resolve_object(page_ref)
+        let contents_ref = match resolved_object(&mut pdf, page_ref)
             .unwrap()
             .as_dict()
             .unwrap()
@@ -2905,7 +2917,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        pdf.resolve_object(contents_ref)
+        resolved_object(&mut pdf, contents_ref)
             .unwrap()
             .into_stream()
             .unwrap()
@@ -3345,7 +3357,7 @@ mod tests {
 
     /// The imported overlay XObject ref (`/Fx1`) referenced by a patched page.
     fn fx1_ref<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> ObjectRef {
-        let page = pdf.resolve_object(page_ref).unwrap();
+        let page = resolved_object(pdf, page_ref).unwrap();
         let res = page
             .as_dict()
             .unwrap()
@@ -3363,7 +3375,7 @@ mod tests {
     /// Whether a page has been patched into an overlay page (its /Resources is
     /// just `<< /XObject << /Fx0 ... >> >>`, so /Font is gone and /XObject present).
     fn is_patched<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> bool {
-        let page = pdf.resolve_object(page_ref).unwrap();
+        let page = resolved_object(pdf, page_ref).unwrap();
         let res = page
             .as_dict()
             .unwrap()
@@ -3429,7 +3441,7 @@ mod tests {
 
         // /Fx0 (the page itself) differs per page (each page's own content).
         let fx0 = |pdf: &mut Pdf<_>, page_ref: ObjectRef| -> ObjectRef {
-            let page = pdf.resolve_object(page_ref).unwrap();
+            let page = resolved_object(pdf, page_ref).unwrap();
             let xobj = page
                 .as_dict()
                 .unwrap()
@@ -3490,13 +3502,12 @@ mod tests {
         )
         .unwrap();
 
-        let page = dest.resolve_object(dest_pages[0]).unwrap();
+        let page = resolved_object(&mut dest, dest_pages[0]).unwrap();
         let contents_ref = match page.as_dict().unwrap().get("Contents") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = dest
-            .resolve_object(contents_ref)
+        let stream = resolved_object(&mut dest, contents_ref)
             .unwrap()
             .into_stream()
             .unwrap();
@@ -3676,7 +3687,7 @@ mod tests {
         pdf: &mut Pdf<R>,
         page_ref: ObjectRef,
     ) -> (BTreeMap<String, ObjectRef>, String) {
-        let page = pdf.resolve_object(page_ref).unwrap();
+        let page = resolved_object(pdf, page_ref).unwrap();
         let page_dict = page.as_dict().unwrap();
         let xobj = page_dict
             .get("Resources")
@@ -3697,8 +3708,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf
-            .resolve_object(contents_ref)
+        let stream = resolved_object(pdf, contents_ref)
             .unwrap()
             .into_stream()
             .unwrap();
@@ -3852,7 +3862,10 @@ mod tests {
             number: 3,
             generation: 0,
         };
-        let page_dict = dest.resolve_object(page_ref).unwrap().into_dict().unwrap();
+        let page_dict = resolved_object(&mut dest, page_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         assert!(
             page_dict.get("MediaBox").is_none(),
             "empty specs must not trigger the page-tree repair pass"

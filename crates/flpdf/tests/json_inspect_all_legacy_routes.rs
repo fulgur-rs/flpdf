@@ -1,6 +1,6 @@
 //! Contract test for the file-level json_inspect legacy-route cutover.
 
-const HISTORICAL_JSON_VIEW_FUNCTIONS: &[&str] = &[
+const JSON_VIEW_FUNCTIONS: &[&str] = &[
     "qpdf_preparation_collects_refs_from_a_freed_old_xref_stream",
     "qpdf_preparation_keeps_old_xref_streams_freed_at_the_same_generation",
 ];
@@ -26,15 +26,15 @@ fn selected_function(source: &str, name: &str) -> String {
 fn json_inspect_has_no_unowned_legacy_resolution_calls() {
     let source = include_str!("../src/json_inspect.rs");
     let mut canonical_source = source.to_owned();
-    for name in HISTORICAL_JSON_VIEW_FUNCTIONS {
+    for name in JSON_VIEW_FUNCTIONS {
         let function = selected_function(source, name);
         assert!(
-            function.contains("resolve_object("),
-            "historical JSON-view function {name} must retain its explicit raw cache route"
+            function.contains("get_object_handle("),
+            "JSON-view function {name} must obtain its canonical handle"
         );
         assert!(
-            function.contains("prepare_qpdf_json_objects("),
-            "historical JSON-view function {name} must remain bounded to JSON preparation"
+            function.contains("pdf.resolve("),
+            "JSON-view function {name} must resolve through the canonical resolver"
         );
         canonical_source = canonical_source.replacen(&function, "", 1);
     }

@@ -5,6 +5,9 @@
 //! leaves and removes those keys from the page-tree nodes. The `--pages` CLI
 //! consumer must preserve that shape after rebuilding its page tree.
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use assert_cmd::Command;
 use flpdf::{Object, Pdf};
 use std::collections::BTreeMap;
@@ -68,7 +71,7 @@ fn resolve_to_terminal(pdf: &mut Pdf<BufReader<File>>, mut value: Object) -> Obj
         match value {
             Object::Reference(reference) => {
                 value = pdf
-                    .resolve_object(reference)
+                    .resolve_canonical_object(reference)
                     .expect("referenced value must resolve");
             }
             other => return other,
@@ -121,7 +124,7 @@ fn page_tree_snapshot(path: &Path) -> PageTreeSnapshot {
     let mut pdf = Pdf::open(BufReader::new(file)).expect("output PDF must parse");
     let catalog_ref = pdf.root_ref().expect("output PDF must have a catalog");
     let catalog = pdf
-        .resolve_object(catalog_ref)
+        .resolve_canonical_object(catalog_ref)
         .expect("catalog must resolve");
     let Object::Dictionary(catalog) = catalog else {
         panic!("catalog must be a dictionary: {catalog:?}");

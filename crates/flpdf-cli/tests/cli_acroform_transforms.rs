@@ -33,6 +33,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 mod common;
+use common::PdfCanonicalTestExt;
 use common::{first_widget_ref, page_annotation_handles};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -542,7 +543,7 @@ fn generate_appearances_routes_checkbox_without_ap_through_set_value() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let widget = pdf.resolve_object(widget_ref).unwrap();
+    let widget = pdf.resolve_canonical_object(widget_ref).unwrap();
     let widget = widget.as_dict().unwrap();
     assert!(matches!(widget.get("V"), Some(Object::Name(name)) if name == b"Yes"));
     assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
@@ -592,7 +593,7 @@ fn generate_appearances_checkbox_with_ap_synchronizes_as_to_value() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let widget = pdf.resolve_object(widget_ref).unwrap();
+    let widget = pdf.resolve_canonical_object(widget_ref).unwrap();
     let widget = widget.as_dict().unwrap();
     assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Yes"));
     let ap = widget.get("AP").and_then(Object::as_dict).unwrap();
@@ -619,7 +620,7 @@ fn generate_appearances_direct_radio_with_ap_leaves_as_unchanged() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let widget = pdf.resolve_object(widget_ref).unwrap();
+    let widget = pdf.resolve_canonical_object(widget_ref).unwrap();
     let widget = widget.as_dict().unwrap();
     assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
     let ap = widget.get("AP").and_then(Object::as_dict).unwrap();
@@ -891,7 +892,7 @@ fn flatten_rotation_processes_all_pages() {
     assert_eq!(page_refs.len(), 2, "output must have 2 pages");
 
     for (i, &page_ref) in page_refs.iter().enumerate() {
-        let page_obj = pdf.resolve_object(page_ref).unwrap();
+        let page_obj = pdf.resolve_canonical_object(page_ref).unwrap();
         let Object::Dictionary(dict) = page_obj else {
             panic!("page {} is not a dictionary", i + 1);
         };

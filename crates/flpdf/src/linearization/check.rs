@@ -1873,6 +1873,13 @@ pub fn check_linearization_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Object;
+
+    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
     use crate::linearization::plan::LinearizationPlan;
     use crate::linearization::renumber::RenumberMap;
     use crate::linearization::writer::write_linearized;
@@ -3271,7 +3278,7 @@ mod tests {
             crate::Object::Dictionary(crate::Dictionary::new()),
         );
         let root_ref = ObjectRef::new(1, 0);
-        let mut root = match pdf.resolve_object(root_ref).expect("resolve root") {
+        let mut root = match resolved_object(&mut pdf, root_ref).expect("resolve root") {
             crate::Object::Dictionary(dict) => dict,
             other => panic!("expected root dictionary, got {other:?}"), // cov:ignore: defensive; the fixture's root is always a dictionary
         };

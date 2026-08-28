@@ -137,7 +137,7 @@ impl std::error::Error for ParseObjectRefError {}
 ///
 /// All node types in the PDF object graph are represented here. Indirect references
 /// are stored as [`Object::Reference`] until they are explicitly resolved with
-/// [`Pdf::resolve_object`](crate::Pdf::resolve_object).
+/// [`Pdf::resolve`](crate::Pdf::resolve) and materialized at an object boundary.
 ///
 /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: this raw recursive object graph is
 /// the legacy representation. Delete it after parser, writer, and every

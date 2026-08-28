@@ -616,10 +616,10 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 ///
 /// # Errors
 ///
-/// Returns [`Err`] only if [`Pdf::resolve_object`] itself fails for a ref in `refs`
+/// Returns [`Err`] only if canonical [`Pdf::resolve`] itself fails for a ref in `refs`
 /// (an I/O or parse error), or if the target object-number space would overflow
 /// `u32`.  Refs that are unknown, freed, or otherwise unresolvable do **not**
-/// error: [`Pdf::resolve_object`] yields [`Object::Null`] for them, so they are simply
+/// error: canonical resolution yields [`Object::Null`] for them, so they are simply
 /// copied as `Null`.
 ///
 /// Callers normally obtain `refs` from
@@ -712,7 +712,9 @@ pub(crate) fn copy_objects_with_seed<RS: Read + Seek, RT: Read + Seek>(
         if seed.contains_key(&src_ref) {
             continue;
         }
-        let mut obj = source.resolve_object(src_ref)?;
+        let source_handle = source.get_object_handle(src_ref);
+        source.resolve(&source_handle)?;
+        let mut obj = source_handle.materialize()?;
         rewrite_refs(&mut obj, 0, &map)?;
         target.set_object(map[&src_ref], obj);
     }
@@ -1513,10 +1515,11 @@ mod tests {
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         assert!(reopened.object_refs().contains(&written_ref));
-        assert!(reopened
-            .resolve_object(written_ref)
-            .expect("resolve written placeholder")
-            .is_null());
+        let written_handle = reopened.get_object_handle(written_ref);
+        reopened
+            .resolve(&written_handle)
+            .expect("resolve written placeholder");
+        assert!(written_handle.is_null());
     }
 
     #[test]

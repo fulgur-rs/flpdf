@@ -351,14 +351,14 @@ fn qdf_mode_round_trip_content_preserved() {
     // renumbered Catalog-first, so navigate via the Catalog's /Metadata ref.
     let mut pdf3 = Pdf::open(Cursor::new(final_output)).unwrap();
     let root = pdf3.root_ref().expect("output has /Root");
-    let metadata_ref = match pdf3.resolve_object(root).expect("resolve /Root") {
+    let metadata_ref = match pdf3.resolve_canonical_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
         },
         other => panic!("/Root must be a dictionary, got {other:?}"),
     };
-    let obj = pdf3.resolve_object(metadata_ref).unwrap();
+    let obj = pdf3.resolve_canonical_object(metadata_ref).unwrap();
     let Object::Stream(stream) = obj else {
         panic!("/Metadata must be a stream after second rewrite");
     };
@@ -628,7 +628,7 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
     // No /Type /ObjStm must exist in the output.
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for obj_ref in reopened.object_refs() {
-        if let Ok(Object::Stream(s)) = reopened.resolve_object(obj_ref) {
+        if let Ok(Object::Stream(s)) = reopened.resolve_canonical_object(obj_ref) {
             let is_objstm = matches!(
                 s.dict.get("Type"),
                 Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
@@ -644,7 +644,9 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
     // Object 2 (originally inside the ObjStm) must be resolvable with its
     // original number and must be the Pages dict.
     let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
-    let pages = reopened2.resolve_object(ObjectRef::new(2, 0)).unwrap();
+    let pages = reopened2
+        .resolve_canonical_object(ObjectRef::new(2, 0))
+        .unwrap();
     match &pages {
         Object::Dictionary(d) => {
             assert_eq!(
@@ -1235,7 +1237,7 @@ struct QdfStream {
 fn metadata_stream_number(output: &[u8]) -> u32 {
     let mut pdf = Pdf::open(Cursor::new(output.to_vec())).expect("re-open qdf output");
     let root = pdf.root_ref().expect("output has /Root");
-    match pdf.resolve_object(root).expect("resolve /Root") {
+    match pdf.resolve_canonical_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => r.number,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
@@ -1685,5 +1687,6 @@ fn non_qdf_output_keeps_compact_dict_form() {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{check_output, write_default, write_with_settings, WriterTestSettings};

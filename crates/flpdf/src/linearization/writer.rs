@@ -4555,8 +4555,14 @@ mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
     use crate::writer::{WriterOptions, DETERMINISTIC_ID_ARRAY_LEN};
-    use crate::{Dictionary, Pdf};
-    use std::io::Cursor;
+    use crate::{Dictionary, ObjectRef, Pdf};
+    use std::io::{Cursor, Read, Seek};
+
+    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
 
     struct FinishErrorWriter {
         errno: i32,
@@ -5156,9 +5162,7 @@ mod tests {
         let mut output =
             Pdf::open(Cursor::new(document.bytes)).expect("linearized output should parse");
         let root_ref = output.root_ref().expect("output has /Root");
-        let root = output
-            .resolve_object(root_ref)
-            .expect("output catalog resolves");
+        let root = resolved_object(&mut output, root_ref).expect("output catalog resolves");
         let root = root.into_dict().expect("output root must be a dictionary");
         assert!(matches!(root.get("Outlines"), Some(Object::Reference(_))));
     }
@@ -6543,8 +6547,7 @@ mod tests {
         let mut reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
         let refs = reopened.live_object_refs();
         let decoded_any_match = refs.into_iter().any(|r| {
-            reopened
-                .resolve_object(r)
+            resolved_object(&mut reopened, r)
                 .ok()
                 .and_then(|o| o.into_stream())
                 .and_then(|stream| {
@@ -6711,7 +6714,7 @@ mod tests {
         let stream = refs
             .into_iter()
             .find_map(|r| {
-                let stream = reopened.resolve_object(r).ok()?.into_stream()?;
+                let stream = resolved_object(&mut reopened, r).ok()?.into_stream()?;
                 let decoded = crate::filters::test_dictionary_api::decode_stream_data(
                     &stream.dict,
                     &stream.data,
@@ -7701,14 +7704,14 @@ mod tests {
         let mut reopened = Pdf::open(Cursor::new(out.to_vec()))
             .expect("encrypted output must reopen with the empty user password");
         let root_ref = reopened.root_ref().expect("root_ref");
-        let pages_ref = match reopened.resolve_object(root_ref).expect("resolve /Root") {
+        let pages_ref = match resolved_object(&mut reopened, root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get("Pages") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: fixture invariant
             },
             other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
         };
-        let page_ref = match reopened.resolve_object(pages_ref).expect("resolve /Pages") {
+        let page_ref = match resolved_object(&mut reopened, pages_ref).expect("resolve /Pages") {
             Object::Dictionary(d) => match d.get("Kids") {
                 Some(Object::Array(kids)) => match kids.first() {
                     Some(Object::Reference(r)) => *r,
@@ -7718,7 +7721,7 @@ mod tests {
             },
             other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
         };
-        let contents_ref = match reopened.resolve_object(page_ref).expect("resolve page") {
+        let contents_ref = match resolved_object(&mut reopened, page_ref).expect("resolve page") {
             Object::Dictionary(d) => match d.get("Contents") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: fixture invariant
@@ -7742,8 +7745,7 @@ mod tests {
             String::from_utf8_lossy(stream_bytes) // cov:ignore: only evaluated on assertion failure
         );
 
-        let decrypted_label = match reopened
-            .resolve_object(contents_ref)
+        let decrypted_label = match resolved_object(&mut reopened, contents_ref)
             .expect("resolve encrypted /Contents")
         {
             Object::Stream(stream) => match stream.dict.get("Label") {
@@ -7767,7 +7769,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let producer = match rt.resolve_object(info_ref).expect("resolve /Info") {
+        let producer = match resolved_object(rt, info_ref).expect("resolve /Info") {
             Object::Dictionary(d) => match d.get("Producer") {
                 Some(Object::String(s)) => s.clone(),
                 other => panic!("/Producer must be a string, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
@@ -7776,14 +7778,14 @@ mod tests {
         };
 
         let root_ref = rt.root_ref().expect("root_ref");
-        let pages_ref = match rt.resolve_object(root_ref).expect("resolve /Root") {
+        let pages_ref = match resolved_object(rt, root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get("Pages") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
             other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let page_ref = match rt.resolve_object(pages_ref).expect("resolve /Pages") {
+        let page_ref = match resolved_object(rt, pages_ref).expect("resolve /Pages") {
             Object::Dictionary(d) => match d.get("Kids") {
                 Some(Object::Array(kids)) => match kids.first() {
                     Some(Object::Reference(r)) => *r,
@@ -7793,14 +7795,14 @@ mod tests {
             },
             other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let contents_ref = match rt.resolve_object(page_ref).expect("resolve page") {
+        let contents_ref = match resolved_object(rt, page_ref).expect("resolve page") {
             Object::Dictionary(d) => match d.get("Contents") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
             other => panic!("page must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let content = match rt.resolve_object(contents_ref).expect("resolve /Contents") {
+        let content = match resolved_object(rt, contents_ref).expect("resolve /Contents") {
             Object::Stream(s) => s.data,
             other => panic!("/Contents must be a stream, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
@@ -8479,119 +8481,9 @@ mod tests {
         assert!(root.get_key(b"/Extensions").is_direct());
     }
 
-    #[test]
-    fn linearized_writer_propagates_progress_object_count_failure() {
-        let mut pdf = open_tiny_pdf();
-        let replacement_ref = ObjectRef::new(999, 0);
-        let mut replacement = Object::Null;
-        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
-            replacement = Object::Array(vec![replacement]);
-        }
-        pdf.get_object_handle(replacement_ref);
-        pdf.legacy_materialized_memo
-            .insert(replacement_ref, replacement);
-        pdf.legacy_materialized_replacement_refs
-            .insert(replacement_ref);
-        let options = WriterOptions {
-            progress_reporter: Some(crate::writer::ProgressReporter::new(Box::new(|_| Ok(())))),
-            ..WriterOptions::default()
-        };
-
-        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
-            .expect_err("progress setup must propagate object-count errors");
-        assert!(error
-            .to_string()
-            .contains("object handle lift: inline object nesting exceeds maximum"));
-    }
-
     /// Minimal single-page PDF whose Catalog carries `/Outlines` as a DIRECT
     /// dictionary. `Optimization::prepare_pdf` (`optimization.rs:136-143`)
     /// makes this indirect and marks the Catalog dirty during planning,
-    /// permanently -- independent of whether the overall write succeeds.
-    fn tiny_pdf_with_direct_outlines_bytes() -> Vec<u8> {
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.4\n");
-
-        let off1 = pdf.len() as u64;
-        pdf.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines << /Count 0 >> >>\nendobj\n",
-        );
-
-        let off2 = pdf.len() as u64;
-        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-        let off3 = pdf.len() as u64;
-        pdf.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-        );
-
-        let xref_start = pdf.len() as u64;
-        let xref = format!(
-            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
-            off1, off2, off3,
-        );
-        pdf.extend_from_slice(xref.as_bytes());
-        let trailer = format!(
-            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            xref_start,
-        );
-        pdf.extend_from_slice(trailer.as_bytes());
-        pdf
-    }
-
-    #[test]
-    fn linearized_writer_keeps_catalog_dirty_after_a_planning_mutation_and_a_later_failure() {
-        // Reproduces the exact shape of `linearized_writer_propagates_progress_object_count_failure`
-        // above (planning succeeds, `configure_progress_for_pdf`'s later
-        // object-count computation fails), but with a Catalog that
-        // `Optimization::prepare_pdf` permanently mutates (direct
-        // `/Outlines` -> indirect) during that successful planning phase.
-        // The mid-closure `record_catalog_snapshot_dirty_baseline` call in
-        // `write_linearized_for_pdf_writer` runs only after planning and
-        // object-count computation both succeed, so this later failure
-        // exercises the unconditional refresh added after the closure.
-        let mut pdf = Pdf::open(Cursor::new(tiny_pdf_with_direct_outlines_bytes()))
-            .expect("tiny PDF should parse");
-        let root_ref = pdf.root_ref().expect("Catalog present");
-        assert!(
-            !pdf.is_dirty(root_ref),
-            "a freshly parsed source document must start clean"
-        );
-
-        let replacement_ref = ObjectRef::new(999, 0);
-        let mut replacement = Object::Null;
-        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
-            replacement = Object::Array(vec![replacement]);
-        }
-        pdf.get_object_handle(replacement_ref);
-        pdf.legacy_materialized_memo
-            .insert(replacement_ref, replacement);
-        pdf.legacy_materialized_replacement_refs
-            .insert(replacement_ref);
-        let options = WriterOptions {
-            progress_reporter: Some(crate::writer::ProgressReporter::new(Box::new(|_| Ok(())))),
-            ..WriterOptions::default()
-        };
-
-        write_linearized_for_pdf_writer(&mut pdf, &options, None)
-            .expect_err("progress setup must propagate object-count errors");
-
-        let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).expect("Catalog resolves");
-        assert!(
-            root.get_key(b"/Outlines").is_indirect(),
-            "planning's direct-outline normalization is a permanent graph \
-             repair and must survive a later failure"
-        );
-        assert!(
-            pdf.is_dirty(root_ref),
-            "the permanent /Outlines mutation must keep the Catalog dirty \
-             even though the overall linearized write failed afterward; \
-             restore_catalog_extensions must not clear the dirty bit using \
-             a dirty baseline captured before planning ran"
-        );
-    }
-
     /// Minimal one-page PDF whose Catalog carries `/Extensions` as a DIRECT
     /// dictionary with a DIRECT `/ADBE` dictionary, but whose `/ADBE`
     /// dictionary carries an `/ExtensionLevel` value that is itself an
@@ -8927,20 +8819,18 @@ mod tests {
         );
 
         let root_ref = reopened.root_ref().expect("root_ref");
-        let metadata_ref = match reopened.resolve_object(root_ref).expect("resolve /Root") {
+        let metadata_ref = match resolved_object(&mut reopened, root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get_ref("Metadata") {
                 Some(r) => r,
                 None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
             },
             other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
         };
-        let metadata_bytes = match reopened
-            .resolve_object(metadata_ref)
-            .expect("resolve /Metadata")
-        {
-            Object::Stream(s) => s.data,
-            other => panic!("/Metadata must be a stream, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
-        };
+        let metadata_bytes =
+            match resolved_object(&mut reopened, metadata_ref).expect("resolve /Metadata") {
+                Object::Stream(s) => s.data,
+                other => panic!("/Metadata must be a stream, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+            };
         assert_eq!(
             metadata_bytes, metadata_marker,
             "/Metadata stream must resolve to its original plaintext via /Crypt /Identity"
@@ -9052,7 +8942,7 @@ mod tests {
             Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
                 .expect("re-open with the empty user password");
         let root_ref = reopened.root_ref().expect("root_ref");
-        let metadata_ref = match reopened.resolve_object(root_ref).expect("resolve /Root") {
+        let metadata_ref = match resolved_object(&mut reopened, root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get_ref("Metadata") {
                 Some(r) => r,
                 None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
@@ -9088,8 +8978,7 @@ mod tests {
         // Reader round-trip. `decrypt_resolved_object` (reader.rs) has its
         // own `/Type /Metadata` + `!encrypt_metadata` fast path, so it keeps
         // the raw on-disk `/Crypt` identity filter and plaintext bytes.
-        let resolved = reopened
-            .resolve_object(metadata_ref)
+        let resolved = resolved_object(&mut reopened, metadata_ref)
             .expect("resolve /Metadata (reader's metadata fast path leaves it untouched)");
         let Object::Stream(s) = resolved else {
             // cov:ignore-start: only reached if the assertion below would

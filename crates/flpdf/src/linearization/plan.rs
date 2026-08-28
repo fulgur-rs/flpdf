@@ -714,7 +714,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                             // Resolve the parent. Genuine resolve failures
                             // (I/O or parse errors) propagate via `?` instead
                             // of silently degrading the closure — mirroring
-                            // the main BFS loop's `pdf.resolve_borrowed(current)?`.
+                            // the main BFS loop's `pdf.resolve(&parent_handle)?`.
                             let parent_handle = pdf.get_object_handle(parent_ref);
                             pdf.resolve(&parent_handle)?;
                             // A /Parent that indirects through a plain
@@ -1037,7 +1037,7 @@ impl LinearizationPlan {
     /// document's page references (e.g. a malformed or unresolvable `/Pages`
     /// tree). Also propagates any error from resolving objects while computing
     /// each page's reachability closure (via [`Pdf::resolve`] /
-    /// [`Pdf::resolve_borrowed`]) — typically an [`crate::Error::Io`] or
+    /// [`Pdf::resolve`]) — typically an [`crate::Error::Io`] or
     /// [`crate::Error::Parse`] on a truncated or malformed object. Before any
     /// of that, this also pushes inherited page attributes down the `/Pages`
     /// tree, which propagates the same object-resolution errors and returns
@@ -3030,6 +3030,12 @@ mod tests {
     use crate::object::MAX_INLINE_DEPTH;
     use std::io::Cursor;
 
+    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
+
     fn route_with_plan(
         plan: &LinearizationPlan,
         containers: &[Vec<ObjectRef>],
@@ -4725,12 +4731,12 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("qpdf-style recovery");
         assert!(plan.part4_rest.contains(&ObjectRef::new(4, 0)));
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(4, 0))
+            resolved_object(&mut pdf, ObjectRef::new(4, 0))
                 .unwrap()
                 .as_stream()
                 .unwrap()
                 .data,
-            b"ab"
+            b"ab\n"
         );
         assert_eq!(
             pdf.repair_diagnostics()

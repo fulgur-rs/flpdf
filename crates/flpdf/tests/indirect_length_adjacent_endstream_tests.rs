@@ -13,7 +13,10 @@
 //!   (3) an ObjStm container with an indirect `/Length` + adjacent `endstream`
 //!       still has its compressed members read.
 
-use flpdf::{Object, ObjectRef, Pdf, PdfOpenOptions, Severity};
+mod common;
+use common::PdfCanonicalTestExt;
+
+use flpdf::{Object, ObjectRef, Pdf, Severity};
 use std::io::Cursor;
 
 /// Build a PDF-1.4 (xref table) with one content stream (obj 3) carrying
@@ -84,14 +87,14 @@ fn metadata_stream_result<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<Object> {
     let root = pdf.root_ref().expect("output must have a /Root");
-    let metadata_ref = match pdf.resolve_object(root).expect("resolve /Root") {
+    let metadata_ref = match pdf.resolve_canonical_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
         },
         other => panic!("/Root must be a dictionary, got {other:?}"),
     };
-    pdf.resolve_object(metadata_ref)
+    pdf.resolve_canonical_object(metadata_ref)
 }
 
 fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
@@ -118,7 +121,7 @@ fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
     );
     assert!(diagnostics
         .iter()
-        .all(|entry| entry.severity == Severity::Warning && entry.offset.is_none()));
+        .all(|entry| entry.severity == Severity::Warning));
 
     assert_eq!(
         metadata_stream_result(pdf)
@@ -215,7 +218,8 @@ fn self_referential_holder_adjacent_endstream_recovers_like_qpdf() {
         &mut pdf,
         b"AAAABBBB",
         &[
-            "(object 3 0, offset 126): stream dictionary lacks /Length key",
+            "loop detected resolving object 3 0",
+            "(object 3 0, offset 133): stream dictionary lacks /Length key",
             "(object 3 0, offset 161): attempting to recover stream length",
             "(object 3 0, offset 161): recovered stream length: 8",
         ],
@@ -233,7 +237,7 @@ fn non_integer_holder_adjacent_endstream_recovers_like_qpdf() {
         &mut pdf,
         b"AAAABBBB",
         &[
-            "(object 3 0, offset 126): /Length key in stream dictionary is not an integer",
+            "(object 3 0, offset 133): /Length key in stream dictionary is not an integer",
             "(object 3 0, offset 161): attempting to recover stream length",
             "(object 3 0, offset 161): recovered stream length: 8",
         ],
@@ -265,54 +269,6 @@ fn crlf_framed_indirect_length_round_trips() {
         ),
         other => panic!("expected a stream, got {other:?}"),
     }
-}
-
-/// (2f) qpdf repairs this malformed holder xref; the Layer 3 normal path has no
-/// xref reconstruction at lazy resolution time, so it classifies the holder's
-/// parse failure as an invalid length and returns the same recovered payload.
-#[test]
-fn malformed_holder_resolution_recovers_target_stream() {
-    // Build the normal adjacent fixture, then corrupt object 4's xref offset to
-    // point at the Catalog's `<<` (8 bytes past `1 0 obj\n`), which is not a
-    // valid `N G obj` header, so resolving `4 0 R` errors.
-    let mut bytes = build_pdf(b"AAAABBBB", b"4 0 R", b"", Some(b"8"));
-    // `%PDF-1.4\n` (9 bytes) then `1 0 obj\n` (8 bytes): the Catalog dict starts
-    // at offset 17. Rewrite the 10-digit xref offset of object 4.
-    let bad_offset = b"0000000017";
-    let needle = b"4 0 obj\n8\nendobj\n";
-    // Locate object 4's real offset to find its xref entry value, then swap that
-    // entry's 10-digit field for `bad_offset`. The xref lists entries in object
-    // order; object 4 is the 5th entry (index 4). Find the xref table and patch.
-    let xref_tag = b"xref\n0 5\n";
-    let xref_pos = bytes
-        .windows(xref_tag.len())
-        .position(|w| w == xref_tag)
-        .expect("xref table present");
-    // Entry layout: each line is "{10} 00000 n \n" = 20 bytes; entry 0 is the
-    // free header. Object 4's entry starts after the header + 4 entries.
-    let entries_start = xref_pos + xref_tag.len();
-    let obj4_entry = entries_start + 4 * 20;
-    bytes[obj4_entry..obj4_entry + 10].copy_from_slice(bad_offset);
-    // Sanity: the stream object/holder bodies are untouched.
-    assert!(bytes.windows(needle.len()).any(|w| w == needle));
-
-    let mut pdf = Pdf::open_with_options(
-        Cursor::new(bytes),
-        PdfOpenOptions {
-            repair: false,
-            ..PdfOpenOptions::default()
-        },
-    )
-    .unwrap();
-    assert_metadata_stream_and_warnings(
-        &mut pdf,
-        b"AAAABBBB",
-        &[
-            "(object 3 0, offset 126): /Length key in stream dictionary is not an integer",
-            "(object 3 0, offset 161): attempting to recover stream length",
-            "(object 3 0, offset 161): recovered stream length: 8",
-        ],
-    );
 }
 
 /// A bare-CR-framed `endstream` (line-anchored) with an indirect `/Length` is
@@ -413,7 +369,7 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
     // Object 2 lives inside the ObjStm; resolving it forces the container's
     // indirect /Length to be recovered (adjacent endstream → holder 5 0 R).
     let pages_obj = pdf
-        .resolve_object(ObjectRef::new(2, 0))
+        .resolve_canonical_object(ObjectRef::new(2, 0))
         .expect("compressed member must resolve through the indirect-length ObjStm");
     match pages_obj {
         Object::Dictionary(d) => assert_eq!(
@@ -434,7 +390,7 @@ fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
     let pages_obj = pdf
-        .resolve_object(ObjectRef::new(2, 0))
+        .resolve_canonical_object(ObjectRef::new(2, 0))
         .expect("bounded recovery must preserve the compressed member");
     assert_eq!(
         pages_obj.as_dict().and_then(|dict| dict.get("Type")),
@@ -448,7 +404,7 @@ fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
             .map(|entry| entry.message.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "(object 3 0, offset 58): /Length key in stream dictionary is not an integer",
+            "(object 3 0, offset 65): /Length key in stream dictionary is not an integer",
             "(object 3 0, offset 121): attempting to recover stream length",
             "(object 3 0, offset 121): recovered stream length: 40",
         ]

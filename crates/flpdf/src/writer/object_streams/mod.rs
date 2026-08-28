@@ -1163,7 +1163,7 @@ mod tests {
     ///
     /// The flpdf stream parser (`stream_from_dict`) requires `/Length` to be a
     /// direct integer.  When `collect_indirect_objstm_length_refs` iterates
-    /// over all objects and hits ObjStm 3, `pdf.resolve_object(3 0 R)` calls
+    /// over all objects and hits ObjStm 3, `Pdf::resolve` calls
     /// `stream_from_dict`, which errors on the indirect `/Length 5 0 R`.
     /// That error propagates through `plan_object_streams` via `?`, so the
     /// function must return `Err`.

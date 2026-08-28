@@ -20,6 +20,9 @@
 #[path = "support/filter_handles.rs"]
 mod filter_handles;
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf};
 use predicates::prelude::*;
@@ -498,7 +501,7 @@ fn cli_show_stream_dct_decode_error_and_rewrite_byte_identical() {
     let (_tmp2, out_path) = rewrite_pdf(pdf_path_str, &["--remove-unreferenced-resources=no"]);
     let out_bytes = std::fs::read(&out_path).unwrap();
     let mut pdf = Pdf::open(Cursor::new(out_bytes)).unwrap();
-    let obj = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap();
+    let obj = pdf.resolve_canonical_object(ObjectRef::new(4, 0)).unwrap();
     let Object::Stream(stream) = obj else {
         panic!("object 4 should be a stream after rewrite");
     };
@@ -560,7 +563,7 @@ fn cli_show_stream_ccitt_passthrough_marker_and_rewrite() {
     let (_tmp2, out_path) = rewrite_pdf(pdf_path_str, &["--remove-unreferenced-resources=no"]);
     let out_bytes = std::fs::read(&out_path).unwrap();
     let mut pdf = Pdf::open(Cursor::new(out_bytes)).unwrap();
-    let obj = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap();
+    let obj = pdf.resolve_canonical_object(ObjectRef::new(4, 0)).unwrap();
     let Object::Stream(stream) = obj else {
         panic!("object 4 should be a stream after rewrite");
     };
@@ -625,7 +628,7 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
 
     // Re-open and resolve obj 4 (the JBIG2 stream).
     let mut pdf = Pdf::open(Cursor::new(out_bytes.clone())).unwrap();
-    let obj = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap();
+    let obj = pdf.resolve_canonical_object(ObjectRef::new(4, 0)).unwrap();
     let Object::Stream(stream) = obj else {
         panic!("object 4 should be a stream after rewrite");
     };
@@ -669,7 +672,7 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
     // The globals stream (obj 5) must still be resolvable (reference is not dangling).
     let mut pdf2 = Pdf::open(Cursor::new(out_bytes.clone())).unwrap();
     let globals_obj = pdf2
-        .resolve_object(ObjectRef::new(5, 0))
+        .resolve_canonical_object(ObjectRef::new(5, 0))
         .unwrap_or_else(|e| panic!("JBIG2Globals obj 5 must be resolvable after rewrite: {e}"));
     assert!(
         matches!(globals_obj, Object::Stream(_)),

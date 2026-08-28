@@ -9,10 +9,27 @@ use flpdf::job::{CheckError, QPDFJob};
 use flpdf::ObjectRef;
 use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
-    ObjectStreamMode, Pdf, PdfWriter, Result, StreamDataMode,
+    Object, ObjectStreamMode, Pdf, PdfWriter, Result, StreamDataMode,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
+
+/// Canonical object access used by integration assertions while the removed
+/// owned raw-object resolver has no compatibility API in the library.
+///
+/// The helper delegates to the live ObjectHandle resolver and materializes
+/// only at the assertion boundary.
+pub trait PdfCanonicalTestExt {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object>;
+}
+
+impl<R: Read + Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        let handle = self.get_object_handle(object_ref);
+        self.resolve(&handle)?;
+        handle.materialize()
+    }
+}
 
 /// Result shape used by integration tests that only need to assert that the
 /// canonical qpdf job check accepted an emitted PDF.

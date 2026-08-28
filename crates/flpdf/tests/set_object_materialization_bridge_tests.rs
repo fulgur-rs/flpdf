@@ -12,6 +12,9 @@
 //! intentionally keeps that file limited to the canonical-only resolution
 //! path.
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use flpdf::{Object, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::BufReader;
@@ -52,9 +55,9 @@ fn materialize_then_set_object_round_trips_structurally() {
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
     let object_ref = pdf.root_ref().expect("root");
 
-    let resolved = pdf.resolve_object(object_ref).unwrap();
+    let resolved = pdf.resolve_canonical_object(object_ref).unwrap();
     pdf.set_object(object_ref, resolved.clone());
-    assert_eq!(pdf.resolve_object(object_ref).unwrap(), resolved);
+    assert_eq!(pdf.resolve_canonical_object(object_ref).unwrap(), resolved);
 }
 
 /// `Object::RealLiteral { value, literal }` preserves a non-canonical source
@@ -66,11 +69,11 @@ fn real_literal_survives_resolve_set_object_round_trip() {
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open real-literal fixture");
     let object_ref = ObjectRef::new(1, 0);
 
-    let resolved = pdf.resolve_object(object_ref).unwrap();
+    let resolved = pdf.resolve_canonical_object(object_ref).unwrap();
     assert!(matches!(&resolved, Object::RealLiteral { literal, .. } if literal == b".4"));
 
     pdf.set_object(object_ref, resolved.clone());
-    assert_eq!(pdf.resolve_object(object_ref).unwrap(), resolved);
+    assert_eq!(pdf.resolve_canonical_object(object_ref).unwrap(), resolved);
 }
 
 /// `Stream` is `{ dict: Dictionary, data: Vec<u8> }` by value; the handle
@@ -99,7 +102,7 @@ fn stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip() {
         "native parse must record a real dictionary offset"
     );
 
-    let resolved = pdf.resolve_object(stream_ref).unwrap();
+    let resolved = pdf.resolve_canonical_object(stream_ref).unwrap();
     assert!(matches!(&resolved, Object::Stream(_)));
     pdf.set_object(stream_ref, resolved);
 
@@ -126,13 +129,13 @@ fn set_object_with_a_content_stream_only_token_preserves_the_original_value() {
 
     pdf.set_object(object_ref, Object::Operator(b"q".to_vec()));
     assert_eq!(
-        pdf.resolve_object(object_ref).unwrap(),
+        pdf.resolve_canonical_object(object_ref).unwrap(),
         Object::Operator(b"q".to_vec())
     );
 
     pdf.set_object(object_ref, Object::InlineImage(b"data".to_vec()));
     assert_eq!(
-        pdf.resolve_object(object_ref).unwrap(),
+        pdf.resolve_canonical_object(object_ref).unwrap(),
         Object::InlineImage(b"data".to_vec())
     );
 }
@@ -146,11 +149,14 @@ fn resolve_borrowed_returns_null_after_delete_object() {
     let file = File::open(minimal_fixture_path()).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
     let root_ref = pdf.root_ref().expect("root");
-    pdf.resolve_object(root_ref).unwrap();
+    pdf.resolve_canonical_object(root_ref).unwrap();
 
     pdf.delete_object(root_ref);
 
-    assert_eq!(pdf.resolve_borrowed(root_ref).unwrap(), &Object::Null);
+    assert_eq!(
+        pdf.resolve_canonical_object(root_ref).unwrap(),
+        Object::Null
+    );
 }
 
 /// `Pdf::lift`'s bounded-depth guard (private to the crate; mirrors every
@@ -173,5 +179,5 @@ fn set_object_with_excessive_depth_still_round_trips_via_the_memo_override() {
     }
 
     pdf.set_object(object_ref, deep.clone());
-    assert_eq!(pdf.resolve_object(object_ref).unwrap(), deep);
+    assert_eq!(pdf.resolve_canonical_object(object_ref).unwrap(), deep);
 }

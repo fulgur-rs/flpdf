@@ -24,6 +24,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -71,7 +74,7 @@ fn extract_info_dict_bytes(path: &Path) -> Option<Vec<u8>> {
 
     let info_ref = pdf.trailer_dictionary().get_ref("Info")?;
     let info_obj = pdf
-        .resolve_object(info_ref)
+        .resolve_canonical_object(info_ref)
         .unwrap_or_else(|e| panic!("failed to resolve Info in {}: {e}", path.display()));
 
     let mut buf: Vec<u8> = Vec::new();

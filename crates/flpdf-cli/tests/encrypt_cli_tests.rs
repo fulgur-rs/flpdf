@@ -7,6 +7,9 @@
 //! independent oracle). The CLI's accept/reject matrix is also pinned here
 //! so user-visible diagnostics remain stable.
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use assert_cmd::Command;
 use flpdf::{Pdf, PdfOpenOptions};
 use predicates::prelude::*;
@@ -150,7 +153,7 @@ fn assert_qdf_encrypted_output(output: &Path, password: &str) {
     );
     let root_ref = reopened.root_ref().expect("encrypted QDF output has /Root");
     reopened
-        .resolve_object(root_ref)
+        .resolve_canonical_object(root_ref)
         .expect("authenticated reader resolves the QDF root");
 }
 

@@ -185,16 +185,12 @@ impl<R: Read + Seek> Pdf<R> {
             foreign_object_visiting: BTreeMap::new(),
             acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
-            legacy_materialized_memo: BTreeMap::new(),
-            legacy_materialized_replacement_refs: BTreeSet::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             legacy_resolution_state_synced: already_reconstructed,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
-            recovered_stream_eols: BTreeMap::new(),
-            transformed_stream_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
             qpdf_trailer_references: trailer_references,
             qpdf_parsed_xref_stream_refs: BTreeSet::new(),
@@ -476,6 +472,12 @@ impl Pdf<Cursor<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Object {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).expect("resolve object");
+        handle.materialize().expect("materialize object value")
+    }
     use crate::{Object, ObjectRef};
 
     /// A classic-xref PDF whose trailer `/Encrypt` dictionary is missing
@@ -555,7 +557,7 @@ mod tests {
 
         let root_ref = pdf.root_ref().expect("root ref");
         assert_eq!(root_ref, ObjectRef::new(1, 0));
-        let catalog = pdf.resolve_object(root_ref).unwrap();
+        let catalog = resolved_object(&mut pdf, root_ref);
         let catalog_dict = catalog.as_dict().unwrap();
         assert_eq!(
             catalog_dict.get("Type").unwrap().as_name(),
@@ -567,7 +569,7 @@ mod tests {
             .expect("/Pages must be a reference");
         assert_eq!(pages_ref, ObjectRef::new(2, 0));
 
-        let pages = pdf.resolve_object(pages_ref).unwrap();
+        let pages = resolved_object(&mut pdf, pages_ref);
         let pages_dict = pages.as_dict().unwrap();
         assert_eq!(
             pages_dict.get("Type").unwrap().as_name(),
@@ -598,9 +600,7 @@ mod tests {
 
         // Mutating `a`'s Pages dict must not leak into `b`: each call to
         // `Pdf::empty()` owns its own bytes and cache.
-        let mut pages_dict = a
-            .resolve_object(pages_ref)
-            .unwrap()
+        let mut pages_dict = resolved_object(&mut a, pages_ref)
             .as_dict()
             .unwrap()
             .clone();
@@ -608,16 +608,14 @@ mod tests {
         a.set_object(pages_ref, Object::Dictionary(pages_dict));
 
         assert_eq!(
-            a.resolve_object(pages_ref)
-                .unwrap()
+            resolved_object(&mut a, pages_ref)
                 .as_dict()
                 .unwrap()
                 .get("Count"),
             Some(&Object::Integer(7))
         );
         assert_eq!(
-            b.resolve_object(pages_ref)
-                .unwrap()
+            resolved_object(&mut b, pages_ref)
                 .as_dict()
                 .unwrap()
                 .get("Count"),

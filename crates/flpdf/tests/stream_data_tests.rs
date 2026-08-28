@@ -92,7 +92,7 @@ fn make_pdf_with_stream(raw: &[u8], filter: Option<&[u8]>) -> Vec<u8> {
 fn extract_stream_obj(pdf_bytes: &[u8]) -> Stream {
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes.to_vec())).expect("open");
     let obj = pdf
-        .resolve_object(ObjectRef::new(4, 0))
+        .resolve_canonical_object(ObjectRef::new(4, 0))
         .expect("resolve 4 0 R");
     match obj {
         Object::Stream(s) => s,
@@ -309,5 +309,6 @@ fn stream_data_none_falls_back_to_compress_streams() {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{check_output, write_default, write_with_settings, WriterTestSettings};

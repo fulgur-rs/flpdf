@@ -21,6 +21,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 mod common;
+use common::PdfCanonicalTestExt;
 use common::{remap_object_refs, write_with_settings_and_mapping, WriterTestSettings};
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
@@ -59,7 +60,7 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
 }
 
 fn raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> Object {
-    let Object::Dictionary(item) = pdf.resolve_object(item_ref).unwrap() else {
+    let Object::Dictionary(item) = pdf.resolve_canonical_object(item_ref).unwrap() else {
         panic!("outline item must be a dictionary");
     };
     item.get("A").cloned().unwrap_or(Object::Null)
@@ -70,13 +71,13 @@ fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> O
     let mut seen = BTreeSet::new();
     while let Object::Reference(reference) = value {
         assert!(seen.insert(reference), "cycle in test action holder");
-        value = pdf.resolve_object(reference).unwrap();
+        value = pdf.resolve_canonical_object(reference).unwrap();
     }
     value
 }
 
 fn dict_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &str) -> Object {
-    let Object::Dictionary(dict) = pdf.resolve_object(object_ref).unwrap() else {
+    let Object::Dictionary(dict) = pdf.resolve_canonical_object(object_ref).unwrap() else {
         panic!("{object_ref} must resolve to a dictionary");
     };
     dict.get(key).cloned().unwrap_or(Object::Null)
@@ -183,13 +184,15 @@ fn deep_outline_round_trip_through_write_pdf() {
 
     // Follow the serialized raw `/First` chain independently of the helper.
     let catalog_ref = reopened.root_ref().unwrap();
-    let Object::Dictionary(catalog) = reopened.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = reopened.resolve_canonical_object(catalog_ref).unwrap()
+    else {
         panic!("catalog must be a dictionary");
     };
     let Object::Reference(outlines_ref) = catalog.get("Outlines").cloned().unwrap() else {
         panic!("catalog /Outlines must be indirect");
     };
-    let Object::Dictionary(outlines) = reopened.resolve_object(outlines_ref).unwrap() else {
+    let Object::Dictionary(outlines) = reopened.resolve_canonical_object(outlines_ref).unwrap()
+    else {
         panic!("outlines root must be a dictionary");
     };
     let mut cursor = outlines.get("First").cloned().unwrap();
@@ -199,7 +202,7 @@ fn deep_outline_round_trip_through_write_pdf() {
         let Object::Reference(reference) = cursor else {
             panic!("raw outline item {raw_count} must be indirect");
         };
-        let Object::Dictionary(item) = reopened.resolve_object(reference).unwrap() else {
+        let Object::Dictionary(item) = reopened.resolve_canonical_object(reference).unwrap() else {
             panic!("raw outline item {reference} must be a dictionary");
         };
         raw_count += 1;
@@ -333,7 +336,7 @@ fn action_chain_with_next_round_trips_through_write_pdf() {
     ];
     let before: Vec<Object> = action_refs[1..]
         .iter()
-        .map(|&reference| pdf.resolve_object(reference).unwrap())
+        .map(|&reference| pdf.resolve_canonical_object(reference).unwrap())
         .collect();
 
     let (out, mapping) =
@@ -343,7 +346,11 @@ fn action_chain_with_next_round_trips_through_write_pdf() {
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let after: Vec<Object> = action_refs[1..]
         .iter()
-        .map(|reference| reopened.resolve_object(mapping[reference]).unwrap())
+        .map(|reference| {
+            reopened
+                .resolve_canonical_object(mapping[reference])
+                .unwrap()
+        })
         .collect();
     let mut expected = before.clone();
     for value in &mut expected {
@@ -590,7 +597,7 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         Object::Reference(reference) => reference,
         other => panic!("/SE must remain an indirect reference, got {other:?}"),
     };
-    match reopened.resolve_object(se_ref).unwrap() {
+    match reopened.resolve_canonical_object(se_ref).unwrap() {
         Object::Dictionary(dict) => {
             assert_eq!(
                 dict.get("Type"),
@@ -675,7 +682,7 @@ fn struct_elem_survives_page_rebuild_pg_drop_and_outline_se_still_resolves() {
     };
     assert_eq!(se_ref, ObjectRef::new(20, 0));
 
-    match pdf.resolve_object(se_ref).unwrap() {
+    match pdf.resolve_canonical_object(se_ref).unwrap() {
         Object::Dictionary(dict) => {
             assert_eq!(
                 dict.get("Type"),

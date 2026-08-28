@@ -79,7 +79,7 @@ fn single_font_pdf(base: &[u8]) -> Vec<u8> {
 fn leaf_base_font(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, page_idx: usize) -> Vec<u8> {
     let leaf_ref = pages::page_refs(doc).unwrap()[page_idx];
     let leaf = doc
-        .resolve_object(leaf_ref)
+        .resolve_canonical_object(leaf_ref)
         .unwrap()
         .as_dict()
         .cloned()
@@ -89,7 +89,12 @@ fn leaf_base_font(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, page_idx: usize) -> V
     // The single font entry (named /F1 in the fixture); resolve its /BaseFont.
     let (_, font_obj) = fonts.iter().next().expect("page has one font");
     let font = match font_obj {
-        Object::Reference(r) => doc.resolve_object(*r).unwrap().as_dict().cloned().unwrap(),
+        Object::Reference(r) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .as_dict()
+            .cloned()
+            .unwrap(),
         Object::Dictionary(d) => d.clone(),
         _ => panic!("font entry is not a dict"),
     };
@@ -106,7 +111,12 @@ fn resolve_dict_entry(
     key: &str,
 ) -> flpdf::Dictionary {
     match dict.get(key).expect("dict has key") {
-        Object::Reference(r) => doc.resolve_object(*r).unwrap().as_dict().cloned().unwrap(),
+        Object::Reference(r) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .as_dict()
+            .cloned()
+            .unwrap(),
         Object::Dictionary(d) => d.clone(),
         _ => panic!("entry {key} is not a dict"),
     }
@@ -116,7 +126,7 @@ fn resolve_dict_entry(
 fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     let catalog_ref = doc.root_ref().unwrap();
     let catalog = doc
-        .resolve_borrowed(catalog_ref)
+        .resolve_canonical_object(catalog_ref)
         .unwrap()
         .as_dict()
         .cloned()
@@ -128,7 +138,7 @@ fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
             _ => None,
         })
         .unwrap();
-    doc.resolve_borrowed(pages_ref)
+    doc.resolve_canonical_object(pages_ref)
         .unwrap()
         .as_dict()
         .cloned()
@@ -139,7 +149,7 @@ fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
 fn count_font_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, base: &[u8]) -> usize {
     let mut n = 0;
     for r in doc.object_refs() {
-        if let Ok(obj) = doc.resolve_object(r) {
+        if let Ok(obj) = doc.resolve_canonical_object(r) {
             if let Some(d) = obj.as_dict() {
                 if d.get("Type").and_then(|o| o.as_name()) == Some(&b"Font"[..])
                     && d.get("BaseFont").and_then(|o| o.as_name()) == Some(base)
@@ -202,7 +212,7 @@ fn merge_preserves_qpdf_inherited_box_identity_without_default_rotate() {
         .iter()
         .map(|page_ref| {
             merged
-                .resolve_object(*page_ref)
+                .resolve_canonical_object(*page_ref)
                 .unwrap()
                 .into_dict()
                 .unwrap()
@@ -264,6 +274,7 @@ fn merge_single_input_round_trips() {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{write_default, write_with_settings, WriterTestSettings};
 
@@ -355,7 +366,7 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
     let ref2 = catalog
         .get_ref("Ref2")
         .expect("primary unrelated Catalog reference must survive");
-    let ref2_object = merged.resolve_object(ref2).unwrap();
+    let ref2_object = merged.resolve_canonical_object(ref2).unwrap();
     assert_eq!(
         ref2_object
             .as_dict()
@@ -366,7 +377,7 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
     assert_eq!(
         catalog
             .get_ref("ViewerPreferences")
-            .and_then(|reference| merged.resolve_object(reference).ok())
+            .and_then(|reference| merged.resolve_canonical_object(reference).ok())
             .and_then(|object| object.as_dict().cloned())
             .and_then(|dict| dict.get("DisplayDocTitle").cloned()),
         Some(Object::Boolean(true))
@@ -523,15 +534,27 @@ fn annot_aa_dest_ref(
     doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
     annot_ref: flpdf::ObjectRef,
 ) -> (flpdf::ObjectRef, bool) {
-    let annot = doc.resolve_object(annot_ref).unwrap().into_dict().unwrap();
+    let annot = doc
+        .resolve_canonical_object(annot_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let aa = match annot.get("AA") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /AA dict, got {other:?}"),
     };
     let enter = match aa.get("E") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /AA /E action, got {other:?}"),
     };
     let d = match enter.get("D") {
@@ -542,7 +565,10 @@ fn annot_aa_dest_ref(
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /AA /E /D[0] to be an indirect reference, got {other:?}"),
     };
-    let is_null = matches!(doc.resolve_object(page_dest).unwrap(), Object::Null);
+    let is_null = matches!(
+        doc.resolve_canonical_object(page_dest).unwrap(),
+        Object::Null
+    );
     (page_dest, is_null)
 }
 
@@ -552,7 +578,11 @@ fn annot_dest_ref(
     doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
     annot_ref: flpdf::ObjectRef,
 ) -> (flpdf::ObjectRef, bool) {
-    let annot = doc.resolve_object(annot_ref).unwrap().into_dict().unwrap();
+    let annot = doc
+        .resolve_canonical_object(annot_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let dest = match annot.get("Dest") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected /Dest array, got {other:?}"),
@@ -561,7 +591,10 @@ fn annot_dest_ref(
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /Dest[0] to be an indirect reference, got {other:?}"),
     };
-    let is_null = matches!(doc.resolve_object(page_ref).unwrap(), Object::Null);
+    let is_null = matches!(
+        doc.resolve_canonical_object(page_ref).unwrap(),
+        Object::Null
+    );
     (page_ref, is_null)
 }
 
@@ -571,10 +604,18 @@ fn annot_action_dest_ref(
     doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
     annot_ref: flpdf::ObjectRef,
 ) -> (flpdf::ObjectRef, bool) {
-    let annot = doc.resolve_object(annot_ref).unwrap().into_dict().unwrap();
+    let annot = doc
+        .resolve_canonical_object(annot_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let action = match annot.get("A") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /A action, got {other:?}"),
     };
     let d = match action.get("D") {
@@ -585,7 +626,10 @@ fn annot_action_dest_ref(
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /A /D[0] to be an indirect reference, got {other:?}"),
     };
-    let is_null = matches!(doc.resolve_object(page_ref).unwrap(), Object::Null);
+    let is_null = matches!(
+        doc.resolve_canonical_object(page_ref).unwrap(),
+        Object::Null
+    );
     (page_ref, is_null)
 }
 
@@ -595,15 +639,27 @@ fn page_aa_dest_ref(
     doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
     page_ref: flpdf::ObjectRef,
 ) -> (flpdf::ObjectRef, bool) {
-    let page = doc.resolve_object(page_ref).unwrap().into_dict().unwrap();
+    let page = doc
+        .resolve_canonical_object(page_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let aa = match page.get("AA") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /AA dict, got {other:?}"),
     };
     let open = match aa.get("O") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /AA /O action, got {other:?}"),
     };
     let d = match open.get("D") {
@@ -614,7 +670,10 @@ fn page_aa_dest_ref(
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /AA /O /D[0] to be an indirect reference, got {other:?}"),
     };
-    let is_null = matches!(doc.resolve_object(page_dest).unwrap(), Object::Null);
+    let is_null = matches!(
+        doc.resolve_canonical_object(page_dest).unwrap(),
+        Object::Null
+    );
     (page_dest, is_null)
 }
 
@@ -623,10 +682,14 @@ fn annot_refs(
     doc: &mut Pdf<std::io::Cursor<Vec<u8>>>,
     page_ref: flpdf::ObjectRef,
 ) -> Vec<flpdf::ObjectRef> {
-    let page = doc.resolve_object(page_ref).unwrap().into_dict().unwrap();
+    let page = doc
+        .resolve_canonical_object(page_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let annots = match page.get("Annots") {
         Some(Object::Array(arr)) => arr.clone(),
-        Some(Object::Reference(r)) => match doc.resolve_object(*r).unwrap() {
+        Some(Object::Reference(r)) => match doc.resolve_canonical_object(*r).unwrap() {
             Object::Array(arr) => arr,
             other => panic!("expected indirect /Annots to be an array, got {other:?}"),
         },
@@ -783,7 +846,11 @@ fn merge_indirect_annots_nulls_removed_dest_and_ignores_pageless_dests() {
     );
 
     // The named /Dest carries no page ref: it is retained verbatim as a name.
-    let named = doc.resolve_object(annots[1]).unwrap().into_dict().unwrap();
+    let named = doc
+        .resolve_canonical_object(annots[1])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     assert_eq!(
         named.get("Dest").and_then(|o| o.as_name()),
         Some(&b"SomeNamedDest"[..]),
@@ -791,7 +858,11 @@ fn merge_indirect_annots_nulls_removed_dest_and_ignores_pageless_dests() {
     );
 
     // The URI action contains no page reference and is retained verbatim.
-    let uri = doc.resolve_object(annots[2]).unwrap().into_dict().unwrap();
+    let uri = doc
+        .resolve_canonical_object(annots[2])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let action = match uri.get("A") {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /A action dict, got {other:?}"),
@@ -902,7 +973,11 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
 
     // /A /Next chain → removed page2: the GoTo on the /Next continuation must
     // have its target nulled.
-    let annot_next = doc.resolve_object(annots[0]).unwrap().into_dict().unwrap();
+    let annot_next = doc
+        .resolve_canonical_object(annots[0])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let head = match annot_next.get("A") {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /A action dict, got {other:?}"),
@@ -916,7 +991,10 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
         other => panic!("expected /Next /D array, got {other:?}"),
     };
     assert!(
-        matches!(doc.resolve_object(next_target).unwrap(), Object::Null),
+        matches!(
+            doc.resolve_canonical_object(next_target).unwrap(),
+            Object::Null
+        ),
         "removed page reached via /A /Next must resolve to null"
     );
     assert!(
@@ -925,7 +1003,11 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
     );
 
     // /A action array → removed page3: the GoTo array element's target nulled.
-    let annot_arr = doc.resolve_object(annots[1]).unwrap().into_dict().unwrap();
+    let annot_arr = doc
+        .resolve_canonical_object(annots[1])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let arr_target = match annot_arr.get("A") {
         Some(Object::Array(elems)) => {
             // The GoTo is the second element; find it and read its /D[0].
@@ -942,7 +1024,10 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
         other => panic!("expected /A action array, got {other:?}"),
     };
     assert!(
-        matches!(doc.resolve_object(arr_target).unwrap(), Object::Null),
+        matches!(
+            doc.resolve_canonical_object(arr_target).unwrap(),
+            Object::Null
+        ),
         "removed page reached via an action array must resolve to null"
     );
     assert!(
@@ -951,7 +1036,11 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
     );
 
     // /A /GoTo /SD → removed page4: the StructElem's /Pg target nulled.
-    let annot_sd = doc.resolve_object(annots[2]).unwrap().into_dict().unwrap();
+    let annot_sd = doc
+        .resolve_canonical_object(annots[2])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let sd_action = match annot_sd.get("A") {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /A action dict, got {other:?}"),
@@ -962,7 +1051,7 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
     };
     // The StructElem itself is copied; its /Pg points at the nulled page4.
     let struct_elem = doc
-        .resolve_object(struct_elem_ref)
+        .resolve_canonical_object(struct_elem_ref)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -971,7 +1060,10 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
         .and_then(Object::as_ref_id)
         .expect("StructElem has /Pg ref");
     assert!(
-        matches!(doc.resolve_object(pg_target).unwrap(), Object::Null),
+        matches!(
+            doc.resolve_canonical_object(pg_target).unwrap(),
+            Object::Null
+        ),
         "removed page reached via /SD StructElem /Pg must resolve to null"
     );
     assert!(
@@ -1028,19 +1120,34 @@ fn merge_bead_p_removed_page_is_nulled() {
 
     // Walk the copied bead ring from page0's /B to bead1, whose /P targets the
     // removed page.
-    let page0 = doc.resolve_object(page0_ref).unwrap().into_dict().unwrap();
+    let page0 = doc
+        .resolve_canonical_object(page0_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let b = match page0.get("B") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected /B array, got {other:?}"),
     };
     let bead0_ref = b.first().and_then(Object::as_ref_id).unwrap();
-    let bead0 = doc.resolve_object(bead0_ref).unwrap().into_dict().unwrap();
+    let bead0 = doc
+        .resolve_canonical_object(bead0_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let bead1_ref = bead0.get("N").and_then(Object::as_ref_id).unwrap();
-    let bead1 = doc.resolve_object(bead1_ref).unwrap().into_dict().unwrap();
+    let bead1 = doc
+        .resolve_canonical_object(bead1_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let p_target = bead1.get("P").and_then(Object::as_ref_id).unwrap();
 
     assert!(
-        matches!(doc.resolve_object(p_target).unwrap(), Object::Null),
+        matches!(
+            doc.resolve_canonical_object(p_target).unwrap(),
+            Object::Null
+        ),
         "bead-/P-reached removed page must resolve to null"
     );
     // ...but it is outside the output page tree (never appears in /Kids).
@@ -1239,7 +1346,7 @@ fn doc_level_dest_pdf() -> Vec<u8> {
 /// Resolve the catalog dict of a merged document.
 fn catalog_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     let catalog_ref = doc.root_ref().unwrap();
-    doc.resolve_object(catalog_ref)
+    doc.resolve_canonical_object(catalog_ref)
         .unwrap()
         .into_dict()
         .unwrap()
@@ -1249,7 +1356,7 @@ fn catalog_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
 fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usize {
     let mut n = 0;
     for r in doc.live_object_refs() {
-        if let Ok(obj) = doc.resolve_object(r) {
+        if let Ok(obj) = doc.resolve_canonical_object(r) {
             let dict = match &obj {
                 Object::Dictionary(d) => Some(d.clone()),
                 Object::Stream(s) => Some(s.dict.clone()),
@@ -1274,7 +1381,7 @@ fn outline_item_refs(
     let mut out = Vec::new();
     let mut visited = std::collections::BTreeSet::new();
     let first = doc
-        .resolve_object(outlines_ref)
+        .resolve_canonical_object(outlines_ref)
         .unwrap()
         .into_dict()
         .unwrap()
@@ -1297,7 +1404,7 @@ fn walk_outline_refs(
             break;
         }
         // A /First/Next may point at a non-dict (malformed); stop that chain.
-        let Some(item) = doc.resolve_object(r).unwrap().into_dict() else {
+        let Some(item) = doc.resolve_canonical_object(r).unwrap().into_dict() else {
             break;
         };
         out.push(r);
@@ -1319,7 +1426,10 @@ fn dest_array_first(
         Some(Object::Reference(r)) => *r,
         other => panic!("expected dest[0] to be a reference, got {other:?}"),
     };
-    let is_null = matches!(doc.resolve_object(page_ref).unwrap(), Object::Null);
+    let is_null = matches!(
+        doc.resolve_canonical_object(page_ref).unwrap(),
+        Object::Null
+    );
     (page_ref, is_null)
 }
 
@@ -1372,7 +1482,11 @@ fn merge_inherits_primary_outline_only() {
     );
 
     // Item 0 /Dest → surviving primary page0: remapped to its new ref, NOT null.
-    let item0 = doc.resolve_object(items[0]).unwrap().into_dict().unwrap();
+    let item0 = doc
+        .resolve_canonical_object(items[0])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let dest0 = match item0.get("Dest") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected item0 /Dest array, got {other:?}"),
@@ -1382,7 +1496,11 @@ fn merge_inherits_primary_outline_only() {
     assert!(!d0_null, "surviving outline dest must not be nulled");
 
     // Item 1 /A /GoTo /D → surviving primary page1: remapped, NOT null.
-    let item1 = doc.resolve_object(items[1]).unwrap().into_dict().unwrap();
+    let item1 = doc
+        .resolve_canonical_object(items[1])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let action = match item1.get("A") {
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected item1 /A dict, got {other:?}"),
@@ -1398,12 +1516,16 @@ fn merge_inherits_primary_outline_only() {
     // /Names /Dests carries the primary's named dests; d_p1 → surviving page0.
     let names = match cat.get("Names") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Names, got {other:?}"),
     };
     let dests_leaf_ref = names.get_ref("Dests").expect("/Names /Dests ref");
     let leaf = doc
-        .resolve_object(dests_leaf_ref)
+        .resolve_canonical_object(dests_leaf_ref)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -1446,7 +1568,11 @@ fn merge_primary_outline_dest_to_removed_page_is_nulled() {
 
     // Outline item 2 /Dest → removed page2: array kept, first element is a
     // reference resolving to null.
-    let item2 = doc.resolve_object(items[2]).unwrap().into_dict().unwrap();
+    let item2 = doc
+        .resolve_canonical_object(items[2])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let dest2 = match item2.get("Dest") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected item2 /Dest array, got {other:?}"),
@@ -1457,11 +1583,15 @@ fn merge_primary_outline_dest_to_removed_page_is_nulled() {
     // Named dest d_p3 → removed page2: same null-out.
     let names = match cat.get("Names") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Names, got {other:?}"),
     };
     let leaf = doc
-        .resolve_object(names.get_ref("Dests").unwrap())
+        .resolve_canonical_object(names.get_ref("Dests").unwrap())
         .unwrap()
         .into_dict()
         .unwrap();
@@ -1479,7 +1609,11 @@ fn merge_primary_outline_dest_to_removed_page_is_nulled() {
     // Legacy /Catalog /Dests legacy_p3 → removed page2: same null-out.
     let legacy = match cat.get("Dests") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected legacy /Dests, got {other:?}"),
     };
     let legacy_dest = match legacy.get("legacy_p3") {
@@ -1492,7 +1626,11 @@ fn merge_primary_outline_dest_to_removed_page_is_nulled() {
     // /OpenAction /GoTo /D → removed page2: same null-out.
     let oa = match cat.get("OpenAction") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /OpenAction, got {other:?}"),
     };
     let oa_d = match oa.get("D") {
@@ -1626,7 +1764,7 @@ fn merge_opaque_openaction_d_operand_is_copied_and_remapped() {
         other => panic!("opaque /GoToR /D operand must be a live copied reference, got {other:?}"),
     };
     assert_eq!(
-        doc.resolve_object(d_ref).unwrap(),
+        doc.resolve_canonical_object(d_ref).unwrap(),
         Object::String(b"NamedDest".to_vec()),
         "the /D operand object must be folded into the closure and copied"
     );
@@ -1672,13 +1810,17 @@ fn merge_inline_openaction_goto_sd_retained_with_removed_page_nulled() {
         .first()
         .and_then(Object::as_ref_id)
         .expect("/SD retains a StructElem reference");
-    let struct_elem = doc.resolve_object(struct_ref).unwrap().into_dict().unwrap();
+    let struct_elem = doc
+        .resolve_canonical_object(struct_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let removed_page = struct_elem
         .get("Pg")
         .and_then(Object::as_ref_id)
         .expect("StructElem /Pg is retained");
     assert!(matches!(
-        doc.resolve_object(removed_page).unwrap(),
+        doc.resolve_canonical_object(removed_page).unwrap(),
         Object::Null
     ));
     let d = match oa.get("D") {
@@ -1732,13 +1874,17 @@ fn merge_inline_openaction_goto_sd_only_retains_null_page_boundary() {
         .first()
         .and_then(Object::as_ref_id)
         .expect("/SD retains a StructElem reference");
-    let struct_elem = doc.resolve_object(struct_ref).unwrap().into_dict().unwrap();
+    let struct_elem = doc
+        .resolve_canonical_object(struct_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let removed_page = struct_elem
         .get("Pg")
         .and_then(Object::as_ref_id)
         .expect("StructElem /Pg is retained");
     assert!(matches!(
-        doc.resolve_object(removed_page).unwrap(),
+        doc.resolve_canonical_object(removed_page).unwrap(),
         Object::Null
     ));
     assert!(oa.get("D").is_none(), "no /D fallback present");
@@ -1790,14 +1936,18 @@ fn merge_inline_openaction_goto_sd_retained_when_target_kept() {
         .first()
         .and_then(Object::as_ref_id)
         .expect("/SD retains a StructElem reference");
-    let struct_elem = doc.resolve_object(struct_ref).unwrap().into_dict().unwrap();
+    let struct_elem = doc
+        .resolve_canonical_object(struct_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let page_ref = struct_elem
         .get("Pg")
         .and_then(Object::as_ref_id)
         .expect("StructElem /Pg is retained");
     assert_eq!(page_ref, pages::page_refs(&mut doc).unwrap()[0]);
     assert!(!matches!(
-        doc.resolve_object(page_ref).unwrap(),
+        doc.resolve_canonical_object(page_ref).unwrap(),
         Object::Null
     ));
 }
@@ -1901,11 +2051,15 @@ fn merge_inherits_inline_doc_level_carriers() {
     // Inline /Names was inherited; its /Dests leaf carries the named dests.
     let names = match cat.get("Names") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Names, got {other:?}"),
     };
     let leaf = doc
-        .resolve_object(names.get_ref("Dests").unwrap())
+        .resolve_canonical_object(names.get_ref("Dests").unwrap())
         .unwrap()
         .into_dict()
         .unwrap();
@@ -2109,7 +2263,11 @@ fn merge_outline_nested_child_cyclic_and_malformed() {
     let mut null_dest_count = 0;
     let mut surviving_dest_count = 0;
     for &r in &items {
-        let item = doc.resolve_object(r).unwrap().into_dict().unwrap();
+        let item = doc
+            .resolve_canonical_object(r)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         if let Some(Object::Array(arr)) = item.get("Dest") {
             let arr = arr.clone();
             let (_ref, is_null) = dest_array_first(&mut doc, &arr);
@@ -2178,12 +2336,20 @@ fn merge_inherits_inline_dests_root() {
     // The inline /Dests root was inherited: catalog has /Names → /Dests leaf.
     let names = match cat.get("Names") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Names, got {other:?}"),
     };
     let leaf = match names.get("Dests") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Dests leaf, got {other:?}"),
     };
     let pairs = match leaf.get("Names") {
@@ -2250,7 +2416,7 @@ fn merge_tolerates_empty_outline_root() {
         .get_ref("Outlines")
         .expect("empty /Outlines root inherited onto output catalog");
     let outlines = doc
-        .resolve_object(outlines_ref)
+        .resolve_canonical_object(outlines_ref)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -2327,7 +2493,7 @@ fn merge_inline_legacy_dests_non_array_remapped() {
     // (pre-fix: stayed source ref 31, which was never copied -> Null).
     let d_ref_arr = match legacy.get("d_ref") {
         Some(Object::Array(a)) => a.clone(),
-        Some(Object::Reference(r)) => match doc.resolve_object(*r).unwrap() {
+        Some(Object::Reference(r)) => match doc.resolve_canonical_object(*r).unwrap() {
             Object::Array(a) => a,
             other => panic!("expected /d_ref to resolve to array, got {other:?}"),
         },
@@ -2433,7 +2599,7 @@ fn merge_direct_dest_carriers_preserve_indirect_destination_holders() {
         Object::Reference(reference) => *reference,
         other => panic!("named destination holder must stay indirect, got {other:?}"),
     };
-    let named_dest = match doc.resolve_object(named_holder_ref).unwrap() {
+    let named_dest = match doc.resolve_canonical_object(named_holder_ref).unwrap() {
         Object::Array(array) => array,
         other => panic!("named destination holder must resolve to an array, got {other:?}"),
     };
@@ -2449,7 +2615,7 @@ fn merge_direct_dest_carriers_preserve_indirect_destination_holders() {
         Some(Object::Reference(reference)) => *reference,
         other => panic!("legacy destination holder must stay indirect, got {other:?}"),
     };
-    let legacy_dest = match doc.resolve_object(legacy_holder_ref).unwrap() {
+    let legacy_dest = match doc.resolve_canonical_object(legacy_holder_ref).unwrap() {
         Object::Dictionary(dict) => dict,
         other => panic!("legacy destination holder must resolve to a dict, got {other:?}"),
     };
@@ -2558,7 +2724,7 @@ fn action_after_71_array_holders(
 ) -> flpdf::Dictionary {
     for _ in 0..=70 {
         let concrete = match value {
-            Object::Reference(reference) => doc.resolve_object(reference).unwrap(),
+            Object::Reference(reference) => doc.resolve_canonical_object(reference).unwrap(),
             direct => direct,
         };
         let mut items = concrete.into_array().expect("singleton action array");
@@ -2597,7 +2763,7 @@ fn merge_long_indirect_open_action_array_chain_nulls_removed_page() {
         .and_then(Object::as_ref_id)
         .unwrap();
     assert!(matches!(
-        out.resolve_object(removed_page).unwrap(),
+        out.resolve_canonical_object(removed_page).unwrap(),
         Object::Null
     ));
 }
@@ -2729,7 +2895,11 @@ fn merge_inline_open_action_next_array_remapped() {
     // /Next[1]: indirect GoTo action → resolved, inlined, /D → page2.
     let n1 = match &next_arr[1] {
         Object::Dictionary(d) => d.clone(),
-        Object::Reference(r) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Object::Reference(r) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         o => panic!("/Next[1]: {o:?}"),
     };
     let n1_d = match n1.get("D") {
@@ -2775,7 +2945,11 @@ fn merge_non_goto_open_action_d_retains_null_removed_page() {
     let oa_ref = cat
         .get_ref("OpenAction")
         .expect("indirect /OpenAction inherited onto output catalog");
-    let oa = doc.resolve_object(oa_ref).unwrap().into_dict().unwrap();
+    let oa = doc
+        .resolve_canonical_object(oa_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let oa_d = match oa.get("D") {
         Some(Object::Array(a)) => a.clone(),
         other => panic!("expected /OpenAction /D array, got {other:?}"),
@@ -2854,13 +3028,17 @@ fn two_page_form_pdf() -> Vec<u8> {
 fn acroform_field_names(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<Vec<u8>> {
     let cat = catalog_dict(doc);
     let acroform = match cat.get("AcroForm") {
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /AcroForm, got {other:?}"),
     };
     let fields = match acroform.get("Fields") {
         Some(Object::Array(arr)) => arr.clone(),
-        Some(Object::Reference(r)) => match doc.resolve_object(*r).unwrap() {
+        Some(Object::Reference(r)) => match doc.resolve_canonical_object(*r).unwrap() {
             Object::Array(arr) => arr,
             other => panic!("expected indirect /Fields array, got {other:?}"),
         },
@@ -2872,11 +3050,15 @@ fn acroform_field_names(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<Vec<u8>>
             Object::Reference(r) => r,
             other => panic!("expected field ref, got {other:?}"),
         };
-        let field = doc.resolve_object(field_ref).unwrap().into_dict().unwrap();
+        let field = doc
+            .resolve_canonical_object(field_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let name = match field.get("T") {
             Some(Object::String(s)) => s.clone(),
             Some(Object::Reference(r)) => doc
-                .resolve_object(*r)
+                .resolve_canonical_object(*r)
                 .unwrap()
                 .as_string()
                 .map(<[u8]>::to_vec)
@@ -3089,7 +3271,11 @@ fn merge_inherits_primary_acroform_dr_and_da() {
 
     let cat = catalog_dict(&mut doc);
     let acroform = match cat.get("AcroForm") {
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected indirect /AcroForm, got {other:?}"),
     };
     // /DA inherited verbatim from the primary.
@@ -3102,7 +3288,11 @@ fn merge_inherits_primary_acroform_dr_and_da() {
     let dr = resolve_dict_entry(&mut doc, &acroform, "DR");
     let font = resolve_dict_entry(&mut doc, &dr, "Font");
     let helv_ref = font.get_ref("Helv").expect("/DR /Font /Helv ref");
-    let helv = doc.resolve_object(helv_ref).unwrap().into_dict().unwrap();
+    let helv = doc
+        .resolve_canonical_object(helv_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     assert_eq!(
         helv.get("BaseFont").and_then(Object::as_name),
         Some(&b"Helvetica"[..]),
@@ -3201,7 +3391,11 @@ fn merge_remaps_indirect_primary_da() {
 
     let cat = catalog_dict(&mut doc);
     let acroform = match cat.get("AcroForm") {
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected indirect /AcroForm, got {other:?}"),
     };
     // The indirect /DA must point at a copied object that resolves to the
@@ -3210,7 +3404,7 @@ fn merge_remaps_indirect_primary_da() {
         .get_ref("DA")
         .expect("indirect /DA must survive as a (remapped) reference");
     assert_eq!(
-        doc.resolve_object(da_ref).unwrap().as_string(),
+        doc.resolve_canonical_object(da_ref).unwrap().as_string(),
         Some(&b"/Helv 0 Tf 0 g"[..]),
         "remapped indirect /DA must resolve to the primary's appearance string"
     );
@@ -3379,7 +3573,7 @@ fn count_live_page_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
         .into_iter()
         .filter(|&r| {
             matches!(
-                doc.resolve_object(r),
+                doc.resolve_canonical_object(r),
                 Ok(Object::Dictionary(ref d))
                     if d.get("Type").and_then(Object::as_name) == Some(&b"Page"[..])
             )
@@ -3393,7 +3587,11 @@ fn count_live_page_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
 fn sole_field_kids_count(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
     let cat = catalog_dict(doc);
     let acroform = match cat.get("AcroForm") {
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected indirect /AcroForm, got {other:?}"),
     };
     let fields = match acroform.get("Fields") {
@@ -3405,7 +3603,11 @@ fn sole_field_kids_count(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
         Object::Reference(r) => *r,
         other => panic!("expected field ref, got {other:?}"),
     };
-    let field = doc.resolve_object(field_ref).unwrap().into_dict().unwrap();
+    let field = doc
+        .resolve_canonical_object(field_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     match field.get("Kids") {
         Some(Object::Array(arr)) => arr.len(),
         other => panic!("expected field /Kids array, got {other:?}"),
@@ -3715,13 +3917,17 @@ fn top_level_field_in_annots_unselected_pdf() -> Vec<u8> {
 fn field_kids_count_by_name(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, name: &[u8]) -> usize {
     let cat = catalog_dict(doc);
     let acroform = match cat.get("AcroForm") {
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         Some(Object::Dictionary(d)) => d.clone(),
         other => panic!("expected /AcroForm, got {other:?}"),
     };
     let fields = match acroform.get("Fields") {
         Some(Object::Array(arr)) => arr.clone(),
-        Some(Object::Reference(r)) => match doc.resolve_object(*r).unwrap() {
+        Some(Object::Reference(r)) => match doc.resolve_canonical_object(*r).unwrap() {
             Object::Array(arr) => arr,
             other => panic!("expected indirect /Fields array, got {other:?}"),
         },
@@ -3732,11 +3938,15 @@ fn field_kids_count_by_name(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, name: &[u8]
             Object::Reference(r) => r,
             other => panic!("expected field ref, got {other:?}"),
         };
-        let field = doc.resolve_object(field_ref).unwrap().into_dict().unwrap();
+        let field = doc
+            .resolve_canonical_object(field_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let field_name = match field.get("T") {
             Some(Object::String(s)) => s.clone(),
             Some(Object::Reference(r)) => doc
-                .resolve_object(*r)
+                .resolve_canonical_object(*r)
                 .unwrap()
                 .as_string()
                 .map(<[u8]>::to_vec)
@@ -3894,7 +4104,7 @@ fn merge_duplicate_page_selection_clones_dict_shares_children() {
 
     // The shared child (/Contents) is the SAME ref on both copied pages.
     let contents_ref = |doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, page_ref: flpdf::ObjectRef| {
-        doc.resolve_object(page_ref)
+        doc.resolve_canonical_object(page_ref)
             .unwrap()
             .into_dict()
             .unwrap()
@@ -4030,7 +4240,11 @@ fn merge_shared_goto_action_resolves_to_single_correct_page() {
     let outlines_ref = cat.get_ref("Outlines").expect("output has /Outlines");
     let items = outline_item_refs(&mut doc, outlines_ref);
     assert_eq!(items.len(), 1, "single outline item inherited");
-    let item = doc.resolve_object(items[0]).unwrap().into_dict().unwrap();
+    let item = doc
+        .resolve_canonical_object(items[0])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let g_from_outline = match item.get("A") {
         Some(Object::Reference(r)) => *r,
         other => panic!("outline item /A must be an indirect reference, got {other:?}"),
@@ -4040,7 +4254,11 @@ fn merge_shared_goto_action_resolves_to_single_correct_page() {
     // page A, not the shallow clone).
     let annots = annot_refs(&mut doc, page_a);
     assert_eq!(annots.len(), 1, "page A carries one annotation");
-    let annot = doc.resolve_object(annots[0]).unwrap().into_dict().unwrap();
+    let annot = doc
+        .resolve_canonical_object(annots[0])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let g_from_annot = match annot.get("A") {
         Some(Object::Reference(r)) => *r,
         other => panic!("annotation /A must be an indirect reference, got {other:?}"),
@@ -4057,7 +4275,7 @@ fn merge_shared_goto_action_resolves_to_single_correct_page() {
     // The shared action's /D[0] must resolve to page B's new ref — a SINGLE
     // correct page, remapped exactly once (no double remap, not null).
     let action = doc
-        .resolve_object(g_from_outline)
+        .resolve_canonical_object(g_from_outline)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -4074,7 +4292,10 @@ fn merge_shared_goto_action_resolves_to_single_correct_page() {
         "shared /GoTo dest must resolve to page B's single new ref (no double remap)"
     );
     assert!(
-        !matches!(doc.resolve_object(dest_ref).unwrap(), Object::Null),
+        !matches!(
+            doc.resolve_canonical_object(dest_ref).unwrap(),
+            Object::Null
+        ),
         "page B is selected, so its dest target must not be nulled"
     );
 
@@ -4126,7 +4347,11 @@ fn merge_inline_annot_removed_dest_nulled() {
 
     // The inline annot is a direct dict on /Annots (NOT an indirect ref), so it
     // cannot go through the `annot_refs` helper.
-    let page = doc.resolve_object(page0_ref).unwrap().into_dict().unwrap();
+    let page = doc
+        .resolve_canonical_object(page0_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let annots = match page.get("Annots") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected inline /Annots array, got {other:?}"),
@@ -4144,7 +4369,10 @@ fn merge_inline_annot_removed_dest_nulled() {
         other => panic!("expected /Dest[0] to be an indirect reference, got {other:?}"),
     };
     assert!(
-        matches!(doc.resolve_object(dest_ref).unwrap(), Object::Null),
+        matches!(
+            doc.resolve_canonical_object(dest_ref).unwrap(),
+            Object::Null
+        ),
         "removed-target inline annot /Dest must resolve to Null, not a live page orphan"
     );
 
@@ -4195,25 +4423,33 @@ fn merge_dr_resource_named_p_survives() {
         .get("AcroForm")
         .and_then(Object::as_ref_id)
         .expect("merged output must carry an /AcroForm reference");
-    let acroform = match doc.resolve_object(acroform_ref).unwrap() {
+    let acroform = match doc.resolve_canonical_object(acroform_ref).unwrap() {
         Object::Dictionary(d) => d,
         other => panic!("expected /AcroForm dict, got {other:?}"),
     };
     let dr = match acroform.get("DR") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /DR dict, got {other:?}"),
     };
     let font = match dr.get("Font") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /DR /Font dict, got {other:?}"),
     };
     let p_ref = match font.get("P") {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /DR /Font /P indirect reference, got {other:?}"),
     };
-    let resolved = doc.resolve_object(p_ref).unwrap();
+    let resolved = doc.resolve_canonical_object(p_ref).unwrap();
     assert!(
         !matches!(resolved, Object::Null),
         "the /DA-referenced /DR /Font /P font must survive the merge, not be nulled"
@@ -4280,7 +4516,7 @@ fn merge_inline_open_action_js_operand_folded_and_remapped() {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /OpenAction /JS indirect reference, got {other:?}"),
     };
-    let resolved = doc.resolve_object(js_ref).unwrap();
+    let resolved = doc.resolve_canonical_object(js_ref).unwrap();
     assert!(
         !matches!(resolved, Object::Null),
         "the inline /OpenAction /JS operand must be folded and remapped, not dangling"
@@ -4456,7 +4692,7 @@ fn merge_inline_open_action_no_s_dest_dict_remapped_and_nulled() {
         other => panic!("expected /OpenAction /D array, got {other:?}"),
     };
     assert!(
-        matches!(doc2.resolve_object(d2_ref).unwrap(), Object::Null),
+        matches!(doc2.resolve_canonical_object(d2_ref).unwrap(), Object::Null),
         "no-/S /OpenAction /D[0] to a removed page must resolve to null"
     );
 
@@ -4519,7 +4755,7 @@ fn merge_inline_non_goto_open_action_d_remapped_not_nulled() {
         "the opaque action's /D[0] indirect ref must be remapped to the copied page 0"
     );
     assert!(
-        !matches!(doc.resolve_object(d_ref).unwrap(), Object::Null),
+        !matches!(doc.resolve_canonical_object(d_ref).unwrap(), Object::Null),
         "the opaque action's /D[0] target must remain a live page, not be nulled"
     );
 
@@ -4656,12 +4892,20 @@ fn merge_inherits_inline_dests_kids_root() {
 
     let names = match cat.get("Names") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Names, got {other:?}"),
     };
     let root = match names.get("Dests") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!("expected /Dests root, got {other:?}"),
     };
     // The root keeps its /Kids shape; the single kid ref must be remapped to a
@@ -4675,7 +4919,7 @@ fn merge_inherits_inline_dests_kids_root() {
         Object::Reference(r) => *r,
         o => panic!("expected /Kids[0] indirect ref, got {o:?}"),
     };
-    let kid = match doc.resolve_object(kid_ref).unwrap() {
+    let kid = match doc.resolve_canonical_object(kid_ref).unwrap() {
         Object::Dictionary(d) => d,
         other => panic!("the /Kids sub-leaf must be copied, not Null: {other:?}"),
     };
@@ -4772,7 +5016,7 @@ fn merge_inline_open_action_indirect_next_array_remapped() {
         Some(Object::Array(a)) => a.clone(),
         // The indirect /Next may be re-wired either inline-resolved or as a
         // copied indirect ref; resolve it either way.
-        Some(Object::Reference(r)) => match doc.resolve_object(*r).unwrap() {
+        Some(Object::Reference(r)) => match doc.resolve_canonical_object(*r).unwrap() {
             Object::Array(a) => a,
             other => panic!("expected /Next ref to resolve to array, got {other:?}"),
         },
@@ -4781,7 +5025,11 @@ fn merge_inline_open_action_indirect_next_array_remapped() {
     assert_eq!(next.len(), 1, "/Next array has one action element");
     let n0 = match &next[0] {
         Object::Dictionary(d) => d.clone(),
-        Object::Reference(r) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Object::Reference(r) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         o => panic!("/Next[0] action: {o:?}"),
     };
     let n0_d = match n0.get("D") {
@@ -5012,7 +5260,11 @@ fn merge_inherits_direct_outline_root() {
     // The inherited /Outlines is reconstructed inline on the output catalog.
     let outlines = match cat.get("Outlines") {
         Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => doc.resolve_object(*r).unwrap().into_dict().unwrap(),
+        Some(Object::Reference(r)) => doc
+            .resolve_canonical_object(*r)
+            .unwrap()
+            .into_dict()
+            .unwrap(),
         other => panic!(
             "a direct (inline) primary /Outlines root must be inherited, not dropped, got {other:?}"
         ),
@@ -5024,7 +5276,11 @@ fn merge_inherits_direct_outline_root() {
     let first_ref = outlines
         .get_ref("First")
         .expect("the copied inline outline must carry a /First item ref");
-    let item = doc.resolve_object(first_ref).unwrap().into_dict().unwrap();
+    let item = doc
+        .resolve_canonical_object(first_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let dest = match item.get("Dest") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected the copied item's /Dest array, got {other:?}"),
@@ -5165,7 +5421,11 @@ fn merge_keeps_surviving_dest_behind_page_ref_chain() {
     // must remap to a live page, not be treated as removed and nulled.
     let page0 = pages::page_refs(&mut doc).unwrap()[0];
     let annot_ref = annot_refs(&mut doc, page0)[0];
-    let annot = doc.resolve_object(annot_ref).unwrap().into_dict().unwrap();
+    let annot = doc
+        .resolve_canonical_object(annot_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let dest = match annot.get("Dest") {
         Some(Object::Array(arr)) => arr.clone(),
         other => panic!("expected the copied annot's /Dest array, got {other:?}"),

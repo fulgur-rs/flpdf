@@ -23,6 +23,7 @@
 #![cfg(feature = "qpdf-zlib-compat")]
 
 mod common;
+use common::PdfCanonicalTestExt;
 
 use common::{write_with_settings, WriterTestSettings};
 use flpdf::{
@@ -294,7 +295,7 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
 
     let mut rewritten = Pdf::open(Cursor::new(actual)).unwrap();
     let catalog = rewritten
-        .resolve_object(rewritten.root_ref().unwrap())
+        .resolve_canonical_object(rewritten.root_ref().unwrap())
         .unwrap();
     assert!(matches!(catalog, Object::Dictionary(ref dictionary)
             if dictionary.get("Pages")
