@@ -5329,6 +5329,11 @@ mod tests {
         let root_ref = crate::ObjectRef::new(1, 0);
         let before: ObjectHandle = pdf.get_object_handle(root_ref);
         pdf.resolve(&before).expect("resolve catalog");
+        // Own the pre-build value: `before` is the canonical handle for
+        // root_ref, so it observes any later in-place mutation of that
+        // same slot. Capturing its JSON here, before the build call,
+        // gives an independent snapshot to diff against.
+        let before_json = project(before.get_json(QPDF_JSON_VERSION, true).unwrap()).unwrap();
 
         let json = build_test_document_selected(
             &mut pdf,
@@ -5343,13 +5348,12 @@ mod tests {
             ["version", "parameters", "qpdf"]
         );
         assert!(pdf.repair_diagnostics().entries().is_empty());
-        let after: ObjectHandle = pdf.get_object_handle(root_ref);
-        pdf.resolve(&after).expect("resolve catalog after JSON");
-        assert!(after.is_same_object_as(&before));
+        let after_json = project(before.get_json(QPDF_JSON_VERSION, true).unwrap()).unwrap();
         assert_eq!(
-            qpdf_object_value(&json, "obj:1 0 R"),
-            &project(after.get_json(QPDF_JSON_VERSION, true).unwrap()).unwrap()
+            after_json, before_json,
+            "the catalog must not be mutated by a build that skips outline repair"
         );
+        assert_eq!(qpdf_object_value(&json, "obj:1 0 R"), &before_json);
     }
 
     #[test]
