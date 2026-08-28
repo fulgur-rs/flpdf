@@ -11255,11 +11255,11 @@ mod tests {
             broken: false,
         })
         .expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolver.with_reader_mut(|reader| reader.broken = true);
 
-        let error = handle
-            .try_dereference()
+        let error = pdf
+            .resolve(&handle)
             .expect_err("a dead input source cannot resolve anything");
 
         assert!(
