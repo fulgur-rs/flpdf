@@ -694,7 +694,7 @@ fn update_from_json_check_inspects_rc4_encrypted_input_by_default() {
         ])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("File is encrypted\n"))
+        .stdout(predicate::str::contains("R = 2\n"))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 

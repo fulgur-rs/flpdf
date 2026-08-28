@@ -2535,7 +2535,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
         return finish_job_exit_status(job.show_xref(pdf)?);
     }
     if cli.show_encryption {
-        return render_show_encryption_report(job, pdf, cli.password.password_is_hex_key);
+        return finish_show_encryption(job, pdf, cli.password.password_is_hex_key);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
 }
@@ -5727,112 +5727,19 @@ fn run_show_encryption(
     let mut pdf = job
         .open_for_encryption_inspection(BufReader::new(file), input.display().to_string(), options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-    render_show_encryption_report(&mut job, &mut pdf, password.password_is_hex_key)
+    finish_show_encryption(&mut job, &mut pdf, password.password_is_hex_key)
 }
 
-/// Render the qpdf-verbatim `--show-encryption` report for an already-open
-/// document, shared by [`run_show_encryption`] (file-backed open) and the
-/// JSON-input/update inspection route ([`run_job_inspection_on_pdf`]), which
-/// must render the report from the job-owned, already-updated document
-/// rather than reopening the original file.
-///
-/// Completes the warning/exit-status boundary on `job` itself (rather than
-/// the disconnected fresh-`QPDFJob` [`finish_operation_warnings`] helper) so
-/// `--no-warn` -- already applied to `job` via `set_suppress_warnings` by
-/// both callers -- also gates the trailing "operation succeeded with
-/// warnings" summary here, matching `--check`'s `finish_check_job(job.check(pdf))`.
-fn render_show_encryption_report<R: Read + Seek>(
+/// Emit the qpdf-verbatim encryption report through the job-owned renderer,
+/// then complete the same warning/exit-status boundary as other inspections.
+/// The document may have come from either a file-backed input or a JSON update,
+/// so the already-open document must be passed through unchanged.
+fn finish_show_encryption<R: Read + Seek>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
     password_is_hex_key: bool,
 ) -> CliResult<()> {
-    // qpdf prints "File is not encrypted" and exits 0 for plaintext files.
-    let Some(info) = pdf.encryption_info()? else {
-        logger_info("File is not encrypted\n")?;
-        job.record_document_warnings(pdf);
-        return finish_job_exit_status(job.complete(false)?);
-    };
-
-    // Built as raw bytes, not a `String`: qpdf's `getTrimmedUserPassword()`
-    // is a `std::string` of arbitrary bytes (reachable via `--password-file`
-    // or a byte-preserving password mode) and `QPDFJob::showEncryption`
-    // writes it verbatim to stdout. `String::from_utf8_lossy` would replace
-    // invalid UTF-8 with U+FFFD, diverging from qpdf's byte-for-byte report.
-    let mut output = Vec::new();
-
-    if !info.user_password_matched && !info.owner_password_matched && !password_is_hex_key {
-        output.extend_from_slice(b"Incorrect password supplied\n");
-    }
-
-    // Verbatim qpdf `--show-encryption` lines (source:
-    // libqpdf/QPDFJob.cc QPDFJob::showEncryption).
-    output.extend_from_slice(format!("R = {}\n", info.r).as_bytes());
-    output.extend_from_slice(format!("P = {}\n", info.permissions.raw()).as_bytes());
-    output.extend_from_slice(b"User password = ");
-    output.extend_from_slice(&info.user_password);
-    output.push(b'\n');
-    if info.owner_password_matched {
-        output.extend_from_slice(b"Supplied password is owner password\n"); // cov:ignore: exercised by show-encryption subprocess integration tests
-    }
-    if info.user_password_matched {
-        output.extend_from_slice(b"Supplied password is user password\n");
-    }
-
-    // qpdf's allow* booleans are revision-dependent. Replicate the exact
-    // bit logic from qpdf libqpdf/QPDF_encryption.cc (P(n) = bit n-1 of the
-    // signed /P value, 1-based as in the PDF spec).
-    let p = info.permissions.raw();
-    let r = info.r;
-    let bit = |n: u32| (p >> (n - 1)) & 1 == 1;
-    let allow_print_low = bit(3);
-    let allow_extract_all = bit(5);
-    let allow_accessibility = if r < 3 { bit(5) } else { bit(10) };
-    let allow_print_high = allow_print_low && (r < 3 || bit(12));
-    let allow_modify_assembly = if r < 3 { bit(4) } else { bit(11) };
-    let allow_modify_form = if r < 3 { bit(6) } else { bit(9) };
-    let allow_modify_annotation = bit(6);
-    let allow_modify_other = bit(4);
-    let allow_modify_all = allow_modify_annotation
-        && allow_modify_other
-        && (r < 3 || (allow_modify_form && allow_modify_assembly));
-    let show = |v: bool| if v { "allowed" } else { "not allowed" };
-    output.extend_from_slice(
-        format!("extract for accessibility: {}\n", show(allow_accessibility)).as_bytes(),
-    );
-    output.extend_from_slice(
-        format!("extract for any purpose: {}\n", show(allow_extract_all)).as_bytes(),
-    );
-    output
-        .extend_from_slice(format!("print low resolution: {}\n", show(allow_print_low)).as_bytes());
-    output.extend_from_slice(
-        format!("print high resolution: {}\n", show(allow_print_high)).as_bytes(),
-    );
-    output.extend_from_slice(
-        format!(
-            "modify document assembly: {}\n",
-            show(allow_modify_assembly)
-        )
-        .as_bytes(),
-    );
-    output.extend_from_slice(format!("modify forms: {}\n", show(allow_modify_form)).as_bytes());
-    output.extend_from_slice(
-        format!("modify annotations: {}\n", show(allow_modify_annotation)).as_bytes(),
-    );
-    output.extend_from_slice(format!("modify other: {}\n", show(allow_modify_other)).as_bytes());
-    output.extend_from_slice(format!("modify anything: {}\n", show(allow_modify_all)).as_bytes());
-    if info.v >= 4 {
-        output.extend_from_slice(
-            format!("stream encryption method: {}\n", info.stream_method).as_bytes(),
-        );
-        output.extend_from_slice(
-            format!("string encryption method: {}\n", info.string_method).as_bytes(),
-        );
-        // qpdf prints the embedded-file ("file") method; the no-/EFF fallback
-        // to the stream method happens where `cf_file` is resolved, not here.
-        output
-            .extend_from_slice(format!("file encryption method: {}\n", info.eff_method).as_bytes());
-    }
-    logger_info(output)?;
+    job.show_encryption(pdf, password_is_hex_key)?;
     job.record_document_warnings(pdf);
     finish_job_exit_status(job.complete(false)?)
 }

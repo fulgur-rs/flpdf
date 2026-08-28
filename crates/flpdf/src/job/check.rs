@@ -12,7 +12,7 @@ use crate::linearization::{
 };
 use crate::pipeline::Discard;
 use crate::{DecodeLevel, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter};
-use crate::{ObjectHandle, QPDFLogger, Result, Severity};
+use crate::{EncryptionInfo, ObjectHandle, QPDFLogger, Result, Severity};
 use std::fmt;
 use std::io::{Read, Seek};
 
@@ -149,6 +149,23 @@ impl QPDFJob {
         }
         Ok(self.complete(false)?)
     }
+
+    /// Emit qpdf's `QPDFJob::showEncryption` report for an already-open
+    /// document.
+    ///
+    /// The renderer is owned by this job layer so `--check` and the CLI's
+    /// standalone `--show-encryption` path cannot drift in permission or
+    /// encryption-method semantics. `password_is_hex_key` only controls the
+    /// read-only inspection prefix used when a partial open retained an
+    /// encrypted document after a failed ordinary password attempt.
+    pub fn show_encryption<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        password_is_hex_key: bool,
+    ) -> Result<()> {
+        let logger = self.logger();
+        emit_encryption_report(pdf, &logger, password_is_hex_key)
+    }
 }
 
 /// Run the canonical qpdf-shaped document check for crate-internal tests.
@@ -206,12 +223,18 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         }
         None => logger.info(format!("PDF Version: {}\n", pdf.version()))?,
     }
-    let encryption = if pdf.is_encrypted() {
-        "File is encrypted\n"
-    } else {
-        "File is not encrypted\n"
-    };
-    logger.info(encryption)?;
+    // `check()` only ever renders this report for a document that already
+    // opened successfully, so the password-derived `user_password_matched`/
+    // `owner_password_matched` flags can legitimately both be false (a
+    // hex-key open never sets them) without the document being the product
+    // of a failed password attempt. qpdf's `doCheck` calls `showEncryption`
+    // directly (`QPDFJob.cc:744-765`) and that function never emits
+    // "Incorrect password supplied" in any branch (`QPDFJob.cc:700-742`) —
+    // the message exists only in `createQPDF()`'s `qpdf_e_password` catch
+    // block for the standalone `--show-encryption` mode
+    // (`QPDFJob.cc:428-448`), a path `--check` never reaches. Always
+    // suppress it here.
+    emit_encryption_report(pdf, logger, true)?;
 
     let linearized = match pdf.is_linearized() {
         Ok(value) => value,
@@ -307,6 +330,130 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     }
 
     Ok(CheckOutcome { warnings })
+}
+
+fn emit_encryption_report<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    logger: &QPDFLogger,
+    suppress_password_mismatch_notice: bool,
+) -> Result<()> {
+    let report = render_encryption_report(pdf, suppress_password_mismatch_notice)?;
+    logger.info(report)
+}
+
+/// Build the byte-exact report emitted by qpdf's `QPDFJob::showEncryption`.
+///
+/// This keeps the report in a byte buffer because qpdf writes the recovered
+/// user password as an arbitrary byte string, not as UTF-8 text. The
+/// revision-dependent permission projection follows
+/// `libqpdf/QPDF_encryption.cc`'s `allow*` methods.
+///
+/// `suppress_password_mismatch_notice` covers every caller where the
+/// "Incorrect password supplied" line must never appear even though the
+/// matched-password flags are both false: a hex-key open (the caller passes
+/// `true` for `password_is_hex_key`) never sets either flag on success, and
+/// `check()`'s report (the caller passes a hard-coded `true`) can only ever
+/// run against a document that already opened successfully, so the failed-
+/// password state this line describes is unreachable there regardless of
+/// how the document was authenticated.
+fn render_encryption_report<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    suppress_password_mismatch_notice: bool,
+) -> Result<Vec<u8>> {
+    let Some(info) = pdf.encryption_info()? else {
+        return Ok(b"File is not encrypted\n".to_vec());
+    };
+
+    let mut output = Vec::new();
+    if !info.user_password_matched
+        && !info.owner_password_matched
+        && !suppress_password_mismatch_notice
+    {
+        output.extend_from_slice(b"Incorrect password supplied\n");
+    }
+
+    output.extend_from_slice(format!("R = {}\n", info.r).as_bytes());
+    output.extend_from_slice(format!("P = {}\n", info.permissions.raw()).as_bytes());
+    output.extend_from_slice(b"User password = ");
+    output.extend_from_slice(&info.user_password);
+    output.push(b'\n');
+    if info.owner_password_matched {
+        output.extend_from_slice(b"Supplied password is owner password\n");
+    }
+    if info.user_password_matched {
+        output.extend_from_slice(b"Supplied password is user password\n");
+    }
+
+    let permissions = permission_report(&info);
+    for (label, allowed) in [
+        ("extract for accessibility", permissions.accessibility),
+        ("extract for any purpose", permissions.extract_all),
+        ("print low resolution", permissions.print_low),
+        ("print high resolution", permissions.print_high),
+        ("modify document assembly", permissions.modify_assembly),
+        ("modify forms", permissions.modify_form),
+        ("modify annotations", permissions.modify_annotation),
+        ("modify other", permissions.modify_other),
+        ("modify anything", permissions.modify_all),
+    ] {
+        output.extend_from_slice(format!("{label}: {}\n", show_bool(allowed)).as_bytes());
+    }
+
+    if info.v >= 4 {
+        output.extend_from_slice(
+            format!("stream encryption method: {}\n", info.stream_method).as_bytes(),
+        );
+        output.extend_from_slice(
+            format!("string encryption method: {}\n", info.string_method).as_bytes(),
+        );
+        output
+            .extend_from_slice(format!("file encryption method: {}\n", info.eff_method).as_bytes());
+    }
+    Ok(output)
+}
+
+struct PermissionReport {
+    accessibility: bool,
+    extract_all: bool,
+    print_low: bool,
+    print_high: bool,
+    modify_assembly: bool,
+    modify_form: bool,
+    modify_annotation: bool,
+    modify_other: bool,
+    modify_all: bool,
+}
+
+fn permission_report(info: &EncryptionInfo) -> PermissionReport {
+    let raw = info.permissions.raw() as u32;
+    let bit = |number: u32| raw & (1u32 << (number - 1)) != 0;
+    let print_low = bit(3);
+    let modify_assembly = if info.r < 3 { bit(4) } else { bit(11) };
+    let modify_form = if info.r < 3 { bit(6) } else { bit(9) };
+    let modify_annotation = bit(6);
+    let modify_other = bit(4);
+
+    PermissionReport {
+        accessibility: if info.r < 3 { bit(5) } else { bit(10) },
+        extract_all: bit(5),
+        print_low,
+        print_high: print_low && (info.r < 3 || bit(12)),
+        modify_assembly,
+        modify_form,
+        modify_annotation,
+        modify_other,
+        modify_all: modify_annotation
+            && modify_other
+            && (info.r < 3 || (modify_form && modify_assembly)),
+    }
+}
+
+fn show_bool(value: bool) -> &'static str {
+    if value {
+        "allowed"
+    } else {
+        "not allowed"
+    }
 }
 
 fn linearization_parameter_error_message(input_name: &str, message: &str, offset: u64) -> String {
@@ -1408,6 +1555,128 @@ mod tests {
         assert_eq!(
             *info.lock().expect("info capture"),
             b"checking minimal.pdf\nPDF Version: 1.7\nFile is not encrypted\nFile is not linearized\nNo syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n"
+        );
+    }
+
+    #[test]
+    fn encrypted_document_check_uses_qpdf_show_encryption_report() {
+        let info = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(
+            Some(PipelineHandle::new(Capture {
+                bytes: Arc::clone(&info),
+            })),
+            None,
+        );
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+                ))),
+                "encrypted.pdf",
+                PdfOpenOptions {
+                    password: b"user-v2".to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .expect("encrypted fixture should open");
+
+        let status = job.check(&mut pdf).expect("check should succeed");
+
+        assert_eq!(status, JobExitCode::Success);
+        assert_eq!(
+            *info.lock().expect("info capture"),
+            concat!(
+                "checking encrypted.pdf\n",
+                "PDF Version: 1.7\n",
+                "R = 3\n",
+                "P = -4\n",
+                "User password = user-v2\n",
+                "Supplied password is user password\n",
+                "extract for accessibility: allowed\n",
+                "extract for any purpose: allowed\n",
+                "print low resolution: allowed\n",
+                "print high resolution: allowed\n",
+                "modify document assembly: allowed\n",
+                "modify forms: allowed\n",
+                "modify annotations: allowed\n",
+                "modify other: allowed\n",
+                "modify anything: allowed\n",
+                "File is not linearized\n",
+                "No syntax or stream encoding errors found; the file may still contain\n",
+                "errors that qpdf cannot detect\n",
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn hex_key_opened_document_check_never_reports_incorrect_password() {
+        // Regression test: a hex-key open never sets `user_password_matched`
+        // or `owner_password_matched`, which used to make check()'s
+        // encryption report wrongly print "Incorrect password supplied" for
+        // a successfully-authenticated document. qpdf's `doCheck` calls
+        // `showEncryption` directly (`QPDFJob.cc:744-765`) and that function
+        // has no branch that emits this line (`QPDFJob.cc:700-742`); verified
+        // byte-identical against `qpdf --check --password-is-hex-key
+        // --password=<key> v5-aes-256-r6.pdf` (qpdf 11.9.0).
+        let info = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(
+            Some(PipelineHandle::new(Capture {
+                bytes: Arc::clone(&info),
+            })),
+            None,
+        );
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/encrypted/v5-aes-256-r6.pdf"
+                ))),
+                "encrypted.pdf",
+                PdfOpenOptions {
+                    password: b"fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290"
+                        .to_vec(),
+                    password_is_hex_key: true,
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .expect("hex-key open should succeed");
+
+        let status = job.check(&mut pdf).expect("check should succeed");
+
+        assert_eq!(status, JobExitCode::Success);
+        assert_eq!(
+            *info.lock().expect("info capture"),
+            concat!(
+                "checking encrypted.pdf\n",
+                "PDF Version: 1.7 extension level 8\n",
+                "R = 6\n",
+                "P = -4\n",
+                "User password = \n",
+                "extract for accessibility: allowed\n",
+                "extract for any purpose: allowed\n",
+                "print low resolution: allowed\n",
+                "print high resolution: allowed\n",
+                "modify document assembly: allowed\n",
+                "modify forms: allowed\n",
+                "modify annotations: allowed\n",
+                "modify other: allowed\n",
+                "modify anything: allowed\n",
+                "stream encryption method: AESv3\n",
+                "string encryption method: AESv3\n",
+                "file encryption method: AESv3\n",
+                "File is not linearized\n",
+                "No syntax or stream encoding errors found; the file may still contain\n",
+                "errors that qpdf cannot detect\n",
+            )
+            .as_bytes()
         );
     }
 

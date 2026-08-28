@@ -381,7 +381,7 @@ fn check_encrypted_fixture_accepts_correct_empty_password_flag() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("File is encrypted\n"));
+    .stdout(predicate::str::contains("R = 4\n"));
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn check_inspects_rc4_encrypted_input_by_default() {
         .arg(&input)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("File is encrypted\n"))
+        .stdout(predicate::str::contains("R = 2\n"))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 
@@ -432,7 +432,7 @@ fn check_rc4_with_allow_weak_crypto_still_clean_no_warning() {
         .arg(&input)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("File is encrypted\n"))
+        .stdout(predicate::str::contains("R = 2\n"))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 
@@ -469,7 +469,7 @@ fn rewrite_encrypted_fixture_preserves_encryption_by_default() {
         .args(["--check", output.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("File is encrypted\n"));
+        .stdout(predicate::str::contains("R = 4\n"));
 }
 
 #[test]
@@ -481,7 +481,7 @@ fn check_encrypted_fixture_uses_empty_default_password() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("File is encrypted\n"));
+    .stdout(predicate::str::contains("R = 4\n"));
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn check_encrypted_fixture_reads_password_file_and_strips_newline() {
         .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
         .assert()
         .success()
-        .stdout(predicate::str::contains("File is encrypted\n"));
+        .stdout(predicate::str::contains("R = 4\n"));
 }
 
 #[test]
