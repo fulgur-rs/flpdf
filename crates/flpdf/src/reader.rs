@@ -556,13 +556,11 @@ impl<R: Read + Seek> Pdf<R> {
             }
             .into());
         }
-        match encrypt.materialize()? {
-            Object::Dictionary(dict) => Ok(Some(dict)),
-            _ => Err(EncryptedError::Malformed {
-                reason: "/Encrypt object is not a dictionary".into(),
-            }
-            .into()),
-        }
+        let dict = encrypt
+            .materialize()?
+            .into_dict()
+            .expect("try_as_dictionary confirmed that /Encrypt is a dictionary");
+        Ok(Some(dict))
     }
 
     /// Lift an already-materialized legacy [`Object`] value into a canonical
@@ -2702,6 +2700,21 @@ mod tests {
     }
 
     #[test]
+    fn encrypt_dictionary_rejects_a_non_dictionary_canonical_handle() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF");
+        pdf.trailer.insert("Encrypt", Object::Integer(42));
+
+        let error = pdf
+            .encrypt_dictionary()
+            .expect_err("a scalar /Encrypt value must be malformed");
+        assert!(matches!(
+            error,
+            Error::Encrypted(EncryptedError::Malformed { reason })
+                if reason == "/Encrypt object is not a dictionary"
+        ));
+    }
+
+    #[test]
     fn canonical_recovered_stream_eol_treats_encrypted_recovery_as_ciphertext_framing() {
         // Regression test for job/inspection.rs's `show-stream`/`dump-object`
         // double-trimming real decrypted content as recovery-scan framing
@@ -4775,6 +4788,49 @@ mod tests {
         let stream = Stream::new(dict, b"not zlib".to_vec());
 
         assert!(parse_object_stream_entry(&stream, 0).is_err());
+    }
+
+    #[test]
+    fn object_stream_file_object_helpers_reject_invalid_metadata() {
+        let mut missing_first = Dictionary::new();
+        missing_first.insert("N", Object::Integer(1));
+        assert!(
+            parse_object_stream_entry(&Stream::new(missing_first, b"7 0".to_vec()), 0).is_err()
+        );
+
+        let mut out_of_range = Dictionary::new();
+        out_of_range.insert("N", Object::Integer(1));
+        out_of_range.insert("First", Object::Integer(4));
+        assert!(
+            parse_object_stream_entry(&Stream::new(out_of_range, b"7 0 42".to_vec()), 1).is_err()
+        );
+
+        let mut bad_start = Dictionary::new();
+        bad_start.insert("N", Object::Integer(1));
+        bad_start.insert("First", Object::Integer(100));
+        assert!(parse_object_stream_entry(&Stream::new(bad_start, b"7 0".to_vec()), 0).is_err());
+
+        let mut non_integer_count = Dictionary::new();
+        non_integer_count.insert("N", Object::Name(b"one".to_vec()));
+        assert!(object_stream_count(&Stream::new(non_integer_count, Vec::new())).is_err());
+
+        let mut negative_count = Dictionary::new();
+        negative_count.insert("N", Object::Integer(-1));
+        assert!(object_stream_count(&Stream::new(negative_count, Vec::new())).is_err());
+
+        assert!(parse_non_negative_i64(&Object::Name(b"not-an-integer".to_vec()), "test").is_err());
+        assert!(parse_non_negative_i64(&Object::Integer(-1), "test").is_err());
+        assert!(parse_non_negative_u64(-1, "test").is_err());
+    }
+
+    #[test]
+    fn read_failing_cursor_returns_its_injected_error() {
+        let mut reader = ReadFailingCursor::new(Vec::new());
+        reader.fail_reads = true;
+        let mut byte = [0_u8; 1];
+
+        let error = reader.read(&mut byte).expect_err("injected read failure");
+        assert_eq!(error.to_string(), "injected holder read failure");
     }
 
     #[test]

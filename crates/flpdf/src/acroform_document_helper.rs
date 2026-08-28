@@ -2459,6 +2459,26 @@ mod tests {
     }
 
     #[test]
+    fn collect_reachable_refs_resolves_each_indirect_object_through_its_handle() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Child", Object::Reference(ObjectRef::new(6, 0)))])),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
+
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        collect_reachable_refs(&mut pdf, ObjectRef::new(5, 0), &mut out, &mut seen, 0, true)
+            .unwrap();
+
+        assert_eq!(
+            out,
+            BTreeSet::from([ObjectRef::new(5, 0), ObjectRef::new(6, 0)])
+        );
+    }
+
+    #[test]
     fn annotation_to_field_map_merged_and_separated_widgets() {
         // AcroForm /Fields [7 8]; 7 is a merged field+widget (top-level,
         // /Subtype /Widget directly on it); 8 is a parent field with /Kids

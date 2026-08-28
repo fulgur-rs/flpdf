@@ -1783,6 +1783,25 @@ mod tests {
         assert!(!names.contains(b"F1".as_slice()));
     }
 
+    #[test]
+    fn top_level_field_for_annot_reads_the_parent_chain_through_handles() {
+        let mut pdf = open_minimal();
+        let parent_ref = set_dict(&mut pdf, 10, &[("T", Object::String(b"field".to_vec()))]);
+        let annot_ref = set_dict(
+            &mut pdf,
+            11,
+            &[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("Parent", Object::Reference(parent_ref)),
+            ],
+        );
+
+        assert_eq!(
+            top_level_field_for_annot(&mut pdf, annot_ref).unwrap(),
+            Some(parent_ref)
+        );
+    }
+
     // ---- merge_resources_shallow ------------------------------------------
 
     #[test]
@@ -2482,6 +2501,43 @@ mod tests {
         assert!(
             font.get("F2_1").is_none(),
             "must reuse the pre-existing /F1 rather than mint /F2_1",
+        );
+    }
+
+    #[test]
+    fn adjust_inherited_field_checks_canonical_parent_ancestors() {
+        let mut pdf = open_minimal();
+        let grandparent_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("DA", Object::String(b"/F1 12 Tf".to_vec()))],
+        );
+        let parent_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("Parent", Object::Reference(grandparent_ref))],
+        );
+        let field_ref = set_dict(&mut pdf, 12, &[("Parent", Object::Reference(parent_ref))]);
+        let mut field_dict = crate::Dictionary::new();
+        let overrides = InheritedOverrides {
+            override_da: true,
+            from_default_da: b"/F2 10 Tf".to_vec(),
+            override_q: false,
+            from_default_q: 0,
+        };
+
+        adjust_inherited_field(
+            &mut pdf,
+            field_ref,
+            &mut field_dict,
+            &overrides,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            field_dict.get("DA").is_none(),
+            "an explicit grandparent /DA must suppress the inherited override"
         );
     }
 
