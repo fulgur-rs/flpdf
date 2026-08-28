@@ -10933,10 +10933,9 @@ mod tests {
                 "the guard must reject a whole-source rewind"
             );
         });
-        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("stream recovery scans the live source");
         assert_eq!(
             handle
