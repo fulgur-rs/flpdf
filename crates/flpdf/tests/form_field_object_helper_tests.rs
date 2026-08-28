@@ -91,11 +91,7 @@ fn direct_entry(object: &ObjectHandle, key: &[u8]) -> ObjectHandle {
     value
 }
 
-fn key_name(
-    _pdf: &mut Pdf<Cursor<Vec<u8>>>,
-    object: &ObjectHandle,
-    key: &[u8],
-) -> Option<Vec<u8>> {
+fn key_name(_pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8]) -> Option<Vec<u8>> {
     direct_entry(object, key).as_name()
 }
 
@@ -107,11 +103,7 @@ fn key_string(
     direct_entry(object, key).as_string()
 }
 
-fn key_boolean(
-    _pdf: &mut Pdf<Cursor<Vec<u8>>>,
-    object: &ObjectHandle,
-    key: &[u8],
-) -> Option<bool> {
+fn key_boolean(_pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8]) -> Option<bool> {
     direct_entry(object, key).as_boolean()
 }
 
