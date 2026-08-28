@@ -1,13 +1,22 @@
 use std::fs;
 
-fn production_region<'a>(source: &'a str, module: &str) -> &'a str {
-    source
+fn production_region(source: &str, module: &str) -> String {
+    let normalized = source.replace("\r\n", "\n");
+    normalized
         .split_once("#[cfg(test)]\nmod tests")
-        .map(|(production, _)| production)
+        .map(|(production, _)| production.to_owned())
         .unwrap_or_else(|| {
             assert_eq!(module, "pdf.rs", "only pdf.rs has no inline test module");
-            source
+            normalized
         })
+}
+
+#[test]
+fn production_region_accepts_windows_line_endings() {
+    assert_eq!(
+        production_region("production\r\n#[cfg(test)]\r\nmod tests", "reader.rs"),
+        "production\n"
+    );
 }
 
 #[test]
