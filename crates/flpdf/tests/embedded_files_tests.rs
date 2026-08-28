@@ -21,9 +21,8 @@
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
 use flpdf::{
-    delete_embedded_file, insert_embedded_file, list_embedded_files, Dictionary,
-    EmbeddedFileDocumentHelper, EmbeddedFileStream, Error, FileSpec, Object, ObjectHandle,
-    ObjectRef, Pdf, LEAF_MAX,
+    delete_embedded_file, insert_embedded_file, list_embedded_files, EmbeddedFileDocumentHelper,
+    EmbeddedFileStream, Error, FileSpec, ObjectHandle, ObjectRef, Pdf, LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -51,27 +50,63 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("Pdf::open")
 }
 
+fn handle_array(items: Vec<ObjectHandle>) -> ObjectHandle {
+    ObjectHandle::array(items)
+}
+
+fn handle_dictionary(entries: Vec<(&[u8], ObjectHandle)>) -> ObjectHandle {
+    ObjectHandle::dictionary(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_vec(), value))
+            .collect(),
+    )
+}
+
+fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve(&handle).expect("resolve canonical test object");
+    handle
+}
+
+fn catalog_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+    let catalog_ref = pdf.root_ref().expect("root");
+    resolved_handle(pdf, catalog_ref)
+}
+
+fn replace_catalog_key(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: ObjectHandle) {
+    let catalog = catalog_handle(pdf);
+    catalog
+        .replace_key(key, value)
+        .expect("replace catalog key");
+    pdf.mark_object_handle_dirty(&catalog)
+        .expect("mark catalog dirty");
+}
+
+fn make_indirect(pdf: &Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) -> ObjectHandle {
+    pdf.make_indirect_from_object_handle(value)
+        .expect("make canonical indirect object")
+}
+
 fn make_filespec(pdf: &mut Pdf<Cursor<Vec<u8>>>, filename: &[u8]) -> ObjectHandle {
     let embedded_file = EmbeddedFileStream::create_ef_stream(pdf, b"payload").expect("stream");
     FileSpec::create_file_spec(pdf, filename, embedded_file).expect("filespec")
 }
 
-fn embedded_names_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Dictionary {
-    let catalog_ref = pdf.root_ref().expect("root");
-    let catalog = pdf
-        .resolve_object(catalog_ref)
-        .expect("catalog")
-        .into_dict()
-        .expect("catalog dictionary");
-    match catalog.get("Names").cloned() {
-        Some(Object::Dictionary(names)) => names,
-        Some(Object::Reference(names_ref)) => pdf
-            .resolve_object(names_ref)
-            .expect("names")
-            .into_dict()
-            .expect("names dictionary"),
-        other => panic!("missing /Names dictionary: {other:?}"),
+fn embedded_names_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+    let catalog = catalog_handle(pdf);
+    let mut names = catalog.get_key(b"/Names");
+    for _ in 0..8 {
+        pdf.resolve(&names).expect("resolve /Names");
+        if names.as_dictionary().is_some() {
+            return names;
+        }
+        let Some(next_ref) = names.as_reference() else {
+            panic!("missing /Names dictionary");
+        };
+        names = pdf.get_object_handle(next_ref);
     }
+    panic!("/Names holder chain exceeded test bound");
 }
 
 // ── Test 1: single-level /Names leaf ─────────────────────────────────────────
@@ -596,16 +631,17 @@ fn writer_second_insert_mutates_existing_tree_root() {
     insert_embedded_file(&mut pdf, b"alpha.txt", ObjectRef::new(3, 0)).expect("insert alpha");
 
     let first_root = {
-        embedded_names_dict(&mut pdf)
-            .get_ref("EmbeddedFiles")
+        embedded_names_handle(&mut pdf)
+            .get_key(b"/EmbeddedFiles")
+            .object_ref()
             .expect("tree root")
     };
 
     insert_embedded_file(&mut pdf, b"beta.txt", ObjectRef::new(4, 0)).expect("insert beta");
 
-    let names = embedded_names_dict(&mut pdf);
+    let names = embedded_names_handle(&mut pdf);
     assert_eq!(
-        names.get_ref("EmbeddedFiles"),
+        names.get_key(b"/EmbeddedFiles").object_ref(),
         Some(first_root),
         "qpdf helper insertion mutates the existing root instead of rebuilding it"
     );
@@ -660,15 +696,19 @@ fn writer_delete_mutates_existing_nonempty_tree_root() {
     insert_embedded_file(&mut pdf, b"remove.txt", ObjectRef::new(4, 0)).expect("insert remove");
 
     let root_before = {
-        embedded_names_dict(&mut pdf)
-            .get_ref("EmbeddedFiles")
+        embedded_names_handle(&mut pdf)
+            .get_key(b"/EmbeddedFiles")
+            .object_ref()
             .expect("tree root")
     };
 
     assert!(delete_embedded_file(&mut pdf, b"remove.txt").expect("delete"));
 
-    let names = embedded_names_dict(&mut pdf);
-    assert_eq!(names.get_ref("EmbeddedFiles"), Some(root_before));
+    let names = embedded_names_handle(&mut pdf);
+    assert_eq!(
+        names.get_key(b"/EmbeddedFiles").object_ref(),
+        Some(root_before)
+    );
     assert_eq!(
         list_embedded_files(&mut pdf).expect("list"),
         vec![(b"keep.txt".to_vec(), ObjectRef::new(3, 0))]
@@ -710,8 +750,6 @@ fn writer_delete_last_entry_cleans_up() {
 
 #[test]
 fn writer_large_insert_produces_kids() {
-    use flpdf::Object;
-
     let mut pdf = open(build_empty_pdf());
     let count = LEAF_MAX + 5; // One chunk over the threshold.
 
@@ -734,59 +772,48 @@ fn writer_large_insert_produces_kids() {
     // ── Structural check: tree root must carry /Kids, not /Names ─────────────
     // `/Names` is direct when qpdf initializes it; `/EmbeddedFiles` is the
     // indirect root created by `QPDFNameTreeObjectHelper::newEmpty`.
-    let names_dict = embedded_names_dict(&mut pdf);
-    let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
-    let ef_root = match pdf.resolve_object(ef_root_ref).expect("resolve EF root") {
-        Object::Dictionary(d) => d,
-        other => panic!("EF root not a dict: {other:?}"),
-    };
+    let names = embedded_names_handle(&mut pdf);
+    let ef_root_ref = names
+        .get_key(b"/EmbeddedFiles")
+        .object_ref()
+        .expect("/EmbeddedFiles");
+    let ef_root = resolved_handle(&mut pdf, ef_root_ref);
 
     // The root must have /Kids (not a flat /Names leaf) because count > LEAF_MAX.
     assert!(
-        ef_root.get("Kids").is_some(),
-        "tree root with {count} entries must have /Kids, got: {ef_root:?}"
+        ef_root.get_key(b"/Kids").as_array().is_some(),
+        "tree root with {count} entries must have /Kids"
     );
     assert!(
-        ef_root.get("Names").is_none(),
+        ef_root.get_key(b"/Names").is_null(),
         "tree root with /Kids must not also have /Names"
     );
 
     // Verify /Limits on a leaf child.
-    let Object::Array(kids) = ef_root.get("Kids").cloned().unwrap() else {
-        panic!("/Kids is not an array");
-    };
-    let first_leaf_ref = match &kids[0] {
-        Object::Reference(r) => *r,
-        other => panic!("first kid not a reference: {other:?}"),
-    };
-    let first_leaf = match pdf.resolve_object(first_leaf_ref).expect("resolve leaf") {
-        Object::Dictionary(d) => d,
-        other => panic!("leaf not a dict: {other:?}"),
-    };
+    let kids = ef_root.get_key(b"/Kids").as_array().expect("/Kids array");
+    let first_leaf_ref = kids[0].object_ref().expect("first kid reference");
+    let first_leaf = resolved_handle(&mut pdf, first_leaf_ref);
     assert!(
-        first_leaf.get("Limits").is_some(),
+        first_leaf.get_key(b"/Limits").as_array().is_some(),
         "leaf node must have /Limits"
     );
     // /Limits must be a two-element array of strings.
-    let Object::Array(limits) = first_leaf.get("Limits").cloned().unwrap() else {
-        panic!("/Limits is not an array");
-    };
+    let limits = first_leaf
+        .get_key(b"/Limits")
+        .as_array()
+        .expect("/Limits array");
     assert_eq!(limits.len(), 2, "/Limits must have exactly 2 elements");
     assert!(
-        matches!(&limits[0], Object::String(_)),
+        limits[0].as_string().is_some(),
         "/Limits[0] must be a string"
     );
     assert!(
-        matches!(&limits[1], Object::String(_)),
+        limits[1].as_string().is_some(),
         "/Limits[1] must be a string"
     );
     // First limit ≤ last limit within the leaf.
-    let Object::String(first_lim) = &limits[0] else {
-        unreachable!()
-    };
-    let Object::String(last_lim) = &limits[1] else {
-        unreachable!()
-    };
+    let first_lim = limits[0].as_string().expect("first limit string");
+    let last_lim = limits[1].as_string().expect("last limit string");
     assert!(
         first_lim <= last_lim,
         "leaf /Limits[0] must be ≤ /Limits[1]"
@@ -797,8 +824,6 @@ fn writer_large_insert_produces_kids() {
 
 #[test]
 fn writer_single_insert_root_omits_limits() {
-    use flpdf::Object;
-
     let mut pdf = open(build_empty_pdf());
     let fs_ref = ObjectRef::new(3, 0);
 
@@ -813,47 +838,44 @@ fn writer_single_insert_root_omits_limits() {
     assert_eq!(entries[0].0, b"alpha.txt");
     assert_eq!(entries[0].1, fs_ref);
 
-    let names_dict = embedded_names_dict(&mut pdf);
-    let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
-    let ef_root = match pdf.resolve_object(ef_root_ref).expect("resolve EF root") {
-        Object::Dictionary(d) => d,
-        other => panic!("EF root not a dict: {other:?}"),
-    };
+    let names = embedded_names_handle(&mut pdf);
+    let ef_root_ref = names
+        .get_key(b"/EmbeddedFiles")
+        .object_ref()
+        .expect("/EmbeddedFiles");
+    let ef_root = resolved_handle(&mut pdf, ef_root_ref);
 
     // Structural conformance (ISO 32000-2 §7.9.6; qpdf): a single-node root is a
     // /Names leaf-root that omits /Limits and is not a /Kids root.
     assert!(
-        ef_root.get("Names").is_some(),
-        "single-node root is a /Names leaf-root, got: {ef_root:?}"
+        ef_root.get_key(b"/Names").as_array().is_some(),
+        "single-node root is a /Names leaf-root"
     );
     assert!(
-        ef_root.get("Limits").is_none(),
-        "root omits /Limits (ISO 32000-2 §7.9.6; qpdf), got: {ef_root:?}"
+        ef_root.get_key(b"/Limits").is_null(),
+        "root omits /Limits (ISO 32000-2 §7.9.6; qpdf)"
     );
     assert!(
-        ef_root.get("Kids").is_none(),
-        "single node is not a /Kids root, got: {ef_root:?}"
+        ef_root.get_key(b"/Kids").is_null(),
+        "single node is not a /Kids root"
     );
 
     // Substantive check: the /Names array actually names the single attachment,
     // confirming a populated single-node tree rather than an empty one.
-    let Object::Array(pairs) = ef_root.get("Names").cloned().unwrap() else {
-        panic!("/Names is not an array");
-    };
+    let pairs = ef_root.get_key(b"/Names").as_array().expect("/Names array");
     assert_eq!(
         pairs.len(),
         2,
         "single-entry leaf /Names must be one [key, value] pair"
     );
     assert!(
-        matches!(&pairs[0], Object::String(k) if k == b"alpha.txt"),
+        pairs[0].as_string().as_deref() == Some(b"alpha.txt"),
         "/Names[0] must be the attachment key, got: {:?}",
-        pairs[0]
+        pairs[0].unparse_resolved()
     );
     assert!(
-        matches!(&pairs[1], Object::Reference(r) if *r == fs_ref),
-        "/Names[1] must reference the inserted filespec, got: {:?}",
-        pairs[1]
+        pairs[1].object_ref() == Some(fs_ref),
+        "/Names[1] must reference the inserted filespec"
     );
 }
 
@@ -931,8 +953,6 @@ fn build_direct_dict_entry_pdf() -> Vec<u8> {
 
 #[test]
 fn writer_preserves_direct_dict_filespec_on_insert() {
-    use flpdf::Object;
-
     let mut pdf = open(build_direct_dict_entry_pdf());
 
     // Sanity: the public reader skips the direct-dict entry (documented).
@@ -948,36 +968,33 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
     // Walk the rebuilt tree by hand and collect the raw /Names pairs across
     // all leaves (the rebuilt root may be a single leaf or carry /Kids).
     let catalog_ref = pdf.root_ref().expect("root");
-    let catalog = match pdf.resolve_object(catalog_ref).expect("resolve catalog") {
-        Object::Dictionary(d) => d,
-        other => panic!("catalog not a dict: {other:?}"),
-    };
-    let names_ref = catalog.get_ref("Names").expect("catalog /Names");
-    let names_dict = match pdf.resolve_object(names_ref).expect("resolve /Names") {
-        Object::Dictionary(d) => d,
-        other => panic!("/Names not a dict: {other:?}"),
-    };
-    let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
+    let catalog = resolved_handle(&mut pdf, catalog_ref);
+    let names_ref = catalog
+        .get_key(b"/Names")
+        .object_ref()
+        .expect("catalog /Names");
+    let names_dict = resolved_handle(&mut pdf, names_ref);
+    let ef_root_ref = names_dict
+        .get_key(b"/EmbeddedFiles")
+        .object_ref()
+        .expect("/EmbeddedFiles");
 
     // Gather (key, value) pairs from every leaf reachable from the root.
-    let mut pairs: Vec<(Vec<u8>, Object)> = Vec::new();
+    let mut pairs: Vec<(Vec<u8>, ObjectHandle)> = Vec::new();
     let mut stack = vec![ef_root_ref];
     while let Some(node_ref) = stack.pop() {
-        let node = match pdf.resolve_object(node_ref).expect("resolve node") {
-            Object::Dictionary(d) => d,
-            other => panic!("node not a dict: {other:?}"),
-        };
-        if let Some(Object::Array(arr)) = node.get("Names").cloned() {
+        let node = resolved_handle(&mut pdf, node_ref);
+        if let Some(arr) = node.get_key(b"/Names").as_array() {
             let mut it = arr.into_iter();
             while let (Some(k), Some(v)) = (it.next(), it.next()) {
-                if let Object::String(key) = k {
+                if let Some(key) = k.as_string() {
                     pairs.push((key, v));
                 }
             }
         }
-        if let Some(Object::Array(kids)) = node.get("Kids").cloned() {
+        if let Some(kids) = node.get_key(b"/Kids").as_array() {
             for kid in kids {
-                if let Object::Reference(r) = kid {
+                if let Some(r) = kid.object_ref() {
                     stack.push(r);
                 }
             }
@@ -991,8 +1008,8 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
         .find(|(k, _)| k == b"added.txt")
         .expect("inserted key must be present");
     assert_eq!(
-        added.1,
-        Object::Reference(ObjectRef::new(5, 0)),
+        added.1.object_ref(),
+        Some(ObjectRef::new(5, 0)),
         "inserted value must be the reference passed to insert_embedded_file"
     );
 
@@ -1000,197 +1017,16 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
         .iter()
         .find(|(k, _)| k == b"direct.txt")
         .expect("pre-existing direct-dict entry must NOT be dropped on rebuild");
-    match &direct.1 {
-        Object::Dictionary(d) => {
-            assert_eq!(
-                d.get("F").cloned(),
-                Some(Object::String(b"direct.txt".to_vec())),
-                "direct-dict /Filespec must be preserved verbatim"
-            );
-        }
-        other => panic!("direct-dict value must stay a dictionary, got: {other:?}"),
-    }
-}
-
-// ── Holder-chain (double-indirect) coverage (flpdf-3x23) ─────────────────────
-//
-// `Pdf::resolve`/`resolve_borrowed` are single-hop. When the catalog `/Names`
-// value (or a `/AF` array) is reached through more than one indirect hop
-// (`ref → ref → value`), code that resolves once then type-checks drops the
-// terminal. These tests build such 2-hop chains and assert the EFFECT through
-// the public API; each is RED before the `resolve_ref_chain` fix.
-
-/// Catalog `/Names` reached through a 2-hop chain: `2 0 R → 3 0 R → names dict`.
-///
-/// Object layout:
-///   1 0 R  Catalog       (/Names 2 0 R)
-///   2 0 R  bare reference 3 0 R              (first hop)
-///   3 0 R  /Names dict    (/EmbeddedFiles 4 0 R)
-///   4 0 R  leaf node      (/Names [(alpha) 5 0 R])
-///   5 0 R  Filespec for alpha
-fn build_two_hop_names_pdf() -> Vec<u8> {
-    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
-    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
-
-    off.insert(1, out.len() as u64);
-    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 99 0 R /Names 2 0 R >>\nendobj\n");
-
-    off.insert(2, out.len() as u64);
-    out.extend_from_slice(b"2 0 obj\n3 0 R\nendobj\n");
-
-    off.insert(3, out.len() as u64);
-    out.extend_from_slice(b"3 0 obj\n<< /EmbeddedFiles 4 0 R >>\nendobj\n");
-
-    off.insert(4, out.len() as u64);
-    out.extend_from_slice(b"4 0 obj\n<< /Names [ (alpha) 5 0 R ] >>\nendobj\n");
-
-    off.insert(5, out.len() as u64);
-    out.extend_from_slice(b"5 0 obj\n<< /Type /Filespec /F (alpha.txt) >>\nendobj\n");
-
-    finish_pdf(&mut out, &off, 5, 1);
-    out
-}
-
-fn open_two_hop_names_pdf() -> Pdf<Cursor<Vec<u8>>> {
-    let mut pdf = open(build_two_hop_names_pdf());
-    pdf.set_object(
-        ObjectRef::new(2, 0),
-        Object::Reference(ObjectRef::new(3, 0)),
-    );
-    pdf
-}
-
-// ── Site 2: list_embedded_files reads through a 2-hop /Names ──────────────────
-
-#[test]
-fn list_enumerates_through_two_hop_names() {
-    let mut pdf = open_two_hop_names_pdf();
-    let entries = list_embedded_files(&mut pdf).expect("list_embedded_files");
+    let direct_dict = direct
+        .1
+        .as_dictionary()
+        .expect("direct-dict value must stay a dictionary");
     assert_eq!(
-        entries.len(),
-        1,
-        "the embedded file behind a 2-hop /Names must be enumerated"
-    );
-    assert_eq!(entries[0].0, b"alpha");
-    assert_eq!(entries[0].1, ObjectRef::new(5, 0));
-}
-
-// ── Site 5: insert via a 2-hop /Names preserves sibling keys ──────────────────
-//
-// `insert_embedded_file` collects existing entries (site 3) then rebuilds
-// (site 5). With a 2-hop /Names, a single-hop reader returns the names dict as
-// non-dict, so the rebuilt tree drops a sibling key (`/Dests`) and the pre-
-// existing attachment. Following the chain preserves both.
-
-#[test]
-fn insert_through_two_hop_names_preserves_sibling_and_existing() {
-    use flpdf::Object;
-
-    let mut pdf = open_two_hop_names_pdf();
-
-    // Add a sibling key to the terminal /Names dict (object 3) so we can detect
-    // whether the rebuild operated on the real terminal dict or a fresh one.
-    let Object::Dictionary(mut names_dict) =
-        pdf.resolve_object(ObjectRef::new(3, 0)).expect("resolve 3")
-    else {
-        panic!("object 3 must be the /Names dict");
-    };
-    names_dict.insert("Dests", Object::Reference(ObjectRef::new(99, 0)));
-    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(names_dict));
-
-    // Insert a new embedded file (reference value; object 5 already exists).
-    insert_embedded_file(&mut pdf, b"beta.txt", ObjectRef::new(5, 0)).expect("insert beta");
-
-    // Both the pre-existing attachment and the new one must be listable.
-    let entries = list_embedded_files(&mut pdf).expect("list after insert");
-    let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
-    assert!(
-        keys.contains(&b"alpha".as_ref()),
-        "pre-existing attachment behind 2-hop /Names must survive insert, got {keys:?}"
-    );
-    assert!(
-        keys.contains(&b"beta.txt".as_ref()),
-        "newly inserted attachment must be listable, got {keys:?}"
-    );
-
-    // The sibling /Dests key in the terminal names dict must be preserved: the
-    // rebuild must operate on the real terminal dict, not a fresh one.
-    let catalog = match pdf
-        .resolve_object(pdf.root_ref().expect("root"))
-        .expect("catalog")
-    {
-        Object::Dictionary(d) => d,
-        other => panic!("catalog not a dict: {other:?}"),
-    };
-    let names_ref = catalog.get_ref("Names").expect("catalog /Names");
-    // The rewritten /Names points (possibly through the chain) at the dict that
-    // now carries /EmbeddedFiles; resolve follows one hop, and the terminal
-    // must still hold /Dests.
-    let names_dict = match pdf
-        .resolve_object(names_ref)
-        .expect("resolve /Names terminal")
-    {
-        Object::Dictionary(d) => d,
-        Object::Reference(r) => match pdf.resolve_object(r).expect("resolve /Names hop2") {
-            Object::Dictionary(d) => d,
-            other => panic!("/Names hop2 not a dict: {other:?}"),
-        },
-        other => panic!("/Names not a dict/ref: {other:?}"),
-    };
-    assert!(
-        names_dict.get("Dests").is_some(),
-        "sibling /Dests key in terminal names dict must survive rebuild, got {names_dict:?}"
-    );
-}
-
-// ── Site 4: delete last entry via a 2-hop /Names reaches the rebuild ──────────
-//
-// `delete_embedded_file` collects (site 3) then rebuilds-empty (site 4). With a
-// 2-hop /Names, a single-hop collect returns empty so `delete` reports `false`
-// and never reaches the empty rebuild. Following the chain finds the entry,
-// removes it, and (with a sibling key present) updates the terminal dict.
-
-#[test]
-fn delete_last_entry_through_two_hop_names() {
-    use flpdf::Object;
-
-    let mut pdf = open_two_hop_names_pdf();
-
-    // Add a sibling /Dests key so the terminal /Names dict is non-empty after
-    // /EmbeddedFiles is dropped — exercises the non-empty set_object branch of
-    // the empty-rebuild path on the terminal ref.
-    let Object::Dictionary(mut names_dict) =
-        pdf.resolve_object(ObjectRef::new(3, 0)).expect("resolve 3")
-    else {
-        panic!("object 3 must be the /Names dict");
-    };
-    names_dict.insert("Dests", Object::Reference(ObjectRef::new(99, 0)));
-    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(names_dict));
-
-    let removed = delete_embedded_file(&mut pdf, b"alpha").expect("delete");
-    assert!(
-        removed,
-        "delete of the sole entry behind a 2-hop /Names must find and remove it"
-    );
-
-    // qpdf retains an empty /EmbeddedFiles tree while preserving /Dests.
-    let Object::Dictionary(terminal) = pdf
-        .resolve_object(ObjectRef::new(3, 0))
-        .expect("resolve terminal")
-    else {
-        panic!("object 3 must still be the terminal /Names dict");
-    };
-    assert!(terminal.get("EmbeddedFiles").is_some());
-    assert!(
-        terminal.get("Dests").is_some(),
-        "sibling /Dests key must survive the empty rebuild on the terminal dict"
-    );
-
-    // And the tree must now enumerate as empty.
-    let entries = list_embedded_files(&mut pdf).expect("list after delete");
-    assert!(
-        entries.is_empty(),
-        "tree must be empty after deleting last entry"
+        direct_dict
+            .get(b"/F".as_slice())
+            .and_then(ObjectHandle::as_string),
+        Some(b"direct.txt".to_vec()),
+        "direct-dict /Filespec must be preserved verbatim"
     );
 }
 
@@ -1240,7 +1076,7 @@ fn build_indirect_af_pdf() -> Vec<u8> {
 
 #[test]
 fn remove_attachment_preserves_indirect_af_array_and_nulls_filespec() {
-    use flpdf::{remove_attachment, Object};
+    use flpdf::remove_attachment;
 
     let mut pdf = open(build_indirect_af_pdf());
 
@@ -1249,24 +1085,19 @@ fn remove_attachment_preserves_indirect_af_array_and_nulls_filespec() {
 
     // The terminal /AF array (object 7) retains both object references, while
     // the removed Filespec object is replaced with null.
-    let Object::Array(af) = pdf
-        .resolve_object(ObjectRef::new(7, 0))
-        .expect("indirect /AF array must still resolve")
-    else {
-        panic!("object 7 must be the terminal /AF array");
-    };
+    let af = resolved_handle(&mut pdf, ObjectRef::new(7, 0))
+        .as_array()
+        .expect("indirect /AF array must still resolve");
     assert!(af
         .iter()
-        .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(4, 0))));
+        .any(|value| value.object_ref() == Some(ObjectRef::new(4, 0))));
     assert!(
         af.iter()
-            .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(5, 0))),
-        "unrelated kept ref must remain in the terminal /AF array, got {af:?}"
+            .any(|value| value.object_ref() == Some(ObjectRef::new(5, 0))),
+        "unrelated kept ref must remain in the terminal /AF array"
     );
-    assert_eq!(
-        pdf.resolve_object(ObjectRef::new(4, 0))
-            .expect("Filespec remains addressable"),
-        Object::Null,
+    assert!(
+        resolved_handle(&mut pdf, ObjectRef::new(4, 0)).is_null(),
         "qpdf replaces the removed Filespec with null"
     );
 }
@@ -1413,9 +1244,7 @@ fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
         .has_embedded_files()
         .expect("missing root"));
 
-    let mut non_dict_catalog = open(build_single_level_pdf());
-    let catalog_ref = non_dict_catalog.root_ref().expect("root");
-    non_dict_catalog.set_object(catalog_ref, Object::Integer(7));
+    let mut non_dict_catalog = open(build_non_dict_root_pdf());
     let filespec = make_filespec(&mut non_dict_catalog, b"ignored.txt");
     non_dict_catalog
         .embedded_files()
@@ -1433,17 +1262,8 @@ fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
         .expect("non-dict names"));
 
     let mut non_dict_embedded_files = open(build_no_embedded_files_pdf());
-    let catalog_ref = non_dict_embedded_files.root_ref().expect("root");
-    let mut catalog = non_dict_embedded_files
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dict")
-        .clone();
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Integer(7));
-    catalog.insert("Names", Object::Dictionary(names));
-    non_dict_embedded_files.set_object(catalog_ref, Object::Dictionary(catalog));
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", ObjectHandle::integer(7))]);
+    replace_catalog_key(&mut non_dict_embedded_files, b"/Names", names);
     assert!(!non_dict_embedded_files
         .embedded_files()
         .has_embedded_files()
@@ -1466,17 +1286,8 @@ fn helper_replace_rebuilds_non_dictionary_names_and_embedded_files_paths() {
         .is_same_object_as(&names_filespec));
 
     let mut non_dict_embedded_files = open(build_no_embedded_files_pdf());
-    let catalog_ref = non_dict_embedded_files.root_ref().expect("root");
-    let mut catalog = non_dict_embedded_files
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Integer(7));
-    catalog.insert("Names", Object::Dictionary(names));
-    non_dict_embedded_files.set_object(catalog_ref, Object::Dictionary(catalog));
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", ObjectHandle::integer(7))]);
+    replace_catalog_key(&mut non_dict_embedded_files, b"/Names", names);
 
     let embedded_filespec = make_filespec(&mut non_dict_embedded_files, b"embedded.txt");
     non_dict_embedded_files
@@ -1532,27 +1343,18 @@ fn helper_lookup_returns_none_for_missing_key_in_existing_tree() {
 fn helper_listing_rejects_a_first_non_string_name_tree_key() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"valid.txt");
-    let mut tree = Dictionary::new();
-    tree.insert(
-        "Names",
-        Object::Array(vec![
-            Object::Name(b"not-a-string".to_vec()),
-            filespec.materialize().expect("filespec materializes"),
-            Object::String(b"valid".to_vec()),
-            filespec.materialize().expect("filespec materializes"),
+    pdf.resolve(&filespec).expect("resolve filespec");
+    let tree = handle_dictionary(vec![(
+        b"/Names",
+        handle_array(vec![
+            ObjectHandle::name(b"not-a-string".to_vec()),
+            filespec.shallow_copy().expect("copy filespec"),
+            ObjectHandle::string(b"valid".to_vec()),
+            filespec.shallow_copy().expect("copy filespec"),
         ]),
-    );
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Dictionary(tree));
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    )]);
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", tree)]);
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     assert!(matches!(
         pdf.embedded_files().get_embedded_files(),
@@ -1566,29 +1368,21 @@ fn helper_listing_skips_a_later_non_string_name_tree_key() {
     let mut pdf = open(build_no_names_pdf());
     let first = make_filespec(&mut pdf, b"first.txt");
     let last = make_filespec(&mut pdf, b"last.txt");
-    let mut tree = Dictionary::new();
-    tree.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"a".to_vec()),
-            first.materialize().expect("filespec materializes"),
-            Object::Name(b"not-a-string".to_vec()),
-            Object::Null,
-            Object::String(b"c".to_vec()),
-            last.materialize().expect("filespec materializes"),
+    pdf.resolve(&first).expect("resolve first filespec");
+    pdf.resolve(&last).expect("resolve last filespec");
+    let tree = handle_dictionary(vec![(
+        b"/Names",
+        handle_array(vec![
+            ObjectHandle::string(b"a".to_vec()),
+            first.shallow_copy().expect("copy first filespec"),
+            ObjectHandle::name(b"not-a-string".to_vec()),
+            ObjectHandle::null(),
+            ObjectHandle::string(b"c".to_vec()),
+            last.shallow_copy().expect("copy last filespec"),
         ]),
-    );
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Dictionary(tree));
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    )]);
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", tree)]);
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     let entries = pdf
         .embedded_files()
@@ -1649,13 +1443,13 @@ fn helper_replace_rejects_foreign_indirect_filespec_without_mutation() {
 #[test]
 fn helper_replace_rejects_foreign_direct_filespec_without_mutation() {
     let mut source = open(build_no_names_pdf());
-    let owner_ref = ObjectRef::new(500, 0);
-    let mut filespec = Dictionary::new();
-    filespec.insert("F", Object::String(b"foreign.txt".to_vec()));
-    let mut owner_dict = Dictionary::new();
-    owner_dict.insert("FS", Object::Dictionary(filespec));
-    source.set_object(owner_ref, Object::Dictionary(owner_dict));
-    let owner = source.get_object_handle(owner_ref);
+    let owner = make_indirect(
+        &source,
+        handle_dictionary(vec![(
+            b"/FS",
+            handle_dictionary(vec![(b"/F", ObjectHandle::string(b"foreign.txt".to_vec()))]),
+        )]),
+    );
     source.resolve(&owner).expect("resolve owner");
     let foreign = owner.get_key(b"/FS");
 
@@ -1674,27 +1468,17 @@ fn helper_replace_rejects_foreign_direct_filespec_without_mutation() {
 #[test]
 fn helper_returns_a_live_direct_filespec_handle() {
     let mut pdf = open(build_no_names_pdf());
-    let mut direct_filespec = Dictionary::new();
-    direct_filespec.insert("F", Object::String(b"direct.txt".to_vec()));
-    let mut tree = Dictionary::new();
-    tree.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"direct".to_vec()),
-            Object::Dictionary(direct_filespec),
+    let direct_filespec =
+        handle_dictionary(vec![(b"/F", ObjectHandle::string(b"direct.txt".to_vec()))]);
+    let tree = handle_dictionary(vec![(
+        b"/Names",
+        handle_array(vec![
+            ObjectHandle::string(b"direct".to_vec()),
+            direct_filespec,
         ]),
-    );
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Dictionary(tree));
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    )]);
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", tree)]);
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     let handle = pdf
         .embedded_files()
@@ -1722,59 +1506,37 @@ fn helper_returns_a_live_direct_filespec_handle() {
 #[test]
 fn helper_reads_a_direct_filespec_below_indirect_kids() {
     let mut pdf = open(build_no_names_pdf());
-    let indirect_leaf_ref = ObjectRef::new(499, 0);
-    let leaf_ref = ObjectRef::new(500, 0);
-    let root_ref = ObjectRef::new(501, 0);
-    let names_ref = ObjectRef::new(502, 0);
-    let indirect_filespec_ref = ObjectRef::new(503, 0);
-
-    let mut filespec = Dictionary::new();
-    filespec.insert("F", Object::String(b"nested.txt".to_vec()));
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"earlier".to_vec()),
-            Object::Dictionary(Dictionary::new()),
-            Object::String(b"nested".to_vec()),
-            Object::Dictionary(filespec),
-        ]),
+    let indirect_filespec = make_indirect(&pdf, handle_dictionary(Vec::new()));
+    let direct_filespec =
+        handle_dictionary(vec![(b"/F", ObjectHandle::string(b"nested.txt".to_vec()))]);
+    let leaf = make_indirect(
+        &pdf,
+        handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![
+                ObjectHandle::string(b"earlier".to_vec()),
+                handle_dictionary(Vec::new()),
+                ObjectHandle::string(b"nested".to_vec()),
+                direct_filespec,
+            ]),
+        )]),
     );
-    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-    let mut first_leaf = Dictionary::new();
-    first_leaf.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"indirect".to_vec()),
-            Object::Reference(indirect_filespec_ref),
-        ]),
+    let first_leaf = make_indirect(
+        &pdf,
+        handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![
+                ObjectHandle::string(b"indirect".to_vec()),
+                indirect_filespec,
+            ]),
+        )]),
     );
-    pdf.set_object(indirect_leaf_ref, Object::Dictionary(first_leaf));
-    pdf.set_object(indirect_filespec_ref, Object::Dictionary(Dictionary::new()));
-
-    let mut root = Dictionary::new();
-    root.insert(
-        "Kids",
-        Object::Array(vec![
-            Object::Reference(indirect_leaf_ref),
-            Object::Reference(leaf_ref),
-        ]),
+    let root = make_indirect(
+        &pdf,
+        handle_dictionary(vec![(b"/Kids", handle_array(vec![first_leaf, leaf]))]),
     );
-    pdf.set_object(root_ref, Object::Dictionary(root));
-
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Reference(root_ref));
-    pdf.set_object(names_ref, Object::Dictionary(names));
-
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Reference(names_ref));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    let names = make_indirect(&pdf, handle_dictionary(vec![(b"/EmbeddedFiles", root)]));
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     let files = pdf
         .embedded_files()
@@ -1808,10 +1570,7 @@ fn helper_remove_nulls_indirect_filespec_without_attachment_gc() {
         .remove_embedded_file(b"remove")
         .expect("remove"));
 
-    assert!(pdf
-        .resolve_borrowed(filespec_ref)
-        .expect("resolved filespec")
-        .is_null());
+    assert!(resolved_handle(&mut pdf, filespec_ref).is_null());
 }
 
 #[test]
@@ -1827,27 +1586,11 @@ fn helper_remove_keeps_empty_embedded_files_tree() {
         .remove_embedded_file(b"last")
         .expect("remove"));
 
-    let catalog_ref = pdf.root_ref().expect("root");
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    let names = match catalog.get("Names").cloned() {
-        Some(Object::Dictionary(names)) => names,
-        Some(Object::Reference(names_ref)) => pdf
-            .resolve_borrowed(names_ref)
-            .expect("names")
-            .as_dict()
-            .expect("names dictionary")
-            .clone(),
-        other => panic!("qpdf retains /Names after final remove: {other:?}"),
-    };
-    assert!(matches!(
-        names.get("EmbeddedFiles"),
-        Some(Object::Reference(_))
-    ));
+    let names = embedded_names_handle(&mut pdf);
+    assert!(
+        names.get_key(b"/EmbeddedFiles").is_indirect(),
+        "qpdf retains an indirect /EmbeddedFiles root after final remove"
+    );
 }
 
 #[test]
@@ -1855,34 +1598,25 @@ fn helper_reads_repairs_direct_kid() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"kid.txt");
     let filespec_ref = filespec.object_ref().expect("indirect filespec");
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"kid".to_vec()),
-            Object::Reference(filespec_ref),
-        ]),
-    );
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![
-            Object::String(b"deep".to_vec()),
-            Object::String(b"deep".to_vec()),
-        ]),
-    );
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Dictionary(root));
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    let leaf = handle_dictionary(vec![
+        (
+            b"/Names",
+            handle_array(vec![
+                ObjectHandle::string(b"kid".to_vec()),
+                pdf.get_object_handle(filespec_ref),
+            ]),
+        ),
+        (
+            b"/Limits",
+            handle_array(vec![
+                ObjectHandle::string(b"deep".to_vec()),
+                ObjectHandle::string(b"deep".to_vec()),
+            ]),
+        ),
+    ]);
+    let root = handle_dictionary(vec![(b"/Kids", handle_array(vec![leaf]))]);
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", root)]);
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     assert_eq!(
         pdf.embedded_files()
@@ -1892,21 +1626,16 @@ fn helper_reads_repairs_direct_kid() {
         1
     );
 
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary");
-    let names = catalog
-        .get("Names")
-        .and_then(Object::as_dict)
-        .expect("direct names");
+    let names = embedded_names_handle(&mut pdf);
     let root = names
-        .get("EmbeddedFiles")
-        .and_then(Object::as_dict)
+        .get_key(b"/EmbeddedFiles")
+        .as_dictionary()
         .expect("direct root");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+    let kids = root
+        .get(b"/Kids".as_slice())
+        .and_then(ObjectHandle::as_array)
+        .expect("kids");
+    assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
 #[test]
@@ -1919,13 +1648,10 @@ fn helper_persists_direct_kid_repair_before_empty_result() {
         .expect("qpdf resolves the malformed child to a null tree node")
         .is_empty());
 
-    let names = embedded_names_dict(&mut pdf);
-    let root = names
-        .get("EmbeddedFiles")
-        .and_then(Object::as_dict)
-        .expect("direct root");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+    let names = embedded_names_handle(&mut pdf);
+    let root = names.get_key(b"/EmbeddedFiles");
+    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
 #[test]
@@ -1938,14 +1664,11 @@ fn helper_persists_direct_kid_repair_before_valid_result_after_first_entry() {
         .expect("qpdf skips the malformed second child")
         .contains_key(b"valid".as_slice()));
 
-    let names = embedded_names_dict(&mut pdf);
-    let root = names
-        .get("EmbeddedFiles")
-        .and_then(Object::as_dict)
-        .expect("direct root");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
-    assert!(matches!(kids.get(1), Some(Object::Dictionary(_))));
+    let names = embedded_names_handle(&mut pdf);
+    let root = names.get_key(b"/EmbeddedFiles");
+    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
+    assert!(kids.get(1).is_some_and(ObjectHandle::is_direct));
 }
 
 #[test]
@@ -1958,13 +1681,10 @@ fn helper_lookup_persists_direct_kid_repair_before_find_none() {
         .expect("qpdf resolves the malformed child to a null tree node")
         .is_none());
 
-    let names = embedded_names_dict(&mut pdf);
-    let root = names
-        .get("EmbeddedFiles")
-        .and_then(Object::as_dict)
-        .expect("direct root");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+    let names = embedded_names_handle(&mut pdf);
+    let root = names.get_key(b"/EmbeddedFiles");
+    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
 #[test]
@@ -1976,13 +1696,10 @@ fn helper_remove_persists_direct_kid_repair_before_find_false() {
         .remove_embedded_file(b"missing")
         .expect("qpdf resolves the malformed child to a null tree node"));
 
-    let names = embedded_names_dict(&mut pdf);
-    let root = names
-        .get("EmbeddedFiles")
-        .and_then(Object::as_dict)
-        .expect("direct root");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+    let names = embedded_names_handle(&mut pdf);
+    let root = names.get_key(b"/EmbeddedFiles");
+    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
 #[test]
@@ -1994,13 +1711,9 @@ fn helper_remove_persists_indirect_root_repair_before_find_false() {
         .remove_embedded_file(b"missing")
         .expect("qpdf resolves the malformed child to a null tree node"));
 
-    let root = pdf
-        .resolve_object(ObjectRef::new(3, 0))
-        .expect("root")
-        .into_dict()
-        .expect("root dictionary");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+    let root = resolved_handle(&mut pdf, ObjectRef::new(3, 0));
+    let kids = root.get_key(b"/Kids").as_array().expect("kids");
+    assert!(kids.first().is_some_and(ObjectHandle::is_indirect));
 }
 
 #[test]
@@ -2008,57 +1721,38 @@ fn helper_remove_missing_persists_direct_kid_repair() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"kid.txt");
     let filespec_ref = filespec.object_ref().expect("indirect filespec");
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"kid".to_vec()),
-            Object::Reference(filespec_ref),
-        ]),
-    );
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![
-            Object::String(b"kid".to_vec()),
-            Object::String(b"kid".to_vec()),
-        ]),
-    );
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Dictionary(root));
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    let leaf = handle_dictionary(vec![
+        (
+            b"/Names",
+            handle_array(vec![
+                ObjectHandle::string(b"kid".to_vec()),
+                pdf.get_object_handle(filespec_ref),
+            ]),
+        ),
+        (
+            b"/Limits",
+            handle_array(vec![
+                ObjectHandle::string(b"kid".to_vec()),
+                ObjectHandle::string(b"kid".to_vec()),
+            ]),
+        ),
+    ]);
+    let root = handle_dictionary(vec![(b"/Kids", handle_array(vec![leaf]))]);
+    let names = handle_dictionary(vec![(b"/EmbeddedFiles", root)]);
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     assert!(!pdf
         .embedded_files()
         .remove_embedded_file(b"missing")
         .expect("absent remove"));
 
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary");
-    let root = catalog
-        .get("Names")
-        .and_then(Object::as_dict)
-        .and_then(|names| names.get("EmbeddedFiles"))
-        .and_then(Object::as_dict)
-        .expect("direct root");
-    assert!(matches!(
-        root.get("Kids")
-            .and_then(Object::as_array)
-            .and_then(|kids| kids.first()),
-        Some(Object::Reference(_))
-    ));
+    let names = embedded_names_handle(&mut pdf);
+    let root = names.get_key(b"/EmbeddedFiles");
+    assert!(root
+        .get_key(b"/Kids")
+        .as_array()
+        .and_then(|kids| kids.first().cloned())
+        .is_some_and(|kid| kid.is_indirect()));
 }
 
 #[test]
@@ -2066,51 +1760,37 @@ fn helper_remove_accepts_a_tree_deeper_than_legacy_limit() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"deep.txt");
     let filespec_ref = filespec.object_ref().expect("indirect filespec");
-    let leaf_ref = ObjectRef::new(10_000, 0);
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"deep".to_vec()),
-            Object::Reference(filespec_ref),
-        ]),
+    let filespec_handle = pdf.get_object_handle(filespec_ref);
+    let leaf = make_indirect(
+        &pdf,
+        handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![
+                ObjectHandle::string(b"deep".to_vec()),
+                filespec_handle,
+            ]),
+        )]),
     );
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![
-            Object::String(b"deep".to_vec()),
-            Object::String(b"deep".to_vec()),
-        ]),
-    );
-    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
 
-    let mut child = leaf_ref;
-    for number in (10_001..=10_101).rev() {
-        let mut node = Dictionary::new();
-        node.insert("Kids", Object::Array(vec![Object::Reference(child)]));
-        node.insert(
-            "Limits",
-            Object::Array(vec![
-                Object::String(b"deep".to_vec()),
-                Object::String(b"deep".to_vec()),
+    let mut child = leaf;
+    for _ in 0..101 {
+        child = make_indirect(
+            &pdf,
+            handle_dictionary(vec![
+                (b"/Kids", handle_array(vec![child])),
+                (
+                    b"/Limits",
+                    handle_array(vec![
+                        ObjectHandle::string(b"deep".to_vec()),
+                        ObjectHandle::string(b"deep".to_vec()),
+                    ]),
+                ),
             ]),
         );
-        let node_ref = ObjectRef::new(number, 0);
-        pdf.set_object(node_ref, Object::Dictionary(node));
-        child = node_ref;
     }
 
-    let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles", Object::Reference(child));
-    let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    let names = make_indirect(&pdf, handle_dictionary(vec![(b"/EmbeddedFiles", child)]));
+    replace_catalog_key(&mut pdf, b"/Names", names);
 
     assert!(pdf
         .embedded_files()
@@ -2139,11 +1819,11 @@ fn helper_remove_returns_false_for_absent_tree_and_key() {
 #[test]
 fn helper_remove_direct_filespec_does_not_null_an_indirect_object() {
     let mut pdf = open(build_no_names_pdf());
-    let sentinel = ObjectRef::new(500, 0);
-    pdf.set_object(sentinel, Object::Integer(7));
+    let sentinel_handle = make_indirect(&pdf, ObjectHandle::integer(7));
+    let sentinel = sentinel_handle.object_ref().expect("sentinel ref");
     let direct = ObjectHandle::dictionary(vec![
-        (b"Type".to_vec(), ObjectHandle::name(b"Filespec".to_vec())),
-        (b"F".to_vec(), ObjectHandle::string(b"direct.txt".to_vec())),
+        (b"/Type".to_vec(), ObjectHandle::name(b"Filespec".to_vec())),
+        (b"/F".to_vec(), ObjectHandle::string(b"direct.txt".to_vec())),
     ]);
 
     pdf.embedded_files()
@@ -2154,10 +1834,7 @@ fn helper_remove_direct_filespec_does_not_null_an_indirect_object() {
         .remove_embedded_file(b"direct")
         .expect("remove direct"));
 
-    assert_eq!(
-        pdf.resolve_borrowed(sentinel).expect("sentinel"),
-        &Object::Integer(7)
-    );
+    assert_eq!(resolved_handle(&mut pdf, sentinel).as_integer(), Some(7));
     assert!(pdf
         .embedded_files()
         .get_embedded_files()

@@ -1,64 +1,54 @@
-//! Route contract for the direct name-tree fixture slice.
+//! Route contract for the file-level embedded-files test cutover.
 
-const SELECTED_TESTS: &[&str] = &[
-    "insert_does_not_allocate_for_direct_names_dictionary",
-    "inserting_into_direct_embedded_files_root_preserves_it",
-    "helper_replace_keeps_direct_names_dictionary_direct",
-];
-
-fn selected_function(source: &str, name: &str) -> String {
-    let start = source
-        .find(&format!("fn {name}"))
-        .unwrap_or_else(|| panic!("selected test must exist: {name}"));
-    let rest = &source[start..];
-    let end = [
-        rest.find("\n#[test]"),
-        rest.find("\nfn "),
-        rest.find("\n///"),
-    ]
-    .into_iter()
-    .flatten()
-    .min()
-    .unwrap_or(rest.len());
-    rest[..end].to_owned()
+fn test_module(source: &str) -> &str {
+    source
+        .split_once("#[cfg(test)]")
+        .map(|(_, tests)| tests)
+        .unwrap_or_else(|| panic!("embedded_files.rs must keep its test module"))
 }
 
 #[test]
-fn selected_embedded_files_tests_use_only_canonical_fixture_routes() {
+fn embedded_files_tests_use_only_canonical_fixture_routes() {
     let source = include_str!("embedded_files_tests.rs");
-
-    for name in SELECTED_TESTS {
-        let function = selected_function(source, name);
-        for forbidden in [
-            "resolve_object(",
-            "resolve_borrowed(",
-            "resolve_to_terminal(",
-            "resolve_chain(",
-            "materialize(",
-            ".set_object(",
-        ] {
-            assert!(
-                !function.contains(forbidden),
-                "selected test {name} retains legacy fixture route {forbidden:?}"
-            );
-        }
+    for forbidden in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "resolve_to_terminal(",
+        "resolve_chain(",
+        "materialize(",
+        "set_object(",
+        "Object::",
+        "Dictionary::",
+    ] {
         assert!(
-            function.contains("ObjectHandle"),
-            "selected test {name} must use typed handles"
+            !source.contains(forbidden),
+            "embedded_files_tests.rs retains legacy fixture route {forbidden:?}"
         );
     }
+    assert!(source.contains("ObjectHandle"));
+    assert!(source.contains("pdf.resolve("));
+    assert!(source.contains("replace_key"));
+}
 
-    let selected = SELECTED_TESTS
-        .iter()
-        .map(|name| selected_function(source, name))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        selected.contains("Pdf::resolve") || selected.contains("pdf.resolve("),
-        "selected tests must resolve live canonical handles"
-    );
-    assert!(
-        selected.contains("replace_key"),
-        "selected tests must mutate Catalog values through handle APIs"
-    );
+#[test]
+fn embedded_files_module_tests_use_only_canonical_fixture_routes() {
+    let source = include_str!("../src/embedded_files.rs");
+    let tests = test_module(source);
+    for forbidden in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "resolve_to_terminal(",
+        "resolve_chain(",
+        "materialize(",
+        "set_object(",
+        "Object::",
+        "Dictionary::",
+    ] {
+        assert!(
+            !tests.contains(forbidden),
+            "embedded_files.rs test module retains legacy fixture route {forbidden:?}"
+        );
+    }
+    assert!(tests.contains("ObjectHandle"));
+    assert!(tests.contains("pdf.resolve("));
 }
