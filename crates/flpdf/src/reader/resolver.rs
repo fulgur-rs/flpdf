@@ -6889,13 +6889,13 @@ mod tests {
             },
         )
         .expect("re-open of V=4 output with user-pw");
-        let info_ref = match rt.trailer_dictionary().get("Info") {
-            Some(crate::Object::Reference(object_ref)) => *object_ref,
-            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
-        };
+        let info_ref = rt
+            .trailer_dictionary()
+            .get_ref("Info")
+            .expect("trailer /Info must be a reference");
 
-        let info = rt.get_object_handle(info_ref);
-        info.try_dereference()
+        let info: ObjectHandle = rt.get_object_handle(info_ref);
+        rt.resolve(&info)
             .expect("canonical resolver must resolve /Info");
         let values = info.as_dictionary().expect("/Info must be a dictionary");
         assert_eq!(
@@ -7068,9 +7068,8 @@ mod tests {
             )
             .expect("open encrypted stream fixture");
             let object_ref = ObjectRef::new(3, 0);
-            let stream = pdf.get_object_handle(object_ref);
-            stream
-                .try_dereference()
+            let stream: ObjectHandle = pdf.get_object_handle(object_ref);
+            pdf.resolve(&stream)
                 .expect("resolve encrypted stream handle");
             let offset = stream.get_parsed_offset();
             let dict = stream.as_stream_dict().expect("stream dictionary");
@@ -7109,12 +7108,12 @@ mod tests {
             },
         )
         .expect("open encrypted fixture");
-        let info_ref = match pdf.trailer_dictionary().get("Info") {
-            Some(crate::Object::Reference(object_ref)) => *object_ref,
-            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
-        };
-        let info = pdf.get_object_handle(info_ref);
-        info.try_dereference()
+        let info_ref = pdf
+            .trailer_dictionary()
+            .get_ref("Info")
+            .expect("trailer /Info must be a reference");
+        let info: ObjectHandle = pdf.get_object_handle(info_ref);
+        pdf.resolve(&info)
             .expect("canonical resolver must resolve /Info");
         (
             info_ref,
@@ -7297,12 +7296,12 @@ mod tests {
             .expect("encryption parameters")
             .cf_string = crate::encryption::state::EncryptionMode::Unknown;
 
-        let info_ref = match pdf.trailer_dictionary().get("Info") {
-            Some(crate::Object::Reference(object_ref)) => *object_ref,
-            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
-        };
-        let info = pdf.get_object_handle(info_ref);
-        info.try_dereference()
+        let info_ref = pdf
+            .trailer_dictionary()
+            .get_ref("Info")
+            .expect("trailer /Info must be a reference");
+        let info: ObjectHandle = pdf.get_object_handle(info_ref);
+        pdf.resolve(&info)
             .expect("canonical resolver must decrypt with qpdf's AES fallback");
         assert_eq!(
             info.as_dictionary()
@@ -7350,8 +7349,9 @@ mod tests {
         pdf.set_logger(logger);
         let info_ref = pdf.trailer_dictionary().get_ref("Info").unwrap();
 
+        let info: ObjectHandle = pdf.get_object_handle(info_ref);
         assert!(matches!(
-            pdf.get_object_handle(info_ref).try_dereference(),
+            pdf.resolve(&info),
             Err(Error::System(ref message)) if message == "sink write failure 1"
         ));
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -7482,7 +7482,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        handle.try_dereference().expect(
+        pdf.resolve(&handle).expect(
             "an attached resolver resolves an uncompressed object; \
              `belongs to a dropped PDF` here would instead mean `get_object_handle` \
              vended a handle whose `Weak` could not be upgraded, i.e. no resolver \
@@ -7600,14 +7600,14 @@ mod tests {
     fn a_reference_already_being_resolved_takes_the_loop_branch_and_leaves_the_outer_mark() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
         handle.set_parsed_offset_if_unset(100);
 
-        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref)
+        let resolver = Rc::clone(&pdf.resolver);
+        let outer = ResolveMark::begin(&resolver.core, object_ref)
             .expect("the first mark for a reference must be recorded, not reported as a loop");
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("a resolution loop is qpdf's null outcome, not an error");
 
         assert!(handle.is_null(), "a detected loop resolves to null");
@@ -7653,10 +7653,9 @@ mod tests {
                 index: 0,
             },
         );
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf catches the stream-shape error and resolves the member to null");
         assert!(handle.is_null());
         assert!(pdf
@@ -7678,16 +7677,6 @@ mod tests {
     #[test]
     fn a_malformed_compressed_class_resolves_to_null_without_the_legacy_route() {
         let object_ref = ObjectRef::new(1, 0);
-        // A separate document, so establishing the baseline cannot resolve the
-        // handle under test: `resolve_borrowed` writes through to the very slot
-        // `try_dereference` would then short-circuit on.
-        assert!(
-            Pdf::open_mem_owned(minimal_pdf_bytes())
-                .expect("open")
-                .resolve_borrowed(object_ref)
-                .is_ok(),
-            "the raw compatibility route can read this object, so canonical resolution must not call it"
-        );
 
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         pdf.resolver.insert_xref_entry(
@@ -7697,10 +7686,9 @@ mod tests {
                 index: 0,
             },
         );
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
-        handle
-            .try_dereference()
+        pdf.resolve(&handle)
             .expect("qpdf resolves a malformed compressed object to null");
         assert!(handle.is_null());
         assert!(pdf
@@ -9040,14 +9028,15 @@ mod tests {
     fn a_detected_loop_warns_with_qpdfs_message_text() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
         assert!(
             pdf.repair_diagnostics().entries().is_empty(),
             "this fixture opens without warnings, so the loop is the only source"
         );
 
-        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
-        handle.try_dereference().expect("a loop is not an error");
+        let resolver = Rc::clone(&pdf.resolver);
+        let outer = ResolveMark::begin(&resolver.core, object_ref).expect("first mark");
+        pdf.resolve(&handle).expect("a loop is not an error");
         drop(outer);
 
         let diagnostics = pdf.repair_diagnostics();
@@ -9074,16 +9063,17 @@ mod tests {
     fn loop_warning_sink_failure_propagates_after_collection() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).unwrap();
         let object_ref = ObjectRef::new(1, 0);
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
         let logger = crate::QPDFLogger::create();
         logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
             crate::pipeline::test_support::NthWriteFailure::new(1),
         )));
         pdf.set_logger(logger);
 
-        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).unwrap();
+        let resolver = Rc::clone(&pdf.resolver);
+        let outer = ResolveMark::begin(&resolver.core, object_ref).unwrap();
         assert!(matches!(
-            handle.try_dereference(),
+            pdf.resolve(&handle),
             Err(Error::System(ref message)) if message == "sink write failure 1"
         ));
         drop(outer);
@@ -9101,11 +9091,12 @@ mod tests {
     fn resolver_warnings_and_document_warnings_share_one_ordered_collection() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
-        let handle = pdf.get_object_handle(object_ref);
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
 
         pdf.push_warning("before the loop").unwrap();
-        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
-        handle.try_dereference().expect("a loop is not an error");
+        let resolver = Rc::clone(&pdf.resolver);
+        let outer = ResolveMark::begin(&resolver.core, object_ref).expect("first mark");
+        pdf.resolve(&handle).expect("a loop is not an error");
         drop(outer);
         pdf.push_warning("after the loop").unwrap();
 
@@ -11572,10 +11563,9 @@ mod tests {
                     )
                     .expect("open strict fixture"),
                 );
-                let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+                let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-                handle
-                    .try_dereference()
+                pdf.resolve(&handle)
                     .expect("qpdf catches the unusable chained /Length");
                 assert!(handle.is_null());
                 assert!(pdf
@@ -11771,8 +11761,8 @@ mod tests {
 
         assert!(!pdf.reconstructed_xref());
 
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        handle.try_dereference().expect("resolved after recovery");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle).expect("resolved after recovery");
         assert_eq!(
             handle.unparse_resolved(),
             b"(recovered)",
@@ -11865,8 +11855,8 @@ mod tests {
         );
         replace(&mut pdf, replacement_ref, 71);
 
-        pdf.get_object_handle(ObjectRef::new(1, 0))
-            .try_dereference()
+        let recovery_trigger: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&recovery_trigger)
             .expect("damaged header must trigger xref reconstruction");
 
         assert!(pdf.reconstructed_xref());
@@ -11890,18 +11880,16 @@ mod tests {
             );
         }
 
-        let recovered_source = pdf.get_object_handle(source_ref);
-        recovered_source
-            .try_dereference()
+        let recovered_source: ObjectHandle = pdf.get_object_handle(source_ref);
+        pdf.resolve(&recovered_source)
             .expect("same-generation replacement must keep a canonical handle");
         assert_eq!(
             recovered_source.as_integer(),
             Some(70),
             "qpdf keeps the same-generation replacement cached across recovery"
         );
-        let replacement = pdf.get_object_handle(replacement_ref);
-        replacement
-            .try_dereference()
+        let replacement: ObjectHandle = pdf.get_object_handle(replacement_ref);
+        pdf.resolve(&replacement)
             .expect("different-generation replacement must stay initialized");
         assert_eq!(replacement.as_integer(), Some(71));
         assert!(pdf.resolver.registered_handle(source_ref).is_some());
@@ -12503,9 +12491,8 @@ mod tests {
             reader.get_mut().truncate(prefix.len() - 1);
         });
 
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        handle
-            .try_dereference()
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&handle)
             .expect("qpdf catches the reconstruction parse error");
         assert!(handle.is_null());
         assert!(pdf
