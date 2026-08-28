@@ -3089,6 +3089,11 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
             resources.object_ref().is_some() && resources.as_dictionary().is_some(),
             "qpdf promotes direct inherited /Resources to an indirect handle"
         );
+        assert_eq!(
+            resources.unparse_resolved(),
+            b"<< /Font << /F1 << >> >> >>",
+            "qpdf must preserve the complete inherited /Resources dictionary"
+        );
         let font = resources.get_key(b"/Font");
         pdf.resolve(&font).unwrap();
         let f1 = font.get_key(b"/F1");
@@ -3098,6 +3103,10 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
 
         let media_box = page.get_key(b"/MediaBox");
         pdf.resolve(&media_box).unwrap();
+        assert!(
+            media_box.object_ref().is_some(),
+            "qpdf promotes direct inherited /MediaBox to an indirect handle"
+        );
         let media_values = media_box
             .as_array()
             .unwrap()
@@ -3108,6 +3117,10 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
 
         let crop_box = page.get_key(b"/CropBox");
         pdf.resolve(&crop_box).unwrap();
+        assert!(
+            crop_box.object_ref().is_some(),
+            "qpdf promotes direct inherited /CropBox to an indirect handle"
+        );
         let crop_values = crop_box
             .as_array()
             .unwrap()
