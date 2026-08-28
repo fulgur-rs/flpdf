@@ -590,7 +590,6 @@ mod tests {
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
     use crate::writer::write_qpdf_to_memory;
-    use crate::Object;
     use crate::Pdf;
     use std::io::Cursor;
     use std::process::Command;
@@ -738,6 +737,58 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
     }
 
+    fn resolved_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).expect("resolve object");
+        handle
+    }
+
+    fn resolved_key(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object: &ObjectHandle,
+        key: &[u8],
+    ) -> ObjectHandle {
+        let value = object.get_key(key);
+        pdf.resolve(&value).expect("resolve dictionary child");
+        value
+    }
+
+    fn integer_array(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) -> Vec<i64> {
+        resolved_handle_value(pdf, value)
+            .as_array()
+            .expect("array")
+            .into_iter()
+            .map(|item| {
+                resolved_handle_value(pdf, item)
+                    .as_integer()
+                    .expect("integer array item")
+            })
+            .collect()
+    }
+
+    fn resolved_handle_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: ObjectHandle) -> ObjectHandle {
+        pdf.resolve(&value).expect("resolve handle");
+        value
+    }
+
+    fn integer_array_key(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object: &ObjectHandle,
+        key: &[u8],
+    ) -> Vec<i64> {
+        let value = resolved_key(pdf, object, key);
+        integer_array(pdf, value)
+    }
+
+    fn handle_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+        resolved_handle(pdf, object_ref)
+    }
+
+    fn set_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, value: ObjectHandle) {
+        pdf.set_object_handle(object_ref, value)
+            .expect("set canonical object handle");
+    }
+
     #[test]
     fn rebuild_marks_qpdf_get_all_pages_observation() {
         let mut pdf = open(build_nested_pdf());
@@ -813,13 +864,6 @@ mod tests {
         );
     }
 
-    fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
-        match pdf.resolve_borrowed(r).unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            other => panic!("{r} is not a dictionary: {other:?}"),
-        }
-    }
-
     #[test]
     fn empty_selection_is_error() {
         let mut pdf = open(build_nested_pdf());
@@ -851,45 +895,58 @@ mod tests {
             vec![ObjectRef::new(6, 0), ObjectRef::new(4, 0)]
         );
 
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
-        let Some(Object::Array(kids)) = root.get("Kids") else {
-            panic!("root /Kids missing or wrong type");
-        };
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
         assert_eq!(
-            kids,
-            &vec![
-                Object::Reference(ObjectRef::new(6, 0)),
-                Object::Reference(ObjectRef::new(4, 0)),
-            ]
+            resolved_key(&mut pdf, &root, b"/Count").as_integer(),
+            Some(2)
+        );
+        let kids = resolved_key(&mut pdf, &root, b"/Kids")
+            .as_array()
+            .expect("root /Kids array");
+        assert_eq!(
+            kids.into_iter()
+                .map(|kid| kid.object_ref().expect("/Kids indirect page"))
+                .collect::<Vec<_>>(),
+            vec![ObjectRef::new(6, 0), ObjectRef::new(4, 0)]
         );
     }
 
     #[test]
     fn direct_catalog_root_stays_direct_after_rebuild_and_round_trips() {
         let mut pdf = open(build_nested_pdf());
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap()
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: build_nested_pdf fixes object 1 as the catalog dictionary
-        };
-        catalog.insert("Pages", Object::Dictionary(root));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        let direct_root = root
+            .shallow_copy()
+            .expect("/Pages dictionary should be shallow-copyable");
+        let catalog = handle_of(&mut pdf, ObjectRef::new(1, 0));
+        assert!(
+            catalog.as_dictionary().is_some(),
+            "catalog must be a dictionary"
+        );
+        catalog
+            .replace_key(b"/Pages", direct_root)
+            .expect("catalog /Pages replacement");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("catalog mutation must be dirty");
 
         let result =
             rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(4, 0)]).unwrap();
         assert_eq!(result.new_kids.len(), 2);
 
-        let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("catalog must remain a dictionary"); // cov:ignore: only this test writes object 1 as a catalog dictionary
-        };
-        let Some(Object::Dictionary(root)) = catalog.get("Pages") else {
-            panic!("catalog /Pages must remain direct"); // cov:ignore: direct-root preservation is asserted by the successful rebuild above
-        };
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        let catalog = handle_of(&mut pdf, ObjectRef::new(1, 0));
+        let root = resolved_key(&mut pdf, &catalog, b"/Pages");
+        assert!(root.is_direct(), "catalog /Pages must remain direct");
+        assert_eq!(
+            resolved_key(&mut pdf, &root, b"/Count").as_integer(),
+            Some(2)
+        );
         for page_ref in result.new_kids {
-            let page = dict_of(&mut pdf, page_ref);
-            assert_eq!(page.get("Parent"), Some(&Object::Dictionary(root.clone())));
+            let page = handle_of(&mut pdf, page_ref);
+            let parent = resolved_key(&mut pdf, &page, b"/Parent");
+            assert!(
+                parent.is_same_object_as(&root),
+                "page /Parent must retain the direct root identity"
+            );
         }
 
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
@@ -914,9 +971,9 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)])
             .expect("flat page rebuild must succeed");
 
-        let page = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        let page = handle_of(&mut pdf, ObjectRef::new(3, 0));
         assert!(
-            page.get("Rotate").is_none(),
+            !page.has_key(b"/Rotate"),
             "qpdf leaves an absent inherited /Rotate absent"
         );
     }
@@ -975,52 +1032,66 @@ mod tests {
     #[test]
     fn rebuilt_root_drops_qpdf_inheritable_attributes_after_materializing_pages() {
         let mut pdf = open(build_nested_pdf());
-        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        root.insert(
-            "MediaBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(612),
-                Object::Integer(792),
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        root.replace_key(
+            b"/MediaBox",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(612),
+                ObjectHandle::integer(792),
             ]),
-        );
-        root.insert(
-            "CropBox",
-            Object::Array(vec![
-                Object::Integer(10),
-                Object::Integer(20),
-                Object::Integer(500),
-                Object::Integer(700),
+        )
+        .unwrap();
+        root.replace_key(
+            b"/CropBox",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(10),
+                ObjectHandle::integer(20),
+                ObjectHandle::integer(500),
+                ObjectHandle::integer(700),
             ]),
-        );
-        root.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
-        root.insert("Rotate", Object::Integer(180));
-        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+        )
+        .unwrap();
+        root.replace_key(b"/Resources", ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        root.replace_key(b"/Rotate", ObjectHandle::integer(180))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
 
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(6, 0)])
             .expect("flat page rebuild must succeed");
 
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        for key in ["MediaBox", "CropBox", "Resources", "Rotate"] {
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        for key in [
+            b"/MediaBox".as_slice(),
+            b"/CropBox".as_slice(),
+            b"/Resources".as_slice(),
+            b"/Rotate".as_slice(),
+        ] {
             assert!(
-                root.get(key).is_none(),
-                "rebuilt /Pages root must not retain inheritable /{key}: {root:?}"
+                !root.has_key(key),
+                "rebuilt /Pages root must not retain inheritable {key:?}"
             );
         }
 
-        let intermediate = dict_of(&mut pdf, ObjectRef::new(3, 0));
-        for key in ["MediaBox", "CropBox", "Resources", "Rotate"] {
+        let intermediate = handle_of(&mut pdf, ObjectRef::new(3, 0));
+        for key in [
+            b"/MediaBox".as_slice(),
+            b"/CropBox".as_slice(),
+            b"/Resources".as_slice(),
+            b"/Rotate".as_slice(),
+        ] {
             assert!(
-                intermediate.get(key).is_none(),
-                "orphaned intermediate /Pages must not retain inheritable /{key}: {intermediate:?}"
+                !intermediate.has_key(key),
+                "orphaned intermediate /Pages must not retain inheritable {key:?}"
             );
         }
 
-        let page = dict_of(&mut pdf, ObjectRef::new(6, 0));
+        let page = handle_of(&mut pdf, ObjectRef::new(6, 0));
         assert_eq!(
-            page.get("CropBox"),
-            Some(&Object::Reference(ObjectRef::new(10, 0))),
+            resolved_key(&mut pdf, &page, b"/CropBox").object_ref(),
+            Some(ObjectRef::new(10, 0)),
             "the selected page must retain the root-inherited /CropBox handle"
         );
     }
@@ -1055,13 +1126,16 @@ mod tests {
     fn rebuild_warns_for_unknown_keys_only_on_flattened_pages_nodes() {
         let mut pdf = open(build_nested_pdf());
 
-        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        root.insert("UserUnit", Object::Integer(1));
-        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        root.replace_key(b"/UserUnit", ObjectHandle::integer(1))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
 
-        let mut intermediate = dict_of(&mut pdf, ObjectRef::new(3, 0));
-        intermediate.insert("UserUnit", Object::Integer(2));
-        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(intermediate));
+        let intermediate = handle_of(&mut pdf, ObjectRef::new(3, 0));
+        intermediate
+            .replace_key(b"/UserUnit", ObjectHandle::integer(2))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&intermediate).unwrap();
 
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)])
             .expect("page-tree rebuild must preserve qpdf warning behavior");
@@ -1079,17 +1153,22 @@ mod tests {
             "only the flattened intermediate /Pages node should warn"
         );
 
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("UserUnit"), Some(&Object::Integer(1)));
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(
+            resolved_key(&mut pdf, &root, b"/UserUnit").as_integer(),
+            Some(1)
+        );
     }
 
     #[test]
     fn rebuild_propagates_unknown_pages_warning_sink_failure() {
         let mut pdf = open(build_nested_pdf());
 
-        let mut intermediate = dict_of(&mut pdf, ObjectRef::new(3, 0));
-        intermediate.insert("UserUnit", Object::Integer(2));
-        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(intermediate));
+        let intermediate = handle_of(&mut pdf, ObjectRef::new(3, 0));
+        intermediate
+            .replace_key(b"/UserUnit", ObjectHandle::integer(2))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&intermediate).unwrap();
 
         let logger = crate::QPDFLogger::create();
         logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
@@ -1112,34 +1191,27 @@ mod tests {
         let mut pdf = open(build_nested_pdf());
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)]).unwrap();
 
-        let leaf = dict_of(&mut pdf, ObjectRef::new(4, 0));
-        assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
-        let Some(Object::Reference(media_box_ref)) = leaf.get("MediaBox") else {
-            // cov:ignore-start: fixture-shape guard
-            panic!("expected promoted inherited /MediaBox reference, got {leaf:?}");
-            // cov:ignore-end
-        };
+        let leaf = handle_of(&mut pdf, ObjectRef::new(4, 0));
         assert_eq!(
-            pdf.resolve_object(*media_box_ref).unwrap(),
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(200),
-                Object::Integer(300),
-            ])
+            resolved_key(&mut pdf, &leaf, b"/Rotate").as_integer(),
+            Some(90)
         );
+        let media_box = resolved_key(&mut pdf, &leaf, b"/MediaBox");
+        assert!(
+            media_box.is_indirect(),
+            "expected promoted inherited /MediaBox reference"
+        );
+        assert_eq!(integer_array(&mut pdf, media_box), vec![0, 0, 200, 300]);
         // /Resources inherited via indirect ref 9 0 R retains that live
         // indirect handle, rather than materializing a dictionary clone.
-        match leaf.get("Resources") {
-            Some(Object::Reference(resources_ref)) => {
-                assert_eq!(*resources_ref, ObjectRef::new(9, 0));
-            }
-            other => panic!("expected inherited /Resources reference, got {other:?}"), // cov:ignore: fixture-shape guard
-        }
+        assert_eq!(
+            resolved_key(&mut pdf, &leaf, b"/Resources").object_ref(),
+            Some(ObjectRef::new(9, 0))
+        );
         // Reparented to root.
         assert_eq!(
-            leaf.get("Parent"),
-            Some(&Object::Reference(ObjectRef::new(2, 0)))
+            resolved_key(&mut pdf, &leaf, b"/Parent").object_ref(),
+            Some(ObjectRef::new(2, 0))
         );
     }
 
@@ -1150,18 +1222,16 @@ mod tests {
         let mut pdf = open(build_nested_pdf());
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(5, 0)]).unwrap();
 
-        let leaf = dict_of(&mut pdf, ObjectRef::new(5, 0));
+        let leaf = handle_of(&mut pdf, ObjectRef::new(5, 0));
         assert_eq!(
-            leaf.get("MediaBox"),
-            Some(&Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(400),
-                Object::Integer(500),
-            ])),
+            integer_array_key(&mut pdf, &leaf, b"/MediaBox"),
+            vec![0, 0, 400, 500],
             "own /MediaBox must win over inherited [0 0 200 300]"
         );
-        assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(
+            resolved_key(&mut pdf, &leaf, b"/Rotate").as_integer(),
+            Some(90)
+        );
     }
 
     #[test]
@@ -1183,19 +1253,28 @@ mod tests {
             Some(&vec![ObjectRef::new(4, 0), clone_ref])
         );
 
-        let original = dict_of(&mut pdf, ObjectRef::new(4, 0));
-        let clone = dict_of(&mut pdf, clone_ref);
+        let original = handle_of(&mut pdf, ObjectRef::new(4, 0));
+        let clone = handle_of(&mut pdf, clone_ref);
         // Distinct objects but identical materialized content; /Contents
         // stream object is shared (same indirect ref), not duplicated.
-        assert_eq!(original.get("Contents"), clone.get("Contents"));
         assert_eq!(
-            original.get("Contents"),
-            Some(&Object::Reference(ObjectRef::new(7, 0)))
+            resolved_key(&mut pdf, &original, b"/Contents").object_ref(),
+            resolved_key(&mut pdf, &clone, b"/Contents").object_ref()
         );
-        assert_eq!(clone.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(
+            resolved_key(&mut pdf, &original, b"/Contents").object_ref(),
+            Some(ObjectRef::new(7, 0))
+        );
+        assert_eq!(
+            resolved_key(&mut pdf, &clone, b"/Rotate").as_integer(),
+            Some(90)
+        );
 
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(
+            resolved_key(&mut pdf, &root, b"/Count").as_integer(),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1217,13 +1296,15 @@ mod tests {
             vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]
         );
 
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        let kids = resolved_key(&mut pdf, &root, b"/Kids")
+            .as_array()
+            .expect("rebuilt /Kids array");
         assert_eq!(
-            root.get("Kids"),
-            Some(&Object::Array(vec![
-                Object::Reference(ObjectRef::new(3, 0)),
-                Object::Reference(ObjectRef::new(4, 0)),
-            ]))
+            kids.into_iter()
+                .map(|kid| kid.object_ref().expect("/Kids page reference"))
+                .collect::<Vec<_>>(),
+            vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]
         );
     }
 
@@ -1241,9 +1322,12 @@ mod tests {
 
         // Each leaf must carry the materialized inherited attrs after reopen.
         for page_ref in refs {
-            let leaf = dict_of(&mut pdf2, page_ref);
-            assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
-            assert!(leaf.get("MediaBox").is_some());
+            let leaf = handle_of(&mut pdf2, page_ref);
+            assert_eq!(
+                resolved_key(&mut pdf2, &leaf, b"/Rotate").as_integer(),
+                Some(90)
+            );
+            assert!(leaf.has_key(b"/MediaBox"));
         }
 
         // Belt-and-suspenders: the crate's own validity check is clean.
@@ -1274,59 +1358,75 @@ mod tests {
     fn rebuild_honors_repair_depth_limit() {
         let mut pdf = open(build_nested_pdf());
 
-        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        root.insert(
-            "Kids",
-            Object::Array(vec![Object::Reference(ObjectRef::new(10, 0))]),
-        );
-        root.insert("Count", Object::Integer(1));
-        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+        let root = handle_of(&mut pdf, ObjectRef::new(2, 0));
+        let first_ref = pdf.get_object_handle(ObjectRef::new(10, 0));
+        root.replace_key(b"/Kids", ObjectHandle::array(vec![first_ref]))
+            .unwrap();
+        root.replace_key(b"/Count", ObjectHandle::integer(1))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
 
-        let mut first = crate::Dictionary::new();
-        first.insert("Type", Object::Name(b"Pages".to_vec()));
-        first.insert("Parent", Object::Reference(ObjectRef::new(2, 0)));
-        first.insert(
-            "Kids",
-            Object::Array(vec![Object::Reference(ObjectRef::new(11, 0))]),
-        );
-        first.insert("Count", Object::Integer(1));
-        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(first));
+        let first = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (
+                b"/Parent".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(2, 0)),
+            ),
+            (
+                b"/Kids".to_vec(),
+                ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(11, 0))]),
+            ),
+            (b"/Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        set_handle(&mut pdf, ObjectRef::new(10, 0), first);
 
         // The missing /Type is deliberately below the supplied bound. The old
         // default-bound preparation silently repairs it before rebuilding.
-        let mut second = crate::Dictionary::new();
-        second.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
-        second.insert(
-            "Kids",
-            Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
-        );
-        second.insert("Count", Object::Integer(1));
-        pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(second));
+        let second = ObjectHandle::dictionary(vec![
+            (
+                b"/Parent".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(10, 0)),
+            ),
+            (
+                b"/Kids".to_vec(),
+                ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(4, 0))]),
+            ),
+            (b"/Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        set_handle(&mut pdf, ObjectRef::new(11, 0), second);
 
-        let Object::Dictionary(mut leaf) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
-            panic!("selected object must be a page"); // cov:ignore: build_nested_pdf fixes object 4 as a page dictionary
-        };
-        leaf.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
-        leaf.insert("Rotate", Object::Integer(0));
-        leaf.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
-        leaf.insert(
-            "CropBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(200),
-                Object::Integer(300),
+        let leaf = handle_of(&mut pdf, ObjectRef::new(4, 0));
+        leaf.replace_key(b"/Parent", pdf.get_object_handle(ObjectRef::new(10, 0)))
+            .unwrap();
+        leaf.replace_key(b"/Rotate", ObjectHandle::integer(0))
+            .unwrap();
+        leaf.replace_key(b"/Resources", ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        leaf.replace_key(
+            b"/CropBox",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(200),
+                ObjectHandle::integer(300),
             ]),
-        );
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(leaf));
+        )
+        .unwrap();
+        pdf.mark_object_handle_dirty(&leaf).unwrap();
 
-        let before_root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        let before_second = dict_of(&mut pdf, ObjectRef::new(11, 0));
+        let before_root = handle_of(&mut pdf, ObjectRef::new(2, 0)).unparse_resolved();
+        let before_second = handle_of(&mut pdf, ObjectRef::new(11, 0)).unparse_resolved();
         let error = rebuild_page_tree_with_max_depth(&mut pdf, &[ObjectRef::new(4, 0)], 2)
             .expect_err("repair must use the caller-supplied depth limit");
         assert!(matches!(error, Error::Unsupported(_)), "got {error:?}");
-        assert_eq!(dict_of(&mut pdf, ObjectRef::new(2, 0)), before_root);
-        assert_eq!(dict_of(&mut pdf, ObjectRef::new(11, 0)), before_second);
+        assert_eq!(
+            handle_of(&mut pdf, ObjectRef::new(2, 0)).unparse_resolved(),
+            before_root
+        );
+        assert_eq!(
+            handle_of(&mut pdf, ObjectRef::new(11, 0)).unparse_resolved(),
+            before_second
+        );
     }
 
     #[test]
@@ -1403,9 +1503,9 @@ mod tests {
         let mut direct_leaf = open(build_direct_leaf_pdf());
         rebuild_page_tree(&mut direct_leaf, &[ObjectRef::new(3, 0)])
             .expect("direct leaf rebuild must succeed");
-        let direct_page = dict_of(&mut direct_leaf, ObjectRef::new(3, 0));
+        let direct_page = handle_of(&mut direct_leaf, ObjectRef::new(3, 0));
         assert!(
-            direct_page.get("Rotate").is_none(),
+            !direct_page.has_key(b"/Rotate"),
             "qpdf's direct-leaf probe has no inherited /Rotate to push"
         );
     }
