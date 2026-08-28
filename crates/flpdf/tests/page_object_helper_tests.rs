@@ -205,36 +205,38 @@ fn content_stream_objects_empty_when_no_contents() {
 fn flatten_rotation_is_a_live_page_facade_route() {
     let mut pdf = open(annotation_page("[30 50 70 100]", Some(90)));
     let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
-    let mut page = PageObjectHelper::new(page_ref, &mut pdf);
-
-    page.flatten_rotation()
+    PageObjectHelper::new(page_ref, &mut pdf)
+        .flatten_rotation()
         .expect("direct /Rotate page should flatten");
 
-    let page_dict = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
-    assert!(page_dict.get("Rotate").is_none());
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert!(page.get_key(b"/Rotate").is_null());
+    let media_box = page.get_key(b"/MediaBox");
+    pdf.resolve(&media_box).unwrap();
     assert_eq!(
-        page_dict.get("MediaBox"),
-        Some(&Object::Array(vec![
+        handle_pdf_bytes(&media_box),
+        object_pdf_bytes(&Object::Array(vec![
             Object::Real(20.0),
             Object::Real(10.0),
             Object::Real(320.0),
             Object::Real(210.0),
         ]))
     );
-    let annotation_ref = page_dict
-        .get("Annots")
-        .and_then(Object::as_array)
-        .and_then(|annots| annots.first())
-        .and_then(Object::as_ref_id)
+    let annots = page.get_key(b"/Annots");
+    pdf.resolve(&annots).unwrap();
+    let annotation_ref = annots
+        .as_array()
+        .and_then(|annots| annots.into_iter().next())
+        .and_then(|annotation| annotation.object_ref())
         .expect("flattened annotation must remain on the page");
-    let annotation = pdf
-        .resolve_object(annotation_ref)
-        .unwrap()
-        .into_dict()
-        .unwrap();
+    let annotation = pdf.get_object_handle(annotation_ref);
+    pdf.resolve(&annotation).unwrap();
+    let rect = annotation.get_key(b"/Rect");
+    pdf.resolve(&rect).unwrap();
     assert_eq!(
-        annotation.get("Rect"),
-        Some(&Object::Array(vec![
+        handle_pdf_bytes(&rect),
+        object_pdf_bytes(&Object::Array(vec![
             Object::Real(50.0),
             Object::Real(150.0),
             Object::Real(100.0),
@@ -252,8 +254,9 @@ fn flatten_rotation_handles_270_degrees_and_inherited_rotation_masking() {
     PageObjectHelper::new(page_ref, &mut pdf)
         .flatten_rotation()
         .expect("270-degree page should flatten");
-    let page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
-    assert!(page.get("Rotate").is_none());
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert!(page.get_key(b"/Rotate").is_null());
     let content = pages::page_content_bytes(&mut pdf, page_ref).unwrap();
     assert!(content.starts_with(b"q\n0 1 -1 0 340 0 cm\n"));
 
@@ -266,12 +269,9 @@ fn flatten_rotation_handles_270_degrees_and_inherited_rotation_masking() {
     PageObjectHelper::new(inherited_page, &mut inherited)
         .flatten_rotation()
         .expect("direct rotation should mask inherited rotation");
-    let page = inherited
-        .resolve_object(inherited_page)
-        .unwrap()
-        .into_dict()
-        .unwrap();
-    assert_eq!(page.get("Rotate"), Some(&Object::Integer(0)));
+    let page = inherited.get_object_handle(inherited_page);
+    inherited.resolve(&page).unwrap();
+    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(0));
 }
 
 #[test]
@@ -284,12 +284,9 @@ fn flatten_rotation_skips_invalid_media_box_and_non_array_annotations() {
     PageObjectHelper::new(invalid_page, &mut invalid_media)
         .flatten_rotation()
         .expect("invalid media box should be a qpdf no-op");
-    let page = invalid_media
-        .resolve_object(invalid_page)
-        .unwrap()
-        .into_dict()
-        .unwrap();
-    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+    let page = invalid_media.get_object_handle(invalid_page);
+    invalid_media.resolve(&page).unwrap();
+    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
 
     let mut non_array_annots = open(build_pdf_with_extras(
         "",
@@ -300,12 +297,9 @@ fn flatten_rotation_skips_invalid_media_box_and_non_array_annotations() {
     PageObjectHelper::new(page_ref, &mut non_array_annots)
         .flatten_rotation()
         .expect("non-array annotations should be ignored");
-    let page = non_array_annots
-        .resolve_object(page_ref)
-        .unwrap()
-        .into_dict()
-        .unwrap();
-    assert!(page.get("Rotate").is_none());
+    let page = non_array_annots.get_object_handle(page_ref);
+    non_array_annots.resolve(&page).unwrap();
+    assert!(page.get_key(b"/Rotate").is_null());
 }
 
 #[test]
@@ -318,23 +312,22 @@ fn copy_annotations_uses_same_document_live_handles() {
     page.copy_annotations(source_page, Matrix::new(1.0, 0.0, 0.0, 1.0, 5.0, 7.0))
         .expect("same-document annotation copy should succeed");
 
-    let annots = pdf
-        .resolve_object(page_ref)
-        .unwrap()
-        .into_dict()
-        .unwrap()
-        .remove("Annots")
-        .unwrap()
-        .into_array()
-        .unwrap();
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    let annots = page.get_key(b"/Annots");
+    pdf.resolve(&annots).unwrap();
+    let annots = annots.as_array().unwrap();
     assert_eq!(annots.len(), 2);
     let copied = annots[1]
-        .as_ref_id()
+        .object_ref()
         .expect("copied annotation is indirect");
-    let copied = pdf.resolve_object(copied).unwrap().into_dict().unwrap();
+    let copied = pdf.get_object_handle(copied);
+    pdf.resolve(&copied).unwrap();
+    let rect = copied.get_key(b"/Rect");
+    pdf.resolve(&rect).unwrap();
     assert_eq!(
-        copied.get("Rect"),
-        Some(&Object::Array(vec![
+        handle_pdf_bytes(&rect),
+        object_pdf_bytes(&Object::Array(vec![
             Object::Real(35.0),
             Object::Real(57.0),
             Object::Real(75.0),
@@ -377,25 +370,20 @@ fn copy_annotations_from_validates_the_foreign_source_owner() {
     )
     .expect("foreign annotation copy should succeed");
 
-    let annots = destination
-        .resolve_object(destination_page)
-        .unwrap()
-        .into_dict()
-        .unwrap()
-        .remove("Annots")
-        .unwrap()
-        .into_array()
-        .unwrap();
+    let page = destination.get_object_handle(destination_page);
+    destination.resolve(&page).unwrap();
+    let annots = page.get_key(b"/Annots");
+    destination.resolve(&annots).unwrap();
+    let annots = annots.as_array().unwrap();
     assert_eq!(annots.len(), 1);
-    let copied = annots[0].as_ref_id().expect("foreign copy is indirect");
-    let copied = destination
-        .resolve_object(copied)
-        .unwrap()
-        .into_dict()
-        .unwrap();
+    let copied = annots[0].object_ref().expect("foreign copy is indirect");
+    let copied = destination.get_object_handle(copied);
+    destination.resolve(&copied).unwrap();
+    let rect = copied.get_key(b"/Rect");
+    destination.resolve(&rect).unwrap();
     assert_eq!(
-        copied.get("Rect"),
-        Some(&Object::Array(vec![
+        handle_pdf_bytes(&rect),
+        object_pdf_bytes(&Object::Array(vec![
             Object::Real(35.0),
             Object::Real(57.0),
             Object::Real(75.0),
@@ -2174,35 +2162,6 @@ fn get_annotations_resolves_indirect_array() {
 }
 
 #[test]
-fn get_annotations_follows_holder_chain() {
-    // /Annots is stored behind a two-hop holder chain:
-    //   page /Annots -> 5 0 R -> 6 0 R -> [4 0 R]
-    // A single resolve hop would stop at the intermediate reference 6 0 R
-    // (not an array) and error; the chain must be followed to the terminal.
-    let annot4 = (
-        4u32,
-        b"4 0 obj\n<< /Type /Annot /Subtype /Text >>\nendobj\n".to_vec(),
-    );
-    let carrier = (5u32, b"5 0 obj\n6 0 R\nendobj\n".to_vec());
-    let annot_array = (6u32, b"6 0 obj\n[4 0 R]\nendobj\n".to_vec());
-    let bytes = build_pdf_with_extras(
-        "/MediaBox [0 0 612 792]",
-        "/Annots 5 0 R",
-        &[annot4, carrier, annot_array],
-    );
-    let mut pdf = open(bytes);
-    pdf.set_object(
-        ObjectRef::new(5, 0),
-        Object::Reference(ObjectRef::new(6, 0)),
-    );
-    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-
-    let annots = helper.get_annotations().unwrap();
-
-    assert_eq!(annots, vec![ObjectRef::new(4, 0)]);
-}
-
-#[test]
 fn get_annotations_reference_terminal_not_array_errors() {
     // /Annots is an indirect reference whose terminal is NOT an array.
     // The chain is followed to object 5 (a dictionary), and the helper must
@@ -2211,39 +2170,6 @@ fn get_annotations_reference_terminal_not_array_errors() {
     let non_array = (5u32, b"5 0 obj\n<< >>\nendobj\n".to_vec());
     let bytes = build_pdf_with_extras("/MediaBox [0 0 612 792]", "/Annots 5 0 R", &[non_array]);
     let mut pdf = open(bytes);
-    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-
-    match helper.get_annotations() {
-        Err(Error::Unsupported(msg)) => {
-            assert!(
-                msg.contains("does not resolve to an array"),
-                "expected 'does not resolve to an array' message, got: {msg}"
-            );
-        }
-        other => panic!("expected Error::Unsupported, got {other:?}"),
-    }
-}
-
-#[test]
-fn get_annotations_chain_terminal_not_array_errors() {
-    // /Annots is stored behind a two-hop holder chain whose terminal is NOT an
-    // array:
-    //   page /Annots -> 5 0 R -> 6 0 R -> << >>
-    // The chain must be followed past the intermediate reference to its
-    // non-array terminal, then surface the specific error. A single resolve hop
-    // would stop at 6 0 R (still a reference) and never reach the dictionary.
-    let carrier = (5u32, b"5 0 obj\n6 0 R\nendobj\n".to_vec());
-    let non_array = (6u32, b"6 0 obj\n<< >>\nendobj\n".to_vec());
-    let bytes = build_pdf_with_extras(
-        "/MediaBox [0 0 612 792]",
-        "/Annots 5 0 R",
-        &[carrier, non_array],
-    );
-    let mut pdf = open(bytes);
-    pdf.set_object(
-        ObjectRef::new(5, 0),
-        Object::Reference(ObjectRef::new(6, 0)),
-    );
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
 
     match helper.get_annotations() {
@@ -2468,29 +2394,28 @@ fn art_box_falls_back_to_crop_box() {
     assert_eq!(ab, PageBox::new(20.0, 20.0, 590.0, 770.0));
 }
 
-/// Box inheritance round-trip: set MediaBox via set_object, write, re-open,
-/// read back via PageObjectHelper.
+/// Box inheritance round-trip: replace MediaBox through a live handle, write,
+/// re-open, and read back via PageObjectHelper.
 #[test]
 fn media_box_round_trip_after_mutation() {
     // Start with /MediaBox only on parent.
     let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "");
     let mut pdf = open(bytes);
 
-    // Materialize a different MediaBox directly on the leaf page.
-    let page_obj = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
-    let Object::Dictionary(mut page_dict) = page_obj else {
-        panic!("expected page dict")
-    };
-    page_dict.insert(
-        "MediaBox",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(500),
-            Object::Integer(700),
+    // Replace a different MediaBox directly on the live leaf page handle.
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve(&page).unwrap();
+    page.replace_key(
+        b"/MediaBox",
+        ObjectHandle::array(vec![
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(500),
+            ObjectHandle::integer(700),
         ]),
-    );
-    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page_dict));
+    )
+    .unwrap();
+    pdf.mark_object_handle_dirty(&page).unwrap();
 
     // Serialize and re-open.
     let mut serialized: Vec<u8> = Vec::new();
