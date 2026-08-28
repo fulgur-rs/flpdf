@@ -1,5 +1,8 @@
 //! Tests for /AcroForm /SigFlags reading, preservation, surfacing, and clearing.
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use flpdf::{
     acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
     strip_signature_values, Object, ObjectRef, Pdf, PdfWriter, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
@@ -210,7 +213,7 @@ fn build_indirect_ft_signature_field_pdf() -> Vec<u8> {
 }
 
 fn has_entry(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &str) -> bool {
-    match pdf.resolve_object(object_ref).unwrap() {
+    match pdf.resolve_canonical_object(object_ref).unwrap() {
         Object::Dictionary(dict) => dict.get(key).is_some(),
         _ => false,
     }
@@ -309,14 +312,14 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
 /// Read the top-level `/AcroForm /Fields` array via public API.
 fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<Object> {
     let root_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(cat) = pdf.resolve_object(root_ref).unwrap() else {
+    let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         return Vec::new();
     };
     let Some(af) = cat.get("AcroForm").cloned() else {
         return Vec::new();
     };
     let af = match af {
-        Object::Reference(r) => pdf.resolve_object(r).unwrap(),
+        Object::Reference(r) => pdf.resolve_canonical_object(r).unwrap(),
         other => other,
     };
     let Object::Dictionary(afd) = af else {
@@ -324,7 +327,7 @@ fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<Object> {
     };
     match afd.get("Fields").cloned() {
         Some(Object::Array(a)) => a,
-        Some(Object::Reference(r)) => match pdf.resolve_object(r).unwrap() {
+        Some(Object::Reference(r)) => match pdf.resolve_canonical_object(r).unwrap() {
             Object::Array(a) => a,
             _ => Vec::new(),
         },
@@ -491,7 +494,7 @@ fn strip_signature_values_removes_direct_signature_field_value() {
     assert!(changed);
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap(),
         Object::Null
     );
     assert!(pdf.signatures().unwrap().is_empty());
@@ -508,7 +511,7 @@ fn strip_signature_values_removes_inherited_signature_field_value() {
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
     assert!(!has_entry(&mut pdf, ObjectRef::new(6, 0), "V"));
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(7, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(7, 0)).unwrap(),
         Object::Null
     );
     assert!(has_entry(&mut pdf, ObjectRef::new(9, 0), "V"));
@@ -524,7 +527,7 @@ fn strip_signature_values_resolves_indirect_field_type() {
     assert!(changed);
     assert!(!has_entry(&mut pdf, ObjectRef::new(5, 0), "V"));
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap(),
         Object::Null
     );
     assert!(pdf.signatures().unwrap().is_empty());
@@ -617,7 +620,7 @@ fn clear_sig_flags_clears_inline_acroform_without_clobbering_catalog() {
 
     // The catalog itself must be intact, not replaced by the AcroForm sub-dict.
     let root_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(catalog) = pdf.resolve_object(root_ref).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!("catalog should still be a dictionary");
     };
     assert_eq!(
@@ -635,7 +638,7 @@ fn remove_security_restrictions_drops_perms_and_zeros_sigflags() {
     let mut pdf = open(build_perms_and_acroform_pdf());
     assert!(remove_security_restrictions(&mut pdf).unwrap());
     let root_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(cat) = pdf.resolve_object(root_ref).unwrap() else {
+    let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!("catalog")
     };
     assert!(cat.get("Perms").is_none(), "/Perms must be removed");
@@ -647,7 +650,7 @@ fn remove_security_restrictions_removes_perms_when_acroform_absent() {
     let mut pdf = open(build_perms_docmdp_only_pdf());
     assert!(remove_security_restrictions(&mut pdf).unwrap());
     let root_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(cat) = pdf.resolve_object(root_ref).unwrap() else {
+    let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!("catalog")
     };
     assert!(cat.get("Perms").is_none());
@@ -721,7 +724,7 @@ fn disable_digital_signatures_strips_sig_field_keys_and_erases_from_fields() {
     // byte-for-byte by the remove_restrictions_qpdf_parity fixtures.
     assert!(
         matches!(
-            pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
+            pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap(),
             Object::Dictionary(_)
         ),
         "sig dict must not be eagerly deleted; write-time GC drops orphans"
@@ -770,7 +773,7 @@ fn disable_digital_signatures_docmdp_only_removes_perms() {
     let mut pdf = open(build_perms_docmdp_only_pdf());
     assert!(disable_digital_signatures(&mut pdf).unwrap());
     let root_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(cat) = pdf.resolve_object(root_ref).unwrap() else {
+    let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!()
     };
     assert!(cat.get("Perms").is_none());
@@ -826,7 +829,7 @@ fn disable_digital_signatures_keeps_nonterminal_sig_parent_signature() {
 
     // The signature dictionary (7) survives (still referenced by 5 and 6).
     assert_ne!(
-        pdf.resolve_object(ObjectRef::new(7, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(7, 0)).unwrap(),
         Object::Null
     );
     assert!(

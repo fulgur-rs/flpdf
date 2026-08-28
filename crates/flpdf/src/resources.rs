@@ -621,8 +621,14 @@ fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Dictionary, Object, Stream};
-    use std::io::Cursor;
+    use crate::{Dictionary, Object, ObjectRef, Pdf, Stream};
+    use std::io::{Cursor, Read, Seek};
+
+    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
 
     /// Build a minimal one-page PDF with a caller-supplied page dictionary and
     /// object 4 body. The Auto heuristic tests use object 4 as either a
@@ -1027,8 +1033,7 @@ mod tests {
     }
 
     fn assert_form_fonts_pruned(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
-        let form = pdf
-            .resolve_object(ObjectRef::new(4, 0))
+        let form = resolved_object(pdf, ObjectRef::new(4, 0))
             .expect("Form should resolve")
             .into_stream()
             .expect("Form target should remain a stream");
@@ -1075,8 +1080,7 @@ mod tests {
         remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
             .expect("resource pruning should succeed");
 
-        let form = pdf
-            .resolve_object(ObjectRef::new(4, 0))
+        let form = resolved_object(&mut pdf, ObjectRef::new(4, 0))
             .expect("Form should resolve")
             .into_stream()
             .expect("Form target should remain a stream");
@@ -1104,8 +1108,7 @@ mod tests {
         // syntactically malformed one (matching the `<0g>` fixture pattern
         // used elsewhere in this module), matching qpdf's contract of
         // leaving a Form whose content cannot be parsed entirely untouched.
-        let form = pdf
-            .resolve_object(ObjectRef::new(4, 0))
+        let form = resolved_object(&mut pdf, ObjectRef::new(4, 0))
             .expect("Form should resolve")
             .into_stream()
             .expect("Form target should be a stream");
@@ -1120,8 +1123,7 @@ mod tests {
         remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
             .expect("resource pruning must tolerate an unparsable Form, not abort");
 
-        let form = pdf
-            .resolve_object(ObjectRef::new(4, 0))
+        let form = resolved_object(&mut pdf, ObjectRef::new(4, 0))
             .expect("Form should resolve")
             .into_stream()
             .expect("Form target should remain a stream");
@@ -1162,8 +1164,7 @@ mod tests {
         remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
             .expect("malformed declared XObject must be skipped, not abort pruning");
 
-        let page = pdf
-            .resolve_object(ObjectRef::new(3, 0))
+        let page = resolved_object(&mut pdf, ObjectRef::new(3, 0))
             .expect("page should resolve")
             .into_dict()
             .expect("page should remain a dictionary");
@@ -1210,8 +1211,7 @@ mod tests {
         // through the materialized `Object` (rather than an `ObjectHandle`
         // dereference, which collapses an unresolvable indirect target to
         // null) to check the value actually stored at the key.
-        let page = pdf
-            .resolve_object(ObjectRef::new(3, 0))
+        let page = resolved_object(&mut pdf, ObjectRef::new(3, 0))
             .expect("page should resolve")
             .into_dict()
             .expect("page should remain a dictionary");

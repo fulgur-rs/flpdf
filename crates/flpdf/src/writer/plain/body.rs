@@ -1042,7 +1042,16 @@ mod tests {
     use crate::writer::plain::plan::PlannedIndirectObject;
     use crate::{Dictionary, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Stream};
     use std::cell::RefCell;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek};
+
+    fn resolved_object<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        object_ref: ObjectRef,
+    ) -> crate::Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
 
     #[test]
     fn unfiltered_crypt_cleanup_handles_missing_and_scalar_decode_parms() {
@@ -1161,14 +1170,16 @@ mod tests {
     }
 
     #[test]
-    fn canonical_emission_reuses_a_legacy_recovered_stream_eol() {
+    fn canonical_emission_reuses_a_recovered_stream_eol() {
         let fixture =
             include_bytes!("../../../../../tests/fixtures/compat/null-length-framing-matrix.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        pdf.resolve_object(ObjectRef::new(5, 0))
-            .expect("legacy resolution records the recovered framing EOL");
+        resolved_object(&mut pdf, ObjectRef::new(5, 0))
+            .expect("canonical resolution records the recovered framing EOL");
+        let stream_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
         assert_eq!(
-            pdf.recovered_stream_eol(ObjectRef::new(5, 0)),
+            pdf.canonical_recovered_stream_eol(ObjectRef::new(5, 0), &stream_handle)
+                .expect("canonical recovered EOL"),
             Some(&b"\n"[..])
         );
         let options = WriterOptions {
@@ -1190,8 +1201,8 @@ mod tests {
         let fixture =
             include_bytes!("../../../../../tests/fixtures/compat/null-length-framing-matrix.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        pdf.resolve_object(ObjectRef::new(5, 0))
-            .expect("legacy resolution records the recovered framing EOL");
+        resolved_object(&mut pdf, ObjectRef::new(5, 0))
+            .expect("canonical resolution records the recovered framing EOL");
         let options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,
             stream_data: Some(crate::StreamDataMode::Preserve),
@@ -1254,7 +1265,10 @@ mod tests {
                 data: b"abc".to_vec(),
             }),
         );
-        let mut catalog = pdf.resolve_object(root).unwrap().into_dict().unwrap();
+        let mut catalog = resolved_object(&mut pdf, root)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         catalog.insert("RemovedDirect", Object::Reference(removed));
         catalog.insert(
             "RemovedArray",
@@ -1571,7 +1585,10 @@ mod tests {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let root = pdf.root_ref().unwrap();
-        let mut catalog = pdf.resolve_object(root).unwrap().into_dict().unwrap();
+        let mut catalog = resolved_object(&mut pdf, root)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let source_objstm = ObjectRef::new(1, 0);
         catalog.insert("ReachableStructural", Object::Reference(source_objstm));
         pdf.set_object(root, Object::Dictionary(catalog));

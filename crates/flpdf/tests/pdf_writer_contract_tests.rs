@@ -15,6 +15,7 @@ use flpdf::{
 };
 
 mod common;
+use common::PdfCanonicalTestExt;
 use common::{write_with_settings, WriterTestSettings};
 
 #[derive(Clone)]
@@ -651,7 +652,7 @@ fn synthetic_content_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
     );
 
     let pages_ref = ObjectRef::new(2, 0);
-    let mut pages = pdf.resolve_object(pages_ref)?.clone();
+    let mut pages = pdf.resolve_canonical_object(pages_ref)?.clone();
     let pages_dict = pages.as_dict_mut().expect("pages dictionary");
     pages_dict.insert("Count", Object::Integer(3));
     pages_dict.insert(
@@ -783,7 +784,7 @@ fn attach_flate_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> Obje
     );
     let root_ref = pdf.root_ref().expect("catalog reference");
     let mut catalog = pdf
-        .resolve_object(root_ref)
+        .resolve_canonical_object(root_ref)
         .expect("catalog must resolve")
         .clone();
     catalog
@@ -809,7 +810,7 @@ fn attach_plain_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> Obje
     );
     let root_ref = pdf.root_ref().expect("catalog reference");
     let mut catalog = pdf
-        .resolve_object(root_ref)
+        .resolve_canonical_object(root_ref)
         .expect("catalog must resolve")
         .clone();
     catalog
@@ -826,7 +827,7 @@ fn copy_encryption_source_from_donor(donor: &mut Pdf<Cursor<Vec<u8>>>) -> CopyEn
         .get_ref("Encrypt")
         .expect("encrypted donor must have /Encrypt");
     let encrypt_dict = donor
-        .resolve_object(encrypt_ref)
+        .resolve_canonical_object(encrypt_ref)
         .expect("donor /Encrypt must resolve")
         .as_dict()
         .expect("donor /Encrypt must be a dictionary")
@@ -853,14 +854,14 @@ fn metadata_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rewritten PDF must reopen");
     let root_ref = pdf.root_ref().expect("catalog reference");
     let metadata_ref = pdf
-        .resolve_object(root_ref)
+        .resolve_canonical_object(root_ref)
         .expect("catalog must resolve")
         .as_dict()
         .expect("catalog must be a dictionary")
         .get_ref("Metadata")
         .expect("catalog must reference metadata");
     let metadata = pdf
-        .resolve_object(metadata_ref)
+        .resolve_canonical_object(metadata_ref)
         .expect("metadata must resolve")
         .as_stream()
         .expect("metadata must be a stream")
@@ -904,7 +905,7 @@ fn runlength_contents_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rewritten PDF must reopen");
     let catalog_ref = pdf.root_ref().expect("fixture must have a catalog");
     let catalog = pdf
-        .resolve_object(catalog_ref)
+        .resolve_canonical_object(catalog_ref)
         .expect("catalog must resolve")
         .clone();
     let pages_ref = catalog
@@ -913,7 +914,7 @@ fn runlength_contents_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
         .get_ref("Pages")
         .expect("catalog must reference pages");
     let pages = pdf
-        .resolve_object(pages_ref)
+        .resolve_canonical_object(pages_ref)
         .expect("pages must resolve")
         .clone();
     let page_ref = pages
@@ -925,7 +926,7 @@ fn runlength_contents_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
         .and_then(Object::as_ref_id)
         .expect("pages must contain one page reference");
     let page = pdf
-        .resolve_object(page_ref)
+        .resolve_canonical_object(page_ref)
         .expect("page must resolve")
         .clone();
     let contents_ref = page
@@ -934,7 +935,7 @@ fn runlength_contents_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
         .get_ref("Contents")
         .expect("page must reference contents");
     let stream = pdf
-        .resolve_object(contents_ref)
+        .resolve_canonical_object(contents_ref)
         .expect("contents must resolve")
         .as_stream()
         .expect("contents must be a stream")
@@ -1675,12 +1676,14 @@ fn pdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> flp
     assert!(reopened.is_encrypted());
     let rewritten_root_ref = reopened.root_ref().expect("rewritten Catalog reference");
     let rewritten_metadata_ref = reopened
-        .resolve_object(rewritten_root_ref)?
+        .resolve_canonical_object(rewritten_root_ref)?
         .as_dict()
         .expect("rewritten Catalog must be a dictionary")
         .get_ref("Metadata")
         .expect("rewritten Catalog must reference metadata");
-    let metadata = reopened.resolve_object(rewritten_metadata_ref)?.clone();
+    let metadata = reopened
+        .resolve_canonical_object(rewritten_metadata_ref)?
+        .clone();
     let metadata = metadata.as_stream().expect("metadata must be a stream");
     assert_eq!(metadata.data, target_metadata);
     assert_eq!(metadata.dict.get("Filter"), None);
@@ -1765,7 +1768,10 @@ fn pdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::R
     let check = Command::new("qpdf").arg("--check").arg(&path).output()?;
     assert!(check.status.success(), "qpdf --check failed: {check:?}");
     let root = rewritten.root_ref().expect("PCLm output must have a root");
-    assert!(rewritten.resolve_object(root)?.as_dict().is_some());
+    assert!(rewritten
+        .resolve_canonical_object(root)?
+        .as_dict()
+        .is_some());
     Ok(())
 }
 
@@ -2039,12 +2045,12 @@ fn pdf_writer_standard_encryption_false_keeps_metadata_cleartext() -> flpdf::Res
     )?;
     let root_ref = reopened.root_ref().expect("rewritten Catalog reference");
     let metadata_ref = reopened
-        .resolve_object(root_ref)?
+        .resolve_canonical_object(root_ref)?
         .as_dict()
         .expect("rewritten Catalog must be a dictionary")
         .get_ref("Metadata")
         .expect("rewritten Catalog must reference metadata");
-    let metadata = reopened.resolve_object(metadata_ref)?.clone();
+    let metadata = reopened.resolve_canonical_object(metadata_ref)?.clone();
     let metadata = metadata.as_stream().expect("metadata must be a stream");
     assert_eq!(metadata.data, metadata_payload);
     assert_eq!(metadata.dict.get("Filter"), None);
@@ -3370,7 +3376,7 @@ fn pdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
         Object::Stream(Stream::new(metadata_dict, metadata_data)),
     );
     let root_ref = pdf.root_ref().expect("catalog reference");
-    let mut catalog = pdf.resolve_object(root_ref)?.clone();
+    let mut catalog = pdf.resolve_canonical_object(root_ref)?.clone();
     catalog
         .as_dict_mut()
         .expect("catalog dictionary")
@@ -3391,12 +3397,12 @@ fn pdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
     let mut rewritten = Pdf::open(Cursor::new(output))?;
     let root_ref = rewritten.root_ref().expect("catalog reference");
     let metadata_ref = rewritten
-        .resolve_object(root_ref)?
+        .resolve_canonical_object(root_ref)?
         .as_dict()
         .expect("catalog dictionary")
         .get_ref("Metadata")
         .expect("metadata reference");
-    let metadata = rewritten.resolve_object(metadata_ref)?.clone();
+    let metadata = rewritten.resolve_canonical_object(metadata_ref)?.clone();
     let metadata = metadata.as_stream().expect("metadata stream");
     let decoded = flpdf::filters::decode_stream_data(
         &filter_handles::dictionary(&metadata.dict),
@@ -3525,12 +3531,12 @@ fn pdf_writer_treats_null_filter_as_unfiltered_stream() -> flpdf::Result<()> {
     // `Some(Object::Null)`.
     let root_ref = pdf.root_ref().expect("catalog reference");
     let pages_ref = pdf
-        .resolve_object(root_ref)?
+        .resolve_canonical_object(root_ref)?
         .as_dict()
         .expect("catalog dictionary")
         .get_ref("Pages")
         .expect("pages reference");
-    let pages = pdf.resolve_object(pages_ref)?.clone();
+    let pages = pdf.resolve_canonical_object(pages_ref)?.clone();
     let page_ref = pages
         .as_dict()
         .expect("pages dictionary")
@@ -3539,14 +3545,14 @@ fn pdf_writer_treats_null_filter_as_unfiltered_stream() -> flpdf::Result<()> {
         .and_then(|kids| kids.first())
         .and_then(Object::as_ref_id)
         .expect("page reference");
-    let page = pdf.resolve_object(page_ref)?.clone();
+    let page = pdf.resolve_canonical_object(page_ref)?.clone();
     let contents_ref = page
         .as_dict()
         .expect("page dictionary")
         .get_ref("Contents")
         .expect("contents reference");
     let mut contents = pdf
-        .resolve_object(contents_ref)?
+        .resolve_canonical_object(contents_ref)?
         .as_stream()
         .expect("contents stream")
         .clone();
@@ -3639,12 +3645,12 @@ fn pdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Re
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     let root_ref = pdf.root_ref().expect("catalog reference");
     let pages_ref = pdf
-        .resolve_object(root_ref)?
+        .resolve_canonical_object(root_ref)?
         .as_dict()
         .expect("catalog dictionary")
         .get_ref("Pages")
         .expect("pages reference");
-    let pages = pdf.resolve_object(pages_ref)?.clone();
+    let pages = pdf.resolve_canonical_object(pages_ref)?.clone();
     let page_ref = pages
         .as_dict()
         .expect("pages dictionary")
@@ -3653,14 +3659,14 @@ fn pdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Re
         .and_then(|kids| kids.first())
         .and_then(Object::as_ref_id)
         .expect("page reference");
-    let page = pdf.resolve_object(page_ref)?.clone();
+    let page = pdf.resolve_canonical_object(page_ref)?.clone();
     let contents_ref = page
         .as_dict()
         .expect("page dictionary")
         .get_ref("Contents")
         .expect("contents reference");
     let mut stream = pdf
-        .resolve_object(contents_ref)?
+        .resolve_canonical_object(contents_ref)?
         .as_stream()
         .expect("stream")
         .clone();
@@ -3683,12 +3689,12 @@ fn pdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Re
     let mut rewritten = Pdf::open(Cursor::new(output))?;
     let root_ref = rewritten.root_ref().expect("catalog reference");
     let stream_ref = rewritten
-        .resolve_object(root_ref)?
+        .resolve_canonical_object(root_ref)?
         .as_dict()
         .expect("catalog dictionary")
         .get_ref("Pages")
         .expect("pages reference");
-    let pages = rewritten.resolve_object(stream_ref)?.clone();
+    let pages = rewritten.resolve_canonical_object(stream_ref)?.clone();
     let page_ref = pages
         .as_dict()
         .expect("pages dictionary")
@@ -3697,13 +3703,13 @@ fn pdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Re
         .and_then(|kids| kids.first())
         .and_then(Object::as_ref_id)
         .expect("page reference");
-    let page = rewritten.resolve_object(page_ref)?.clone();
+    let page = rewritten.resolve_canonical_object(page_ref)?.clone();
     let contents_ref = page
         .as_dict()
         .expect("page dictionary")
         .get_ref("Contents")
         .expect("contents reference");
-    let stream = rewritten.resolve_object(contents_ref)?.clone();
+    let stream = rewritten.resolve_canonical_object(contents_ref)?.clone();
     let stream = stream.as_stream().expect("stream");
     assert_eq!(
         stream.dict.get("Filter"),

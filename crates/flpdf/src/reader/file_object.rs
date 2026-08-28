@@ -14,7 +14,6 @@ pub(crate) enum RecoveryPolicy {
     Strict,
     Bounded,
     RequireTerminator,
-    RequireTokenTerminator,
     RequireEndstream,
 }
 
@@ -597,9 +596,7 @@ fn complete_handle_stream(
         Some((end, after)) => (end, after, None),
         None if matches!(
             policy,
-            RecoveryPolicy::RequireTerminator
-                | RecoveryPolicy::RequireTokenTerminator
-                | RecoveryPolicy::RequireEndstream
+            RecoveryPolicy::RequireTerminator | RecoveryPolicy::RequireEndstream
         ) && usable_length =>
         {
             return Err(Error::parse(
@@ -625,9 +622,7 @@ fn complete_handle_stream(
                 }
                 None if matches!(
                     policy,
-                    RecoveryPolicy::RequireTerminator
-                        | RecoveryPolicy::RequireTokenTerminator
-                        | RecoveryPolicy::RequireEndstream
+                    RecoveryPolicy::RequireTerminator | RecoveryPolicy::RequireEndstream
                 ) =>
                 {
                     return Err(Error::parse(data_start, "stream data exceeds input"));
@@ -748,9 +743,7 @@ fn complete_stream(
         Some((end, after)) => (end, after, None),
         None if matches!(
             policy,
-            RecoveryPolicy::RequireTerminator
-                | RecoveryPolicy::RequireTokenTerminator
-                | RecoveryPolicy::RequireEndstream
+            RecoveryPolicy::RequireTerminator | RecoveryPolicy::RequireEndstream
         ) && usable_length =>
         {
             return Err(Error::parse(
@@ -776,9 +769,7 @@ fn complete_stream(
                 }
                 None if matches!(
                     policy,
-                    RecoveryPolicy::RequireTerminator
-                        | RecoveryPolicy::RequireTokenTerminator
-                        | RecoveryPolicy::RequireEndstream
+                    RecoveryPolicy::RequireTerminator | RecoveryPolicy::RequireEndstream
                 ) =>
                 {
                     return Err(Error::parse(data_start, "stream data exceeds input"));
@@ -842,9 +833,9 @@ fn recover_stream_boundary(
         RecoveryPolicy::RequireEndstream => {
             find_line_anchored_endstream_terminator(input, data_start)
         }
-        RecoveryPolicy::Strict
-        | RecoveryPolicy::Bounded
-        | RecoveryPolicy::RequireTokenTerminator => find_recovery_terminator(input, data_start),
+        RecoveryPolicy::Strict | RecoveryPolicy::Bounded => {
+            find_recovery_terminator(input, data_start)
+        }
     };
     if let Some(terminator) = terminator {
         let data_end = terminator.position();

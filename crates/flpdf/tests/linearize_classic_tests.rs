@@ -29,6 +29,7 @@ fn linearize_classic(fixture: &str) -> Vec<u8> {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{write_linearized_with_settings, WriterTestSettings};
 
@@ -62,7 +63,7 @@ fn useoutlines_classic_routes_outlines_to_first_page_and_round_trips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve_object(r)
+        pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -99,7 +100,7 @@ fn outlines_classic_routes_outlines_to_second_half_and_round_trips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve_object(r)
+        pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -125,7 +126,7 @@ fn crossobj_arr_ref_in_nonpage_obj_places_null_before_first_page_end() {
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
-        pdf.resolve_object(r)
+        pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -155,7 +156,7 @@ fn revorder_resurrect_deferred_null_before_first_page_end() {
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
-        pdf.resolve_object(r)
+        pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -192,7 +193,7 @@ fn page_highnum_content_lownum_page_before_content() {
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
-        pdf.resolve_object(r)
+        pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -255,7 +256,7 @@ fn od_live_arr_null_lands_in_od_section() {
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
-        pdf.resolve_object(r)
+        pdf.resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -329,7 +330,7 @@ fn linearize_content_normalization_scopes_to_page_content_only() {
     let mut written = Pdf::open(Cursor::new(bytes)).expect("output must reopen");
     for r in written.object_refs() {
         written
-            .resolve_object(r)
+            .resolve_canonical_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }

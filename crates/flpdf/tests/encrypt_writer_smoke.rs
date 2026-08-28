@@ -316,7 +316,7 @@ fn encrypted_standard_writes_preserve_missing_page_resources_like_qpdf_11_9() {
             .expect("enumerate rewritten pages");
         assert_eq!(pages.len(), 1);
         let page = reopened
-            .resolve_object(pages[0])
+            .resolve_canonical_object(pages[0])
             .expect("resolve rewritten page");
         assert!(
             page.as_dict().is_some_and(|dict| dict.get("Resources").is_none()),
@@ -330,7 +330,9 @@ fn resolve_nested_info_marker(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
         Some(Object::Reference(reference)) => *reference,
         other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
     };
-    let info = pdf.resolve_object(info_ref).expect("resolve /Info");
+    let info = pdf
+        .resolve_canonical_object(info_ref)
+        .expect("resolve /Info");
     let nested = info
         .as_dict()
         .and_then(|dict| dict.get("Nested"))
@@ -345,7 +347,7 @@ fn resolve_nested_info_marker(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
 fn resolve_metadata_label(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
     let root_ref = pdf.root_ref().expect("encrypted output has /Root");
     let metadata_ref = match pdf
-        .resolve_object(root_ref)
+        .resolve_canonical_object(root_ref)
         .expect("resolve Catalog")
         .as_dict()
         .and_then(|dict| dict.get("Metadata"))
@@ -354,7 +356,7 @@ fn resolve_metadata_label(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
         other => panic!("Catalog /Metadata must be an indirect reference, got {other:?}"),
     };
     match pdf
-        .resolve_object(metadata_ref)
+        .resolve_canonical_object(metadata_ref)
         .expect("resolve Metadata stream")
         .as_stream()
         .and_then(|stream| stream.dict.get("Label"))
@@ -505,7 +507,7 @@ fn v4_aes128_round_trip_on_one_page_resolves_to_same_root() {
     // Resolve the catalog dictionary and verify it carries /Type /Catalog
     // after decryption (proves at least one full object decrypts cleanly).
     let catalog = enc_pdf
-        .resolve_object(enc_root)
+        .resolve_canonical_object(enc_root)
         .expect("decrypted /Catalog object resolves");
     let Object::Dictionary(dict) = catalog else {
         panic!("expected /Catalog Dictionary");
@@ -562,7 +564,7 @@ fn aes_encrypted_strings_use_hex_in_compact_and_qdf() {
             other => panic!("trailer /Encrypt must be an indirect reference, got {other:?}"),
         };
         let encrypt_dict = reopened
-            .resolve_object(encrypt_ref)
+            .resolve_canonical_object(encrypt_ref)
             .expect("resolve dedicated /Encrypt object");
         assert_eq!(
             encrypt_dict.as_dict().and_then(|dict| dict.get("Filter")),
@@ -631,7 +633,7 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
         "/Info type-2 xref entry must name the emitted ObjStm container"
     );
     let container = reopened
-        .resolve_object(ObjectRef::new(container_number, 0))
+        .resolve_canonical_object(ObjectRef::new(container_number, 0))
         .expect("resolve and decrypt ObjStm container");
     let stream = container.as_stream().expect("ObjStm object is a stream");
     let decoded =
@@ -770,13 +772,13 @@ fn rc4_128_printable_ciphertext_uses_literal_string_syntax() {
 /// re-opened encrypted `pdf` and return its `/Length` dictionary entry.
 fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
     let root = pdf.root_ref().expect("/Root");
-    let catalog = pdf.resolve_object(root).expect("catalog");
+    let catalog = pdf.resolve_canonical_object(root).expect("catalog");
     let open_action = catalog
         .as_dict()
         .and_then(|d| d.get("OpenAction").cloned())
         .expect("/OpenAction");
     let action = match open_action {
-        Object::Reference(r) => pdf.resolve_object(r).expect("action"),
+        Object::Reference(r) => pdf.resolve_canonical_object(r).expect("action"),
         other => other,
     };
     let js_ref = action
@@ -784,7 +786,7 @@ fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
         .and_then(|d| d.get("JS").cloned())
         .expect("/JS");
     let js = match js_ref {
-        Object::Reference(r) => pdf.resolve_object(r).expect("js stream"),
+        Object::Reference(r) => pdf.resolve_canonical_object(r).expect("js stream"),
         other => other,
     };
     js.as_stream()
@@ -842,5 +844,6 @@ fn v4_aes128_preserve_drops_orphan_length_holder() {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{write_default, write_with_settings, WriterTestSettings};

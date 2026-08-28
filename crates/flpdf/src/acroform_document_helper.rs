@@ -2196,7 +2196,9 @@ pub(crate) fn collect_reachable_refs<R: Read + Seek>(
     }
     out.insert(object_ref);
 
-    let obj = pdf.resolve_object(object_ref)?;
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve(&handle)?;
+    let obj = handle.materialize()?;
     collect_refs_in_object(pdf, &obj, out, seen, depth, 0, skip_parent_key)
 }
 

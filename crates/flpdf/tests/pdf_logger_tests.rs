@@ -1,3 +1,6 @@
+mod common;
+use common::PdfCanonicalTestExt;
+
 use flpdf::job::QPDFJob;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
@@ -302,8 +305,8 @@ fn warning_routes_lazy_resolution_immediately_and_only_once() {
     )
     .unwrap();
 
-    pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
-    pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
+    pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap();
+    pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap();
 
     assert_eq!(
         output.lock().unwrap().as_slice(),
@@ -327,7 +330,7 @@ fn warning_delivery_failure_is_returned_after_the_diagnostic_is_appended() {
     .unwrap();
 
     assert!(matches!(
-        pdf.resolve_object(ObjectRef::new(5, 0)),
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)),
         Err(Error::System(ref message)) if message == "warning sink failed"
     ));
     assert_eq!(
@@ -352,7 +355,7 @@ fn live_logger_replacement_routes_only_to_the_replacement() {
 
     pdf.set_logger(replacement.clone());
     assert_eq!(pdf.logger(), replacement);
-    pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
+    pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap();
 
     assert!(original_output.lock().unwrap().is_empty());
     assert_eq!(
@@ -376,12 +379,12 @@ fn live_suppression_toggle_only_changes_delivery_not_collection() {
 
     pdf.set_suppress_warnings(true);
     assert!(pdf.suppress_warnings());
-    pdf.resolve_object(ObjectRef::new(4, 0)).unwrap();
+    pdf.resolve_canonical_object(ObjectRef::new(4, 0)).unwrap();
     assert!(output.lock().unwrap().is_empty());
 
     pdf.set_suppress_warnings(false);
     assert!(!pdf.suppress_warnings());
-    pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
+    pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap();
 
     let diagnostics = pdf.repair_diagnostics();
     assert_eq!(diagnostics.entries().len(), 2);

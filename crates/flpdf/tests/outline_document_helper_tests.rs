@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
 mod common;
+use common::PdfCanonicalTestExt;
 use common::{remap_object_refs, write_with_settings_and_mapping, WriterTestSettings};
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
@@ -257,7 +258,7 @@ fn write_outlines_json(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
 
 fn direct_dests_root(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Dictionary {
     let catalog_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_canonical_object(catalog_ref).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
@@ -877,7 +878,7 @@ fn construction_integerizes_a_bare_reference_item() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(5, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap(),
         Object::Integer(6)
     );
     let mut helper = pdf.outline();
@@ -1883,7 +1884,7 @@ fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
             ),
             [(object_number, _)] => {
                 let Object::Dictionary(root) = pdf
-                    .resolve_object(ObjectRef::new(*object_number, 0))
+                    .resolve_canonical_object(ObjectRef::new(*object_number, 0))
                     .unwrap()
                 else {
                     panic!("{label}: indirect root must remain a dictionary");
@@ -1942,7 +1943,8 @@ fn direct_first_child_short_pair_repairs_from_the_mutated_root() {
             6, 0
         ))]))
     );
-    let Object::Dictionary(child) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Dictionary(child) = pdf.resolve_canonical_object(ObjectRef::new(6, 0)).unwrap()
+    else {
         panic!("converted first child must be an indirect dictionary");
     };
     assert_eq!(
@@ -2346,7 +2348,8 @@ fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_se
             Object::Reference(ObjectRef::new(9, 0)),
         ]))
     );
-    let Object::Dictionary(first_parent) = pdf.resolve_object(ObjectRef::new(10, 0)).unwrap()
+    let Object::Dictionary(first_parent) =
+        pdf.resolve_canonical_object(ObjectRef::new(10, 0)).unwrap()
     else {
         panic!("converted first parent must be a dictionary");
     };
@@ -2356,7 +2359,9 @@ fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_se
             11, 0,
         ))]))
     );
-    let Object::Dictionary(first_leaf) = pdf.resolve_object(ObjectRef::new(11, 0)).unwrap() else {
+    let Object::Dictionary(first_leaf) =
+        pdf.resolve_canonical_object(ObjectRef::new(11, 0)).unwrap()
+    else {
         panic!("converted first leaf must be a dictionary");
     };
     assert_eq!(
@@ -2386,7 +2391,9 @@ fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_se
         dests.get("Kids"),
         Some(Object::Array(kids)) if kids.first() == Some(&Object::Reference(mapped_first_parent))
     ));
-    let Object::Dictionary(first_parent) = reopened.resolve_object(mapped_first_parent).unwrap()
+    let Object::Dictionary(first_parent) = reopened
+        .resolve_canonical_object(mapped_first_parent)
+        .unwrap()
     else {
         panic!("reopened first parent must be a dictionary");
     };
@@ -2416,7 +2423,8 @@ fn name_tree_begin_converts_a_direct_first_kid_under_an_indirect_root() {
         warning_messages(&pdf),
         ["Name/Number tree node (object 8): converting kid number 0 to an indirect object"]
     );
-    let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(8, 0)).unwrap() else {
+    let Object::Dictionary(root) = pdf.resolve_canonical_object(ObjectRef::new(8, 0)).unwrap()
+    else {
         panic!("indirect destination root must remain a dictionary");
     };
     assert_eq!(
@@ -2426,7 +2434,7 @@ fn name_tree_begin_converts_a_direct_first_kid_under_an_indirect_root() {
         ))]))
     );
     assert!(matches!(
-        pdf.resolve_object(ObjectRef::new(9, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(9, 0)).unwrap(),
         Object::Dictionary(_)
     ));
 
@@ -2439,7 +2447,7 @@ fn name_tree_begin_converts_a_direct_first_kid_under_an_indirect_root() {
     let mapped_root = mapping[&ObjectRef::new(8, 0)];
     let mapped_leaf = mapping[&ObjectRef::new(9, 0)];
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
-    let Object::Dictionary(root) = reopened.resolve_object(mapped_root).unwrap() else {
+    let Object::Dictionary(root) = reopened.resolve_canonical_object(mapped_root).unwrap() else {
         panic!("reopened indirect destination root must remain a dictionary");
     };
     assert_eq!(
@@ -2468,7 +2476,8 @@ fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
         warning_messages(&pdf),
         ["Name/Number tree node: converting kid number 0 to an indirect object"]
     );
-    let Object::Dictionary(names) = pdf.resolve_object(ObjectRef::new(8, 0)).unwrap() else {
+    let Object::Dictionary(names) = pdf.resolve_canonical_object(ObjectRef::new(8, 0)).unwrap()
+    else {
         panic!("indirect /Names holder must remain a dictionary");
     };
     let Some(Object::Dictionary(root)) = names.get("Dests") else {
@@ -2490,7 +2499,7 @@ fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
     let mapped_names = mapping[&ObjectRef::new(8, 0)];
     let mapped_leaf = mapping[&ObjectRef::new(9, 0)];
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
-    let Object::Dictionary(names) = reopened.resolve_object(mapped_names).unwrap() else {
+    let Object::Dictionary(names) = reopened.resolve_canonical_object(mapped_names).unwrap() else {
         panic!("reopened indirect /Names holder must remain a dictionary");
     };
     let Some(Object::Dictionary(root)) = names.get("Dests") else {
@@ -2595,7 +2604,7 @@ fn name_tree_begin_indirects_a_direct_scalar_before_reporting_it_as_non_dictiona
         ]))
     );
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(9, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(9, 0)).unwrap(),
         Object::Integer(42)
     );
 }
@@ -3274,7 +3283,7 @@ fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
     );
 
     let catalog_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_canonical_object(catalog_ref).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
@@ -3292,7 +3301,7 @@ fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
         ]))
     );
     assert!(matches!(
-        pdf.resolve_object(ObjectRef::new(8, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(8, 0)).unwrap(),
         Object::Dictionary(_)
     ));
 
@@ -3303,7 +3312,8 @@ fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
     };
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
     let catalog_ref = reopened.root_ref().unwrap();
-    let Object::Dictionary(catalog) = reopened.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = reopened.resolve_canonical_object(catalog_ref).unwrap()
+    else {
         panic!("reopened catalog must be a dictionary");
     };
     let Object::Dictionary(names) = catalog.get("Names").unwrap() else {
@@ -3388,14 +3398,15 @@ fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsin
     );
 
     let catalog_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_canonical_object(catalog_ref).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     assert_eq!(
         catalog.get("Names"),
         Some(&Object::Reference(ObjectRef::new(20, 0)))
     );
-    let Object::Dictionary(names) = pdf.resolve_object(ObjectRef::new(20, 0)).unwrap() else {
+    let Object::Dictionary(names) = pdf.resolve_canonical_object(ObjectRef::new(20, 0)).unwrap()
+    else {
         panic!("indirect /Names holder must remain a dictionary");
     };
     assert_eq!(
@@ -3403,10 +3414,11 @@ fn missing_name_tree_limits_repairs_the_terminal_indirect_root_without_collapsin
         Some(&Object::Reference(ObjectRef::new(21, 0)))
     );
     assert_eq!(
-        pdf.resolve_object(ObjectRef::new(21, 0)).unwrap(),
+        pdf.resolve_canonical_object(ObjectRef::new(21, 0)).unwrap(),
         Object::Reference(ObjectRef::new(22, 0))
     );
-    let Object::Dictionary(dests) = pdf.resolve_object(ObjectRef::new(22, 0)).unwrap() else {
+    let Object::Dictionary(dests) = pdf.resolve_canonical_object(ObjectRef::new(22, 0)).unwrap()
+    else {
         panic!("terminal /Dests root must remain a dictionary");
     };
     assert_eq!(dests.get("Kids"), None);
@@ -3477,10 +3489,12 @@ fn malformed_name_tree_repair_rebuilds_more_than_one_leaf() {
     );
     assert_eq!(dests.get("Names"), None);
 
-    let Object::Dictionary(first) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap() else {
+    let Object::Dictionary(first) = pdf.resolve_canonical_object(ObjectRef::new(9, 0)).unwrap()
+    else {
         panic!("first repaired leaf must be a dictionary");
     };
-    let Object::Dictionary(second) = pdf.resolve_object(ObjectRef::new(10, 0)).unwrap() else {
+    let Object::Dictionary(second) = pdf.resolve_canonical_object(ObjectRef::new(10, 0)).unwrap()
+    else {
         panic!("second repaired leaf must be a dictionary");
     };
     assert!(matches!(first.get("Names"), Some(Object::Array(names)) if names.len() == 32));
@@ -3530,10 +3544,13 @@ fn malformed_name_tree_repair_reproduces_qpdf_parent_split_order() {
     let Object::Reference(second_parent_ref) = root_kids[1] else {
         panic!("second repaired parent must be indirect");
     };
-    let Object::Dictionary(first_parent) = pdf.resolve_object(first_parent_ref).unwrap() else {
+    let Object::Dictionary(first_parent) = pdf.resolve_canonical_object(first_parent_ref).unwrap()
+    else {
         panic!("first repaired parent must be a dictionary");
     };
-    let Object::Dictionary(second_parent) = pdf.resolve_object(second_parent_ref).unwrap() else {
+    let Object::Dictionary(second_parent) =
+        pdf.resolve_canonical_object(second_parent_ref).unwrap()
+    else {
         panic!("second repaired parent must be a dictionary");
     };
     assert!(matches!(first_parent.get("Kids"), Some(Object::Array(kids)) if kids.len() == 16));
@@ -3655,14 +3672,15 @@ fn malformed_name_tree_repair_updates_a_direct_root_inside_indirect_names() {
         page_dest(3)
     );
     let catalog_ref = pdf.root_ref().unwrap();
-    let Object::Dictionary(catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_canonical_object(catalog_ref).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     assert_eq!(
         catalog.get("Names"),
         Some(&Object::Reference(ObjectRef::new(20, 0)))
     );
-    let Object::Dictionary(names) = pdf.resolve_object(ObjectRef::new(20, 0)).unwrap() else {
+    let Object::Dictionary(names) = pdf.resolve_canonical_object(ObjectRef::new(20, 0)).unwrap()
+    else {
         panic!("indirect /Names must remain a dictionary");
     };
     let Object::Dictionary(dests) = names.get("Dests").unwrap() else {
@@ -3981,7 +3999,7 @@ fn named_destination_materializes_indirect_result_holder() {
 }
 
 fn raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> Object {
-    let Object::Dictionary(item) = pdf.resolve_object(item_ref).unwrap() else {
+    let Object::Dictionary(item) = pdf.resolve_canonical_object(item_ref).unwrap() else {
         panic!("outline item must be a dictionary");
     };
     item.get("A").cloned().unwrap_or(Object::Null)
@@ -3992,7 +4010,7 @@ fn resolved_raw_action(pdf: &mut Pdf<Cursor<Vec<u8>>>, item_ref: ObjectRef) -> O
     let mut seen = BTreeSet::new();
     while let Object::Reference(reference) = value {
         assert!(seen.insert(reference), "cycle in test action holder");
-        value = pdf.resolve_object(reference).unwrap();
+        value = pdf.resolve_canonical_object(reference).unwrap();
     }
     value
 }
@@ -4304,7 +4322,8 @@ fn action_goto_named_dest_kept_verbatim_while_name_tree_remaps() {
     );
 
     // The name tree's raw "mydest" destination array is what gets remapped.
-    let Object::Dictionary(dests) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap() else {
+    let Object::Dictionary(dests) = pdf.resolve_canonical_object(ObjectRef::new(9, 0)).unwrap()
+    else {
         panic!("/Names /Dests leaf must remain a dictionary");
     };
     let Object::Array(entries) = dests.get("Names").unwrap() else {

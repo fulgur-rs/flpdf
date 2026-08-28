@@ -6677,6 +6677,15 @@ mod tests {
     use flpdf::{Dictionary, Object, Stream};
     use std::sync::{Arc, Mutex};
 
+    fn resolved_object<R: std::io::Read + std::io::Seek>(
+        pdf: &mut flpdf::Pdf<R>,
+        object_ref: flpdf::ObjectRef,
+    ) -> flpdf::Result<flpdf::Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
+
     struct ChunkRecordingSink {
         chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     }
@@ -6838,7 +6847,10 @@ mod tests {
         let holder_ref = ObjectRef::new(100, 0);
         let stream_ref = ObjectRef::new(101, 0);
 
-        let mut page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
+        let mut page = resolved_object(&mut pdf, page_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         page.insert("Contents", Object::Reference(holder_ref));
         pdf.set_object(page_ref, Object::Dictionary(page));
         pdf.set_object(holder_ref, Object::Reference(stream_ref));
@@ -6861,8 +6873,7 @@ mod tests {
             }]
         );
         assert_eq!(seen, HashSet::from([stream_ref]));
-        let stream = pdf
-            .resolve_object(stream_ref)
+        let stream = resolved_object(&mut pdf, stream_ref)
             .unwrap()
             .into_stream()
             .unwrap();
@@ -6877,7 +6888,10 @@ mod tests {
         .unwrap();
         let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
         let direct_stream = Stream::new(Dictionary::new(), b"\r<0g".to_vec());
-        let mut page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
+        let mut page = resolved_object(&mut pdf, page_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         page.insert("Contents", Object::Stream(direct_stream));
         pdf.set_object(page_ref, Object::Dictionary(page));
 
@@ -6886,7 +6900,10 @@ mod tests {
 
         assert!(warnings.is_empty());
         assert!(seen.is_empty());
-        let page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
+        let page = resolved_object(&mut pdf, page_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         assert_eq!(
             page.get("Contents")
                 .and_then(Object::as_stream)

@@ -19,6 +19,9 @@
 #[path = "support/filter_handles.rs"]
 mod filter_handles;
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf, Stream};
 use std::io::Cursor;
@@ -116,7 +119,7 @@ fn top_level_rewrite_with_args(src: &[u8], extra_args: &[&str]) -> Vec<u8> {
 fn extract_obj4(pdf_bytes: &[u8]) -> Stream {
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes.to_vec())).expect("open output PDF");
     match pdf
-        .resolve_object(ObjectRef::new(4, 0))
+        .resolve_canonical_object(ObjectRef::new(4, 0))
         .expect("resolve 4 0 R")
     {
         Object::Stream(s) => s,

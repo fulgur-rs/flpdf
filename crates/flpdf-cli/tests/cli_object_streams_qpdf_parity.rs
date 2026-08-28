@@ -22,6 +22,9 @@
 //!   on CI.
 //! - **Local runs**: print a diagnostic and return early (tests skip).
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use assert_cmd::Command as CargoCommand;
 use flpdf::{Object, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
@@ -303,7 +306,7 @@ fn disable_mode_emits_no_objstm() {
     let bytes = std::fs::read(&disabled).unwrap();
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     let has_objstm = pdf.object_refs().into_iter().any(|r| {
-        if let Ok(Object::Stream(s)) = pdf.resolve_object(r) {
+        if let Ok(Object::Stream(s)) = pdf.resolve_canonical_object(r) {
             matches!(s.dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"ObjStm")
         } else {
             false
@@ -351,7 +354,7 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
         .root_ref()
         .expect("output PDF must have a /Root reference in trailer");
     let catalog = pdf
-        .resolve_object(root_ref)
+        .resolve_canonical_object(root_ref)
         .expect("failed to resolve /Root");
     let catalog_dict = match &catalog {
         Object::Dictionary(d) => d.clone(),
@@ -367,7 +370,7 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
         .get_ref("Pages")
         .expect("/Catalog must contain a /Pages reference");
     let pages = pdf
-        .resolve_object(pages_ref)
+        .resolve_canonical_object(pages_ref)
         .expect("failed to resolve /Pages");
     let pages_dict = match pages {
         Object::Dictionary(d) => d,
@@ -444,7 +447,7 @@ fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32>
             continue;
         }
         let obj_ref = ObjectRef::new(num, generation);
-        let obj = match pdf.resolve_object(obj_ref) {
+        let obj = match pdf.resolve_canonical_object(obj_ref) {
             Ok(o) => o,
             // If we cannot resolve it, skip (e.g. object 0 free).
             Err(_) => continue,

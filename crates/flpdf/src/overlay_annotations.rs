@@ -29,6 +29,15 @@ use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 
 const MAX_PARENT_WALK_DEPTH: usize = 100;
 
+// This module's survey/template path is retained only for existing tests until
+// the AcroForm appearance/resource owner absorbs it. Resolve through the live
+// canonical handle first; no reader-owned raw resolver is used here.
+fn resolve_materialized<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve(&handle)?;
+    handle.materialize()
+}
+
 /// Per-placement inherited-field override plan derived from the source and
 /// dest `/AcroForm`'s `/DA` and `/Q` defaults, consumed by
 /// [`adjust_inherited_field`] during the field-tree BFS. See qpdf
@@ -96,7 +105,7 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
     // /Annots is neither Array/Reference/Null) are malformed-input
     // branches without a corresponding qpdf-oracle golden.
     let annots_val = {
-        let obj = source.resolve_borrowed(source_page_ref)?;
+        let obj = resolve_materialized(source, source_page_ref)?;
         let Some(dict) = obj.as_dict() else {
             return Ok(None);
         };
@@ -105,7 +114,7 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
     let annots_array = match annots_val {
         None | Some(Object::Null) => return Ok(None),
         Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match source.resolve_object(r)? {
+        Some(Object::Reference(r)) => match resolve_materialized(source, r)? {
             Object::Array(arr) => arr,
             _ => return Ok(None),
         },
@@ -213,7 +222,7 @@ fn top_level_field_for_annot<R: Read + Seek>(
     // Read the annot dict, deciding whether it is a widget and whether it
     // itself is a field.
     let (is_widget, is_field, parent_ref) = {
-        let obj = source.resolve_borrowed(annot_ref)?;
+        let obj = resolve_materialized(source, annot_ref)?;
         let Some(dict) = obj.as_dict() else {
             return Ok(None); // cov:ignore: annot ref resolves to non-dict — malformed source
         };
@@ -249,7 +258,7 @@ fn top_level_field_for_annot<R: Read + Seek>(
             return Ok(None); // /Parent cycle — malformed input
         }
         let parent_of_current = {
-            let obj = source.resolve_borrowed(current)?;
+            let obj = resolve_materialized(source, current)?;
             let Some(dict) = obj.as_dict() else {
                 return Ok(None);
             };
@@ -290,7 +299,7 @@ fn read_source_acroform_defaults<R: Read + Seek>(
         return Ok((None, None, None));
     };
     let acroform_val = {
-        let obj = source.resolve_borrowed(root_ref)?;
+        let obj = resolve_materialized(source, root_ref)?;
         let Some(dict) = obj.as_dict() else {
             return Ok((None, None, None));
         };
@@ -299,7 +308,7 @@ fn read_source_acroform_defaults<R: Read + Seek>(
     let acroform_dict = match acroform_val {
         None | Some(Object::Null) => return Ok((None, None, None)),
         Some(Object::Dictionary(d)) => d,
-        Some(Object::Reference(r)) => match source.resolve_object(r)? {
+        Some(Object::Reference(r)) => match resolve_materialized(source, r)? {
             Object::Dictionary(d) => d,
             _ => return Ok((None, None, None)),
         },
@@ -678,7 +687,7 @@ fn shallow_dup_indirect<R: Read + Seek>(
     dest: &mut Pdf<R>,
     src_ref: ObjectRef,
 ) -> Result<ObjectRef> {
-    let obj = dest.resolve_object(src_ref)?;
+    let obj = resolve_materialized(dest, src_ref)?;
     let new_ref = allocate_next_ref(dest)?;
     dest.set_object(new_ref, obj);
     Ok(new_ref)
@@ -748,7 +757,7 @@ fn duplicate_field_tree<R: Read + Seek>(
         // Read the dup's current dictionary (which is a shallow-copy of the
         // source's dict at the time of shallow_dup_indirect, so /Parent and
         // /Kids still hold source refs).
-        let Some(mut dict) = dest.resolve_object(dup_ref)?.into_dict() else {
+        let Some(mut dict) = resolve_materialized(dest, dup_ref)?.into_dict() else {
             continue; // cov:ignore: dup ref resolved to non-dict — malformed
         };
 
@@ -769,7 +778,7 @@ fn duplicate_field_tree<R: Read + Seek>(
             let kids_array = match kids_val {
                 Object::Array(arr) => Some(arr),
                 // cov:ignore-start: indirect /Kids resolution — defensive shape
-                Object::Reference(kr) => match dest.resolve_object(kr)? {
+                Object::Reference(kr) => match resolve_materialized(dest, kr)? {
                     Object::Array(arr) => Some(arr),
                     _ => None,
                 },
@@ -847,7 +856,7 @@ fn duplicate_field_tree<R: Read + Seek>(
                 // a direct /DA string, so this arm needs a source with
                 // `/DA <ref>` to reach.
                 Some(Object::Reference(da_ref)) => {
-                    match dest.resolve_object(da_ref)? {
+                    match resolve_materialized(dest, da_ref)? {
                         Object::String(da) => {
                             let new_da = adjust_default_appearance(&da, dr_map)?;
                             dict.insert("DA", Object::String(new_da));
@@ -901,7 +910,7 @@ fn transform_annot_ap_streams<R: Read + Seek>(
     cm: Matrix,
     dr_map: &DrMap,
 ) -> Result<()> {
-    let Some(mut annot_dict) = dest.resolve_object(annot_ref)?.into_dict() else {
+    let Some(mut annot_dict) = resolve_materialized(dest, annot_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
     let Some(ap_val) = annot_dict.get("AP").cloned() else {
@@ -909,7 +918,7 @@ fn transform_annot_ap_streams<R: Read + Seek>(
     };
     let Some(mut apdict) = (match ap_val {
         Object::Dictionary(d) => Some(d),
-        Object::Reference(r) => dest.resolve_object(r)?.into_dict(), // cov:ignore: function signature — llvm-cov instrumentation artifact
+        Object::Reference(r) => resolve_materialized(dest, r)?.into_dict(), // cov:ignore: function signature — llvm-cov instrumentation artifact
         _ => None, // cov:ignore: fallback match arm — defensive/malformed input
     }) else {
         return Ok(()); // cov:ignore: defensive early return
@@ -964,7 +973,7 @@ fn dup_and_transform_ap_stream<R: Read + Seek>(
     stream_ref: ObjectRef,
     cm: Matrix,
 ) -> Result<Option<ObjectRef>> {
-    let obj = dest.resolve_object(stream_ref)?;
+    let obj = resolve_materialized(dest, stream_ref)?;
     let Object::Stream(mut stream) = obj else {
         return Ok(None); // cov:ignore: defensive early return
     };
@@ -1042,7 +1051,7 @@ fn transform_annot_rect<R: Read + Seek>(
     annot_ref: ObjectRef,
     cm: Matrix,
 ) -> Result<()> {
-    let Some(mut dict) = dest.resolve_object(annot_ref)?.into_dict() else {
+    let Some(mut dict) = resolve_materialized(dest, annot_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
     let rect_val = dict.get("Rect").cloned();
@@ -1111,7 +1120,7 @@ fn read_dest_acroform_defaults<R: Read + Seek>(dest: &mut Pdf<R>) -> Result<(Vec
         return Ok((Vec::new(), 0)); // cov:ignore: defensive early return
     };
     let acroform_val = {
-        let obj = dest.resolve_borrowed(root_ref)?;
+        let obj = resolve_materialized(dest, root_ref)?;
         let Some(dict) = obj.as_dict() else {
             return Ok((Vec::new(), 0)); // cov:ignore: defensive early return
         };
@@ -1120,7 +1129,7 @@ fn read_dest_acroform_defaults<R: Read + Seek>(dest: &mut Pdf<R>) -> Result<(Vec
     let acroform_dict = match acroform_val {
         None | Some(Object::Null) => return Ok((Vec::new(), 0)),
         Some(Object::Dictionary(d)) => d, // cov:ignore: match arm — defensive on unexpected shape
-        Some(Object::Reference(r)) => match dest.resolve_object(r)? {
+        Some(Object::Reference(r)) => match resolve_materialized(dest, r)? {
             Object::Dictionary(d) => d,
             _ => return Ok((Vec::new(), 0)), // cov:ignore: defensive early return
         },
@@ -1188,7 +1197,7 @@ fn ancestor_has_key<R: Read + Seek>(
             return Ok(false); // cov:ignore: defensive early return
         }
         let parent = {
-            let obj = dest.resolve_borrowed(current)?;
+            let obj = resolve_materialized(dest, current)?;
             let Some(dict) = obj.as_dict() else {
                 return Ok(false); // cov:ignore: defensive early return
             };
@@ -1204,7 +1213,7 @@ fn ancestor_has_key<R: Read + Seek>(
             .copied()
             .unwrap_or(parent_ref);
         let has = {
-            let obj = dest.resolve_borrowed(ancestor_ref)?;
+            let obj = resolve_materialized(dest, ancestor_ref)?;
             match obj.as_dict() {
                 Some(dict) => dict.get(key).is_some(),
                 None => false, // cov:ignore: defensive `None` match arm
@@ -1234,7 +1243,7 @@ fn set_annot_page_ref_if_null<R: Read + Seek>(
     dest: &mut Pdf<R>,
     annot_ref: ObjectRef,
 ) -> Result<()> {
-    let Some(mut dict) = dest.resolve_object(annot_ref)?.into_dict() else {
+    let Some(mut dict) = resolve_materialized(dest, annot_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
     match dict.get("P") {
@@ -1257,7 +1266,7 @@ fn append_page_annots<R: Read + Seek>(
     if new_annot_refs.is_empty() {
         return Ok(()); // cov:ignore: defensive early return
     }
-    let Some(mut page_dict) = dest.resolve_object(dest_page_ref)?.into_dict() else {
+    let Some(mut page_dict) = resolve_materialized(dest, dest_page_ref)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
     // cov:ignore-start: pre-existing /Annots on the dest page — none of the
@@ -1267,7 +1276,7 @@ fn append_page_annots<R: Read + Seek>(
     let mut annots = match page_dict.get("Annots").cloned() {
         None | Some(Object::Null) => Vec::new(),
         Some(Object::Array(arr)) => arr,
-        Some(Object::Reference(r)) => match dest.resolve_object(r)? {
+        Some(Object::Reference(r)) => match resolve_materialized(dest, r)? {
             Object::Array(arr) => arr,
             _ => Vec::new(),
         },
@@ -1312,7 +1321,7 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             "destination has no /Root; cannot install /AcroForm for copied form fields".into(),
         ));
     };
-    let Some(mut catalog) = dest.resolve_object(root_ref)?.into_dict() else {
+    let Some(mut catalog) = resolve_materialized(dest, root_ref)?.into_dict() else {
         return Err(Error::Unsupported(
             "destination /Root does not resolve to a dictionary".into(),
         ));
@@ -1345,7 +1354,7 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
             af_ref
         }
     };
-    let mut acroform_dict = match dest.resolve_object(acroform_ref)?.into_dict() {
+    let mut acroform_dict = match resolve_materialized(dest, acroform_ref)?.into_dict() {
         Some(d) => d,
         // cov:ignore-start: defensive early return on non-dict /AcroForm
         None => {
@@ -1422,10 +1431,10 @@ fn merge_resources_shallow<R: Read + Seek>(
     source_dr: ObjectRef,
     dr_map: &mut DrMap,
 ) -> Result<()> {
-    let Some(src_dict) = dest.resolve_object(source_dr)?.into_dict() else {
+    let Some(src_dict) = resolve_materialized(dest, source_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
-    let Some(mut dest_dict) = dest.resolve_object(dest_dr)?.into_dict() else {
+    let Some(mut dest_dict) = resolve_materialized(dest, dest_dr)?.into_dict() else {
         return Ok(()); // cov:ignore: defensive early return
     };
     // Reset both maps to the identity mappings this merge is about to
@@ -1444,11 +1453,11 @@ fn merge_resources_shallow<R: Read + Seek>(
     // operates on resolved QPDFObjectHandle values, so both shapes must
     // merge — losing an indirect source sub-dict would drop the referenced
     // fonts entirely. `src_dict` is owned (from `into_dict`), so the loop's
-    // borrow of it does not collide with `dest.resolve_object(...)` on the mutable
+    // borrow of it does not collide with `resolve_materialized(dest, ...)` on the mutable
     // `dest` — both borrows are of separate variables.
     for (type_key, src_type_val) in src_dict.iter() {
         let src_type_dict = match src_type_val {
-            Object::Reference(r) => dest.resolve_object(*r)?.into_dict(),
+            Object::Reference(r) => resolve_materialized(dest, *r)?.into_dict(),
             _ => src_type_val.as_dict().cloned(),
         };
 
@@ -1475,7 +1484,7 @@ fn merge_resources_shallow<R: Read + Seek>(
         // subsequent `_N` renames) into every other holder of that ref.
         let (mut new_type_dict, new_indirect_target) = match dest_dict.get(type_key).cloned() {
             Some(Object::Dictionary(existing)) => (existing, None),
-            Some(Object::Reference(r)) => match dest.resolve_object(r)?.into_dict() {
+            Some(Object::Reference(r)) => match resolve_materialized(dest, r)?.into_dict() {
                 Some(d) => (d, Some(allocate_next_ref(dest)?)),
                 // cov:ignore-start: dest resource-type ref does not resolve
                 // to a dict — degrade to a fresh dict and replace inline.
@@ -1648,14 +1657,16 @@ pub(crate) fn get_resource_names<R: Read + Seek>(
     let mut names = BTreeSet::new();
     for (_, value) in dict.iter() {
         let value_dict = match value {
-            Object::Reference(reference) => pdf.resolve_object(*reference)?.into_dict(),
+            Object::Reference(reference) => resolve_materialized(pdf, *reference)?.into_dict(),
             _ => value.as_dict().cloned(),
         };
         if let Some(value_dict) = value_dict {
             for (key, nested_value) in value_dict.iter() {
                 let is_null = match nested_value {
                     Object::Null => true,
-                    Object::Reference(reference) => pdf.resolve_object(*reference)?.is_null(),
+                    Object::Reference(reference) => {
+                        resolve_materialized(pdf, *reference)?.is_null()
+                    }
                     _ => false,
                 };
                 if !is_null {
@@ -1724,7 +1735,10 @@ mod tests {
     }
 
     fn font_dict<R: Read + Seek>(pdf: &mut Pdf<R>, dr_ref: ObjectRef) -> crate::Dictionary {
-        let dr = pdf.resolve_object(dr_ref).unwrap().into_dict().unwrap();
+        let dr = resolve_materialized(pdf, dr_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         dr.get("Font").and_then(Object::as_dict).unwrap().clone()
     }
 
@@ -2054,15 +2068,17 @@ mod tests {
 
         assert!(dr_map.is_empty(), "no name collision, no rename");
         // dest's /Font now points at a NEW indirect object (not the original).
-        let dest_dict = pdf.resolve_object(dest_dr).unwrap().into_dict().unwrap();
+        let dest_dict = resolve_materialized(&mut pdf, dest_dr)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let new_font_ref = dest_dict.get_ref("Font").expect("Font must be indirect");
         assert_ne!(
             new_font_ref, dest_font_subdict_ref,
             "qpdf shallow-copies indirect sub-dicts into a fresh ref",
         );
         // The ORIGINAL indirect object is untouched — still only carries F0.
-        let original = pdf
-            .resolve_object(dest_font_subdict_ref)
+        let original = resolve_materialized(&mut pdf, dest_font_subdict_ref)
             .unwrap()
             .into_dict()
             .unwrap();
@@ -2072,8 +2088,7 @@ mod tests {
             "original indirect object must not be mutated (other holders would see F1 leak)",
         );
         // The NEW indirect object carries the shallow-copied F0 plus F1.
-        let merged = pdf
-            .resolve_object(new_font_ref)
+        let merged = resolve_materialized(&mut pdf, new_font_ref)
             .unwrap()
             .into_dict()
             .unwrap();
@@ -2717,13 +2732,15 @@ mod tests {
              F1 -> F1_1 collision rename"
         );
 
-        let page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
+        let page = resolve_materialized(&mut pdf, page_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let annots_arr = page.get("Annots").and_then(Object::as_array).unwrap();
         assert_eq!(annots_arr.len(), 2);
         let new_non_field_annot_ref = annots_arr[0].as_ref_id().unwrap();
 
-        let new_annot = pdf
-            .resolve_object(new_non_field_annot_ref)
+        let new_annot = resolve_materialized(&mut pdf, new_non_field_annot_ref)
             .unwrap()
             .into_dict()
             .unwrap();
@@ -2732,8 +2749,7 @@ mod tests {
             .and_then(Object::as_dict)
             .and_then(|ap| ap.get_ref("N"))
             .expect("dup'd AP /N stream ref");
-        let new_ap_stream = pdf
-            .resolve_object(new_ap_stream_ref)
+        let new_ap_stream = resolve_materialized(&mut pdf, new_ap_stream_ref)
             .unwrap()
             .into_stream()
             .unwrap();
@@ -2790,7 +2806,10 @@ mod tests {
 
         transform_annot_ap_streams(&mut pdf, annot_ref, Matrix::default(), &dr_map).unwrap();
 
-        let annot = pdf.resolve_object(annot_ref).unwrap().into_dict().unwrap();
+        let annot = resolve_materialized(&mut pdf, annot_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let ap = annot.get("AP").and_then(Object::as_dict).unwrap();
         let top_ref = ap.get_ref("N").unwrap();
         let nested_ref = ap
@@ -2799,8 +2818,7 @@ mod tests {
             .and_then(|d| d.get_ref("On"))
             .unwrap();
         for stream_ref in [top_ref, nested_ref] {
-            let stream = pdf
-                .resolve_object(stream_ref)
+            let stream = resolve_materialized(&mut pdf, stream_ref)
                 .unwrap()
                 .into_stream()
                 .unwrap();
@@ -3163,10 +3181,12 @@ mod tests {
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
 
         let root_ref = dest.root_ref().unwrap();
-        let catalog = dest.resolve_object(root_ref).unwrap().into_dict().unwrap();
+        let catalog = resolve_materialized(&mut dest, root_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let acroform_ref = catalog.get_ref("AcroForm").unwrap();
-        let acroform = dest
-            .resolve_object(acroform_ref)
+        let acroform = resolve_materialized(&mut dest, acroform_ref)
             .unwrap()
             .into_dict()
             .unwrap();
@@ -3176,12 +3196,18 @@ mod tests {
         let f1_1_ref = font.get_ref("F1_1").expect("collision renamed to /F1_1");
         assert_ne!(f1_ref, f1_1_ref);
 
-        let f1_font = dest.resolve_object(f1_ref).unwrap().into_dict().unwrap();
+        let f1_font = resolve_materialized(&mut dest, f1_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         assert_eq!(
             f1_font.get("BaseFont"),
             Some(&Object::Name(b"Helvetica".to_vec()))
         );
-        let f1_1_font = dest.resolve_object(f1_1_ref).unwrap().into_dict().unwrap();
+        let f1_1_font = resolve_materialized(&mut dest, f1_1_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         assert_eq!(
             f1_1_font.get("BaseFont"),
             Some(&Object::Name(b"Courier".to_vec()))
@@ -3199,7 +3225,10 @@ mod tests {
             // defensive continue, since a malformed shape here is a test
             // setup bug, not an input to tolerate.
             let field_ref = field.as_ref_id().unwrap();
-            let field_dict = dest.resolve_object(field_ref).unwrap().into_dict().unwrap();
+            let field_dict = resolve_materialized(&mut dest, field_ref)
+                .unwrap()
+                .into_dict()
+                .unwrap();
             if let Some(Object::String(da)) = field_dict.get("DA") {
                 if da.as_slice() == b"0 0.4 0 rg /F1_1 18 Tf" {
                     saw_rewritten_da = true;
@@ -3251,10 +3280,12 @@ mod tests {
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
 
         let root_ref = dest.root_ref().unwrap();
-        let catalog = dest.resolve_object(root_ref).unwrap().into_dict().unwrap();
+        let catalog = resolve_materialized(&mut dest, root_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let acroform_ref = catalog.get_ref("AcroForm").unwrap();
-        let acroform = dest
-            .resolve_object(acroform_ref)
+        let acroform = resolve_materialized(&mut dest, acroform_ref)
             .unwrap()
             .into_dict()
             .unwrap();

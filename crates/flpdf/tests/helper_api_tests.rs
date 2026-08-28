@@ -111,9 +111,9 @@ fn page_helper_get_all_pages_matches_manual_kids() {
         helper.get_all_pages().unwrap()
     };
     let root = pdf.root_ref().unwrap();
-    let cat = pdf.resolve_object(root).unwrap();
+    let cat = pdf.resolve_canonical_object(root).unwrap();
     let pages_ref = cat.as_dict().unwrap().get_ref("Pages").unwrap();
-    let pages = pdf.resolve_object(pages_ref).unwrap();
+    let pages = pdf.resolve_canonical_object(pages_ref).unwrap();
     let manual: Vec<_> = pages
         .as_dict()
         .unwrap()
@@ -138,7 +138,7 @@ fn insert_page_at(pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>, new_num: u32) 
     use flpdf::{Object, ObjectRef};
     let root = pdf.root_ref().unwrap();
     let pages_ref = pdf
-        .resolve_object(root)
+        .resolve_canonical_object(root)
         .unwrap()
         .as_dict()
         .unwrap()
@@ -160,7 +160,11 @@ fn insert_page_at(pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>, new_num: u32) 
         ]),
     );
     pdf.set_object(page_ref, Object::Dictionary(page));
-    let mut pages = pdf.resolve_object(pages_ref).unwrap().into_dict().unwrap();
+    let mut pages = pdf
+        .resolve_canonical_object(pages_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let mut new_kids = pages.get("Kids").unwrap().as_array().unwrap().to_vec();
     let new_count = new_kids.len() as i64 + 1;
     new_kids.insert(1, Object::Reference(page_ref));
@@ -187,13 +191,13 @@ fn full_rewrite_converges_across_object_numbers() {
     let mut reopened = flpdf::Pdf::open(std::io::Cursor::new(bytes_a)).unwrap();
     let root = reopened.root_ref().unwrap();
     let pages_ref = reopened
-        .resolve_object(root)
+        .resolve_canonical_object(root)
         .unwrap()
         .as_dict()
         .unwrap()
         .get_ref("Pages")
         .unwrap();
-    let pages = reopened.resolve_object(pages_ref).unwrap();
+    let pages = reopened.resolve_canonical_object(pages_ref).unwrap();
     let kids = pages
         .as_dict()
         .unwrap()
@@ -208,7 +212,7 @@ fn full_rewrite_converges_across_object_numbers() {
     // pins the order to [original page 1, NEW page, original page 2] — not
     // merely "some /Page sits at index 1".
     let mid_ref = kids[1].as_ref_id().unwrap();
-    let mid = reopened.resolve_object(mid_ref).unwrap();
+    let mid = reopened.resolve_canonical_object(mid_ref).unwrap();
     let media_box: Vec<i64> = mid
         .as_dict()
         .unwrap()
@@ -290,7 +294,7 @@ fn acroform_helper_field_infos_match_manual_and_retain_indirect_handle() {
     // Manual raw extraction of the field refs: catalog -> AcroForm -> Fields.
     let root = pdf.root_ref().unwrap();
     let manual_field_refs: Vec<flpdf::ObjectRef> = {
-        let cat = pdf.resolve_object(root).unwrap();
+        let cat = pdf.resolve_canonical_object(root).unwrap();
         let cat_dict = cat.as_dict().unwrap();
         // /AcroForm is a direct inline dictionary here.
         let acroform = cat_dict.get("AcroForm").unwrap().as_dict().unwrap();
@@ -517,9 +521,9 @@ fn attachment_helpers_list_one_entry_matching_manual_name_tree() {
     // catalog -> /Names -> /EmbeddedFiles -> /Names [(key) ref].
     let root = pdf.root_ref().unwrap();
     let manual_ref = {
-        let cat = pdf.resolve_object(root).unwrap();
+        let cat = pdf.resolve_canonical_object(root).unwrap();
         let names_ref = cat.as_dict().unwrap().get_ref("Names").unwrap();
-        let names = pdf.resolve_object(names_ref).unwrap();
+        let names = pdf.resolve_canonical_object(names_ref).unwrap();
         let ef = names.as_dict().unwrap().get("EmbeddedFiles").unwrap();
         let pairs = ef
             .as_dict()
@@ -577,13 +581,17 @@ fn manual_set_pages_kids(
     use flpdf::Object;
     let root = pdf.root_ref().unwrap();
     let pages_ref = pdf
-        .resolve_object(root)
+        .resolve_canonical_object(root)
         .unwrap()
         .as_dict()
         .unwrap()
         .get_ref("Pages")
         .unwrap();
-    let mut pages = pdf.resolve_object(pages_ref).unwrap().into_dict().unwrap();
+    let mut pages = pdf
+        .resolve_canonical_object(pages_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     pages.insert(
         "Kids",
         Object::Array(kids.iter().map(|&r| Object::Reference(r)).collect()),
@@ -640,7 +648,11 @@ fn acroform_set_field_value_matches_manual_v_insert() {
                 .unwrap();
         },
         |pdf| {
-            let mut field = pdf.resolve_object(f1_ref).unwrap().into_dict().unwrap();
+            let mut field = pdf
+                .resolve_canonical_object(f1_ref)
+                .unwrap()
+                .into_dict()
+                .unwrap();
             field.insert("V", Object::String(b"Bob".to_vec()));
             pdf.set_object(f1_ref, Object::Dictionary(field));
         },
@@ -672,7 +684,11 @@ fn acroform_set_default_appearance_matches_manual_promote_and_insert() {
         |pdf| {
             // Reproduce the inline -> indirect promotion the helper performs.
             let root = pdf.root_ref().unwrap();
-            let mut catalog = pdf.resolve_object(root).unwrap().into_dict().unwrap();
+            let mut catalog = pdf
+                .resolve_canonical_object(root)
+                .unwrap()
+                .into_dict()
+                .unwrap();
             // We own `catalog` and repoint /AcroForm immediately below, so move
             // the old value out rather than cloning it.
             let mut acroform = match catalog.remove("AcroForm") {
@@ -736,7 +752,11 @@ fn attachment_insert_embedded_file_matches_manual_name_tree() {
             let mut names_dict = Dictionary::new();
             names_dict.insert("EmbeddedFiles", Object::Reference(leaf_ref));
             let root = pdf.root_ref().unwrap();
-            let mut catalog = pdf.resolve_object(root).unwrap().into_dict().unwrap();
+            let mut catalog = pdf
+                .resolve_canonical_object(root)
+                .unwrap()
+                .into_dict()
+                .unwrap();
             catalog.insert("Names", Object::Dictionary(names_dict));
             pdf.set_object(root, Object::Dictionary(catalog));
         },
@@ -785,7 +805,7 @@ fn acroform_inherited_da_is_read_without_materializing_fields() {
         Some(b"/Helv 12 Tf 0 g".to_vec())
     );
 
-    let field = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
+    let field = pdf.resolve_canonical_object(ObjectRef::new(5, 0)).unwrap();
     assert!(field.as_dict().unwrap().get("DA").is_none());
 }
 
@@ -807,7 +827,11 @@ fn attachment_delete_embedded_file_matches_manual_empty_tree() {
         |pdf| {
             use flpdf::{Dictionary, Object, ObjectRef};
             let names_ref = ObjectRef::new(3, 0);
-            let mut names = pdf.resolve_object(names_ref).unwrap().into_dict().unwrap();
+            let mut names = pdf
+                .resolve_canonical_object(names_ref)
+                .unwrap()
+                .into_dict()
+                .unwrap();
             let mut empty_tree = Dictionary::new();
             empty_tree.insert("Names", Object::Array(vec![]));
             names.insert("EmbeddedFiles", Object::Dictionary(empty_tree));
@@ -817,5 +841,6 @@ fn attachment_delete_embedded_file_matches_manual_empty_tree() {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{write_default, write_with_settings, WriterTestSettings};

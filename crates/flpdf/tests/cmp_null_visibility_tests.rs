@@ -3,6 +3,7 @@
 #![cfg(feature = "qpdf-zlib-compat")]
 
 mod common;
+use common::PdfCanonicalTestExt;
 
 use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
 use flpdf::{
@@ -814,7 +815,7 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
             .object_refs()
             .into_iter()
             .all(|object_ref| !matches!(
-                reopened.resolve_object(object_ref).unwrap(),
+                reopened.resolve_canonical_object(object_ref).unwrap(),
                 Object::Stream(ref stream)
                     if matches!(
                         stream.dict.get("Type"),
@@ -828,7 +829,7 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
             .object_refs()
             .into_iter()
             .any(|object_ref| matches!(
-                reopened.resolve_object(object_ref).unwrap(),
+                reopened.resolve_canonical_object(object_ref).unwrap(),
                 Object::Dictionary(ref dict)
                     if matches!(
                         dict.get("Type"),
@@ -897,7 +898,7 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
     );
     assert!(
         matches!(
-            reopened.resolve_object(held).unwrap(),
+            reopened.resolve_canonical_object(held).unwrap(),
             Object::Dictionary(ref dict)
                 if matches!(
                     dict.get("Kind"),
@@ -960,7 +961,7 @@ fn preserve_explicit_structural_deletion_keeps_source_container_over_100_members
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let mut member_counts = Vec::new();
     for object_ref in reopened.object_refs() {
-        if let Object::Stream(stream) = reopened.resolve_object(object_ref).unwrap() {
+        if let Object::Stream(stream) = reopened.resolve_canonical_object(object_ref).unwrap() {
             if matches!(
                 stream.dict.get("Type"),
                 Some(Object::Name(name)) if name.as_slice() == b"ObjStm"

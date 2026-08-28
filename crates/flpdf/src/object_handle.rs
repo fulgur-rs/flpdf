@@ -2955,13 +2955,10 @@ impl ObjectHandle {
     ///
     /// This mutates the live handle graph directly. If `self`'s ref has
     /// already been read through [`crate::Pdf::resolve`] or
-    /// [`crate::Pdf::resolve_borrowed`], those methods cache the
-    /// materialized value the first time a ref is resolved and do not
-    /// re-derive it — a later call to either will keep returning the
-    /// pre-mutation value for that ref rather than observing this change.
-    /// Callers that need `resolve`/`resolve_borrowed` to reflect a
-    /// mutation made through this API must not have resolved the same ref
-    /// through them first.
+    /// [`crate::Pdf::resolve`], resolution keeps the same canonical handle
+    /// identity while this mutation changes the live value in place. A later
+    /// canonical resolve observes that value; it does not rebuild a separate
+    /// raw snapshot.
     ///
     /// This also has no path to inform the owning [`crate::Pdf`] that
     /// `self`'s value changed. After mutating a handle, call
@@ -3632,8 +3629,8 @@ impl ObjectHandle {
     /// decoded, canonical dictionary key including its leading `/`; this API
     /// does not normalize slashless input. Never performs resolution itself.
     ///
-    /// See [`Self::replace_key`]'s doc comment for the same
-    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// See [`Self::replace_key`]'s doc comment for the same canonical
+    /// resolution behavior and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too.
     pub fn remove_key(&self, key: &[u8]) {
         let removed = self.with_value_mut(|v| {
@@ -3924,8 +3921,8 @@ impl ObjectHandle {
     /// the more "sensible"-looking alternative of the sub-dictionary's own
     /// keys.
     ///
-    /// See [`Self::replace_key`]'s doc comment for the same
-    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// See [`Self::replace_key`]'s doc comment for the same canonical
+    /// resolution behavior and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
     /// since this method installs and rebinds entries via `replace_key`.
     ///
@@ -4518,8 +4515,8 @@ impl ObjectHandle {
     /// buffer back two streams, as `QPDF::copyStreamData` does
     /// (`libqpdf/QPDF.cc:2240,2256-2258`).
     ///
-    /// See [`Self::replace_key`]'s doc comment for the same
-    /// `resolve`/`resolve_borrowed` staleness caveat and the
+    /// See [`Self::replace_key`]'s doc comment for the same canonical
+    /// resolution behavior and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
     /// since this method mutates the stream data in place and updates its
     /// dictionary through qpdf's lower-level stream-internal path.
@@ -5702,7 +5699,7 @@ impl ObjectHandle {
     }
 
     /// Convert this handle's value into a legacy [`crate::Object`] tree —
-    /// `Pdf::resolve`/`Pdf::resolve_borrowed`'s own materialization bridge,
+    /// `Pdf::resolve` followed by an explicit materialization boundary,
     /// also public for a caller outside this crate that still needs a
     /// legacy `Object`/[`Dictionary`] for one value reached through an
     /// otherwise `ObjectHandle`-native walk (e.g. `flpdf-qtest-tools`' qtest
@@ -5817,7 +5814,7 @@ impl ObjectHandle {
     pub fn unparse_resolved(&self) -> Vec<u8> {
         // Bridges through a null-omission-aware materialization walk
         // (`unparse_materialize`, distinct from the general `materialize`/
-        // `Pdf::resolve_borrowed` bridge -- see that function's own doc)
+        // `Pdf::resolve` materialization path -- see that function's own doc)
         // and `Object::write_pdf`'s own already-byte-identical-tested
         // formatter rather than duplicating array/dict/string-escaping
         // logic against `ObjectValue` directly.
@@ -6024,7 +6021,7 @@ fn materialize_child(handle: &ObjectHandle, depth: usize) -> Result<Object> {
 }
 
 // A separate materialization walk used only by `ObjectHandle::unparse_resolved`,
-// not by the general `materialize`/`Pdf::resolve_borrowed` bridge above (whose
+// not by the general `materialize` path above (whose
 // existing behavior other callers depend on unchanged). Applies qpdf's
 // dictionary-entry null-omission rule (`QPDF_Dictionary::unparse()`,
 // `libqpdf/QPDF_Dictionary.cc:59-69`: `if (!iter.second.isNull()) { ... }`) —

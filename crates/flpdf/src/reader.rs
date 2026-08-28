@@ -2,26 +2,14 @@
 pub(crate) mod file_object;
 pub(crate) mod resolver;
 
-use self::file_object::{
-    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingBody,
-    PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
-};
+use self::file_object::{parse_file_object_syntax, PendingBody, PendingFileObject};
 use crate::cache::CacheEntry;
-#[cfg(test)]
-use crate::encryption::crypt_filters::crypt_filter_modes;
-use crate::encryption::crypt_filters::interpret_cf;
-#[cfg(test)]
-use crate::encryption::crypt_filters::interpret_cf_from_handle;
 use crate::encryption::password::{password_candidates_for_read, PasswordMode};
 use crate::encryption::permissions::Permissions;
+use crate::encryption::standard::ObjectKeyAlg;
+use crate::encryption::state::{EncryptionInfo, EncryptionInspectionState};
 #[cfg(test)]
-use crate::encryption::standard::StringCipher;
-use crate::encryption::standard::{decrypt_cipher_bytes, decrypt_strings_in_object, ObjectKeyAlg};
-#[cfg(test)]
-use crate::encryption::state::aes128_object_key;
-use crate::encryption::state::{
-    EncryptionInfo, EncryptionInspectionState, EncryptionMode, EncryptionState,
-};
+use crate::encryption::state::{EncryptionMode, EncryptionState};
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 #[cfg(test)]
@@ -31,8 +19,9 @@ use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
 use crate::parser::dictionary_value_source_offset;
+#[cfg(test)]
 use crate::parser::parse_qpdf_file_object;
-use crate::pipeline::rc4::PlRc4;
+#[cfg(any(test, feature = "qtest-driver"))]
 use crate::tokenizer::Tokenizer;
 use crate::{
     Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, Stream, XrefEntry,
@@ -41,8 +30,6 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
-
-static NULL_OBJECT: Object = Object::Null;
 
 use crate::pdf::{CompressedMemberProvenance, Pdf};
 
@@ -218,40 +205,15 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.push_warning(message)
     }
 
-    /// Exact source framing removed by an authoritative `endstream` scan.
-    pub(crate) fn recovered_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
-        // The recovery scan runs against source bytes. When THIS stream's
-        // payload was decrypted, the byte belongs to ciphertext framing rather
-        // than to the plaintext returned by `resolve`. Document-wide
-        // encryption is not sufficient: metadata under `/EncryptMetadata
-        // false`, `/StmF /Identity`, and explicit `/Crypt /Identity` streams
-        // keep plaintext source bytes and therefore retain the recovered EOL.
-        if self.transformed_stream_refs.contains(&object_ref) {
-            return None;
-        }
-        self.recovered_stream_eols
-            .get(&object_ref)
-            .copied()
-            .map(crate::parser::RecoveredStreamEol::as_bytes)
-    }
-
     /// Exact source framing recorded by the canonical ObjectHandle resolver
-    /// after a repaired stream-length scan. This is intentionally separate
-    /// from [`Self::recovered_stream_eol`], whose map is synchronized only for
-    /// legacy `Object` compatibility reads. Job-level stream inspection needs
-    /// the qpdf-shaped metadata without entering that compatibility route.
+    /// after a repaired stream-length scan. Job-level stream inspection and
+    /// writer consumers use this qpdf-shaped metadata without a second raw
+    /// value cache.
     ///
-    /// `transformed_stream_refs` is populated only by the legacy
-    /// `resolve_to_cache` decrypt path, which pure canonical `ObjectHandle`
-    /// callers never reach, so it cannot gate this method. Instead this
-    /// mirrors the same guards
-    /// [`Self::synchronize_canonical_recovered_stream_eol`] uses: a recovered
-    /// EOL is not removable framing when the stream's own bytes were
-    /// replaced, it has a data provider, qpdf's `decryptStream` route would
-    /// transform this stream, or the source went through qpdf-style xref
-    /// reconstruction (after reconstruction the canonical raw stream view
-    /// is itself the public compatibility value; trimming it a second time
-    /// here would make that raw byte look like writer-only framing).
+    /// A recovered EOL is not removable framing when the stream's own bytes
+    /// were replaced, it has a data provider, qpdf's `decryptStream` route
+    /// would transform this stream, or the source went through qpdf-style xref
+    /// reconstruction.
     pub(crate) fn canonical_recovered_stream_eol(
         &self,
         object_ref: ObjectRef,
@@ -583,18 +545,21 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn encrypt_dictionary(&mut self) -> Result<Option<Dictionary>> {
-        match self.trailer_dictionary().get("Encrypt").cloned() {
-            None => Ok(None),
-            Some(Object::Dictionary(dict)) => Ok(Some(dict)),
-            Some(Object::Reference(object_ref)) => match self.resolve_borrowed(object_ref)? {
-                Object::Dictionary(dict) => Ok(Some(dict.clone())),
-                _ => Err(EncryptedError::Malformed {
-                    reason: "/Encrypt object is not a dictionary".into(),
-                }
-                .into()),
-            },
-            Some(_) => Err(EncryptedError::Malformed {
-                reason: "/Encrypt entry is not a dictionary or reference".into(),
+        let encrypt = self.trailer_key_handle(b"Encrypt");
+        if encrypt.is_null() {
+            return Ok(None);
+        }
+        self.resolve(&encrypt)?;
+        if encrypt.try_as_dictionary()?.is_none() {
+            return Err(EncryptedError::Malformed {
+                reason: "/Encrypt object is not a dictionary".into(),
+            }
+            .into());
+        }
+        match encrypt.materialize()? {
+            Object::Dictionary(dict) => Ok(Some(dict)),
+            _ => Err(EncryptedError::Malformed {
+                reason: "/Encrypt object is not a dictionary".into(),
             }
             .into()),
         }
@@ -611,7 +576,7 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// Bounded at `parser::MAX_PARSE_DEPTH`, not `lift`'s default
     /// `MAX_INLINE_DEPTH`: `object` already parsed successfully at the looser
-    /// bound (it came from [`Self::resolve_borrowed`] or an equivalent parse),
+    /// bound (it came from an already-parsed source object),
     /// so re-lifting through the tighter structural-walk bound would reject a
     /// value that parse already accepted — the same reasoning
     /// [`Self::trailer_key_handle`] documents for the analogous trailer-entry
@@ -672,7 +637,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// normal resolution, so `stream` text inside strings, names, comments, or
     /// earlier stream payloads cannot be mistaken for the stream marker.
     pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
@@ -696,7 +661,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         filter_index: usize,
     ) -> Result<Option<u64>> {
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
@@ -742,7 +707,7 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         object_refs: &[ObjectRef],
     ) -> Result<Vec<Option<u64>>> {
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         let mut offsets = BTreeMap::new();
         for &object_ref in object_refs {
             if offsets.contains_key(&object_ref) {
@@ -801,7 +766,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         array_indices: &[usize],
     ) -> Result<Vec<Option<u64>>> {
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(vec![None; array_indices.len()]);
         };
@@ -898,8 +863,8 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// The original on-disk bytes are not touched; [`crate::PdfWriter`] will
     /// see the updated value when it walks the cache and emit it in the fresh
-    /// output. Subsequent [`Pdf::resolve`]/
-    /// [`Pdf::resolve_borrowed`] calls for `object_ref` observe `object`
+    /// output. Subsequent canonical handle lookups for `object_ref` observe
+    /// `object`
     /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
         // This is the canonical cache replacement boundary, not xref
@@ -911,7 +876,7 @@ impl<R: Read + Seek> Pdf<R> {
         // xref/cache removal is separately `removeObject` (`:1996-2005`).
         // Refresh the legacy cache before replacing the canonical value, or
         // an old object-stream entry can incorrectly retain provenance.
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         // qpdf's replaceObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
         // Promote those compatibility-cache values before the replacement
@@ -922,51 +887,25 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
-        self.recovered_stream_eols.remove(&object_ref);
-        self.transformed_stream_refs.remove(&object_ref);
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
             self.record_compressed_member_provenance(object_ref, stream, index);
         }
 
-        // Write through to the canonical handle graph too (not just
-        // `self.cache`): `Pdf::resolve_borrowed` now materializes from the
-        // handle, so leaving a stale already-resolved handle in place would
-        // make a later resolve of this same ref keep observing the value
-        // from *before* this call.
-        self.legacy_materialized_memo.remove(&object_ref);
-        self.legacy_materialized_replacement_refs
-            .remove(&object_ref);
+        // Write through to the canonical handle graph too, preserving the
+        // single live value that every qpdf-shaped consumer observes.
         let handle = self.get_object_handle(object_ref);
-        let lifted = self.lift_for_set_object(&object, &handle);
-        match lifted {
-            Ok(value) => {
-                handle.set_resolved(value);
-                // A caller-supplied replacement no longer describes the
-                // source bytes that populated this handle. Clear the parsed
-                // description only after the replacement has been lifted and
-                // installed; a failed lift leaves the canonical value intact.
-                handle.clear_description();
-                // The value is now caller-supplied, in-memory-constructed
-                // data, not something parsed from a source position; any
-                // previously recorded offset no longer describes it.
-                handle.reset_parsed_offset();
-                handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
-            }
-            Err(_) => {
-                // Programmatic depth is unbounded above, so this fallback is
-                // only for an Object variant that has no canonical
-                // ObjectValue representation (currently a content-stream
-                // token nested in a stream dictionary). `set_object` is
-                // infallible; preserve the exact caller value for the legacy
-                // raw-object boundary while keeping valid replacements on the
-                // canonical handle graph.
-                self.legacy_materialized_memo
-                    .insert(object_ref, object.clone());
-                self.legacy_materialized_replacement_refs.insert(object_ref);
-            }
-        }
+        let value = self
+            .lift_for_set_object(&object, &handle)
+            .expect("programmatic Object values must be representable as ObjectHandle values");
+        handle.set_resolved(value);
+        // A caller-supplied replacement no longer describes the source bytes
+        // that populated this handle. Clear source provenance after the
+        // replacement has been lifted and installed.
+        handle.clear_description();
+        handle.reset_parsed_offset();
+        handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
 
         self.cache.set_resolved(object_ref, object);
         self.handle_mutated_object_refs.remove(&object_ref);
@@ -977,10 +916,9 @@ impl<R: Read + Seek> Pdf<R> {
     // This is intentionally broader than the ordinary legacy bounded lift:
     // qpdf's `replaceObject` accepts the already-constructed operator and
     // inline-image values (`QPDFObjectHandle.cc:1933-1941`) and does not apply
-    // the raw bridge's parser-depth policy to programmatic values. Keep the
-    // canonical replacement on the handle graph for the entire caller-owned
-    // Object tree; the lift itself remains stack-safe through
-    // `stacker::maybe_grow`.
+    // a parser-depth policy to programmatic values. Keep the canonical
+    // replacement on the handle graph for the entire caller-owned Object
+    // tree; the lift itself remains stack-safe through `stacker::maybe_grow`.
     //
     // Identical to the ordinary bounded lift except when `object` is a stream and
     // `existing_handle`'s current (pre-overwrite) value is also a stream:
@@ -989,10 +927,9 @@ impl<R: Read + Seek> Pdf<R> {
     // preserving its already-recorded parsed offset and shared identity,
     // rather than minting a fresh dictionary handle that would start at the
     // no-offset sentinel (`stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip`
-    // is the regression tripwire for getting this wrong). A stream dictionary
-    // remains an ordinary PDF dictionary: qpdf's operator and inline-image
-    // values are content-stream-only and therefore still use the legacy
-    // fallback when supplied there.
+    // is the regression tripwire for getting this wrong). The handle value
+    // supports the complete programmatic ObjectValue set, including operator
+    // and inline-image leaves used by content-oriented tests.
     fn lift_for_set_object(
         &mut self,
         object: &Object,
@@ -1004,14 +941,14 @@ impl<R: Read + Seek> Pdf<R> {
                     stream,
                     existing_dict,
                     PROGRAMMATIC_LIFT_MAX_DEPTH,
-                    false,
+                    true,
                 );
             }
             let stream_dict = self.lift_dictionary_bounded_with_options(
                 &stream.dict,
                 0,
                 PROGRAMMATIC_LIFT_MAX_DEPTH,
-                false,
+                true,
             )?;
             return Ok(ObjectValue::Stream {
                 stream_dict: self
@@ -1150,23 +1087,21 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Remove `object_ref`, marking it deleted.
     ///
-    /// Subsequent [`Pdf::resolve`]/[`Pdf::resolve_borrowed`] calls for
-    /// `object_ref` observe [`Object::Null`], matching the behavior for any
+    /// Subsequent canonical handle lookups for `object_ref` observe
+    /// [`Object::Null`], matching the behavior for any
     /// other unknown or freed reference.
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
         if object_ref.number != 0 {
             // The cache early return below must see the reconstructed live xref;
             // qpdf removes the corresponding cached object when a mutation
             // removes it (`libqpdf/QPDF.cc:1996-2004`).
-            self.synchronize_legacy_resolution_state();
+            self.synchronize_cache_with_resolver_xref();
         }
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
         }
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
-        self.recovered_stream_eols.remove(&object_ref);
-        self.transformed_stream_refs.remove(&object_ref);
         if object_ref.number == 0 {
             return;
         }
@@ -1182,17 +1117,6 @@ impl<R: Read + Seek> Pdf<R> {
             .remove_object_preserving_handle(object_ref)
             .expect("canonical resolver object removal is infallible");
 
-        // Invalidate the handle-graph bridge state unconditionally, before
-        // the cache-state early return below: `Pdf::prepare_qpdf_json_objects`
-        // can mark a ref's cache entry `Missing` (discovered as a dangling
-        // reference from a live object's own content) before any handle for
-        // it has ever been created via `Pdf::get_object_handle`. If the two
-        // lines below ran only past the early return, that combination
-        // (cache already `Missing`, handle still `Unresolved`) would
-        // leave stale compatibility data behind.
-        self.legacy_materialized_memo.remove(&object_ref);
-        self.legacy_materialized_replacement_refs
-            .remove(&object_ref);
         self.handle_mutated_object_refs.remove(&object_ref);
         self.get_object_handle(object_ref)
             .set_resolved(ObjectValue::Null);
@@ -1270,7 +1194,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// - `Deleted` — explicit `delete_object()` calls,
     /// - `Missing` — referenced but never present in any xref,
     /// - `Reserved` — forward-reference placeholders that
-    ///   [`Pdf::resolve_object`] returns as `Object::Null` (no real indirect
+    ///   the canonical handle returns as `Object::Null` (no real indirect
     ///   object behind them).
     ///
     /// A `live_object_refs()` entry may still resolve to `Object::Null`; that
@@ -1660,10 +1584,7 @@ impl<R: Read + Seek> Pdf<R> {
         // Refresh the legacy cache before replacing the canonical value, or
         // an old object-stream entry can incorrectly retain provenance
         // (mirrors `set_object`'s identical precondition above).
-        // Refresh the legacy cache before replacing the canonical value, or
-        // an old object-stream entry can incorrectly retain provenance
-        // (mirrors `set_object`'s identical precondition above).
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         // qpdf's replaceObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
         // Promote those compatibility-cache values before the replacement
@@ -1673,8 +1594,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
-        self.recovered_stream_eols.remove(&object_ref);
-        self.transformed_stream_refs.remove(&object_ref);
         self.mark_object_handle_mutated(object_ref);
         Ok(target)
     }
@@ -1691,7 +1610,7 @@ impl<R: Read + Seek> Pdf<R> {
         // Refresh the legacy cache before removing the canonical value, or an
         // old object-stream entry can incorrectly retain provenance (mirrors
         // `replace_object_handle`'s identical precondition above).
-        self.synchronize_legacy_resolution_state();
+        self.synchronize_cache_with_resolver_xref();
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
         // Promote those compatibility-cache values before the removal drops
@@ -1700,11 +1619,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.remove_object(object_ref)?;
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
-        self.recovered_stream_eols.remove(&object_ref);
-        self.transformed_stream_refs.remove(&object_ref);
-        self.legacy_materialized_memo.remove(&object_ref);
-        self.legacy_materialized_replacement_refs
-            .remove(&object_ref);
         self.mark_object_handle_mutated(object_ref);
         Ok(())
     }
@@ -1894,12 +1808,6 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn mark_object_handle_mutated(&mut self, object_ref: ObjectRef) {
-        // ObjectHandle mutation happens below the legacy materialization
-        // bridge. Discard any snapshot previously returned by resolve so the
-        // next resolve and the writer materialize the changed live handle.
-        self.legacy_materialized_memo.remove(&object_ref);
-        self.legacy_materialized_replacement_refs
-            .remove(&object_ref);
         self.handle_mutated_object_refs.insert(object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
@@ -1951,107 +1859,6 @@ impl<R: Read + Seek> Pdf<R> {
             self.mark_object_handle_mutated(object_ref);
         }
         Ok(())
-    }
-
-    fn reconcile_legacy_materialized_memos(&mut self) -> Result<()> {
-        let pending: Vec<ObjectRef> = self
-            .legacy_materialized_replacement_refs
-            .iter()
-            .copied()
-            .collect();
-
-        for object_ref in pending {
-            let Some(handle) = self.resolver.registered_handle(object_ref) else {
-                continue;
-            };
-            let Some(replacement) = self.legacy_materialized_memo.remove(&object_ref) else {
-                continue;
-            };
-            // `set_object` reaches this legacy path only when the supplied
-            // value has no canonical ObjectValue representation. Reconcile
-            // that narrow compatibility value with the existing bounded
-            // materialization walk; valid programmatic depth replacements
-            // never enter this path.
-            // Content-stream tokens are valid `ObjectValue` leaves even
-            // though the generic legacy lift rejects them outside a content
-            // stream; preserve them at every nesting level rather than
-            // making enumeration fail.
-            let value = match replacement {
-                Object::Stream(stream) => self
-                    .lift_owned_stream_bounded_with_options(
-                        stream,
-                        handle.as_stream_dict(),
-                        0,
-                        crate::parser::MAX_PARSE_DEPTH,
-                        true,
-                    )
-                    .map_err(|(error, stream)| (error, Object::Stream(stream))),
-                replacement => self
-                    .lift_bounded_with_content_tokens(
-                        &replacement,
-                        0,
-                        crate::parser::MAX_PARSE_DEPTH,
-                    )
-                    .map_err(|error| (error, replacement)),
-            };
-            let value = match value {
-                Ok(value) => value,
-                Err((error, replacement)) => {
-                    // Keep the infallible legacy replacement authoritative if
-                    // canonical lifting fails. The next reconciliation call
-                    // must see the same value, without requiring a payload
-                    // clone merely to preserve this error path.
-                    self.legacy_materialized_memo
-                        .insert(object_ref, replacement);
-                    return Err(error);
-                }
-            };
-            handle.set_resolved(value);
-            handle.clear_description();
-            handle.reset_parsed_offset();
-            handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
-            self.legacy_materialized_memo.remove(&object_ref);
-            self.legacy_materialized_replacement_refs
-                .remove(&object_ref);
-        }
-        Ok(())
-    }
-
-    fn lift_owned_stream_bounded_with_options(
-        &mut self,
-        stream: Stream,
-        existing_dict: Option<ObjectHandle>,
-        depth: usize,
-        max_depth: usize,
-        allow_content_tokens: bool,
-    ) -> std::result::Result<ObjectValue, (Error, Stream)> {
-        let dict_value = match self.lift_dictionary_bounded_with_options(
-            &stream.dict,
-            depth,
-            max_depth,
-            allow_content_tokens,
-        ) {
-            Ok(value) => value,
-            Err(error) => return Err((error, stream)),
-        };
-        let stream_dict = match existing_dict {
-            Some(existing_dict) => {
-                existing_dict.replace_direct_value(ObjectValue::Dictionary(dict_value));
-                existing_dict.clear_description();
-                existing_dict
-            }
-            None => self
-                .resolver
-                .direct_object_handle(ObjectValue::Dictionary(dict_value)),
-        };
-        Ok(ObjectValue::Stream {
-            stream_dict,
-            // Moving the Vec into Rc preserves qpdf's shared-buffer boundary
-            // without copying the legacy memo's payload.
-            stream_data: Some(Rc::new(stream.data)),
-            stream_length: 0,
-            stream_provider: None,
-        })
     }
 
     /// Promote xref-stream objects parsed from the source `/Prev` chain into
@@ -2180,10 +1987,6 @@ impl<R: Read + Seek> Pdf<R> {
     /// effective source table, matching qpdf's `insertFreeXrefEntry` split
     /// between `xref_table` and `deleted_objects`.
     pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
-        // Reconcile caller-supplied replacements before qpdf-style dangling
-        // reference preparation. Otherwise resolving the superseded source
-        // value can register references that the replacement no longer owns.
-        self.reconcile_legacy_materialized_memos()?;
         let trailer_refs = self.register_trailer_references();
         self.resolver.fix_dangling_references()?;
 
@@ -2196,7 +1999,6 @@ impl<R: Read + Seek> Pdf<R> {
             self.get_object_handle(object_ref).try_dereference()?;
         }
 
-        self.reconcile_legacy_materialized_memos()?;
         self.register_top_level_replacement_targets();
         let removed = self.qpdf_removed_refs.clone();
         Ok(self
@@ -2222,16 +2024,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily
     /// and retain the same shared object identity: resolving the same
     /// indirect reference more than once yields handles that alias the same
-    /// cached value rather than independent copies. [`Pdf::resolve_object`]
-    /// is the owned raw-`Object` resolver, kept under its own explicit name
-    /// only for the next legacy-route removal slice.
+    /// cached value rather than independent copies.
     ///
     /// This does not chase through an already-resolved
     /// [`Pdf::set_object`]-driven bare-reference redirect to its terminal
     /// value — see [`Pdf::resolve_to_terminal`] for that.
-    /// [`Pdf::resolve_borrowed`] (and everything built on it, notably
-    /// `ref_chain.rs`'s own bounded chain-follow primitive) depends on this
-    /// method exposing exactly one hop per call, not silently collapsing a
+    /// `ref_chain.rs`'s bounded chain-follow primitive depends on this method
+    /// exposing exactly one hop per call, not silently collapsing a
     /// multi-hop chain.
     ///
     /// The canonical parser records source descriptions and offsets while it
@@ -2311,7 +2110,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// The chase itself still mutates nothing: only the *last* hop's own
     /// handle is returned, so `handle` and every intermediate hop keep the
     /// redirect [`Pdf::set_object`] recorded, and a later
-    /// [`Pdf::resolve_borrowed`] for any ref in the chain still observes it.
+    /// a later canonical handle lookup for any ref in the chain still observes
+    /// it.
     ///
     /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: terminal-chase legacy API.
     /// Delete with `ObjectValue::Reference`; do not call from new code.
@@ -2553,11 +2353,9 @@ impl<R: Read + Seek> Pdf<R> {
                 // In the normal lift mode, content-stream-only tokens are not
                 // resolved file/ObjStm values and are rejected rather than
                 // silently discarded as `Null`: `Pdf::set_object` treats this
-                // failure as "cannot be represented in the handle graph" and
-                // stores the caller-supplied value in
-                // `legacy_materialized_memo`. Memo reconciliation opts into
-                // the lossless ObjectValue leaves above, including nested
-                // tokens, so enumeration can restore the authoritative value.
+                // failure as "cannot be represented in the handle graph".
+                // Content-token lifting is explicit at the caller boundary;
+                // ordinary object lifting does not silently discard a token.
                 Object::Operator(_) | Object::InlineImage(_) => {
                     return Err(Error::Unsupported(
                         "object handle lift: content-stream-only token has no ObjectValue representation"
@@ -2640,10 +2438,8 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    // qpdf-cutover-delete: owned raw-`Object` resolver. Delete after its
-    // callers use canonical handle accessors; do not use it from the new
-    // resolver path.
-    /// Resolve `object_ref` to its concrete value, parsing on demand.
+    /// Resolve `object_ref` to its concrete value for the JSON projection,
+    /// parsing on demand through the canonical handle resolver.
     ///
     /// Resolution caches the result so subsequent calls are constant-time. Unknown,
     /// freed, or compressed-but-broken entries return [`Object::Null`] rather than an
@@ -2651,440 +2447,10 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// Has the same error behavior as [`Pdf::resolve_borrowed`]:
-    ///
-    /// - [`Error::Io`] when seeking to or reading the object's bytes fails.
-    /// - [`Error::Parse`] when the indirect object cannot be parsed.
-    /// - [`Error::Encrypted`] when decrypting the resolved object fails.
-    ///
-    /// An unknown, freed, or compressed-but-broken reference is **not** an error;
-    /// it resolves to [`Object::Null`].
-    pub fn resolve_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
-        Ok(self.resolve_borrowed(object_ref)?.clone())
-    }
-
-    // qpdf-cutover-delete: borrowed raw-`Object` resolver and its
-    // materialization memo are legacy-only. Delete after callers migrate; do
-    // not preserve this signature as a new design constraint.
-    /// Resolve `object_ref` and borrow the cached concrete value.
-    ///
-    /// This has the same resolution behavior as [`Pdf::resolve_object`] but avoids
-    /// cloning the resolved [`Object`]. The returned reference is tied to the mutable
-    /// borrow of this [`Pdf`], so callers must finish using it before resolving or
-    /// mutating other objects through the same reader.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Io`] when seeking to or reading the object's bytes fails.
-    /// - [`Error::Parse`] when the indirect object cannot be parsed.
-    /// - [`Error::Encrypted`] when decrypting the resolved object fails.
-    ///
-    /// An unknown, freed, or compressed-but-broken reference is **not** an error;
-    /// it resolves to [`Object::Null`].
-    pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
-        self.synchronize_canonical_recovered_stream_eol(object_ref)?;
-        // This is intentionally the raw-Object compatibility boundary. The
-        // canonical ObjectHandle API above owns qpdf-shaped lazy resolution;
-        // the legacy reader still owns stream-length recovery, transformed
-        // stream bookkeeping, and qpdf JSON's materialized Object contract.
-        if self.handle_mutated_object_refs.contains(&object_ref) {
-            if self.materialize_canonical_compatibility_value(object_ref)? {
-                return Ok(self
-                    .legacy_materialized_memo
-                    .get(&object_ref)
-                    .expect("inserted materialized ObjectHandle value"));
-            }
-            return Ok(&NULL_OBJECT); // cov:ignore: a successful canonical resolve always leaves a null handle resolved
-        }
-
-        // qpdf has one object cache. A canonical producer may have resolved a
-        // source object while the legacy compatibility cache still contains
-        // only its initial xref entry. Prefer that live canonical value before
-        // reading the unresolved legacy entry, otherwise the two staged
-        // consumers parse the same malformed source twice and duplicate its
-        // recovery diagnostics. This is a read-only compatibility snapshot;
-        // canonical resolution itself still never populates the legacy cache.
-        if !self.qpdf_parsed_xref_stream_refs.contains(&object_ref)
-            && !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_)))
-        {
-            if let Some(handle) = self
-                .resolver
-                .registered_handle(object_ref)
-                .filter(ObjectHandle::is_resolved)
-            {
-                let value = self.materialize_handle_for_legacy(object_ref, &handle)?;
-                self.legacy_materialized_memo.insert(object_ref, value);
-                return Ok(self
-                    .legacy_materialized_memo
-                    .get(&object_ref)
-                    .expect("inserted canonical compatibility value"));
-            }
-        }
-
-        match self.resolve_to_cache(object_ref) {
-            Ok(true) => {
-                if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
-                    return Ok(object);
-                } // cov:ignore: resolve_to_cache returns true only after installing a resolved cache entry
-            }
-            Ok(false)
-                if self.resolver.attempt_recovery() && !self.resolver.reconstructed_xref() =>
-            {
-                if self.materialize_canonical_compatibility_value(object_ref)? {
-                    return Ok(self
-                        .legacy_materialized_memo
-                        .get(&object_ref)
-                        .expect("inserted recovered canonical value"));
-                } // cov:ignore: canonical materialization cannot return false after resolving an indirect handle
-            }
-            Err(error)
-                if self.resolver.attempt_recovery()
-                    && !self.resolver.reconstructed_xref()
-                    && matches!(error, Error::Parse { .. }) =>
-            {
-                if self.materialize_canonical_compatibility_value(object_ref)? {
-                    return Ok(self
-                        .legacy_materialized_memo
-                        .get(&object_ref)
-                        .expect("inserted recovered canonical value"));
-                }
-            }
-            Err(error) => return Err(error),
-            Ok(false) => {}
-        }
-
-        // A canonical handle may have been resolved by a caller without
-        // populating the raw cache. Expose that value only as an explicit
-        // compatibility read; it does not route canonical resolution back
-        // through the legacy engine.
-        // cov:ignore-start: the canonical handle branch above or a recovery branch returns immediately whenever a handle becomes resolved; this is the defensive single-Pdf fallback
-        if !self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
-            if let Some(handle) = self
-                .resolver
-                .registered_handle(object_ref)
-                .filter(ObjectHandle::is_resolved)
-            {
-                let value = self.materialize_handle_for_legacy(object_ref, &handle)?; // cov:ignore: every resolved registered handle is returned by the earlier compatibility branch
-                self.legacy_materialized_memo.insert(object_ref, value);
-                return Ok(self
-                    .legacy_materialized_memo
-                    .get(&object_ref)
-                    .expect("inserted materialized ObjectHandle value"));
-            }
-        }
-        // cov:ignore-end
-
-        Ok(&NULL_OBJECT)
-    }
-
-    /// Materialize a canonical handle only for an explicit raw-object
-    /// compatibility read after the caller has mutated that handle. This is
-    /// not recovery for ordinary raw resolution: the raw reader keeps its own
-    /// bounded retry budget, and canonical parsing must never bypass it.
-    fn materialize_canonical_compatibility_value(&mut self, object_ref: ObjectRef) -> Result<bool> {
+    pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         let handle = self.get_object_handle(object_ref);
         self.resolve(&handle)?;
-        self.synchronize_canonical_recovered_stream_eol(object_ref)?;
-        self.synchronize_legacy_resolution_state();
-        if !handle.is_resolved() {
-            return Ok(false); // cov:ignore: the canonical resolver resolves or errors for every indirect handle
-        }
-
-        if handle.get_parsed_offset() < 0 && !self.handle_mutated_object_refs.contains(&object_ref)
-        {
-            if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
-                self.cache.entry(object_ref)
-            {
-                self.legacy_materialized_memo
-                    .insert(object_ref, cached.clone());
-                return Ok(true);
-            }
-        }
-
-        self.legacy_materialized_memo.insert(
-            object_ref,
-            self.materialize_handle_for_legacy(object_ref, &handle)?,
-        );
-        Ok(true)
-    }
-
-    /// Materialize a canonical value for a legacy `Object` consumer without
-    /// exposing source framing that the legacy reader stores separately.
-    ///
-    /// qpdf's canonical `QPDF_Stream` keeps the recovered line ending inside
-    /// its validated source length; the old flpdf `Stream` snapshot removes
-    /// that framing and lets the writer restore it from
-    /// [`Self::recovered_stream_eol`]. Keep this normalization at the
-    /// compatibility boundary only: the live `ObjectHandle` remains the
-    /// qpdf-shaped source of truth and continues to pipe the full recovered
-    /// source span.
-    fn synchronize_canonical_recovered_stream_eol(&mut self, object_ref: ObjectRef) -> Result<()> {
-        if self.transformed_stream_refs.contains(&object_ref)
-            || self.recovered_stream_eols.contains_key(&object_ref)
-        {
-            return Ok(());
-        }
-        // After qpdf-style xref reconstruction, the canonical raw stream view
-        // is the public compatibility value itself; do not create a second
-        // legacy-side framing marker that would make that raw byte look like a
-        // writer-only payload suffix.
-        if self.resolver.reconstructed_xref() {
-            return Ok(());
-        }
-        let Some(handle) = self
-            .resolver
-            .registered_handle(object_ref)
-            .filter(ObjectHandle::is_resolved)
-        else {
-            return Ok(());
-        };
-        let Some(stream_dict) = handle.as_stream_dict() else {
-            return Ok(());
-        };
-        if handle.as_stream_data().is_some()
-            || handle.has_stream_data_provider()
-            || self
-                .resolver
-                .recovered_stream_eol_is_transformed(&stream_dict)?
-        {
-            return Ok(());
-        }
-        if let Some(eol) = self.resolver.recovered_stream_eol(object_ref) {
-            self.recovered_stream_eols.insert(object_ref, eol);
-        }
-        Ok(())
-    }
-
-    fn materialize_handle_for_legacy(
-        &self,
-        object_ref: ObjectRef,
-        handle: &ObjectHandle,
-    ) -> Result<Object> {
-        let mut value = handle.materialize()?;
-        let eol = self.recovered_stream_eol(object_ref);
-        if let Some(eol) = eol {
-            if let Object::Stream(stream) = &mut value {
-                if handle.stream_source_length() == Some(stream.data.len())
-                    && stream.data.ends_with(eol)
-                {
-                    stream.data.truncate(stream.data.len() - eol.len());
-                }
-            }
-        }
-        Ok(value)
-    }
-
-    /// Read and parse the indirect object stored at `offset`, returning the read
-    /// bytes alongside the parse result.
-    ///
-    /// The read is bounded to the start of the next object in the file. Objects
-    /// in a well-formed PDF do not overlap, so that window contains the object in
-    /// full, and resolving every object stays linear in the file size — an
-    /// unbounded read-to-end per object is quadratic and a CPU DoS on a document
-    /// (e.g. a repaired one) that exposes many objects whose bodies run toward
-    /// EOF. When the bounded window does not parse — a recorded offset points
-    /// inside this object (corrupt xref, or a header-like line captured inside
-    /// stream data during repair) — it falls back to reading to EOF, but only
-    /// while [`Self::resolution_fallbacks_remaining`] permits, so a flood of such
-    /// objects cannot revive the quadratic cost.
-    fn read_object_at(
-        &mut self,
-        expected_ref: ObjectRef,
-        offset: u64,
-    ) -> Result<file_object::FileObjectRead> {
-        self.read_object_at_with_policy(
-            expected_ref,
-            offset,
-            RecoveryPolicy::RequireTokenTerminator,
-            RecoveryPolicy::Bounded,
-        )
-    }
-
-    // Read the byte window starting at `offset`, bounded by the next known
-    // object's offset when one exists, or by EOF for the last object in the
-    // file. Shared by `read_object_at_with_policy`'s own (first-attempt)
-    // window read, extracted so the legacy reader's bounded fast path has one
-    // definition of its source window.
-    fn read_bounded_object_window(&mut self, offset: u64) -> Result<Vec<u8>> {
-        let next = self.next_object_offset(offset);
-        self.resolver.read_window(offset, next)
-    }
-
-    fn read_object_at_with_policy(
-        &mut self,
-        expected_ref: ObjectRef,
-        offset: u64,
-        window_policy: RecoveryPolicy,
-        full_policy: RecoveryPolicy,
-    ) -> Result<file_object::FileObjectRead> {
-        let next = self.next_object_offset(offset);
-        let bytes = self.read_bounded_object_window(offset)?;
-
-        let initial_policy = if next.is_some() {
-            window_policy
-        } else {
-            full_policy
-        };
-        match self.parse_and_finish_file_object(expected_ref, &bytes, offset, initial_policy) {
-            Ok(parsed) => Ok(parsed),
-            Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
-                self.resolution_fallbacks_remaining -= 1;
-                // A fresh, short borrow: the borrow the window read above took
-                // ended before `parse_and_finish_file_object`, which can
-                // re-enter resolution through an indirect `/Length`.
-                let full = self.resolver.read_window(offset, None)?;
-                self.parse_and_finish_file_object(expected_ref, &full, offset, full_policy)
-                    .or(Err(window_err))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn parse_and_finish_file_object(
-        &mut self,
-        expected_ref: ObjectRef,
-        bytes: &[u8],
-        offset: u64,
-        policy: RecoveryPolicy,
-    ) -> Result<file_object::FileObjectRead> {
-        let pending = parse_file_object_syntax(bytes)?;
-        let resolved_length = self.resolve_pending_stream_length(expected_ref, &pending, offset)?;
-        let result = finish_file_object(bytes, pending, resolved_length, policy);
-        self.cache.set_unresolved(expected_ref, offset);
-        result
-    }
-
-    fn resolve_pending_stream_length(
-        &mut self,
-        expected_ref: ObjectRef,
-        pending: &PendingFileObject,
-        offset: u64,
-    ) -> Result<Option<ResolvedStreamLength>> {
-        let Some(holder) = pending.indirect_length_ref() else {
-            return Ok(None);
-        };
-        if holder == pending.object_ref {
-            return Ok(Some(ResolvedStreamLength::Missing));
-        }
-
-        self.cache.set_reserved(expected_ref);
-        let length_handle = self.get_object_handle(holder);
-        let resolved_object = if length_handle.is_resolved() {
-            match length_handle.try_as_integer()? {
-                Some(value) => Ok(Some(ResolvedStreamLength::Integer(value))),
-                None if length_handle.is_null() => Ok(None),
-                None => Ok(Some(ResolvedStreamLength::Invalid)),
-            }
-        } else {
-            // Stream framing is qpdf's readObjectAtOffset recovery boundary
-            // (`QPDF.cc:1360-1402, 1485-1531`). The bounded legacy reader is
-            // still authoritative while it is establishing that boundary:
-            // the canonical parser intentionally reads a whole source window
-            // and would otherwise replay warnings from a malformed holder.
-            // Synchronize its result into the canonical child handle below so
-            // later consumers share one ObjectHandle identity.
-            let legacy_object = self.resolve_borrowed(holder).cloned();
-            if let Ok(object) = &legacy_object {
-                if !length_handle.is_resolved() {
-                    let value = self.lift_for_set_object(object, &length_handle)?;
-                    length_handle.set_resolved(value);
-                } // cov:ignore: resolve_borrowed synchronizes the canonical holder before returning; this preserves a defensive cache-only guard
-            }
-            match legacy_object {
-                Ok(Object::Integer(value)) => Ok(Some(ResolvedStreamLength::Integer(value))),
-                Ok(Object::Null) => Ok(None),
-                Ok(_) => Ok(Some(ResolvedStreamLength::Invalid)),
-                Err(Error::Parse { .. }) => Ok(Some(ResolvedStreamLength::Invalid)),
-                Err(err) => Err(err),
-            }
-        };
-        let resolved = match resolved_object {
-            Ok(Some(resolved)) => resolved,
-            Ok(None)
-                if matches!(
-                    self.cache.entry(holder),
-                    None | Some(CacheEntry::Missing | CacheEntry::Deleted)
-                ) =>
-            {
-                ResolvedStreamLength::Missing
-            }
-            Ok(None) => ResolvedStreamLength::Invalid,
-            Err(err) => {
-                self.cache.set_unresolved(expected_ref, offset);
-                return Err(err);
-            }
-        };
-        self.cache.set_unresolved(expected_ref, offset);
-        Ok(Some(resolved))
-    }
-
-    pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
-        if self.handle_mutated_object_refs.contains(&object_ref)
-            || !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_)))
-        {
-            if let Some(handle) = self
-                .resolver
-                .registered_handle(object_ref)
-                .filter(ObjectHandle::is_resolved)
-            {
-                return handle.materialize();
-            }
-        }
-        if self.resolve_to_cache(object_ref)? {
-            if self.handle_mutated_object_refs.contains(&object_ref) {
-                let handle = self.get_object_handle(object_ref);
-                self.resolve(&handle)?;
-                return handle.materialize();
-            }
-            if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
-                return Ok(object.clone());
-            }
-        }
-
-        Ok(Object::Null)
-    }
-
-    /// Resolve a qpdf-visible object without cloning its cached value.
-    ///
-    /// Unlike [`Self::resolve_borrowed`], this retains the historical xref-stream
-    /// compatibility view used by qpdf JSON preparation when the object is
-    /// absent from the legacy object cache. The value still comes from the
-    /// canonical `ObjectHandle`; no raw xref-stream side table is consulted.
-    pub(crate) fn resolve_qpdf_json_object_borrowed(
-        &mut self,
-        object_ref: ObjectRef,
-    ) -> Result<&Object> {
-        if self.handle_mutated_object_refs.contains(&object_ref)
-            || !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_)))
-        {
-            if let Some(handle) = self
-                .resolver
-                .registered_handle(object_ref)
-                .filter(ObjectHandle::is_resolved)
-            {
-                self.legacy_materialized_memo
-                    .insert(object_ref, handle.materialize()?);
-                return Ok(self
-                    .legacy_materialized_memo
-                    .get(&object_ref)
-                    .expect("inserted canonical qpdf-json value"));
-            }
-        }
-        self.resolve_to_cache(object_ref)?;
-        if self.handle_mutated_object_refs.contains(&object_ref) {
-            let handle = self.get_object_handle(object_ref);
-            self.resolve(&handle)?;
-            self.legacy_materialized_memo
-                .insert(object_ref, handle.materialize()?);
-            return Ok(self
-                .legacy_materialized_memo
-                .get(&object_ref)
-                .expect("inserted materialized ObjectHandle value"));
-        }
-        match self.cache.entry(object_ref) {
-            Some(CacheEntry::Resolved(object)) => Ok(object),
-            _ => Ok(&NULL_OBJECT),
-        }
+        handle.materialize()
     }
 
     /// Offset of the first recorded object that starts strictly after `offset`,
@@ -3096,7 +2462,7 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Bring the legacy cache and bounded-read offsets in line with the
     /// canonical resolver after a resolution-time xref reconstruction.
-    pub(crate) fn synchronize_legacy_resolution_state(&mut self) {
+    pub(crate) fn synchronize_cache_with_resolver_xref(&mut self) {
         if self.legacy_resolution_state_synced || !self.resolver.reconstructed_xref() {
             return;
         }
@@ -3136,1025 +2502,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.sorted_object_offsets.dedup();
         self.legacy_resolution_state_synced = true;
     }
-
-    fn resolve_to_cache(&mut self, object_ref: ObjectRef) -> Result<bool> {
-        self.synchronize_legacy_resolution_state();
-        let entry = self.cache.entry(object_ref);
-        if matches!(entry, Some(CacheEntry::Resolved(_))) {
-            return Ok(true);
-        }
-
-        match entry.cloned() {
-            Some(CacheEntry::Unresolved { offset }) => {
-                let mut parsed = self.read_object_at(object_ref, offset)?;
-                if parsed.object_ref != object_ref {
-                    return Ok(false);
-                }
-                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
-                let recovered_eol_bytes =
-                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
-                let (object, stream_payload_transformed) =
-                    self.decrypt_resolved_object(object_ref, parsed.object, recovered_eol_bytes)?;
-                self.cache.set_resolved(object_ref, object);
-                if stream_payload_transformed {
-                    self.transformed_stream_refs.insert(object_ref);
-                } else {
-                    self.transformed_stream_refs.remove(&object_ref);
-                }
-                if let Some(eol) = recovered_eol {
-                    self.recovered_stream_eols.insert(object_ref, eol);
-                } else {
-                    self.recovered_stream_eols.remove(&object_ref);
-                }
-                self.record_file_object_diagnostics(object_ref, offset, parsed.diagnostics)?;
-                Ok(true)
-            }
-            Some(CacheEntry::Compressed { stream, index }) => {
-                self.resolve_compressed_entry(object_ref, stream, index)
-            }
-            Some(
-                CacheEntry::Resolved(_)
-                | CacheEntry::Missing
-                | CacheEntry::Deleted
-                | CacheEntry::Reserved,
-            )
-            | None => Ok(false),
-        }
-    }
-
-    fn record_file_object_diagnostics(
-        &mut self,
-        object_ref: ObjectRef,
-        offset: u64,
-        diagnostics: Vec<FileObjectDiagnostic>,
-    ) -> Result<()> {
-        for diagnostic in diagnostics {
-            self.push_warning(format!(
-                "(object {} {}, offset {}): {}",
-                object_ref.number,
-                object_ref.generation,
-                offset.saturating_add(diagnostic.relative_offset as u64),
-                diagnostic.kind.message()
-            ))?;
-        }
-        Ok(())
-    }
-
-    fn resolve_compressed_entry(
-        &mut self,
-        object_ref: ObjectRef,
-        stream: u32,
-        index: u32,
-    ) -> Result<bool> {
-        // qpdf's effective xref is authoritative for the member/source pair
-        // (`QPDF.cc:1792-1795`). Tests that seed only the legacy cache have
-        // no source row, so the direct parser remains available for that
-        // narrow compatibility setup; source-backed documents always take
-        // this check.
-        if let Some(source_entry) = self.resolver.xref_entry(object_ref) {
-            if !matches!(
-                source_entry,
-                XrefEntry::Compressed {
-                    stream: source_stream,
-                    ..
-                } if source_stream == stream
-            ) {
-                return Ok(false);
-            }
-        }
-
-        let stream_ref = ObjectRef::new(stream, 0);
-        // qpdf resolves the object-stream container through the same object
-        // cache as every other indirect object (`QPDF.cc:1756-1833`). Keep
-        // this compatibility-cache consumer on that canonical handle too:
-        // its stream dictionary and payload must be read through the live
-        // `QPDF_Stream` filter path, not through a second raw `Object` copy.
-        let Some(stream_handle) = self.object_stream_handle_with_legacy_fallback(stream_ref)?
-        else {
-            return Ok(false);
-        };
-        if stream_handle.as_stream_dict().is_none() {
-            return Ok(false);
-        }
-        if !matches!(
-            self.cache.entry(stream_ref),
-            Some(CacheEntry::Resolved(Object::Stream(_)))
-        ) {
-            let stream_object = stream_handle.materialize()?;
-            if matches!(stream_object, Object::Stream(_)) {
-                self.cache.set_resolved(stream_ref, stream_object);
-            }
-        }
-
-        let Some(parsed) =
-            self.parse_object_stream_entry_from_handle(&stream_handle, object_ref.number)?
-        else {
-            return Ok(false);
-        };
-        let ParsedObjectStreamEntry {
-            object,
-            diagnostics,
-        } = parsed;
-        let (object, _stream_payload_transformed) =
-            self.decrypt_resolved_object(object_ref, object, None)?;
-        self.compressed_member_parents.insert(
-            object_ref,
-            CompressedMemberProvenance {
-                parent_ref: stream_ref,
-                parent_index: index,
-                source_stream: stream,
-                source_index: index,
-            },
-        );
-        self.cache.set_resolved(object_ref, object);
-        self.record_object_stream_diagnostics(stream_ref, object_ref, diagnostics)?;
-        Ok(true)
-    }
-
-    fn decrypt_resolved_object(
-        &mut self,
-        object_ref: ObjectRef,
-        mut object: Object,
-        recovered_stream_eol: Option<&[u8]>,
-    ) -> Result<(Object, bool)> {
-        let encrypt_ref = {
-            let encryption_guard = self.encryption.borrow();
-            let Some(encryption) = encryption_guard.as_ref() else {
-                return Ok((object, false));
-            };
-            encryption.encrypt_ref
-        };
-        if Some(object_ref) == encrypt_ref {
-            return Ok((object, false));
-        }
-
-        // qpdf `QPDF::decryptString` (`libqpdf/QPDF_encryption.cc:977-1039`).
-        // Keep this borrow scoped to the string pass. The stream pass below
-        // may resolve indirect filter parameters through the document resolver,
-        // which shares this RefCell (unlike qpdf's shared_ptr state).
-        let warn_unknown_string = {
-            let mut encryption_guard = self.encryption.borrow_mut();
-            let encryption = encryption_guard
-                .as_mut()
-                .expect("encryption state remains present after initial check");
-            decrypt_object_strings(object_ref, &mut object, encryption)?
-        };
-
-        let mut stream_payload_transformed = false;
-        let mut warn_unknown_stream = false;
-        if let Object::Stream(stream) = &mut object {
-            let (encrypt_metadata, has_explicit_crypt_filter) = {
-                let encryption_guard = self.encryption.borrow();
-                let encryption = encryption_guard
-                    .as_ref()
-                    .expect("encryption state remains present after string pass");
-                (
-                    encryption.encrypt_metadata,
-                    stream_has_explicit_crypt_filter(&stream.dict),
-                )
-            };
-            if !encrypt_metadata && is_metadata_stream(&stream.dict) {
-                self.warn_unknown_crypt_filters(warn_unknown_string, false)?;
-                return Ok((object, false));
-            } else if has_explicit_crypt_filter {
-                let explicit_result = {
-                    let mut encryption_guard = self.encryption.borrow_mut();
-                    let encryption = encryption_guard
-                        .as_mut()
-                        .expect("encryption state remains present before stream pass");
-                    apply_explicit_crypt_filters(
-                        object_ref,
-                        stream,
-                        encryption,
-                        recovered_stream_eol,
-                        &mut warn_unknown_stream,
-                    )
-                };
-                if let Err(error) = explicit_result {
-                    // qpdf's `decryptStream` warns from its method switch
-                    // (`libqpdf/QPDF_encryption.cc:1121-1133`) before it
-                    // derives the object key (`:1135`) or prepends the
-                    // decryption stage (`:1137-1149`), so a failure in either
-                    // of those later steps does not swallow the warning.
-                    self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream)?;
-                    return Err(error);
-                }
-                stream_payload_transformed = true;
-            } else {
-                let mut encryption_guard = self.encryption.borrow_mut();
-                let encryption = encryption_guard
-                    .as_mut()
-                    .expect("encryption state remains present before stream pass");
-                // qpdf `QPDF::decryptStream`'s method selection
-                // (`libqpdf/QPDF_encryption.cc:1062-1134`), for a stream that
-                // declared no `/Crypt` filter of its own.
-                //
-                // qpdf runs this at pipe time, against the pipeline it is
-                // about to prepend a stage to, not here at resolve time. This
-                // is the resolve-time route's copy of the same switch; the
-                // pipe-time home is `ResolverHandle::pipe_stream_data`, and
-                // this copy goes away with the rest of the resolve-time
-                // decryption when its consumers move over.
-                let (use_aes, warn) = encryption.stream_method(None);
-                warn_unknown_stream = warn;
-                if let Some(use_aes) = use_aes {
-                    decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
-                    stream_payload_transformed = true;
-                }
-            }
-        }
-        self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream)?;
-        Ok((object, stream_payload_transformed))
-    }
-
-    /// Recover an object-stream container that exists only in the legacy
-    /// compatibility cache. Normal source-backed objects are resolved by the
-    /// canonical resolver above; this narrow bridge is for callers/tests that
-    /// intentionally seed `Pdf::cache` directly, and for malformed stream
-    /// framing where qpdf's recovery reader is the established owner.
-    fn object_stream_handle_with_legacy_fallback(
-        &mut self,
-        stream_ref: ObjectRef,
-    ) -> Result<Option<ObjectHandle>> {
-        let stream_handle = self.get_object_handle(stream_ref);
-        let prefer_legacy_framing = self.object_stream_needs_legacy_framing(stream_ref)?;
-        let canonical_error = if prefer_legacy_framing {
-            None
-        } else {
-            self.resolve(&stream_handle).err()
-        };
-        if !prefer_legacy_framing
-            && canonical_error.is_none()
-            && stream_handle.as_stream_dict().is_some()
-        {
-            return Ok(Some(stream_handle));
-        }
-
-        match self.cache.entry(stream_ref).cloned() {
-            Some(CacheEntry::Resolved(object)) => {
-                if !matches!(object, Object::Stream(_)) {
-                    return Ok(None);
-                }
-                let value = self.lift_for_set_object(&object, &stream_handle)?;
-                stream_handle.set_resolved(value);
-                Ok(Some(stream_handle))
-            }
-            Some(CacheEntry::Unresolved { offset }) => {
-                let policy = RecoveryPolicy::RequireTokenTerminator;
-                let mut parsed =
-                    self.read_object_at_with_policy(stream_ref, offset, policy, policy)?;
-                if parsed.object_ref != stream_ref {
-                    return Ok(None);
-                }
-                // A false next-object offset can end the bounded window
-                // right after the object-stream dictionary's closing `>>`
-                // but before the `stream` keyword, so the parse above
-                // succeeds as a bare direct object (not an error) instead of
-                // failing -- read_object_at_with_policy's own retry-on-error
-                // path never triggers for that shape. qpdf's
-                // readObjectAtOffset recovery has no bounded/unbounded split
-                // at all (`QPDF.cc:1330-1402`); reproduce its effective
-                // behavior by retrying through EOF once more when the parse
-                // succeeded but did not actually yield a stream.
-                if !matches!(parsed.object, Object::Stream(_))
-                    && self.resolution_fallbacks_remaining > 0
-                {
-                    self.resolution_fallbacks_remaining -= 1;
-                    let full_bytes = self.resolver.read_window(offset, None)?;
-                    let retried =
-                        self.parse_and_finish_file_object(stream_ref, &full_bytes, offset, policy)?;
-                    if retried.object_ref == stream_ref {
-                        parsed = retried;
-                    }
-                }
-                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
-                let recovered_eol_bytes =
-                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
-                let (object, stream_payload_transformed) =
-                    self.decrypt_resolved_object(stream_ref, parsed.object, recovered_eol_bytes)?;
-                if !matches!(object, Object::Stream(_)) {
-                    return Ok(None); // cov:ignore: successful stream framing always yields Object::Stream here
-                }
-                self.cache.set_resolved(stream_ref, object.clone());
-                if stream_payload_transformed {
-                    self.transformed_stream_refs.insert(stream_ref);
-                } else {
-                    self.transformed_stream_refs.remove(&stream_ref);
-                }
-                if let Some(eol) = recovered_eol {
-                    self.recovered_stream_eols.insert(stream_ref, eol);
-                } else {
-                    self.recovered_stream_eols.remove(&stream_ref);
-                }
-                self.record_file_object_diagnostics(stream_ref, offset, parsed.diagnostics)?;
-                let value = self.lift_for_set_object(&object, &stream_handle)?;
-                stream_handle.set_resolved(value);
-                Ok(Some(stream_handle))
-            }
-            Some(
-                CacheEntry::Compressed { .. }
-                | CacheEntry::Missing
-                | CacheEntry::Deleted
-                | CacheEntry::Reserved,
-            )
-            | None => match canonical_error {
-                Some(error) => Err(error), // cov:ignore: an error with no recoverable cache entry is a defensive propagation arm
-                None => Ok(None),
-            },
-        }
-    }
-
-    fn object_stream_needs_legacy_framing(&mut self, stream_ref: ObjectRef) -> Result<bool> {
-        let Some(CacheEntry::Unresolved { offset }) = self.cache.entry(stream_ref).cloned() else {
-            return Ok(false);
-        };
-        // qpdf's readObjectAtOffset does not use the next xref offset as a
-        // hard bound while recovering a malformed object. Probe the bounded
-        // window first, but retry this inspection through EOF when the window
-        // ends inside the object dictionary. This probe charges its own EOF
-        // retry against `resolution_fallbacks_remaining`, independent of
-        // object_stream_handle_with_legacy_fallback's actual parse retry
-        // (`Self::resolution_fallbacks_remaining`'s doc): without its own
-        // charge, a crafted xref where every compressed member's container
-        // still parses as a bare dictionary at this bounded window would
-        // re-run this full-file probe once per member with no cap, since
-        // `self.cache` only starts reflecting a resolved container after a
-        // member successfully resolves through it.
-        let bytes = self.read_object_stream_framing_probe(offset)?;
-        let pending = parse_file_object_syntax(&bytes)?;
-        let PendingBody::Stream { dict, .. } = pending.body else {
-            return Ok(false);
-        };
-        Ok(!matches!(
-            dict.get("Length"),
-            Some(Object::Integer(value)) if *value >= 0
-        ))
-    }
-
-    fn read_object_stream_framing_probe(&mut self, offset: u64) -> Result<Vec<u8>> {
-        let next = self.next_object_offset(offset);
-        let bytes = self.read_bounded_object_window(offset)?;
-        // A false next-object offset can land after the complete object
-        // dictionary but before the `stream` keyword, so the bounded parse
-        // succeeds as `PendingBody::Direct` (a bare dictionary) instead of
-        // failing outright. That is just as truncated as a parse error for
-        // an object stream, whose body must be `PendingBody::Stream` -- treat
-        // it the same way and retry through EOF.
-        let needs_retry = match parse_file_object_syntax(&bytes) {
-            Err(_) => true,
-            Ok(pending) => matches!(pending.body, PendingBody::Direct { .. }),
-        };
-        if next.is_some() && self.resolution_fallbacks_remaining > 0 && needs_retry {
-            self.resolution_fallbacks_remaining -= 1;
-            return self.resolver.read_window(offset, None);
-        }
-        Ok(bytes)
-    }
-
-    #[cfg(test)]
-    fn filter_dictionary_to_handle(
-        &self,
-        dictionary: &Dictionary,
-        depth: usize,
-    ) -> Result<ObjectHandle> {
-        if depth > crate::parser::MAX_PARSE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "filter prefix dictionary nesting exceeds maximum of {}",
-                crate::parser::MAX_PARSE_DEPTH
-            )));
-        }
-        let entries = dictionary
-            .iter()
-            .map(|(key, value)| {
-                Ok((
-                    crate::object_handle::canonical_dictionary_key_from_legacy(key),
-                    self.filter_object_to_handle(value, depth + 1)?,
-                ))
-            })
-            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-        Ok(self
-            .resolver
-            .direct_object_handle(ObjectValue::Dictionary(entries)))
-    }
-
-    #[cfg(test)]
-    fn filter_object_to_handle(&self, object: &Object, depth: usize) -> Result<ObjectHandle> {
-        if depth > crate::parser::MAX_PARSE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "filter prefix object nesting exceeds maximum of {}",
-                crate::parser::MAX_PARSE_DEPTH
-            )));
-        }
-        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
-            let value = match object {
-                Object::Null => ObjectValue::Null,
-                Object::Boolean(value) => ObjectValue::Boolean(*value),
-                Object::Integer(value) => ObjectValue::Integer(*value),
-                Object::Real(value) => ObjectValue::Real(*value),
-                Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
-                    value: *value,
-                    literal: literal.clone(),
-                },
-                Object::Name(value) => ObjectValue::Name(value.clone()),
-                Object::String(value) => ObjectValue::String(value.clone()),
-                Object::Array(values) => ObjectValue::Array(
-                    values
-                        .iter()
-                        .map(|value| self.filter_object_to_handle(value, depth + 1))
-                        .collect::<Result<Vec<_>>>()?,
-                ),
-                Object::Dictionary(dictionary) => {
-                    let handle = self.filter_dictionary_to_handle(dictionary, depth + 1)?;
-                    return Ok(handle);
-                }
-                Object::Stream(stream) => ObjectValue::Stream {
-                    stream_dict: self.filter_dictionary_to_handle(&stream.dict, depth + 1)?,
-                    stream_data: Some(Rc::new(stream.data.clone())),
-                    stream_length: 0,
-                    stream_provider: None,
-                },
-                Object::Reference(object_ref) => {
-                    return Ok(self.resolver.get_object_handle(*object_ref));
-                }
-                Object::Operator(_) | Object::InlineImage(_) => {
-                    return Err(Error::Unsupported(
-                        "filter prefix contains a content-stream-only object".to_owned(),
-                    ));
-                }
-            };
-            Ok(self.resolver.direct_object_handle(value))
-        })
-    }
-
-    /// qpdf's unknown-crypt-filter warnings, in the order qpdf emits them for
-    /// one object: strings from `QPDF::decryptString`
-    /// (`libqpdf/QPDF_encryption.cc:1000-1001`) before streams from
-    /// `QPDF::decryptStream` (`:1123-1129`).
-    ///
-    /// Each fires at most once per document because the selection that
-    /// requests it also rewrites the crypt filter it complained about.
-    fn warn_unknown_crypt_filters(&self, strings: bool, streams: bool) -> Result<()> {
-        if strings {
-            self.resolver.push_warning(
-                "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
-                 strings may be decrypted improperly",
-            )?;
-        }
-        if streams {
-            self.resolver.push_warning(
-                "unknown encryption filter for streams (check /StmF from /Encrypt dictionary); \
-                 streams may be decrypted improperly",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn parse_object_stream_entry_from_handle(
-        &mut self,
-        stream_handle: &ObjectHandle,
-        target_object_number: u32,
-    ) -> Result<Option<ParsedObjectStreamEntry>> {
-        let stream_dict = stream_handle
-            .as_stream_dict()
-            .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
-        let stream_data = self.decode_object_stream_data(stream_handle)?;
-        let stream_object_count = object_stream_count_from_handle(&stream_dict)?;
-        let stream_data_first =
-            object_stream_integer_from_handle(&stream_dict, b"/First", "/First")?;
-
-        let first = usize::try_from(stream_data_first)
-            .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
-
-        let mut tokenizer = Tokenizer::new(&stream_data);
-        let mut object_offsets = BTreeMap::new();
-        for _ in 0..stream_object_count {
-            // qpdf stores these pairs in std::map keyed by object number
-            // (`QPDF.cc:1788-1790`); the type-2 field2 is not this selector.
-            let object_number = u32::try_from(parse_non_negative_u64(
-                tokenizer.next_integer()?,
-                "object stream object number",
-            )?)
-            .map_err(|_| Error::parse(0, "object stream object number does not fit u32"))?;
-            let object_offset =
-                parse_non_negative_u64(tokenizer.next_integer()?, "object stream object offset")?;
-            object_offsets.insert(object_number, object_offset);
-        }
-
-        let Some(object_offset) = object_offsets.get(&target_object_number).copied() else {
-            return Ok(None);
-        };
-
-        let start = first
-            .checked_add(
-                usize::try_from(object_offset)
-                    .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?,
-            )
-            .ok_or_else(|| Error::parse(0, "compressed object offset overflow"))?;
-
-        if start > stream_data.len() {
-            return Err(Error::parse(0, "compressed object offset out of range"));
-        }
-
-        let (object, mut diagnostics) = parse_qpdf_file_object(&stream_data[start..])?;
-        for diagnostic in &mut diagnostics {
-            diagnostic.relative_offset += start;
-        }
-        Ok(Some(ParsedObjectStreamEntry {
-            object,
-            diagnostics,
-        }))
-    }
-
-    fn decode_object_stream_data(&self, stream_handle: &ObjectHandle) -> Result<Vec<u8>> {
-        let mut decoded_stream = crate::pipeline::buffer::Buffer::new("object stream", None);
-        let mut filtering_attempted = false;
-        let _success = stream_handle.pipe_stream_data_for_object_stream(
-            &mut decoded_stream,
-            &mut filtering_attempted,
-            0,
-            crate::writer::DecodeLevel::Specialized,
-            false,
-            false,
-        )?;
-        if !filtering_attempted {
-            return Err(Error::Unsupported(
-                "getStreamData called on unfilterable stream".to_owned(),
-            ));
-        }
-        Ok(decoded_stream.take_buffer()?)
-    }
-
-    fn record_object_stream_diagnostics(
-        &mut self,
-        stream_ref: ObjectRef,
-        object_ref: ObjectRef,
-        diagnostics: Vec<crate::parser::ParserDiagnostic>,
-    ) -> Result<()> {
-        for diagnostic in diagnostics {
-            self.push_warning(format!(
-                "object stream {} (object {} {}, offset {}): {}",
-                stream_ref.number,
-                object_ref.number,
-                object_ref.generation,
-                diagnostic.relative_offset,
-                diagnostic.message
-            ))?;
-        }
-        Ok(())
-    }
-}
-
-/// qpdf `QPDF::decryptString`'s decryption half (`:1009-1038`), applied to
-/// every string reachable from `object`.
-fn decrypt_object_strings(
-    object_ref: ObjectRef,
-    object: &mut Object,
-    encryption: &mut EncryptionState,
-) -> Result<bool> {
-    let encrypt_ref = encryption.encrypt_ref;
-    if Some(object_ref) == encrypt_ref || !object_contains_string(object, 0)? {
-        return Ok(false);
-    }
-    let (use_aes, warn) = encryption.string_method();
-    let Some(use_aes) = use_aes else {
-        return Ok(warn);
-    };
-    encryption.with_object_cipher(object_ref, use_aes, |cipher| {
-        decrypt_strings_in_object(object_ref, object, cipher, encrypt_ref)
-    })?;
-    Ok(warn)
-}
-
-/// Whether qpdf's parser would encounter a string token while reading this
-/// already-materialized legacy object. The scan is deliberately key-free:
-/// `decryptString` and therefore `getKeyForObject` run only at an actual
-/// string token (`QPDFParser.cc:114-121`).
-fn object_contains_string(object: &Object, depth: usize) -> Result<bool> {
-    if depth > crate::object::MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "decrypt: inline object nesting exceeds maximum of {}",
-            crate::object::MAX_INLINE_DEPTH // cov:ignore-start: llvm maps the covered recursive error and String arm to trailing syntax
-        )));
-    }
-    let values: Option<Box<dyn Iterator<Item = &Object> + '_>> = match object {
-        Object::String(_) => return Ok(true),
-        // cov:ignore-end
-        Object::Array(values) => Some(Box::new(values.iter())),
-        Object::Dictionary(dict) => Some(Box::new(dict.iter().map(|(_, value)| value))),
-        Object::Stream(stream) => Some(Box::new(stream.dict.iter().map(|(_, value)| value))),
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::RealLiteral { .. }
-        | Object::Name(_)
-        | Object::Reference(_)
-        | Object::Operator(_)
-        | Object::InlineImage(_) => None,
-    };
-    if let Some(values) = values {
-        for value in values {
-            if object_contains_string(value, depth + 1)? {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-// Test-only mirror of `decrypt_object_strings`'s mode dispatch (same key
-// derivation, same `decrypt_cipher_bytes` leaf primitive), walking an
-// `ObjectValue`/`ObjectHandle` tree in place. The production canonical parser
-// decrypts literal strings as they are parsed; these helpers retain focused
-// coverage for the handle-tree encryption primitive itself.
-//
-// Returns whether the caller must emit the unknown-crypt-filter warning for
-// strings, exactly as `decrypt_resolved_object`'s string half does; the crypt
-// filter selection is shared, so a document only ever warns once.
-#[cfg(test)]
-fn decrypt_object_value_strings(
-    object_ref: ObjectRef,
-    value: &mut ObjectValue,
-    encryption: &mut EncryptionState,
-) -> Result<bool> {
-    if Some(object_ref) == encryption.encrypt_ref {
-        return Ok(false);
-    }
-    if !object_value_contains_string(value)? {
-        return Ok(false);
-    }
-    let (use_aes, warn) = encryption.string_method();
-    let Some(use_aes) = use_aes else {
-        return Ok(warn);
-    };
-    encryption.with_object_cipher(object_ref, use_aes, |cipher| {
-        decrypt_strings_in_object_value(value, cipher)
-    })?;
-    Ok(warn)
-}
-
-#[cfg(test)]
-fn object_value_contains_string(value: &ObjectValue) -> Result<bool> {
-    match value {
-        ObjectValue::String(_) => Ok(true),
-        ObjectValue::Array(items) => handles_contain_string(items.iter(), 1),
-        ObjectValue::Dictionary(entries) => handles_contain_string(entries.values(), 1),
-        ObjectValue::Stream { stream_dict, .. } => {
-            let entries = stream_dict
-                .as_dictionary()
-                .expect("a stream's own dictionary handle is always a direct Dictionary value");
-            handles_contain_string(entries.values(), 1)
-        }
-        ObjectValue::Null
-        | ObjectValue::Unresolved
-        | ObjectValue::Reserved
-        | ObjectValue::Destroyed
-        | ObjectValue::Boolean(_)
-        | ObjectValue::Integer(_)
-        | ObjectValue::Real(_)
-        | ObjectValue::RealLiteral { .. }
-        | ObjectValue::Name(_)
-        | ObjectValue::Reference(_)
-        | ObjectValue::Operator(_)
-        | ObjectValue::InlineImage(_) => Ok(false),
-    }
-}
-
-#[cfg(test)]
-fn handles_contain_string<'a>(
-    handles: impl Iterator<Item = &'a ObjectHandle>,
-    depth: usize,
-) -> Result<bool> {
-    for handle in handles {
-        if handle_contains_string(handle, depth)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(test)]
-fn handle_contains_string(handle: &ObjectHandle, depth: usize) -> Result<bool> {
-    if handle.is_indirect() {
-        return Ok(false);
-    }
-    if depth > crate::object::MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "decrypt: inline object nesting exceeds maximum of {}",
-            crate::object::MAX_INLINE_DEPTH
-        )));
-    }
-    if handle.as_string().is_some() {
-        return Ok(true);
-    }
-    if let Some(items) = handle.as_array() {
-        return handles_contain_string(items.iter(), depth + 1);
-    }
-    if let Some(entries) = handle.as_dictionary() {
-        return handles_contain_string(entries.values(), depth + 1);
-    }
-    if let Some(dict) = handle.as_stream_dict() {
-        let entries = dict
-            .as_dictionary()
-            .expect("a stream's own dictionary handle is always a direct Dictionary value");
-        return handles_contain_string(entries.values(), depth + 1);
-    }
-    Ok(false)
-}
-
-// The top-level value itself: a bare `ObjectValue::String` is mutated
-// directly (it is a plain owned local, not yet wrapped in a handle); a
-// container recurses into its already-populated `ObjectHandle` children via
-// `decrypt_handle_strings_in_place`, which tracks depth itself (this
-// function is the sole, always-depth-0 entry point -- it never recurses
-// into itself, so it carries no depth parameter of its own).
-#[cfg(test)]
-fn decrypt_strings_in_object_value(
-    value: &mut ObjectValue,
-    cipher: StringCipher<'_>,
-) -> Result<()> {
-    match value {
-        ObjectValue::String(bytes) => decrypt_cipher_bytes(bytes, cipher),
-        ObjectValue::Array(items) => {
-            for item in items.iter() {
-                decrypt_handle_strings_in_place(item, cipher, 1)?;
-            }
-            Ok(())
-        }
-        ObjectValue::Dictionary(entries) => {
-            for item in entries.values() {
-                decrypt_handle_strings_in_place(item, cipher, 1)?;
-            }
-            Ok(())
-        }
-        ObjectValue::Stream { stream_dict, .. } => {
-            decrypt_stream_dict_strings_in_place(stream_dict, cipher, 1)
-        }
-        ObjectValue::Null
-        | ObjectValue::Unresolved
-        | ObjectValue::Reserved
-        | ObjectValue::Destroyed
-        | ObjectValue::Boolean(_)
-        | ObjectValue::Integer(_)
-        | ObjectValue::Real(_)
-        | ObjectValue::RealLiteral { .. }
-        | ObjectValue::Name(_)
-        | ObjectValue::Reference(_)
-        | ObjectValue::Operator(_)
-        | ObjectValue::InlineImage(_) => Ok(()),
-    }
-}
-
-// A child reached through direct containment: an indirect handle is a
-// terminal leaf here (its own eventual resolution decrypts it separately,
-// keyed by its own object ref, exactly like a legacy `Object::Reference`
-// stops `decrypt_strings_in_value`'s walk) -- `handle.is_indirect()` is
-// checked before touching the handle's value at all, rather than relying on
-// `replace_direct_value`'s no-op-on-indirect behavior alone, so a resolved
-// indirect child's own contents are never even read here, let alone
-// decrypted with the wrong (parent's) key. A direct string is decrypted and
-// written back in place via `replace_direct_value`, which preserves the
-// handle's identity and already-recorded parsed offset.
-#[cfg(test)]
-fn decrypt_handle_strings_in_place(
-    handle: &ObjectHandle,
-    cipher: StringCipher<'_>,
-    depth: usize,
-) -> Result<()> {
-    if handle.is_indirect() {
-        return Ok(());
-    }
-    if depth > crate::object::MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "decrypt: inline object nesting exceeds maximum of {}",
-            crate::object::MAX_INLINE_DEPTH
-        )));
-    }
-    if let Some(mut bytes) = handle.as_string() {
-        decrypt_cipher_bytes(&mut bytes, cipher)?;
-        handle.replace_direct_value(ObjectValue::String(bytes));
-        return Ok(());
-    }
-    if let Some(items) = handle.as_array() {
-        for item in &items {
-            decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
-        }
-        return Ok(());
-    }
-    if let Some(entries) = handle.as_dictionary() {
-        for item in entries.values() {
-            decrypt_handle_strings_in_place(item, cipher, depth + 1)?;
-        }
-        return Ok(());
-    }
-    if let Some(dict) = handle.as_stream_dict() {
-        return decrypt_stream_dict_strings_in_place(&dict, cipher, depth + 1);
-    }
-    Ok(())
-}
-
-// Walks a stream's own dictionary entries directly, at exactly the depth its
-// caller specifies, without charging its own extra inline level for the
-// dictionary handle itself first. Matches `decrypt_strings_in_value`'s
-// `Object::Stream(stream) => stream.dict.values_mut()` arm, which visits a
-// stream's dictionary entries at the *same* depth+1 the stream itself was
-// reached at -- the legacy walk never treats the stream's own dictionary
-// container as a nesting level in its own right, only its entries count.
-// Getting this wrong is real, not cosmetic: the focused tests exercise the
-// same-depth accounting used by the raw-object compatibility walker. Charging
-// one extra level would reject a value that that explicitly legacy boundary
-// accepts and decrypts.
-#[cfg(test)]
-fn decrypt_stream_dict_strings_in_place(
-    dict: &ObjectHandle,
-    cipher: StringCipher<'_>,
-    depth: usize,
-) -> Result<()> {
-    let entries = dict
-        .as_dictionary()
-        .expect("a stream's own dictionary handle is always a direct Dictionary value");
-    for item in entries.values() {
-        decrypt_handle_strings_in_place(item, cipher, depth)?;
-    }
-    Ok(())
-}
-
-/// qpdf `QPDF::decryptStream`'s decryption half (`:1136-1153`).
-///
-/// qpdf prepends `Pl_RC4` for streams where `decryptString` uses the bare
-/// `RC4` class (`:1024-1031` versus `:1146-1151`); this keeps that split.
-fn decrypt_stream_bytes(
-    object_ref: ObjectRef,
-    bytes: &mut Vec<u8>,
-    use_aes: bool,
-    encryption: &mut EncryptionState,
-) -> Result<()> {
-    if !use_aes {
-        let key = encryption.key_for_object(object_ref, false).to_vec();
-        return PlRc4::transform_in_place("RC4 stream decryption", bytes, &key).map_err(Into::into);
-    }
-    encryption.with_object_cipher(object_ref, true, |cipher| {
-        decrypt_cipher_bytes(bytes, cipher)
-    })
-}
-
-/// Sets `warn_unknown` when the caller must emit the unknown-crypt-filter
-/// warning for streams: a `/Crypt` filter naming a method qpdf does not
-/// recognise still goes through `QPDF::decryptStream`'s switch, whose unknown
-/// arm warns and resets `cf_stream` (`libqpdf/QPDF_encryption.cc:1121-1133`).
-///
-/// The flag is an out-parameter rather than part of the return value because
-/// qpdf raises that warning at `:1121-1133`, ahead of the key derivation at
-/// `:1135` and the pipeline construction at `:1137-1149`. Returning it would
-/// discard it whenever one of those later steps fails, which is the opposite
-/// of qpdf's ordering.
-fn apply_explicit_crypt_filters(
-    object_ref: ObjectRef,
-    stream: &mut crate::Stream,
-    encryption: &mut EncryptionState,
-    recovered_stream_eol: Option<&[u8]>,
-    warn_unknown: &mut bool,
-) -> Result<()> {
-    let filter = stream
-        .dict
-        .get("Filter")
-        .cloned()
-        .expect("caller checked for an explicit /Crypt filter");
-    let decode_params = stream.dict.get("DecodeParms").cloned();
-    if let Some(filters) = filter.as_array() {
-        crate::filters::validate_filter_chain_len(filters.len())?;
-    }
-
-    // qpdf's QPDF::decryptStream prepends one decryption stage to the source
-    // pipeline before QPDF_Stream applies any /Filter entry
-    // (QPDF_encryption.cc:1041-1043, QPDF.cc:2477-2492). The legacy raw
-    // Object compatibility path is still materialized here, but it must keep
-    // that ordering: decrypt the raw payload once, then remove /Crypt and
-    // leave every other filter's encoded bytes untouched. Decoding a prefix
-    // and re-encoding it made the result depend on flpdf-only encoders and
-    // was wrong whenever /Crypt followed ASCII85/ASCIIHex/Flate.
-    let explicit_mode = match &filter {
-        Object::Name(name) if name.as_slice() == b"Crypt" => {
-            Some(explicit_crypt_mode(encryption, decode_params.as_ref()))
-        }
-        Object::Array(filters) => filters
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, filter)| {
-                if !matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt") {
-                    return None;
-                }
-                let params = decode_params_at(decode_params.as_ref(), index)?;
-                let params_dict = params.as_dict()?;
-                params_dict.get("Name")?.as_name()?;
-                Some(explicit_crypt_mode(encryption, Some(params)))
-            }),
-        _ => None, // cov:ignore: the caller only enters for a name or array containing Crypt
-    };
-    // For an array, a malformed or missing local `/Name` leaves qpdf's
-    // `method` at `e_unknown`, which falls back to the document `/StmF`.
-    let (use_aes, warn) = encryption.stream_method(explicit_mode);
-    *warn_unknown |= warn;
-
-    if let Some(eol) = recovered_stream_eol {
-        stream.data.extend_from_slice(eol);
-        if use_aes.is_some() {
-            // The recovered line ending belongs to the parser's source span,
-            // not to the encrypted stream payload. qpdf subtracts it from the
-            // source length before its prepended decryption stage.
-            stream.data.truncate(stream.data.len() - eol.len());
-        }
-    }
-    if let Some(use_aes) = use_aes {
-        decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
-    }
-
-    remove_explicit_crypt_filter_with_values(stream, filter, decode_params);
-    Ok(())
-}
-
-fn remove_explicit_crypt_filter_with_values(
-    stream: &mut crate::Stream,
-    filter: Object,
-    decode_params: Option<Object>,
-) {
-    if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
-        stream.dict.remove("Filter");
-        stream.dict.remove("DecodeParms");
-        return;
-    }
-
-    let Some(mut filters) = filter.into_array() else {
-        return; // cov:ignore: the qpdf explicit-crypt shape is a name or array; malformed shape is defensive
-    };
-    let mut decode_params = decode_params;
-    let mut index = 0;
-    while index < filters.len() {
-        if matches!(&filters[index], Object::Name(name) if name.as_slice() == b"Crypt") {
-            filters.remove(index);
-            if let Some(Object::Array(params)) = &mut decode_params {
-                if index < params.len() {
-                    params.remove(index);
-                }
-            }
-        } else {
-            index += 1;
-        }
-    }
-
-    if filters.is_empty() {
-        stream.dict.remove("Filter");
-        stream.dict.remove("DecodeParms");
-    } else {
-        stream.dict.insert("Filter", Object::Array(filters));
-        match decode_params {
-            Some(params) => stream.dict.insert("DecodeParms", params),
-            None => {
-                stream.dict.remove("DecodeParms");
-            }
-        };
-    }
-}
-
-fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
-    let params = decode_params?;
-    if params.as_dict().is_some() {
-        Some(params)
-    } else {
-        params.as_array()?.get(index)
-    }
-}
-
-/// The crypt filter a stream's own `/Crypt` `/DecodeParms` names, read the way
-/// qpdf reads it inside `QPDF::decryptStream` (`:1069-1073`, `:1083-1088`):
-/// through `interpretCF`, so an unrecognised name is `e_unknown` rather than
-/// an error.
-fn explicit_crypt_mode(
-    encryption: &EncryptionState,
-    decode_params: Option<&Object>,
-) -> EncryptionMode {
-    let Some(params) = decode_params.and_then(Object::as_dict) else {
-        return EncryptionMode::Identity;
-    };
-    interpret_cf(&encryption.crypt_filters, params.get("Name"))
-}
-
-fn stream_has_explicit_crypt_filter(dict: &Dictionary) -> bool {
-    dict.get("Filter").is_some_and(|filter| {
-        filter.as_name() == Some(b"Crypt".as_slice())
-            || filter.as_array().is_some_and(|filters| {
-                filters
-                    .iter()
-                    .any(|filter| filter.as_name() == Some(b"Crypt".as_slice()))
-            })
-    })
-}
-
-fn is_metadata_stream(dict: &Dictionary) -> bool {
-    dict.get("Type")
-        .and_then(Object::as_name)
-        .is_some_and(|name| name == b"Metadata")
 }
 
 #[cfg(test)]
@@ -4210,19 +2557,13 @@ pub(crate) fn parse_object_stream_entry(
         return Err(Error::parse(0, "compressed object offset out of range"));
     }
 
-    let (object, mut diagnostics) = parse_qpdf_file_object(&stream_data[start..])?;
-    for diagnostic in &mut diagnostics {
-        diagnostic.relative_offset += start;
-    }
-    Ok(ParsedObjectStreamEntry {
-        object,
-        diagnostics,
-    })
+    let (object, _diagnostics) = parse_qpdf_file_object(&stream_data[start..])?;
+    Ok(ParsedObjectStreamEntry { object })
 }
 
+#[cfg(test)]
 pub(crate) struct ParsedObjectStreamEntry {
     pub(crate) object: Object,
-    diagnostics: Vec<crate::parser::ParserDiagnostic>,
 }
 
 #[cfg(test)]
@@ -4237,32 +2578,6 @@ pub(crate) fn object_stream_count(stream_object: &crate::Stream) -> Result<usize
     .map_err(|_| Error::parse(0, "Object stream /N does not fit usize"))
 }
 
-fn object_stream_integer_from_handle(
-    stream_dict: &ObjectHandle,
-    key: &[u8],
-    label: &str,
-) -> Result<i64> {
-    let value = stream_dict.try_get_key(key)?.try_as_integer()?;
-    let Some(value) = value else {
-        return Err(Error::parse(
-            0,
-            format!("object stream {label} is not an integer"),
-        ));
-    };
-    if value < 0 {
-        return Err(Error::parse(
-            0,
-            format!("object stream {label} is negative"),
-        ));
-    }
-    Ok(value)
-}
-
-fn object_stream_count_from_handle(stream_dict: &ObjectHandle) -> Result<usize> {
-    usize::try_from(object_stream_integer_from_handle(stream_dict, b"/N", "/N")?)
-        .map_err(|_| Error::parse(0, "object stream /N does not fit usize"))
-}
-
 #[cfg(test)]
 fn parse_non_negative_i64(value: &crate::Object, context: &str) -> Result<i64> {
     let crate::Object::Integer(integer) = value else {
@@ -4274,6 +2589,7 @@ fn parse_non_negative_i64(value: &crate::Object, context: &str) -> Result<i64> {
     Ok(*integer)
 }
 
+#[cfg(test)]
 fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
     if value < 0 {
         return Err(Error::parse(0, format!("{context} is negative")));
@@ -4284,15 +2600,57 @@ fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        handle.materialize()
+    }
+
+    fn canonical_recovered_eol<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        object_ref: ObjectRef,
+    ) -> Result<Option<&'static [u8]>> {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle)?;
+        pdf.canonical_recovered_stream_eol(object_ref, &handle)
+    }
     use crate::pages::page_refs;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
     use crate::writer::ObjectWriterEmission;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
-    use std::process::Command;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        crate::filters::test_dictionary_api::encode_stream_data(&dict, plaintext)
+            .expect("Flate encode")
+    }
+
+    fn explicit_rc4_encryption_state() -> EncryptionState {
+        EncryptionState {
+            file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
+            encryption_v: 4,
+            encryption_r: 4,
+            cf_stream: EncryptionMode::Identity,
+            cf_string: EncryptionMode::Identity,
+            cf_file: EncryptionMode::Identity,
+            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Rc4)]),
+            encrypt_metadata: true,
+            encrypt_ref: None,
+            weak_crypto: true,
+            permissions: Permissions::new(-4),
+            user_password_matched: true,
+            owner_password_matched: false,
+            user_password: Vec::new(),
+            cached_object_encryption_key: Vec::new(),
+            cached_key_og: None,
+        }
+    }
 
     struct ReadFailingCursor {
         inner: Cursor<Vec<u8>>,
@@ -4330,17 +2688,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_recovered_stream_eol_ignores_legacy_transformed_stream_refs() {
-        // `transformed_stream_refs` is populated only by the legacy
-        // `resolve_to_cache` decrypt path; pure canonical `ObjectHandle`
-        // callers (job-level inspection) never reach it. Membership in that
-        // set must have no bearing on the canonical accessor -- proven here
-        // by inserting object 1 (the non-stream Catalog, which never has a
-        // recorded EOL either way) and confirming the result is unaffected.
+    fn canonical_recovered_stream_eol_is_none_for_a_non_stream_handle() {
+        // A non-stream Catalog has no recovered stream framing metadata.
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF");
         let object_ref = ObjectRef::new(1, 0);
         let handle = pdf.get_object_handle(object_ref);
-        pdf.transformed_stream_refs.insert(object_ref);
 
         assert_eq!(
             pdf.canonical_recovered_stream_eol(object_ref, &handle)
@@ -4464,1781 +2816,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decrypt_resolved_object_never_decrypts_the_encrypt_dictionary() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
-        let file = std::fs::File::open(path).expect("encrypted fixture");
-        let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
-        let encrypt_ref = pdf.encryption_ref().expect("indirect /Encrypt");
-        let sentinel = Object::Integer(42);
-
-        let (object, stream_payload_decrypted) = pdf
-            .decrypt_resolved_object(encrypt_ref, sentinel.clone(), None)
-            .expect("/Encrypt bypass");
-
-        assert_eq!(object, sentinel);
-        assert!(!stream_payload_decrypted);
-    }
-
-    #[test]
-    fn object_handle_as_string_decrypts_canonical_parsed_encrypted_strings() {
-        use crate::encryption::EncryptParams;
-        use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
-        use std::io::Cursor;
-
-        // A minimal Catalog/Pages/Info fixture: /Info (trailer-reachable,
-        // survives the writer's Catalog-first reachability walk) holds a
-        // direct, uncompressed, plain-xref-table string -- exactly the shape
-        // The canonical live parser builds the handle graph directly from
-        // raw source bytes, which is the path this test targets.
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut entries: Vec<(u16, usize)> = Vec::new();
-        entries.push((0, bytes.len()));
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        entries.push((0, bytes.len()));
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        entries.push((0, bytes.len()));
-        bytes.extend_from_slice(b"3 0 obj\n<< /Title (TopSecretTitle) >>\nendobj\n");
-        let startxref = bytes.len();
-        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
-        bytes.extend_from_slice(b"0000000000 65535 f \n");
-        for (generation, offset) in &entries {
-            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
-        }
-        bytes.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
-                entries.len() + 1
-            )
-            .as_bytes(),
-        );
-
-        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            compress_streams: CompressStreams::No,
-            encrypt: Some(EncryptParams::v4_aes128(
-                b"user-pw".to_vec(),
-                b"owner-pw".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=4 AES128 encrypted write");
-
-        let mut rt = Pdf::open_with_options(
-            Cursor::new(out),
-            PdfOpenOptions {
-                password: b"user-pw".to_vec(),
-                ..PdfOpenOptions::default()
-            },
-        )
-        .expect("re-open of V=4 output with user-pw");
-
-        let info_ref = match rt.trailer_dictionary().get("Info") {
-            Some(Object::Reference(r)) => *r,
-            // Defensive-only: this test's own fixture always writes /Info
-            // as a reference (the writer's Catalog-first renumber keeps it
-            // that way), so this arm cannot run.
-            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: unreachable given this test's own fixture
-        };
-        let info_handle = rt.get_object_handle(info_ref);
-        rt.resolve(&info_handle).expect("resolve /Info handle");
-        let dict = info_handle
-            .as_dictionary()
-            .expect("/Info must be a dictionary");
-        let title_handle = dict.get(b"/Title".as_slice()).expect("/Title entry");
-        let title = title_handle.as_string().expect("/Title must be a string");
-
-        assert_eq!(
-            title.as_slice(),
-            b"TopSecretTitle",
-            "ObjectHandle::as_string() must decrypt a canonical-parsed string from an \
-             encrypted document, not return raw ciphertext -- the live parser \
-             builds ObjectValue::String directly from raw (possibly still-encrypted) source \
-             bytes, and this accessor reads that stored value directly"
-        );
-    }
-
-    /// An `/Encrypt` dictionary carrying `entries`, for the `/CF` and
-    /// `interpretCF` ports below.
-    fn encrypt_dict(entries: &[(&str, Object)]) -> Dictionary {
-        let mut dict = Dictionary::new();
-        for (key, value) in entries {
-            dict.insert(key, value.clone());
-        }
-        dict
-    }
-
-    fn cf_dict(entries: &[(&str, Object)]) -> Object {
-        Object::Dictionary(encrypt_dict(entries))
-    }
-
-    /// qpdf `QPDF_encryption.cc:866-880`: the recognised `/CFM` names.
-    #[test]
-    fn crypt_filter_modes_maps_the_three_recognised_cfm_names() {
-        let encrypt = encrypt_dict(&[(
-            "CF",
-            cf_dict(&[
-                ("Rc4CF", cf_dict(&[("CFM", Object::Name(b"V2".to_vec()))])),
-                (
-                    "AesCF",
-                    cf_dict(&[("CFM", Object::Name(b"AESV2".to_vec()))]),
-                ),
-                (
-                    "Aes3CF",
-                    cf_dict(&[("CFM", Object::Name(b"AESV3".to_vec()))]),
-                ),
-            ]),
-        )]);
-
-        let modes = crypt_filter_modes(&encrypt, 4);
-
-        assert_eq!(modes[b"Rc4CF".as_slice()], EncryptionMode::Rc4);
-        assert_eq!(modes[b"AesCF".as_slice()], EncryptionMode::Aes128);
-        assert_eq!(modes[b"Aes3CF".as_slice()], EncryptionMode::Aes256);
-    }
-
-    /// An unrecognised `/CFM` is `e_unknown`, not an error: qpdf defers because
-    /// the document may never reference the filter (`:877-880`). Observed with
-    /// `qpdf --password=u --show-encryption` on a `/V 4` file whose `/CFM` was
-    /// rewritten to `/AESVX`, which reports `unknown` and exits 0.
-    #[test]
-    fn crypt_filter_modes_keeps_an_unrecognised_cfm_as_unknown() {
-        let encrypt = encrypt_dict(&[(
-            "CF",
-            cf_dict(&[(
-                "StdCF",
-                cf_dict(&[("CFM", Object::Name(b"AESVX".to_vec()))]),
-            )]),
-        )]);
-
-        let modes = crypt_filter_modes(&encrypt, 4);
-
-        assert_eq!(modes[b"StdCF".as_slice()], EncryptionMode::Unknown);
-    }
-
-    /// A missing or non-name `/CFM` leaves qpdf's `e_none` initialiser in place
-    /// (`:865-866`). Observed: blanking `/CFM /AESV2`, and replacing it with
-    /// `/CFM 12345`, both make qpdf report `none` and decline to decrypt.
-    #[test]
-    fn crypt_filter_modes_treats_a_missing_or_non_name_cfm_as_none() {
-        let encrypt = encrypt_dict(&[(
-            "CF",
-            cf_dict(&[
-                ("NoCFM", cf_dict(&[("Length", Object::Integer(16))])),
-                ("BadCFM", cf_dict(&[("CFM", Object::Integer(12345))])),
-            ]),
-        )]);
-
-        let modes = crypt_filter_modes(&encrypt, 4);
-
-        assert_eq!(modes[b"NoCFM".as_slice()], EncryptionMode::Identity);
-        assert_eq!(modes[b"BadCFM".as_slice()], EncryptionMode::Identity);
-    }
-
-    /// A `/CF` value that is not a dictionary is skipped rather than rejected
-    /// (`:864`), so the name has no entry and later resolves to `e_unknown`.
-    /// Observed: replacing the `/StdCF` value with `null` makes qpdf report
-    /// `unknown` and exit 0.
-    #[test]
-    fn crypt_filter_modes_skips_a_non_dictionary_cf_entry() {
-        let encrypt = encrypt_dict(&[("CF", cf_dict(&[("StdCF", Object::Null)]))]);
-
-        let modes = crypt_filter_modes(&encrypt, 4);
-
-        assert!(modes.is_empty());
-        assert_eq!(
-            interpret_cf(&modes, Some(&Object::Name(b"StdCF".to_vec()))),
-            EncryptionMode::Unknown
-        );
-    }
-
-    /// The `/CF` block is gated on `/V`, not `/R` (`:860`).
-    #[test]
-    fn crypt_filter_modes_only_runs_for_v4_and_v5() {
-        let encrypt = encrypt_dict(&[(
-            "CF",
-            cf_dict(&[("StdCF", cf_dict(&[("CFM", Object::Name(b"V2".to_vec()))]))]),
-        )]);
-
-        for v in [4, 5] {
-            assert_eq!(crypt_filter_modes(&encrypt, v).len(), 1, "/V {v}");
-        }
-        for v in [0, 1, 2, 3, 6] {
-            assert!(crypt_filter_modes(&encrypt, v).is_empty(), "/V {v}");
-        }
-    }
-
-    /// qpdf `interpretCF` (`:700-716`). The `/CF` lookup runs before the
-    /// built-in `/Identity`, so a document that names a crypt filter
-    /// `/Identity` shadows the built-in. Observed: a `/V 4` file with
-    /// `/CF << /Identity << /CFM /AESV2 …>> >>` and `/StmF /Identity` makes
-    /// qpdf report `AESv2` for streams.
-    #[test]
-    fn interpret_cf_prefers_a_named_filter_over_the_builtin_identity() {
-        let modes = BTreeMap::from([(b"Identity".to_vec(), EncryptionMode::Aes128)]);
-
-        assert_eq!(
-            interpret_cf(&modes, Some(&Object::Name(b"Identity".to_vec()))),
-            EncryptionMode::Aes128
-        );
-        assert_eq!(
-            interpret_cf(&BTreeMap::new(), Some(&Object::Name(b"Identity".to_vec()))),
-            EncryptionMode::Identity
-        );
-    }
-
-    /// A selector with no `/CF` entry is `e_unknown` (`:710`); one that is not
-    /// a name at all is qpdf's "Default: /Identity" (`:712-714`).
-    #[test]
-    fn interpret_cf_separates_an_absent_entry_from_a_non_name_selector() {
-        let modes = BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Aes128)]);
-
-        assert_eq!(
-            interpret_cf(&modes, Some(&Object::Name(b"NoSuchCF".to_vec()))),
-            EncryptionMode::Unknown
-        );
-        assert_eq!(
-            interpret_cf(&modes, Some(&Object::Integer(7))),
-            EncryptionMode::Identity
-        );
-        assert_eq!(interpret_cf(&modes, None), EncryptionMode::Identity);
-    }
-
-    #[test]
-    fn interpret_cf_from_handle_matches_the_materialized_selector_and_qpdf_order() {
-        let mut encryption = explicit_rc4_encryption_state();
-        encryption
-            .crypt_filters
-            .insert(b"Identity".to_vec(), EncryptionMode::Aes128);
-
-        let cases = [
-            (
-                Object::Name(b"StdCF".to_vec()),
-                ObjectHandle::name(b"StdCF".to_vec()),
-                EncryptionMode::Rc4,
-            ),
-            (
-                Object::Name(b"Identity".to_vec()),
-                ObjectHandle::name(b"Identity".to_vec()),
-                EncryptionMode::Aes128,
-            ),
-            (
-                Object::Name(b"NoSuchCF".to_vec()),
-                ObjectHandle::name(b"NoSuchCF".to_vec()),
-                EncryptionMode::Unknown,
-            ),
-            (
-                Object::Integer(7),
-                ObjectHandle::integer(7),
-                EncryptionMode::Identity,
-            ),
-            (Object::Null, ObjectHandle::null(), EncryptionMode::Identity),
-        ];
-
-        for (object, handle, expected) in cases {
-            assert_eq!(
-                interpret_cf(&encryption.crypt_filters, Some(&object)),
-                expected
-            );
-            assert_eq!(
-                interpret_cf_from_handle(&encryption, &handle).unwrap(),
-                expected
-            );
-        }
-
-        let builtin_identity = explicit_rc4_encryption_state();
-        assert_eq!(
-            interpret_cf_from_handle(&builtin_identity, &ObjectHandle::name(b"Identity".to_vec()),)
-                .unwrap(),
-            EncryptionMode::Identity
-        );
-    }
-
-    #[test]
-    fn interpret_cf_from_handle_lazily_resolves_an_indirect_name() {
-        let encryption = explicit_rc4_encryption_state();
-        let (handle, _resolver) = crate::object_handle::identity_tests::resolver_bearing_handle(
-            ObjectValue::Name(b"StdCF".to_vec()),
-        );
-
-        assert!(!handle.is_resolved());
-        assert_eq!(
-            interpret_cf_from_handle(&encryption, &handle).unwrap(),
-            EncryptionMode::Rc4
-        );
-        assert!(handle.is_resolved());
-    }
-
-    #[test]
-    fn interpret_cf_from_handle_propagates_resolution_failures() {
-        let encryption = explicit_rc4_encryption_state();
-
-        let (dropped, resolver) = crate::object_handle::identity_tests::resolver_bearing_handle(
-            ObjectValue::Name(b"StdCF".to_vec()),
-        );
-        drop(resolver);
-        assert_eq!(
-            interpret_cf_from_handle(&encryption, &dropped)
-                .unwrap_err()
-                .to_string(),
-            "object 20 0 belongs to a dropped PDF"
-        );
-
-        let (failing, _resolver) =
-            crate::object_handle::identity_tests::error_resolving_handle(ObjectRef::new(21, 0));
-        assert_eq!(
-            interpret_cf_from_handle(&encryption, &failing)
-                .unwrap_err()
-                .to_string(),
-            "resolver failed"
-        );
-    }
-
-    /// qpdf enters the crypt-filter switch only for `/V >= 4` (`:982-983`,
-    /// `:1062-1063`), leaving `use_aes` false — so a pre-`/V 4` document is
-    /// RC4 no matter what the crypt filter fields hold.
-    #[test]
-    fn select_method_is_rc4_below_v4_whatever_the_crypt_filter_says() {
-        for method in [
-            EncryptionMode::Identity,
-            EncryptionMode::Rc4,
-            EncryptionMode::Aes128,
-            EncryptionMode::Aes256,
-            EncryptionMode::Unknown,
-        ] {
-            let mut cf = method;
-            assert_eq!(
-                EncryptionState::select_method(method, &mut cf, 2),
-                (Some(false), false),
-                "{method:?}"
-            );
-            assert_eq!(cf, method, "the pre-/V 4 path must not rewrite the filter");
-        }
-    }
-
-    /// The `e_none` arm returns without decrypting; the two AES arms and the
-    /// RC4 arm map onto `use_aes` (`:1105-1120`).
-    #[test]
-    fn select_method_maps_each_known_filter_onto_use_aes() {
-        let cases = [
-            (EncryptionMode::Identity, None),
-            (EncryptionMode::Rc4, Some(false)),
-            (EncryptionMode::Aes128, Some(true)),
-            (EncryptionMode::Aes256, Some(true)),
-        ];
-        for (method, expected) in cases {
-            let mut cf = method;
-            assert_eq!(
-                EncryptionState::select_method(method, &mut cf, 4),
-                (expected, false),
-                "{method:?}"
-            );
-            assert_eq!(cf, method, "only the unknown arm rewrites the filter");
-        }
-    }
-
-    /// `compute_data_key`'s `/V >= 5` shortcut (`:337-340`): the file key is
-    /// used straight, so the object and generation numbers do not enter it.
-    #[test]
-    fn compute_data_key_uses_the_file_key_straight_from_v5() {
-        let encryption = EncryptionState {
-            file_key: (0..32).collect(),
-            encryption_v: 5,
-            encryption_r: 6,
-            ..explicit_rc4_encryption_state()
-        };
-
-        for use_aes in [false, true] {
-            assert_eq!(
-                encryption.compute_data_key(ObjectRef::new(9, 3), use_aes),
-                encryption.file_key
-            );
-        }
-        assert_eq!(
-            encryption.compute_data_key(ObjectRef::new(1, 0), true),
-            encryption.compute_data_key(ObjectRef::new(4242, 7), true)
-        );
-    }
-
-    /// Algorithm 3.1 below `/V 5` (`:342-356`): the low three bytes of the
-    /// object number, the low two of the generation, then `"sAlT"` for AES,
-    /// hashed and truncated to `min(len, 16)`.
-    #[test]
-    fn compute_data_key_follows_algorithm_3_1_below_v5() {
-        let encryption = EncryptionState {
-            file_key: (0..16).collect(),
-            encryption_v: 4,
-            encryption_r: 4,
-            ..explicit_rc4_encryption_state()
-        };
-        let og = ObjectRef::new(0x03_0201, 0x0605);
-
-        let expect = |use_aes: bool| {
-            let mut input: Vec<u8> = (0..16).collect();
-            input.extend_from_slice(&[0x01, 0x02, 0x03, 0x05, 0x06]);
-            if use_aes {
-                input.extend_from_slice(b"sAlT");
-            }
-            let digest = crate::encryption::primitives::md5(&input);
-            digest[..input.len().min(16)].to_vec()
-        };
-
-        assert_eq!(encryption.compute_data_key(og, false), expect(false));
-        assert_eq!(encryption.compute_data_key(og, true), expect(true));
-        assert_ne!(
-            encryption.compute_data_key(og, false),
-            encryption.compute_data_key(og, true),
-            "the AES salt must change the key"
-        );
-    }
-
-    /// qpdf caches the object key on the object/generation pair alone, leaving
-    /// `use_aes` out of the key (`:962`). A document whose `/StrF` and `/StmF`
-    /// disagree about AES therefore reuses whichever key was derived first.
-    #[test]
-    fn key_for_object_caches_on_the_object_alone_and_ignores_use_aes() {
-        let mut encryption = EncryptionState {
-            file_key: (0..16).collect(),
-            encryption_v: 4,
-            encryption_r: 4,
-            ..explicit_rc4_encryption_state()
-        };
-        let og = ObjectRef::new(3, 0);
-
-        let rc4_key = encryption.key_for_object(og, false).to_vec();
-        assert_eq!(rc4_key, encryption.compute_data_key(og, false));
-
-        // Same object, now asking for AES: qpdf returns the cached RC4-derived
-        // key rather than re-deriving with the salt.
-        assert_eq!(encryption.key_for_object(og, true), rc4_key);
-        assert_ne!(rc4_key, encryption.compute_data_key(og, true));
-
-        // A different object misses the cache and derives afresh.
-        let other = ObjectRef::new(4, 0);
-        let expected = encryption.compute_data_key(other, true);
-        assert_eq!(encryption.key_for_object(other, true), expected);
-    }
-
-    fn explicit_rc4_encryption_state() -> EncryptionState {
-        EncryptionState {
-            file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
-            encryption_v: 4,
-            encryption_r: 4,
-            cf_stream: EncryptionMode::Identity,
-            cf_string: EncryptionMode::Identity,
-            cf_file: EncryptionMode::Identity,
-            crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Rc4)]),
-            encrypt_metadata: true,
-            encrypt_ref: None,
-            weak_crypto: true,
-            permissions: Permissions::new(-4),
-            user_password_matched: true,
-            owner_password_matched: false,
-            user_password: Vec::new(),
-            cached_object_encryption_key: Vec::new(),
-            cached_key_og: None,
-        }
-    }
-
-    fn rc4_ciphertext(
-        object_ref: ObjectRef,
-        plaintext: &[u8],
-        encryption: &EncryptionState,
-    ) -> Vec<u8> {
-        let mut encryption = encryption.clone();
-        let mut ciphertext = plaintext.to_vec();
-        decrypt_stream_bytes(object_ref, &mut ciphertext, false, &mut encryption)
-            .expect("RC4 encryption");
-        ciphertext
-    }
-
-    #[test]
-    fn production_explicit_crypt_keeps_indirect_decode_params() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let decode_params_ref = ObjectRef::new(5, 0);
-        let plaintext = b"native prefix";
-        let encryption = explicit_rc4_encryption_state();
-        let mut predictor_input = vec![0];
-        predictor_input.extend_from_slice(plaintext);
-        let encoded = rc4_ciphertext(
-            ObjectRef::new(4, 0),
-            &flate_encoded(&predictor_input),
-            &encryption,
-        );
-
-        let mut decode_params = Dictionary::new();
-        decode_params.insert("Predictor", Object::Integer(12));
-        decode_params.insert("Columns", Object::Integer(plaintext.len() as i64));
-        decode_params.insert("Colors", Object::Integer(1));
-        decode_params.insert("BitsPerComponent", Object::Integer(8));
-        pdf.set_object(decode_params_ref, Object::Dictionary(decode_params));
-
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"FlateDecode".to_vec()),
-                Object::Name(b"Crypt".to_vec()),
-            ]),
-        );
-        stream_dict.insert(
-            "DecodeParms",
-            Object::Array(vec![
-                Object::Reference(decode_params_ref),
-                crypt_params(b"StdCF"),
-            ]),
-        );
-        *pdf.encryption.borrow_mut() = Some(encryption);
-
-        let (object, transformed) = pdf
-            .decrypt_resolved_object(
-                ObjectRef::new(4, 0),
-                Object::Stream(Stream::new(stream_dict, encoded)),
-                None,
-            )
-            .expect("production explicit Crypt route");
-        assert!(transformed);
-        let Object::Stream(stream) = object else {
-            panic!("fixture must remain a stream"); // cov:ignore: constructed as a stream above
-        };
-        let stream_handle = pdf
-            .filter_dictionary_to_handle(&stream.dict, 0)
-            .expect("lift remaining filter parameters");
-        let decoded = crate::filters::decode_stream_data_from_handle(
-            &stream_handle,
-            &stream.data,
-            crate::filters::DecodeLimits::default(),
-        )
-        .expect("decode rewritten stream through native params");
-        assert_eq!(decoded, plaintext);
-    }
-
-    #[test]
-    fn source_backed_explicit_crypt_keeps_decode_params_without_reentry() {
-        let decode_params_ref = ObjectRef::new(5, 0);
-        let bytes = classic_pdf_with_bodies(
-            &[
-                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-                b"4 0 obj\nnull\nendobj\n",
-                b"5 0 obj\n<< /Predictor 12 /Columns 13 /Colors 1 /BitsPerComponent 8 >>\nendobj\n",
-            ],
-            ObjectRef::new(1, 0),
-        );
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open source-backed fixture");
-        let plaintext = b"native prefix";
-        let encryption = explicit_rc4_encryption_state();
-        let mut predictor_input = vec![0];
-        predictor_input.extend_from_slice(plaintext);
-        let encoded = rc4_ciphertext(
-            ObjectRef::new(4, 0),
-            &flate_encoded(&predictor_input),
-            &encryption,
-        );
-
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"FlateDecode".to_vec()),
-                Object::Name(b"Crypt".to_vec()),
-            ]),
-        );
-        stream_dict.insert(
-            "DecodeParms",
-            Object::Array(vec![
-                Object::Reference(decode_params_ref),
-                crypt_params(b"StdCF"),
-            ]),
-        );
-        *pdf.encryption.borrow_mut() = Some(encryption);
-
-        let (object, transformed) = pdf
-            .decrypt_resolved_object(
-                ObjectRef::new(4, 0),
-                Object::Stream(Stream::new(stream_dict, encoded)),
-                None,
-            )
-            .expect("source-backed DecodeParms must not reenter encryption state");
-        assert!(transformed);
-        let Object::Stream(stream) = object else {
-            panic!("fixture must remain a stream"); // cov:ignore: constructed as a stream above
-        };
-        let stream_handle = pdf
-            .filter_dictionary_to_handle(&stream.dict, 0)
-            .expect("lift remaining source-backed filter parameters");
-        let decoded = crate::filters::decode_stream_data_from_handle(
-            &stream_handle,
-            &stream.data,
-            crate::filters::DecodeLimits::default(),
-        )
-        .expect("decode rewritten source-backed stream through native params");
-        assert_eq!(decoded, plaintext);
-    }
-
-    /// Compare the canonical source-backed indirect-`/DecodeParms` route with
-    /// qpdf 11.9.0 on a real encrypted PDF. The stream stores
-    /// `RC4(FlateDecode(plaintext))`, so qpdf must resolve object 5 while
-    /// building its filtered pipeline and flpdf must select the same
-    /// source-backed handles before decrypting the stream.
-    #[test]
-    fn source_backed_indirect_decode_params_match_pinned_qpdf_bytes() {
-        let version = match Command::new("/usr/bin/qpdf").arg("--version").output() {
-            Ok(version) => version,
-            // cov:ignore-start: CI provides the pinned qpdf binary; this is a developer-host skip
-            Err(error) => {
-                eprintln!(
-                    "/usr/bin/qpdf unavailable; skipping indirect DecodeParms oracle: {error}"
-                );
-                return;
-            } // cov:ignore-end
-        };
-        let first_line = String::from_utf8_lossy(&version.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        if first_line != "qpdf version 11.9.0" {
-            // cov:ignore-start: CI provides exactly qpdf 11.9.0; this is a developer-host skip
-            eprintln!(
-                "expected /usr/bin/qpdf 11.9.0; skipping indirect DecodeParms oracle: {first_line}"
-            );
-            return;
-            // cov:ignore-end
-        }
-
-        use crate::encryption::standard::{
-            build_v4_encrypt_dict, encrypt_cipher_bytes, per_object_key, ObjectKeyAlg,
-            StringEncryptCipher, V4CryptMethod, V4EncryptParams,
-        };
-        use crate::encryption::{EncryptMethod, EncryptParams};
-
-        const PASSWORD: &[u8] = b"user-pw";
-        const OWNER_PASSWORD: &[u8] = b"owner-pw";
-        const ID0: [u8; 16] = [0x42; 16];
-        const PLAINTEXT: &[u8] = b"qpdf indirect DecodeParms oracle payload";
-        let encryption_params = EncryptParams::rc4(
-            EncryptMethod::V4Rc4128,
-            PASSWORD.to_vec(),
-            OWNER_PASSWORD.to_vec(),
-        );
-        let (encrypt_dict, file_key) = build_v4_encrypt_dict(&V4EncryptParams {
-            method: V4CryptMethod::Rc4,
-            user_password: PASSWORD,
-            owner_password: OWNER_PASSWORD,
-            p: encryption_params.permissions.to_p_bits(),
-            id0: &ID0,
-            encrypt_metadata: true,
-        })
-        .expect("build qpdf-compatible V=4 encryption dictionary");
-        let object_key = per_object_key(&file_key, 4, 0, ObjectKeyAlg::Rc4);
-        let mut predictor_input = vec![0];
-        predictor_input.extend_from_slice(PLAINTEXT);
-        let mut encoded = flate_encoded(&predictor_input);
-        encrypt_cipher_bytes(
-            &mut encoded,
-            StringEncryptCipher::Rc4 { key: &object_key },
-            &[0; 16],
-        )
-        .expect("encrypt explicit Crypt payload");
-
-        let mut encrypt_wire = Vec::new();
-        crate::writer::encrypted_strings::write_encryption_dictionary(
-            &mut encrypt_wire,
-            &encrypt_dict,
-        );
-        let mut bodies = Vec::new();
-        bodies.push(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec());
-        bodies.push(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec());
-        bodies.push(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n"
-                .to_vec(),
-        );
-        let mut stream = format!(
-            "4 0 obj\n<< /Length {} /Filter [/FlateDecode /Crypt] /DecodeParms [5 0 R << /Type /CryptFilterDecodeParms /Name /StdCF >>] >>\nstream\n",
-            encoded.len()
-        )
-        .into_bytes();
-        stream.extend_from_slice(&encoded);
-        stream.extend_from_slice(b"\nendstream\nendobj\n");
-        bodies.push(stream);
-        bodies.push(
-            format!(
-                "5 0 obj\n<< /Predictor 12 /Columns {} /Colors 1 /BitsPerComponent 8 >>\nendobj\n",
-                PLAINTEXT.len()
-            )
-            .into_bytes(),
-        );
-        bodies.push({
-            let mut body = b"6 0 obj\n".to_vec();
-            body.extend_from_slice(&encrypt_wire);
-            body.extend_from_slice(b"\nendobj\n");
-            body
-        });
-
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut offsets = Vec::with_capacity(bodies.len());
-        for body in &bodies {
-            offsets.push(bytes.len());
-            bytes.extend_from_slice(body);
-        }
-        let xref_start = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
-        for offset in offsets {
-            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        let id_hex = ID0
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        bytes.extend_from_slice(
-            format!(
-                "trailer\n<< /Size 7 /Root 1 0 R /Encrypt 6 0 R /ID [<{id_hex}><{id_hex}>] >>\nstartxref\n{xref_start}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-
-        let directory = tempfile::tempdir().expect("temporary qpdf oracle directory");
-        let path = directory.path().join("indirect-decode-parms.pdf");
-        std::fs::write(&path, &bytes).expect("write qpdf oracle fixture");
-        let qpdf = Command::new("/usr/bin/qpdf")
-            .arg("--password=user-pw")
-            .arg("--show-object=4")
-            .arg("--filtered-stream-data")
-            .arg(&path)
-            .output()
-            .expect("run pinned qpdf indirect DecodeParms probe");
-        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
-        assert!(
-            qpdf.status.success(),
-            "qpdf indirect DecodeParms probe failed:\n{qpdf_stderr}"
-        );
-
-        let mut pdf = Pdf::open_with_options(
-            Cursor::new(bytes),
-            crate::PdfOpenOptions {
-                password: PASSWORD.to_vec(),
-                ..crate::PdfOpenOptions::default()
-            },
-        )
-        .expect("open qpdf oracle fixture with flpdf");
-        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve(&stream)
-            .expect("resolve source-backed encrypted stream");
-        let flpdf = stream
-            .get_stream_data(crate::writer::DecodeLevel::All)
-            .expect("decode source-backed encrypted stream with flpdf")
-            .as_ref()
-            .clone();
-        assert_eq!(qpdf.stdout, PLAINTEXT, "qpdf oracle plaintext");
-        assert_eq!(flpdf, qpdf.stdout, "flpdf and qpdf stream bytes");
-    }
-
-    #[test]
-    fn filter_prefix_lift_handles_legacy_kinds_and_depth_limits() {
-        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let mut nested = Dictionary::new();
-        nested.insert("Value", Object::Integer(7));
-
-        let mut dictionary = Dictionary::new();
-        dictionary.insert("Null", Object::Null);
-        dictionary.insert("Boolean", Object::Boolean(true));
-        dictionary.insert("Integer", Object::Integer(7));
-        dictionary.insert("Real", Object::Real(1.5));
-        dictionary.insert(
-            "RealLiteral",
-            Object::RealLiteral {
-                value: 0.4,
-                literal: b".4".to_vec(),
-            },
-        );
-        dictionary.insert("Name", Object::Name(b"FlateDecode".to_vec()));
-        dictionary.insert("String", Object::String(b"params".to_vec()));
-        dictionary.insert(
-            "Array",
-            Object::Array(vec![Object::Boolean(false), Object::Integer(2)]),
-        );
-        dictionary.insert("Dictionary", Object::Dictionary(nested));
-        dictionary.insert(
-            "Stream",
-            Object::Stream(Stream::new(Dictionary::new(), b"payload".to_vec())),
-        );
-        let referenced = ObjectRef::new(5, 0);
-        dictionary.insert("Reference", Object::Reference(referenced));
-
-        let handle = pdf
-            .filter_dictionary_to_handle(&dictionary, 0)
-            .expect("all ordinary PDF object kinds lift into handles");
-        assert_eq!(
-            handle
-                .try_get_key(b"/Reference")
-                .expect("reference child")
-                .object_ref(),
-            Some(referenced)
-        );
-        assert!(handle
-            .try_get_key(b"/Dictionary")
-            .expect("dictionary child")
-            .as_dictionary()
-            .is_some());
-        assert!(handle
-            .try_get_key(b"/Stream")
-            .expect("stream child")
-            .as_stream_dict()
-            .is_some());
-
-        assert!(pdf
-            .filter_dictionary_to_handle(&Dictionary::new(), crate::parser::MAX_PARSE_DEPTH + 1)
-            .is_err());
-        assert!(pdf
-            .filter_object_to_handle(&Object::Null, crate::parser::MAX_PARSE_DEPTH + 1)
-            .is_err());
-        assert!(pdf
-            .filter_object_to_handle(&Object::Operator(b"q".to_vec()), 0)
-            .is_err());
-        assert!(pdf
-            .filter_object_to_handle(&Object::InlineImage(b"BI".to_vec()), 0)
-            .is_err());
-    }
-
-    #[test]
-    fn cached_stream_length_handles_follow_qpdf_classification_and_sync() {
-        let pending = parse_file_object_syntax(
-            b"1 0 obj\n<< /Length 99 0 R >>\nstream\nabc\nendstream\nendobj\n",
-        )
-        .expect("pending stream");
-        let target = ObjectRef::new(1, 0);
-        let holder = ObjectRef::new(99, 0);
-
-        let mut null_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let null_handle = null_pdf.get_object_handle(holder);
-        null_handle.set_resolved(ObjectValue::Null);
-        assert!(null_handle.is_resolved());
-        assert!(null_handle.is_null());
-        assert!(null_pdf.cache.entry(holder).is_none());
-        assert_eq!(
-            null_pdf
-                .resolve_pending_stream_length(target, &pending, 0)
-                .expect("cached null holder"),
-            Some(ResolvedStreamLength::Missing)
-        );
-
-        let mut invalid_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        invalid_pdf
-            .get_object_handle(holder)
-            .set_resolved(ObjectValue::Name(b"not-an-integer".to_vec()));
-        assert_eq!(
-            invalid_pdf
-                .resolve_pending_stream_length(target, &pending, 0)
-                .expect("cached invalid holder"),
-            Some(ResolvedStreamLength::Invalid)
-        );
-
-        let mut sync_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let length_handle = sync_pdf.get_object_handle(holder);
-        sync_pdf.cache.set_resolved(holder, Object::Integer(3));
-        assert!(!length_handle.is_resolved());
-        assert_eq!(
-            sync_pdf
-                .resolve_pending_stream_length(target, &pending, 0)
-                .expect("legacy cache holder"),
-            Some(ResolvedStreamLength::Integer(3))
-        );
-        assert!(length_handle.is_resolved());
-    }
-
-    #[test]
-    fn rc4_stream_decryption_preserves_payload_allocation() {
-        let object_ref = ObjectRef::new(7, 0);
-        let mut encryption = explicit_rc4_encryption_state();
-        let plaintext = vec![0x42; crate::pipeline::rc4::DEFAULT_OUT_BUFFER_SIZE + 17];
-        let mut bytes = plaintext.clone();
-        let original_ptr = bytes.as_ptr();
-        let original_capacity = bytes.capacity();
-
-        decrypt_stream_bytes(object_ref, &mut bytes, false, &mut encryption)
-            .expect("RC4 transform");
-        assert_eq!(bytes.as_ptr(), original_ptr);
-        assert_eq!(bytes.capacity(), original_capacity);
-        assert_ne!(bytes, plaintext);
-
-        decrypt_stream_bytes(object_ref, &mut bytes, false, &mut encryption)
-            .expect("RC4 inverse transform");
-        assert_eq!(bytes.as_ptr(), original_ptr);
-        assert_eq!(bytes, plaintext);
-    }
-
-    #[test]
-    fn a_string_free_legacy_object_does_not_prime_qpdfs_key_cache() {
-        let object_ref = ObjectRef::new(7, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        encryption.file_key = (0..16).collect();
-        encryption.cf_stream = EncryptionMode::Aes128;
-        let mut oracle_state = encryption.clone();
-        let key: [u8; 16] = oracle_state
-            .key_for_object(object_ref, true)
-            .try_into()
-            .expect("V4 AES object key");
-        let plaintext = b"string-free stream uses its own method first";
-        let mut ciphertext = plaintext.to_vec();
-        crate::encryption::standard::encrypt_cipher_bytes(
-            &mut ciphertext,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
-            &[0x5a; 16],
-        )
-        .expect("build AES ciphertext");
-        let mut object = Object::Stream(Stream::new(Dictionary::new(), Vec::new()));
-
-        decrypt_object_strings(object_ref, &mut object, &mut encryption)
-            .expect("walk string-free stream dictionary");
-
-        assert_eq!(encryption.cached_key_og, None);
-        assert!(encryption.cached_object_encryption_key.is_empty());
-        decrypt_stream_bytes(object_ref, &mut ciphertext, true, &mut encryption)
-            .expect("stream method primes and uses qpdf's cache");
-        assert_eq!(ciphertext, plaintext);
-    }
-
-    #[test]
-    fn a_string_free_object_value_does_not_prime_qpdfs_key_cache() {
-        let object_ref = ObjectRef::new(7, 0); // cov:ignore: llvm test-prologue mapping artifact; the test body runs
-        let mut encryption = explicit_rc4_string_encryption_state();
-        encryption.cf_stream = EncryptionMode::Aes128;
-        let mut value = ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_length: 0,
-            stream_provider: None,
-        };
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("walk string-free stream dictionary");
-
-        assert_eq!(encryption.cached_key_og, None);
-        assert!(encryption.cached_object_encryption_key.is_empty());
-    }
-
-    #[test]
-    fn legacy_identity_string_does_not_prime_qpdfs_key_cache() {
-        let object_ref = ObjectRef::new(7, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        encryption.cf_string = EncryptionMode::Identity;
-        let mut object = Object::String(b"identity string".to_vec());
-
-        let warn = decrypt_object_strings(object_ref, &mut object, &mut encryption)
-            .expect("Identity is a no-op");
-
-        assert!(!warn);
-        assert_eq!(object.as_string(), Some(b"identity string".as_slice()));
-        assert_eq!(encryption.cached_key_og, None);
-    }
-
-    #[test]
-    fn legacy_string_scan_rejects_excess_inline_nesting() {
-        let object_ref = ObjectRef::new(7, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let mut object = Object::String(b"leaf".to_vec());
-        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
-            object = Object::Array(vec![object]);
-        }
-
-        let error = decrypt_object_strings(object_ref, &mut object, &mut encryption)
-            .expect_err("excess inline nesting must error before key derivation");
-        assert!(
-            matches!(error, Error::Unsupported(ref message) if message.contains("inline object nesting exceeds maximum")), // cov:ignore: llvm maps this executed matches predicate as zero
-            "got {error:?}"
-        );
-        assert_eq!(encryption.cached_key_og, None);
-    }
-
-    fn explicit_rc4_string_encryption_state() -> EncryptionState {
-        EncryptionState {
-            cf_string: EncryptionMode::Rc4,
-            ..explicit_rc4_encryption_state()
-        }
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_rc4_top_level_string() {
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let mut value =
-            ObjectValue::String(rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption));
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("RC4 top-level string decryption");
-
-        let ObjectValue::String(bytes) = &value else {
-            panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
-        };
-        assert_eq!(bytes.as_slice(), b"TopSecretTitle");
-    }
-
-    // This catches a production regression where the parser callback treats
-    // qpdf's `/StrF /Identity` as an RC4/AES method. Replacing the `None`
-    // method branch with a cipher call changes these bytes.
-    #[test]
-    fn decrypt_object_string_leaves_identity_filter_bytes_unchanged() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let mut bytes = b"identity string bytes".to_vec();
-
-        let warn = encryption
-            .decrypt_object_string(ObjectRef::new(3, 0), &mut bytes)
-            .expect("Identity string method is a no-op");
-
-        assert_eq!(bytes, b"identity string bytes");
-        assert!(!warn);
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_skips_the_encrypt_dictionary_object() {
-        let object_ref = ObjectRef::new(9, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        encryption.encrypt_ref = Some(object_ref);
-        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
-        let mut value = ObjectValue::String(ciphertext.clone());
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("the /Encrypt object's own strings are exempt, not an error");
-
-        let ObjectValue::String(bytes) = &value else {
-            panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
-        };
-        assert_eq!(
-            bytes.as_slice(),
-            ciphertext.as_slice(),
-            "the /Encrypt dictionary's own strings must never be decrypted, \
-             mirroring decrypt_object_strings's identical encrypt_ref guard"
-        );
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_decrypts_a_string_inside_a_direct_array() {
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
-        let mut value = ObjectValue::Array(vec![ObjectHandle::string(ciphertext)]);
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("array-contained string decryption");
-
-        let ObjectValue::Array(items) = &value else {
-            panic!("value must still be an array"); // cov:ignore: unreachable given this test's own construction of value
-        };
-        assert_eq!(
-            items[0].as_string().as_deref(),
-            Some(b"TopSecretTitle".as_slice())
-        );
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_decrypts_a_string_inside_a_nested_dictionary() {
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
-        let inner =
-            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
-        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"/Nested".to_vec(), inner)]));
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("nested-dictionary string decryption");
-
-        let ObjectValue::Dictionary(entries) = &value else {
-            panic!("value must still be a dictionary"); // cov:ignore: unreachable given this test's own construction of value
-        };
-        let nested = entries.get(b"/Nested".as_slice()).expect("Nested entry");
-        let nested_dict = nested.as_dictionary().expect("Nested must be a dictionary");
-        let title = nested_dict.get(b"/Title".as_slice()).expect("Title entry");
-        assert_eq!(
-            title.as_string().as_deref(),
-            Some(b"TopSecretTitle".as_slice())
-        );
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_decrypts_a_string_inside_a_stream_dictionary() {
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
-        let dict =
-            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
-        let mut value = ObjectValue::Stream {
-            stream_dict: dict,
-            stream_data: Some(Rc::new(
-                b"stream payload, untouched by string decryption".to_vec(),
-            )),
-            stream_length: 0,
-            stream_provider: None,
-        };
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("stream-dictionary string decryption");
-
-        let ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-            ..
-        } = &value
-        else {
-            panic!("value must still be a stream"); // cov:ignore: unreachable given this test's own construction of value
-        };
-        let stream_dict = stream_dict.as_dictionary().expect("stream dict");
-        let title = stream_dict.get(b"/Title".as_slice()).expect("Title entry");
-        assert_eq!(
-            title.as_string().as_deref(),
-            Some(b"TopSecretTitle".as_slice())
-        );
-        assert_eq!(
-            stream_data
-                .as_ref()
-                .expect("direct stream retains its data")
-                .as_slice(),
-            b"stream payload, untouched by string decryption",
-            "stream payload bytes are never touched by string decryption"
-        );
-    }
-
-    #[test]
-    fn decrypt_handle_strings_in_place_decrypts_a_string_inside_a_directly_nested_stream() {
-        // Distinct from the top-level-stream test above: here the stream is
-        // a *child* reached through `decrypt_handle_strings_in_place`'s own
-        // `as_stream_dict()` arm, not `decrypt_strings_in_object_value`'s
-        // top-level `Stream` arm. A direct (non-indirect) `ObjectHandle`
-        // wrapping a stream value is not the common case -- qpdf's own
-        // streams are always indirect -- but it is reachable through the
-        // public API the same way `object_handle.rs`'s own
-        // `a_direct_stream_value_unparse_resolved_inlines_rather_than_referencing`
-        // test documents: a nested `Object::Stream` passed to
-        // `Pdf::set_object` inside an array or dictionary.
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
-        let stream_dict =
-            ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
-        let stream_child = ObjectHandle::from_value(ObjectValue::Stream {
-            stream_dict,
-            stream_data: Some(Rc::new(b"payload".to_vec())),
-            stream_length: 0,
-            stream_provider: None,
-        });
-        let mut value = ObjectValue::Array(vec![stream_child]);
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("directly nested stream string decryption");
-
-        let ObjectValue::Array(items) = &value else {
-            panic!("value must still be an array"); // cov:ignore: unreachable given this test's own construction of value
-        };
-        let nested_dict = items[0]
-            .as_stream_dict()
-            .expect("array item must still be a stream")
-            .as_dictionary()
-            .expect("stream dict");
-        let title = nested_dict.get(b"/Title".as_slice()).expect("Title entry");
-        assert_eq!(
-            title.as_string().as_deref(),
-            Some(b"TopSecretTitle".as_slice())
-        );
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_leaves_a_top_level_scalar_untouched() {
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let mut value = ObjectValue::Integer(42);
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("a bare scalar object has no string to decrypt");
-
-        assert!(matches!(value, ObjectValue::Integer(42)));
-    }
-
-    #[test]
-    fn decrypt_handle_strings_in_place_never_touches_an_indirect_childs_own_value() {
-        // An indirect child is a terminal leaf: its own eventual resolution
-        // decrypts it separately, keyed by its own object ref. Using the
-        // *parent's* key here would corrupt it -- confirmed by resolving the
-        // child to a string that would decrypt to something else entirely
-        // under the parent's key, then asserting it is untouched.
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(4, 0), 0);
-        child.set_resolved(ObjectValue::String(b"unrelated ciphertext".to_vec()));
-        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Ref".to_vec(), child.clone())]));
-
-        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect("indirect children are skipped, not an error");
-
-        assert_eq!(
-            child.as_string().as_deref(),
-            Some(b"unrelated ciphertext".as_slice()),
-            "an indirect child's own resolved value must be left exactly as-is"
-        );
-    }
-
-    #[test]
-    fn decrypt_handle_strings_in_place_rejects_excess_direct_nesting() {
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let mut handle = ObjectHandle::string(b"leaf".to_vec());
-        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
-            handle = ObjectHandle::array(vec![handle]);
-        }
-        let mut value = ObjectValue::Array(vec![handle]);
-
-        let err = decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
-            .expect_err("excess direct nesting must error, not overflow the stack");
-        assert!(
-            matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn decrypt_object_value_strings_does_not_charge_the_stream_dictionary_container_its_own_inline_level(
-    ) {
-        // Codex Review on PR #603 (discussion_r3690827731): a stream's own
-        // dictionary handle must not be charged its own inline-nesting level
-        // before its entries are visited -- decrypt_strings_in_value's
-        // legacy Object::Stream arm visits stream.dict.values_mut() at the
-        // *same* depth+1 the stream itself was reached at, so a document the
-        // legacy path (resolve_to_cache) accepts must not be rejected here
-        // just because the canonical handle parser uses this walk instead.
-        // Pin the exact boundary both paths must agree on: a stream
-        // dictionary entry nested MAX_INLINE_DEPTH levels deep (accepted --
-        // matches decrypt_strings_in_value's own depth+1-at-entries
-        // accounting) versus MAX_INLINE_DEPTH+1 (rejected, one level over).
-        let object_ref = ObjectRef::new(3, 0);
-        let mut encryption = explicit_rc4_string_encryption_state();
-        let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
-
-        let nest = |extra_levels: usize| {
-            let mut handle = ObjectHandle::string(ciphertext.clone());
-            for _ in 0..extra_levels {
-                handle = ObjectHandle::array(vec![handle]);
-            }
-            handle
-        };
-
-        let mut accepted = ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![(
-                b"Deep".to_vec(),
-                nest(crate::object::MAX_INLINE_DEPTH - 1),
-            )]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_length: 0,
-            stream_provider: None,
-        };
-        decrypt_object_value_strings(object_ref, &mut accepted, &mut encryption).expect(
-            "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
-             the legacy decryptor's own boundary, must be accepted",
-        );
-
-        let mut rejected = ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![(
-                b"TooDeep".to_vec(),
-                nest(crate::object::MAX_INLINE_DEPTH),
-            )]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_length: 0,
-            stream_provider: None,
-        };
-        let err = decrypt_object_value_strings(object_ref, &mut rejected, &mut encryption)
-            .expect_err("one level past the legacy decryptor's own boundary must still error");
-        assert!(
-            matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
-            "got {err:?}"
-        );
-    }
-
-    fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
-        let mut dict = Dictionary::new();
-        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        crate::filters::test_dictionary_api::encode_stream_data(&dict, plaintext)
-            .expect("Flate encode")
-    }
-
-    fn ascii_hex_encoded_without_eod(plaintext: &[u8]) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(plaintext.len() * 2);
-        for byte in plaintext {
-            encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
-        }
-        encoded
-    }
-
-    fn crypt_params(name: &[u8]) -> Object {
-        let mut params = Dictionary::new();
-        params.insert("Name", Object::Name(name.to_vec()));
-        Object::Dictionary(params)
-    }
-
-    /// qpdf's `decryptStream` warns about an unrecognised crypt method at
-    /// `libqpdf/QPDF_encryption.cc:1121-1133`, before it derives the object key
-    /// at `:1135` and before it prepends the decryption stage at `:1137-1149`.
-    /// A failure in either later step therefore cannot suppress the warning.
-    ///
-    /// The failure here comes from an underivable AES object key: the state's
-    /// file key is five bytes, so `compute_data_key` yields neither an AES-128
-    /// nor an AES-256 key.
-    #[test]
-    fn explicit_crypt_filter_warning_survives_a_later_failure() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let mut encryption = explicit_rc4_encryption_state();
-        // An unrecognised /Name leaves qpdf's `method` at `e_unknown`, which is
-        // the arm that warns and resets `cf_stream` to AES.
-        encryption.cf_stream = EncryptionMode::Unknown;
-        *pdf.encryption.borrow_mut() = Some(encryption);
-
-        let mut dict = Dictionary::new();
-        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
-        dict.insert("DecodeParms", crypt_params(b"NoSuchFilter"));
-
-        let error = pdf
-            .decrypt_resolved_object(
-                ObjectRef::new(4, 0),
-                Object::Stream(Stream::new(dict, vec![0u8; 48])),
-                None,
-            )
-            .expect_err("a five-byte file key cannot produce an AES object key");
-        assert!(matches!(error, Error::Encrypted(_)), "got {error:?}");
-
-        let warnings: Vec<String> = pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .map(|entry| entry.message.clone())
-            .collect();
-        assert!(
-            warnings
-                .iter()
-                .any(|message| message.contains("unknown encryption filter for streams")),
-            "the unknown-filter warning must outlive the later failure: {warnings:?}"
-        );
-    }
-
-    /// `permissions()`/`encryption_info()` prefer `encryption_inspection`,
-    /// which every real document population populates unconditionally
-    /// before authentication (`initialize_encryption_inspection` is called
-    /// once, in `engine.rs`, ahead of `authenticate_if_encrypted`). Their
-    /// fallback to `self.encryption` alone exists for a `Pdf` whose
-    /// encryption state was set directly rather than through that shared
-    /// construction path, matching how the rest of this test module already
-    /// injects `EncryptionState` to isolate encryption-dependent behavior
-    /// from full document parsing.
-    #[test]
-    fn permissions_and_encryption_info_fall_back_without_inspection_state() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        assert!(
-            pdf.encryption_inspection.borrow().is_none(),
-            "a plaintext-opened fixture has no /Encrypt to inspect"
-        );
-        // `encryption_info()`'s fallback still needs a real /Encrypt entry to
-        // read `/Filter` from (only `v`/`r`/`length_bits`/permissions/password
-        // fields come from `self.encryption` itself); inject a minimal direct
-        // dictionary so `encrypt_dictionary()` succeeds without going through
-        // `initialize_encryption_inspection`.
-        pdf.trailer.insert(
-            "Encrypt",
-            Object::Dictionary({
-                let mut dict = Dictionary::new();
-                dict.insert("Filter", Object::Name(b"Standard".to_vec()));
-                dict
-            }),
-        );
-        *pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
-
-        let permissions = pdf
-            .permissions()
-            .expect("the fallback must report permissions from self.encryption");
-        assert_eq!(permissions.raw(), -4);
-
-        let info = pdf
-            .encryption_info()
-            .expect("encryption_info must not error")
-            .expect("the fallback must report EncryptionInfo from self.encryption");
-        assert_eq!(info.v, 4);
-        assert_eq!(info.r, 4);
-        assert_eq!(info.filter, "Standard");
-        assert!(info.user_password_matched);
-        assert!(!info.owner_password_matched);
-    }
-
-    #[test]
-    fn decrypt_resolved_object_propagates_non_encrypted_explicit_filter_errors() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        *pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![Object::Name(b"Crypt".to_vec()); 17]),
-        );
-        dict.insert(
-            "DecodeParms",
-            Object::Array(vec![crypt_params(b"Identity"); 17]),
-        );
-        let error = pdf
-            .decrypt_resolved_object(
-                ObjectRef::new(4, 0),
-                Object::Stream(Stream::new(dict, b"identity".to_vec())),
-                None,
-            )
-            .expect_err("an overlong filter chain must remain a hard error");
-        assert!(matches!(error, Error::Unsupported(message) if message.contains("filter chain")));
-    }
-
-    fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![Object::Name(b"Crypt".to_vec()); chain_len]),
-        );
-        dict.insert(
-            "DecodeParms",
-            Object::Array(vec![crypt_params(b"Identity"); chain_len]),
-        );
-        Stream::new(dict, b"identity".to_vec())
-    }
-
-    #[test]
-    fn explicit_crypt_rejects_overlong_identity_chain_before_mutation() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let mut stream = explicit_identity_crypt_chain(17);
-        let original = stream.clone();
-
-        let err = apply_explicit_crypt_filters(
-            ObjectRef::new(4, 0),
-            &mut stream,
-            &mut encryption,
-            Some(b"\n"),
-            &mut false,
-        )
-        .expect_err("17 explicit Crypt filters must exceed the shared decode cap");
-
-        assert!(
-            matches!(
-                err,
-                Error::Unsupported(ref message)
-                    if message == "filter chain length 17 exceeds maximum of 16"
-            ),
-            "got {err:?}"
-        );
-        assert_eq!(
-            stream, original,
-            "the chain cap must reject before recovered framing or filters are mutated"
-        );
-    }
-
-    #[test]
-    fn explicit_crypt_accepts_max_length_identity_chain() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let mut stream = explicit_identity_crypt_chain(16);
-
-        apply_explicit_crypt_filters(
-            ObjectRef::new(4, 0),
-            &mut stream,
-            &mut encryption,
-            None,
-            &mut false,
-        )
-        .expect("16 explicit Crypt filters are within the shared decode cap");
-
-        assert_eq!(stream.data, b"identity");
-        assert_eq!(stream.dict.get("Filter"), None);
-        assert_eq!(stream.dict.get("DecodeParms"), None);
-    }
-
-    /// A `/Crypt` `/DecodeParms` whose `/Name` is not a name is qpdf's
-    /// "Default: /Identity" in `interpretCF` (`libqpdf/QPDF_encryption.cc:712-714`):
-    /// `e_none`, so the payload is left alone. It used to be an flpdf-only
-    /// `Malformed` error, which would refuse to open documents qpdf reads.
-    #[test]
-    fn explicit_crypt_with_a_non_name_param_leaves_the_payload_alone() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let mut malformed = Dictionary::new();
-        malformed.insert("Name", Object::Integer(1));
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
-        );
-        dict.insert(
-            "DecodeParms",
-            Object::Array(vec![Object::Dictionary(malformed)]),
-        );
-        let mut stream = Stream::new(dict, b"ciphertext".to_vec());
-
-        let mut warn = false;
-        apply_explicit_crypt_filters(
-            ObjectRef::new(4, 0),
-            &mut stream,
-            &mut encryption,
-            None,
-            &mut warn,
-        )
-        .expect("a non-name /Crypt /Name is qpdf's Identity default, not an error");
-
-        assert!(!warn, "e_none does not warn; only e_unknown does");
-        assert_eq!(stream.data, b"ciphertext");
-        assert_eq!(stream.dict.get("Filter"), None);
-        assert_eq!(stream.dict.get("DecodeParms"), None);
-    }
-
-    /// The `/Crypt` counterpart of the same lookup: a `/Name` with no `/CF`
-    /// entry is `e_unknown` (`:710`), which reaches `decryptStream`'s
-    /// `default:` arm — warn, rewrite `cf_stream` to `e_aes`, decrypt anyway
-    /// (`:1121-1133`).
-    #[test]
-    fn explicit_crypt_with_an_unknown_filter_name_warns_and_rewrites_cf_stream() {
-        let mut encryption = EncryptionState {
-            // `/V 4` always carries a 128-bit key, which is what the rewritten
-            // `e_aes` arm needs to derive a 16-byte object key from.
-            file_key: (0..16).collect(),
-            ..explicit_rc4_encryption_state()
-        };
-        let mut params = Dictionary::new();
-        params.insert("Name", Object::Name(b"NoSuchCF".to_vec()));
-        let mut dict = Dictionary::new();
-        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
-        dict.insert("DecodeParms", Object::Dictionary(params));
-        // Real AES-128 ciphertext under the object key the rewritten `e_aes`
-        // arm derives, so the assertion covers the decryption too, not just
-        // the selection.
-        let object_ref = ObjectRef::new(4, 0);
-        let object_key = aes128_object_key(&encryption.compute_data_key(object_ref, true))
-            .expect("V=4 AES object key");
-        let mut payload = b"crypt filter payload".to_vec();
-        crate::encryption::standard::encrypt_cipher_bytes(
-            &mut payload,
-            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &object_key },
-            &[0x5a; 16],
-        )
-        .expect("build AES ciphertext");
-        let mut stream = Stream::new(dict, payload);
-
-        let mut warn = false;
-        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None, &mut warn)
-            .expect("unknown crypt filters decrypt as AES rather than failing");
-
-        assert!(warn, "an unknown crypt filter must ask the caller to warn");
-        assert_eq!(
-            encryption.cf_stream,
-            EncryptionMode::Aes128,
-            "qpdf resets cf_stream so the warning is not repeated"
-        );
-        assert_eq!(stream.data, b"crypt filter payload");
-
-        // The rewrite is what suppresses the second warning: the same state
-        // now takes the `e_aes` arm silently.
-        let (use_aes, warn_again) = encryption.stream_method(None);
-        assert_eq!(use_aes, Some(true));
-        assert!(!warn_again, "cf_stream was reset, so qpdf warns only once");
-    }
-
-    #[test]
-    fn explicit_named_crypt_removes_recovered_framing_before_rc4() {
-        let object_ref = ObjectRef::new(4, 0);
-        let mut encryption = explicit_rc4_encryption_state();
-        let plaintext = b"named explicit crypt";
-        let mut dict = Dictionary::new();
-        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
-        dict.insert("DecodeParms", crypt_params(b"StdCF"));
-        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, plaintext, &encryption));
-
-        apply_explicit_crypt_filters(
-            object_ref,
-            &mut stream,
-            &mut encryption,
-            Some(b"\n"),
-            &mut false,
-        )
-        .expect("remove named Crypt");
-
-        assert_eq!(stream.data, plaintext);
-        assert_eq!(stream.dict.get("Filter"), None);
-        assert_eq!(stream.dict.get("DecodeParms"), None);
-    }
-
-    #[test]
-    fn explicit_crypt_first_removes_recovered_framing_before_rc4() {
-        let object_ref = ObjectRef::new(4, 0);
-        let mut encryption = explicit_rc4_encryption_state();
-        let plaintext = b"array explicit crypt";
-        let compressed = flate_encoded(plaintext);
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"Crypt".to_vec()),
-                Object::Name(b"FlateDecode".to_vec()),
-            ]),
-        );
-        dict.insert(
-            "DecodeParms",
-            Object::Array(vec![crypt_params(b"StdCF"), Object::Null]),
-        );
-        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &compressed, &encryption));
-
-        apply_explicit_crypt_filters(
-            object_ref,
-            &mut stream,
-            &mut encryption,
-            Some(b"\n"),
-            &mut false,
-        )
-        .expect("remove first Crypt");
-
-        assert_eq!(
-            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
-                .expect("decode remaining Flate"),
-            plaintext
-        );
-        assert_eq!(
-            stream.dict.get("Filter"),
-            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
-        );
-        assert_eq!(
-            stream.dict.get("DecodeParms"),
-            Some(&Object::Array(vec![Object::Null]))
-        );
-    }
-
-    #[test]
-    fn explicit_crypt_decrypts_before_ascii_hex_regardless_of_filter_slot() {
-        let object_ref = ObjectRef::new(4, 0);
-        let mut encryption = explicit_rc4_encryption_state();
-        let plaintext = b"crypt before ascii hex";
-        let encoded = ascii_hex_encoded_without_eod(plaintext);
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"ASCIIHexDecode".to_vec()),
-                Object::Name(b"Crypt".to_vec()),
-            ]),
-        );
-        dict.insert(
-            "DecodeParms",
-            Object::Array(vec![Object::Null, crypt_params(b"StdCF")]),
-        );
-        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &encoded, &encryption));
-
-        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None, &mut false)
-            .expect("remove Crypt without re-encoding the ASCIIHex prefix");
-
-        assert_eq!(
-            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
-                .expect("decode remaining ASCIIHex"),
-            plaintext
-        );
-        assert_eq!(
-            stream.dict.get("Filter"),
-            Some(&Object::Array(vec![Object::Name(
-                b"ASCIIHexDecode".to_vec()
-            )]))
-        );
-        assert_eq!(
-            stream.dict.get("DecodeParms"),
-            Some(&Object::Array(vec![Object::Null]))
-        );
-    }
-
-    #[test]
-    fn singleton_explicit_crypt_array_removes_filter_entries() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
-        );
-        dict.insert(
-            "DecodeParms",
-            Object::Array(vec![crypt_params(b"Identity")]),
-        );
-        let mut stream = Stream::new(dict, b"identity".to_vec());
-
-        apply_explicit_crypt_filters(
-            ObjectRef::new(4, 0),
-            &mut stream,
-            &mut encryption,
-            None,
-            &mut false,
-        )
-        .expect("remove singleton Crypt");
-
-        assert_eq!(stream.data, b"identity");
-        assert_eq!(stream.dict.get("Filter"), None);
-        assert_eq!(stream.dict.get("DecodeParms"), None);
-    }
-
-    #[test]
-    fn explicit_crypt_array_without_decode_params_keeps_remaining_filter() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let plaintext = b"no decode params";
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"Crypt".to_vec()),
-                Object::Name(b"FlateDecode".to_vec()),
-            ]),
-        );
-        let mut stream = Stream::new(dict, flate_encoded(plaintext));
-
-        apply_explicit_crypt_filters(
-            ObjectRef::new(4, 0),
-            &mut stream,
-            &mut encryption,
-            None,
-            &mut false,
-        )
-        .expect("remove Crypt without DecodeParms");
-
-        assert_eq!(
-            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
-                .expect("decode remaining Flate"),
-            plaintext
-        );
-        assert_eq!(stream.dict.get("DecodeParms"), None);
-    }
-
-    #[test]
-    fn explicit_crypt_preserves_short_decode_params_array() {
-        let mut encryption = explicit_rc4_encryption_state();
-        let plaintext = b"short decode params";
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"FlateDecode".to_vec()),
-                Object::Name(b"Crypt".to_vec()),
-            ]),
-        );
-        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
-        let mut stream = Stream::new(dict, flate_encoded(plaintext));
-
-        apply_explicit_crypt_filters(
-            ObjectRef::new(4, 0),
-            &mut stream,
-            &mut encryption,
-            None,
-            &mut false,
-        )
-        .expect("remove Crypt with short DecodeParms");
-
-        assert_eq!(
-            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
-                .expect("decode remaining Flate"),
-            plaintext
-        );
-        assert_eq!(
-            stream.dict.get("DecodeParms"),
-            Some(&Object::Array(vec![Object::Null]))
-        );
-    }
-
     /// Minimal valid single-page PDF used across `open_mem` tests.
     ///
     /// Structure:
@@ -6299,9 +2876,7 @@ mod tests {
         pdf.extend_from_slice(trailer.as_bytes());
 
         let mut pdf = Pdf::open_mem(Arc::from(&pdf[..])).expect("open_mem");
-        let value = pdf
-            .resolve_object(ObjectRef::new(3, 0))
-            .expect("resolve object 3");
+        let value = resolved_object(&mut pdf, ObjectRef::new(3, 0)).expect("resolve object 3");
         let dict = value.as_dict().expect("dictionary");
         assert_eq!(
             dict.get("Foo"),
@@ -6640,8 +3215,7 @@ mod tests {
         let new_ref = new_object.object_ref().unwrap();
 
         let root_ref = ObjectRef::new(1, 0);
-        let mut root_dict = pdf
-            .resolve_object(root_ref)
+        let mut root_dict = resolved_object(&mut pdf, root_ref)
             .expect("resolve root")
             .into_dict()
             .unwrap();
@@ -6658,18 +3232,15 @@ mod tests {
         let out = writer.get_buffer().expect("take full-rewrite output");
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
-        let resolved_root = reopened
-            .resolve_object(root_ref)
-            .expect("resolve root in reopened output");
+        let resolved_root =
+            resolved_object(&mut reopened, root_ref).expect("resolve root in reopened output");
         let extra_ref = resolved_root
             .into_dict()
             .and_then(|d| d.get("Extra").cloned())
             .expect("root has /Extra");
         assert_eq!(extra_ref, Object::Reference(emitted_ref));
         assert_eq!(
-            reopened
-                .resolve_object(emitted_ref)
-                .expect("resolve new object"),
+            resolved_object(&mut reopened, emitted_ref).expect("resolve new object"),
             Object::Integer(777),
             "new object must not be dangling after a full rewrite"
         );
@@ -6700,13 +3271,8 @@ mod tests {
             .expect("allocated stream must be emitted");
         let out = writer.get_buffer().expect("take full-rewrite output");
 
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical stream output must not materialize a legacy object"
-        );
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
-        let extra_ref = reopened
-            .resolve_object(ObjectRef::new(1, 0))
+        let extra_ref = resolved_object(&mut reopened, ObjectRef::new(1, 0))
             .expect("resolve rewritten root")
             .into_dict()
             .and_then(|dict| dict.get("Extra").cloned())
@@ -6714,8 +3280,7 @@ mod tests {
             .expect("rewritten root has stream reference");
         assert_eq!(extra_ref, emitted_ref);
         assert_eq!(
-            reopened
-                .resolve_object(emitted_ref)
+            resolved_object(&mut reopened, emitted_ref)
                 .expect("resolve rewritten stream")
                 .as_stream()
                 .expect("stream remains a stream")
@@ -6795,11 +3360,6 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         pdf.set_object(target_ref, Object::Integer(42));
         pdf.set_object(page_ref, replacement.clone());
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "over-depth replacements within qpdf's parser boundary stay canonical"
-        );
-
         let (emitted_ref, emitted_target_ref, output) = {
             let mut writer = crate::PdfWriter::new(&mut pdf);
             writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
@@ -6821,9 +3381,8 @@ mod tests {
         };
 
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen over-depth output");
-        let mut leaf = reopened
-            .resolve_object(emitted_ref)
-            .expect("resolve over-depth replacement");
+        let mut leaf =
+            resolved_object(&mut reopened, emitted_ref).expect("resolve over-depth replacement");
         for _ in 0..depth {
             leaf = match leaf {
                 Object::Array(mut items) => items.remove(0),
@@ -6832,9 +3391,7 @@ mod tests {
         }
         assert_eq!(leaf, Object::Reference(emitted_target_ref));
         assert_eq!(
-            reopened
-                .resolve_object(emitted_target_ref)
-                .expect("resolve nested target"),
+            resolved_object(&mut reopened, emitted_target_ref).expect("resolve nested target"),
             Object::Integer(42)
         );
     }
@@ -6860,14 +3417,9 @@ mod tests {
             (emitted_ref, writer.get_buffer().expect("take output"))
         };
 
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical replacement must not populate the legacy materialization bridge"
-        );
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         assert_eq!(
-            reopened
-                .resolve_object(emitted_ref)
+            resolved_object(&mut reopened, emitted_ref)
                 .expect("resolve replacement")
                 .into_dict()
                 .and_then(|dict| dict.get("Marker").cloned())
@@ -6895,13 +3447,8 @@ mod tests {
             writer.get_buffer().expect("take output")
         };
 
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical removal must not populate the legacy materialization bridge"
-        );
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
-        let rewritten_pages = reopened
-            .resolve_object(ObjectRef::new(2, 0))
+        let rewritten_pages = resolved_object(&mut reopened, ObjectRef::new(2, 0))
             .expect("resolve rewritten pages")
             .into_dict()
             .expect("pages is a dictionary");
@@ -6911,8 +3458,7 @@ mod tests {
             .expect("rewritten pages has kids");
         assert_eq!(kids, &[Object::Null]);
         assert_eq!(
-            reopened
-                .resolve_object(ObjectRef::new(3, 0))
+            resolved_object(&mut reopened, ObjectRef::new(3, 0))
                 .expect("removed page resolves as qpdf null"),
             Object::Null,
             "removed page must not be emitted as an indirect body"
@@ -6934,10 +3480,6 @@ mod tests {
             .to_string()
             .contains("Attempting to add an object from a different QPDF"));
         assert!(!root.has_key(b"/Foreign"));
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "foreign-owner rejection must happen before legacy materialization"
-        );
     }
 
     #[test]
@@ -6973,7 +3515,7 @@ mod tests {
     }
 
     #[test]
-    fn qpdf_json_borrowed_resolution_materializes_a_handle_only_object_on_demand() {
+    fn qpdf_json_resolution_materializes_a_handle_only_object_on_demand() {
         // The borrowed JSON path needs a stable Object reference, but a
         // handle-created object must still avoid a cache payload clone until
         // a caller actually asks to inspect it.
@@ -6985,9 +3527,9 @@ mod tests {
 
         assert!(pdf.cache.entry(object_ref).is_none());
         assert_eq!(
-            pdf.resolve_qpdf_json_object_borrowed(object_ref)
+            pdf.resolve_qpdf_json_object(object_ref)
                 .expect("borrow qpdf JSON object"),
-            &Object::Integer(778)
+            Object::Integer(778)
         );
         assert!(
             pdf.cache.entry(object_ref).is_none(),
@@ -7020,14 +3562,14 @@ mod tests {
             Object::Dictionary(expected_catalog)
         );
 
-        // The borrowed path reaches the same canonical re-entry after its raw
+        // The second path reaches the same canonical re-entry after its raw
         // cache read installs a fresh resolved entry.
         let second_ref = ObjectRef::new(2, 0);
         pdf.handle_mutated_object_refs.insert(second_ref);
         assert_eq!(
-            pdf.resolve_qpdf_json_object_borrowed(second_ref)
+            pdf.resolve_qpdf_json_object(second_ref)
                 .expect("borrowed canonical JSON resolution"),
-            &Object::Integer(42)
+            Object::Integer(42)
         );
     }
 
@@ -7045,10 +3587,6 @@ mod tests {
         page.replace_key(b"/Rotate", ObjectHandle::integer(90))
             .unwrap();
         pdf.mark_object_dirty(page_ref);
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical mutation setup must not materialize a legacy snapshot"
-        );
 
         let mut writer = crate::PdfWriter::new(&mut pdf);
         writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
@@ -7056,14 +3594,8 @@ mod tests {
         writer.write().expect("full rewrite");
         let out = writer.get_buffer().expect("take full-rewrite output");
 
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical writer traversal must not populate the legacy materialization bridge"
-        );
-
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
-        let resolved_page = reopened
-            .resolve_object(page_ref)
+        let resolved_page = resolved_object(&mut reopened, page_ref)
             .expect("resolve page in reopened output")
             .into_dict()
             .expect("page is a dictionary");
@@ -7180,11 +3712,16 @@ mod tests {
                 let bytes = recovered_stream_fixture(length_entry, eol, None);
                 let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct-length fixture");
                 let object_ref = ObjectRef::new(1, 0);
-                let stream = pdf
-                    .resolve_object(object_ref)
-                    .expect("resolve recovered stream");
-                assert_eq!(stream.as_stream().unwrap().data, b"abc");
-                assert_eq!(pdf.recovered_stream_eol(object_ref), Some(expected));
+                let stream =
+                    resolved_object(&mut pdf, object_ref).expect("resolve recovered stream");
+                assert_eq!(
+                    stream.as_stream().unwrap().data,
+                    [&b"abc"[..], expected].concat()
+                );
+                assert_eq!(
+                    canonical_recovered_eol(&mut pdf, object_ref).expect("canonical recovered EOL"),
+                    Some(expected)
+                );
             }
         }
 
@@ -7219,56 +3756,13 @@ mod tests {
                 pdf.delete_object(ObjectRef::new(2, 0));
             }
             let object_ref = ObjectRef::new(1, 0);
-            let stream = pdf
-                .resolve_object(object_ref)
-                .expect("resolve recovered stream");
-            assert_eq!(stream.as_stream().unwrap().data, b"abc");
-            assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
+            let stream = resolved_object(&mut pdf, object_ref).expect("resolve recovered stream");
+            assert_eq!(stream.as_stream().unwrap().data, b"abc\n");
+            assert_eq!(
+                canonical_recovered_eol(&mut pdf, object_ref).expect("canonical recovered EOL"),
+                Some(&b"\n"[..])
+            );
         }
-    }
-
-    #[test]
-    fn qpdf_reader_recovers_malformed_length_holder_as_invalid_once() {
-        let bytes = recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n<<"));
-        let mut pdf = Pdf::open_mem_owned_with_options(
-            bytes,
-            PdfOpenOptions {
-                repair: false,
-                ..PdfOpenOptions::default()
-            },
-        )
-        .expect("open strict malformed-holder fixture");
-        let object_ref = ObjectRef::new(1, 0);
-        assert_eq!(
-            pdf.resolve_object(object_ref)
-                .expect("recover target stream")
-                .as_stream()
-                .unwrap()
-                .data,
-            b"abc"
-        );
-        assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
-        assert_eq!(
-            pdf.repair_diagnostics()
-                .entries()
-                .iter()
-                .map(|entry| entry.message.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "(object 1 0, offset 9): /Length key in stream dictionary is not an integer",
-                "(object 1 0, offset 44): attempting to recover stream length",
-                "(object 1 0, offset 44): recovered stream length: 4",
-            ]
-        );
-        assert_eq!(
-            pdf.resolve_object(object_ref)
-                .unwrap()
-                .as_stream()
-                .unwrap()
-                .data,
-            b"abc"
-        );
-        assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
     }
 
     #[test]
@@ -7278,7 +3772,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
 
         assert_eq!(
-            pdf.resolve_object(object_ref).expect("recover stray name"),
+            resolved_object(&mut pdf, object_ref).expect("recover stray name"),
             Object::Name(b"a\0\x31x".to_vec())
         );
         assert_eq!(
@@ -7291,7 +3785,7 @@ mod tests {
         );
 
         assert_eq!(
-            pdf.resolve_object(object_ref).unwrap(),
+            resolved_object(&mut pdf, object_ref).unwrap(),
             Object::Name(b"a\0\x31x".to_vec())
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -7306,10 +3800,16 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open compressed stray-name fixture");
         let object_ref = ObjectRef::new(7, 0);
         pdf.cache.set_compressed(object_ref, 1, 0);
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: 1,
+                index: 0,
+            },
+        );
 
         assert_eq!(
-            pdf.resolve_object(object_ref)
-                .expect("recover compressed stray name"),
+            resolved_object(&mut pdf, object_ref).expect("recover compressed stray name"),
             Object::Name(b"a\0\x31x".to_vec())
         );
         let snapshot = pdf.repair_diagnostics();
@@ -7325,7 +3825,7 @@ mod tests {
         );
 
         assert_eq!(
-            pdf.resolve_object(object_ref).unwrap(),
+            resolved_object(&mut pdf, object_ref).unwrap(),
             Object::Name(b"a\0\x31x".to_vec())
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -7340,39 +3840,20 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open compressed stray-name fixture");
         let object_ref = ObjectRef::new(7, 0);
         pdf.cache.set_compressed(object_ref, 1, 0);
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: 1,
+                index: 0,
+            },
+        );
         fail_warning_delivery(&mut pdf);
 
         assert!(matches!(
-            pdf.resolve_object(object_ref),
+            resolved_object(&mut pdf, object_ref),
             Err(crate::Error::System(ref message)) if message == "sink write failure 1"
         ));
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
-    }
-
-    #[test]
-    fn qpdf_reader_restores_target_cache_after_length_holder_io_error() {
-        let bytes =
-            recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
-        let mut pdf =
-            Pdf::open(ReadFailingCursor::new(bytes)).expect("open readable holder fixture");
-        let target = ObjectRef::new(1, 0);
-        let target_offset = 9;
-        let pending = parse_file_object_syntax(
-            b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n",
-        )
-        .expect("parse pending target stream");
-
-        pdf.resolver
-            .with_reader_mut(|reader| reader.fail_reads = true);
-        let err = pdf
-            .resolve_pending_stream_length(target, &pending, target_offset)
-            .expect_err("holder I/O errors must remain unrecoverable");
-
-        assert!(matches!(err, Error::Io(_)), "got {err:?}");
-        assert!(matches!(
-            pdf.cache.entry(target),
-            Some(CacheEntry::Unresolved { offset }) if *offset == target_offset
-        ));
     }
 
     #[test]
@@ -7381,11 +3862,12 @@ mod tests {
             recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open valid indirect-length fixture");
         let object_ref = ObjectRef::new(1, 0);
-        let stream = pdf
-            .resolve_object(object_ref)
-            .expect("resolve recovered stream");
+        let stream = resolved_object(&mut pdf, object_ref).expect("resolve recovered stream");
         assert_eq!(stream.as_stream().unwrap().data, b"abc");
-        assert_eq!(pdf.recovered_stream_eol(object_ref), None);
+        assert_eq!(
+            canonical_recovered_eol(&mut pdf, object_ref).expect("canonical recovered EOL"),
+            None
+        );
     }
 
     #[test]
@@ -7394,7 +3876,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
         let object_ref = ObjectRef::new(1, 0);
         assert_eq!(
-            pdf.resolve_object(object_ref)
+            resolved_object(&mut pdf, object_ref)
                 .unwrap()
                 .as_stream()
                 .unwrap()
@@ -7412,7 +3894,10 @@ mod tests {
     fn qpdf_reader_registers_file_object_diagnostics_once_after_cache_commit() {
         let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).unwrap();
         let object_ref = ObjectRef::new(4, 0);
-        assert_eq!(pdf.resolve_object(object_ref).unwrap(), Object::Integer(3));
+        assert_eq!(
+            resolved_object(&mut pdf, object_ref).unwrap(),
+            Object::Integer(3)
+        );
         assert_eq!(
             pdf.resolve_qpdf_json_object(object_ref).unwrap(),
             Object::Integer(3)
@@ -7450,12 +3935,12 @@ mod tests {
         for bytes in cases {
             let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
             assert_eq!(
-                pdf.resolve_object(ObjectRef::new(1, 0))
+                resolved_object(&mut pdf, ObjectRef::new(1, 0))
                     .unwrap()
                     .as_stream()
                     .unwrap()
                     .data,
-                b"abc"
+                b"abc\n"
             );
         }
     }
@@ -7726,8 +4211,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open false-next-offset PDF");
 
         assert!(matches!(
-            pdf.resolve_object(ObjectRef::new(1, 0))
-                .expect("ordinary bounded fallback"),
+            resolved_object(&mut pdf, ObjectRef::new(1, 0)).expect("ordinary bounded fallback"),
             Object::Stream(_)
         ));
         assert_eq!(
@@ -7745,315 +4229,6 @@ mod tests {
 
         assert!(pdf.source_stream_data_offset(ObjectRef::new(1, 0)).is_err());
         assert_eq!(pdf.resolution_fallbacks_remaining, 0);
-    }
-
-    #[test]
-    fn qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors() {
-        let stream_body =
-            b"1 0 obj\n<< /Length 2 0 R >>\nstream\n9 0 obj\nnull\nendobj\nendstream\nendobj\n";
-        let length_body = b"2 0 obj\n19\nendobj\n";
-        let bytes = classic_pdf_with_bodies(&[stream_body, length_body], ObjectRef::new(1, 0));
-        let stream_offset = bytes
-            .windows(b"1 0 obj".len())
-            .position(|window| window == b"1 0 obj")
-            .unwrap() as u64;
-        let false_next_offset = stream_offset + b"1 0 obj\n<< /Length 2".len() as u64;
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fallback fixture");
-        pdf.sorted_object_offsets.push(false_next_offset);
-        pdf.sorted_object_offsets.sort_unstable();
-
-        let initial_budget = pdf.resolution_fallbacks_remaining;
-        let parsed = pdf
-            .read_object_at(ObjectRef::new(1, 0), stream_offset)
-            .expect("full read fallback must recover stream");
-        assert_eq!(parsed.object_ref, ObjectRef::new(1, 0));
-        assert_eq!(
-            parsed.object.as_stream().unwrap().data,
-            b"9 0 obj\nnull\nendobj"
-        );
-        assert_eq!(
-            pdf.resolution_fallbacks_remaining,
-            initial_budget.saturating_sub(1)
-        );
-
-        let malformed = classic_pdf_with_bodies(
-            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", b"2 0 obj\n<<"],
-            ObjectRef::new(1, 0),
-        );
-        let malformed_offset = malformed
-            .windows(b"2 0 obj".len())
-            .position(|window| window == b"2 0 obj")
-            .unwrap() as u64;
-        let mut pdf = Pdf::open_mem_owned(malformed).expect("open malformed lazy object");
-        assert!(pdf
-            .read_object_at(ObjectRef::new(2, 0), malformed_offset)
-            .is_err());
-        pdf.sorted_object_offsets.push(malformed_offset + 5);
-        pdf.sorted_object_offsets.sort_unstable();
-        pdf.resolution_fallbacks_remaining = 1;
-        let window_error = pdf
-            .read_object_at(ObjectRef::new(2, 0), malformed_offset)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(pdf.resolution_fallbacks_remaining, 0);
-        let exhausted_error = pdf
-            .read_object_at(ObjectRef::new(2, 0), malformed_offset)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(window_error, exhausted_error);
-        assert!(matches!(
-            pdf.cache.entry(ObjectRef::new(2, 0)),
-            Some(CacheEntry::Unresolved { offset }) if *offset == malformed_offset
-        ));
-    }
-
-    #[test]
-    fn compressed_entry_retries_objstm_when_bounded_window_ends_inside_payload() {
-        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
-        let mut body = format!(
-            "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
-            payload.len()
-        )
-        .into_bytes();
-        body.extend_from_slice(payload);
-        body.extend_from_slice(b"endstream\nendobj\n");
-        let bytes = classic_pdf_with_bodies(
-            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n", &body],
-            ObjectRef::new(1, 0),
-        );
-        let objstm_offset = bytes
-            .windows(b"4 0 obj".len())
-            .position(|window| window == b"4 0 obj")
-            .unwrap() as u64;
-        let false_next_offset = bytes
-            .windows(b"9 0 obj".len())
-            .position(|window| window == b"9 0 obj")
-            .unwrap() as u64;
-
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm fallback fixture");
-        pdf.cache
-            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
-        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.sorted_object_offsets.push(false_next_offset);
-        pdf.sorted_object_offsets.sort_unstable();
-        let initial_budget = pdf.resolution_fallbacks_remaining;
-
-        let object = pdf
-            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
-            .expect("bounded ObjStm must retry against EOF");
-        assert_eq!(
-            object.as_dict().and_then(|dict| dict.get("Value")),
-            Some(&Object::Integer(1))
-        );
-        assert_eq!(
-            pdf.resolution_fallbacks_remaining,
-            initial_budget.saturating_sub(1)
-        );
-        assert!(matches!(
-            pdf.cache.entry(ObjectRef::new(4, 0)),
-            Some(CacheEntry::Resolved(Object::Stream(_)))
-        ));
-    }
-
-    #[test]
-    fn compressed_entry_retries_legacy_framing_probe_when_bounded_window_is_truncated() {
-        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
-        let mut body = "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n"
-            .to_owned()
-            .into_bytes();
-        body.extend_from_slice(payload);
-        body.extend_from_slice(b"endstream\nendobj\n");
-        let length_body = format!("6 0 obj\n{}\nendobj\n", payload.len()).into_bytes();
-        let bytes = classic_pdf_with_bodies(
-            &[
-                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
-                &body,
-                &length_body,
-            ],
-            ObjectRef::new(1, 0),
-        );
-        let objstm_offset = bytes
-            .windows(b"4 0 obj".len())
-            .position(|window| window == b"4 0 obj")
-            .expect("object stream header") as u64;
-        let false_next_offset = bytes
-            .windows(b"/Length".len())
-            .position(|window| window == b"/Length")
-            .expect("object-stream dictionary key") as u64;
-
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
-        pdf.cache
-            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
-        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.sorted_object_offsets.push(false_next_offset);
-        pdf.sorted_object_offsets.sort_unstable();
-        let initial_budget = pdf.resolution_fallbacks_remaining;
-
-        let object = pdf
-            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
-            .expect("legacy-framing probe must retry against EOF");
-        assert_eq!(
-            object.as_dict().and_then(|dict| dict.get("Value")),
-            Some(&Object::Integer(1))
-        );
-        assert_eq!(
-            pdf.resolution_fallbacks_remaining,
-            initial_budget.saturating_sub(2),
-            "the framing probe and the actual object-read retry each charge \
-             their own EOF read against the same offset"
-        );
-    }
-
-    #[test]
-    fn compressed_entry_retries_legacy_framing_probe_when_bounded_window_stops_before_stream_keyword(
-    ) {
-        // A false next-object offset can land after the complete object
-        // dictionary (past the closing `>>`) but before the `stream`
-        // keyword. The bounded parse then succeeds as a bare dictionary
-        // (`PendingBody::Direct`) instead of failing outright, which must
-        // still be treated as truncated framing and retried through EOF --
-        // otherwise object_stream_needs_legacy_framing wrongly concludes no
-        // legacy framing is needed for an object stream whose /Length is an
-        // indirect reference, and the compressed member resolves to null.
-        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
-        let mut body = "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n"
-            .to_owned()
-            .into_bytes();
-        body.extend_from_slice(payload);
-        body.extend_from_slice(b"endstream\nendobj\n");
-        let length_body = format!("6 0 obj\n{}\nendobj\n", payload.len()).into_bytes();
-        let bytes = classic_pdf_with_bodies(
-            &[
-                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
-                &body,
-                &length_body,
-            ],
-            ObjectRef::new(1, 0),
-        );
-        let objstm_offset = bytes
-            .windows(b"4 0 obj".len())
-            .position(|window| window == b"4 0 obj")
-            .expect("object stream header") as u64;
-        // Land the false next-object offset right after the dictionary's
-        // closing `>>` and its trailing newline, but before `stream`.
-        let false_next_offset = bytes
-            .windows(b">>\nstream\n".len())
-            .position(|window| window == b">>\nstream\n")
-            .expect("object-stream dictionary close") as u64
-            + b">>\n".len() as u64;
-
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
-        pdf.cache
-            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
-        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.sorted_object_offsets.push(false_next_offset);
-        pdf.sorted_object_offsets.sort_unstable();
-        let initial_budget = pdf.resolution_fallbacks_remaining;
-
-        let object = pdf
-            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
-            .expect("legacy-framing probe must retry through EOF past a bare-dictionary parse");
-        assert_eq!(
-            object.as_dict().and_then(|dict| dict.get("Value")),
-            Some(&Object::Integer(1)),
-            "the compressed member must be recovered, not resolve to null"
-        );
-        assert_eq!(
-            pdf.resolution_fallbacks_remaining,
-            initial_budget.saturating_sub(2),
-            "the framing probe and the actual object-read retry each charge \
-             their own EOF read against the same offset"
-        );
-    }
-
-    #[test]
-    fn legacy_framing_probe_stays_within_the_fallback_budget_across_many_members() {
-        // A crafted xref can mark many compressed members as belonging to
-        // an object number that is not actually an object-stream container
-        // at all -- an ordinary dictionary with no `stream` body, which the
-        // canonical resolver happily resolves as a plain (non-stream)
-        // handle. `object_stream_handle_with_legacy_fallback`'s early
-        // return (`!prefer_legacy_framing && canonical_error.is_none() &&
-        // !stream_handle.is_missing()`) then hands that non-stream handle
-        // straight back without ever reaching the `Unresolved` match arm,
-        // so `self.cache` for this ref stays `Unresolved` forever and
-        // `resolve_compressed_entry`'s `as_stream_dict().is_none()` guard
-        // rejects every member. Each member's resolution therefore
-        // re-enters `object_stream_needs_legacy_framing` and re-probes the
-        // same offset, with no other retry machinery along the way to
-        // charge the budget. Without the probe charging its own EOF
-        // retry, this would repeat an unbounded full-file read once per
-        // member; with the charge, the shared budget caps the total number
-        // of full-file reads regardless of how many members reference it.
-        let body = "4 0 obj\n<< /Foo /Bar >>\nendobj\n".to_owned().into_bytes();
-        // Object 4 must be a real xref entry (not merely seeded into the
-        // legacy cache) so the canonical resolver actually resolves it as a
-        // plain, non-missing dictionary handle instead of reporting it
-        // missing outright -- that is what routes
-        // object_stream_handle_with_legacy_fallback through its early
-        // return instead of the `Unresolved` match arm, which has its own,
-        // separately budget-charged EOF retry that would otherwise mask
-        // the probe's own charge.
-        let bytes = classic_pdf_with_bodies(
-            &[
-                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
-                b"2 0 obj\nnull\nendobj\n",
-                b"3 0 obj\nnull\nendobj\n",
-                &body,
-            ],
-            ObjectRef::new(1, 0),
-        );
-        let objstm_offset = bytes
-            .windows(b"4 0 obj".len())
-            .position(|window| window == b"4 0 obj")
-            .expect("object stream header") as u64;
-        // Land the false next-object offset right after the dictionary's
-        // closing `>>` and its trailing newline, same as the
-        // stops-before-stream-keyword case above -- except here there is no
-        // `stream` keyword anywhere in the file, so retrying through EOF
-        // still yields a bare dictionary, not a stream. Search only from
-        // objstm_offset onward: the catalog body earlier in the file also
-        // ends in `>>\nendobj\n` and would otherwise match first.
-        let false_next_offset = objstm_offset
-            + bytes[objstm_offset as usize..]
-                .windows(b">>\nendobj\n".len())
-                .position(|window| window == b">>\nendobj\n")
-                .expect("object-stream dictionary close") as u64
-            + b">>\n".len() as u64;
-
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
-        pdf.cache
-            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
-        for (member, index) in [(7, 0), (8, 1), (9, 2)] {
-            pdf.cache
-                .set_compressed(ObjectRef::new(member, 0), 4, index);
-        }
-        pdf.sorted_object_offsets.push(false_next_offset);
-        pdf.sorted_object_offsets.sort_unstable();
-        pdf.resolution_fallbacks_remaining = 2;
-
-        for member in [7, 8, 9] {
-            assert_eq!(
-                pdf.resolve_qpdf_json_object(ObjectRef::new(member, 0))
-                    .expect(
-                        "a container that is not a stream resolves its member to null, not Err"
-                    ),
-                Object::Null,
-                "member {member} must not recover from a container that never has a stream body"
-            );
-        }
-        assert_eq!(
-            pdf.resolution_fallbacks_remaining, 0,
-            "the shared fallback budget caps total full-file reads across all members \
-             instead of granting each member its own unbounded probe"
-        );
-        assert!(
-            matches!(
-                pdf.cache.entry(ObjectRef::new(4, 0)),
-                Some(CacheEntry::Unresolved { offset }) if *offset == objstm_offset
-            ),
-            "the container never resolves, so later members keep re-probing until the budget caps them"
-        );
     }
 
     #[test]
@@ -8093,6 +4268,13 @@ mod tests {
         );
         let compressed_ref = ObjectRef::new(7, 0);
         pdf.cache.set_compressed(compressed_ref, 4, 0);
+        pdf.resolver.insert_xref_entry(
+            compressed_ref,
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        );
         assert!(matches!(
             pdf.resolve_qpdf_json_object(compressed_ref).unwrap(),
             Object::Dictionary(_)
@@ -8177,6 +4359,13 @@ mod tests {
             Object::Stream(Stream::new(stream_dict, encoded_objstm)),
         );
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(7, 0),
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        );
 
         let object = pdf
             .resolve_qpdf_json_object(ObjectRef::new(7, 0))
@@ -8185,117 +4374,6 @@ mod tests {
             object.as_dict().and_then(|dict| dict.get("Value")),
             Some(&Object::Integer(1))
         );
-    }
-
-    #[test]
-    fn object_stream_consumer_covers_legacy_cache_and_handle_error_boundaries() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let stream_ref = ObjectRef::new(7, 0);
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
-        stream_dict.insert("N", Object::Integer(1));
-        stream_dict.insert("First", Object::Integer(4));
-        stream_dict.insert("Length", Object::Integer(16));
-        let stream = Stream::new(stream_dict, b"7 0 << /Value 1 >>".to_vec());
-        pdf.cache.set_resolved(stream_ref, Object::Stream(stream));
-        let stream_handle = pdf
-            .object_stream_handle_with_legacy_fallback(stream_ref)
-            .expect("cache-seeded stream")
-            .expect("stream handle");
-        assert!(stream_handle.as_stream_dict().is_some());
-
-        let non_stream_ref = ObjectRef::new(8, 0);
-        pdf.cache.set_resolved(non_stream_ref, Object::Integer(1));
-        assert!(pdf
-            .object_stream_handle_with_legacy_fallback(non_stream_ref)
-            .expect("cache-seeded non-stream")
-            .is_none());
-
-        let mut source_pdf = Pdf::open_mem_owned(classic_pdf_with_bodies(
-            &[
-                b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /Crypt /DecodeParms << /Name /Identity >> /Length 2 0 R >>\nstream\n7 0 << /Value 1 >>\nendstream\nendobj\n",
-                b"2 0 obj\n18\nendobj\n",
-            ],
-            ObjectRef::new(1, 0),
-        ))
-        .expect("open malformed-framing identity stream");
-        *source_pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
-        source_pdf
-            .object_stream_handle_with_legacy_fallback(ObjectRef::new(1, 0))
-            .expect("legacy framing fallback")
-            .expect("identity encrypted object stream");
-        assert!(source_pdf
-            .transformed_stream_refs
-            .contains(&ObjectRef::new(1, 0)));
-
-        let direct_dict = ObjectHandle::dictionary(vec![
-            (b"N".to_vec(), ObjectHandle::integer(1)),
-            (b"First".to_vec(), ObjectHandle::integer(4)),
-        ]);
-        let out_of_range =
-            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"7 0 << /Value 1 >>".to_vec()));
-        assert!(source_pdf
-            .parse_object_stream_entry_from_handle(&out_of_range, 1)
-            .expect("missing header object must be unresolved")
-            .is_none());
-
-        let out_of_bounds = ObjectHandle::stream(direct_dict.clone(), Rc::new(b"7 999".to_vec()));
-        assert!(source_pdf
-            .parse_object_stream_entry_from_handle(&out_of_bounds, 7)
-            .is_err());
-
-        let malformed_header =
-            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"not-an-integer 0".to_vec()));
-        assert!(source_pdf
-            .parse_object_stream_entry_from_handle(&malformed_header, 7)
-            .is_err());
-
-        let negative_object_number =
-            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"-1 0".to_vec()));
-        assert!(source_pdf
-            .parse_object_stream_entry_from_handle(&negative_object_number, 7)
-            .is_err());
-
-        let too_large_object_number =
-            ObjectHandle::stream(direct_dict, Rc::new(b"4294967296 0".to_vec()));
-        assert!(source_pdf
-            .parse_object_stream_entry_from_handle(&too_large_object_number, 7)
-            .is_err());
-
-        let invalid_filter_dict = ObjectHandle::dictionary(vec![
-            (b"N".to_vec(), ObjectHandle::integer(1)),
-            (b"First".to_vec(), ObjectHandle::integer(4)),
-            (
-                b"Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            ),
-        ]);
-        let invalid_filter =
-            ObjectHandle::stream(invalid_filter_dict, Rc::new(b"not flate data".to_vec()));
-        assert!(source_pdf
-            .decode_object_stream_data(&invalid_filter)
-            .is_err());
-
-        let provider_ref = ObjectRef::new(10, 0);
-        let mut provider_dict = Dictionary::new();
-        provider_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        source_pdf.set_object(
-            provider_ref,
-            Object::Stream(Stream::new(provider_dict, Vec::new())),
-        );
-        let provider_handle = source_pdf.get_object_handle(provider_ref);
-        provider_handle
-            .replace_stream_data_with_retry_callback(|_, _, _| Ok(false), None, None)
-            .expect("install retry-aware provider");
-        assert!(source_pdf
-            .decode_object_stream_data(&provider_handle)
-            .is_err());
-
-        let missing_count = ObjectHandle::dictionary(vec![]);
-        assert!(object_stream_integer_from_handle(&missing_count, b"/N", "/N").is_err());
-        let negative_count =
-            ObjectHandle::dictionary(vec![(b"N".to_vec(), ObjectHandle::integer(-1))]);
-        assert!(object_stream_integer_from_handle(&negative_count, b"/N", "/N").is_err());
     }
 
     #[test]
@@ -8311,9 +4389,11 @@ mod tests {
             },
         );
 
-        assert!(!pdf
-            .resolve_compressed_entry(object_ref, 4, 0)
-            .expect("stale source must be treated as unresolved"));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .expect("stale source must be treated as unresolved"),
+            Object::Null
+        );
     }
 
     #[test]
@@ -8350,7 +4430,7 @@ mod tests {
             Some(&Object::Integer(2))
         );
         assert_eq!(
-            pdf.resolve_qpdf_json_object_borrowed(object_ref)
+            pdf.resolve_qpdf_json_object(object_ref)
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -8368,7 +4448,7 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
         assert_eq!(
-            pdf.resolve_object(object_ref)
+            resolved_object(&mut pdf, object_ref)
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -8385,7 +4465,7 @@ mod tests {
         pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
-            pdf.resolve_object(object_ref)
+            resolved_object(&mut pdf, object_ref)
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -8492,135 +4572,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn borrowed_qpdf_resolution_uses_the_canonical_historical_stream() {
-        let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
-        let live_ref = ObjectRef::new(8, 0);
-        pdf.set_object(
-            live_ref,
-            Object::Stream(Stream::new(Dictionary::new(), vec![0x41; 1024 * 1024])),
-        );
-        let live_payload_ptr = pdf
-            .resolve_borrowed(live_ref)
-            .expect("resolve seeded live stream")
-            .as_stream()
-            .expect("seeded live object is a stream")
-            .data
-            .as_ptr();
-        let resolved_live = pdf
-            .resolve_qpdf_json_object_borrowed(live_ref)
-            .expect("resolve live stream");
-        assert_eq!(
-            resolved_live
-                .as_stream()
-                .expect("live object is a stream")
-                .data
-                .as_ptr(),
-            live_payload_ptr
-        );
-
-        let historical_ref = ObjectRef::new(9, 0);
-        pdf.install_test_parsed_xref_stream_handle(
-            historical_ref,
-            Object::Stream(Stream::new(Dictionary::new(), vec![0x5a; 1024 * 1024])),
-        )
-        .expect("install canonical historical stream");
-        let canonical_payload = pdf
-            .get_object_handle(historical_ref)
-            .as_stream_data()
-            .expect("canonical historical stream payload");
-        let repeated_payload = pdf
-            .get_object_handle(historical_ref)
-            .as_stream_data()
-            .expect("repeated canonical historical stream payload");
-        assert!(std::rc::Rc::ptr_eq(&canonical_payload, &repeated_payload));
-
-        let resolved = pdf
-            .resolve_qpdf_json_object_borrowed(historical_ref)
-            .expect("resolve historical stream");
-        let stream = resolved.as_stream().expect("historical object is a stream");
-
-        assert_eq!(stream.data.len(), 1024 * 1024);
-    }
-
-    #[test]
-    fn borrowed_resolution_materializes_a_pre_resolved_canonical_value_after_a_legacy_parse_error()
-    {
-        let object_ref = ObjectRef::new(1, 0);
-        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n[2147483648 0 R]\nendobj\n"], object_ref);
-        let xref_offset = bytes
-            .windows(b"xref\n".len())
-            .position(|window| window == b"xref\n")
-            .expect("xref marker") as u64;
-        let mut pdf = Pdf::open_mem_owned_with_options(
-            bytes,
-            PdfOpenOptions {
-                repair: true,
-                ..PdfOpenOptions::default()
-            },
-        )
-        .expect("open repair fixture");
-
-        // Simulate a stale cache offset after a canonical caller has already
-        // resolved the handle. The compatibility parser must fail first, then
-        // the repair path may expose the canonical value without reparsing it.
-        let handle = pdf.get_object_handle(object_ref);
-        handle.set_resolved(ObjectValue::Integer(42));
-        pdf.cache.set_unresolved(object_ref, xref_offset);
-
-        assert_eq!(
-            pdf.resolve_borrowed(object_ref)
-                .expect("canonical value after legacy parse failure"),
-            &Object::Integer(42)
-        );
-    }
-
-    #[test]
-    fn canonical_compatibility_materialization_reuses_a_resolved_legacy_stream() {
-        let object_ref = ObjectRef::new(91, 0);
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let handle = pdf.get_object_handle(object_ref);
-        let stream_data = b"canonical stream bytes".to_vec();
-        handle.set_resolved(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(Vec::new()),
-            stream_data: Some(Rc::new(stream_data.clone())),
-            stream_length: stream_data.len(),
-            stream_provider: None,
-        });
-
-        let legacy = Object::Stream(Stream::new(Dictionary::new(), b"legacy bytes".to_vec()));
-        pdf.cache.set_resolved(object_ref, legacy.clone());
-
-        assert!(pdf
-            .materialize_canonical_compatibility_value(object_ref)
-            .expect("canonical stream compatibility materialization"));
-        assert_eq!(pdf.legacy_materialized_memo.get(&object_ref), Some(&legacy));
-    }
-
-    #[test]
-    fn legacy_materialization_tolerates_stale_stream_eol_for_non_stream_handles() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let stream_ref = ObjectRef::new(91, 0);
-        pdf.recovered_stream_eols
-            .insert(stream_ref, crate::parser::RecoveredStreamEol::Lf);
-
-        let stream_handle = ObjectHandle::from_value(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(Vec::new()),
-            stream_data: Some(Rc::new(b"abc\n".to_vec())),
-            stream_provider: None,
-            stream_length: 4,
-        });
-        let stream = pdf
-            .materialize_handle_for_legacy(stream_ref, &stream_handle)
-            .expect("stream compatibility materialization");
-        assert_eq!(stream.as_stream().expect("stream value").data, b"abc");
-
-        let scalar = pdf
-            .materialize_handle_for_legacy(stream_ref, &ObjectHandle::integer(42))
-            .expect("scalar compatibility materialization");
-        assert_eq!(scalar, Object::Integer(42));
-    }
-
     fn top_level_bare_reference_pdf() -> Vec<u8> {
         classic_pdf_with_bodies(
             &[
@@ -8662,7 +4613,7 @@ mod tests {
         let mut normal_first =
             Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
         assert_eq!(
-            normal_first.resolve_object(object_ref).unwrap(),
+            resolved_object(&mut normal_first, object_ref).unwrap(),
             Object::Integer(3)
         );
         assert_eq!(
@@ -8681,14 +4632,14 @@ mod tests {
             Object::Integer(3)
         );
         assert_eq!(
-            json_first.resolve_object(object_ref).unwrap(),
+            resolved_object(&mut json_first, object_ref).unwrap(),
             Object::Integer(3)
         );
         assert_eq!(json_first.repair_diagnostics().entries().len(), 1);
     }
 
     #[test]
-    fn normal_resolution_retries_when_bounded_window_ends_inside_stream_payload() {
+    fn canonical_resolution_reads_a_complete_stream_even_with_a_header_like_payload() {
         let payload = b"before\n9 0 obj\nafter\n";
         let mut stream_body = b"2 0 obj\n<< /Length 3 0 R >>\nstream\n".to_vec();
         stream_body.extend_from_slice(payload);
@@ -8707,21 +4658,20 @@ mod tests {
             .position(|window| window == b"9 0 obj")
             .expect("header-like stream payload") as u64;
 
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fallback fixture");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         pdf.sorted_object_offsets.push(false_next_offset);
         pdf.sorted_object_offsets.sort_unstable();
         let initial_budget = pdf.resolution_fallbacks_remaining;
 
-        let object = pdf
-            .resolve_object(ObjectRef::new(2, 0))
-            .expect("bounded stream must retry against EOF");
+        let object = resolved_object(&mut pdf, ObjectRef::new(2, 0))
+            .expect("canonical resolver must read the complete stream");
         assert_eq!(
             object.as_stream().map(|stream| stream.data.as_slice()),
             Some(payload.as_slice())
         );
         assert_eq!(
-            pdf.resolution_fallbacks_remaining,
-            initial_budget.saturating_sub(1)
+            pdf.resolution_fallbacks_remaining, initial_budget,
+            "canonical resolver does not use the legacy bounded-window retry budget"
         );
     }
 
@@ -8738,11 +4688,11 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
 
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
+            resolved_object(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
             Object::Null
         );
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
+            resolved_object(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
             Object::Null
         );
         let snapshot = pdf.repair_diagnostics();
@@ -8778,7 +4728,7 @@ mod tests {
         )
         .expect("linear-scan xref repair");
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
+            resolved_object(&mut pdf, ObjectRef::new(4, 0)).unwrap(),
             Object::Integer(3)
         );
         assert_eq!(
@@ -8838,12 +4788,20 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 1, 0);
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(7, 0),
+            XrefEntry::Compressed {
+                stream: 1,
+                index: 0,
+            },
+        );
         assert_eq!(
-            pdf.resolve_object(ObjectRef::new(7, 0)).unwrap(),
+            resolved_object(&mut pdf, ObjectRef::new(7, 0)).unwrap(),
             Object::Integer(6)
         );
         assert_eq!(
-            pdf.recovered_stream_eol(ObjectRef::new(1, 0)),
+            canonical_recovered_eol(&mut pdf, ObjectRef::new(1, 0))
+                .expect("canonical recovered EOL"),
             Some(&b"\n"[..])
         );
         assert!(pdf
@@ -9799,8 +5757,7 @@ mod tests {
         let output = writer.get_buffer().expect("take output");
 
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen output");
-        let emitted_stream_ref = reopened
-            .resolve_object(root_ref)
+        let emitted_stream_ref = resolved_object(&mut reopened, root_ref)
             .expect("resolve rewritten root")
             .into_dict()
             .and_then(|dict| dict.get("Extra").cloned())
@@ -9808,8 +5765,7 @@ mod tests {
             .expect("rewritten root has stream reference");
         assert_eq!(emitted_stream_ref, emitted_ref);
         assert_eq!(
-            reopened
-                .resolve_object(emitted_ref)
+            resolved_object(&mut reopened, emitted_ref)
                 .expect("resolve rewritten stream")
                 .as_stream()
                 .expect("rewritten object remains a stream")
@@ -10044,9 +6000,8 @@ mod tests {
             let mut legacy = Pdf::open_mem_owned(source.clone()).expect("open legacy");
             let mut canonical = Pdf::open_mem_owned(source.clone()).expect("open canonical");
 
-            let original_object = legacy
-                .resolve_object(object_ref)
-                .expect("resolve legacy catalog");
+            let original_object =
+                resolved_object(&mut legacy, object_ref).expect("resolve legacy catalog");
             let mut legacy_modified = original_object.clone();
             legacy_modified
                 .as_dict_mut()
@@ -10074,8 +6029,7 @@ mod tests {
             assert!(legacy.is_dirty(object_ref));
             assert!(canonical.is_dirty(object_ref));
             assert_eq!(
-                legacy
-                    .resolve_object(object_ref)
+                resolved_object(&mut legacy, object_ref)
                     .expect("resolve modified legacy catalog")
                     .as_dict()
                     .and_then(|dict| dict.get("Marker"))
@@ -10099,8 +6053,7 @@ mod tests {
                         .expect("copy canonical original value"),
                 )
                 .expect("restore canonical catalog");
-            assert!(legacy
-                .resolve_object(object_ref)
+            assert!(resolved_object(&mut legacy, object_ref)
                 .expect("resolve restored catalog")
                 .as_dict()
                 .unwrap()
@@ -10134,17 +6087,12 @@ mod tests {
     fn replace_object_handle_clears_source_derived_side_tables() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
-        pdf.recovered_stream_eols
-            .insert(object_ref, crate::parser::RecoveredStreamEol::Lf);
-        pdf.transformed_stream_refs.insert(object_ref);
         pdf.qpdf_parsed_xref_stream_refs.insert(object_ref);
         pdf.qpdf_dangling_refs.insert(object_ref);
 
         pdf.replace_object_handle(object_ref, ObjectHandle::integer(7))
             .expect("replace canonical object");
 
-        assert!(!pdf.recovered_stream_eols.contains_key(&object_ref));
-        assert!(!pdf.transformed_stream_refs.contains(&object_ref));
         assert!(!pdf.qpdf_parsed_xref_stream_refs.contains(&object_ref));
         assert!(!pdf.qpdf_dangling_refs.contains(&object_ref));
     }
@@ -10524,7 +6472,7 @@ mod tests {
         }
         pdf.set_object(object_ref, replacement.clone());
         assert_eq!(
-            pdf.resolve_object(object_ref).expect("resolve replacement"),
+            resolved_object(&mut pdf, object_ref).expect("resolve replacement"),
             replacement
         );
 
@@ -10638,10 +6586,6 @@ mod tests {
                 .contains_key(b"/TooDeep".as_slice()),
             "the canonical stream dictionary must retain an over-deep replacement"
         );
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "an over-deep programmatic stream replacement must not use the legacy memo"
-        );
     }
 
     #[test]
@@ -10679,87 +6623,6 @@ mod tests {
                 .materialize()
                 .expect("materialize canonical replacement"),
             replacement
-        );
-    }
-
-    #[test]
-    fn get_all_objects_moves_legacy_stream_memo_payload_without_copying_it() {
-        let bytes = classic_pdf_with_bodies(
-            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
-            ObjectRef::new(1, 0),
-        );
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
-        let object_ref = ObjectRef::new(1, 0);
-        let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle)
-            .expect("resolve the original stream handle");
-
-        let mut replacement_dict = Dictionary::new();
-        // Content-stream-only tokens make the infallible legacy set_object
-        // bridge retain the replacement in its memo for later reconciliation.
-        replacement_dict.insert("Invalid", Object::Operator(b"q".to_vec()));
-        pdf.set_object(
-            object_ref,
-            Object::Stream(Stream::new(replacement_dict, vec![0x5a; 1024 * 1024])),
-        );
-
-        let memo_payload_ptr = pdf
-            .legacy_materialized_memo
-            .get(&object_ref)
-            .and_then(Object::as_stream)
-            .expect("set_object stores a stream replacement in the legacy memo")
-            .data
-            .as_ptr();
-
-        let reconciled = pdf
-            .get_all_objects()
-            .expect("reconcile the replacement")
-            .into_iter()
-            .find(|candidate| candidate.object_ref() == Some(object_ref))
-            .expect("reconciled replacement handle is enumerated");
-        let canonical_payload = reconciled
-            .as_stream_data()
-            .expect("reconciled value is a stream with payload");
-
-        assert_eq!(
-            canonical_payload.as_ptr(),
-            memo_payload_ptr,
-            "reconciliation must move the memo payload into the shared canonical buffer"
-        );
-    }
-
-    #[test]
-    fn get_all_objects_moves_legacy_stream_memo_payload_into_a_new_dictionary() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let object_ref = ObjectRef::new(99, 0);
-        let mut replacement_dict = Dictionary::new();
-        replacement_dict.insert("Invalid", Object::Operator(b"q".to_vec()));
-        pdf.set_object(
-            object_ref,
-            Object::Stream(Stream::new(replacement_dict, vec![0x5a; 4096])),
-        );
-
-        let memo_payload_ptr = pdf
-            .legacy_materialized_memo
-            .get(&object_ref)
-            .and_then(Object::as_stream)
-            .expect("set_object stores a stream replacement in the legacy memo")
-            .data
-            .as_ptr();
-        let reconciled = pdf
-            .get_all_objects()
-            .expect("reconcile the replacement")
-            .into_iter()
-            .find(|candidate| candidate.object_ref() == Some(object_ref))
-            .expect("reconciled replacement handle is enumerated");
-
-        assert_eq!(
-            reconciled
-                .as_stream_data()
-                .expect("reconciled value is a stream with payload")
-                .as_ptr(),
-            memo_payload_ptr,
-            "a replacement without an existing stream dictionary must also move its payload"
         );
     }
 
@@ -10938,11 +6801,11 @@ mod tests {
                 .expect("unresolved qpdf historical lookup"),
             Object::Null
         );
-        assert!(matches!(
-            pdf.resolve_qpdf_json_object_borrowed(historical_ref)
-                .expect("borrowed unresolved qpdf historical lookup"),
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(historical_ref)
+                .expect("canonical unresolved qpdf historical lookup"),
             Object::Null
-        ));
+        );
     }
 
     #[test]
@@ -10975,61 +6838,6 @@ mod tests {
         assert!(!objects
             .iter()
             .any(|candidate| { candidate.object_ref() == Some(ObjectRef::new(99, u16::MAX)) }));
-    }
-
-    #[test]
-    fn get_all_objects_ignores_a_stale_memo_without_a_registered_handle() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let stale_ref = ObjectRef::new(999, 0);
-        pdf.legacy_materialized_memo
-            .insert(stale_ref, Object::Integer(7));
-        pdf.legacy_materialized_replacement_refs.insert(stale_ref);
-
-        let objects = pdf
-            .get_all_objects()
-            .expect("a stale memo must not block canonical enumeration");
-        assert!(!objects
-            .iter()
-            .any(|candidate| candidate.object_ref() == Some(stale_ref)));
-        assert!(pdf.legacy_materialized_memo.contains_key(&stale_ref));
-        assert!(pdf
-            .legacy_materialized_replacement_refs
-            .contains(&stale_ref));
-    }
-
-    #[test]
-    fn get_all_objects_ignores_a_registered_replacement_without_a_memo() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let object_ref = ObjectRef::new(999, 0);
-        pdf.get_object_handle(object_ref);
-        pdf.legacy_materialized_replacement_refs.insert(object_ref);
-
-        pdf.get_all_objects()
-            .expect("a replacement marker without a memo is harmless");
-        assert!(pdf
-            .legacy_materialized_replacement_refs
-            .contains(&object_ref));
-    }
-
-    #[test]
-    fn get_all_objects_propagates_an_unliftable_materialized_replacement() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let object_ref = ObjectRef::new(999, 0);
-        pdf.get_object_handle(object_ref);
-
-        let mut replacement = Object::Null;
-        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
-            replacement = Object::Array(vec![replacement]);
-        }
-        pdf.legacy_materialized_memo.insert(object_ref, replacement);
-        pdf.legacy_materialized_replacement_refs.insert(object_ref);
-
-        let error = pdf
-            .get_all_objects()
-            .expect_err("an over-deep replacement must fail during reconciliation");
-        assert!(error
-            .to_string()
-            .contains("object handle lift: inline object nesting exceeds maximum"));
     }
 
     #[test]
@@ -11390,7 +7198,7 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve(&handle).expect("resolve handle");
 
-        let legacy = pdf.resolve_borrowed(object_ref).expect("resolve legacy");
+        let legacy = resolved_object(&mut pdf, object_ref).expect("resolve legacy");
         let legacy_dict = legacy.as_dict().expect("legacy resolves to a dictionary");
         let dict = handle
             .as_dictionary()
@@ -11479,7 +7287,7 @@ mod tests {
             "ot_unresolved, unchanged by this method"
         );
         assert_eq!(
-            pdf.resolve_object(redirect_ref).expect("legacy resolve"),
+            resolved_object(&mut pdf, redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
         );
     }
@@ -11525,7 +7333,7 @@ mod tests {
         assert_eq!(handle.unparse(), b"200 0 R");
         assert_eq!(handle.as_reference(), Some(target_ref));
         assert_eq!(
-            pdf.resolve_object(redirect_ref).expect("legacy resolve"),
+            resolved_object(&mut pdf, redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
         );
 
@@ -11645,7 +7453,7 @@ mod tests {
         let middle_handle = pdf.get_object_handle(middle_ref);
         assert_eq!(middle_handle.as_reference(), Some(terminal_ref));
         assert_eq!(
-            pdf.resolve_object(outer_ref).expect("legacy resolve"),
+            resolved_object(&mut pdf, outer_ref).expect("legacy resolve"),
             Object::Reference(middle_ref)
         );
     }
@@ -11851,8 +7659,7 @@ mod tests {
         pdf.resolve(&handle)
             .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
 
-        let legacy = pdf
-            .resolve_object(ObjectRef::new(7, 0))
+        let legacy = resolved_object(&mut pdf, ObjectRef::new(7, 0))
             .expect("resolve_borrowed must also accept it");
         assert!(legacy.as_array().is_some());
         assert!(handle.as_array().is_some());
@@ -11956,9 +7763,8 @@ mod tests {
         pdf.resolve(&handle)
             .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
 
-        let legacy = pdf
-            .resolve_object(object_ref)
-            .expect("resolve_borrowed must also accept it");
+        let legacy =
+            resolved_object(&mut pdf, object_ref).expect("resolve_borrowed must also accept it");
         assert!(legacy.as_array().is_some());
         assert!(handle.as_array().is_some());
     }
@@ -12100,8 +7906,8 @@ mod tests {
     /// Object 0 (the qpdf-style xref free-list head) is exempt from every
     /// tracking side effect `delete_object` otherwise performs, including
     /// the handle-graph invalidation the previous test pins for every other
-    /// ref: it must return before touching `qpdf_removed_refs`,
-    /// `legacy_materialized_memo`, or `handle_registry` at all.
+    /// ref: it must return before touching `qpdf_removed_refs` or the
+    /// canonical handle registry at all.
     #[test]
     fn delete_object_is_a_no_op_for_object_number_zero() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
@@ -12129,38 +7935,6 @@ mod tests {
     /// `resolve`'s fallback wildcard arm (the one thing this
     /// self-healed silently through before this test existed) gets caught
     /// instead of silently regressing.
-    #[test]
-    fn delete_object_invalidates_bridge_state_for_a_dangling_ref_seeded_only_via_cache() {
-        let bytes = classic_pdf_with_bodies(
-            &[b"1 0 obj\n<< /Type /Catalog /Dangling 99 0 R >>\nendobj\n"],
-            ObjectRef::new(1, 0),
-        );
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open dangling-ref fixture");
-        let dangling_ref = ObjectRef::new(99, 0);
-
-        pdf.prepare_qpdf_json_objects()
-            .expect("discover the dangling reference");
-        assert!(
-            matches!(pdf.cache.entry(dangling_ref), Some(CacheEntry::Missing)),
-            "prepare_qpdf_json_objects must have seeded the cache as Missing"
-        );
-        assert!(
-            pdf.resolver.registered_handle(dangling_ref).is_none(),
-            "no handle must exist yet for this ref"
-        );
-
-        pdf.delete_object(dangling_ref);
-
-        assert_eq!(pdf.resolve_borrowed(dangling_ref).unwrap(), &Object::Null);
-    }
-
-    /// Design's Parsed-Offset Contract: "An absent, freed, dangling, cyclic,
-    /// or otherwise unresolvable indirect object ... resolves to null with
-    /// parsed offset -1." Deleting an object whose handle was already
-    /// resolved (here, natively parsed with a real source offset) must
-    /// reset that offset -- an outstanding clone of the handle must not go
-    /// on reporting the deleted object's former body position once it reads
-    /// as null.
     #[test]
     fn delete_object_resets_the_parsed_offset_of_an_already_resolved_handle() {
         let bytes = classic_pdf_with_bodies(
@@ -12230,8 +8004,7 @@ mod tests {
         // qpdf's cached compressed object before QPDF::removeObject erases
         // only the requested ObjStm cache entry (QPDF.cc:1996-2004).
         assert!(matches!(
-            pdf.resolve_object(member_ref)
-                .expect("resolve ObjStm member"),
+            resolved_object(&mut pdf, member_ref).expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12258,8 +8031,7 @@ mod tests {
         let member_ref = ObjectRef::new(7, 0);
 
         assert!(matches!(
-            pdf.resolve_object(member_ref)
-                .expect("resolve ObjStm member"),
+            resolved_object(&mut pdf, member_ref).expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12309,8 +8081,7 @@ mod tests {
         let member_ref = ObjectRef::new(7, 0);
 
         assert!(matches!(
-            pdf.resolve_object(member_ref)
-                .expect("resolve ObjStm member"),
+            resolved_object(&mut pdf, member_ref).expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12345,8 +8116,7 @@ mod tests {
         let member_ref = ObjectRef::new(7, 0);
 
         assert!(matches!(
-            pdf.resolve_object(member_ref)
-                .expect("resolve ObjStm member"),
+            resolved_object(&mut pdf, member_ref).expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12624,14 +8394,6 @@ mod tests {
             Some(7),
             "the canonical replacement must retain the terminal value past the parser depth"
         );
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical replacement must not fall back to a legacy materialized memo"
-        );
-        assert!(
-            pdf.legacy_materialized_replacement_refs.is_empty(),
-            "canonical replacement must not leave a deferred legacy replacement marker"
-        );
     }
 
     #[test]
@@ -12646,10 +8408,6 @@ mod tests {
         let operator = Object::Operator(b"Do".to_vec());
         pdf.set_object(operator_ref, operator.clone());
 
-        assert!(
-            pdf.legacy_materialized_memo.is_empty(),
-            "canonical replacements must not fall back to the legacy memo"
-        );
         assert_eq!(
             operator_handle
                 .materialize()

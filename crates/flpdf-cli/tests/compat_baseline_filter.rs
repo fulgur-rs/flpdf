@@ -27,6 +27,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
+mod common;
+use common::PdfCanonicalTestExt;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -102,7 +105,7 @@ fn collect_stream_filters(path: &Path) -> Vec<Vec<Vec<u8>>> {
 
     let mut filters: Vec<Vec<Vec<u8>>> = Vec::new();
     for obj_ref in refs {
-        let obj = pdf.resolve_object(obj_ref).unwrap_or_else(|e| {
+        let obj = pdf.resolve_canonical_object(obj_ref).unwrap_or_else(|e| {
             panic!("failed to resolve {:?} in {}: {e}", obj_ref, path.display())
         });
         if let Object::Stream(stream) = obj {

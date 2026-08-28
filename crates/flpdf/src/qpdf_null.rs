@@ -20,10 +20,15 @@ pub(crate) fn reference_is_null<R: Read + Seek>(
         if !visited.insert(current) {
             return Ok(true);
         }
-        match pdf.resolve_qpdf_json_object_borrowed(current)? {
-            Object::Null => return Ok(true),
-            Object::Reference(next) => current = *next,
-            _ => return Ok(false),
+        let handle = pdf.get_object_handle(current);
+        pdf.resolve(&handle)?;
+        if handle.is_null() {
+            return Ok(true);
+        }
+        if let Some(next) = handle.as_reference() {
+            current = next;
+        } else {
+            return Ok(false);
         }
     }
 }

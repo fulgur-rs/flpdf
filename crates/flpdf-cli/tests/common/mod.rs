@@ -4,7 +4,23 @@
 //! treat it as its own test binary; each test file pulls it in with
 //! `mod common;`.
 
-use flpdf::{ObjectHandle, ObjectRef, PageObjectHelper, Pdf};
+#![allow(dead_code)]
+
+use flpdf::{Object, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
+
+/// Canonical object access for integration assertions after the library's
+/// owned raw-object resolver was removed.
+pub trait PdfCanonicalTestExt {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object>;
+}
+
+impl<R: std::io::Read + std::io::Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        let handle = self.get_object_handle(object_ref);
+        self.resolve(&handle)?;
+        handle.materialize()
+    }
+}
 
 /// Return the canonical annotation handles listed by a page.
 pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(

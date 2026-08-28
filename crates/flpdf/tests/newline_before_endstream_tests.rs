@@ -88,14 +88,17 @@ fn build_minimal_pdf(payload: &[u8]) -> Vec<u8> {
 /// number is not stable; navigate by reference from `/Root` instead.
 fn resolve_metadata_stream<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> Stream {
     let root = pdf.root_ref().expect("output must have a /Root");
-    let metadata_ref = match pdf.resolve_object(root).expect("resolve /Root") {
+    let metadata_ref = match pdf.resolve_canonical_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
         },
         other => panic!("/Root must be a dictionary, got {other:?}"),
     };
-    match pdf.resolve_object(metadata_ref).expect("resolve /Metadata") {
+    match pdf
+        .resolve_canonical_object(metadata_ref)
+        .expect("resolve /Metadata")
+    {
         Object::Stream(s) => s,
         other => panic!("/Metadata must be a stream, got {other:?}"),
     }
@@ -715,5 +718,6 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{write_with_settings, WriterTestSettings};

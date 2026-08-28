@@ -109,15 +109,20 @@ fn linearize(src: &[u8], use_generate: bool) -> flpdf::Result<Vec<u8>> {
 }
 
 mod common;
+use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
 use common::{write_linearized_with_settings, WriterTestSettings};
 
 /// Resolve the first page leaf (Catalog -> Pages -> Kids[0]) of a linearized doc.
 fn first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Object {
     let root = pdf.root_ref().expect("root ref present");
-    let cat = pdf.resolve_object(root).expect("catalog resolves");
+    let cat = pdf
+        .resolve_canonical_object(root)
+        .expect("catalog resolves");
     let pages_ref = cat.as_dict().unwrap().get_ref("Pages").expect("/Pages ref");
-    let pages = pdf.resolve_object(pages_ref).expect("pages resolves");
+    let pages = pdf
+        .resolve_canonical_object(pages_ref)
+        .expect("pages resolves");
     let kids = pages.as_dict().unwrap().get("Kids").expect("/Kids").clone();
     let first_ref = match kids {
         Object::Array(a) => match a.first().expect("non-empty Kids") {
@@ -126,7 +131,8 @@ fn first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Object {
         },
         other => panic!("/Kids not an array: {other:?}"),
     };
-    pdf.resolve_object(first_ref).expect("first page resolves")
+    pdf.resolve_canonical_object(first_ref)
+        .expect("first page resolves")
 }
 
 /// Assert no live object resolves to `null` — a clean 2-page doc has none, so any
@@ -138,7 +144,7 @@ fn assert_no_stray_null(bytes: Vec<u8>) {
             // Object 0 is the free-list head (always null) — not a body object.
             continue;
         }
-        let o = pdf.resolve_object(r).expect("object resolves");
+        let o = pdf.resolve_canonical_object(r).expect("object resolves");
         assert!(
             !matches!(o, Object::Null),
             "no stray null body object expected, found null at {r}"
@@ -149,7 +155,8 @@ fn assert_no_stray_null(bytes: Vec<u8>) {
 /// Resolve the Catalog dict of a linearized doc.
 fn catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Object {
     let root = pdf.root_ref().expect("root ref present");
-    pdf.resolve_object(root).expect("catalog resolves")
+    pdf.resolve_canonical_object(root)
+        .expect("catalog resolves")
 }
 
 // --- Case 1: object-0 dict value (`/Bad 0 0 R`) on the first page ----------
@@ -245,7 +252,7 @@ fn dangling_array_elements_resurrect_or_inline_both_modes() {
             ref other => panic!("missing-xref slot must resurrect to a ref, got {other:?}"),
         };
         assert!(
-            pdf.resolve_object(resurrected)
+            pdf.resolve_canonical_object(resurrected)
                 .expect("resurrected resolves")
                 .is_null(),
             "the resurrected array slot must point at a null body object"
@@ -381,7 +388,7 @@ fn first_page_dict_missing_array_ref_resurrected_both_modes() {
             }
         };
         assert!(
-            pdf.resolve_object(resurrected).expect("resurrected resolves").is_null(),
+            pdf.resolve_canonical_object(resurrected).expect("resurrected resolves").is_null(),
             "first-page missing-xref array slot must be a null body object (generate={use_generate})"
         );
         assert!(
@@ -415,7 +422,7 @@ fn resources_dict_missing_array_ref_resurrected_both_modes() {
             other => panic!("/Resources not an indirect ref: {other:?}"),
         };
         let resources = pdf
-            .resolve_object(resources_ref)
+            .resolve_canonical_object(resources_ref)
             .expect("resources resolves");
         let arr = match resources.as_dict().unwrap().get("Arr") {
             Some(Object::Array(a)) => a.clone(),
@@ -434,7 +441,7 @@ fn resources_dict_missing_array_ref_resurrected_both_modes() {
             }
         };
         assert!(
-            pdf.resolve_object(resurrected)
+            pdf.resolve_canonical_object(resurrected)
                 .expect("resurrected resolves")
                 .is_null(),
             "resources missing-xref array slot must be a null body (generate={use_generate})"
