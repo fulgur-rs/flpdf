@@ -415,20 +415,19 @@ fn writer_handles_missing_and_malformed_catalog_paths() {
 fn insert_does_not_allocate_for_direct_names_dictionary() {
     let mut pdf = open(build_single_level_pdf());
     let catalog_ref = pdf.root_ref().expect("catalog");
-    let mut catalog = pdf
-        .resolve_object(catalog_ref)
-        .expect("resolve catalog")
-        .into_dict()
-        .expect("catalog dict");
-    let names_ref = catalog.get_ref("Names").expect("Names ref");
-    let names = pdf
-        .resolve_object(names_ref)
-        .expect("resolve Names")
-        .into_dict()
-        .expect("Names dict");
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+    let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog).expect("resolve catalog");
+    let names_ref = catalog.get_key(b"/Names").object_ref().expect("Names ref");
+    let names = pdf.get_object_handle(names_ref);
+    pdf.resolve(&names).expect("resolve Names");
+    catalog
+        .replace_key(b"/Names", names.shallow_copy().expect("copy Names"))
+        .expect("make Names direct");
+    pdf.mark_object_handle_dirty(&catalog)
+        .expect("mark catalog dirty");
+    // Register the highest possible identity so any accidental allocation
+    // still fails, without using the legacy Object cache setter.
+    let _max_handle = pdf.get_object_handle(ObjectRef::new(u32::MAX, 0));
 
     assert!(insert_embedded_file(&mut pdf, b"alpha", ObjectRef::new(4, 0)).is_ok());
 }
@@ -471,19 +470,19 @@ fn inserting_into_direct_embedded_files_root_preserves_it() {
     insert_embedded_file(&mut pdf, b"other", ObjectRef::new(2, 0)).expect("insert");
 
     let catalog_ref = pdf.root_ref().expect("catalog");
-    let catalog = pdf
-        .resolve_object(catalog_ref)
-        .expect("resolve catalog")
-        .into_dict()
-        .expect("catalog dict");
-    let names = catalog
-        .get("Names")
-        .and_then(Object::as_dict)
-        .expect("direct Names");
-    assert!(matches!(
-        names.get("EmbeddedFiles"),
-        Some(Object::Dictionary(_))
-    ));
+    let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog).expect("resolve catalog");
+    let names = catalog.get_key(b"/Names");
+    assert!(names.is_direct(), "direct Names must remain direct");
+    let embedded_files = names.get_key(b"/EmbeddedFiles");
+    assert!(
+        embedded_files.is_direct(),
+        "direct EmbeddedFiles root must remain direct"
+    );
+    assert!(
+        embedded_files.as_dictionary().is_some(),
+        "direct EmbeddedFiles root must remain a dictionary"
+    );
 }
 
 // ── Test 7: fixture attachment-two-page.pdf (integration) ────────────────────
@@ -1608,27 +1607,30 @@ fn helper_replace_keeps_direct_names_dictionary_direct() {
     let mut pdf = open(build_no_embedded_files_pdf());
     let filespec = make_filespec(&mut pdf, b"direct-names.txt");
     let catalog_ref = pdf.root_ref().expect("root");
-    let mut catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary")
-        .clone();
-    let mut names = Dictionary::new();
-    names.insert("Dests", Object::Dictionary(Dictionary::new()));
-    catalog.insert("Names", Object::Dictionary(names));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog).expect("resolve catalog");
+    let names = ObjectHandle::dictionary(vec![(
+        b"/Dests".to_vec(),
+        ObjectHandle::dictionary(Vec::new()),
+    )]);
+    catalog
+        .replace_key(b"/Names", names)
+        .expect("install direct Names");
+    pdf.mark_object_handle_dirty(&catalog)
+        .expect("mark catalog dirty");
 
     pdf.embedded_files()
         .replace_embedded_file(b"direct", filespec)
         .expect("replace");
 
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .expect("catalog")
-        .as_dict()
-        .expect("catalog dictionary");
-    assert!(matches!(catalog.get("Names"), Some(Object::Dictionary(_))));
+    let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog).expect("resolve catalog");
+    let names = catalog.get_key(b"/Names");
+    assert!(names.is_direct(), "direct Names must remain direct");
+    assert!(
+        names.as_dictionary().is_some(),
+        "direct Names must remain a dictionary"
+    );
 }
 
 #[test]
