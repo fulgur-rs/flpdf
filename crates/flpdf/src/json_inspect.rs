@@ -4552,39 +4552,48 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let image_ref = ObjectRef::new(99, 0);
 
-        let mut image_dict = Dictionary::new();
-        image_dict.insert("Subtype", Object::Name(b"Image".to_vec()));
-        pdf.set_object(
+        pdf.set_object_handle(
             image_ref,
-            Object::Stream(Stream::new(image_dict, Vec::new())),
-        );
-
-        let mut xobjects = Dictionary::new();
-        xobjects.insert(
-            "Direct",
-            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
-        );
-        xobjects.insert("Im", Object::Reference(image_ref));
+            ObjectHandle::stream(
+                handle_dictionary(vec![(b"Subtype", ObjectHandle::name(b"Image".to_vec()))]),
+                Rc::new(Vec::new()),
+            ),
+        )
+        .unwrap();
+        let image_handle: ObjectHandle = pdf.get_object_handle(image_ref);
         let no_subtype_ref = ObjectRef::new(100, 0);
-        pdf.set_object(
+        pdf.set_object_handle(
             no_subtype_ref,
-            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
-        );
-        xobjects.insert("NoSubtype", Object::Reference(no_subtype_ref));
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+        )
+        .unwrap();
+        let no_subtype_handle: ObjectHandle = pdf.get_object_handle(no_subtype_ref);
         let form_ref = ObjectRef::new(101, 0);
-        let mut form_dict = Dictionary::new();
-        form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
-        pdf.set_object(form_ref, Object::Stream(Stream::new(form_dict, Vec::new())));
-        xobjects.insert("Form", Object::Reference(form_ref));
-        let mut resources = Dictionary::new();
-        resources.insert("XObject", Object::Dictionary(xobjects));
-
-        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
-        else {
-            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
-        };
-        page.insert("Resources", Object::Dictionary(resources));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        pdf.set_object_handle(
+            form_ref,
+            ObjectHandle::stream(
+                handle_dictionary(vec![(b"Subtype", ObjectHandle::name(b"Form".to_vec()))]),
+                Rc::new(Vec::new()),
+            ),
+        )
+        .unwrap();
+        let form_handle: ObjectHandle = pdf.get_object_handle(form_ref);
+        let xobjects = handle_dictionary(vec![
+            (
+                b"Direct",
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ),
+            (b"Im", image_handle),
+            (b"NoSubtype", no_subtype_handle),
+            (b"Form", form_handle),
+        ]);
+        let resources = handle_dictionary(vec![(b"XObject", xobjects)]);
+        let page: ObjectHandle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("resolve page");
+        page.replace_key(b"/Resources", resources)
+            .expect("replace page resources");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         assert_eq!(
             collect_image_refs(&mut pdf, page_ref).expect("collect images"),
@@ -4597,15 +4606,13 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
 
-        let mut resources = Dictionary::new();
-        resources.insert("XObject", Object::Integer(7));
-
-        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
-        else {
-            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
-        };
-        page.insert("Resources", Object::Dictionary(resources));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let resources = handle_dictionary(vec![(b"XObject", ObjectHandle::integer(7))]);
+        let page: ObjectHandle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("resolve page");
+        page.replace_key(b"/Resources", resources)
+            .expect("replace page resources");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         assert!(collect_image_refs(&mut pdf, page_ref)
             .expect("collect images")
@@ -4617,19 +4624,17 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
         let non_stream_ref = ObjectRef::new(99, 0);
-        pdf.set_object(non_stream_ref, Object::Integer(1));
-
-        let mut xobjects = Dictionary::new();
-        xobjects.insert("Im", Object::Reference(non_stream_ref));
-        let mut resources = Dictionary::new();
-        resources.insert("XObject", Object::Dictionary(xobjects));
-
-        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
-        else {
-            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
-        };
-        page.insert("Resources", Object::Dictionary(resources));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        pdf.set_object_handle(non_stream_ref, ObjectHandle::integer(1))
+            .unwrap();
+        let non_stream_handle: ObjectHandle = pdf.get_object_handle(non_stream_ref);
+        let xobjects = handle_dictionary(vec![(b"Im", non_stream_handle)]);
+        let resources = handle_dictionary(vec![(b"XObject", xobjects)]);
+        let page: ObjectHandle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("resolve page");
+        page.replace_key(b"/Resources", resources)
+            .expect("replace page resources");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         assert!(collect_image_refs(&mut pdf, page_ref)
             .expect("collect images")
@@ -4641,12 +4646,12 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
 
-        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
-        else {
-            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
-        };
-        page.insert("Resources", Object::Integer(7));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page: ObjectHandle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("resolve page");
+        page.replace_key(b"/Resources", ObjectHandle::integer(7))
+            .expect("replace page resources");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         // qpdf's QPDFPageObjectHelper::getAttribute returns the non-dictionary
         // value, while forEachXObject then uses getKeyIfDict and produces no
@@ -4838,15 +4843,29 @@ mod tests {
     // build_pagelabels_section tests (flpdf-9hc.11.5)
     // ══════════════════════════════════════════════════════════════════════════
 
+    fn handle_array(children: Vec<ObjectHandle>) -> ObjectHandle {
+        ObjectHandle::array(children)
+    }
+
+    fn handle_dictionary(entries: Vec<(&[u8], ObjectHandle)>) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_vec(), value))
+                .collect(),
+        )
+    }
+
     // Helper: build a synthetic catalog with a /PageLabels entry.
-    fn patch_pagelabels(pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>, pagelabels: Object) {
+    fn patch_pagelabels(pdf: &mut crate::Pdf<std::io::Cursor<Vec<u8>>>, pagelabels: ObjectHandle) {
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("catalog is not a Dictionary"),
-        };
-        catalog.insert("PageLabels", pagelabels);
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog
+            .replace_key(b"/PageLabels", pagelabels)
+            .expect("replace /PageLabels");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
     }
 
     // ── 35b. /PageLabels present on a zero-page document → one fabricated
@@ -4912,21 +4931,19 @@ mod tests {
     #[test]
     fn pagelabels_repairs_direct_number_tree_kid() {
         let mut pdf = load_one_page_pdf();
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name(b"D".to_vec()));
-        label.insert("St", Object::Integer(3));
-        let mut leaf = Dictionary::new();
-        leaf.insert(
-            "Limits",
-            Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
-        );
-        leaf.insert(
-            "Nums",
-            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
-        );
-        let mut root = Dictionary::new();
-        root.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
-        patch_pagelabels(&mut pdf, Object::Dictionary(root));
+        let label = handle_dictionary(vec![
+            (b"S", ObjectHandle::name(b"D".to_vec())),
+            (b"St", ObjectHandle::integer(3)),
+        ]);
+        let leaf = handle_dictionary(vec![
+            (
+                b"Limits",
+                handle_array(vec![ObjectHandle::integer(0), ObjectHandle::integer(0)]),
+            ),
+            (b"Nums", handle_array(vec![ObjectHandle::integer(0), label])),
+        ]);
+        let root = handle_dictionary(vec![(b"Kids", handle_array(vec![leaf]))]);
+        patch_pagelabels(&mut pdf, root);
 
         let result = build_pagelabels_section(&mut pdf).expect("build pagelabels");
 
@@ -4942,18 +4959,14 @@ mod tests {
     fn pagelabels_single_range_decimal() {
         let mut pdf = load_one_page_pdf();
 
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name(b"D".to_vec()));
-        label.insert("St", Object::Integer(1));
-
-        let pagelabels = Object::Dictionary({
-            let mut d = Dictionary::new();
-            d.insert(
-                "Nums",
-                Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
-            );
-            d
-        });
+        let label = handle_dictionary(vec![
+            (b"S", ObjectHandle::name(b"D".to_vec())),
+            (b"St", ObjectHandle::integer(1)),
+        ]);
+        let pagelabels = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![ObjectHandle::integer(0), label]),
+        )]);
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
@@ -4982,14 +4995,12 @@ mod tests {
     #[test]
     fn pagelabels_read_does_not_dirty_a_valid_tree() {
         let mut pdf = load_one_page_pdf();
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name(b"D".to_vec()));
-        let mut root = Dictionary::new();
-        root.insert(
-            "Nums",
-            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
-        );
-        patch_pagelabels(&mut pdf, Object::Dictionary(root));
+        let label = handle_dictionary(vec![(b"S", ObjectHandle::name(b"D".to_vec()))]);
+        let root = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![ObjectHandle::integer(0), label]),
+        )]);
+        patch_pagelabels(&mut pdf, root);
         for object_ref in pdf.dirty_object_refs() {
             pdf.clear_dirty(object_ref);
         }
@@ -5006,32 +5017,24 @@ mod tests {
         // /Nums [0 << /S /D >> 1 << /S /R /P "Appx" /St 1 >> 2 << /S /a >>]
         let mut pdf = load_fixture_pdf("three-page.pdf");
 
-        let mut label0 = Dictionary::new();
-        label0.insert("S", Object::Name(b"D".to_vec()));
-
-        let mut label5 = Dictionary::new();
-        label5.insert("S", Object::Name(b"R".to_vec()));
-        label5.insert("P", Object::String(b"Appx".to_vec()));
-        label5.insert("St", Object::Integer(1));
-
-        let mut label10 = Dictionary::new();
-        label10.insert("S", Object::Name(b"a".to_vec()));
-
-        let pagelabels = Object::Dictionary({
-            let mut d = Dictionary::new();
-            d.insert(
-                "Nums",
-                Object::Array(vec![
-                    Object::Integer(0),
-                    Object::Dictionary(label0),
-                    Object::Integer(1),
-                    Object::Dictionary(label5),
-                    Object::Integer(2),
-                    Object::Dictionary(label10),
-                ]),
-            );
-            d
-        });
+        let label0 = handle_dictionary(vec![(b"S", ObjectHandle::name(b"D".to_vec()))]);
+        let label5 = handle_dictionary(vec![
+            (b"S", ObjectHandle::name(b"R".to_vec())),
+            (b"P", ObjectHandle::string(b"Appx".to_vec())),
+            (b"St", ObjectHandle::integer(1)),
+        ]);
+        let label10 = handle_dictionary(vec![(b"S", ObjectHandle::name(b"a".to_vec()))]);
+        let pagelabels = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![
+                ObjectHandle::integer(0),
+                label0,
+                ObjectHandle::integer(1),
+                label5,
+                ObjectHandle::integer(2),
+                label10,
+            ]),
+        )]);
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
@@ -5073,21 +5076,16 @@ mod tests {
     #[test]
     fn pagelabels_indirect_label_value_resolved() {
         // A /Nums value that is an indirect reference to a label dict must be
-        // resolved (covers the `Object::Reference` arm of the decode hook).
+        // resolved by the canonical number-tree walk.
         let mut pdf = load_one_page_pdf();
         let label_ref = crate::ObjectRef::new(900, 0);
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name("D".into()));
-        pdf.set_object(label_ref, Object::Dictionary(label));
-
-        let pagelabels = Object::Dictionary({
-            let mut d = Dictionary::new();
-            d.insert(
-                "Nums",
-                Object::Array(vec![Object::Integer(0), Object::Reference(label_ref)]),
-            );
-            d
-        });
+        let label = handle_dictionary(vec![(b"S", ObjectHandle::name(b"D".to_vec()))]);
+        pdf.set_object_handle(label_ref, label).unwrap();
+        let label_handle: ObjectHandle = pdf.get_object_handle(label_ref);
+        let pagelabels = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![ObjectHandle::integer(0), label_handle]),
+        )]);
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
@@ -5104,14 +5102,10 @@ mod tests {
         // QPDFPageLabelDocumentHelper ignores the non-dictionary entry, then
         // getLabelsForPageRange fabricates the default /St 1 label.
         let mut pdf = load_one_page_pdf();
-        let pagelabels = Object::Dictionary({
-            let mut d = Dictionary::new();
-            d.insert(
-                "Nums",
-                Object::Array(vec![Object::Integer(0), Object::Integer(42)]),
-            );
-            d
-        });
+        let pagelabels = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![ObjectHandle::integer(0), ObjectHandle::integer(42)]),
+        )]);
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
@@ -5132,17 +5126,11 @@ mod tests {
         // Label dict with only /P — qpdf omits null /S and adds /St.
         let mut pdf = load_one_page_pdf();
 
-        let mut label = Dictionary::new();
-        label.insert("P", Object::String(b"App".to_vec()));
-
-        let pagelabels = Object::Dictionary({
-            let mut d = Dictionary::new();
-            d.insert(
-                "Nums",
-                Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
-            );
-            d
-        });
+        let label = handle_dictionary(vec![(b"P", ObjectHandle::string(b"App".to_vec()))]);
+        let pagelabels = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![ObjectHandle::integer(0), label]),
+        )]);
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
@@ -5171,23 +5159,15 @@ mod tests {
         // /PageLabels << /Kids [99 0 R] >>  where 99 0 obj << /Nums [0 << /S /r >>] >>
         let mut pdf = load_one_page_pdf();
 
-        let mut label = Dictionary::new();
-        label.insert("S", Object::Name(b"r".to_vec()));
-
-        let mut subtree = Dictionary::new();
-        subtree.insert(
-            "Nums",
-            Object::Array(vec![Object::Integer(0), Object::Dictionary(label)]),
-        );
-
+        let label = handle_dictionary(vec![(b"S", ObjectHandle::name(b"r".to_vec()))]);
+        let subtree = handle_dictionary(vec![(
+            b"Nums",
+            handle_array(vec![ObjectHandle::integer(0), label]),
+        )]);
         let subtree_ref = crate::ObjectRef::new(99, 0);
-        pdf.set_object(subtree_ref, Object::Dictionary(subtree));
-
-        let pagelabels = Object::Dictionary({
-            let mut d = Dictionary::new();
-            d.insert("Kids", Object::Array(vec![Object::Reference(subtree_ref)]));
-            d
-        });
+        pdf.set_object_handle(subtree_ref, subtree).unwrap();
+        let subtree_handle: ObjectHandle = pdf.get_object_handle(subtree_ref);
+        let pagelabels = handle_dictionary(vec![(b"Kids", handle_array(vec![subtree_handle]))]);
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
@@ -5309,27 +5289,46 @@ mod tests {
         &value["qpdf"][1][object]["value"]
     }
 
-    fn direct_dests_root(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Dictionary {
-        let Object::Dictionary(catalog) = pdf.resolve_object(crate::ObjectRef::new(1, 0)).unwrap()
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
-        let Some(Object::Dictionary(names)) = catalog.get("Names") else {
-            panic!("catalog /Names must be a direct dictionary"); // cov:ignore: test-fixture shape guard
-        };
-        let Some(Object::Dictionary(dests)) = names.get("Dests") else {
-            panic!("/Names /Dests must be a direct dictionary"); // cov:ignore: test-fixture shape guard
-        };
-        dests.clone()
+    fn replace_catalog_key(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        key: &[u8],
+        value: ObjectHandle,
+    ) {
+        let catalog_ref = pdf.root_ref().expect("no /Root");
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog
+            .replace_key(key, value)
+            .expect("replace catalog key");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
+    }
+
+    fn direct_dests_root(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> ObjectHandle {
+        let catalog_ref = crate::ObjectRef::new(1, 0);
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        let names = catalog
+            .try_get_key(b"/Names")
+            .expect("resolve catalog /Names");
+        assert!(
+            names.as_dictionary().is_some(),
+            "catalog /Names must be a dictionary"
+        );
+        let dests = names.try_get_key(b"/Dests").expect("resolve /Names /Dests");
+        assert!(
+            dests.as_dictionary().is_some(),
+            "/Names /Dests must be a dictionary"
+        );
+        dests
     }
 
     #[test]
     fn selected_qpdf_skips_outline_repair_and_preserves_raw_objects() {
         let mut pdf = load_repairable_outline_pdf();
-        let before = pdf
-            .resolve_object(crate::ObjectRef::new(1, 0))
-            .unwrap()
-            .clone();
+        let root_ref = crate::ObjectRef::new(1, 0);
+        let before: ObjectHandle = pdf.get_object_handle(root_ref);
+        pdf.resolve(&before).expect("resolve catalog");
 
         let json = build_test_document_selected(
             &mut pdf,
@@ -5344,13 +5343,12 @@ mod tests {
             ["version", "parameters", "qpdf"]
         );
         assert!(pdf.repair_diagnostics().entries().is_empty());
-        assert_eq!(
-            pdf.resolve_object(crate::ObjectRef::new(1, 0)).unwrap(),
-            before
-        );
+        let after: ObjectHandle = pdf.get_object_handle(root_ref);
+        pdf.resolve(&after).expect("resolve catalog after JSON");
+        assert!(after.is_same_object_as(&before));
         assert_eq!(
             qpdf_object_value(&json, "obj:1 0 R"),
-            &pdf_object_to_json(&before).unwrap()
+            &project(after.get_json(QPDF_JSON_VERSION, true).unwrap()).unwrap()
         );
     }
 
@@ -5372,8 +5370,8 @@ mod tests {
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
         let dests = direct_dests_root(&mut pdf);
-        assert!(dests.get("Kids").is_none());
-        assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
+        assert!(!dests.has_key(b"/Kids"));
+        assert!(dests.get_key(b"/Names").as_array().is_some());
     }
 
     #[test]
@@ -5393,13 +5391,12 @@ mod tests {
             ["version", "parameters", "outlines", "qpdf"]
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
-        let repaired_catalog = pdf
-            .resolve_object(crate::ObjectRef::new(1, 0))
-            .unwrap()
-            .clone();
+        let repaired_catalog: ObjectHandle = pdf.get_object_handle(crate::ObjectRef::new(1, 0));
+        pdf.resolve(&repaired_catalog)
+            .expect("resolve repaired catalog");
         assert_eq!(
             qpdf_object_value(&json, "obj:1 0 R"),
-            &pdf_object_to_json(&repaired_catalog).unwrap()
+            &project(repaired_catalog.get_json(QPDF_JSON_VERSION, true).unwrap(),).unwrap()
         );
     }
 
@@ -6605,15 +6602,10 @@ mod tests {
 
         let mut outlines = Dictionary::new();
         outlines.insert("First", Object::Dictionary(first));
-        let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = pdf
-            .resolve_object(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        catalog.insert("Outlines", Object::Dictionary(outlines));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let outlines = pdf
+            .lift_object_to_handle(&Object::Dictionary(outlines))
+            .expect("lift direct outlines to a canonical handle");
+        replace_catalog_key(&mut pdf, b"/Outlines", outlines);
 
         let result = build_outlines_section(&mut pdf).unwrap();
         let entries = json_array(&result);
@@ -6732,15 +6724,8 @@ mod tests {
         pdf.set_object(first_holder_ref, Object::Reference(dests_ref));
         pdf.set_object(dests_ref, Object::Dictionary(dests));
 
-        let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = pdf
-            .resolve_object(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        catalog.insert("Dests", Object::Reference(first_holder_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let first_holder: ObjectHandle = pdf.get_object_handle(first_holder_ref);
+        replace_catalog_key(&mut pdf, b"/Dests", first_holder);
 
         let result = build_outlines_section(&mut pdf).unwrap();
         let entries = json_array(&result);
@@ -6814,15 +6799,22 @@ mod tests {
         outline_root_ref: crate::ObjectRef,
         outline_root: Dictionary,
     ) {
+        let outline_root = pdf
+            .lift_object_to_handle(&Object::Dictionary(outline_root))
+            .expect("lift outline root to a canonical handle");
+        pdf.set_object_handle(outline_root_ref, outline_root)
+            .expect("install outline root");
+
         // Wire catalog → outline root.
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("catalog is not a Dictionary"),
-        };
-        catalog.insert("Outlines", Object::Reference(outline_root_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-        pdf.set_object(outline_root_ref, Object::Dictionary(outline_root));
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        let outline_handle: ObjectHandle = pdf.get_object_handle(outline_root_ref);
+        catalog
+            .replace_key(b"/Outlines", outline_handle)
+            .expect("replace catalog /Outlines");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
     }
 
     // ── Test 1: No /Outlines → empty array ───────────────────────────────────
@@ -7381,13 +7373,13 @@ mod tests {
         // byte with no continuation bytes).
         let mut pdf = load_fixture_pdf("form-fields-and-annotations.pdf");
         let widget_ref = ObjectRef::new(13, 0);
-        let mut widget_dict = pdf
-            .resolve_object(widget_ref)
-            .expect("resolve widget 13 0")
-            .into_dict()
-            .expect("widget 13 0 is a dictionary");
-        widget_dict.insert("AS", Object::Name(vec![b'A', 0xE9]));
-        pdf.set_object(widget_ref, Object::Dictionary(widget_dict));
+        let widget: ObjectHandle = pdf.get_object_handle(widget_ref);
+        pdf.resolve(&widget).expect("resolve widget 13 0");
+        widget
+            .replace_key(b"/AS", ObjectHandle::name(vec![b'A', 0xE9]))
+            .expect("replace widget appearance state");
+        pdf.mark_object_handle_dirty(&widget)
+            .expect("mark widget dirty");
 
         let result =
             crate::job::build_acroform_section(&mut pdf).expect("build_acroform_section failed");
@@ -7430,32 +7422,37 @@ mod tests {
         filespec: Dictionary,
         name: &[u8],
     ) {
-        // Build the name tree leaf: /Names [name filespec_ref]
-        let mut ef_root = Dictionary::new();
-        ef_root.insert(
-            "Names",
-            Object::Array(vec![
-                Object::String(name.to_vec()),
-                Object::Reference(filespec_ref),
-            ]),
-        );
-        pdf.set_object(ef_root_ref, Object::Dictionary(ef_root));
+        let filespec = pdf
+            .lift_object_to_handle(&Object::Dictionary(filespec))
+            .expect("lift filespec to a canonical handle");
+        pdf.set_object_handle(filespec_ref, filespec)
+            .expect("install filespec");
+        let filespec_handle: ObjectHandle = pdf.get_object_handle(filespec_ref);
 
-        // Build the /Names dict with /EmbeddedFiles
-        let mut names_dict = Dictionary::new();
-        names_dict.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
-        pdf.set_object(names_ref, Object::Dictionary(names_dict));
+        // Build the name tree leaf: /Names [name filespec_ref].
+        let ef_root = handle_dictionary(vec![(
+            b"Names",
+            handle_array(vec![ObjectHandle::string(name.to_vec()), filespec_handle]),
+        )]);
+        pdf.set_object_handle(ef_root_ref, ef_root)
+            .expect("install embedded-files name tree");
+        let ef_root_handle: ObjectHandle = pdf.get_object_handle(ef_root_ref);
 
-        // Patch the catalog
+        // Build the /Names dict with /EmbeddedFiles.
+        let names_dict = handle_dictionary(vec![(b"EmbeddedFiles", ef_root_handle)]);
+        pdf.set_object_handle(names_ref, names_dict)
+            .expect("install /Names dictionary");
+        let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
+
+        // Patch the catalog through its live canonical handle.
         let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = match pdf.resolve_borrowed(catalog_ref).expect("resolve catalog") {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("catalog is not a Dictionary"),
-        };
-        catalog.insert("Names", Object::Reference(names_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-
-        pdf.set_object(filespec_ref, Object::Dictionary(filespec));
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog
+            .replace_key(b"/Names", names_handle)
+            .expect("replace catalog /Names");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
     }
 
     // ── attachments Test 1: No /Names/EmbeddedFiles → empty object ───────────
@@ -7499,15 +7496,8 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let names_ref = crate::ObjectRef::new(900, 0);
         pdf.set_object(names_ref, Object::Integer(7));
-        let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
-        catalog.insert("Names", Object::Reference(names_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
+        replace_catalog_key(&mut pdf, b"/Names", names_handle);
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(result, object(vec![]));
@@ -7520,17 +7510,12 @@ mod tests {
         // Covers the `None => return empty` branch when /Names exists but
         // carries no /EmbeddedFiles key.
         let mut pdf = load_one_page_pdf();
-        let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
         let mut names = Dictionary::new();
         names.insert("Dests", Object::Dictionary(Dictionary::new()));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names_handle = pdf
+            .lift_object_to_handle(&Object::Dictionary(names))
+            .expect("lift /Names dictionary");
+        replace_catalog_key(&mut pdf, b"/Names", names_handle);
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(result, object(vec![]), "expected empty object");
@@ -7541,15 +7526,8 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let names_ref = crate::ObjectRef::new(902, 0);
         pdf.set_object(names_ref, Object::Integer(7));
-        let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
-        catalog.insert("Names", Object::Reference(names_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
+        replace_catalog_key(&mut pdf, b"/Names", names_handle);
 
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
@@ -7576,15 +7554,8 @@ mod tests {
         names.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
         pdf.set_object(names_ref, Object::Dictionary(names));
 
-        let catalog_ref = pdf.root_ref().expect("no /Root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
-        catalog.insert("Names", Object::Reference(names_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
+        replace_catalog_key(&mut pdf, b"/Names", names_handle);
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(
@@ -7619,15 +7590,10 @@ mod tests {
         tree.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
         let mut names = Dictionary::new();
         names.insert("EmbeddedFiles", Object::Dictionary(tree));
-        let catalog_ref = pdf.root_ref().expect("catalog ref");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names_handle = pdf
+            .lift_object_to_handle(&Object::Dictionary(names))
+            .expect("lift /Names dictionary");
+        replace_catalog_key(&mut pdf, b"/Names", names_handle);
 
         let result = build_attachments_section(&mut pdf).expect("build attachments");
 
@@ -7666,14 +7632,8 @@ mod tests {
         pdf.set_object(names_holder_ref, Object::Reference(names_ref));
         pdf.set_object(names_ref, Object::Dictionary(names));
         let catalog_ref = pdf.root_ref().expect("catalog ref");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
-        catalog.insert("Names", Object::Reference(names_holder_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names_holder: ObjectHandle = pdf.get_object_handle(names_holder_ref);
+        replace_catalog_key(&mut pdf, b"/Names", names_holder);
         for object_ref in pdf.dirty_object_refs() {
             pdf.clear_dirty(object_ref);
         }
@@ -7683,15 +7643,10 @@ mod tests {
         let entries = object_pairs(&result);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "inline");
-        let catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dict");
-        assert_eq!(
-            catalog.get("Names"),
-            Some(&Object::Reference(names_holder_ref))
-        );
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("catalog");
+        let names = catalog.get_key(b"/Names");
+        assert_eq!(names.object_ref(), Some(names_holder_ref));
         assert!(!pdf.is_dirty(catalog_ref));
         assert!(pdf.is_dirty(names_ref));
     }
@@ -8287,33 +8242,30 @@ mod tests {
 
         // Build an inline (direct) filespec dictionary and place it directly
         // into the /Names array — no indirect reference layer.
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"inline.txt".to_vec()));
-        filespec.insert("UF", Object::String(b"inline.txt".to_vec()));
-
-        let mut ef_root = Dictionary::new();
-        ef_root.insert(
-            "Names",
-            Object::Array(vec![
-                Object::String(b"inline.txt".to_vec()),
-                Object::Dictionary(filespec), // <-- direct, not Reference
-            ]),
-        );
         let ef_root_ref = crate::ObjectRef::new(300, 0);
-        pdf.set_object(ef_root_ref, Object::Dictionary(ef_root));
-
-        let mut names_dict = Dictionary::new();
-        names_dict.insert("EmbeddedFiles", Object::Reference(ef_root_ref));
         let names_ref = crate::ObjectRef::new(301, 0);
-        pdf.set_object(names_ref, Object::Dictionary(names_dict));
+        let filespec = handle_dictionary(vec![
+            (b"F", ObjectHandle::string(b"inline.txt".to_vec())),
+            (b"UF", ObjectHandle::string(b"inline.txt".to_vec())),
+        ]);
+        let ef_root = handle_dictionary(vec![(
+            b"Names",
+            handle_array(vec![ObjectHandle::string(b"inline.txt".to_vec()), filespec]),
+        )]);
+        pdf.set_object_handle(ef_root_ref, ef_root).unwrap();
+        let ef_root_handle: ObjectHandle = pdf.get_object_handle(ef_root_ref);
+        let names_dict = handle_dictionary(vec![(b"EmbeddedFiles", ef_root_handle)]);
+        pdf.set_object_handle(names_ref, names_dict).unwrap();
+        let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
 
         let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = match pdf.resolve_borrowed(catalog_ref).unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!(),
-        };
-        catalog.insert("Names", Object::Reference(names_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog
+            .replace_key(b"/Names", names_handle)
+            .expect("replace catalog /Names");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         let pairs = object_pairs(&result);
@@ -9154,10 +9106,13 @@ mod tests {
         // obj:7 of one-page.pdf is an ASCII85Decode+FlateDecode content stream.
         // resolve() returns the decrypted-but-still-filter-encoded bytes.
         let oref = crate::ObjectRef::new(7, 0);
-        let raw_bytes = match pdf.resolve_object(oref).expect("resolve obj:7") {
-            Object::Stream(s) => s.data.clone(),
-            other => panic!("obj:7 is not a Stream: {other:?}"),
-        };
+        let stream: ObjectHandle = pdf.get_object_handle(oref);
+        pdf.resolve(&stream).expect("resolve obj:7");
+        let raw_bytes = stream
+            .get_raw_stream_data()
+            .expect("obj:7 raw stream data")
+            .as_ref()
+            .clone();
 
         let inner = get_obj7_stream_inner(&mut pdf, DecodeLevel::None, &StreamDataMode::Inline);
         let serde_json::Value::String(b64) = &inner[0].1 else {
