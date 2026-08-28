@@ -474,8 +474,13 @@ fn inserting_into_direct_embedded_files_root_preserves_it() {
     pdf.resolve(&catalog).expect("resolve catalog");
     let names = catalog.get_key(b"/Names");
     assert!(names.is_direct(), "direct Names must remain direct");
+    let embedded_files = names.get_key(b"/EmbeddedFiles");
     assert!(
-        names.get_key(b"/EmbeddedFiles").as_dictionary().is_some(),
+        embedded_files.is_direct(),
+        "direct EmbeddedFiles root must remain direct"
+    );
+    assert!(
+        embedded_files.as_dictionary().is_some(),
         "direct EmbeddedFiles root must remain a dictionary"
     );
 }
@@ -1620,8 +1625,10 @@ fn helper_replace_keeps_direct_names_dictionary_direct() {
 
     let catalog: ObjectHandle = pdf.get_object_handle(catalog_ref);
     pdf.resolve(&catalog).expect("resolve catalog");
+    let names = catalog.get_key(b"/Names");
+    assert!(names.is_direct(), "direct Names must remain direct");
     assert!(
-        catalog.get_key(b"/Names").as_dictionary().is_some(),
+        names.as_dictionary().is_some(),
         "direct Names must remain a dictionary"
     );
 }
