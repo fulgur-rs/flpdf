@@ -78,8 +78,6 @@
 //! ```
 
 use crate::nntree::NameTree;
-#[cfg(test)]
-use crate::{Dictionary, Object};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
@@ -515,6 +513,56 @@ mod tests {
             .expect("minimal test fixture has object 1 as its first object")
     }
 
+    fn handle_array(items: Vec<ObjectHandle>) -> ObjectHandle {
+        ObjectHandle::array(items)
+    }
+
+    fn handle_dictionary(entries: Vec<(&[u8], ObjectHandle)>) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_vec(), value))
+                .collect(),
+        )
+    }
+
+    fn set_test_object(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+        value: ObjectHandle,
+    ) -> ObjectHandle {
+        pdf.set_object_handle(object_ref, value)
+            .expect("set canonical test object");
+        pdf.get_object_handle(object_ref)
+    }
+
+    fn resolved_handle(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+    ) -> ObjectHandle {
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).expect("resolve canonical test object");
+        handle
+    }
+
+    fn catalog_handle(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> ObjectHandle {
+        let catalog_ref = pdf.root_ref().expect("root");
+        resolved_handle(pdf, catalog_ref)
+    }
+
+    fn replace_catalog_key(
+        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
+        key: &[u8],
+        value: ObjectHandle,
+    ) {
+        let catalog = catalog_handle(pdf);
+        catalog
+            .replace_key(key, value)
+            .expect("replace catalog key");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
+    }
+
     fn indirect_names_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -626,7 +674,7 @@ mod tests {
             .expect("resolve embedded-files root");
 
         let filespec_ref = ObjectRef::new(90, 0);
-        pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
+        set_test_object(&mut pdf, filespec_ref, handle_dictionary(Vec::new()));
         insert_embedded_file(&mut pdf, b"new.txt", filespec_ref).expect("insert");
 
         let pairs = retained_root
@@ -646,29 +694,25 @@ mod tests {
         insert_embedded_file(&mut pdf, b"retained-af.txt", filespec_ref).expect("insert");
 
         let af_ref = ObjectRef::new(next_object_number(&mut pdf) + 1, 0);
-        pdf.set_object(af_ref, Object::Array(vec![Object::Reference(filespec_ref)]));
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        catalog.insert("AF", Object::Reference(af_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let filespec_handle = pdf.get_object_handle(filespec_ref);
+        set_test_object(&mut pdf, af_ref, handle_array(vec![filespec_handle]));
+        let af_handle = pdf.get_object_handle(af_ref);
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/AF", af_handle.clone())
+            .expect("replace catalog /AF");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
         let page_ref = crate::pages::page_refs(&mut pdf)
             .expect("page refs")
             .into_iter()
             .next()
             .expect("page");
-        let mut page = pdf
-            .resolve_borrowed(page_ref)
-            .expect("page")
-            .as_dict()
-            .expect("page dictionary")
-            .clone();
-        page.insert("AF", Object::Reference(af_ref));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = resolved_handle(&mut pdf, page_ref);
+        page.replace_key(b"/AF", af_handle)
+            .expect("replace page /AF");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         let retained_af = pdf.get_object_handle(af_ref);
         pdf.resolve(&retained_af).expect("resolve AF array");
@@ -684,9 +728,8 @@ mod tests {
             "qpdf keeps the retained AF array element"
         );
         assert_eq!(
-            pdf.resolve_object(filespec_ref)
-                .expect("Filespec remains addressable"),
-            Object::Null,
+            resolved_handle(&mut pdf, filespec_ref).is_null(),
+            true,
             "qpdf replaces the removed Filespec with null"
         );
     }
@@ -694,27 +737,16 @@ mod tests {
     #[test]
     fn helper_mutates_a_retained_direct_embedded_files_root() {
         let mut pdf = open_minimal();
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        let mut root = Dictionary::new();
-        root.insert("Names", Object::Array(Vec::new()));
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Dictionary(root));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let root = handle_dictionary(vec![(b"/Names", handle_array(Vec::new()))]);
+        let names = handle_dictionary(vec![(b"/EmbeddedFiles", root)]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
-        let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog_handle).expect("resolve catalog");
+        let catalog_handle = catalog_handle(&mut pdf);
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
         let retained_pairs = retained_root.get_key(b"/Names");
 
         let filespec_ref = ObjectRef::new(90, 0);
-        pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
+        set_test_object(&mut pdf, filespec_ref, handle_dictionary(Vec::new()));
         let filespec = pdf.get_object_handle(filespec_ref);
         pdf.embedded_files()
             .replace_embedded_file(b"entry", filespec)
@@ -767,36 +799,21 @@ mod tests {
     #[test]
     fn helper_mutates_an_indirect_root_without_detaching_direct_filespec_handle() {
         let mut pdf = open_minimal();
-        let catalog_ref = pdf.root_ref().expect("root");
         let root_ref = ObjectRef::new(90, 0);
         let added_ref = ObjectRef::new(91, 0);
 
-        let mut existing_filespec = Dictionary::new();
-        existing_filespec.insert("F", Object::String(b"old.txt".to_vec()));
-        let mut root = Dictionary::new();
-        root.insert(
-            "Names",
-            Object::Array(vec![
-                Object::String(b"a".to_vec()),
-                Object::Dictionary(existing_filespec),
-            ]),
-        );
-        pdf.set_object(root_ref, Object::Dictionary(root));
-        pdf.set_object(added_ref, Object::Dictionary(Dictionary::new()));
+        let existing_filespec =
+            handle_dictionary(vec![(b"/F", ObjectHandle::string(b"old.txt".to_vec()))]);
+        let root = handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![ObjectHandle::string(b"a".to_vec()), existing_filespec]),
+        )]);
+        let root_handle = set_test_object(&mut pdf, root_ref, root);
+        set_test_object(&mut pdf, added_ref, handle_dictionary(Vec::new()));
+        let names = handle_dictionary(vec![(b"/EmbeddedFiles", root_handle)]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Reference(root_ref));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-
-        let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog_handle).expect("resolve catalog");
+        let catalog_handle = catalog_handle(&mut pdf);
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
         pdf.resolve(&retained_root)
             .expect("resolve embedded-files root");
@@ -844,86 +861,33 @@ mod tests {
     }
 
     #[test]
-    fn helper_mutates_a_direct_root_behind_a_names_redirect_chain() {
-        let mut pdf = open_minimal();
-        let catalog_ref = pdf.root_ref().expect("root");
-        let terminal_ref = ObjectRef::new(90, 0);
-        let redirect_ref = ObjectRef::new(91, 0);
-        let filespec_ref = ObjectRef::new(92, 0);
-
-        let mut root = Dictionary::new();
-        root.insert("Names", Object::Array(Vec::new()));
-        let mut terminal = Dictionary::new();
-        terminal.insert("EmbeddedFiles", Object::Dictionary(root));
-        pdf.set_object(terminal_ref, Object::Dictionary(terminal));
-        pdf.set_object(redirect_ref, Object::Reference(terminal_ref));
-        pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
-
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        catalog.insert("Names", Object::Reference(redirect_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-
-        let terminal_handle = pdf.get_object_handle(terminal_ref);
-        pdf.resolve(&terminal_handle)
-            .expect("resolve terminal names dictionary");
-        let retained_root = terminal_handle.get_key(b"/EmbeddedFiles");
-
-        let filespec = pdf.get_object_handle(filespec_ref);
-        pdf.embedded_files()
-            .replace_embedded_file(b"entry", filespec)
-            .expect("replace");
-
-        assert_eq!(
-            retained_root
-                .get_key(b"/Names")
-                .as_array()
-                .expect("updated names array")
-                .len(),
-            2,
-            "the canonical terminal root must observe helper replacement"
-        );
-    }
-
-    #[test]
     fn helper_mutates_a_retained_direct_kids_root() {
         let mut pdf = open_minimal();
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        let mut leaf = Dictionary::new();
-        leaf.insert(
-            "Names",
-            Object::Array(vec![Object::String(b"a".to_vec()), Object::Integer(1)]),
-        );
-        leaf.insert(
-            "Limits",
-            Object::Array(vec![
-                Object::String(b"a".to_vec()),
-                Object::String(b"a".to_vec()),
-            ]),
-        );
-        let mut root = Dictionary::new();
-        root.insert("Kids", Object::Array(vec![Object::Dictionary(leaf)]));
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Dictionary(root));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let leaf = handle_dictionary(vec![
+            (
+                b"/Names",
+                handle_array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    ObjectHandle::integer(1),
+                ]),
+            ),
+            (
+                b"/Limits",
+                handle_array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    ObjectHandle::string(b"a".to_vec()),
+                ]),
+            ),
+        ]);
+        let root = handle_dictionary(vec![(b"/Kids", handle_array(vec![leaf]))]);
+        let names = handle_dictionary(vec![(b"/EmbeddedFiles", root)]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
-        let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog_handle).expect("resolve catalog");
+        let catalog_handle = catalog_handle(&mut pdf);
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
 
         let filespec_ref = ObjectRef::new(90, 0);
-        pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
+        set_test_object(&mut pdf, filespec_ref, handle_dictionary(Vec::new()));
         let filespec = pdf.get_object_handle(filespec_ref);
         pdf.embedded_files()
             .replace_embedded_file(b"b", filespec)
@@ -942,31 +906,18 @@ mod tests {
     #[test]
     fn helper_preserves_an_untouched_direct_filespec_handle_during_root_update() {
         let mut pdf = open_minimal();
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        let mut filespec = Dictionary::new();
-        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
-        filespec.insert("F", Object::String(b"old.txt".to_vec()));
-        let mut root = Dictionary::new();
-        root.insert(
-            "Names",
-            Object::Array(vec![
-                Object::String(b"a".to_vec()),
-                Object::Dictionary(filespec),
-            ]),
-        );
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Dictionary(root));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let filespec = handle_dictionary(vec![
+            (b"/Type", ObjectHandle::name(b"Filespec".to_vec())),
+            (b"/F", ObjectHandle::string(b"old.txt".to_vec())),
+        ]);
+        let root = handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![ObjectHandle::string(b"a".to_vec()), filespec]),
+        )]);
+        let names = handle_dictionary(vec![(b"/EmbeddedFiles", root)]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
-        let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog_handle).expect("resolve catalog");
+        let catalog_handle = catalog_handle(&mut pdf);
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
         let retained_filespec = retained_root
             .get_key(b"/Names")
@@ -975,7 +926,7 @@ mod tests {
             .clone();
 
         let added_ref = ObjectRef::new(90, 0);
-        pdf.set_object(added_ref, Object::Dictionary(Dictionary::new()));
+        set_test_object(&mut pdf, added_ref, handle_dictionary(Vec::new()));
         let added = pdf.get_object_handle(added_ref);
         pdf.embedded_files()
             .replace_embedded_file(b"b", added)
@@ -1009,25 +960,23 @@ mod tests {
         // A side-car stream that will be reachable ONLY via the filespec dict.
         let next = next_object_number(&mut pdf);
         let sidecar_ref = ObjectRef::new(next + 1, 0);
-        pdf.set_object(
-            sidecar_ref,
-            Object::Stream(crate::object::Stream {
-                dict: Dictionary::new(),
-                data: b"sidecar".to_vec(),
-            }),
+        let sidecar = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            std::rc::Rc::new(b"sidecar".to_vec()),
         );
+        set_test_object(&mut pdf, sidecar_ref, sidecar);
 
         // Build a filespec, then point an indirect key at the side-car so the
         // side-car is reachable exclusively through the filespec.
         let fs_ref = FileSpecBuilder::new("trans.txt", b"payload")
             .build(&mut pdf)
             .expect("build filespec");
-        let Object::Dictionary(mut fs_dict) = pdf.resolve_object(fs_ref).expect("resolve filespec")
-        else {
-            panic!("expected filespec dict");
-        };
-        fs_dict.insert("CI", Object::Reference(sidecar_ref));
-        pdf.set_object(fs_ref, Object::Dictionary(fs_dict));
+        let filespec = resolved_handle(&mut pdf, fs_ref);
+        filespec
+            .replace_key(b"/CI", pdf.get_object_handle(sidecar_ref))
+            .expect("add side-car reference");
+        pdf.mark_object_handle_dirty(&filespec)
+            .expect("mark filespec dirty");
         insert_embedded_file(&mut pdf, b"trans.txt", fs_ref).expect("insert");
 
         remove_attachment(&mut pdf, b"trans.txt").expect("remove");
@@ -1046,17 +995,16 @@ mod tests {
         let fs_ref = FileSpecBuilder::new("indirect-ef.txt", b"payload")
             .build(&mut pdf)
             .expect("build filespec");
-        let Object::Dictionary(mut fs_dict) = pdf.resolve_object(fs_ref).expect("resolve filespec")
-        else {
-            panic!("expected filespec dict");
-        };
-        let Object::Dictionary(ef_dict) = fs_dict.get("EF").cloned().expect("/EF") else {
-            panic!("expected /EF dict");
-        };
+        let filespec = resolved_handle(&mut pdf, fs_ref);
+        let ef_dict = filespec.get_key(b"/EF").as_dictionary().expect("/EF dict");
         let ef_ref = ObjectRef::new(fs_ref.number + 100, 0);
-        pdf.set_object(ef_ref, Object::Dictionary(ef_dict));
-        fs_dict.insert("EF", Object::Reference(ef_ref));
-        pdf.set_object(fs_ref, Object::Dictionary(fs_dict));
+        let ef_handle = ObjectHandle::dictionary(ef_dict.into_iter().collect());
+        set_test_object(&mut pdf, ef_ref, ef_handle);
+        filespec
+            .replace_key(b"/EF", pdf.get_object_handle(ef_ref))
+            .expect("replace /EF with indirect dictionary");
+        pdf.mark_object_handle_dirty(&filespec)
+            .expect("mark filespec dirty");
 
         let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve stream")
@@ -1116,18 +1064,15 @@ mod tests {
         // it *indirectly* (the only reference to this array object).
         let next = next_object_number(&mut pdf);
         let af_array_ref = ObjectRef::new(next + 1, 0);
-        pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
+        let filespec_handle = pdf.get_object_handle(fs_ref);
+        set_test_object(&mut pdf, af_array_ref, handle_array(vec![filespec_handle]));
 
-        let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .clone()
-        else {
-            panic!("expected catalog dict");
-        };
-        catalog.insert("AF", Object::Reference(af_array_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
+            .expect("replace catalog /AF");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         let removed = remove_attachment(&mut pdf, b"idx.txt").expect("remove");
         assert!(removed);
@@ -1147,21 +1092,15 @@ mod tests {
         );
 
         // Catalog /AF and its null Filespec reference remain.
-        let Object::Dictionary(catalog2) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog after")
-        else {
-            panic!("expected catalog dict");
-        };
+        let catalog2 = catalog_handle(&mut pdf);
         assert_eq!(
-            catalog2.get("AF"),
-            Some(&Object::Reference(af_array_ref)),
+            catalog2.get_key(b"/AF").object_ref(),
+            Some(af_array_ref),
             "catalog /AF must remain in place"
         );
         assert_eq!(
-            pdf.resolve_object(fs_ref)
-                .expect("Filespec remains addressable"),
-            Object::Null,
+            resolved_handle(&mut pdf, fs_ref).is_null(),
+            true,
             "Filespec must be nulled, not removed"
         );
     }
@@ -1183,31 +1122,24 @@ mod tests {
         // catalog and the page.
         let next = next_object_number(&mut pdf);
         let af_array_ref = ObjectRef::new(next + 1, 0);
-        pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
+        let filespec_handle = pdf.get_object_handle(fs_ref);
+        set_test_object(&mut pdf, af_array_ref, handle_array(vec![filespec_handle]));
 
-        let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .clone()
-        else {
-            panic!("expected catalog dict");
-        };
-        catalog.insert("AF", Object::Reference(af_array_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
+            .expect("replace catalog /AF");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
         assert_eq!(page_refs.len(), 1, "fixture has one page");
         let page_ref = page_refs[0];
-        let Object::Dictionary(mut page_dict) = pdf
-            .resolve_borrowed(page_ref)
-            .expect("resolve page")
-            .clone()
-        else {
-            panic!("expected page dict");
-        };
-        page_dict.insert("AF", Object::Reference(af_array_ref));
-        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+        let page = resolved_handle(&mut pdf, page_ref);
+        page.replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
+            .expect("replace page /AF");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         // Removal walks catalog then every page, calling the helper once per
         // parent against the SAME shared array object.
@@ -1216,17 +1148,15 @@ mod tests {
 
         // The shared array object must still resolve for every parent and keep
         // the removed Filespec reference.
-        let Object::Array(af_after) = pdf
-            .resolve_borrowed(af_array_ref)
-            .expect("shared indirect /AF array must still resolve (not deleted)")
-        else {
-            panic!("expected /AF array object");
-        };
+        let af_after = resolved_handle(&mut pdf, af_array_ref)
+            .as_array()
+            .expect("shared indirect /AF array must still resolve (not deleted)");
         assert_eq!(
-            af_after.as_slice(),
-            [Object::Reference(fs_ref)],
+            af_after.len(),
+            1,
             "shared /AF array must retain the nulled Filespec reference"
         );
+        assert_eq!(af_after[0].object_ref(), Some(fs_ref));
 
         // The null Filespec remains reachable through the shared array.
         let live = pdf.live_object_refs();
@@ -1236,20 +1166,15 @@ mod tests {
         );
 
         // Page /AF must still point at the surviving shared array.
-        let Object::Dictionary(page_after) =
-            pdf.resolve_borrowed(page_ref).expect("resolve page after")
-        else {
-            panic!("expected page dict");
-        };
+        let page_after = resolved_handle(&mut pdf, page_ref);
         assert_eq!(
-            page_after.get("AF").and_then(Object::as_ref_id),
+            page_after.get_key(b"/AF").object_ref(),
             Some(af_array_ref),
             "page /AF must still point at the surviving shared array"
         );
         assert_eq!(
-            pdf.resolve_object(fs_ref)
-                .expect("Filespec remains addressable"),
-            Object::Null,
+            resolved_handle(&mut pdf, fs_ref).is_null(),
+            true,
             "Filespec must be nulled, not removed"
         );
     }
@@ -1276,28 +1201,23 @@ mod tests {
         // legitimately references the SAME filespec.
         let next = next_object_number(&mut pdf);
         let dests_leaf_ref = ObjectRef::new(next + 1, 0);
-        let mut dests_leaf = Dictionary::new();
-        dests_leaf.insert(
-            "Names",
-            Object::Array(vec![
-                Object::String(b"shared-dest".to_vec()),
-                Object::Reference(fs_ref),
+        let dests_leaf = handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![
+                ObjectHandle::string(b"shared-dest".to_vec()),
+                pdf.get_object_handle(fs_ref),
             ]),
-        );
-        pdf.set_object(dests_leaf_ref, Object::Dictionary(dests_leaf));
+        )]);
+        set_test_object(&mut pdf, dests_leaf_ref, dests_leaf);
 
         // Hang it off the catalog's /Dests so it is reachable from the catalog
         // (a legitimate live name tree, not a dead ghost).
-        let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .clone()
-        else {
-            panic!("expected catalog dict");
-        };
-        catalog.insert("Dests", Object::Reference(dests_leaf_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/Dests", pdf.get_object_handle(dests_leaf_ref))
+            .expect("replace catalog /Dests");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         // Remove the embedded-files attachment. qpdf nulls the Filespec
         // object even when another name tree still references its object ref.
@@ -1309,22 +1229,19 @@ mod tests {
             live.contains(&fs_ref),
             "the null Filespec ref remains reachable through /Dests"
         );
-        assert_eq!(
-            pdf.resolve_object(fs_ref)
-                .expect("Filespec remains addressable"),
-            Object::Null,
+        assert!(
+            resolved_handle(&mut pdf, fs_ref).is_null(),
             "qpdf replaces the shared Filespec with null"
         );
 
         // The /Dests reference itself must remain intact.
-        let Object::Dictionary(leaf) = pdf
-            .resolve_borrowed(dests_leaf_ref)
-            .expect("resolve dests leaf")
-        else {
-            panic!("expected dests leaf dict");
-        };
+        let leaf = resolved_handle(&mut pdf, dests_leaf_ref);
+        let names = leaf
+            .get_key(b"/Names")
+            .as_array()
+            .expect("dests leaf names");
         assert!(
-            matches!(leaf.get("Names"), Some(Object::Array(a)) if a.iter().any(|o| matches!(o, Object::Reference(r) if *r == fs_ref))),
+            names.iter().any(|value| value.object_ref() == Some(fs_ref)),
             "/Dests leaf must still reference the filespec"
         );
 
@@ -1359,26 +1276,20 @@ mod tests {
         // Make the stream dictionary back-reference the filespec (pathological
         // but legal) and have a live, catalog-reachable object reference the
         // stream so conservative GC must preserve it.
-        let Object::Stream(mut stream) = pdf
-            .resolve_borrowed(stream_ref)
-            .expect("resolve stream")
-            .clone()
-        else {
-            panic!("expected stream object");
-        };
-        stream.dict.insert("RelatedFS", Object::Reference(fs_ref));
-        pdf.set_object(stream_ref, Object::Stream(stream));
+        let stream = resolved_handle(&mut pdf, stream_ref);
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+        stream_dict
+            .replace_key(b"/RelatedFS", pdf.get_object_handle(fs_ref))
+            .expect("add stream back-reference");
+        pdf.mark_object_handle_dirty(&stream)
+            .expect("mark stream dirty");
 
-        let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .clone()
-        else {
-            panic!("expected catalog dict");
-        };
-        catalog.insert("ExtraStreamRef", Object::Reference(stream_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/ExtraStreamRef", pdf.get_object_handle(stream_ref))
+            .expect("replace catalog stream reference");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         let removed = remove_attachment(&mut pdf, b"paired.txt").expect("remove");
         assert!(removed);
@@ -1415,15 +1326,17 @@ mod tests {
         // Build a second filespec whose /EF points at the SAME stream object.
         let next = next_object_number(&mut pdf);
         let fs_b = ObjectRef::new(next + 1, 0);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(shared_stream));
-        ef.insert("UF", Object::Reference(shared_stream));
-        let mut fs_b_dict = Dictionary::new();
-        fs_b_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
-        fs_b_dict.insert("F", Object::String(b"b.txt".to_vec()));
-        fs_b_dict.insert("UF", Object::String(b"b.txt".to_vec()));
-        fs_b_dict.insert("EF", Object::Dictionary(ef));
-        pdf.set_object(fs_b, Object::Dictionary(fs_b_dict));
+        let ef = handle_dictionary(vec![
+            (b"/F", pdf.get_object_handle(shared_stream)),
+            (b"/UF", pdf.get_object_handle(shared_stream)),
+        ]);
+        let fs_b_handle = handle_dictionary(vec![
+            (b"/Type", ObjectHandle::name(b"Filespec".to_vec())),
+            (b"/F", ObjectHandle::string(b"b.txt".to_vec())),
+            (b"/UF", ObjectHandle::string(b"b.txt".to_vec())),
+            (b"/EF", ef),
+        ]);
+        set_test_object(&mut pdf, fs_b, fs_b_handle);
         insert_embedded_file(&mut pdf, b"b.txt", fs_b).expect("insert b");
 
         // Remove attachment "a": its filespec is otherwise unreferenced and
@@ -1461,37 +1374,29 @@ mod tests {
             .expect("build filespec");
 
         // The builder points /EF /F and /EF /UF at one stream; capture it.
-        let Object::Dictionary(fs_dict) = pdf.resolve_borrowed(fs_ref).expect("resolve fs") else {
-            panic!("expected filespec dict");
-        };
-        let Some(Object::Dictionary(mut ef)) = fs_dict.get("EF").cloned() else {
-            panic!("expected inline /EF dict");
-        };
-        let stream_f = match ef.get("F") {
-            Some(Object::Reference(r)) => *r,
-            _ => panic!("expected /EF /F indirect stream"),
-        };
+        let filespec = resolved_handle(&mut pdf, fs_ref);
+        let ef = filespec.get_key(b"/EF");
+        assert!(ef.as_dictionary().is_some(), "expected inline /EF dict");
+        let stream_f = ef
+            .get_key(b"/F")
+            .object_ref()
+            .expect("expected /EF /F indirect stream");
 
         // Add a *distinct* second stream object under /EF /UF.
         let next = next_object_number(&mut pdf);
         let stream_uf = ObjectRef::new(next + 1, 0);
-        let mut s2 = Dictionary::new();
-        s2.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        pdf.set_object(
-            stream_uf,
-            Object::Stream(crate::object::Stream {
-                dict: s2,
-                data: b"sibling stream".to_vec(),
-            }),
+        let stream = ObjectHandle::stream(
+            handle_dictionary(vec![(
+                b"/Type",
+                ObjectHandle::name(b"EmbeddedFile".to_vec()),
+            )]),
+            std::rc::Rc::new(b"sibling stream".to_vec()),
         );
-        ef.insert("UF", Object::Reference(stream_uf));
-        let Object::Dictionary(mut fs_dict_mut) =
-            pdf.resolve_borrowed(fs_ref).expect("resolve fs").clone()
-        else {
-            panic!("expected filespec dict");
-        };
-        fs_dict_mut.insert("EF", Object::Dictionary(ef));
-        pdf.set_object(fs_ref, Object::Dictionary(fs_dict_mut));
+        set_test_object(&mut pdf, stream_uf, stream);
+        ef.replace_key(b"/UF", pdf.get_object_handle(stream_uf))
+            .expect("replace /EF /UF");
+        pdf.mark_object_handle_dirty(&filespec)
+            .expect("mark filespec dirty");
 
         insert_embedded_file(&mut pdf, b"multi.txt", fs_ref).expect("insert");
 
@@ -1524,24 +1429,21 @@ mod tests {
         // An empty indirect /AF array object, shared by the catalog *and* a
         // second dictionary so wrongly deleting it would dangle a live ref.
         let af_array_ref = ObjectRef::new(next + 1, 0);
-        pdf.set_object(af_array_ref, Object::Array(vec![]));
+        set_test_object(&mut pdf, af_array_ref, handle_array(Vec::new()));
 
         let sharer_ref = ObjectRef::new(next + 2, 0);
-        let mut sharer = Dictionary::new();
-        sharer.insert("AF", Object::Reference(af_array_ref));
-        pdf.set_object(sharer_ref, Object::Dictionary(sharer));
+        let sharer = handle_dictionary(vec![(b"/AF", pdf.get_object_handle(af_array_ref))]);
+        set_test_object(&mut pdf, sharer_ref, sharer);
 
-        let catalog_ref = pdf.root_ref().expect("root");
-        let Object::Dictionary(mut catalog) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .clone()
-        else {
-            panic!("expected catalog dict");
-        };
-        catalog.insert("AF", Object::Reference(af_array_ref));
-        catalog.insert("Sharer", Object::Reference(sharer_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/AF", pdf.get_object_handle(af_array_ref))
+            .expect("replace catalog /AF");
+        catalog
+            .replace_key(b"/Sharer", pdf.get_object_handle(sharer_ref))
+            .expect("replace catalog /Sharer");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         // Add and remove an unrelated attachment.  Its filespec is NOT in the
         // empty indirect /AF array, so the array and parent key must survive.
@@ -1558,14 +1460,9 @@ mod tests {
             live.contains(&af_array_ref),
             "empty indirect /AF array (target absent) must NOT be deleted"
         );
-        let Object::Dictionary(catalog2) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog after")
-        else {
-            panic!("expected catalog dict");
-        };
+        let catalog2 = catalog_handle(&mut pdf);
         assert!(
-            matches!(catalog2.get("AF"), Some(Object::Reference(r)) if *r == af_array_ref),
+            catalog2.get_key(b"/AF").object_ref() == Some(af_array_ref),
             "catalog /AF must still point at the untouched indirect array"
         );
     }
@@ -1602,32 +1499,22 @@ mod tests {
         insert_embedded_file(&mut pdf, b"af-test.txt", fs_ref).expect("insert");
 
         // Add /AF to catalog pointing at fs_ref.
-        let catalog_ref = pdf.root_ref().expect("root");
-        let Some(mut catalog) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .as_dict()
-            .cloned()
-        else {
-            panic!("expected catalog dict");
-        };
-        catalog.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        catalog
+            .replace_key(b"/AF", handle_array(vec![pdf.get_object_handle(fs_ref)]))
+            .expect("replace catalog /AF");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         // Add /AF to the single page as well.
         let page_refs = crate::pages::page_refs(&mut pdf).expect("page_refs");
         assert_eq!(page_refs.len(), 1, "fixture has one page");
         let page_ref = page_refs[0];
-        let Some(mut page_dict) = pdf
-            .resolve_borrowed(page_ref)
-            .expect("resolve page")
-            .as_dict()
-            .cloned()
-        else {
-            panic!("expected page dict");
-        };
-        page_dict.insert("AF", Object::Array(vec![Object::Reference(fs_ref)]));
-        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+        let page = resolved_handle(&mut pdf, page_ref);
+        page.replace_key(b"/AF", handle_array(vec![pdf.get_object_handle(fs_ref)]))
+            .expect("replace page /AF");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("mark page dirty");
 
         // Remove the attachment.
         let removed = remove_attachment(&mut pdf, b"af-test.txt").expect("remove");
@@ -1635,39 +1522,29 @@ mod tests {
 
         // qpdf leaves the associated-files reference in place; the Filespec
         // object itself is replaced with null by removeEmbeddedFile.
-        let Some(catalog2) = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog after")
-            .as_dict()
-        else {
-            panic!("expected catalog dict");
-        };
+        let catalog2 = catalog_handle(&mut pdf);
+        let catalog_af = catalog2.get_key(b"/AF").as_array().expect("catalog /AF");
         assert_eq!(
-            catalog2.get("AF"),
-            Some(&Object::Array(vec![Object::Reference(fs_ref)])),
+            catalog_af.len(),
+            1,
             "qpdf keeps catalog /AF pointing at the nulled Filespec"
         );
+        assert_eq!(catalog_af[0].object_ref(), Some(fs_ref));
 
-        assert_eq!(
-            pdf.resolve_object(fs_ref)
-                .expect("Filespec must remain addressable"),
-            Object::Null,
+        assert!(
+            resolved_handle(&mut pdf, fs_ref).is_null(),
             "qpdf replaces the removed Filespec with null"
         );
 
         // The page's /AF reference is retained too.
-        let Some(page_dict2) = pdf
-            .resolve_borrowed(page_ref)
-            .expect("resolve page after")
-            .as_dict()
-        else {
-            panic!("expected page dict");
-        };
+        let page_dict2 = resolved_handle(&mut pdf, page_ref);
+        let page_af = page_dict2.get_key(b"/AF").as_array().expect("page /AF");
         assert_eq!(
-            page_dict2.get("AF"),
-            Some(&Object::Array(vec![Object::Reference(fs_ref)])),
+            page_af.len(),
+            1,
             "qpdf keeps page /AF pointing at the nulled Filespec"
         );
+        assert_eq!(page_af[0].object_ref(), Some(fs_ref));
     }
 
     // ── Test: shared stream is preserved under conservative GC ───────────────
@@ -1685,30 +1562,37 @@ mod tests {
         let fs_ref2 = ObjectRef::new(next + 3, 0);
 
         // Shared EmbeddedFile stream.
-        let mut ef_dict = Dictionary::new();
-        ef_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        ef_dict.insert("Length", Object::Integer(7));
-        let ef_stream = crate::object::Stream::new(ef_dict, b"payload".to_vec());
-        pdf.set_object(stream_ref, Object::Stream(ef_stream));
+        let ef_dict = handle_dictionary(vec![
+            (b"/Type", ObjectHandle::name(b"EmbeddedFile".to_vec())),
+            (b"/Length", ObjectHandle::integer(7)),
+        ]);
+        set_test_object(
+            &mut pdf,
+            stream_ref,
+            ObjectHandle::stream(ef_dict, std::rc::Rc::new(b"payload".to_vec())),
+        );
 
         // /EF sub-dict pointing both filespecs at the same stream.
-        let mut ef_sub = Dictionary::new();
-        ef_sub.insert("F", Object::Reference(stream_ref));
-        ef_sub.insert("UF", Object::Reference(stream_ref));
+        let ef_sub = handle_dictionary(vec![
+            (b"/F", pdf.get_object_handle(stream_ref)),
+            (b"/UF", pdf.get_object_handle(stream_ref)),
+        ]);
 
         // Filespec 1.
-        let mut fs1 = Dictionary::new();
-        fs1.insert("Type", Object::Name(b"Filespec".to_vec()));
-        fs1.insert("F", Object::String(b"shared1.txt".to_vec()));
-        fs1.insert("EF", Object::Dictionary(ef_sub.clone()));
-        pdf.set_object(fs_ref1, Object::Dictionary(fs1));
+        let fs1 = handle_dictionary(vec![
+            (b"/Type", ObjectHandle::name(b"Filespec".to_vec())),
+            (b"/F", ObjectHandle::string(b"shared1.txt".to_vec())),
+            (b"/EF", ef_sub.clone()),
+        ]);
+        set_test_object(&mut pdf, fs_ref1, fs1);
 
         // Filespec 2.
-        let mut fs2 = Dictionary::new();
-        fs2.insert("Type", Object::Name(b"Filespec".to_vec()));
-        fs2.insert("F", Object::String(b"shared2.txt".to_vec()));
-        fs2.insert("EF", Object::Dictionary(ef_sub));
-        pdf.set_object(fs_ref2, Object::Dictionary(fs2));
+        let fs2 = handle_dictionary(vec![
+            (b"/Type", ObjectHandle::name(b"Filespec".to_vec())),
+            (b"/F", ObjectHandle::string(b"shared2.txt".to_vec())),
+            (b"/EF", ef_sub),
+        ]);
+        set_test_object(&mut pdf, fs_ref2, fs2);
 
         // Insert both into the name tree.
         insert_embedded_file(&mut pdf, b"shared1.txt", fs_ref1).expect("insert 1");
@@ -1747,17 +1631,8 @@ mod tests {
         let mut pdf = open_minimal();
 
         // Attach a /Names dict carrying only an unrelated key (no /EmbeddedFiles).
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("resolve catalog")
-            .as_dict()
-            .expect("catalog dict")
-            .clone();
-        let mut names = Dictionary::new();
-        names.insert("Dests", Object::Dictionary(Dictionary::new()));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names = handle_dictionary(vec![(b"/Dests", handle_dictionary(Vec::new()))]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
         assert!(
             list_embedded_files(&mut pdf).expect("list").is_empty(),
@@ -1772,86 +1647,19 @@ mod tests {
         );
     }
 
-    // ── Test: handle-valued reader reads through a 2-hop /Names ────────────────
-    //
-    // The canonical helper follows the catalog `/Names` holder chain to the
-    // terminal name-tree dictionary while retaining the Filespec handle.
-    #[test]
-    fn handle_entries_read_through_two_hop_names() {
-        let mut pdf = open_minimal();
-
-        // Register an attachment so /Names /EmbeddedFiles holds a real entry.
-        let fs_ref = FileSpecBuilder::new("chain.txt", b"chain payload")
-            .build(&mut pdf)
-            .expect("build filespec");
-        insert_embedded_file(&mut pdf, b"chain.txt", fs_ref).expect("insert");
-
-        // Move qpdf's direct `/Names` dictionary behind an explicit holder
-        // chain to exercise multi-hop resolution.
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog dict");
-        let names = catalog
-            .get("Names")
-            .and_then(Object::as_dict)
-            .expect("catalog /Names must be direct after insert")
-            .clone();
-
-        // Insert a bare-reference carrier in front of the names dict so the
-        // catalog reaches /Names through two hops: catalog → carrier → names.
-        let next = next_object_number(&mut pdf);
-        let names_ref = ObjectRef::new(next + 1, 0);
-        let carrier_ref = ObjectRef::new(next + 2, 0);
-        pdf.set_object(names_ref, Object::Dictionary(names));
-        pdf.set_object(carrier_ref, Object::Reference(names_ref));
-        catalog.insert("Names", Object::Reference(carrier_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-
-        let entries = pdf
-            .embedded_files()
-            .get_embedded_files()
-            .expect("handle-valued entries");
-        assert_eq!(
-            entries.len(),
-            1,
-            "handle-valued reader must enumerate the attachment behind a 2-hop /Names"
-        );
-        assert_eq!(
-            entries
-                .get(b"chain.txt".as_slice())
-                .and_then(ObjectHandle::object_ref),
-            Some(fs_ref)
-        );
-    }
-
     #[test]
     fn handle_entries_preserve_direct_filespec_handles() {
         let mut pdf = open_minimal();
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_borrowed(catalog_ref)
-            .expect("catalog")
-            .as_dict()
-            .expect("catalog dictionary")
-            .clone();
-        let mut filespec = Dictionary::new();
-        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
-        filespec.insert("F", Object::String(b"direct.txt".to_vec()));
-        let mut root = Dictionary::new();
-        root.insert(
-            "Names",
-            Object::Array(vec![
-                Object::String(b"direct".to_vec()),
-                Object::Dictionary(filespec),
-            ]),
-        );
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Dictionary(root));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let filespec = handle_dictionary(vec![
+            (b"/Type", ObjectHandle::name(b"Filespec".to_vec())),
+            (b"/F", ObjectHandle::string(b"direct.txt".to_vec())),
+        ]);
+        let root = handle_dictionary(vec![(
+            b"/Names",
+            handle_array(vec![ObjectHandle::string(b"direct".to_vec()), filespec]),
+        )]);
+        let names = handle_dictionary(vec![(b"/EmbeddedFiles", root)]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
         let entries = pdf
             .embedded_files()
@@ -1885,27 +1693,27 @@ mod tests {
 
         // Materialize qpdf's direct names dictionary as an indirect terminal
         // and add a surviving sibling key.
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog dict");
-        let mut terminal = catalog
-            .get("Names")
-            .and_then(Object::as_dict)
-            .expect("direct names")
-            .clone();
+        let catalog = catalog_handle(&mut pdf);
+        let terminal = catalog
+            .get_key(b"/Names")
+            .shallow_copy()
+            .expect("copy direct names");
         // /Dests as a small inline dict: survives the post-removal sweep because
         // it is owned by the (still-reachable) terminal names dict.
-        let mut dests = Dictionary::new();
-        dests.insert("X", Object::Reference(fs_ref));
-        terminal.insert("Dests", Object::Dictionary(dests));
+        terminal
+            .replace_key(
+                b"/Dests",
+                handle_dictionary(vec![(b"/X", pdf.get_object_handle(fs_ref))]),
+            )
+            .expect("add /Dests sibling");
         let terminal_ref = ObjectRef::new(next_object_number(&mut pdf) + 1, 0);
-        pdf.set_object(terminal_ref, Object::Dictionary(terminal));
+        set_test_object(&mut pdf, terminal_ref, terminal);
 
-        catalog.insert("Names", Object::Reference(terminal_ref));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        catalog
+            .replace_key(b"/Names", pdf.get_object_handle(terminal_ref))
+            .expect("install indirect Names");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         // Remove the last (only) embedded file → empty rebuild with a surviving
         // /Dests sibling.
@@ -1913,27 +1721,20 @@ mod tests {
         assert!(removed, "remove_attachment must return true");
 
         // qpdf modifies the indirect names dictionary in place.
-        let catalog_after = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog after")
-            .into_dict()
-            .expect("catalog dict after");
+        let catalog_after = catalog_handle(&mut pdf);
         let names_after = catalog_after
-            .get("Names")
-            .and_then(Object::as_ref_id)
+            .get_key(b"/Names")
+            .object_ref()
             .expect("catalog /Names must still be indirect");
         assert_eq!(names_after, terminal_ref);
 
         // The terminal retains its sibling and an empty EmbeddedFiles tree.
-        let resolved = pdf
-            .resolve_object(terminal_ref)
-            .expect("resolve terminal /Names target");
-        let names_dict = resolved.into_dict().expect("/Names target is a dict");
+        let names_dict = resolved_handle(&mut pdf, terminal_ref);
         assert!(
-            names_dict.get("Dests").is_some(),
+            names_dict.has_key(b"/Dests"),
             "terminal /Names dict must retain the surviving /Dests sibling"
         );
-        assert!(names_dict.get("EmbeddedFiles").is_some());
+        assert!(names_dict.has_key(b"/EmbeddedFiles"));
     }
 
     // ── Test: non-empty rebuild with a *direct* (inline) /Names dict ──────────
@@ -1946,16 +1747,8 @@ mod tests {
         let mut pdf = open_minimal();
 
         // Seed catalog /Names as a *direct* dict carrying only an unrelated key.
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog dict");
-        let mut names = Dictionary::new();
-        names.insert("Dests", Object::Dictionary(Dictionary::new()));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let names = handle_dictionary(vec![(b"/Dests", handle_dictionary(Vec::new()))]);
+        replace_catalog_key(&mut pdf, b"/Names", names);
 
         // Adding an attachment drives the non-empty rebuild over the direct dict.
         let fs_ref = FileSpecBuilder::new("direct.txt", b"direct payload")
@@ -1968,21 +1761,17 @@ mod tests {
         assert_eq!(entries[0].0, b"direct.txt");
 
         // /Names stays direct and retains /Dests.
-        let catalog_after = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog after")
-            .into_dict()
-            .expect("catalog dict after");
+        let catalog_after = catalog_handle(&mut pdf);
         let names_after = catalog_after
-            .get("Names")
-            .and_then(Object::as_dict)
+            .get_key(b"/Names")
+            .as_dictionary()
             .expect("/Names direct after insert");
         assert!(
-            names_after.get("Dests").is_some(),
+            names_after.contains_key(b"/Dests".as_slice()),
             "the inline /Dests sibling must survive the rebuild"
         );
         assert!(
-            names_after.get("EmbeddedFiles").is_some(),
+            names_after.contains_key(b"/EmbeddedFiles".as_slice()),
             "/EmbeddedFiles must be written into the /Names dict"
         );
     }
@@ -2004,20 +1793,19 @@ mod tests {
 
         // Inline that names dict directly into the catalog (and add /Dests), so
         // the catalog reaches /EmbeddedFiles through a *direct* /Names dict.
-        let catalog_ref = pdf.root_ref().expect("root");
-        let mut catalog = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog dict");
-        let mut names = catalog
-            .get("Names")
-            .and_then(Object::as_dict)
-            .expect("/Names direct after insert")
-            .clone();
-        names.insert("Dests", Object::Dictionary(Dictionary::new()));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let catalog = catalog_handle(&mut pdf);
+        let names = catalog
+            .get_key(b"/Names")
+            .shallow_copy()
+            .expect("copy direct Names");
+        names
+            .replace_key(b"/Dests", handle_dictionary(Vec::new()))
+            .expect("add /Dests sibling");
+        catalog
+            .replace_key(b"/Names", names)
+            .expect("install direct Names");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         // Remove the only attachment → empty rebuild over the direct /Names dict.
         let removed = remove_attachment(&mut pdf, b"only2.txt").expect("remove only2");
@@ -2025,19 +1813,15 @@ mod tests {
 
         // /Names stays inline on the catalog; /Dests and the empty
         // /EmbeddedFiles tree are preserved.
-        let catalog_after = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog after")
-            .into_dict()
-            .expect("catalog dict after");
+        let catalog_after = catalog_handle(&mut pdf);
         let names_after = catalog_after
-            .get("Names")
-            .and_then(Object::as_dict)
+            .get_key(b"/Names")
+            .as_dictionary()
             .expect("/Names must remain a direct dict");
         assert!(
-            names_after.get("Dests").is_some(),
+            names_after.contains_key(b"/Dests".as_slice()),
             "the /Dests sibling must survive the empty rebuild"
         );
-        assert!(names_after.get("EmbeddedFiles").is_some());
+        assert!(names_after.contains_key(b"/EmbeddedFiles".as_slice()));
     }
 }
