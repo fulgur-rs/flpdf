@@ -14,23 +14,28 @@ use std::fs::File;
 use std::io::BufReader;
 
 use flpdf::{
-    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef,
-    Pdf, PdfWriter,
+    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectHandle,
+    ObjectRef, Pdf, PdfWriter,
 };
 
 /// Resolve a page's `/Resources /Font /F1` indirect reference.
 ///
-/// The synthetic pages keep `/Resources` inline, so a single `resolve` of the
-/// page object is enough; the nested dictionaries are read through accessors
-/// (`as_dict` / `as_ref_id`) rather than matching `Object` variants by hand.
+/// The synthetic pages keep `/Resources` inline, so resolving the page and
+/// then each child handle is enough; the nested dictionaries remain live
+/// ObjectHandle values throughout the inspection.
 fn font_ref_of_page<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page: ObjectRef,
 ) -> Option<ObjectRef> {
-    let page_obj = pdf.resolve_object(page).ok()?;
-    let resources = page_obj.as_dict()?.get("Resources")?;
-    let fonts = resources.as_dict()?.get("Font")?;
-    fonts.as_dict()?.get("F1")?.as_ref_id()
+    let page_obj: ObjectHandle = pdf.get_object_handle(page);
+    pdf.resolve(&page_obj).ok()?;
+    let resources = page_obj.get_key(b"/Resources");
+    pdf.resolve(&resources).ok()?;
+    resources.as_dictionary()?;
+    let fonts = resources.get_key(b"/Font");
+    pdf.resolve(&fonts).ok()?;
+    fonts.as_dictionary()?;
+    fonts.get_key(b"/F1").object_ref()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
