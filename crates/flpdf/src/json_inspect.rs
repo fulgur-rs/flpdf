@@ -3317,9 +3317,13 @@ mod tests {
     fn object_handle_write_json_keeps_indirect_reference_before_value_dispatch() {
         let mut pdf = empty_pdf();
         let object_ref = ObjectRef::new(2, 0);
-        pdf.set_object(object_ref, Object::Array(vec![Object::Integer(1)]));
-        pdf.resolve_object(object_ref).unwrap();
-        let handle = pdf.get_object_handle(object_ref);
+        pdf.set_object_handle(
+            object_ref,
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        )
+        .unwrap();
+        let handle: ObjectHandle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).unwrap();
         let mut bytes = Vec::new();
         let mut output = PlString::new("object-handle-json", None, &mut bytes);
 
@@ -3874,15 +3878,19 @@ mod tests {
         // Regression coverage for pdf_object_to_json's object_ref()-first
         // dispatch order: an indirect handle that some *other* code path
         // already resolved must still serialize as "N G R", not get inlined
-        // as its resolved value. Object couldn't represent this state at all
-        // (Object::Reference is always unresolved), so nothing in the legacy
-        // suite could exercise it — see this function's own doc.
+        // as its resolved value. The legacy value model could not represent
+        // this already-resolved indirect state, so nothing in that suite could
+        // exercise it — see this function's own doc.
         use crate::ObjectRef;
         let mut pdf = empty_pdf();
         let child_ref = ObjectRef::new(2, 0);
-        pdf.set_object(child_ref, Object::Array(vec![Object::Integer(1)]));
-        pdf.resolve_object(child_ref).unwrap();
-        let child_handle = pdf.get_object_handle(child_ref);
+        pdf.set_object_handle(
+            child_ref,
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        )
+        .unwrap();
+        let child_handle: ObjectHandle = pdf.get_object_handle(child_ref);
+        pdf.resolve(&child_handle).unwrap();
         assert!(
             child_handle.as_array().is_some(),
             "sanity: the canonical handle for child_ref is already resolved to an array"
@@ -3926,15 +3934,14 @@ mod tests {
     fn pdf_dest_to_json_dereferences_a_resolved_indirect_array() {
         let mut pdf = empty_pdf();
         let dest_ref = ObjectRef::new(9, 0);
-        pdf.set_object(
+        let page_handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.set_object_handle(
             dest_ref,
-            Object::Array(vec![
-                Object::Reference(ObjectRef::new(3, 0)),
-                Object::Name(b"Fit".to_vec()),
-            ]),
-        );
-        pdf.resolve_object(dest_ref).unwrap();
-        let handle = pdf.get_object_handle(dest_ref);
+            ObjectHandle::array(vec![page_handle, ObjectHandle::name(b"Fit".to_vec())]),
+        )
+        .unwrap();
+        let handle: ObjectHandle = pdf.get_object_handle(dest_ref);
+        pdf.resolve(&handle).unwrap();
 
         let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
         assert_eq!(
