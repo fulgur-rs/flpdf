@@ -11405,9 +11405,8 @@ mod tests {
         ]);
 
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let annotation = pdf.get_object_handle(ObjectRef::new(4, 0));
-        annotation
-            .try_dereference()
+        let annotation: ObjectHandle = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve(&annotation)
             .expect("the annotation dictionary resolves");
 
         let ap = annotation
@@ -11425,7 +11424,7 @@ mod tests {
              below to be the one under test"
         );
 
-        let n = ap
+        let n: ObjectHandle = ap
             .as_dictionary()
             .expect("/AP is a dictionary")
             .get(b"/N".as_slice())
@@ -11437,7 +11436,7 @@ mod tests {
              indirect handle, not resolved it eagerly or copied its value"
         );
 
-        n.try_dereference().expect(
+        pdf.resolve(&n).expect(
             "a nested handle reached only by navigating /AP /N, never re-fetched \
              through `Pdf::get_object_handle`, must still resolve through the \
              owning document",
