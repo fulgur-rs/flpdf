@@ -77,20 +77,42 @@ fn assert_direct_dictionary(object: &ObjectHandle, description: &str) {
     );
 }
 
-fn key_name(pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8]) -> Option<Vec<u8>> {
-    resolved_key(pdf, object, key).as_name()
+fn direct_entry(object: &ObjectHandle, key: &[u8]) -> ObjectHandle {
+    let value = object
+        .as_dictionary()
+        .expect("direct entry lookup requires a dictionary")
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| panic!("missing direct dictionary entry {key:?}"));
+    assert!(
+        value.object_ref().is_none(),
+        "dictionary entry {key:?} must retain direct identity"
+    );
+    value
 }
 
-fn key_string(
-    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+fn key_name(
+    _pdf: &mut Pdf<Cursor<Vec<u8>>>,
     object: &ObjectHandle,
     key: &[u8],
 ) -> Option<Vec<u8>> {
-    resolved_key(pdf, object, key).as_string()
+    direct_entry(object, key).as_name()
 }
 
-fn key_boolean(pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &ObjectHandle, key: &[u8]) -> Option<bool> {
-    resolved_key(pdf, object, key).as_boolean()
+fn key_string(
+    _pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    object: &ObjectHandle,
+    key: &[u8],
+) -> Option<Vec<u8>> {
+    direct_entry(object, key).as_string()
+}
+
+fn key_boolean(
+    _pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    object: &ObjectHandle,
+    key: &[u8],
+) -> Option<bool> {
+    direct_entry(object, key).as_boolean()
 }
 
 #[test]
@@ -796,7 +818,7 @@ fn set_field_attribute_string_writes_a_qpdf_unicode_string_on_the_field() {
         "field must stay a dictionary"
     );
     assert_eq!(
-        resolved_key(&mut pdf, &field, b"/TU").as_string(),
+        key_string(&mut pdf, &field, b"/TU"),
         Some(flpdf::pdf_string::new_unicode_string("日本語".as_bytes()))
     );
 }
@@ -843,7 +865,7 @@ fn set_value_marks_text_and_choice_fields_as_needing_appearances() {
             "field must be a dictionary"
         );
         assert_eq!(
-            resolved_key(&mut pdf, &field, b"/V").as_string(),
+            key_string(&mut pdf, &field, b"/V"),
             Some(flpdf::pdf_string::new_unicode_string("日本語".as_bytes()))
         );
         let acroform = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
@@ -852,7 +874,7 @@ fn set_value_marks_text_and_choice_fields_as_needing_appearances() {
             "AcroForm must be a dictionary"
         );
         assert_eq!(
-            resolved_key(&mut pdf, &acroform, b"/NeedAppearances").as_boolean(),
+            key_boolean(&mut pdf, &acroform, b"/NeedAppearances"),
             Some(true)
         );
     }
@@ -870,7 +892,7 @@ fn set_value_marks_the_terminal_acroform_reference_as_needing_appearances() {
 
     let acroform = resolved_handle(&mut pdf, ObjectRef::new(20, 0));
     assert_eq!(
-        resolved_key(&mut pdf, &acroform, b"/NeedAppearances").as_boolean(),
+        key_boolean(&mut pdf, &acroform, b"/NeedAppearances"),
         Some(true)
     );
 }
