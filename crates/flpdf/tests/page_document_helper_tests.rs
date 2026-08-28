@@ -324,14 +324,13 @@ fn add_page_indirects_a_direct_page_input() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_eq!(pages.len(), 2);
     assert_ne!(pages[1], ObjectRef::new(3, 0));
-    let Object::Dictionary(page) = pdf.resolve_object(pages[1]).unwrap() else {
-        panic!("direct input must become an indirect page dictionary");
-    };
+    let page = pdf.get_object_handle(pages[1]);
+    pdf.resolve(&page).unwrap();
+    assert_eq!(page.get_key(b"/Type").as_name(), Some(b"Page".to_vec()));
     assert_eq!(
-        page.get("Type").and_then(Object::as_name),
-        Some(b"Page".as_slice())
+        page.get_key(b"/Parent").object_ref(),
+        Some(ObjectRef::new(2, 0))
     );
-    assert_eq!(page.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
 }
 
 #[test]
@@ -348,9 +347,11 @@ fn add_page_duplicate_does_not_overwrite_a_handle_only_object() {
 
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_ne!(pages[1], reserved_ref);
+    let reserved_value = pdf.get_object_handle(reserved_ref);
+    pdf.resolve(&reserved_value).unwrap();
     assert_eq!(
-        pdf.resolve_object(reserved_ref).unwrap(),
-        Object::Integer(42),
+        reserved_value.as_integer(),
+        Some(42),
         "duplicating a page must not reuse a handle-registry object number"
     );
 }
@@ -358,31 +359,26 @@ fn add_page_duplicate_does_not_overwrite_a_handle_only_object() {
 #[test]
 fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
     let mut source = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut source_root) = source.resolve_object(ObjectRef::new(2, 0)).unwrap()
-    else {
-        panic!("source /Pages must be a dictionary");
-    };
-    let Object::Dictionary(mut source_page) = source.resolve_object(ObjectRef::new(3, 0)).unwrap()
-    else {
-        panic!("source page must be a dictionary");
-    };
-    let media_box = source_page.remove("MediaBox").unwrap();
-    source_root.insert("MediaBox", media_box);
-    source.set_object(ObjectRef::new(2, 0), Object::Dictionary(source_root));
-    source.set_object(ObjectRef::new(3, 0), Object::Dictionary(source_page));
+    let source_root = source.get_object_handle(ObjectRef::new(2, 0));
+    source.resolve(&source_root).unwrap();
+    let source_page = source.get_object_handle(ObjectRef::new(3, 0));
+    source.resolve(&source_page).unwrap();
+    let media_box = source_page.get_key(b"/MediaBox");
+    source.resolve(&media_box).unwrap();
+    source_page.remove_key(b"/MediaBox");
+    source_root.replace_key(b"/MediaBox", media_box).unwrap();
+    source.mark_object_handle_dirty(&source_root).unwrap();
+    source.mark_object_handle_dirty(&source_page).unwrap();
 
     let mut target = open(build_n_page_pdf(1));
     PageDocumentHelper::new(&mut target)
         .add_page(PageInput::foreign(&mut source, ObjectRef::new(3, 0)), false)
         .unwrap();
 
-    let Object::Dictionary(materialized_source_page) =
-        source.resolve_object(ObjectRef::new(3, 0)).unwrap()
-    else {
-        panic!("source page must remain a dictionary");
-    };
+    let materialized_source_page = source.get_object_handle(ObjectRef::new(3, 0));
+    source.resolve(&materialized_source_page).unwrap();
     assert!(
-        materialized_source_page.get("MediaBox").is_some(),
+        !materialized_source_page.get_key(b"/MediaBox").is_null(),
         "qpdf materializes inherited attributes on the source before foreign copy"
     );
 
@@ -390,26 +386,28 @@ fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
         .get_all_pages()
         .unwrap();
     assert_eq!(target_pages.len(), 2);
-    let Object::Dictionary(copied_page) = target.resolve_object(target_pages[1]).unwrap() else {
-        panic!("foreign input must produce a target page dictionary");
-    };
+    let copied_page = target.get_object_handle(target_pages[1]);
+    target.resolve(&copied_page).unwrap();
     assert!(
-        copied_page.get("MediaBox").is_some(),
+        !copied_page.get_key(b"/MediaBox").is_null(),
         "copied page must retain the materialized source MediaBox"
     );
-    assert_eq!(copied_page.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
+    assert_eq!(
+        copied_page.get_key(b"/Parent").object_ref(),
+        Some(ObjectRef::new(2, 0))
+    );
 }
 
 #[test]
 fn add_page_uses_qpdf_copy_foreign_object_null_key_filtering() {
     let mut source = open(build_n_page_pdf(1));
-    let indirect_null = ObjectRef::new(10, 0);
-    source.set_object(indirect_null, Object::Null);
-    let Object::Dictionary(mut page) = source.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-        panic!("source page must be a dictionary");
-    };
-    page.insert("IndirectNull", Object::Reference(indirect_null));
-    source.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+    let indirect_null = source
+        .make_indirect_object_handle(ObjectHandle::null())
+        .unwrap();
+    let page = source.get_object_handle(ObjectRef::new(3, 0));
+    source.resolve(&page).unwrap();
+    page.replace_key(b"/IndirectNull", indirect_null).unwrap();
+    source.mark_object_handle_dirty(&page).unwrap();
 
     let mut target = open(build_n_page_pdf(1));
     PageDocumentHelper::new(&mut target)
@@ -419,11 +417,10 @@ fn add_page_uses_qpdf_copy_foreign_object_null_key_filtering() {
     let pages = PageDocumentHelper::new(&mut target)
         .get_all_pages()
         .expect("target pages");
-    let Object::Dictionary(copied_page) = target.resolve_object(pages[1]).unwrap() else {
-        panic!("foreign input must produce a target page dictionary");
-    };
+    let copied_page = target.get_object_handle(pages[1]);
+    target.resolve(&copied_page).unwrap();
     assert!(
-        copied_page.get("IndirectNull").is_none(),
+        !copied_page.has_key(b"/IndirectNull"),
         "qpdf getKeys omits a source dictionary key whose indirect value resolves to null"
     );
 }
@@ -459,16 +456,11 @@ fn add_page_recopies_a_page_left_as_a_nested_boundary_placeholder() {
         .get_all_pages()
         .unwrap();
     assert_eq!(pages.len(), 2);
-    let Object::Dictionary(copied_page) = target.resolve_object(pages[1]).unwrap() else {
-        panic!(
-            "foreign input must produce a real target page dictionary, not the \
-             leftover null placeholder left by the canonical port's nested-page \
-             boundary reservation"
-        );
-    };
+    let copied_page = target.get_object_handle(pages[1]);
+    target.resolve(&copied_page).unwrap();
     assert_eq!(
-        copied_page.get("Type").and_then(Object::as_name),
-        Some(b"Page".as_slice()),
+        copied_page.get_key(b"/Type").as_name(),
+        Some(b"Page".to_vec()),
         "the rebuilt page tree must hold the actual copied page content"
     );
 }
@@ -476,15 +468,17 @@ fn add_page_recopies_a_page_left_as_a_nested_boundary_placeholder() {
 #[test]
 fn add_page_reuses_foreign_resources_from_the_same_source() {
     let mut source = open(build_n_page_pdf(2));
-    let mut resources = Dictionary::new();
-    resources.insert("Font", Object::Dictionary(Dictionary::new()));
-    source.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
+    let resources = source
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::dictionary(Vec::new()),
+        )]))
+        .unwrap();
     for page_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
-        let Object::Dictionary(mut page) = source.resolve_object(page_ref).unwrap() else {
-            panic!("source page must be a dictionary");
-        };
-        page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
-        source.set_object(page_ref, Object::Dictionary(page));
+        let page = source.get_object_handle(page_ref);
+        source.resolve(&page).unwrap();
+        page.replace_key(b"/Resources", resources.clone()).unwrap();
+        source.mark_object_handle_dirty(&page).unwrap();
     }
 
     let mut target = open(build_n_page_pdf(1));
@@ -497,15 +491,17 @@ fn add_page_reuses_foreign_resources_from_the_same_source() {
     let pages = PageDocumentHelper::new(&mut target)
         .get_all_pages()
         .unwrap();
-    let Object::Dictionary(first) = target.resolve_object(pages[1]).unwrap() else {
-        panic!("first imported page must be a dictionary");
-    };
-    let Object::Dictionary(second) = target.resolve_object(pages[2]).unwrap() else {
-        panic!("second imported page must be a dictionary");
-    };
+    let first = target.get_object_handle(pages[1]);
+    target.resolve(&first).unwrap();
+    let second = target.get_object_handle(pages[2]);
+    target.resolve(&second).unwrap();
+    let first_resources = first.get_key(b"/Resources");
+    target.resolve(&first_resources).unwrap();
+    let second_resources = second.get_key(b"/Resources");
+    target.resolve(&second_resources).unwrap();
     assert_eq!(
-        first.get_ref("Resources"),
-        second.get_ref("Resources"),
+        first_resources.object_ref(),
+        second_resources.object_ref(),
         "qpdf reuses one local resource object for repeated foreign copies"
     );
 }
@@ -513,12 +509,11 @@ fn add_page_reuses_foreign_resources_from_the_same_source() {
 #[test]
 fn add_page_does_not_copy_a_second_page_referenced_by_a_foreign_page() {
     let mut source = open(build_n_page_pdf(2));
-    let Object::Dictionary(mut source_page) = source.resolve_object(ObjectRef::new(3, 0)).unwrap()
-    else {
-        panic!("source page must be a dictionary");
-    };
-    source_page.insert("Peer", Object::Reference(ObjectRef::new(4, 0)));
-    source.set_object(ObjectRef::new(3, 0), Object::Dictionary(source_page));
+    let source_page = source.get_object_handle(ObjectRef::new(3, 0));
+    source.resolve(&source_page).unwrap();
+    let peer = source.get_object_handle(ObjectRef::new(4, 0));
+    source_page.replace_key(b"/Peer", peer).unwrap();
+    source.mark_object_handle_dirty(&source_page).unwrap();
 
     let mut target = open(build_n_page_pdf(1));
     PageDocumentHelper::new(&mut target)
@@ -528,15 +523,16 @@ fn add_page_does_not_copy_a_second_page_referenced_by_a_foreign_page() {
     let pages = PageDocumentHelper::new(&mut target)
         .get_all_pages()
         .unwrap();
-    let Object::Dictionary(copied_page) = target.resolve_object(pages[1]).unwrap() else {
-        panic!("foreign input must produce a target page dictionary");
-    };
-    let peer = copied_page
-        .get_ref("Peer")
-        .expect("qpdf reserves a target identity for the non-top-level Page");
-    assert_eq!(
-        target.resolve_object(peer).unwrap(),
-        Object::Null,
+    let copied_page = target.get_object_handle(pages[1]);
+    target.resolve(&copied_page).unwrap();
+    let peer = copied_page.get_key(b"/Peer");
+    assert!(
+        peer.object_ref().is_some(),
+        "qpdf reserves a target identity for the non-top-level Page"
+    );
+    target.resolve(&peer).unwrap();
+    assert!(
+        peer.is_null(),
         "qpdf copyForeignObject leaves the non-top-level Page reservation null"
     );
 }
