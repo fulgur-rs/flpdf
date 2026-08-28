@@ -355,6 +355,25 @@ fn pdf_with_direct_intermediate_pages_node() -> Vec<u8> {
     out
 }
 
+/// A serialized direct `/Pages` root whose `/Kids` contains a direct scalar.
+/// The parsed child keeps qpdf's warning context, so the fail-soft
+/// non-dictionary branch is exercised without constructing a contextless
+/// programmatic handle.
+fn pdf_with_direct_pages_non_dictionary_kid() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let root_offset = out.len() as u64;
+    out.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Kids [42] /Count 0 >> >>\nendobj\n",
+    );
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    out.extend_from_slice(format!("{root_offset:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 // ---------------------------------------------------------------------------
 // getAllPages() / pushInheritedAttributesToPages()
 // ---------------------------------------------------------------------------
@@ -1940,94 +1959,94 @@ fn get_all_pages_ignores_a_direct_pages_node_with_non_array_kids() {
 #[test]
 fn push_inherited_attributes_materializes_rotate_on_leaf() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    pages.insert("Rotate", Object::Integer(90));
-    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&pages).unwrap();
+    pages
+        .replace_key(b"/Rotate", ObjectHandle::integer(90))
+        .unwrap();
+    pdf.mark_object_handle_dirty(&pages).unwrap();
 
     PageDocumentHelper::new(&mut pdf)
         .push_inherited_attributes_to_pages()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-        panic!("page must be a dictionary");
-    };
-    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+    assert!(pages.get_key(b"/Rotate").is_null());
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve(&page).unwrap();
+    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
 }
 
 #[test]
 fn push_inherited_attributes_traverses_a_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    pages.insert("Rotate", Object::Integer(90));
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Dictionary(pages));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve(&pages).unwrap();
+    pages
+        .replace_key(b"/Rotate", ObjectHandle::integer(90))
+        .unwrap();
+    let direct_pages = pages.shallow_copy().unwrap();
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog.replace_key(b"/Pages", direct_pages).unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     PageDocumentHelper::new(&mut pdf)
         .push_inherited_attributes_to_pages()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-        panic!("page must be a dictionary");
-    };
-    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
-    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    assert!(matches!(catalog.get("Pages"), Some(Object::Dictionary(_))));
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve(&page).unwrap();
+    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    let pages = catalog.get_key(b"/Pages");
+    pdf.resolve(&pages).unwrap();
+    assert!(pages.get_key(b"/Rotate").is_null());
+    assert!(pages.object_ref().is_none() && pages.as_dictionary().is_some());
 }
 
 #[test]
 fn push_inherited_attributes_traverses_direct_pages_descendants() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    let mut child = Dictionary::new();
-    child.insert("Type", Object::Name(b"Pages".to_vec()));
-    child.insert(
-        "Kids",
-        Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
-    );
-    child.insert("Count", Object::Integer(1));
-    child.insert("Rotate", Object::Integer(90));
-    root.insert("Kids", Object::Array(vec![Object::Dictionary(child)]));
-    root.insert("Count", Object::Integer(1));
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Dictionary(root));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    let child = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+        (b"/Kids".to_vec(), ObjectHandle::array(vec![page])),
+        (b"/Count".to_vec(), ObjectHandle::integer(1)),
+        (b"/Rotate".to_vec(), ObjectHandle::integer(90)),
+    ]);
+    let direct_root = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+        (b"/Kids".to_vec(), ObjectHandle::array(vec![child])),
+        (b"/Count".to_vec(), ObjectHandle::integer(1)),
+    ]);
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    catalog.replace_key(b"/Pages", direct_root).unwrap();
+    pdf.mark_object_handle_dirty(&catalog).unwrap();
 
     PageDocumentHelper::new(&mut pdf)
         .push_inherited_attributes_to_pages()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-        panic!("page must be a dictionary");
-    };
-    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve(&page).unwrap();
+    assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve(&catalog).unwrap();
+    let direct_root = catalog.get_key(b"/Pages");
+    pdf.resolve(&direct_root).unwrap();
+    assert!(direct_root.object_ref().is_none());
+    let kids = direct_root.get_key(b"/Kids");
+    pdf.resolve(&kids).unwrap();
+    let direct_child = kids.as_array().unwrap().into_iter().next().unwrap();
+    assert!(direct_child.object_ref().is_none() && direct_child.as_dictionary().is_some());
+    assert!(direct_child.get_key(b"/Rotate").is_null());
 }
 
 #[test]
 fn push_inherited_attributes_ignores_non_dictionary_direct_kids() {
-    let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
-        panic!("pages root must be a dictionary");
-    };
-    root.insert("Kids", Object::Array(vec![Object::Integer(42)]));
-    root.insert("Count", Object::Integer(0));
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-        panic!("catalog must be a dictionary");
-    };
-    catalog.insert("Pages", Object::Dictionary(root));
-    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let mut pdf = open(pdf_with_direct_pages_non_dictionary_kid());
 
     PageDocumentHelper::new(&mut pdf)
         .push_inherited_attributes_to_pages()
