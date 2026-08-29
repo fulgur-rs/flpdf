@@ -217,9 +217,9 @@ pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::PdfOpenOptions;
 pub use signatures::{
-    acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
-    signatures, signatures_with_max_depth, strip_signature_values, SignatureInfo,
-    DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
+    acroform_sig_flags, clear_sig_flags, signatures, signatures_with_max_depth,
+    strip_signature_values, SignatureInfo, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+    SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 pub use struct_tree_pg::{
     drop_struct_elem_dangling_pg, drop_struct_elem_dangling_pg_with_max_depth,

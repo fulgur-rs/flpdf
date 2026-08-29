@@ -3,7 +3,6 @@
 mod arg_parser;
 
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
-use flpdf::disable_digital_signatures;
 use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, flatten_rotation_on_pages, remap_outline_and_dests,
@@ -3537,7 +3536,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // plan is computed: removing signature objects changes the reachable
         // first-page graph. qpdf applies this transformation before planning.
         let had_signatures = if remove_restrictions {
-            disable_digital_signatures(&mut pdf)?
+            AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?
         } else {
             false
         };
@@ -3582,7 +3581,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // dropped by the canonical rewrite GC). The returned flag reports
         // whether anything changed, driving the warning.
         let had_signatures = if remove_restrictions {
-            disable_digital_signatures(&mut pdf)?
+            AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?
         } else {
             false
         };

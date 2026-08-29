@@ -611,7 +611,8 @@ reader.rs に残ったまま）。
    ） + `reader/resolver.rs`(...) + `reader/file_object.rs`
    (1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) +
    `cache.rs`(112) + `writer/object_streams.rs`(207-237) +
-   `signatures.rs`(245-: `removeSecurityRestrictions`) +
+   `reader.rs`(`Pdf::remove_security_restrictions`) +
+   `acroform_document_helper.rs`(`AcroFormDocumentHelper::disable_digital_signatures`) +
    `page_closure.rs`(441) + `ref_chain.rs`(159)）を更新する際は、
    **`reader/resolver.rs` は本設計の4ファイルへ差し替えるが、
    `reader.rs` は残す（削除しない）**。`reader/resolver.rs` を差し替える

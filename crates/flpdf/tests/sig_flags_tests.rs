@@ -4,9 +4,9 @@ mod common;
 use common::PdfCanonicalTestExt;
 
 use flpdf::{
-    acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
-    strip_signature_values, Object, ObjectRef, Pdf, PdfWriter, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
-    SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
+    acroform_sig_flags, clear_sig_flags, strip_signature_values, AcroFormDocumentHelper, Error,
+    Object, ObjectRef, Pdf, PdfWriter, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY,
+    SIG_FLAGS_SIGNATURES_EXIST,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -59,6 +59,20 @@ fn build_signed_acroform_pdf() -> Vec<u8> {
         ),
     ];
     build_pdf(&objects)
+}
+
+/// The trailer points directly at an inline Catalog, which qpdf's `getRoot`
+/// accepts even though the ordinary fixtures use an indirect root.
+fn build_direct_root_acroform_pdf() -> Vec<u8> {
+    let mut bytes = build_signed_acroform_pdf();
+    let marker = b"/Root 1 0 R";
+    let start = bytes
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("fixture trailer has an indirect root marker");
+    let replacement = b"/Root << /Type /Catalog /AcroForm << /SigFlags 3 >> >>";
+    bytes.splice(start..start + marker.len(), replacement.iter().copied());
+    bytes
 }
 
 /// Catalog with an *inline* `/AcroForm << ... /SigFlags 3 >>` dictionary
@@ -290,7 +304,7 @@ fn build_nondict_root_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
-/// Trailer without a `/Root`, so `root_ref()` is `None` and removal is a no-op.
+/// Trailer without a `/Root`, so qpdf's `getRoot()` rejects the document.
 fn build_no_root_pdf() -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let off1 = out.len() as u64;
@@ -307,6 +321,32 @@ fn build_no_root_pdf() -> Vec<u8> {
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
+}
+
+#[test]
+fn signature_mutations_are_exposed_by_their_qpdf_owner_boundaries() {
+    let mut pdf = open(build_signed_acroform_pdf());
+    assert!(pdf
+        .remove_security_restrictions()
+        .expect("document mutation should succeed"));
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+
+    let mut pdf = open(build_signed_acroform_pdf());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .expect("AcroForm helper should initialize")
+        .disable_digital_signatures()
+        .expect("AcroForm mutation should succeed"));
+    assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
+fn remove_security_restrictions_accepts_a_direct_catalog_root() {
+    let mut pdf = open(build_direct_root_acroform_pdf());
+
+    assert!(pdf.remove_security_restrictions().unwrap());
+    let root = pdf.root_handle().unwrap();
+    let acroform = root.get_key(b"/AcroForm");
+    assert_eq!(acroform.get_key(b"/SigFlags").as_integer(), Some(0));
 }
 
 /// Read the top-level `/AcroForm /Fields` array via public API.
@@ -636,7 +676,7 @@ fn clear_sig_flags_clears_inline_acroform_without_clobbering_catalog() {
 #[test]
 fn remove_security_restrictions_drops_perms_and_zeros_sigflags() {
     let mut pdf = open(build_perms_and_acroform_pdf());
-    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    assert!(pdf.remove_security_restrictions().unwrap());
     let root_ref = pdf.root_ref().unwrap();
     let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!("catalog")
@@ -648,7 +688,7 @@ fn remove_security_restrictions_drops_perms_and_zeros_sigflags() {
 #[test]
 fn remove_security_restrictions_removes_perms_when_acroform_absent() {
     let mut pdf = open(build_perms_docmdp_only_pdf());
-    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    assert!(pdf.remove_security_restrictions().unwrap());
     let root_ref = pdf.root_ref().unwrap();
     let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!("catalog")
@@ -659,7 +699,7 @@ fn remove_security_restrictions_removes_perms_when_acroform_absent() {
 #[test]
 fn remove_security_restrictions_is_noop_without_perms_or_sigflags() {
     let mut pdf = open(build_unsigned_pdf());
-    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+    assert!(!pdf.remove_security_restrictions().unwrap());
 }
 
 #[test]
@@ -669,7 +709,7 @@ fn remove_security_restrictions_reports_no_change_when_sigflags_already_zero() {
     // function returns void) and must not report a change when nothing
     // observable differs.
     let mut pdf = open(build_acroform_sig_flags_already_zero_pdf());
-    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+    assert!(!pdf.remove_security_restrictions().unwrap());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
 }
 
@@ -679,7 +719,7 @@ fn remove_security_restrictions_reports_a_change_for_an_indirect_zero_sigflags()
     // direct integer 0 is an observable structural change, unlike an
     // already-direct zero.
     let mut pdf = open(build_acroform_sig_flags_indirect_zero_pdf());
-    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    assert!(pdf.remove_security_restrictions().unwrap());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
 }
 
@@ -687,26 +727,35 @@ fn remove_security_restrictions_reports_a_change_for_an_indirect_zero_sigflags()
 fn remove_security_restrictions_zeros_sigflags_without_perms() {
     // AcroForm /SigFlags present but no catalog /Perms -> changed via SigFlags only.
     let mut pdf = open(build_signed_acroform_pdf());
-    assert!(remove_security_restrictions(&mut pdf).unwrap());
+    assert!(pdf.remove_security_restrictions().unwrap());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
 }
 
 #[test]
-fn remove_security_restrictions_is_noop_when_root_missing() {
+fn remove_security_restrictions_errors_when_root_missing() {
     let mut pdf = open(build_no_root_pdf());
-    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+    assert!(matches!(
+        pdf.remove_security_restrictions(),
+        Err(Error::System(message)) if message == "unable to find /Root dictionary"
+    ));
 }
 
 #[test]
-fn remove_security_restrictions_is_noop_when_root_not_dictionary() {
+fn remove_security_restrictions_errors_when_root_not_dictionary() {
     let mut pdf = open(build_nondict_root_pdf());
-    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+    assert!(matches!(
+        pdf.remove_security_restrictions(),
+        Err(Error::System(message)) if message == "unable to find /Root dictionary"
+    ));
 }
 
 #[test]
 fn disable_digital_signatures_strips_sig_field_keys_and_erases_from_fields() {
     let mut pdf = open(build_disable_sig_field_only_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     // field 5: /FT /V removed, /T kept
     let f5 = ObjectRef::new(5, 0);
     assert!(!has_entry(&mut pdf, f5, "FT"));
@@ -740,7 +789,10 @@ fn disable_digital_signatures_removes_null_valued_sig_field_keys() {
     // qpdf's removeKey erases /V, /SV, /Lock even when their stored value is
     // null; a hasKey-style null-collapsing check must not leave them behind.
     let mut pdf = open(build_disable_sig_field_null_valued_keys_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     let f5 = ObjectRef::new(5, 0);
     assert!(!has_entry(&mut pdf, f5, "FT"));
     assert!(!has_entry(&mut pdf, f5, "V"));
@@ -755,7 +807,10 @@ fn disable_digital_signatures_removes_null_valued_sig_field_keys() {
 #[test]
 fn disable_digital_signatures_keeps_widget_but_strips_sig_keys() {
     let mut pdf = open(build_disable_sig_widget_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     let f5 = ObjectRef::new(5, 0);
     assert!(
         has_entry(&mut pdf, f5, "Subtype"),
@@ -771,7 +826,10 @@ fn disable_digital_signatures_keeps_widget_but_strips_sig_keys() {
 #[test]
 fn disable_digital_signatures_docmdp_only_removes_perms() {
     let mut pdf = open(build_perms_docmdp_only_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     let root_ref = pdf.root_ref().unwrap();
     let Object::Dictionary(cat) = pdf.resolve_canonical_object(root_ref).unwrap() else {
         panic!()
@@ -782,7 +840,10 @@ fn disable_digital_signatures_docmdp_only_removes_perms() {
 #[test]
 fn disable_digital_signatures_is_noop_on_unsigned() {
     let mut pdf = open(build_unsigned_pdf());
-    assert!(!disable_digital_signatures(&mut pdf).unwrap());
+    assert!(!AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
 }
 
 #[test]
@@ -791,7 +852,10 @@ fn disable_digital_signatures_zeros_sigflags_when_fields_absent() {
     // zeros /SigFlags (changed = true) and the /Fields early-return leaves the
     // form otherwise untouched.
     let mut pdf = open(build_acroform_without_fields_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
 }
 
@@ -800,7 +864,10 @@ fn disable_digital_signatures_is_noop_when_fields_have_no_signatures() {
     // /AcroForm with an empty /Fields, no /SigFlags, no /Perms: nothing to
     // strip, so `to_remove` stays empty and the function reports no change.
     let mut pdf = open(build_acroform_without_sig_flags_pdf());
-    assert!(!disable_digital_signatures(&mut pdf).unwrap());
+    assert!(!AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     assert!(acroform_fields(&mut pdf).is_empty());
 }
 
@@ -813,7 +880,10 @@ fn disable_digital_signatures_keeps_nonterminal_sig_parent_signature() {
     // zeroed by removeSecurityRestrictions.
     let mut pdf = open(build_nested_signature_fields_pdf());
     assert!(
-        disable_digital_signatures(&mut pdf).unwrap(),
+        AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
+            .disable_digital_signatures()
+            .unwrap(),
         "returns true because /SigFlags changed"
     );
 
@@ -853,7 +923,10 @@ fn disable_digital_signatures_ignores_non_sig_form_field() {
     // /Sig, so it is skipped: /FT and /V survive and /Fields is untouched. Only
     // /SigFlags is zeroed by removeSecurityRestrictions.
     let mut pdf = open(build_non_sig_widget_field_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     let f5 = ObjectRef::new(5, 0);
     assert!(has_entry(&mut pdf, f5, "FT"), "/Tx field type is preserved");
     assert!(has_entry(&mut pdf, f5, "V"), "/Tx field value is preserved");
@@ -869,7 +942,10 @@ fn disable_digital_signatures_follows_a_long_parent_chain_to_sig_field_type() {
     // key remains on its ancestor because disableDigitalSignatures strips keys
     // only from the form-field object itself.
     let mut pdf = open(build_deep_parent_chain_widget_field_pdf());
-    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap());
     assert!(acroform_fields(&mut pdf).is_empty());
 
     let tail = ObjectRef::new(6 + DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30, 0);
