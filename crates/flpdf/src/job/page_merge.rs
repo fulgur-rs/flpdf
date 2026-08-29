@@ -51,6 +51,13 @@ use std::io::{Cursor, Read, Seek};
 /// take from it (arbitrary order, duplicates allowed).
 pub struct MergeInput<'a, R: Read + Seek + 'static> {
     /// The opened source document.
+    ///
+    /// The borrow lasts only for the merge call, but a provider-backed stream
+    /// copied from this source remains lazy in the returned document. Keep the
+    /// source [`Pdf`] alive until the returned document has been written, or
+    /// call [`Pdf::set_immediate_copy_from`] on the source before merging when
+    /// it must be released earlier. Parsed file-backed streams capture their
+    /// input source separately and do not require this `Pdf` to remain alive.
     pub source: &'a mut Pdf<R>,
     /// 0-based page indices to copy, in output order.
     pub pages: Vec<usize>,
@@ -647,6 +654,15 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// persistent [`Pdf::copy_foreign_object`] route; the result mirrors
 /// [`extract_pages`](crate::extract_pages) for a single input. Write the result
 /// with [`crate::PdfWriter`] to produce one fresh qpdf-style output.
+///
+/// Provider-backed streams reachable from selected pages or from the primary
+/// Catalog/trailer metadata remain lazy until that write. As with qpdf's
+/// `QPDF::copyForeignObject`, keep the corresponding source [`Pdf`] alive
+/// through the write, or call [`Pdf::set_immediate_copy_from`] on that source
+/// before this function when early release is required. This rule applies to
+/// provider-backed streams only; parsed file-backed streams retain a separate
+/// captured input source and can be written after their source `Pdf` is
+/// dropped.
 ///
 /// An input may select **no pages** (`pages: vec![]`): it contributes nothing
 /// and is not an error. A blank document passed as `inputs[0]` with an empty

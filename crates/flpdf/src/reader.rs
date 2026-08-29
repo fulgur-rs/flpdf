@@ -1517,9 +1517,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// `Pdf` must remain alive until every copied stream has been written**
     /// (or otherwise read) from this document; dropping it first produces an
     /// [`Error::Internal`] when the writer tries to read the now-gone
-    /// source. qpdf's escape hatch, `setImmediateCopyFrom` (materializing
-    /// provider-backed stream data into memory at copy time so the source
-    /// need not survive), has no flpdf counterpart yet.
+    /// source. qpdf's escape hatch, `setImmediateCopyFrom`, is exposed as
+    /// [`crate::Pdf::set_immediate_copy_from`]. Call it on the source before
+    /// copying when provider-backed stream data must be materialized at copy
+    /// time so the source need not survive until the destination is written.
     ///
     /// # Errors
     ///

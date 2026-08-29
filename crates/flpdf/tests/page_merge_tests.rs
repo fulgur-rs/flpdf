@@ -1,7 +1,9 @@
 //! Integration tests for [`flpdf::merge_documents`].
 
-use flpdf::{merge_documents, pages, Error, MergeInput, Object, ObjectRef, Pdf};
+use flpdf::{merge_documents, pages, Error, MergeInput, Object, ObjectRef, Pdf, PdfWriter};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
 /// `body` is the literal text between `N 0 obj` and `endobj`.
@@ -425,6 +427,133 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
                 0xee, 0xff,
             ]),
         ])
+    );
+}
+
+/// Attach a provider-backed Catalog stream through public handles. The stream
+/// is deliberately indirect so `merge_documents` must carry it through the
+/// canonical foreign copier rather than snapshotting a direct value.
+fn primary_with_provider_catalog_stream(
+    calls: &Rc<RefCell<usize>>,
+) -> Pdf<std::io::Cursor<Vec<u8>>> {
+    let mut primary = Pdf::open_mem_owned(build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    ))
+    .expect("open provider source");
+    let stream = primary.new_stream().expect("allocate metadata stream");
+    let calls_for_provider = Rc::clone(calls);
+    stream
+        .replace_stream_data_with_callback(
+            move |pipeline| {
+                *calls_for_provider.borrow_mut() += 1;
+                pipeline.write(b"<xmpmeta>merge lifetime</xmpmeta>")?;
+                pipeline.finish()?;
+                Ok(())
+            },
+            None,
+            None,
+        )
+        .expect("install provider");
+    let root = primary.root_handle().expect("resolve Catalog");
+    root.replace_key(b"/Metadata", stream)
+        .expect("attach Catalog metadata");
+    primary
+        .mark_object_handle_dirty(&root)
+        .expect("mark Catalog dirty");
+    primary
+}
+
+#[test]
+fn merge_does_not_read_provider_backed_primary_catalog_stream_during_cleanup() {
+    let calls = Rc::new(RefCell::new(0));
+    let mut primary = primary_with_provider_catalog_stream(&calls);
+    let mut inputs = [MergeInput {
+        source: &mut primary,
+        pages: vec![0],
+    }];
+
+    let _merged = merge_documents(&mut inputs).expect("merge provider source");
+
+    assert_eq!(
+        *calls.borrow(),
+        0,
+        "merge cleanup must not materialize provider-backed stream data"
+    );
+}
+
+fn write_merged_memory(merged: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Result<Vec<u8>, Error> {
+    let mut writer = PdfWriter::new(merged);
+    writer.set_compress_streams(false);
+    writer.set_output_memory()?;
+    writer.write()?;
+    writer.get_buffer()
+}
+
+#[test]
+fn merge_provider_stream_writes_while_source_stays_alive() {
+    let calls = Rc::new(RefCell::new(0));
+    let mut primary = primary_with_provider_catalog_stream(&calls);
+    let mut inputs = [MergeInput {
+        source: &mut primary,
+        pages: vec![0],
+    }];
+    let mut merged = merge_documents(&mut inputs).expect("merge provider source");
+
+    assert_eq!(*calls.borrow(), 0, "provider remains lazy through merge");
+    let output = write_merged_memory(&mut merged).expect("write with source alive");
+
+    assert!(output
+        .windows(b"<xmpmeta>merge lifetime</xmpmeta>".len())
+        .any(|window| window == b"<xmpmeta>merge lifetime</xmpmeta>"));
+    assert_eq!(*calls.borrow(), 1, "writer reads the provider once");
+}
+
+#[test]
+fn merge_provider_stream_reports_the_existing_error_after_source_drop() {
+    let calls = Rc::new(RefCell::new(0));
+    let mut merged = {
+        let mut primary = primary_with_provider_catalog_stream(&calls);
+        let mut inputs = [MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        }];
+        merge_documents(&mut inputs).expect("merge provider source")
+    };
+
+    let error = write_merged_memory(&mut merged).expect_err("dropped source must be observable");
+    assert!(matches!(
+        error,
+        Error::Internal(message) if message == "pipeStreamData called for non-stream"
+    ));
+}
+
+#[test]
+fn merge_provider_stream_supports_source_drop_after_immediate_copy() {
+    let calls = Rc::new(RefCell::new(0));
+    let mut merged = {
+        let mut primary = primary_with_provider_catalog_stream(&calls);
+        primary.set_immediate_copy_from(true);
+        let mut inputs = [MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        }];
+        merge_documents(&mut inputs).expect("merge immediate-copy source")
+    };
+
+    let output = write_merged_memory(&mut merged).expect("write after source drop");
+
+    assert!(output
+        .windows(b"<xmpmeta>merge lifetime</xmpmeta>".len())
+        .any(|window| window == b"<xmpmeta>merge lifetime</xmpmeta>"));
+    assert_eq!(
+        *calls.borrow(),
+        1,
+        "immediate copy materializes the provider during merge"
     );
 }
 
