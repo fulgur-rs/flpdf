@@ -1537,31 +1537,23 @@ impl<R: Read + Seek> Pdf<R> {
         crate::object_copy::copy_foreign_value(self, source_id, foreign)
     }
 
-    /// Replace an indirect object's canonical value from an [`ObjectHandle`].
-    ///
-    /// This is the handle-shaped counterpart of [`Self::set_object`]. qpdf's
-    /// `QPDF::replaceObject` accepts a direct, initialized handle and routes it
-    /// through `updateCache`, whose existing cache slot adopts the replacement
-    /// `QPDFValue` (`libqpdf/QPDF.cc:1986-1993,1843-1857`;
-    /// `libqpdf/qpdf/QPDFObject_private.hh:117-120`). The canonical
-    /// [`Self::replace_object`] primitive performs that same slot
-    /// replacement while retaining the target handle identity.
-    ///
-    /// qpdf records the shared value transition itself rather than exposing a
-    /// separate dirty bit. flpdf's writer still tracks dirty object references,
-    /// so this setter deliberately delegates to the primitive that records
-    /// the target as mutated after a successful replacement. As
-    /// with [`Self::set_object`], every successful write-back marks the target
-    /// dirty; callers that temporarily restore a previously clean value must
-    /// explicitly clear the target's dirty state after the restore.
-    ///
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
     /// raw [`Object`] materialization and writer traversal remain outside this
     /// layer.
     ///
     /// This is qpdf's public `QPDF::replaceObject` surface
-    /// (`include/qpdf/QPDF.hh:380-388`; `libqpdf/QPDF.cc:1980-1993`).
+    /// (`include/qpdf/QPDF.hh:380-388`). qpdf accepts a direct, initialized
+    /// handle and routes it through `updateCache`, whose existing cache slot
+    /// adopts the replacement `QPDFValue` (`libqpdf/QPDF.cc:1980-1993`;
+    /// `libqpdf/qpdf/QPDFObject_private.hh:117-120`), so outstanding handles
+    /// observe the replacement.
+    ///
+    /// qpdf records the shared value transition itself rather than exposing a
+    /// separate dirty bit. flpdf's writer still tracks dirty object
+    /// references, so every successful replacement marks the target
+    /// mutated; callers that temporarily restore a previously clean value
+    /// must explicitly clear the target's dirty state after the restore.
     pub fn replace_object(
         &mut self,
         object_ref: ObjectRef,
