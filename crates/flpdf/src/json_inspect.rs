@@ -3316,7 +3316,7 @@ mod tests {
     fn object_handle_write_json_keeps_indirect_reference_before_value_dispatch() {
         let mut pdf = empty_pdf();
         let object_ref = ObjectRef::new(2, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             object_ref,
             ObjectHandle::array(vec![ObjectHandle::integer(1)]),
         )
@@ -3883,7 +3883,7 @@ mod tests {
         use crate::ObjectRef;
         let mut pdf = empty_pdf();
         let child_ref = ObjectRef::new(2, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             child_ref,
             ObjectHandle::array(vec![ObjectHandle::integer(1)]),
         )
@@ -3934,7 +3934,7 @@ mod tests {
         let mut pdf = empty_pdf();
         let dest_ref = ObjectRef::new(9, 0);
         let page_handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.set_object_handle(
+        pdf.replace_object(
             dest_ref,
             ObjectHandle::array(vec![page_handle, ObjectHandle::name(b"Fit".to_vec())]),
         )
@@ -4551,7 +4551,7 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let image_ref = ObjectRef::new(99, 0);
 
-        pdf.set_object_handle(
+        pdf.replace_object(
             image_ref,
             ObjectHandle::stream(
                 handle_dictionary(vec![(b"Subtype", ObjectHandle::name(b"Image".to_vec()))]),
@@ -4561,14 +4561,14 @@ mod tests {
         .unwrap();
         let image_handle: ObjectHandle = pdf.get_object_handle(image_ref);
         let no_subtype_ref = ObjectRef::new(100, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             no_subtype_ref,
             ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
         )
         .unwrap();
         let no_subtype_handle: ObjectHandle = pdf.get_object_handle(no_subtype_ref);
         let form_ref = ObjectRef::new(101, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             form_ref,
             ObjectHandle::stream(
                 handle_dictionary(vec![(b"Subtype", ObjectHandle::name(b"Form".to_vec()))]),
@@ -4623,7 +4623,7 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
         let non_stream_ref = ObjectRef::new(99, 0);
-        pdf.set_object_handle(non_stream_ref, ObjectHandle::integer(1))
+        pdf.replace_object(non_stream_ref, ObjectHandle::integer(1))
             .unwrap();
         let non_stream_handle: ObjectHandle = pdf.get_object_handle(non_stream_ref);
         let xobjects = handle_dictionary(vec![(b"Im", non_stream_handle)]);
@@ -5079,7 +5079,7 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let label_ref = crate::ObjectRef::new(900, 0);
         let label = handle_dictionary(vec![(b"S", ObjectHandle::name(b"D".to_vec()))]);
-        pdf.set_object_handle(label_ref, label).unwrap();
+        pdf.replace_object(label_ref, label).unwrap();
         let label_handle: ObjectHandle = pdf.get_object_handle(label_ref);
         let pagelabels = handle_dictionary(vec![(
             b"Nums",
@@ -5164,7 +5164,7 @@ mod tests {
             handle_array(vec![ObjectHandle::integer(0), label]),
         )]);
         let subtree_ref = crate::ObjectRef::new(99, 0);
-        pdf.set_object_handle(subtree_ref, subtree).unwrap();
+        pdf.replace_object(subtree_ref, subtree).unwrap();
         let subtree_handle: ObjectHandle = pdf.get_object_handle(subtree_ref);
         let pagelabels = handle_dictionary(vec![(b"Kids", handle_array(vec![subtree_handle]))]);
         patch_pagelabels(&mut pdf, pagelabels);
@@ -6811,7 +6811,7 @@ mod tests {
         let outline_root = pdf
             .lift_object_to_handle(&Object::Dictionary(outline_root))
             .expect("lift outline root to a canonical handle");
-        pdf.set_object_handle(outline_root_ref, outline_root)
+        pdf.replace_object(outline_root_ref, outline_root)
             .expect("install outline root");
 
         // Wire catalog → outline root.
@@ -7434,7 +7434,7 @@ mod tests {
         let filespec = pdf
             .lift_object_to_handle(&Object::Dictionary(filespec))
             .expect("lift filespec to a canonical handle");
-        pdf.set_object_handle(filespec_ref, filespec)
+        pdf.replace_object(filespec_ref, filespec)
             .expect("install filespec");
         let filespec_handle: ObjectHandle = pdf.get_object_handle(filespec_ref);
 
@@ -7443,13 +7443,13 @@ mod tests {
             b"Names",
             handle_array(vec![ObjectHandle::string(name.to_vec()), filespec_handle]),
         )]);
-        pdf.set_object_handle(ef_root_ref, ef_root)
+        pdf.replace_object(ef_root_ref, ef_root)
             .expect("install embedded-files name tree");
         let ef_root_handle: ObjectHandle = pdf.get_object_handle(ef_root_ref);
 
         // Build the /Names dict with /EmbeddedFiles.
         let names_dict = handle_dictionary(vec![(b"EmbeddedFiles", ef_root_handle)]);
-        pdf.set_object_handle(names_ref, names_dict)
+        pdf.replace_object(names_ref, names_dict)
             .expect("install /Names dictionary");
         let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
 
@@ -8261,10 +8261,10 @@ mod tests {
             b"Names",
             handle_array(vec![ObjectHandle::string(b"inline.txt".to_vec()), filespec]),
         )]);
-        pdf.set_object_handle(ef_root_ref, ef_root).unwrap();
+        pdf.replace_object(ef_root_ref, ef_root).unwrap();
         let ef_root_handle: ObjectHandle = pdf.get_object_handle(ef_root_ref);
         let names_dict = handle_dictionary(vec![(b"EmbeddedFiles", ef_root_handle)]);
-        pdf.set_object_handle(names_ref, names_dict).unwrap();
+        pdf.replace_object(names_ref, names_dict).unwrap();
         let names_handle: ObjectHandle = pdf.get_object_handle(names_ref);
 
         let catalog_ref = pdf.root_ref().unwrap();

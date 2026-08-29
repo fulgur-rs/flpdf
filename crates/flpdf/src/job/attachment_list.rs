@@ -535,7 +535,7 @@ mod tests {
         if let Some(params) = params {
             dict.insert("Params", params.into_handle());
         }
-        pdf.set_object_handle(
+        pdf.replace_object(
             stream_ref,
             ObjectHandle::stream(dict.into_handle(), Rc::new(b"data".to_vec())),
         )
@@ -546,7 +546,7 @@ mod tests {
     /// Store `filespec` and register it in the EmbeddedFiles name tree.
     fn attach(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], filespec: HandleDict) -> ObjectRef {
         let filespec_ref = next_ref(pdf);
-        pdf.set_object_handle(filespec_ref, filespec.into_handle())
+        pdf.replace_object(filespec_ref, filespec.into_handle())
             .expect("install Filespec fixture");
         insert_embedded_file(pdf, key, filespec_ref).expect("insert");
         filespec_ref
@@ -829,7 +829,7 @@ mod tests {
         let dict_ref = next_ref(&mut pdf);
         let not_a_stream = HandleDict::new();
         not_a_stream.insert("Type", ObjectHandle::name(b"EmbeddedFile".to_vec()));
-        pdf.set_object_handle(dict_ref, HandleDict::into_handle(not_a_stream))
+        pdf.replace_object(dict_ref, HandleDict::into_handle(not_a_stream))
             .expect("install non-stream fixture");
         let ef = HandleDict::new();
         ef.insert("F", object_ref(&mut pdf, dict_ref));

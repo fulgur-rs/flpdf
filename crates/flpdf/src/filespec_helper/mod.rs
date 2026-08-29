@@ -197,7 +197,7 @@ mod tests {
             ObjectHandle::string(b"direct.txt".to_vec()),
         )]);
         let owner = ObjectHandle::dictionary(vec![(b"/FS".to_vec(), filespec)]);
-        pdf.set_object_handle(owner_ref, owner).unwrap();
+        pdf.replace_object(owner_ref, owner).unwrap();
         let owner = pdf.get_object_handle(owner_ref);
         pdf.resolve(&owner).unwrap();
         let direct_filespec = owner.get_key(b"/FS");
@@ -230,7 +230,7 @@ mod tests {
             ObjectHandle::string(b"foreign.txt".to_vec()),
         )]);
         let owner_dict = ObjectHandle::dictionary(vec![(b"/FS".to_vec(), filespec)]);
-        source.set_object_handle(owner_ref, owner_dict).unwrap();
+        source.replace_object(owner_ref, owner_dict).unwrap();
         let owner = source.get_object_handle(owner_ref);
         source.resolve(&owner).unwrap();
         let foreign_direct_filespec = owner.get_key(b"/FS");

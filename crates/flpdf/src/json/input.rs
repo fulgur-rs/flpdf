@@ -687,7 +687,7 @@ where
             self.fatal("current object has no indirect identity in st_object_top"); // cov:ignore: object-top handles come from an obj:N G R key
             return; // cov:ignore: object-top handles come from an obj:N G R key
         };
-        match self.pdf.replace_object_handle(object_ref, replacement) {
+        match self.pdf.replace_object(object_ref, replacement) {
             Ok(target) => {
                 self.next_obj = Some(target.clone());
                 self.set_object_description(&target, value);
@@ -707,10 +707,7 @@ where
             .filter(|object_ref| !self.reserved.contains(object_ref))
             .collect();
         for object_ref in dangling {
-            if let Err(error) = self
-                .pdf
-                .replace_object_handle(object_ref, ObjectHandle::null())
-            {
+            if let Err(error) = self.pdf.replace_object(object_ref, ObjectHandle::null()) {
                 self.fatal(error.to_string()); // cov:ignore: reserved handles and the null replacement share this resolver
                 return; // cov:ignore: reserved handles and the null replacement share this resolver
             }
@@ -920,7 +917,7 @@ where
                                 self.fatal("current object has no indirect identity in stream"); // cov:ignore: stream objects originate from an indirect obj:N G R key
                                 return; // cov:ignore: stream objects originate from an indirect obj:N G R key
                             };
-                            match self.pdf.replace_object_handle(object_ref, replacement) {
+                            match self.pdf.replace_object(object_ref, replacement) {
                                 Ok(target) => {
                                     self.set_object_description(&target, value);
                                     self.next_obj = Some(target);

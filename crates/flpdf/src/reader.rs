@@ -1482,8 +1482,7 @@ impl<R: Read + Seek> Pdf<R> {
             ));
         }
         let object_ref = reserved.object_ref().unwrap_or(ObjectRef::new(0, 0));
-        self.replace_object_handle(object_ref, replacement)
-            .map(|_| ())
+        self.replace_object(object_ref, replacement).map(|_| ())
     }
 
     /// Create an owned stream and replace its data with the supplied buffer.
@@ -1545,7 +1544,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// through `updateCache`, whose existing cache slot adopts the replacement
     /// `QPDFValue` (`libqpdf/QPDF.cc:1986-1993,1843-1857`;
     /// `libqpdf/qpdf/QPDFObject_private.hh:117-120`). The canonical
-    /// [`Self::replace_object_handle`] primitive performs that same slot
+    /// [`Self::replace_object`] primitive performs that same slot
     /// replacement while retaining the target handle identity.
     ///
     /// qpdf records the shared value transition itself rather than exposing a
@@ -1556,24 +1555,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// dirty; callers that temporarily restore a previously clean value must
     /// explicitly call [`Self::clear_dirty`] after the restore.
     ///
-    /// The legacy [`Self::set_object`] API remains unchanged for consumers that
-    /// still provide a materialized [`Object`].
-    #[allow(dead_code)] // writer consumer cutover is flpdf-egzr.3.2.5
-    pub(crate) fn set_object_handle(
-        &mut self,
-        object_ref: ObjectRef,
-        replacement: ObjectHandle,
-    ) -> Result<()> {
-        self.replace_object_handle(object_ref, replacement)
-            .map(|_| ())
-    }
-
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
     /// raw [`Object`] materialization and writer traversal remain outside this
     /// layer.
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
-    pub(crate) fn replace_object_handle(
+    ///
+    /// This is qpdf's public `QPDF::replaceObject` surface
+    /// (`include/qpdf/QPDF.hh:380-388`; `libqpdf/QPDF.cc:1980-1993`).
+    pub fn replace_object(
         &mut self,
         object_ref: ObjectRef,
         replacement: ObjectHandle,
@@ -1613,7 +1602,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         // Refresh the legacy cache before removing the canonical value, or an
         // old object-stream entry can incorrectly retain provenance (mirrors
-        // `replace_object_handle`'s identical precondition above).
+        // `replace_object`'s identical precondition above).
         self.synchronize_cache_with_resolver_xref();
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
@@ -3421,7 +3410,7 @@ mod tests {
         let replacement =
             ObjectHandle::dictionary(vec![(b"Marker".to_vec(), ObjectHandle::integer(779))]);
         let page_ref = ObjectRef::new(3, 0);
-        pdf.replace_object_handle(page_ref, replacement)
+        pdf.replace_object(page_ref, replacement)
             .expect("replace page object canonically");
 
         let (emitted_ref, out) = {
@@ -5955,7 +5944,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_preserves_target_identity_and_shares_payload() {
+    fn replace_object_preserves_target_identity_and_shares_payload() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
         let target = pdf.get_object_handle(object_ref);
@@ -5967,7 +5956,7 @@ mod tests {
         let replacement_alias = replacement.clone();
 
         let returned = pdf
-            .replace_object_handle(object_ref, replacement)
+            .replace_object(object_ref, replacement)
             .expect("replace canonical object");
 
         assert!(returned.is_same_object_as(&target));
@@ -5994,7 +5983,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
         let replacement_alias = replacement.clone();
 
-        pdf.replace_object_handle(object_ref, replacement)
+        pdf.replace_object(object_ref, replacement)
             .expect("replace canonical object");
         pdf.delete_object(object_ref);
 
@@ -6003,7 +5992,7 @@ mod tests {
     }
 
     #[test]
-    fn set_object_handle_is_the_dirty_marking_handle_form_of_set_object() {
+    fn replace_object_is_the_dirty_marking_handle_form_of_set_object() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
         let target = pdf.get_object_handle(object_ref);
@@ -6014,7 +6003,7 @@ mod tests {
         )]);
         let replacement_alias = replacement.clone();
 
-        pdf.set_object_handle(object_ref, replacement)
+        pdf.replace_object(object_ref, replacement)
             .expect("replace canonical object through setter");
 
         let current = pdf.get_object_handle(object_ref);
@@ -6030,7 +6019,7 @@ mod tests {
     }
 
     #[test]
-    fn set_object_handle_preserves_clean_and_dirty_restore_writer_snapshots() {
+    fn replace_object_preserves_clean_and_dirty_restore_writer_snapshots() {
         let source = String::from_utf8(minimal_pdf_bytes())
             .expect("minimal fixture is UTF-8")
             .replace(
@@ -6093,7 +6082,7 @@ mod tests {
 
             legacy.set_object(object_ref, legacy_modified);
             canonical
-                .set_object_handle(object_ref, handle_modified)
+                .replace_object(object_ref, handle_modified)
                 .expect("replace canonical catalog");
             assert!(legacy.is_dirty(object_ref));
             assert!(canonical.is_dirty(object_ref));
@@ -6115,7 +6104,7 @@ mod tests {
 
             legacy.set_object(object_ref, original_object);
             canonical
-                .set_object_handle(
+                .replace_object(
                     object_ref,
                     original_handle_value
                         .shallow_copy()
@@ -6153,13 +6142,13 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_clears_source_derived_side_tables() {
+    fn replace_object_clears_source_derived_side_tables() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
         pdf.qpdf_parsed_xref_stream_refs.insert(object_ref);
         pdf.qpdf_dangling_refs.insert(object_ref);
 
-        pdf.replace_object_handle(object_ref, ObjectHandle::integer(7))
+        pdf.replace_object(object_ref, ObjectHandle::integer(7))
             .expect("replace canonical object");
 
         assert!(!pdf.qpdf_parsed_xref_stream_refs.contains(&object_ref));
@@ -6167,7 +6156,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_rejects_indirect_replacement_without_mutation() {
+    fn replace_object_rejects_indirect_replacement_without_mutation() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
         let target = pdf.get_object_handle(object_ref);
@@ -6176,7 +6165,7 @@ mod tests {
 
         let indirect_replacement = pdf.get_object_handle(ObjectRef::new(2, 0));
         let error = pdf
-            .replace_object_handle(object_ref, indirect_replacement)
+            .replace_object(object_ref, indirect_replacement)
             .expect_err("qpdf rejects an indirect replacement handle");
 
         assert_eq!(
@@ -6189,7 +6178,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_rejects_a_foreign_direct_value_without_mutation() {
+    fn replace_object_rejects_a_foreign_direct_value_without_mutation() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open target");
         let mut foreign_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open foreign");
         let target_ref = ObjectRef::new(99, 0);
@@ -6202,7 +6191,7 @@ mod tests {
         assert!(foreign_direct.is_direct());
 
         let error = pdf
-            .replace_object_handle(target_ref, foreign_direct)
+            .replace_object(target_ref, foreign_direct)
             .expect_err("qpdf rejects a value owned by another document");
 
         assert_eq!(
@@ -6215,7 +6204,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_accepts_a_direct_reserved_value() {
+    fn replace_object_accepts_a_direct_reserved_value() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
         let replacement = reserved.shallow_copy().expect("reserved copy");
@@ -6225,7 +6214,7 @@ mod tests {
         assert!(pdf.resolver.registered_handle(target_ref).is_none());
 
         let target = pdf
-            .replace_object_handle(target_ref, replacement)
+            .replace_object(target_ref, replacement)
             .expect("qpdf replaceObject accepts an initialized direct reserved value");
 
         assert!(target.is_reserved());
@@ -6235,7 +6224,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_accepts_a_destroyed_value() {
+    fn replace_object_accepts_a_destroyed_value() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let destroyed = pdf.new_reserved().expect("reserved object");
         destroyed.disconnect();
@@ -6245,7 +6234,7 @@ mod tests {
         assert!(pdf.resolver.registered_handle(target_ref).is_none());
 
         let target = pdf
-            .replace_object_handle(target_ref, destroyed)
+            .replace_object(target_ref, destroyed)
             .expect("qpdf replaceObject accepts an initialized destroyed value");
 
         assert_eq!(target.type_code().expect("type code"), 14);
@@ -6280,7 +6269,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_preserves_an_objstm_default_xref_row() {
+    fn replace_object_preserves_an_objstm_default_xref_row() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(99, 0);
         let handle = pdf.get_object_handle(object_ref);
@@ -6294,7 +6283,7 @@ mod tests {
         );
 
         let current = pdf
-            .replace_object_handle(object_ref, ObjectHandle::integer(42))
+            .replace_object(object_ref, ObjectHandle::integer(42))
             .expect("replace canonical handle");
 
         assert_eq!(
@@ -6323,11 +6312,11 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_then_objstm_default_xref_row_is_visible_later() {
+    fn replace_object_then_objstm_default_xref_row_is_visible_later() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(99, 0);
 
-        pdf.replace_object_handle(object_ref, ObjectHandle::integer(42))
+        pdf.replace_object(object_ref, ObjectHandle::integer(42))
             .expect("replace canonical handle");
         assert!(!pdf.get_xref_table().contains_key(&object_ref));
 
@@ -8135,7 +8124,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_promotes_resolved_objstm_members_before_replacing_container() {
+    fn replace_object_promotes_resolved_objstm_members_before_replacing_container() {
         // Same qpdf invariant as `replacing_an_objstm_container_promotes_resolved_members_to_canonical_handles`
         // above (`set_object`), exercised through the handle-shaped setter:
         // `QPDF::replaceObject` only changes the requested cache slot, so an
@@ -8154,7 +8143,7 @@ mod tests {
             Object::Dictionary(_)
         ));
 
-        pdf.replace_object_handle(ObjectRef::new(1, 0), ObjectHandle::null())
+        pdf.replace_object(ObjectRef::new(1, 0), ObjectHandle::null())
             .expect("replace canonical object");
 
         let member = pdf.get_object_handle(member_ref);
@@ -8171,7 +8160,7 @@ mod tests {
     #[test]
     fn remove_object_handle_promotes_resolved_objstm_members_before_removing_container() {
         // Same qpdf invariant as
-        // `replace_object_handle_promotes_resolved_objstm_members_before_replacing_container`,
+        // `replace_object_promotes_resolved_objstm_members_before_replacing_container`,
         // exercised through the handle-shaped removal primitive:
         // `QPDF::removeObject` only erases the requested cache slot, so an
         // already-resolved ObjStm member must be promoted to its own live

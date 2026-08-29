@@ -1044,7 +1044,7 @@ mod tests {
             b"/CustomTrailer 5 0 R",
         );
         trailer_pdf
-            .set_object_handle(ObjectRef::new(5, 0), too_deep_handle())
+            .replace_object(ObjectRef::new(5, 0), too_deep_handle())
             .unwrap();
         let error = Optimization::build_maps(&mut trailer_pdf, &[], |_, _| 1)
             .expect_err("trailer traversal error must propagate");
@@ -1063,7 +1063,7 @@ mod tests {
             b"",
         );
         catalog_pdf
-            .set_object_handle(ObjectRef::new(5, 0), too_deep_handle())
+            .replace_object(ObjectRef::new(5, 0), too_deep_handle())
             .unwrap();
         let error = Optimization::build_maps(&mut catalog_pdf, &[], |_, _| 1)
             .expect_err("catalog traversal error must propagate");
@@ -1112,7 +1112,7 @@ mod tests {
             ],
             b"",
         );
-        pdf.set_object_handle(
+        pdf.replace_object(
             ObjectRef::new(4, 0),
             ObjectHandle::array(vec![ObjectHandle::integer(1)]),
         )

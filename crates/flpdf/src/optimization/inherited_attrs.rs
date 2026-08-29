@@ -397,9 +397,9 @@ mod tests {
         holder_ref: ObjectRef,
         target_ref: ObjectRef,
     ) {
-        pdf.set_object_handle(target_ref, ObjectHandle::null())
+        pdf.replace_object(target_ref, ObjectHandle::null())
             .unwrap();
-        pdf.set_object_handle(
+        pdf.replace_object(
             holder_ref,
             ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(target_ref)),
         )
@@ -634,15 +634,14 @@ mod tests {
                 ),
                 (b"/Count".to_vec(), ObjectHandle::integer(0)),
             ]);
-            pdf.set_object_handle(ObjectRef::new(number, 0), node)
-                .unwrap();
+            pdf.replace_object(ObjectRef::new(number, 0), node).unwrap();
         }
         let boundary = ObjectHandle::dictionary(vec![
             (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
             (b"/Kids".to_vec(), ObjectHandle::array(Vec::new())),
             (b"/Count".to_vec(), ObjectHandle::integer(0)),
         ]);
-        pdf.set_object_handle(ObjectRef::new(2 + MAX_DEPTH as u32, 0), boundary)
+        pdf.replace_object(ObjectRef::new(2 + MAX_DEPTH as u32, 0), boundary)
             .unwrap();
         let prepared = PreparedPages {
             root: PageTreeRoot::Indirect(ObjectRef::new(2, 0)),

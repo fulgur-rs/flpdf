@@ -402,7 +402,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture");
         for (&number, body) in objs {
             if let Ok(target) = body.parse::<ObjectRef>() {
-                pdf.set_object_handle(
+                pdf.replace_object(
                     ObjectRef::new(number, 0),
                     ObjectHandle::from_value(ObjectValue::Reference(target)),
                 )

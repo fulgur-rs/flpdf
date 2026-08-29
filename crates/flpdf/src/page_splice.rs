@@ -947,7 +947,7 @@ mod tests {
     fn insert_at_start_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
+        pdf.replace_object(new_page, new_page_handle()).unwrap();
         splice_pages(&mut pdf, 0..0, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 4);
@@ -968,7 +968,7 @@ mod tests {
     fn insert_at_end_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
+        pdf.replace_object(new_page, new_page_handle()).unwrap();
         splice_pages(&mut pdf, 3..3, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 4);
@@ -984,7 +984,7 @@ mod tests {
     fn insert_in_middle_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
+        pdf.replace_object(new_page, new_page_handle()).unwrap();
         // Insert after page B (between index 1 and 2)
         splice_pages(&mut pdf, 2..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
@@ -1453,7 +1453,7 @@ mod tests {
     fn non_dictionary_insert_page_is_rejected() {
         let mut pdf = open(build_flat_pdf());
         let bad_page = ObjectRef::new(6, 0);
-        pdf.set_object_handle(bad_page, ObjectHandle::array(Vec::new()))
+        pdf.replace_object(bad_page, ObjectHandle::array(Vec::new()))
             .unwrap();
         let err = splice_pages(&mut pdf, 0..0, &[bad_page]).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
@@ -1467,7 +1467,7 @@ mod tests {
         // non-dictionary object into /Kids uncaught.
         let mut pdf = open(build_pages_with_direct_intermediate_two_pages_pdf());
         let bad_page = ObjectRef::new(5, 0);
-        pdf.set_object_handle(bad_page, ObjectHandle::array(Vec::new()))
+        pdf.replace_object(bad_page, ObjectHandle::array(Vec::new()))
             .unwrap();
         let err = splice_pages(&mut pdf, 1..1, &[bad_page]).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
@@ -1477,7 +1477,7 @@ mod tests {
     fn replace_middle_page_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
+        pdf.replace_object(new_page, new_page_handle()).unwrap();
         // Replace page B (index 1) with new_page.
         splice_pages(&mut pdf, 1..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
@@ -1578,7 +1578,7 @@ mod tests {
     fn nested_insert_at_subtree_boundary() {
         let mut pdf = open(build_nested_pdf());
         let new_page = ObjectRef::new(9, 0);
-        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
+        pdf.replace_object(new_page, new_page_handle()).unwrap();
         splice_pages(&mut pdf, 2..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 5);

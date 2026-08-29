@@ -1342,7 +1342,7 @@ mod tests {
             .linearization_candidate_ref()
             .expect("candidate probe should work")
             .expect("fixture should have a linearization object");
-        pdf.replace_object_handle(candidate, ObjectHandle::integer(1))
+        pdf.replace_object(candidate, ObjectHandle::integer(1))
             .expect("candidate should be replaceable");
 
         assert_eq!(

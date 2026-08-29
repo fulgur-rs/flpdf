@@ -234,7 +234,7 @@ pub(crate) fn null_copied_removed_pages<R: Read + Seek>(
     for source_page in all_pages {
         if !selected.contains(source_page) {
             if let Some(&copied_page) = map.get(source_page) {
-                target.replace_object_handle(copied_page, ObjectHandle::null())?;
+                target.replace_object(copied_page, ObjectHandle::null())?;
             }
         }
     }

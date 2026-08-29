@@ -11911,9 +11911,9 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_generation_replacement_matches_qpdf_tombstone_lifetime() {
+    fn replace_object_generation_replacement_matches_qpdf_tombstone_lifetime() {
         assert_generation_replacement_matches_qpdf_tombstone_lifetime(|pdf, object_ref, value| {
-            pdf.replace_object_handle(object_ref, ObjectHandle::integer(value))
+            pdf.replace_object(object_ref, ObjectHandle::integer(value))
                 .expect("replace canonical object");
         });
     }
@@ -12389,7 +12389,7 @@ mod tests {
         // This is the state immediately after editing a member that was
         // originally in an object stream: the canonical replacement records
         // the dirty value and its old compressed-parent provenance.
-        pdf.set_object_handle(object_ref, ObjectHandle::integer(42))
+        pdf.replace_object(object_ref, ObjectHandle::integer(42))
             .unwrap();
 
         // The pre-recovery edit must retain its original object-stream provenance.

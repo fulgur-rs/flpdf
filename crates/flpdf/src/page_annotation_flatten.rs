@@ -431,7 +431,7 @@ fn replace_pruned_annots<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&page)?;
     } else if preserve_indirect_holder {
         if let Some(array_ref) = old_annots.object_ref() {
-            pdf.replace_object_handle(array_ref, new_annots)?;
+            pdf.replace_object(array_ref, new_annots)?;
         } else {
             page.replace_key(b"/Annots", new_annots)?;
             pdf.mark_object_handle_dirty(&page)?;
@@ -469,7 +469,7 @@ fn add_qpdf_flatten_contents<R: Read + Seek>(
 fn add_content_stream<R: Read + Seek>(pdf: &mut Pdf<R>, data: Vec<u8>) -> Result<ObjectHandle> {
     let object_ref = pdf.next_available_object_ref()?;
     let stream = ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(data));
-    pdf.replace_object_handle(object_ref, stream)
+    pdf.replace_object(object_ref, stream)
 }
 
 /// Flatten eligible annotations on every leaf page in the document.
@@ -967,7 +967,7 @@ mod tests {
             .expect("page must be mutable");
         pdf.mark_object_handle_dirty(&page)
             .expect("page mutation must be dirty");
-        pdf.replace_object_handle(ObjectRef::new(4, 0), ObjectHandle::integer(270))
+        pdf.replace_object(ObjectRef::new(4, 0), ObjectHandle::integer(270))
             .expect("indirect rotate value must be replaceable");
 
         assert_eq!(direct_page_rotate(&mut pdf, page_ref).unwrap(), 270);
@@ -1017,13 +1017,13 @@ mod tests {
         .unwrap();
         pdf.mark_object_handle_dirty(&root).unwrap();
 
-        pdf.replace_object_handle(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
+        pdf.replace_object(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let font_category = ObjectHandle::dictionary(vec![(
             b"/F1".to_vec(),
             pdf.get_object_handle(ObjectRef::new(7, 0)),
         )]);
-        pdf.replace_object_handle(ObjectRef::new(6, 0), font_category)
+        pdf.replace_object(ObjectRef::new(6, 0), font_category)
             .unwrap();
         let appearance = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![(
@@ -1035,7 +1035,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1047,8 +1047,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
             pdf.get_object_handle(ObjectRef::new(6, 0)),
@@ -1077,13 +1076,13 @@ mod tests {
         // getDefaultResources does not read /AcroForm/DR. A page Widget in
         // this shape must not receive the document default resources.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        pdf.replace_object_handle(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
+        pdf.replace_object(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let font_category = ObjectHandle::dictionary(vec![(
             b"/F1".to_vec(),
             pdf.get_object_handle(ObjectRef::new(7, 0)),
         )]);
-        pdf.replace_object_handle(ObjectRef::new(6, 0), font_category)
+        pdf.replace_object(ObjectRef::new(6, 0), font_category)
             .unwrap();
         let appearance = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![(
@@ -1095,7 +1094,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1107,8 +1106,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
             pdf.get_object_handle(ObjectRef::new(6, 0)),
@@ -1156,7 +1154,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1168,8 +1166,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
@@ -1198,7 +1195,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1210,8 +1207,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
@@ -1249,13 +1245,13 @@ mod tests {
         register_acroform_fields(&mut pdf, &[]);
         let shared_font =
             ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(41))]);
-        pdf.replace_object_handle(ObjectRef::new(20, 0), shared_font)
+        pdf.replace_object(ObjectRef::new(20, 0), shared_font)
             .unwrap();
         let shared_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
             pdf.get_object_handle(ObjectRef::new(20, 0)),
         )]);
-        pdf.replace_object_handle(ObjectRef::new(9, 0), shared_resources)
+        pdf.replace_object(ObjectRef::new(9, 0), shared_resources)
             .unwrap();
 
         let appearance1 = ObjectHandle::stream(
@@ -1265,7 +1261,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance1)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance1)
             .unwrap();
         let widget1 = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1277,8 +1273,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget1)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget1).unwrap();
 
         let appearance2 = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![(
@@ -1287,7 +1282,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(7, 0), appearance2)
+        pdf.replace_object(ObjectRef::new(7, 0), appearance2)
             .unwrap();
         let widget2 = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1299,8 +1294,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(6, 0), widget2)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(6, 0), widget2).unwrap();
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
@@ -1370,11 +1364,11 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         // Object 8 is never a valid PDF object body -- if this ever gets
         // resolved, the read fails.
-        pdf.replace_object_handle(ObjectRef::new(8, 0), ObjectHandle::name(Vec::new()))
+        pdf.replace_object(ObjectRef::new(8, 0), ObjectHandle::name(Vec::new()))
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1386,8 +1380,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/Font".to_vec(),
@@ -1429,7 +1422,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1441,10 +1434,9 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
 
-        pdf.replace_object_handle(ObjectRef::new(8, 0), ObjectHandle::name(b"Text".to_vec()))
+        pdf.replace_object(ObjectRef::new(8, 0), ObjectHandle::name(b"Text".to_vec()))
             .unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/ProcSet".to_vec(),
@@ -1479,7 +1471,7 @@ mod tests {
         // dirty explicitly so the writer observes the merged content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        pdf.replace_object_handle(
+        pdf.replace_object(
             ObjectRef::new(9, 0),
             ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
         )
@@ -1492,7 +1484,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1504,15 +1496,14 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
 
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
         )]);
 
-        // Setup's replace_object_handle calls already left object 9 dirty;
+        // Setup's replace_object calls already left object 9 dirty;
         // clear that so the post-merge dirty assertion below can only pass
         // because the merge itself marks the mutated array's indirect owner
         // dirty, not because it was already dirty from construction.
@@ -1577,7 +1568,7 @@ mod tests {
         // that must be asserted directly via pdf.is_dirty.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        pdf.replace_object_handle(
+        pdf.replace_object(
             ObjectRef::new(9, 0),
             ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
         )
@@ -1590,7 +1581,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1602,8 +1593,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
 
         let default_resources = ObjectHandle::dictionary(vec![
             (
@@ -1625,7 +1615,7 @@ mod tests {
         assert_eq!(proc_set_before_items.len(), 1);
         assert_eq!(proc_set_before_items[0].as_name(), Some(b"PDF".to_vec()));
 
-        // Setup's replace_object_handle calls already left object 9 dirty;
+        // Setup's replace_object calls already left object 9 dirty;
         // clear that so the post-merge dirty assertion below can only pass
         // because the /ProcSet merge itself marks object 9 dirty (and that
         // mark survives the later /XObject failure), not because it was
@@ -1714,7 +1704,7 @@ mod tests {
             )]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1726,8 +1716,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![
@@ -1778,7 +1767,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1790,8 +1779,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![
@@ -1842,7 +1830,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1854,8 +1842,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
@@ -1895,7 +1882,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+        pdf.replace_object(ObjectRef::new(5, 0), appearance)
             .unwrap();
         let widget = ObjectHandle::dictionary(vec![
             (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -1907,8 +1894,7 @@ mod tests {
                 )]),
             ),
         ]);
-        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
-            .unwrap();
+        pdf.replace_object(ObjectRef::new(4, 0), widget).unwrap();
         let default_resources = ObjectHandle::dictionary(vec![(
             b"/ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
@@ -1991,7 +1977,7 @@ mod tests {
     fn qpdf_flatten_wraps_content_when_dropping_an_unselected_appearance() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         let annotation_ref = ObjectRef::new(4, 0);
-        pdf.replace_object_handle(annotation_ref, ObjectHandle::dictionary(Vec::new()))
+        pdf.replace_object(annotation_ref, ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let annotation = pdf.get_object_handle(annotation_ref);
         pdf.resolve(&annotation).unwrap();
@@ -2027,12 +2013,12 @@ mod tests {
         .unwrap();
 
         let font_handle = pdf.get_object_handle(font_ref);
-        pdf.replace_object_handle(
+        pdf.replace_object(
             resources_ref,
             ObjectHandle::dictionary(vec![(b"/Font".to_vec(), font_handle)]),
         )
         .unwrap();
-        pdf.replace_object_handle(font_ref, ObjectHandle::dictionary(Vec::new()))
+        pdf.replace_object(font_ref, ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let appearance = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![
@@ -2049,11 +2035,10 @@ mod tests {
             ]),
             Rc::new(Vec::new()),
         );
-        pdf.replace_object_handle(appearance_ref, appearance)
-            .unwrap();
+        pdf.replace_object(appearance_ref, appearance).unwrap();
 
         let appearance_handle = pdf.get_object_handle(appearance_ref);
-        pdf.replace_object_handle(
+        pdf.replace_object(
             selected_ref,
             ObjectHandle::dictionary(vec![
                 (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -2074,7 +2059,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        pdf.replace_object_handle(
+        pdf.replace_object(
             unselected_ref,
             ObjectHandle::dictionary(vec![
                 (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
@@ -2082,7 +2067,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        pdf.replace_object_handle(
+        pdf.replace_object(
             link_ref,
             ObjectHandle::dictionary(vec![(
                 b"/Subtype".to_vec(),
@@ -2091,7 +2076,7 @@ mod tests {
         )
         .unwrap();
 
-        pdf.replace_object_handle(
+        pdf.replace_object(
             default_resources_ref,
             ObjectHandle::dictionary(vec![(
                 b"/Font".to_vec(),
@@ -2101,7 +2086,7 @@ mod tests {
         .unwrap();
         let selected_handle = pdf.get_object_handle(selected_ref);
         let default_resources_handle = pdf.get_object_handle(default_resources_ref);
-        pdf.replace_object_handle(
+        pdf.replace_object(
             acroform_ref,
             ObjectHandle::dictionary(vec![
                 (
@@ -2233,7 +2218,7 @@ mod tests {
             .map(|widget_ref| pdf.get_object_handle(widget_ref))
             .collect();
         let acroform_ref = ObjectRef::new(900, 0);
-        pdf.replace_object_handle(
+        pdf.replace_object(
             acroform_ref,
             ObjectHandle::dictionary(vec![(
                 b"/Fields".to_vec(),
@@ -2378,7 +2363,7 @@ mod tests {
     fn flatten_annotations_uses_canonical_inline_appearance() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         let annotation_ref = ObjectRef::new(4, 0);
-        pdf.replace_object_handle(annotation_ref, ObjectHandle::dictionary(Vec::new()))
+        pdf.replace_object(annotation_ref, ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let annotation = pdf.get_object_handle(annotation_ref);
         pdf.resolve(&annotation).unwrap();
@@ -3429,7 +3414,7 @@ mod tests {
 
         // Override obj 6 to be a non-dict value to trigger the fallback path.
         let non_dict_ref = ObjectRef::new(6, 0);
-        pdf.replace_object_handle(non_dict_ref, ObjectHandle::integer(42))
+        pdf.replace_object(non_dict_ref, ObjectHandle::integer(42))
             .unwrap();
 
         let page_ref = ObjectRef::new(3, 0);
