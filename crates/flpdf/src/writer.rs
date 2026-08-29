@@ -1034,13 +1034,14 @@ impl WriterResult {
 /// exact compression parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressStreams {
-    /// Apply FlateDecode to every output stream that does not already carry a
-    /// filter chain flpdf cannot re-encode (e.g. DCTDecode, JPXDecode).
+    /// Apply FlateDecode to every output stream whose declared filter chain is
+    /// decodable at the configured `WriterOptions::decode_level`. A chain that
+    /// is unsupported or above that level is passed through unchanged.
     ///
     /// For the full-rewrite path this means: decode the source stream through
     /// its declared filter pipeline and re-emit the result with a single
-    /// `/FlateDecode` filter.  Streams whose decode or re-encode fails are
-    /// emitted verbatim (the fallback preserves readability).
+    /// `/FlateDecode` filter. Streams whose decode is unavailable at the
+    /// selected level or whose decode/re-encode fails are emitted verbatim.
     ///
     /// This is the default — matching qpdf's behaviour for a plain
     /// `qpdf in.pdf out.pdf` invocation.
@@ -1465,7 +1466,8 @@ pub(crate) struct WriterOptions {
     /// re-encodes it with a single `/FlateDecode` filter, matching qpdf's
     /// default behaviour.  [`CompressStreams::No`] decodes each stream and
     /// emits the raw bytes without any filter; streams that cannot be decoded
-    /// (e.g. `DCTDecode`/`JPXDecode` image data) are passed through verbatim.
+    /// at the selected level or whose data is corrupt are passed through
+    /// verbatim.
     ///
     /// It governs regular indirect streams, ObjStm containers, and the xref
     /// stream alike.
@@ -5720,8 +5722,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 /// # Fallback for unsupported / corrupt inputs
 ///
 /// When `decode_stream_data` returns an error — e.g. because the declared
-/// filter is `DCTDecode` or `JPXDecode` (image codecs not implemented by
-/// flpdf) or because the stream data is corrupt — the stream's `/Filter`
+/// filter is a lossy codec below `DecodeLevel::All`, an unsupported image
+/// codec, or because the stream data is corrupt — the stream's `/Filter`
 /// chain and data bytes are returned **verbatim**.  This preserves
 /// readability: a PDF reader that understands the codec can still decode the
 /// stream, and we do not corrupt the data by emitting uninterpreted bytes
@@ -5909,7 +5911,8 @@ fn apply_stream_compress_policy_with_decode_level(
 /// compress or content-normalization request supplies an encode flag, so
 /// generalized filters are filterable even at decode level `none`; a plain
 /// uncompress request at `none` preserves them. Specialized filters remain
-/// gated by the selected level in every policy.
+/// gated by the selected level in every policy. Lossy `/DCTDecode` is admitted
+/// only at `DecodeLevel::All`, matching `QPDF_Stream::pipeStreamData`.
 fn filter_chain_is_decodable(
     filter: Option<&Object>,
     policy: CompressStreams,
@@ -5936,6 +5939,7 @@ fn filter_chain_is_decodable(
             b"A85" => b"ASCII85Decode".as_slice(),
             b"AHx" => b"ASCIIHexDecode".as_slice(),
             b"RL" => b"RunLengthDecode".as_slice(),
+            b"DCT" => b"DCTDecode".as_slice(),
             name => name,
         };
         match name {
@@ -5947,6 +5951,7 @@ fn filter_chain_is_decodable(
             b"RunLengthDecode" => {
                 matches!(decode_level, DecodeLevel::Specialized | DecodeLevel::All)
             }
+            b"DCTDecode" => matches!(decode_level, DecodeLevel::All),
             _ => false,
         }
     })
@@ -11171,6 +11176,37 @@ mod tests {
         assert!(!filter_chain_is_decodable(
             Some(&unknown),
             CompressStreams::Yes,
+            DecodeLevel::All,
+            false
+        ));
+    }
+
+    #[test]
+    fn dct_decode_level_gate() {
+        let dct = Object::Name(b"DCTDecode".to_vec());
+        for level in [
+            DecodeLevel::None,
+            DecodeLevel::Generalized,
+            DecodeLevel::Specialized,
+        ] {
+            assert!(!filter_chain_is_decodable(
+                Some(&dct),
+                CompressStreams::No,
+                level,
+                false
+            ));
+        }
+        assert!(filter_chain_is_decodable(
+            Some(&dct),
+            CompressStreams::No,
+            DecodeLevel::All,
+            false
+        ));
+
+        let abbreviation = Object::Name(b"DCT".to_vec());
+        assert!(filter_chain_is_decodable(
+            Some(&abbreviation),
+            CompressStreams::No,
             DecodeLevel::All,
             false
         ));

@@ -3107,8 +3107,8 @@ mod tests {
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("DCT decode"),
-            "error must mention the DCT stage; got: {msg}"
+            !msg.contains("DCT decode"),
+            "qpdf does not expose the pipeline identifier in codec errors; got: {msg}"
         );
         assert!(
             msg.contains("Not a JPEG file: starts with 0x73 0x6f"),

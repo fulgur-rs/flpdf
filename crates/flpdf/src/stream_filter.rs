@@ -5366,15 +5366,9 @@ pub(crate) mod tests {
 
             assert!(matches!(error, PipelineError::Runtime(_)));
             #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-            assert_eq!(
-                error.to_string(),
-                "DCT decode: Not a JPEG file: starts with 0x6e 0x6f"
-            );
+            assert_eq!(error.to_string(), "Not a JPEG file: starts with 0x6e 0x6f");
             #[cfg(feature = "qpdf-libjpeg-compat")]
-            assert_eq!(
-                error.to_string(),
-                "DCT decode: Not a JPEG file: starts with 0x6e 0x6f"
-            );
+            assert_eq!(error.to_string(), "Not a JPEG file: starts with 0x6e 0x6f");
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
@@ -5401,10 +5395,7 @@ pub(crate) mod tests {
             };
 
             assert!(matches!(error, PipelineError::Runtime(_)));
-            assert_eq!(
-                error.to_string(),
-                "DCT decode: invalid jpeg data reading from buffer"
-            );
+            assert_eq!(error.to_string(), "invalid jpeg data reading from buffer");
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
@@ -5429,10 +5420,7 @@ pub(crate) mod tests {
             };
 
             assert!(matches!(error, PipelineError::Runtime(_)));
-            assert_eq!(
-                error.to_string(),
-                "DCT decode: invalid jpeg data reading from buffer"
-            );
+            assert_eq!(error.to_string(), "invalid jpeg data reading from buffer");
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
@@ -5478,7 +5466,7 @@ pub(crate) mod tests {
             stage.finish().expect_err("invalid marker must be rejected")
         };
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.to_string(), "DCT decode: invalid marker: 0xFF00");
+        assert_eq!(error.to_string(), "invalid marker: 0xFF00");
         assert!(sink.writes.is_empty());
         assert_eq!(sink.finish_attempts, 0);
     }
@@ -5509,10 +5497,7 @@ pub(crate) mod tests {
         // already-decoded scanlines.
         assert!(!sink.writes.is_empty());
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(
-            error.to_string(),
-            "DCT decode: invalid jpeg data reading from buffer"
-        );
+        assert_eq!(error.to_string(), "invalid jpeg data reading from buffer");
         assert_eq!(sink.finishes, 0);
     }
 
@@ -5564,10 +5549,7 @@ pub(crate) mod tests {
                 .expect_err("downstream panic must become a pipeline error")
         };
 
-        assert_eq!(
-            error.to_string(),
-            "DCT decode: downstream pipeline panicked"
-        );
+        assert_eq!(error.to_string(), "downstream pipeline panicked");
         assert_eq!(sink.write_attempts, 1);
         assert_eq!(sink.finishes, 0);
         assert_eq!(sink.finish_attempts, 0);
@@ -5641,10 +5623,7 @@ pub(crate) mod tests {
         // ("Unsupported JPEG data precision %d", `/usr/include/jerror.h:70`):
         // the default backend's own precision gate is worded to match it,
         // and the compatibility backend gets it for free from real libjpeg.
-        assert_eq!(
-            error.to_string(),
-            "DCT decode: Unsupported JPEG data precision 12"
-        );
+        assert_eq!(error.to_string(), "Unsupported JPEG data precision 12");
         assert!(sink.writes.is_empty());
         assert_eq!(sink.finish_attempts, 0);
     }
@@ -5668,10 +5647,7 @@ pub(crate) mod tests {
                 .expect_err("unknown component count must be rejected")
         };
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(
-            error.to_string(),
-            "DCT decode: unsupported JPEG component count 2"
-        );
+        assert_eq!(error.to_string(), "unsupported JPEG component count 2");
         assert!(sink.writes.is_empty());
         assert_eq!(sink.finish_attempts, 0);
     }

@@ -68,6 +68,8 @@ struct WriterOptions {
     preserve_unreferenced_objects: bool,
     newline_before_endstream: NewlineBeforeEndstream,
     stream_data: Option<StreamDataMode>,
+    decode_level: StreamDecodeLevel,
+    decode_level_set: bool,
     recompress_flate: bool,
     static_id: bool,
     deterministic_id: bool,
@@ -93,6 +95,8 @@ impl Default for WriterOptions {
             preserve_unreferenced_objects: false,
             newline_before_endstream: NewlineBeforeEndstream::Never,
             stream_data: None,
+            decode_level: StreamDecodeLevel::None,
+            decode_level_set: false,
             recompress_flate: false,
             static_id: false,
             deterministic_id: false,
@@ -144,6 +148,13 @@ fn apply_cli_version_options(options: &mut WriterOptions, versions: &CliVersionO
     }
 }
 
+fn apply_cli_decode_level(options: &mut WriterOptions, decode_level: Option<CliDecodeLevel>) {
+    if let Some(level) = decode_level {
+        options.decode_level = level.into();
+        options.decode_level_set = true;
+    }
+}
+
 /// Translate the CLI's effective writer options into the reusable library
 /// configuration that qpdf reapplies to every split-page output writer.
 fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfiguration {
@@ -154,6 +165,9 @@ fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfi
     }
     if let Some(mode) = options.compress_streams {
         configuration.set_compress_streams(matches!(mode, CompressStreams::Yes));
+    }
+    if options.decode_level_set {
+        configuration.set_decode_level(options.decode_level);
     }
     configuration.set_recompress_flate(options.recompress_flate);
     configuration.set_qdf_mode(options.qdf && !linearize);
@@ -629,6 +643,11 @@ struct Cli {
     /// rewrite.  Provided so qtest commands parse cleanly.
     #[arg(long = "compress-streams")]
     compress_streams: Option<String>,
+    /// Control which qpdf stream filters are decoded during rewrite.
+    /// Values are ordered from least to most decoding: none, generalized,
+    /// specialized, and all.
+    #[arg(long = "decode-level", value_enum)]
+    decode_level: Option<CliDecodeLevel>,
     /// Control what qpdf does regarding object streams. `preserve` preserves
     /// original object streams (the default), `disable` creates output with no
     /// object streams, and `generate` creates object streams and compresses
@@ -1340,6 +1359,10 @@ struct RewriteCommand {
     )]
     compress_streams: Option<CliYesNo>,
 
+    /// Control which qpdf stream filters are decoded during rewrite.
+    #[arg(long = "decode-level", value_enum)]
+    decode_level: Option<CliDecodeLevel>,
+
     /// Normalize PDF content streams (qpdf --normalize-content=y|n).
     ///
     /// `y`: re-tokenize each page content stream and emit a canonical whitespace-
@@ -1536,6 +1559,36 @@ enum CliObjectStreamMode {
     Preserve,
     Disable,
     Generate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliDecodeLevel {
+    None,
+    Generalized,
+    Specialized,
+    All,
+}
+
+impl From<CliDecodeLevel> for StreamDecodeLevel {
+    fn from(value: CliDecodeLevel) -> Self {
+        match value {
+            CliDecodeLevel::None => Self::None,
+            CliDecodeLevel::Generalized => Self::Generalized,
+            CliDecodeLevel::Specialized => Self::Specialized,
+            CliDecodeLevel::All => Self::All,
+        }
+    }
+}
+
+impl From<CliDecodeLevel> for DecodeLevel {
+    fn from(value: CliDecodeLevel) -> Self {
+        match value {
+            CliDecodeLevel::None => Self::None,
+            CliDecodeLevel::Generalized => Self::Generalized,
+            CliDecodeLevel::Specialized => Self::Specialized,
+            CliDecodeLevel::All => Self::All,
+        }
+    }
 }
 
 impl From<CliObjectStreamMode> for ObjectStreamMode {
@@ -2063,6 +2116,7 @@ fn main() {
             content_normalization_set: args.normalize_content.is_some(),
             ..WriterOptions::default()
         };
+        apply_cli_decode_level(&mut options, args.decode_level);
         apply_cli_version_options(&mut options, &top_level_version_options);
         // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
@@ -2154,6 +2208,7 @@ fn main() {
             qdf: args.qdf,
             ..WriterOptions::default()
         };
+        apply_cli_decode_level(&mut options, args.decode_level);
         apply_cli_version_options(&mut options, &top_level_version_options);
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
@@ -2220,6 +2275,7 @@ fn main() {
             qdf: args.qdf,
             ..WriterOptions::default()
         };
+        apply_cli_decode_level(&mut options, args.decode_level);
         apply_cli_version_options(&mut options, &top_level_version_options);
         // Top-level `--qdf` is an alias of `rewrite --qdf`; both configure the
         // same canonical qpdf writer.
@@ -2551,10 +2607,14 @@ fn run_json_document<R: Read + Seek>(
 ) -> CliResult<()> {
     // `decode_level` governs both inline `data` payloads and file-mode side
     // files emitted by the job-owned JSON output pipeline.
+    let json_decode_level = cli
+        .decode_level
+        .map(DecodeLevel::from)
+        .unwrap_or(DecodeLevel::Generalized);
     let json_result = if let Some(ref path) = cli.json_output {
         let mut file = open_verified_json_output(runtime.input_identity, path)?;
         let options = JsonJobOptions {
-            decode_level: DecodeLevel::Generalized,
+            decode_level: json_decode_level,
             stream_data,
             stream_prefix: cli.json_stream_prefix.as_deref(),
             keys: json_keys,
@@ -2570,7 +2630,7 @@ fn run_json_document<R: Read + Seek>(
         )
     } else {
         let options = JsonJobOptions {
-            decode_level: DecodeLevel::Generalized,
+            decode_level: json_decode_level,
             stream_data,
             stream_prefix: cli.json_stream_prefix.as_deref(),
             keys: json_keys,
@@ -2692,6 +2752,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 recompress_flate: cmd.recompress_flate,
                 ..WriterOptions::default()
             };
+            apply_cli_decode_level(&mut options, cmd.decode_level);
             apply_cli_version_options(&mut options, &version_options);
             // `rewrite --encrypt` / `--copy-encryption`: wire encryption
             // onto WriterOptions (shared with the top-level surface via

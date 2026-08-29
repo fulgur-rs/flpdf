@@ -121,7 +121,7 @@ fn show_stream_dct_decodes_valid_jpeg() {
 /// the passthrough marker used for genuinely undecodable codecs.
 #[test]
 fn show_stream_dct_invalid_bytes_report_decode_error() {
-    let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC];
+    let fake_jpeg: &[u8] = &[0x77, 0x77];
     let pdf_bytes = build_pdf_with_stream("DCTDecode", fake_jpeg);
 
     let temp = tempfile::NamedTempFile::new().unwrap();
@@ -132,7 +132,10 @@ fn show_stream_dct_invalid_bytes_report_decode_error() {
         .arg(temp.path())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("DCT decode:"));
+        .stderr(predicate::str::contains(
+            "Not a JPEG file: starts with 0x77 0x77",
+        ))
+        .stderr(predicate::str::contains("DCT decode:").not());
 }
 
 /// For a JBIG2Decode stream, show-stream (without --raw-stream-data) must print the marker.
