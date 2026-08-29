@@ -113,6 +113,17 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    /// Stream-dictionary emission with a direct output `/Length` override.
+    /// The source handle remains unchanged; this mirrors qpdf's stream writer,
+    /// which computes the emitted length from the bytes supplied to its pipe.
+    fn write_stream_body_with_ref_map_and_removed_and_length(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length: usize,
+    ) -> Result<()>;
     fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -254,7 +265,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// spaces) at which *this* value's own opening delimiter sits, an array
     /// or dictionary's children are written at `indent + 2`, and its closing
     /// delimiter (`]` / `>>`) returns to column `indent` on its own line —
-    /// exactly [`crate::Object::write_pdf_qdf`]'s own documented contract. Every
+    /// exactly the legacy `Object::write_pdf_qdf` contract. Every
     /// scalar (including a resolved-indirect [`ObjectValue::Reference`], no
     /// qpdf counterpart, same as [`Self::write_object`]'s own choice for
     /// it) writes byte-identically to the non-QDF form; only array,
@@ -738,6 +749,47 @@ impl ObjectWriterEmission for ObjectHandle {
                 _ => Vec::new(),
             };
             unparse_stream_dict_entries_with_ref_map(&entries, refiltered, out, map, removed_refs)
+        })
+    }
+
+    fn write_stream_body_with_ref_map_and_removed_and_length(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length: usize,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_with_ref_map_and_length(
+                &entries,
+                refiltered,
+                out,
+                map,
+                removed_refs,
+                Some(length),
+            )
         })
     }
 
@@ -1317,6 +1369,24 @@ fn unparse_stream_dict_entries_with_ref_map(
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
+    unparse_stream_dict_entries_with_ref_map_and_length(
+        entries,
+        refiltered,
+        out,
+        map,
+        removed_refs,
+        None,
+    )
+}
+
+fn unparse_stream_dict_entries_with_ref_map_and_length(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    refiltered: bool,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    length_override: Option<usize>,
+) -> Result<()> {
     let excluded_entries;
     let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
         excluded_entries = entries
@@ -1349,7 +1419,10 @@ fn unparse_stream_dict_entries_with_ref_map(
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
     }
-    if let Some(length) = length_value {
+    if let Some(length) = length_override {
+        out.extend_from_slice(b" /Length ");
+        out.extend_from_slice(length.to_string().as_bytes());
+    } else if let Some(length) = length_value {
         out.extend_from_slice(b" /Length ");
         write_child_with_ref_map(length, out, map, removed_refs)?;
     }
@@ -3350,6 +3423,79 @@ mod tests {
             &mut write_string,
         )
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_stream_writer_overrides_length_and_suppresses_null_children() -> Result<()> {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(99)),
+                (b"/Null".to_vec(), ObjectHandle::null()),
+                (b"/Keep".to_vec(), ObjectHandle::integer(1)),
+            ]),
+            Rc::new(b"abc".to_vec()),
+        );
+        let mut output = Vec::new();
+        let removed = BTreeSet::new();
+        let map = |object_ref: ObjectRef| Ok(object_ref);
+
+        stream.write_stream_body_with_ref_map_and_removed_and_length(
+            &mut output,
+            false,
+            &map,
+            &removed,
+            3,
+        )?; // cov:ignore: LLVM attributes this successful stream-emission continuation to the test call cleanup.
+
+        assert_eq!(output, b"<< /Keep 1 /Length 3 >>");
+
+        let dictionary =
+            ObjectHandle::dictionary(vec![(b"/Keep".to_vec(), ObjectHandle::integer(1))]);
+        let mut dictionary_output = Vec::new();
+        dictionary.write_stream_body_with_ref_map_and_removed_and_length(
+            &mut dictionary_output,
+            false,
+            &map,
+            &removed,
+            2,
+        )?; // cov:ignore: LLVM attributes this successful dictionary-emission continuation to the test call cleanup.
+        assert_eq!(dictionary_output, b"<< /Keep 1 /Length 2 >>");
+
+        let scalar = ObjectHandle::integer(1);
+        let mut scalar_output = Vec::new();
+        scalar.write_stream_body_with_ref_map_and_removed_and_length(
+            &mut scalar_output,
+            false,
+            &map,
+            &removed,
+            1,
+        )?; // cov:ignore: LLVM attributes this successful scalar-emission continuation to the test call cleanup.
+        assert_eq!(scalar_output, b"<< /Length 1 >>");
+
+        let malformed_stream =
+            ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(b"x".to_vec()));
+        let mut malformed_output = Vec::new();
+        malformed_stream.write_stream_body_with_ref_map_and_removed_and_length(
+            &mut malformed_output,
+            false,
+            &map,
+            &removed,
+            1,
+        )?; // cov:ignore: LLVM attributes this successful malformed-stream fallback continuation to test cleanup.
+        assert_eq!(malformed_output, b"<< /Length 1 >>");
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let error = reserved
+            .write_stream_body_with_ref_map_and_removed_and_length(
+                &mut Vec::new(),
+                false,
+                &map,
+                &removed,
+                0,
+            )
+            .expect_err("reserved stream emission must be rejected");
+        assert!(error.to_string().contains("reserved object"));
         Ok(())
     }
 }

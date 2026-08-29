@@ -7,11 +7,11 @@
 //! direct/indirect root split follows `QPDFWriter.cc:328-333,1160-1236,
 //! 2068-2076,2928-2954` and the `qpdf/qtest/pclm.test` test-driver contract.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use crate::writer::rewrite_renumber::{collect_canonical_enqueue_refs, visible_raw_dict_entries};
-use crate::{Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::writer::rewrite_renumber::{collect_canonical_children, collect_canonical_enqueue_refs};
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
@@ -36,16 +36,13 @@ pub(crate) struct Plan {
 
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
-        let root_ref = pdf.root_ref();
-        let direct_root = if root_ref.is_none() {
-            let root_candidate = pdf.trailer_key_handle(b"Root");
-            if root_candidate.is_null() {
-                return Err(crate::Error::Missing("/Root"));
-            }
-            Some(pdf.root_handle()?)
-        } else {
-            None
-        };
+        let root_candidate = pdf.trailer_key_handle(b"Root");
+        if root_candidate.is_null() {
+            return Err(crate::Error::Missing("/Root"));
+        }
+        let root_handle = pdf.root_handle()?;
+        let root_ref = root_handle.object_ref();
+        let direct_root = root_ref.is_none().then_some(root_handle);
         let mut builder = Builder {
             pdf,
             items: Vec::new(),
@@ -56,20 +53,20 @@ impl Plan {
         for page in crate::pages::page_refs(builder.pdf)? {
             builder.enqueue_reference(page);
 
-            let page_object = builder.resolve_terminal(Object::Reference(page))?;
-            let Some(page_dict) = page_object.as_dict() else {
+            let page_handle = builder.pdf.get_object_handle(page);
+            builder.pdf.resolve(&page_handle)?;
+            if page_handle.try_as_dictionary()?.is_none() {
                 continue; // cov:ignore: page_refs yields only dictionary /Type /Page leaves
-            };
+            }
 
-            if let Some(contents) = page_dict.get("Contents") {
-                builder.enqueue_value(contents)?;
-            } // cov:ignore: LLVM maps the executed page-contents continuation to the call line above
+            let contents = page_handle.try_get_key(b"/Contents")?;
+            if !contents.is_null() {
+                builder.enqueue_handle_with_stream_length_policy(&contents)?;
+            }
 
-            if let Some(xobjects) = builder.page_xobjects(page_dict)? {
-                for (_, image) in xobjects.iter() {
-                    builder.enqueue_value(image)?;
-                    builder.enqueue_synthetic();
-                }
+            for image in builder.page_xobjects(&page_handle)? {
+                builder.enqueue_handle_with_stream_length_policy(&image)?;
+                builder.enqueue_synthetic();
             }
         }
 
@@ -88,8 +85,11 @@ impl Plan {
             };
             let source_handle = builder.pdf.get_object_handle(source);
             builder.pdf.resolve(&source_handle)?;
-            let object = source_handle.materialize()?;
-            builder.enqueue_value_with_stream_length_policy(&object)?;
+            let mut references = Vec::new();
+            collect_canonical_children(builder.pdf, &source_handle, 0, true, &mut references)?;
+            for reference in references {
+                builder.enqueue_reference(reference);
+            }
         }
 
         let root = root_ref.and_then(|root| builder.old_to_new.get(&root).copied());
@@ -143,73 +143,14 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
         Ok(())
     }
 
-    fn enqueue_value(&mut self, value: &Object) -> Result<()> {
-        self.enqueue_value_with_policy(value, false)
-    }
-
-    fn enqueue_value_with_stream_length_policy(&mut self, value: &Object) -> Result<()> {
-        self.enqueue_value_with_policy(value, true)
-    }
-
-    fn enqueue_value_with_policy(&mut self, value: &Object, skip_length: bool) -> Result<()> {
-        match value {
-            Object::Reference(reference) => self.enqueue_reference(*reference),
-            Object::Array(items) => {
-                for item in items {
-                    self.enqueue_value_with_policy(item, skip_length)?;
-                }
-            }
-            Object::Dictionary(dict) => {
-                for (_, value) in visible_raw_dict_entries(self.pdf, dict, skip_length)? {
-                    self.enqueue_value_with_policy(&value, skip_length)?;
-                }
-            }
-            Object::Stream(stream) => {
-                for (_, value) in visible_raw_dict_entries(self.pdf, &stream.dict, true)? {
-                    self.enqueue_value_with_policy(&value, true)?;
-                }
-            }
-            Object::Null
-            | Object::Boolean(_)
-            | Object::Integer(_)
-            | Object::Real(_)
-            | Object::Name(_)
-            | Object::String(_)
-            | Object::RealLiteral { .. }
-            | Object::Operator(_)
-            | Object::InlineImage(_) => {}
-        }
-        Ok(())
-    }
-
-    fn resolve_terminal(&mut self, value: Object) -> Result<Object> {
-        let mut current = value;
-        let mut visited = BTreeSet::new();
-        loop {
-            let Object::Reference(reference) = current else {
-                return Ok(current);
-            };
-            if !visited.insert(reference) {
-                return Ok(Object::Null);
-            }
-            let handle = self.pdf.get_object_handle(reference);
-            self.pdf.resolve(&handle)?;
-            current = handle.materialize()?;
-        }
-    }
-
-    fn page_xobjects(&mut self, page: &crate::Dictionary) -> Result<Option<crate::Dictionary>> {
-        let Some(resources) = page.get("Resources").cloned() else {
-            return Ok(None);
-        };
-        let resources = self.resolve_terminal(resources)?;
-        let Some(resources) = resources.as_dict() else {
-            return Ok(None);
-        };
-        let Some(xobjects) = resources.get("XObject").cloned() else {
-            return Ok(None);
-        };
-        Ok(self.resolve_terminal(xobjects)?.into_dict())
+    fn page_xobjects(&mut self, page: &ObjectHandle) -> Result<Vec<ObjectHandle>> {
+        let resources = page.try_get_key(b"/Resources")?;
+        let xobjects = resources.try_get_key(b"/XObject")?;
+        xobjects
+            .try_get_keys()?
+            .into_iter()
+            .map(|key| xobjects.try_get_key(&key))
+            .collect()
     }
 }
 
@@ -258,20 +199,12 @@ mod tests {
         assert!(matches!(error, crate::Error::Missing("/Root")));
     }
 
-    fn builder<'pdf>(pdf: &'pdf mut Pdf<Cursor<Vec<u8>>>) -> Builder<'pdf, Cursor<Vec<u8>>> {
-        Builder {
-            pdf,
-            items: Vec::new(),
-            old_to_new: HashMap::new(),
-            next_output: 1,
-        }
-    }
-
     #[test]
     fn plan_skips_a_page_that_resolves_to_a_non_dictionary() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
-        pdf.set_object(page, Object::Integer(42));
+        pdf.replace_object(page, ObjectHandle::integer(42))
+            .expect("replace page with a scalar through the canonical route");
 
         let plan = Plan::build(&mut pdf).expect("a scalar page is ignored by the PCLm planner");
 
@@ -293,11 +226,18 @@ mod tests {
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         let page_handle = pdf.get_object_handle(page);
         pdf.resolve(&page_handle).unwrap();
-        let mut page_dict = page_handle.materialize().unwrap().into_dict().unwrap();
-        let mut contents = crate::Dictionary::new();
-        contents.insert("Broken", Object::Reference(ObjectRef::new(11, 0)));
-        page_dict.insert("Contents", Object::Dictionary(contents));
-        pdf.set_object(page, Object::Dictionary(page_dict));
+        let replacement = page_handle
+            .shallow_copy()
+            .expect("page dictionary must be shallow-copyable");
+        let contents = ObjectHandle::dictionary(vec![(
+            b"/Broken".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(11, 0)),
+        )]);
+        replacement
+            .replace_key(b"/Contents", contents)
+            .expect("replace page contents through the canonical route");
+        pdf.replace_object(page, replacement)
+            .expect("replace page through the canonical route");
         pdf.resolver
             .with_reader_mut(|reader| reader.fail_reads = true);
 
@@ -310,23 +250,24 @@ mod tests {
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
         let page_handle = pdf.get_object_handle(page);
         pdf.resolve(&page_handle).unwrap();
-        let mut page_dict = page_handle.materialize().unwrap().into_dict().unwrap();
-        let mut xobjects = crate::Dictionary::new();
-        xobjects.insert("Im0", Object::Reference(ObjectRef::new(99, 0)));
-        let mut resources = crate::Dictionary::new();
-        resources.insert("XObject", Object::Dictionary(xobjects));
-        page_dict.insert("Resources", Object::Dictionary(resources));
-        let mut contents = crate::Dictionary::new();
-        contents.insert("Marker", Object::Integer(1));
-        page_dict.insert("Contents", Object::Dictionary(contents));
-        pdf.set_object(page, Object::Dictionary(page_dict));
-        pdf.set_object(
-            ObjectRef::new(99, 0),
-            Object::Stream(crate::Stream::new(
-                crate::Dictionary::new(),
-                b"image".to_vec(),
-            )),
-        );
+        let replacement = page_handle
+            .shallow_copy()
+            .expect("page dictionary must be shallow-copyable");
+        let image = pdf
+            .new_stream_with_data(std::rc::Rc::new(b"image".to_vec()))
+            .expect("create image stream through the canonical route");
+        let xobjects = ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image)]);
+        let resources = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), xobjects)]);
+        let contents =
+            ObjectHandle::dictionary(vec![(b"/Marker".to_vec(), ObjectHandle::integer(1))]);
+        replacement
+            .replace_key(b"/Resources", resources)
+            .expect("replace page resources through the canonical route");
+        replacement
+            .replace_key(b"/Contents", contents)
+            .expect("replace page contents through the canonical route");
+        pdf.replace_object(page, replacement)
+            .expect("replace page through the canonical route");
 
         let plan = Plan::build(&mut pdf).expect("XObject plan");
 
@@ -334,32 +275,5 @@ mod tests {
             .items
             .iter()
             .any(|item| matches!(item, Item::Synthetic { .. })));
-    }
-
-    #[test]
-    fn builder_page_xobjects_handles_missing_and_non_dictionary_resources() {
-        let mut pdf = fixture_pdf();
-        let mut page = crate::Dictionary::new();
-        let mut current = builder(&mut pdf);
-        assert!(current.page_xobjects(&page).unwrap().is_none());
-
-        page.insert("Resources", Object::Integer(1));
-        assert!(current.page_xobjects(&page).unwrap().is_none());
-
-        page.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
-        assert!(current.page_xobjects(&page).unwrap().is_none());
-    }
-
-    #[test]
-    fn resolve_terminal_turns_a_reference_cycle_into_null() {
-        let mut pdf = fixture_pdf();
-        let cycle = ObjectRef::new(99, 0);
-        pdf.set_object(cycle, Object::Reference(cycle));
-        let mut current = builder(&mut pdf);
-
-        assert_eq!(
-            current.resolve_terminal(Object::Reference(cycle)).unwrap(),
-            Object::Null
-        );
     }
 }

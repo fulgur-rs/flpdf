@@ -20,6 +20,7 @@ pub(crate) mod serialize;
 mod settings;
 pub(crate) use object::ObjectWriterEmission;
 pub use object_streams::ObjectStreamMode;
+#[cfg(test)]
 use serialize::write_stream_payload;
 pub use serialize::write_stream_to_buf;
 #[cfg(test)]
@@ -3527,6 +3528,7 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
 /// The returned bool feeds [`write_reencoded_object`], which only appends a
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
 /// already a lone `/FlateDecode`.
+#[cfg(test)]
 pub(crate) fn reencode_stream_for_compress(
     stream: crate::Stream,
     options: &WriterOptions,
@@ -3648,11 +3650,13 @@ pub(crate) fn reencode_stream_for_compress(
 /// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
 /// its lexicographic order with `/Length` last. Non-stream objects serialize
 /// normally. Shared by the legacy excluded-mode writer and the plain pipeline.
+#[cfg(test)]
 pub(crate) struct StreamEncryptionOptions<'a> {
     context: Option<&'a EncryptionContext>,
     encrypt_strings: bool,
 }
 
+#[cfg(test)]
 impl<'a> StreamEncryptionOptions<'a> {
     pub(crate) const fn new(context: Option<&'a EncryptionContext>, encrypt_strings: bool) -> Self {
         Self {
@@ -3662,6 +3666,7 @@ impl<'a> StreamEncryptionOptions<'a> {
     }
 }
 
+#[cfg(test)]
 fn write_reencoded_object(
     bytes: &mut Vec<u8>,
     reencoded: &Object,
@@ -3894,46 +3899,42 @@ fn write_pclm<R: Read + Seek, W: Write>(
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
     let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
+    let removed: BTreeSet<_> = pdf.deleted_object_refs().into_iter().collect();
 
     for item in &plan.items {
         match *item {
             pclm::Item::Source { source, output } => {
                 let source_handle = pdf.get_object_handle(source);
                 pdf.resolve(&source_handle)?;
-                let mut object = source_handle.materialize()?;
-                // cov:ignore-start: the PCLm plan is built from the same validated
-                // reference graph used for this rewrite; malformed remap input is rejected upstream.
-                crate::writer::rewrite_renumber::renumber_qpdf_refs_in_place(
-                    pdf,
-                    &mut object,
-                    &plan.old_to_new,
-                )?;
-                // cov:ignore-end
                 let offset = bytes.len();
                 bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
-                match object {
-                    Object::Stream(stream) => {
-                        // PCLm image-strip pages never carry a registered
-                        // token filter (AcroForm appearance regeneration is
-                        // the only producer), so `is_data_modified` is always
-                        // false here.
-                        let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
-                            stream, options, false, true, false, false,
-                        );
-                        // cov:ignore-start: PCLm supplies a Vec sink and no encrypted
-                        // string emitter, so this in-memory serializer has no error edge.
-                        write_reencoded_object(
-                            &mut bytes,
-                            &reencoded,
-                            source_filter_is_lone_flate,
-                            options,
-                            None,
-                            output,
-                            StreamEncryptionOptions::new(None, true),
-                        )?;
+                let map = |object_ref| {
+                    plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
+                        // cov:ignore-start: Plan::build collects every live reference before
+                        // this emission loop, so a valid PCLm item cannot miss this map entry.
+                        crate::Error::Unsupported(format!(
+                            "PCLm reference {object_ref} absent from renumber map"
+                        ))
                         // cov:ignore-end
-                    }
-                    other => other.write_pdf(&mut bytes),
+                    }) // cov:ignore: the canonical PCLm plan queues every reference before emission; LLVM maps this closure terminator to the unreachable error arm.
+                };
+                if source_handle.as_stream_dict().is_some() {
+                    let data = source_handle.get_raw_stream_data()?;
+                    source_handle.write_stream_body_with_ref_map_and_removed_and_length(
+                        &mut bytes,
+                        false,
+                        &map,
+                        &removed,
+                        data.len(),
+                    )?; // cov:ignore: PCLm stream emission is covered by the filtered and recovered-stream fixtures; LLVM attributes this continuation to cleanup-only code.
+                    serialize::write_stream_payload(
+                        &mut bytes,
+                        data.as_ref(),
+                        options.newline_before_endstream,
+                    );
+                } else {
+                    source_handle
+                        .write_object_with_ref_map_and_removed(&mut bytes, &map, &removed)?;
                 }
                 bytes.extend_from_slice(b"\nendobj\n");
                 offsets.insert(output.number, (0, offset));
@@ -3988,7 +3989,6 @@ fn write_pclm<R: Read + Seek, W: Write>(
         }
     }
 
-    let removed: BTreeSet<_> = pdf.deleted_object_refs().into_iter().collect();
     match plan.root {
         None => {
             let root = plan.direct_root.as_ref().ok_or_else(|| {
@@ -6133,6 +6133,7 @@ fn filter_chain_is_decodable(
 /// Whether a stream's `/Filter` value is a lone `/FlateDecode` bare name.
 /// qpdf's `QPDFWriter.cc:1265-1269` fast path recognizes the name form
 /// (including qpdf's `/Fl` abbreviation), but not a single-element array.
+#[cfg(test)]
 pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
     match filter {
         Some(Object::Name(name)) => name.as_slice() == b"FlateDecode" || name.as_slice() == b"Fl",

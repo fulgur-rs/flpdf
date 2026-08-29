@@ -289,8 +289,8 @@ fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
     )
 }
 
-#[allow(dead_code)] // used by the canonical-walk unit tests
-fn collect_canonical_children<R: Read + Seek>(
+#[allow(dead_code)] // used by the canonical-walk unit tests and the PCLm planner
+pub(crate) fn collect_canonical_children<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
     depth: usize,
@@ -1106,6 +1106,7 @@ fn enqueue(
 /// inline structural nesting exceeds [`MAX_INLINE_DEPTH`] (leaving an over-deep
 /// reference un-rewritten would point it at the wrong renumbered object, so we
 /// refuse rather than emit a corrupt PDF).
+#[cfg(test)]
 pub(crate) fn renumber_qpdf_refs_in_place<R: Read + Seek, M: NewNumberLookup>(
     pdf: &mut Pdf<R>,
     obj: &mut Object,
