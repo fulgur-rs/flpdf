@@ -49,8 +49,8 @@
 //! This confirms that `Auto` (the qpdf default) performs both name-level
 //! pruning **and** xref-level GC of unreachable objects.  `No` preserves both.
 
+use super::resource_pruning::RemoveUnreferencedResources;
 use crate::page_document_helper::PageDocumentHelper;
-use crate::resources::RemoveUnreferencedResources;
 use crate::{Pdf, Result};
 use std::io::{Read, Seek};
 

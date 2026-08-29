@@ -7,8 +7,9 @@ use flpdf::disable_digital_signatures;
 use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, flatten_rotation_on_pages, remap_outline_and_dests,
-    AttachmentAddOptions, AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError,
-    JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions,
+    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
+    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
+    QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -17,7 +18,6 @@ use flpdf::{
     collate,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
-    should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
     thread_bead_p::drop_thread_bead_dangling_p,
     CombinedPage, CombinedPlan, InputSpec, PageRange, RotateSpec,
@@ -29,7 +29,7 @@ use flpdf::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
     ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
     PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission,
-    QPDFLogger, RemoveUnreferencedResources, StreamDataMode, UsageError, WriterConfiguration,
+    QPDFLogger, StreamDataMode, UsageError, WriterConfiguration,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};

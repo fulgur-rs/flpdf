@@ -11,10 +11,10 @@ use super::page_merge::{
     source_top_level_field_names, MergeInput,
 };
 use super::page_plan::PagePlan;
+use super::resource_pruning::RemoveUnreferencedResources;
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::page_label_document_helper::LabelRange;
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::resources::RemoveUnreferencedResources;
 use crate::{
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
     Pdf, Result,

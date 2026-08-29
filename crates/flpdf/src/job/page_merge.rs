@@ -34,11 +34,11 @@
 //! distinct responsibility this function does not implement.
 
 use super::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
+use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::page_extract::{append_selection_kids, null_copied_removed_pages, target_pages_root};
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
 use crate::pdf_string::{new_unicode_string, utf8_value};
-use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::writer::reachability::sweep_unreachable_objects_except;
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,

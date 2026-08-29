@@ -4,8 +4,9 @@
 //! The canonical route parses one page or Form at a time, then shallow-copies
 //! and prunes only its `/Font` and `/XObject` dictionaries. Document-level
 //! callers own the page iteration; the `Auto` decision is the separate qpdf
-//! job-level `shouldRemoveUnreferencedResources` heuristic below. Both the
-//! Form pre-pass and the ResourceReplacer name scan use the canonical
+//! job-level `shouldRemoveUnreferencedResources` heuristic in
+//! [`crate::job::should_remove_unreferenced_resources`]. Both the Form pre-pass
+//! and the ResourceReplacer name scan use the canonical
 //! `ObjectHandleParserCallbacks` content route.
 //!
 //! Deviation: locating a Form XObject in a `/XObject` category chases
@@ -19,11 +20,10 @@
 
 use crate::content_stream::parse_content_stream_handles;
 use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
-use crate::object_handle::ObjectHandleIdentity;
 use crate::page_object_helper::PageObjectHelper;
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
 /// Resource names referenced by a content scope, keyed by category
@@ -489,108 +489,6 @@ fn is_builtin_color_space_cs_op(name: &[u8]) -> bool {
     )
 }
 
-// ── Mode enum ────────────────────────────────────────────────────────────────
-
-/// Mode passed by qpdf job-level page operations to resource pruning.
-///
-/// Mirrors qpdf's `--remove-unreferenced-resources=auto|yes|no`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RemoveUnreferencedResources {
-    /// Let the qpdf job-level caller decide whether the source document warrants
-    /// the per-page pruning pass.
-    #[default]
-    Auto,
-    /// Run the canonical per-page pruning pass without the Auto heuristic.
-    Yes,
-    /// No-op: leave all `/Resources` entries untouched.
-    No,
-}
-
-/// Decide whether qpdf's `--pages` Auto mode should run page-level resource
-/// pruning for this source document.
-///
-/// This is qpdf 11.9.0's `QPDFJob::shouldRemoveUnreferencedResources`
-/// heuristic (`libqpdf/QPDFJob.cc:2251-2337`). qpdf only pays the cost of
-/// `QPDFPageObjectHelper::removeUnreferencedResources` when the source page
-/// tree contains an inherited/non-leaf `/Resources`, a shared indirect
-/// `/Resources` object, or a shared indirect `/XObject` dictionary. A
-/// page-local indirect `/Resources` that appears once therefore returns false.
-///
-/// Form XObjects reachable from page `/XObject` dictionaries are traversed as
-/// qpdf does, so sharing discovered in a nested Form resource scope also
-/// enables the page-job pruning route.
-pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(false);
-    };
-    let catalog = pdf.get_object_handle(root_ref);
-    let pages = pdf.resolve_to_terminal(&catalog.try_get_key(b"/Pages")?)?;
-    if pages.is_null() {
-        return Ok(false);
-    }
-
-    let mut queue = VecDeque::from([pages]);
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "qpdf page-job traversal intentionally keys on canonical handle identity"
-    )]
-    let mut nodes_seen: HashSet<ObjectHandleIdentity> = HashSet::new();
-    let mut indirect_resources_seen: BTreeSet<ObjectRef> = BTreeSet::new();
-
-    while let Some(node) = queue.pop_front() {
-        let node = pdf.resolve_to_terminal(&node)?;
-        if !nodes_seen.insert(node.identity_key()) {
-            continue;
-        }
-
-        let dict = node.as_stream_dict().unwrap_or_else(|| node.clone());
-        let kids = pdf.resolve_to_terminal(&dict.try_get_key(b"/Kids")?)?;
-        if let Some(kids) = kids.try_as_array()? {
-            // qpdf returns true for any non-leaf page node that owns a
-            // /Resources key, even if only one descendant page is selected.
-            if dict.try_has_key(b"/Resources")? {
-                return Ok(true);
-            }
-            queue.extend(kids);
-            continue;
-        }
-
-        let resources = dict.try_get_key(b"/Resources")?;
-        if let Some(resources_ref) = resources.object_ref() {
-            if !indirect_resources_seen.insert(resources_ref) {
-                return Ok(true);
-            }
-        }
-
-        let resources = pdf.resolve_to_terminal(&resources)?;
-        let Some(resources_dict) = resources.as_dictionary() else {
-            continue;
-        };
-        let xobject = resources_dict
-            .get(b"/XObject".as_slice())
-            .cloned()
-            .unwrap_or_else(ObjectHandle::null);
-        if let Some(xobject_ref) = xobject.object_ref() {
-            if !indirect_resources_seen.insert(xobject_ref) {
-                return Ok(true);
-            }
-        }
-
-        let xobject = pdf.resolve_to_terminal(&xobject)?;
-        let Some(entries) = xobject.as_dictionary() else {
-            continue;
-        };
-        for object in entries.into_values() {
-            let object = pdf.resolve_to_terminal(&object)?;
-            if object.is_form_xobject()? {
-                queue.push_back(object);
-            }
-        }
-    }
-
-    Ok(false)
-}
-
 fn record_direct_names(used: &mut UsedNames, names: &ResourceNamesByType, record_direct: bool) {
     if !record_direct {
         return;
@@ -631,8 +529,7 @@ mod tests {
     }
 
     /// Build a minimal one-page PDF with a caller-supplied page dictionary and
-    /// object 4 body. The Auto heuristic tests use object 4 as either a
-    /// resource dictionary, a holder, or an inert value.
+    /// object 4 body for resource-pruning tests.
     fn build_page_with_resources_carrier_pdf(page_body: &str, obj4_body: &str) -> Vec<u8> {
         let mut out = b"%PDF-1.4\n".to_vec();
         let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
@@ -667,65 +564,6 @@ mod tests {
         bytes.truncate(xref);
         bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\n%%EOF\n");
         bytes
-    }
-
-    /// Build a 1-page PDF whose inherited `/Resources` is an indirect reference.
-    /// The terminal `/Font` dict (object 5) carries a used `/F1` and an unused
-    /// `/F2`; the single page's content references only `/F1`.
-    ///
-    /// `resources_ref` is the object the `/Pages` node points its `/Resources`
-    /// at, and `obj4_body` is object 4's body — together they select the shape:
-    /// - holder chain: `resources_ref = 4`, `obj4_body = "5 0 R"`
-    ///   (`/Resources 4 0 R → 5 0 R → <<dict>>`)
-    /// - single hop:   `resources_ref = 5`, `obj4_body = "<< >>"`
-    ///   (`/Resources 5 0 R → <<dict>>`; object 4 is an inert orphan)
-    fn build_inherited_indirect_resources_pdf(resources_ref: u32, obj4_body: &str) -> Vec<u8> {
-        let content = b"BT /F1 12 Tf 10 10 Td (hi) Tj ET";
-        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
-        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
-
-        let dicts: Vec<(u32, String)> = vec![
-            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
-            (
-                2,
-                format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources {resources_ref} 0 R >>"),
-            ),
-            (
-                3,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>".into(),
-            ),
-            (4, obj4_body.into()),
-            (
-                5,
-                "<< /Font << \
-                 /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> \
-                 /F2 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> \
-                 >> >>"
-                    .into(),
-            ),
-        ];
-        for (n, s) in &dicts {
-            offs.insert(*n, out.len() as u64);
-            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
-        }
-        offs.insert(6, out.len() as u64);
-        out.extend_from_slice(
-            format!("6 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
-        );
-        out.extend_from_slice(content);
-        out.extend_from_slice(b"\nendstream\nendobj\n");
-
-        let xref_start = out.len() as u64;
-        let total = 7u32;
-        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
-        for i in 1..total {
-            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
-        }
-        out.extend_from_slice(
-            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-        out
     }
 
     /// Build a reachable Form XObject whose `/Font` category is indirect and
@@ -782,178 +620,6 @@ mod tests {
                 .as_bytes(),
         );
         out
-    }
-
-    /// Build two leaf pages whose resource dictionaries are distinct while
-    /// their indirect `/XObject` category dictionary is shared.
-    fn build_shared_xobject_heuristic_pdf() -> Vec<u8> {
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = BTreeMap::new();
-        let objects = [
-            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
-            (
-                3,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 5 0 R >>",
-            ),
-            (
-                4,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 6 0 R >>",
-            ),
-            (5, "<< /XObject 7 0 R >>"),
-            (6, "<< /XObject 7 0 R >>"),
-            (7, "<< /Fm 8 0 R >>"),
-        ];
-        for (number, body) in objects {
-            offsets.insert(number, out.len() as u64);
-            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
-        }
-        offsets.insert(8, out.len() as u64);
-        out.extend_from_slice(
-            b"8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /Length 0 >>\nstream\n\nendstream\nendobj\n",
-        );
-
-        let xref_start = out.len() as u64;
-        let total = 9u32;
-        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
-        for number in 1..total {
-            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
-        }
-        out.extend_from_slice(
-            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-        out
-    }
-
-    /// Build two leaves that point at the same indirect `/Resources` object.
-    fn build_shared_resources_heuristic_pdf() -> Vec<u8> {
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = BTreeMap::new();
-        let objects = [
-            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
-            (
-                3,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 5 0 R >>",
-            ),
-            (
-                4,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 5 0 R >>",
-            ),
-            (5, "<< >>"),
-        ];
-        for (number, body) in objects {
-            offsets.insert(number, out.len() as u64);
-            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
-        }
-
-        let xref_start = out.len() as u64;
-        let total = 6u32;
-        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
-        for number in 1..total {
-            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
-        }
-        out.extend_from_slice(
-            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-        out
-    }
-
-    /// Build a page tree that repeats one canonical leaf handle in `/Kids`.
-    fn build_duplicate_page_heuristic_pdf() -> Vec<u8> {
-        let mut out = b"%PDF-1.4\n".to_vec();
-        let mut offsets = BTreeMap::new();
-        let objects = [
-            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, "<< /Type /Pages /Kids [3 0 R 3 0 R] /Count 2 >>"),
-            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
-        ];
-        for (number, body) in objects {
-            offsets.insert(number, out.len() as u64);
-            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
-        }
-
-        let xref_start = out.len() as u64;
-        let total = 4u32;
-        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
-        for number in 1..total {
-            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
-        }
-        out.extend_from_slice(
-            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-        out
-    }
-
-    /// Remove the trailer's `/Root` from a valid fixture.
-    fn build_rootless_heuristic_pdf() -> Vec<u8> {
-        let mut out = build_page_with_resources_carrier_pdf(
-            "<< /Type /Page /MediaBox [0 0 100 100] >>",
-            "<< >>",
-        );
-        let marker = b"/Root 1 0 R";
-        let start = out
-            .windows(marker.len())
-            .position(|window| window == marker)
-            .expect("fixture trailer should contain /Root");
-        out[start..start + marker.len()].fill(b' ');
-        out
-    }
-
-    /// Build a valid catalog whose `/Pages` key is explicitly null.
-    fn build_null_pages_heuristic_pdf() -> Vec<u8> {
-        let mut out = build_page_with_resources_carrier_pdf(
-            "<< /Type /Page /MediaBox [0 0 100 100] >>",
-            "<< >>",
-        );
-        let marker = b"/Pages 2 0 R";
-        let replacement = b"/Pages null ";
-        let start = out
-            .windows(marker.len())
-            .position(|window| window == marker)
-            .expect("fixture catalog should contain /Pages");
-        out[start..start + marker.len()].copy_from_slice(replacement);
-        out
-    }
-
-    #[test]
-    fn pages_auto_resource_heuristic_matches_qpdf_trigger_shapes() {
-        let mut rootless = Pdf::open(Cursor::new(build_rootless_heuristic_pdf())).unwrap();
-        assert!(!should_remove_unreferenced_resources(&mut rootless).unwrap());
-
-        let mut pages_null = Pdf::open(Cursor::new(build_null_pages_heuristic_pdf())).unwrap();
-        assert!(!should_remove_unreferenced_resources(&mut pages_null).unwrap());
-
-        let mut duplicate_nodes =
-            Pdf::open(Cursor::new(build_duplicate_page_heuristic_pdf())).unwrap();
-        assert!(!should_remove_unreferenced_resources(&mut duplicate_nodes).unwrap());
-
-        let mut page_local = Pdf::open(Cursor::new(build_page_with_resources_carrier_pdf(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 4 0 R >>",
-            "<< /Font << >> >>",
-        )))
-        .unwrap();
-        assert!(!should_remove_unreferenced_resources(&mut page_local).unwrap());
-
-        let mut inherited = Pdf::open(Cursor::new(build_inherited_indirect_resources_pdf(
-            4, "5 0 R",
-        )))
-        .unwrap();
-        assert!(should_remove_unreferenced_resources(&mut inherited).unwrap());
-
-        let mut form = Pdf::open(Cursor::new(build_form_with_indirect_font_pdf())).unwrap();
-        assert!(!should_remove_unreferenced_resources(&mut form).unwrap());
-
-        let mut shared_xobject =
-            Pdf::open(Cursor::new(build_shared_xobject_heuristic_pdf())).unwrap();
-        assert!(should_remove_unreferenced_resources(&mut shared_xobject).unwrap());
-
-        let mut shared_resources =
-            Pdf::open(Cursor::new(build_shared_resources_heuristic_pdf())).unwrap();
-        assert!(should_remove_unreferenced_resources(&mut shared_resources).unwrap());
     }
 
     #[test]

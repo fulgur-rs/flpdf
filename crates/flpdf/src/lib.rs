@@ -189,6 +189,7 @@ pub use job::{
     OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, Parity, RotateSpec, SelectedPage,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
+pub use job::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use matrix::{Matrix, Rectangle};
 pub use nntree::{
     NameTree, NameTreeCursor, NumberTree, NumberTreeCursor, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
@@ -215,7 +216,6 @@ pub use pdf_version::{parse_pdf_version, parse_pdf_version_spec, PdfVersion};
 pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::PdfOpenOptions;
-pub use resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use signatures::{
     acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
     signatures, signatures_with_max_depth, strip_signature_values, SignatureInfo,
