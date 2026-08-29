@@ -185,6 +185,7 @@ impl<R: Read + Seek> Pdf<R> {
             foreign_object_visiting: BTreeMap::new(),
             acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
+            root_handle_memo: None,
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             legacy_resolution_state_synced: already_reconstructed,

@@ -619,14 +619,12 @@ fn page_annotation_handles<R: Read + Seek>(
 /// is never needed; the caller must resolve lazily, only once it knows
 /// resource merging will actually run.
 fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<ObjectHandle>> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(None); // cov:ignore: a parsed Pdf always has a root reference
+    // `root_handle` accepts a direct trailer /Root; a missing/dangling/
+    // non-dictionary root degrades to "no default resources" the same way
+    // the pre-existing `root_ref()`-based check did.
+    let Ok(root) = pdf.root_handle() else {
+        return Ok(None); // cov:ignore: a parsed Pdf always has a resolvable root
     };
-    let root = pdf.get_object_handle(root_ref);
-    pdf.resolve(&root)?;
-    if root.as_dictionary().is_none() {
-        return Ok(None); // cov:ignore: parsed catalog root is a dictionary
-    }
     let acroform = pdf.resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
     if acroform.as_dictionary().is_none() {
         return Ok(None); // cov:ignore: malformed AcroForm is ignored like qpdf
@@ -865,16 +863,12 @@ fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
 }
 
 fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(()); // cov:ignore: parsed Pdf always has a root reference
+    // `root_handle` accepts a direct trailer /Root; a missing/dangling/
+    // non-dictionary root is a no-op the same way the pre-existing
+    // `root_ref()`-based checks were.
+    let Ok(root) = pdf.root_handle() else {
+        return Ok(()); // cov:ignore: a parsed Pdf always has a resolvable root
     };
-    let root = pdf.get_object_handle(root_ref);
-    pdf.resolve(&root)?;
-    // cov:ignore-start: parsed Pdf catalogs are dictionaries at this boundary
-    if root.as_dictionary().is_none() {
-        return Ok(()); // cov:ignore: parsed catalog root is a dictionary
-    }
-    // cov:ignore-end
     root.remove_key(b"/AcroForm");
     pdf.mark_object_handle_dirty(&root)?;
     // qpdf's own `flattenAnnotations` (`QPDFPageDocumentHelper.cc:56-77`)

@@ -7123,6 +7123,32 @@ mod tests {
     }
 
     #[test]
+    fn root_handle_survives_a_trailer_handle_degraded_to_null_with_no_prior_call() {
+        // Mirrors `root_ref_survives_a_trailer_handle_degraded_to_null`, but
+        // for `root_handle` when it has never been called before: the
+        // trailer memo degrading to null must not be read as "no root at
+        // all" -- it must fall back to the shallow, depth-safe
+        // `trailer_key_handle("Root")` lookup instead of fabricating a null
+        // candidate.
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("Deep", nested);
+
+        assert!(
+            pdf.trailer().is_null(),
+            "sanity: the whole-trailer walk does degrade here"
+        );
+        let root = pdf
+            .root_handle()
+            .expect("a valid /Root must survive unrelated trailer sibling damage");
+        assert!(root.as_dictionary().is_some());
+    }
+
+    #[test]
     fn trailer_key_handle_is_null_for_a_missing_key() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.trailer_key_handle(b"NoSuchKey");

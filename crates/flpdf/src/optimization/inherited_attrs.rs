@@ -38,14 +38,28 @@ pub(crate) fn push<R: Read + Seek>(
             warn_skipped_keys,
             0,
         )?,
-        PageTreeRoot::Direct { catalog } => push_direct_root(
-            pdf,
-            catalog,
-            &mut key_ancestors,
-            &mut visited,
-            allow_changes,
-            warn_skipped_keys,
-        )?, // cov:ignore: direct-root integration tests exercise this generic dispatch; llvm maps its counter to the callee
+        PageTreeRoot::Direct { catalog } => {
+            let catalog = pdf.get_object_handle(catalog);
+            push_direct_root(
+                pdf,
+                catalog,
+                &mut key_ancestors,
+                &mut visited,
+                allow_changes,
+                warn_skipped_keys,
+            )? // cov:ignore: llvm-cov attributes this covered multi-line Direct branch terminator to the call setup
+        }
+        PageTreeRoot::DirectCatalog => {
+            let catalog = pdf.root_handle()?;
+            push_direct_root(
+                pdf,
+                catalog,
+                &mut key_ancestors,
+                &mut visited,
+                allow_changes,
+                warn_skipped_keys,
+            )? // cov:ignore: direct-root integration tests exercise this generic dispatch; llvm maps its counter to the callee
+        }
     }
     debug_assert!(
         key_ancestors.values().all(Vec::is_empty),
@@ -56,14 +70,13 @@ pub(crate) fn push<R: Read + Seek>(
 
 fn push_direct_root<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    catalog_ref: ObjectRef,
+    catalog: ObjectHandle,
     key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<()> {
     // cov:ignore-start: PreparedPages::Direct is created and consumed without an intervening public mutation
-    let catalog = pdf.get_object_handle(catalog_ref);
     pdf.resolve(&catalog)?;
     let pages = catalog.get_key(b"/Pages");
     if pages.as_dictionary().is_none() {

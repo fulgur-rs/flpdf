@@ -124,6 +124,11 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// rather than re-deriving a fresh one from `self.trailer` each time.
     /// Populated lazily on first request.
     pub(crate) trailer_handle_memo: Option<ObjectHandle>,
+    /// Canonical direct or indirect `/Root` handle when the trailer itself has
+    /// not yet been lifted. This is separate from `trailer_handle_memo` so a
+    /// shallow root lookup does not inherit the whole-trailer depth fallback,
+    /// while repeated direct-root accesses still share qpdf's object identity.
+    pub(crate) root_handle_memo: Option<ObjectHandle>,
     pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
@@ -357,6 +362,15 @@ impl<R: Read + Seek> Pdf<R> {
         let handle = self
             .lift_to_handle_bounded(&trailer, 0, crate::parser::MAX_PARSE_DEPTH)
             .unwrap_or_else(|_| ObjectHandle::null());
+        // A direct `/Root` is not represented in the legacy trailer by an
+        // indirect ObjectRef. If root_handle() was called first, reconnect the
+        // canonical trailer's root slot to that same live handle so later
+        // trailer consumers observe mutations made through the root boundary.
+        if !handle.is_null() {
+            if let Some(root) = self.root_handle_memo.clone() {
+                let _ = handle.replace_key(b"/Root", root);
+            }
+        }
         self.trailer_handle_memo = Some(handle.clone());
         handle
     }
@@ -373,9 +387,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// never `Pdf::set_object`-redirected in place). Returns a direct null
     /// handle for a missing key or a lift failure on `key`'s own value
     /// (matching [`ObjectHandle::get_key`]'s own "missing key" contract).
-    /// Not memoized — unlike the whole trailer, a single key's handle is
-    /// cheap enough to relift on every call, and every caller today needs at
-    /// most one key per `Pdf`.
+    /// Single-key handles are not memoized, except for direct or indirect
+    /// `/Root`: the Catalog is a live mutation boundary and must retain one
+    /// canonical identity even before the whole trailer is lifted.
     pub fn trailer_key_handle(&mut self, key: &[u8]) -> ObjectHandle {
         // The JSON importer and canonical writer mutate the live trailer
         // handle after construction (see `Pdf::root_ref`'s identical
@@ -400,6 +414,11 @@ impl<R: Read + Seek> Pdf<R> {
                     .unwrap_or_else(|_| ObjectHandle::null());
             }
         }
+        if key == b"Root" {
+            if let Some(root) = &self.root_handle_memo {
+                return root.clone();
+            }
+        }
         let Some(value) = self.trailer.get(key).cloned() else {
             return ObjectHandle::null();
         };
@@ -411,8 +430,13 @@ impl<R: Read + Seek> Pdf<R> {
         // it — the same divergence `resolve`'s own call to
         // `lift_bounded` documents and avoids for the analogous
         // compressed-member case.
-        self.lift_to_handle_bounded(&value, 0, crate::parser::MAX_PARSE_DEPTH)
-            .unwrap_or_else(|_| ObjectHandle::null())
+        let handle = self
+            .lift_to_handle_bounded(&value, 0, crate::parser::MAX_PARSE_DEPTH)
+            .unwrap_or_else(|_| ObjectHandle::null());
+        if key == b"Root" && !handle.is_null() {
+            self.root_handle_memo = Some(handle.clone());
+        }
+        handle
     }
 
     /// `/Root` as listed in the trailer, when present.
@@ -445,7 +469,28 @@ impl<R: Read + Seek> Pdf<R> {
     /// graph before checking its type. A missing, dangling, or non-dictionary
     /// `/Root` is a document-level error rather than a missing-key fallback.
     pub fn root_handle(&mut self) -> Result<ObjectHandle> {
-        let candidate = self.trailer_key_handle(b"Root");
+        let trailer_is_live =
+            matches!(&self.trailer_handle_memo, Some(trailer) if !trailer.is_null());
+        let candidate = if trailer_is_live {
+            self.trailer_handle_memo
+                .as_ref()
+                .expect("trailer_is_live confirmed a populated, non-null memo")
+                .try_get_key(b"/Root")
+                .unwrap_or_else(|_| ObjectHandle::null())
+        } else if let Some(root) = &self.root_handle_memo {
+            root.clone()
+        } else {
+            // The trailer memo is either absent or was itself degraded to
+            // null by an unrelated sibling entry's nesting depth (see
+            // `Pdf::trailer`'s own doc). Either way, fall back to the
+            // shallow, depth-safe single-key lift so a valid /Root is not
+            // hidden behind that unrelated trailer damage.
+            let root = self.trailer_key_handle(b"Root");
+            if !root.is_null() {
+                self.root_handle_memo = Some(root.clone());
+            }
+            root
+        };
         let root = self.resolve_to_terminal(&candidate)?;
         if root.as_dictionary().is_none() {
             return Err(Error::System("unable to find /Root dictionary".into()));
