@@ -115,7 +115,6 @@ pub(crate) mod optimization;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
 pub mod outline_object_helper;
-pub(crate) mod overlay_annotations;
 pub(crate) mod overlay_appearance_stream;
 mod page_annotation_flatten;
 pub mod page_closure;
