@@ -201,7 +201,7 @@ mod tests {
 
         let page_local = one_page_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 4 0 R >>",
-            &[(5, "<< >>")],
+            &[(4, "<< >>")],
         );
         let mut page_local = Pdf::open(Cursor::new(page_local)).unwrap();
         assert!(!should_remove_unreferenced_resources(&mut page_local).unwrap());
