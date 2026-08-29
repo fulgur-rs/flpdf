@@ -1,4 +1,9 @@
 //! qpdf correspondence: `Pl_DCT` buffers compressed input and decodes it on `finish`, emitting one decoded scanline at a time to the next pipeline.
+//!
+//! The default backend validates the entropy boundary of baseline single-scan
+//! JPEGs after decoding, matching qpdf's whole-buffer libjpeg source manager:
+//! a missing trailing EOI is reported as `invalid jpeg data reading from
+//! buffer` (`libqpdf/Pl_DCT.cc:199-206,312-325`).
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
@@ -76,6 +81,27 @@ impl<'a> PlDct<'a> {
     fn runtime_error(message: impl AsRef<str>) -> PipelineError {
         PipelineError::runtime(message.as_ref().as_bytes())
     }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    fn require_baseline_eoi(&self, data: &[u8]) -> PipelineResult<()> {
+        let metadata = libjpeg_turbo_rs::decode::marker::MarkerReader::new(data)
+            .read_markers()
+            .map_err(|error| self.jpeg_error(error, data))?;
+        if !metadata.frame.is_progressive && metadata.scans.len() == 1 {
+            match libjpeg_turbo_rs::decode::boundary::scan_next_boundary(
+                data,
+                metadata.entropy_data_offset,
+            ) {
+                libjpeg_turbo_rs::decode::boundary::MarkerBoundary::Eoi(_) => {}
+                libjpeg_turbo_rs::decode::boundary::MarkerBoundary::NeedMore(_)
+                | libjpeg_turbo_rs::decode::boundary::MarkerBoundary::Sos(_) => {
+                    return Err(Self::runtime_error("invalid jpeg data reading from buffer"));
+                }
+            }
+        } // cov:ignore: LLVM attributes this branch-closing line to the non-baseline path; baseline EOI success and error arms are covered.
+        Ok(())
+    }
+
     #[cfg(feature = "qpdf-libjpeg-compat")]
     fn decode_with_compat_backend(&mut self, data: &[u8]) -> PipelineResult<()> {
         let result = {
@@ -197,6 +223,7 @@ impl Pipeline for PlDct<'_> {
             decoder
                 .finish()
                 .map_err(|error| self.jpeg_error(error, &data))?;
+            self.require_baseline_eoi(&data)?;
             self.next.finish()
         }
     }
