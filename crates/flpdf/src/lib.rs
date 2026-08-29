@@ -116,7 +116,6 @@ pub mod outline_document_helper;
 pub mod outline_object_helper;
 pub(crate) mod overlay_appearance_stream;
 mod page_annotation_flatten;
-pub mod page_closure;
 pub mod page_document_helper;
 pub mod page_extract;
 pub(crate) mod page_form_xobject;
@@ -195,7 +194,6 @@ pub use nntree::{
     NameTree, NameTreeCursor, NumberTree, NumberTreeCursor, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
-pub use object_copy::copy_objects;
 pub use object_handle::{
     ObjectHandle, StreamDataProvider, STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
 };

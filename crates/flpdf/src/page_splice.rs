@@ -36,12 +36,9 @@ use std::io::{Read, Seek};
 /// without touching the document.
 ///
 /// This function is part of the document page extraction and merge primitives.
-/// The `insert` refs it splices in are typically pages copied
-/// from another document with
-/// [`copy_objects`](crate::object_copy::copy_objects), whose object set is first
-/// computed per page by
-/// [`page_object_closure`](crate::page_closure::page_object_closure). See the
-/// runnable `examples/splice_pages.rs` and `examples/merge_pdfs.rs`.
+/// The `insert` refs it splices in are typically pages copied from another
+/// document with [`Pdf::copy_foreign_object`]. See the runnable
+/// `examples/splice_pages.rs` and `examples/merge_pdfs.rs`.
 ///
 /// # Errors
 ///
