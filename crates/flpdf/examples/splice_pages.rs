@@ -5,14 +5,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{
-    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef,
-    Pdf, PdfWriter,
-};
+use flpdf::{pages::page_refs, splice_pages, Pdf, PdfWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Source A: 3 pages. Target B: 2 pages. Insert A's pages into B at index 1.
@@ -23,17 +19,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = Pdf::open(BufReader::new(File::open(&a_path)?))?;
     let mut b = Pdf::open(BufReader::new(File::open(&b_path)?))?;
 
-    // Collect A's page refs and the full object closure they need.
+    // Copy A's pages through the destination's persistent foreign-object map.
     let a_pages = page_refs(&mut a)?;
-    let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
-    for &pr in &a_pages {
-        closure.extend(page_object_closure(&mut a, pr)?);
+    let mut copied = Vec::with_capacity(a_pages.len());
+    for &page_ref in &a_pages {
+        let source_page = a.get_object_handle(page_ref);
+        let copied_page = b
+            .copy_foreign_object(&source_page)?
+            .object_ref()
+            .ok_or("copyForeignObject did not return an indirect page")?;
+        copied.push(copied_page);
     }
-
-    // Copy A's pages (and their dependencies) into B in ONE call; record
-    // renumbered refs. A single call dedups the shared font once.
-    let map = copy_objects(&mut a, &mut b, &closure)?;
-    let copied: Vec<ObjectRef> = a_pages.iter().map(|r| map[r]).collect();
 
     // Insert the copied pages at index 1 (remove nothing).
     let n = 1usize;

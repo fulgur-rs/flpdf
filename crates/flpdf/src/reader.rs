@@ -1520,6 +1520,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// source. qpdf's escape hatch, `setImmediateCopyFrom` (materializing
     /// provider-backed stream data into memory at copy time so the source
     /// need not survive), has no flpdf counterpart yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Err`] when `foreign` is a direct handle, has no owning
+    /// document, or is owned by this document itself, and when the
+    /// underlying graph traversal fails: a foreign reserved sentinel
+    /// encountered mid-copy, an unresolvable reference, or a prior call
+    /// against the same source left this document's per-source copy state
+    /// poisoned (qpdf never rolls this back on failure either, so a failed
+    /// copy from a given source cannot be retried).
     pub fn copy_foreign_object(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
         crate::object_copy::copy_foreign_object(self, foreign)
     }

@@ -187,17 +187,18 @@ fn multi_source_pages_preserve_primary_unreferenced_objects_like_qpdf() {
 /// directly (here, the Catalog via `/Owner`). qpdf keeps the primary `QPDF`
 /// in place, so that reference always resolves to the document's one true
 /// Catalog. flpdf's merge instead builds a fresh Catalog/`/Pages` pair and
-/// copies everything else into it, so the copy must seed the primary's
-/// original Catalog/`/Pages` refs onto their target equivalents -- otherwise
-/// the orphan's reference either becomes `Object::Null` (unseeded, dropped by
-/// `rewrite_refs`) or a needless duplicate Catalog copy.
+/// copies everything else into it, so the canonical foreign-object map must
+/// seed the primary's original Catalog/`/Pages` refs onto their target
+/// equivalents -- otherwise the orphan's reference either becomes
+/// `Object::Null` (unseeded, dropped by the canonical copier) or a needless
+/// duplicate Catalog copy.
 ///
 /// A distinct external source is required (not just `.`): with only `.` in
 /// the page-selection segment, `has_external_source` is false and the CLI
 /// takes `run_page_extraction_from_repeated_pdf`, which operates on the
-/// primary in place and never calls the preserve-aware page-spec handler
-/// (`copy_objects_with_seed`) this test targets -- that route would pass
-/// even if the seeding fix were removed.
+/// primary in place and never calls the preserve-aware page-spec handler's
+/// canonical foreign-object map setup -- that route would pass even if the
+/// seeding fix were removed.
 ///
 /// This asserts semantic structure (marker survives, exactly one Catalog,
 /// `/Owner` resolves to that Catalog's own object number) rather than full

@@ -90,7 +90,6 @@
 | `crates/flpdf/src/outline_object_helper.rs` | correspondence | QPDFOutlineObjectHelper.cc getTitle/getCount/getDest/getDestPage, split from the document helper's QPDFOutlineDocumentHelper.cc responsibilities |
 | `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs |
 | `crates/flpdf/src/page_annotation_flatten.rs` | correspondence | QPDFPageObjectHelper.cc annotation flattening split from the page helper |
-| `crates/flpdf/src/page_closure.rs` | correspondence | QPDF.cc copyForeignObject graph closure split from object copying |
 | `crates/flpdf/src/page_document_helper.rs` | correspondence | QPDFPageDocumentHelper.cc responsibilities split with page extraction |
 | `crates/flpdf/src/page_extract.rs` | correspondence | QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only |
 | `crates/flpdf/src/page_form_xobject.rs` | correspondence | QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper |

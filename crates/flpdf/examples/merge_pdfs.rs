@@ -1,22 +1,18 @@
 //! Merge two PDFs, preserving fonts shared between the merged-in pages.
 //!
-//! `copy_objects` deduplicates objects shared *within a single call*: the two
-//! source pages share one font, so after copying them together the merged
-//! output still references that font exactly once.
+//! `Pdf::copy_foreign_object` retains one source-to-target identity map: the
+//! two source pages share one font, so after copying them into the target the
+//! merged output still references that font exactly once.
 //!
 //! Run with: `cargo run --example merge_pdfs -p flpdf`
 
 #[path = "common/mod.rs"]
 mod common;
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufReader;
 
-use flpdf::{
-    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectHandle,
-    ObjectRef, Pdf, PdfWriter,
-};
+use flpdf::{pages::page_refs, splice_pages, ObjectHandle, ObjectRef, Pdf, PdfWriter};
 
 /// Resolve a page's `/Resources /Font /F1` indirect reference.
 ///
@@ -47,15 +43,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a = Pdf::open(BufReader::new(File::open(&a_path)?))?;
     let mut b = Pdf::open(BufReader::new(File::open(&b_path)?))?;
 
-    // Union the closures of B's pages, then copy them in ONE call so the font
-    // they share is copied once (sharing preserved).
+    // Copy each page through the same target-side foreign-object map so the
+    // font they share is copied once (sharing preserved).
     let b_pages = page_refs(&mut b)?;
-    let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
-    for &pr in &b_pages {
-        closure.extend(page_object_closure(&mut b, pr)?);
+    let mut copied = Vec::with_capacity(b_pages.len());
+    for &page_ref in &b_pages {
+        let source_page = b.get_object_handle(page_ref);
+        let copied_page = a
+            .copy_foreign_object(&source_page)?
+            .object_ref()
+            .ok_or("copyForeignObject did not return an indirect page")?;
+        copied.push(copied_page);
     }
-    let map = copy_objects(&mut b, &mut a, &closure)?;
-    let copied: Vec<ObjectRef> = b_pages.iter().map(|r| map[r]).collect();
 
     // Append B's copied pages at the end of A.
     let a_len = page_refs(&mut a)?.len();

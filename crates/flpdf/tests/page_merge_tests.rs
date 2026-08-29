@@ -1436,7 +1436,7 @@ fn dest_array_first(
 // The merge inherits the PRIMARY input's /Outlines, /Names /Dests, and
 // /OpenAction; the SECONDARY input contributes pages only — its document-level
 // structures are NOT merged. Surviving-page dests are remapped to the new page
-// refs (folded into the primary closure so copy_objects's single rewrite pass
+// refs (folded into the primary closure so copy_foreign_object's single rewrite pass
 // remaps them); the secondary's outline items never appear in the output.
 #[test]
 fn merge_inherits_primary_outline_only() {
@@ -1666,7 +1666,7 @@ fn merge_primary_outline_dest_to_removed_page_is_nulled() {
 // An inline-on-catalog /OpenAction (a bare dest array, not an indirect action
 // object) targeting a removed page is nulled too, and a surviving target is
 // remapped. This exercises the inline-on-catalog wiring path (the value lives on
-// the primary catalog, which copy_objects never copies, so merge constructs the
+// the primary catalog, which copy_foreign_object never copies, so merge constructs the
 // target value from the renumber map).
 #[test]
 fn merge_inline_openaction_dest_array_remapped_and_nulled() {
@@ -2554,7 +2554,7 @@ fn merge_inline_dest_holder_chain_leading_ref_remapped() {
 
 /// Direct catalog destination carriers keep indirect destination holders as
 /// indirect objects. The carrier reference itself is remapped to the copied
-/// holder, and `copy_objects` remaps the page reference inside that holder.
+/// holder, and `copy_foreign_object` remaps the page reference inside that holder.
 #[test]
 fn merge_direct_dest_carriers_preserve_indirect_destination_holders() {
     let pdf = build_pdf(
@@ -4185,7 +4185,7 @@ fn merge_empty_primary_starts_from_blank_base() {
 /// both carriers literally reference `7 0 R`. The action's `/D` targets page B
 /// (obj 4) via an indirect page reference. Because the action is one indirect
 /// object referenced from two carriers, the merge closure contains it exactly
-/// once and copy_objects rewrites its `/D` page ref a single time.
+/// once and copy_foreign_object rewrites its `/D` page ref a single time.
 fn shared_goto_pdf() -> Vec<u8> {
     build_pdf(
         &[

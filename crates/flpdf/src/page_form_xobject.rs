@@ -60,7 +60,7 @@ use crate::page_object_helper::PageObjectHelper;
 use crate::{Error, ObjectRef, Pdf, Result};
 
 #[cfg(test)]
-use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
+use crate::object_handle::ObjectHandle;
 #[cfg(test)]
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 #[cfg(test)]
@@ -104,7 +104,7 @@ pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
 /// Mirrors qpdf's `copyForeignObject` step in overlay/underlay: the page is
 /// first wrapped into a Form XObject *inside `source`*, then the XObject and
 /// every object it transitively references are deep-copied into `dest` via
-/// [`copy_objects`](crate::object_copy::copy_objects). The returned
+/// [`Pdf::copy_foreign_object`]. The returned
 /// [`ObjectRef`] is the imported XObject's reference in `dest`.
 ///
 /// # Errors
@@ -126,34 +126,25 @@ where
     //    getFormXObjectForPage runs on the source page first).
     let xobject_ref = get_form_xobject_for_page(source, source_page_ref)?;
 
-    // 2. Compute the XObject's reachable object closure.
-    let closure = xobject_object_closure(source, xobject_ref)?;
-
-    // 3. Deep-copy the closure into the destination, renumbering references.
-    let map = crate::object_copy::copy_objects(source, dest, &closure)?;
-
-    // The XObject ref is the DFS seed of the closure, so it is always present
-    // in the copy map; the error arm is defensive and structurally unreachable.
-    // cov:ignore-start: xobject_ref is always in the closure (the DFS seed), so
-    // it is always a key in the copy map; this error arm cannot be reached.
-    map.get(&xobject_ref).copied().ok_or_else(|| {
-        Error::Unsupported("imported Form XObject reference missing from copy map".to_string())
-    })
-    // cov:ignore-end
+    // 2. Copy the XObject through qpdf's persistent canonical foreign graph
+    // operation. The destination retains the source identity map, so shared
+    // descendants are reused exactly as they are for overlay/underlay.
+    let source_handle = source.get_object_handle(xobject_ref);
+    let copied = dest.copy_foreign_object(&source_handle)?;
+    copied
+        .object_ref()
+        .ok_or_else(|| Error::Unsupported("imported Form XObject is not indirect".to_string()))
 }
 
 /// Import several `source` pages into `dest` as Form XObjects in a single
 /// cross-document copy, returning each page's imported XObject [`ObjectRef`] in
 /// the same order as `source_page_refs`.
 ///
-/// Unlike calling [`import_page_as_form_xobject`] once per page, this builds the
-/// Form XObject for every page inside `source`, **unions** their reachable object
-/// closures, and runs [`copy_objects`](crate::object_copy::copy_objects) exactly
-/// once over that union. A single copy shares any indirect object referenced by
-/// more than one page (a `/Font`, `/ProcSet`, image, …) instead of duplicating
-/// it — matching qpdf's `copyForeignObject`, which keeps one foreign→local map
-/// per source document. Per-page copies would emit a duplicate of every shared
-/// resource, so the result would not be byte-identical to qpdf's overlay output.
+/// Unlike calling [`import_page_as_form_xobject`] once per page, this performs
+/// all copies against one destination document and therefore reuses qpdf's
+/// persistent foreign→local identity map. A single source resource referenced
+/// by more than one page (a `/Font`, `/ProcSet`, image, …) is copied once,
+/// matching qpdf's `copyForeignObject` behavior.
 ///
 /// `source_page_refs` should already be distinct; duplicate refs would request
 /// the same imported XObject twice and are not deduplicated here.
@@ -174,32 +165,29 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    // 1. Build a Form XObject inside `source` for each page and union the
-    //    reachable object closures (a shared child object appears once in the set).
+    // 1. Build a Form XObject inside `source` for each page.
     let mut xobject_refs = Vec::with_capacity(source_page_refs.len());
-    let mut union: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in source_page_refs {
         let xobject_ref = get_form_xobject_for_page(source, page_ref)?;
-        union.extend(xobject_object_closure(source, xobject_ref)?);
         xobject_refs.push(xobject_ref);
     }
 
-    // 2. One copy over the union deduplicates shared child objects.
-    let map = crate::object_copy::copy_objects(source, dest, &union)?;
-
-    // 3. Map each per-page XObject seed to its imported destination ref.
+    // 2. Copy each root through the same persistent destination-side map. The
+    //    canonical copier deduplicates shared descendants across these calls.
     xobject_refs
         .iter()
         .map(|xref| {
-            // Each XObject ref seeds its own closure, so it is always in the
-            // union and thus in the copy map; the error arm is defensive.
-            // cov:ignore-start: every seed is in the union -> in the copy map.
-            map.get(xref).copied().ok_or_else(|| {
-                Error::Unsupported(
-                    "imported Form XObject reference missing from copy map".to_string(),
-                )
-            })
-            // cov:ignore-end
+            let source_handle = source.get_object_handle(*xref);
+            let copied = dest.copy_foreign_object(&source_handle)?;
+            let copied_ref = copied.object_ref();
+            if copied_ref.is_none() {
+                // cov:ignore-start: qpdf guarantees an indirect result for this indirect Form XObject
+                return Err(Error::Unsupported(
+                    "imported Form XObject is not indirect".to_string(),
+                ));
+                // cov:ignore-end
+            }
+            Ok(copied_ref.expect("copyForeignObject returned an indirect Form XObject"))
         })
         .collect()
 }
@@ -582,77 +570,6 @@ fn page_group<R: Read + Seek>(
         }
         Some(direct) => Ok(Some(direct.shallow_copy()?)),
     }
-}
-
-/// Compute the transitive reachable object closure of the Form XObject at
-/// `xobject_ref` (the XObject itself plus every object reachable through its
-/// references). Iterative DFS with canonical-handle identity as the cycle
-/// guard.
-#[cfg(test)]
-pub(crate) fn xobject_object_closure<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    xobject_ref: ObjectRef,
-) -> Result<BTreeSet<ObjectRef>> {
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "qpdf object-graph cycle detection intentionally keys on canonical handle identity"
-    )]
-    let mut visited: std::collections::HashSet<ObjectHandleIdentity> =
-        std::collections::HashSet::new();
-    let mut stack: Vec<ObjectHandle> = vec![pdf.get_object_handle(xobject_ref)];
-    let mut refs = BTreeSet::new();
-
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current.identity_key()) {
-            continue;
-        }
-        if let Some(object_ref) = current.object_ref() {
-            refs.insert(object_ref);
-        }
-        let resolved = pdf.resolve_to_terminal(&current)?;
-        if let Some(object_ref) = resolved.object_ref() {
-            refs.insert(object_ref);
-        }
-        let children = if let Some(stream_dict) = resolved.as_stream_dict() {
-            stream_dict
-                .as_dictionary()
-                .into_iter()
-                .flat_map(|entries| entries.into_values().collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        } else if let Some(entries) = resolved.as_dictionary() {
-            entries.into_values().collect::<Vec<_>>()
-        } else {
-            resolved.as_array().unwrap_or_default()
-        };
-        for child in children {
-            if child.object_ref().is_some()
-                || child.as_reference().is_some()
-                || child.as_dictionary().is_some()
-                || child.as_array().is_some()
-                || child.as_stream_dict().is_some()
-            {
-                stack.push(child);
-            }
-        }
-    }
-
-    Ok(refs)
-}
-
-/// Allocate the next available object reference (`max(numbers) + 1`, generation
-/// 0), matching the allocation pattern used elsewhere in the crate.
-#[cfg(test)]
-#[allow(dead_code)]
-fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
-    let n = pdf
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-    Ok(ObjectRef::new(n, 0))
 }
 
 #[cfg(test)]
@@ -1216,12 +1133,11 @@ mod tests {
     #[test]
     fn import_pages_as_form_xobjects_shares_one_copy_of_a_common_resource() {
         // Two source pages that both reference the same font (F1 -> object 4).
-        // Importing both in one call must union their reachable closures and run
-        // copy_objects exactly once, so the shared font is copied into dest a
-        // single time and both imported XObjects' /Resources point at the same
-        // dest object -- matching qpdf's copyForeignObject, which keeps one
-        // foreign->local map per source document (per-page copies would instead
-        // duplicate the font, diverging from qpdf's overlay output).
+        // Importing both through the same destination must reuse qpdf's
+        // persistent foreign->local map, so the shared font is copied into
+        // dest a single time and both imported XObjects' /Resources point at
+        // the same dest object (per-source map reuse is qpdf's
+        // copyForeignObject contract).
         let mut source = open(build_pdf(
             &[
                 (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1291,31 +1207,6 @@ mod tests {
             font.get("BaseFont").unwrap().as_name(),
             Some(b"Helvetica".to_vec())
         );
-    }
-
-    #[test]
-    fn xobject_object_closure_handles_cyclic_references() {
-        // Two objects referencing each other plus the XObject -> the cycle guard
-        // (visited set) must terminate and include both.
-        let mut pdf = open(build_pdf(
-            &[
-                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
-                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-                (
-                    3,
-                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] \
-                     /Resources << /A 4 0 R >> >>",
-                ),
-                (4, "<< /Peer 5 0 R >>"),
-                (5, "<< /Peer 4 0 R >>"),
-            ],
-            1,
-        ));
-        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        let closure = xobject_object_closure(&mut pdf, xref).unwrap();
-        assert!(closure.contains(&xref));
-        assert!(closure.contains(&ObjectRef::new(4, 0)));
-        assert!(closure.contains(&ObjectRef::new(5, 0)));
     }
 
     // ---- helper-level coverage of defensive arms (direct calls) ----
@@ -1577,34 +1468,6 @@ mod tests {
             .expect("an indirect /Group must shallow-copy to a direct dict");
         assert!(got.is_direct());
         assert!(got.as_dictionary().is_some());
-    }
-
-    #[test]
-    fn xobject_object_closure_accepts_long_acyclic_ref_chain() {
-        // A linear indirect-reference chain may be deeper than the page-tree
-        // depth guard. qpdf's copyForeignObject has no fixed reference-hop
-        // budget; identity-based cycle detection is the applicable guard.
-        let total = DEFAULT_MAX_PAGE_TREE_DEPTH + 5;
-        let mut objs: Vec<(u32, String)> = vec![
-            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
-            (
-                3,
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] \
-                 /Resources << /A 4 0 R >> >>"
-                    .to_string(),
-            ),
-        ];
-        // Objects 4..total form a linear /Next chain off the page's resources.
-        for n in 4..=(total as u32) {
-            objs.push((n, format!("<< /Next {} 0 R >>", n + 1)));
-        }
-        objs.push(((total + 1) as u32, "<< /Leaf true >>".to_string()));
-        let borrowed: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
-        let mut pdf = open(build_pdf(&borrowed, 1));
-        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        let closure = xobject_object_closure(&mut pdf, xref).unwrap();
-        assert!(closure.contains(&ObjectRef::new((total + 1) as u32, 0)));
     }
 
     // ---- inherited_rotate_attribute (edge arms) ----------------------------
