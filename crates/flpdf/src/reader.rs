@@ -1549,11 +1549,11 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// qpdf records the shared value transition itself rather than exposing a
     /// separate dirty bit. flpdf's writer still tracks dirty object references,
-    /// so this setter deliberately delegates to the primitive that calls
-    /// [`Self::mark_object_handle_mutated`] after a successful replacement. As
+    /// so this setter deliberately delegates to the primitive that records
+    /// the target as mutated after a successful replacement. As
     /// with [`Self::set_object`], every successful write-back marks the target
     /// dirty; callers that temporarily restore a previously clean value must
-    /// explicitly call [`Self::clear_dirty`] after the restore.
+    /// explicitly clear the target's dirty state after the restore.
     ///
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
