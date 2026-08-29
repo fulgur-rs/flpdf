@@ -51,7 +51,7 @@ impl<'a> PlDct<'a> {
     fn jpeg_error(&self, error: libjpeg_turbo_rs::JpegError, data: &[u8]) -> PipelineError {
         if let [first, second, ..] = data {
             if !data.starts_with(&[0xff, 0xd8]) {
-                return self.runtime_error(format!(
+                return Self::runtime_error(format!(
                     "Not a JPEG file: starts with 0x{first:02x} 0x{second:02x}"
                 ));
             }
@@ -66,14 +66,15 @@ impl<'a> PlDct<'a> {
         // qpdf's observed diagnostic (verified against `qpdf --show-object
         // --filtered-stream-data` on a 1-byte `/DCTDecode` stream).
         if matches!(error, libjpeg_turbo_rs::JpegError::UnexpectedEof) {
-            return self.runtime_error("invalid jpeg data reading from buffer");
+            return Self::runtime_error("invalid jpeg data reading from buffer");
         }
-        PipelineError::runtime(format!("{}: {error}", self.identifier))
+        let message = error.to_string();
+        PipelineError::runtime(message.as_bytes())
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-    fn runtime_error(&self, message: impl AsRef<str>) -> PipelineError {
-        PipelineError::runtime(format!("{}: {}", self.identifier, message.as_ref()))
+    fn runtime_error(message: impl AsRef<str>) -> PipelineError {
+        PipelineError::runtime(message.as_ref().as_bytes())
     }
     #[cfg(feature = "qpdf-libjpeg-compat")]
     fn decode_with_compat_backend(&mut self, data: &[u8]) -> PipelineResult<()> {
@@ -84,19 +85,14 @@ impl<'a> PlDct<'a> {
 
         match result {
             Ok(()) => self.next.finish(),
-            Err(DecodeError::Codec(message)) => Err(PipelineError::runtime(format!(
-                "{}: {message}",
-                self.identifier
-            ))),
+            Err(DecodeError::Codec(message)) => Err(PipelineError::runtime(message.as_bytes())),
             Err(DecodeError::Callback(error)) => Err(error),
-            Err(DecodeError::CallbackPanicked) => Err(PipelineError::runtime(format!(
-                "{}: downstream pipeline panicked",
-                self.identifier
-            ))),
-            Err(DecodeError::CallbackFailure(message)) => Err(PipelineError::runtime(format!(
-                "{}: {message}",
-                self.identifier
-            ))),
+            Err(DecodeError::CallbackPanicked) => {
+                Err(PipelineError::runtime("downstream pipeline panicked"))
+            }
+            Err(DecodeError::CallbackFailure(message)) => {
+                Err(PipelineError::runtime(message.as_bytes()))
+            }
         }
     }
 }
@@ -134,9 +130,9 @@ impl Pipeline for PlDct<'_> {
             };
 
             if precision != 8 {
-                return Err(
-                    self.runtime_error(format!("Unsupported JPEG data precision {precision}"))
-                );
+                return Err(Self::runtime_error(format!(
+                    "Unsupported JPEG data precision {precision}"
+                )));
             }
 
             let bytes_per_pixel = match components {
@@ -144,13 +140,14 @@ impl Pipeline for PlDct<'_> {
                 3 => 3,
                 4 => 4,
                 _ => {
-                    return Err(self
-                        .runtime_error(format!("unsupported JPEG component count {components}")));
+                    return Err(Self::runtime_error(format!(
+                        "unsupported JPEG component count {components}"
+                    )));
                 }
             };
             // cov:ignore-start: JPEG width is u16 and supported bpp is at most 4, so usize multiplication cannot overflow
             let row_length = width.checked_mul(bytes_per_pixel).ok_or_else(|| {
-                self.runtime_error(format!("scanline byte length overflow for width {width}"))
+                Self::runtime_error(format!("scanline byte length overflow for width {width}"))
             })?;
             // cov:ignore-end
 
@@ -188,7 +185,7 @@ impl Pipeline for PlDct<'_> {
                     .map_err(|error| self.jpeg_error(error, &data))?;
                 // cov:ignore-start: ScanlineDecoder writes into this caller-owned slice and returns no row with a different length
                 if row.len() != row_length {
-                    return Err(self.runtime_error(format!(
+                    return Err(Self::runtime_error(format!(
                         "decoded scanline length {}, expected {row_length}",
                         row.len()
                     )));

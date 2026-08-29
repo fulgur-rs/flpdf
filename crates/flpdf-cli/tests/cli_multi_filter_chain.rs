@@ -468,12 +468,11 @@ fn cli_show_stream_ascii85_lzw_chain() {
 
 #[test]
 fn cli_show_stream_dct_decode_error_and_rewrite_byte_identical() {
-    // Fake JPEG-like bytes: starts with a valid SOI/APP0 marker but is not a
-    // complete, decodable JPEG. DCTDecode decodes real JPEGs (unlike
+    // Non-JPEG bytes. DCTDecode decodes real JPEGs (unlike
     // JBIG2Decode/JPXDecode/CCITTFaxDecode below, which have no decode
     // factory at all), so show-stream must report a decode error here
     // rather than a passthrough marker or a silent success.
-    let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xAA, 0xBB, 0xCC, 0xDD];
+    let fake_jpeg: &[u8] = &[0x73, 0x6f];
 
     let pdf_bytes = build_pdf_with_prefiltered_stream(fake_jpeg, "/DCTDecode", None);
 
@@ -489,7 +488,10 @@ fn cli_show_stream_dct_decode_error_and_rewrite_byte_identical() {
         .args(["show-stream", "4 0", pdf_path_str])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("DCT decode:"));
+        .stderr(predicate::str::contains(
+            "Not a JPEG file: starts with 0x73 0x6f",
+        ))
+        .stderr(predicate::str::contains("DCT decode:").not());
 
     // (b) After full-rewrite, stream data must still be byte-identical: the
     // writer never re-encodes DCTDecode data regardless of whether flpdf's

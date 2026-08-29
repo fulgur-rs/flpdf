@@ -1559,6 +1559,71 @@ fn top_level_normalize_content_y_rejects_unwired_mutating_attachment_paths() {
 }
 
 #[test]
+fn top_level_decode_level_rejects_unwired_mutating_attachment_paths() {
+    let cases: &[&[&str]] = &[
+        &[
+            "--decode-level=all",
+            "--remove-attachment=key",
+            "in.pdf",
+            "out.pdf",
+        ],
+        &[
+            "--decode-level=generalized",
+            "--add-attachment",
+            "attachment.bin",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ],
+        &[
+            "--decode-level=specialized",
+            "in.pdf",
+            "--copy-attachments-from",
+            "donor.pdf",
+            "--",
+            "out.pdf",
+        ],
+    ];
+
+    for args in cases {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(*args)
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "--decode-level is not applied by attachment mutation operations",
+            ));
+    }
+}
+
+#[test]
+fn top_level_decode_level_none_is_accepted_with_mutating_attachment_paths() {
+    // decode-level=none matches the attachment serializers' existing
+    // behavior (no filter decoding at all), so it must not be rejected the
+    // way a non-none level is.
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("attachment.bin");
+    std::fs::write(&attachment, b"payload").unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--decode-level=none",
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn top_level_linearize_accepts_compress_streams_and_pass1() {
     // Mirrors the COMMAND from upstream qpdf's linearize-pass1.test:
     //   qpdf --linearize --static-id --compress-streams=n \

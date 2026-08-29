@@ -1,5 +1,7 @@
 use assert_cmd::Command;
+use flpdf::Pdf;
 use std::fs;
+use std::io::Cursor;
 
 fn minimal_pdf() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -138,5 +140,43 @@ fn qpdf_ctest_1_reports_encryption_metadata_and_permissions() {
     assert!(
         !output.exists(),
         "test01 must not write its outfile argument"
+    );
+}
+
+#[test]
+fn qpdf_ctest_20_writes_with_specialized_decode_level() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let output = directory.path().join("output.pdf");
+    let input = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/test_driver/stream_dct.pdf");
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "20",
+            input.to_str().expect("input path is UTF-8"),
+            "",
+            output.to_str().expect("output path is UTF-8"),
+        ])
+        .assert()
+        .success()
+        .stdout("C test 20 done\n")
+        .stderr("");
+
+    assert!(output.is_file(), "test20 must write its output PDF");
+    let mut pdf = Pdf::open(Cursor::new(fs::read(&output).expect("read output PDF")))
+        .expect("open test20 output PDF");
+    let has_dct_stream = pdf.object_refs().into_iter().any(|object_ref| {
+        let object = pdf.get_object_handle(object_ref);
+        pdf.resolve(&object).is_ok()
+            && object
+                .as_stream_dict()
+                .and_then(|dict| dict.get_key(b"/Filter").as_name())
+                .is_some_and(|name| name == b"DCTDecode")
+    });
+    assert!(
+        has_dct_stream,
+        "specialized decode level must preserve the lossy DCT filter"
     );
 }

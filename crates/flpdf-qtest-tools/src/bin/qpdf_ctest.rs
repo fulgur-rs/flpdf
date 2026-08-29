@@ -1,13 +1,12 @@
-//! Portable Rust translation of the qpdf C test helper's deterministic-ID case.
+//! Portable Rust process adapter for the qpdf C test helper's selected cases.
 //!
-//! qpdf's `qpdf-ctest.c:test19` (`qpdf-ctest.c:435-442`) intentionally tests
-//! the C API lifecycle rather than a C symbol. Its observable sequence is:
-//! read the input, initialize a writer for the output, enable deterministic
-//! IDs, write, report errors, and print `C test 19 done`. Keep this adapter at
-//! the qtest-tools process boundary; the PDF read/write responsibilities stay
-//! in the canonical `flpdf::Pdf` and `flpdf::PdfWriter` APIs.
+//! qpdf's `qpdf-ctest.c:test19` (`qpdf-ctest.c:435-442`) and test20
+//! (`qpdf-ctest.c:445-455`) intentionally test C API lifecycles rather than
+//! requiring callers to link a C symbol. Keep this adapter at the qtest-tools
+//! process boundary; the PDF read/write responsibilities stay in the canonical
+//! `flpdf::Pdf` and `flpdf::PdfWriter` APIs.
 
-use flpdf::{EncryptionInfo, Pdf, PdfOpenOptions, PdfWriter, Result};
+use flpdf::{DecodeLevel, EncryptionInfo, Pdf, PdfOpenOptions, PdfWriter, Result};
 use std::env;
 use std::fs::File;
 use std::io::Write;
@@ -48,16 +47,18 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
     }
     if args.len() != 5 {
         return Err(flpdf::Error::Unsupported(
-            "usage: qpdf-ctest 19 infile password outfile".to_owned(),
+            "usage: qpdf-ctest n infile password outfile".to_owned(),
         ));
     }
 
     match args[1].to_str() {
         Some("1") => run_test1(&args[2], &args[3]),
         Some("19") => run_test19(&args[2], &args[3], &args[4]),
-        _ => Err(flpdf::Error::Unsupported(
-            "usage: qpdf-ctest 19 infile password outfile".to_owned(),
-        )),
+        Some("20") => run_test20(&args[2], &args[3], &args[4]),
+        Some(test_number) => Err(flpdf::Error::Unsupported(format!(
+            "invalid test number {test_number}"
+        ))),
+        None => Err(flpdf::Error::Unsupported("invalid test number".to_owned())),
     }
 }
 
@@ -176,6 +177,40 @@ fn run_test19(
     writer.set_deterministic_id(true);
     writer.write()?;
     println!("C test 19 done");
+    Ok(())
+}
+
+fn run_test20(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let input = PathBuf::from(input_arg);
+    let output = PathBuf::from(output_arg);
+    let password = password_bytes(password_arg);
+    let mut pdf = Pdf::open_with_options(
+        File::open(&input)?,
+        PdfOpenOptions {
+            password,
+            // The raw qpdf C API performs a single authentication attempt;
+            // password recovery is a QPDFJob-only policy.
+            suppress_password_recovery: true,
+            description: input.to_string_lossy().into_owned(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+
+    // qpdf-ctest.c:test20 calls qpdf_init_write before all four writer
+    // setters. Keep that order at the process adapter boundary so the
+    // canonical writer observes the same state transitions.
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(output)?;
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_compress_streams(false);
+    writer.set_decode_level(DecodeLevel::Specialized);
+    writer.write()?;
+    println!("C test 20 done");
     Ok(())
 }
 
