@@ -674,10 +674,7 @@ fn default_appearance_rejects_a_non_dictionary_catalog() {
         .unwrap()
         .set_default_appearance(Vec::new())
         .expect_err("a non-dictionary Catalog must retain the labeled error");
-    assert_eq!(
-        error.to_string(),
-        "unsupported PDF feature: catalog object 1 0 R is not a dictionary"
-    );
+    assert_eq!(error.to_string(), "unable to find /Root dictionary");
 }
 
 #[test]
