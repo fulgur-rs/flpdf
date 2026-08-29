@@ -2804,7 +2804,6 @@ pub(crate) mod tests {
         qpdf_resolution_to_option(resolve_qpdf_candidates(&candidates, qpdf_version_probe))
     }
 
-    #[cfg(feature = "qpdf-libjpeg-compat")]
     fn test_late_truncated_jpeg() -> Vec<u8> {
         let pixels: Vec<u8> = (0..(16 * 16 * 3))
             .map(|value| (value % 256) as u8)
@@ -5495,6 +5494,32 @@ pub(crate) mod tests {
 
         // The C source must report EOF only after libjpeg has emitted its
         // already-decoded scanlines.
+        assert!(!sink.writes.is_empty());
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.to_string(), "invalid jpeg data reading from buffer");
+        assert_eq!(sink.finishes, 0);
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn dct_default_backend_rejects_late_eoi_truncation_like_qpdf() {
+        let jpeg = test_late_truncated_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&jpeg[..jpeg.len() - 2])
+                .expect("late-truncated JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("missing EOI must be a codec error")
+        };
+
         assert!(!sink.writes.is_empty());
         assert!(matches!(error, PipelineError::Runtime(_)));
         assert_eq!(error.to_string(), "invalid jpeg data reading from buffer");
