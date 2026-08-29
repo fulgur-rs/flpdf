@@ -1,4 +1,4 @@
-//! Differential coverage for qpdf's standard writer with an inline Catalog.
+//! Differential coverage for qpdf's writers with an inline Catalog.
 
 use flpdf::Pdf;
 use std::fs::File;
@@ -121,27 +121,32 @@ fn qdf_generate_writer_rewrites_a_reachable_direct_root() -> flpdf::Result<()> {
 
     let input = fixture("direct-root-one-page.pdf");
     let temporary = tempfile::tempdir()?;
-    let output_path = temporary.path().join("qdf-generate.pdf");
-    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
-    let settings = WriterTestSettings {
-        static_id: true,
-        qdf: true,
-        object_streams: flpdf::ObjectStreamMode::Generate,
-        ..WriterTestSettings::default()
-    };
-    let mut output = Vec::new();
-    write_with_settings(&mut pdf, &mut output, &settings)?;
-    std::fs::write(&output_path, &output)?;
-    qpdf_check(&output_path);
+    for (mode, mode_name) in [
+        (flpdf::ObjectStreamMode::Disable, "disable"),
+        (flpdf::ObjectStreamMode::Generate, "generate"),
+    ] {
+        let output_path = temporary.path().join(format!("qdf-{mode_name}.pdf"));
+        let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+        let settings = WriterTestSettings {
+            static_id: true,
+            qdf: true,
+            object_streams: mode,
+            ..WriterTestSettings::default()
+        };
+        let mut output = Vec::new();
+        write_with_settings(&mut pdf, &mut output, &settings)?;
+        std::fs::write(&output_path, &output)?;
+        qpdf_check(&output_path);
 
-    let rewritten = Pdf::open(BufReader::new(File::open(&output_path)?))?;
-    assert!(rewritten.root_ref().is_none());
-    let pages = Command::new("qpdf")
-        .args(["--show-npages", output_path.to_str().unwrap()])
-        .output()
-        .expect("inspect direct-root QDF page count");
-    assert!(pages.status.success());
-    assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "1");
+        let rewritten = Pdf::open(BufReader::new(File::open(&output_path)?))?;
+        assert!(rewritten.root_ref().is_none());
+        let pages = Command::new("qpdf")
+            .args(["--show-npages", output_path.to_str().unwrap()])
+            .output()
+            .expect("inspect direct-root QDF page count");
+        assert!(pages.status.success());
+        assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "1");
+    }
     Ok(())
 }
 
@@ -175,5 +180,112 @@ fn specialized_xref_stream_writer_rewrites_a_direct_root() -> flpdf::Result<()> 
             .any(|window| window == b"/Type /XRef"),
         "specialized Generate output must use an xref stream"
     );
+    Ok(())
+}
+
+#[test]
+fn pclm_writer_rewrites_a_reachable_direct_root() -> flpdf::Result<()> {
+    if !qpdf_available() {
+        eprintln!("qpdf is unavailable; skipping direct-root PCLm differential");
+        return Ok(());
+    }
+
+    let input = fixture("direct-root-one-page.pdf");
+    let temporary = tempfile::tempdir()?;
+    let output_path = temporary.path().join("pclm.pdf");
+    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+    let settings = WriterTestSettings {
+        static_id: true,
+        pclm: true,
+        ..WriterTestSettings::default()
+    };
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+    std::fs::write(&output_path, &output)?;
+    qpdf_check(&output_path);
+    assert!(output.starts_with(b"%PDF-1.4\n%PCLm 1.0\n"));
+
+    let rewritten = Pdf::open(BufReader::new(File::open(&output_path)?))?;
+    assert!(
+        rewritten.root_ref().is_none(),
+        "PCLm must retain the inline Catalog in the output trailer"
+    );
+    let pages = Command::new("qpdf")
+        .args(["--show-npages", output_path.to_str().unwrap()])
+        .output()
+        .expect("inspect direct-root PCLm page count");
+    assert!(pages.status.success());
+    assert_eq!(String::from_utf8_lossy(&pages.stdout).trim(), "1");
+    let trailer = Command::new("qpdf")
+        .args(["--show-object=trailer", output_path.to_str().unwrap()])
+        .output()
+        .expect("inspect direct-root PCLm trailer");
+    assert!(trailer.status.success());
+    let trailer = String::from_utf8_lossy(&trailer.stdout);
+    assert!(trailer.contains("/Root <<"));
+    assert!(
+        trailer.contains("/Pages 2 0 R"),
+        "the inline Catalog's indirect /Pages child must be remapped in PCLm"
+    );
+    Ok(())
+}
+
+#[test]
+fn pclm_writer_preserves_a_direct_catalog_with_extensions() -> flpdf::Result<()> {
+    if !qpdf_available() {
+        eprintln!("qpdf is unavailable; skipping direct-root PCLm extension differential");
+        return Ok(());
+    }
+
+    let input = fixture("direct-root-adbe.pdf");
+    let temporary = tempfile::tempdir()?;
+    let output_path = temporary.path().join("pclm-adbe.pdf");
+    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+    let settings = WriterTestSettings {
+        static_id: true,
+        pclm: true,
+        ..WriterTestSettings::default()
+    };
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+    std::fs::write(&output_path, &output)?;
+    qpdf_check(&output_path);
+
+    let rewritten = Pdf::open(BufReader::new(File::open(&output_path)?))?;
+    assert!(rewritten.root_ref().is_none());
+    let trailer = Command::new("qpdf")
+        .args(["--show-object=trailer", output_path.to_str().unwrap()])
+        .output()
+        .expect("inspect direct-root PCLm trailer");
+    assert!(trailer.status.success());
+    let trailer = String::from_utf8_lossy(&trailer.stdout);
+    assert!(trailer.contains("/Root <<"));
+    assert!(trailer.contains("/ExtensionLevel 8"));
+    Ok(())
+}
+
+#[test]
+fn pclm_writer_rewrites_a_direct_root_with_deterministic_id() -> flpdf::Result<()> {
+    if !qpdf_available() {
+        eprintln!("qpdf is unavailable; skipping deterministic direct-root PCLm differential");
+        return Ok(());
+    }
+
+    let input = fixture("direct-root-one-page.pdf");
+    let temporary = tempfile::tempdir()?;
+    let output_path = temporary.path().join("pclm-deterministic.pdf");
+    let mut pdf = Pdf::open(BufReader::new(File::open(&input)?))?;
+    let settings = WriterTestSettings {
+        deterministic_id: true,
+        pclm: true,
+        ..WriterTestSettings::default()
+    };
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+    std::fs::write(&output_path, &output)?;
+    qpdf_check(&output_path);
+
+    let rewritten = Pdf::open(BufReader::new(File::open(&output_path)?))?;
+    assert!(rewritten.root_ref().is_none());
     Ok(())
 }

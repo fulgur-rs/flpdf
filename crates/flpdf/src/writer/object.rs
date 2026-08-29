@@ -3111,11 +3111,19 @@ fn unparse_trailer_entries_with_ref_map(
         }
         write_dictionary_key(out, key);
         out.push(b' ');
-        if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
-            // These two entries are installed by the writer immediately before
-            // emission and already carry output-space references. Every other
-            // trailer reference still belongs to the source graph and must go
-            // through the caller's old-to-new map.
+        if key.as_slice() == b"/Root" && value.as_reference().is_none() {
+            // An inline Catalog is writer-owned, but its indirect descendants
+            // remain in source space until this final child walk. qpdf's
+            // `unparseChild` recurses into that direct dictionary, so preserve
+            // the direct `/Root` shape while applying the caller's map below.
+            if qdf {
+                write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+            } else {
+                write_child_with_ref_map(value, out, map, removed_refs)?;
+            }
+        } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
+            // An indirect `/Root` or `/Encrypt` installed by the writer already
+            // carries an output-space reference and must not be remapped again.
             if qdf {
                 write_child_qdf(value, 2, out)?;
             } else {

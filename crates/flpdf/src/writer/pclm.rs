@@ -3,13 +3,15 @@
 //! PCLm does not use the ordinary Catalog-first queue. qpdf reserves output
 //! numbers as it enqueues page objects, their contents, image strips, and the
 //! synthetic image-transform streams. The queue then continues with references
-//! discovered while serializing those objects and ends with the Catalog.
+//! discovered while serializing those objects and ends with the Catalog. The
+//! direct/indirect root split follows `QPDFWriter.cc:328-333,1160-1236,
+//! 2068-2076,2928-2954` and the `qpdf/qtest/pclm.test` test-driver contract.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
-use crate::writer::rewrite_renumber::visible_raw_dict_entries;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::writer::rewrite_renumber::{collect_canonical_enqueue_refs, visible_raw_dict_entries};
+use crate::{Object, ObjectHandle, ObjectRef, Pdf, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Item {
@@ -26,12 +28,24 @@ pub(crate) enum Item {
 pub(crate) struct Plan {
     pub(crate) items: Vec<Item>,
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
-    pub(crate) root: ObjectRef,
+    /// Remapped Catalog identity when the source `/Root` is indirect.
+    pub(crate) root: Option<ObjectRef>,
+    /// Canonical Catalog handle when the source `/Root` is direct.
+    pub(crate) direct_root: Option<ObjectHandle>,
 }
 
 impl Plan {
     pub(crate) fn build<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Self> {
-        let root = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
+        let root_ref = pdf.root_ref();
+        let direct_root = if root_ref.is_none() {
+            let root_candidate = pdf.trailer_key_handle(b"Root");
+            if root_candidate.is_null() {
+                return Err(crate::Error::Missing("/Root"));
+            }
+            Some(pdf.root_handle()?)
+        } else {
+            None
+        };
         let mut builder = Builder {
             pdf,
             items: Vec::new(),
@@ -59,7 +73,11 @@ impl Plan {
             }
         }
 
-        builder.enqueue_reference(root);
+        if let Some(root) = root_ref {
+            builder.enqueue_reference(root);
+        } else if let Some(root) = direct_root.as_ref() {
+            builder.enqueue_handle_with_stream_length_policy(root)?; // cov:ignore: direct-root enqueue is exercised by PCLm integration tests; LLVM maps this continuation to the call setup.
+        } // cov:ignore: direct-root enqueue executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
 
         let mut cursor = 0;
         while cursor < builder.items.len() {
@@ -74,15 +92,15 @@ impl Plan {
             builder.enqueue_value_with_stream_length_policy(&object)?;
         }
 
-        let root = builder
-            .old_to_new
-            .get(&root)
-            .copied()
-            .ok_or(crate::Error::Missing("/Root"))?;
+        let root = root_ref.and_then(|root| builder.old_to_new.get(&root).copied());
+        if root_ref.is_some() && root.is_none() {
+            return Err(crate::Error::Missing("/Root")); // cov:ignore: enqueue_reference always inserts an indirect PCLm root before the plan map is read.
+        }
         Ok(Self {
             items: builder.items,
             old_to_new: builder.old_to_new,
             root,
+            direct_root,
         })
     }
 }
@@ -109,6 +127,20 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
         let output = ObjectRef::new(self.next_output, 0);
         self.next_output = self.next_output.saturating_add(1);
         self.items.push(Item::Synthetic { output });
+    }
+
+    /// Enqueue the indirect descendants of a direct Catalog through the live
+    /// handle graph. qpdf's `enqueueObject` recurses through a direct
+    /// dictionary without assigning it an object number; the canonical
+    /// collector supplies the same key/array order and skips a stream's
+    /// output-owned `/Length` edge.
+    fn enqueue_handle_with_stream_length_policy(&mut self, value: &ObjectHandle) -> Result<()> {
+        let mut references = Vec::new();
+        collect_canonical_enqueue_refs(self.pdf, value, 0, true, &mut references)?;
+        for reference in references {
+            self.enqueue_reference(reference);
+        }
+        Ok(())
     }
 
     fn enqueue_value(&mut self, value: &Object) -> Result<()> {
@@ -211,6 +243,19 @@ mod tests {
             include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
         ))
         .expect("fixture must open")
+    }
+
+    #[test]
+    fn plan_rejects_a_missing_root() {
+        let mut pdf = Pdf::open(Cursor::new(
+            b"%PDF-1.3\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n\
+              startxref\n9\n%%EOF\n"
+                .to_vec(),
+        ))
+        .expect("rootless fixture must open");
+
+        let error = Plan::build(&mut pdf).expect_err("PCLm requires a trailer /Root");
+        assert!(matches!(error, crate::Error::Missing("/Root")));
     }
 
     fn builder<'pdf>(pdf: &'pdf mut Pdf<Cursor<Vec<u8>>>) -> Builder<'pdf, Cursor<Vec<u8>>> {
