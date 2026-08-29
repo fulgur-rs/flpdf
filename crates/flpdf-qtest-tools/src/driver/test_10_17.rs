@@ -58,8 +58,22 @@ fn append_show_warnings(
     display_name: &str,
     warnings: &[String],
 ) -> flpdf::Result<()> {
+    // `flpdf::linearization::show_with_pdf`'s warnings are a mix of two
+    // shapes: those already formatted by `linearization_parameter_warning`
+    // (always `"{display_name} (...): ..."` or `"{display_name}: ..."`) and
+    // raw `check_linearization_warnings` messages with no filename at all
+    // (e.g. the literal text "first page object (/O) mismatch"). A bare
+    // `starts_with(display_name)` check is fooled whenever a short
+    // display_name coincidentally prefixes an unrelated word in a raw
+    // message (a `display_name` of "first" would wrongly treat that exact
+    // message as already qualified). Match the two literal shapes
+    // `linearization_parameter_warning` actually produces instead.
+    let qualified_with_paren = format!("{display_name} (");
+    let qualified_with_colon = format!("{display_name}: ");
     for warning in warnings {
-        let warning = if warning.starts_with(display_name) {
+        let warning = if warning.starts_with(&qualified_with_paren)
+            || warning.starts_with(&qualified_with_colon)
+        {
             format!("WARNING: {warning}\n")
         } else {
             format!("WARNING: {display_name}: {warning}\n")
@@ -665,6 +679,30 @@ mod tests {
         assert!(captured_bytes(&info)
             .expect("captured info bytes")
             .is_empty());
+    }
+
+    #[test]
+    fn show_warnings_qualify_a_raw_message_that_coincidentally_shares_the_filename_prefix() {
+        // Regression: "first page object (/O) mismatch" is a real raw
+        // check_linearization_warnings message (linearization/check.rs). A
+        // display_name of "first" is a plain `starts_with` match on this
+        // text without being an actual `"first ("`/`"first: "` qualification
+        // -- it must still get the "first: " prefix, not be passed through.
+        let info = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(Vec::new()));
+        let logger = captured_logger(Arc::clone(&info), Arc::clone(&error));
+
+        append_show_warnings(
+            &logger,
+            "first",
+            &["first page object (/O) mismatch".to_owned()],
+        )
+        .expect("append show warnings");
+
+        assert_eq!(
+            captured_bytes(&error).expect("captured warning bytes"),
+            b"WARNING: first: first page object (/O) mismatch\n"
+        );
     }
 
     fn run_output_test(

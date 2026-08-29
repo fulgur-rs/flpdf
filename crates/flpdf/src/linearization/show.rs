@@ -1126,7 +1126,7 @@ pub fn show_linearization_bytes_with_warnings(
 ) -> std::result::Result<ShowLinearizationOutput, ShowLinearizationError> {
     let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
-    show_linearization_pdf_with_warnings(&mut pdf, display_name)
+    show_with_pdf(&mut pdf, file_bytes, display_name)
 }
 
 /// Decode linearization data from an already-open document and retain the
@@ -1175,7 +1175,7 @@ pub fn show_linearization_path_with_warnings(
     let mut pdf = Pdf::open(Cursor::new(file_bytes.clone()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
     let display_name = path.to_string_lossy();
-    show_linearization_pdf_with_warnings(&mut pdf, &display_name)
+    show_with_pdf(&mut pdf, &file_bytes, &display_name)
 }
 
 // ---------------------------------------------------------------------------

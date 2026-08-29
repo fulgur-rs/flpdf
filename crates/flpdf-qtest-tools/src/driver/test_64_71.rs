@@ -225,8 +225,9 @@ pub(crate) fn run_test_67<R: Read + Seek>(
 ///
 /// [`ObjectHandle::get_stream_data`] preserves the qpdf exception detail and
 /// parsed source context at the canonical stream boundary. The driver catches
-/// that `Error::Unsupported` exactly like qpdf catches `std::exception`, then
-/// continues to the independent all-decoded and raw reads.
+/// every error from this call, not only `Error::Unsupported`, exactly like
+/// qpdf's `catch (std::exception&)`, then continues to the independent
+/// all-decoded and raw reads.
 ///
 /// The two sections after it are independent of the missing flag --
 /// [`DecodeLevel::All`] and [`ObjectHandle::get_raw_stream_data`] both exist
@@ -250,7 +251,10 @@ pub(crate) fn run_test_68<R: Read + Seek>(
         Err(flpdf::Error::Unsupported(message)) => {
             writeln!(stdout, "get unfilterable stream: {message}")?
         }
-        Err(error) => return Err(error),
+        // qpdf's `catch (std::exception&)` (`qpdf/test_driver.cc:2373-2375`)
+        // catches every accessor failure here, not only the unfilterable-
+        // stream case, and always continues to the independent reads below.
+        Err(error) => writeln!(stdout, "get unfilterable stream: {error}")?,
     }
 
     let b1 = qstream.get_stream_data(DecodeLevel::All)?;
@@ -472,7 +476,15 @@ mod tests {
     }
 
     #[test]
-    fn test_68_propagates_non_stream_errors_from_the_qpdf_catch_boundary() {
+    fn test_68_catches_every_accessor_error_like_qpdfs_broad_catch_boundary() {
+        // qpdf's `catch (std::exception&)` (test_driver.cc:2373-2375) catches
+        // ANY exception from the first `getStreamData()` call, not only the
+        // unfilterable-stream case, and always continues to the next
+        // (uncaught) read. A non-stream `/QStream` triggers a different
+        // accessor error on the first call, which must still be printed
+        // here; the second call (`get_stream_data(DecodeLevel::All)`, no
+        // catch) then fails identically and propagates, matching qpdf's own
+        // uncaught exception from that line.
         let mut pdf = Pdf::open_mem_owned_with_options(
             non_stream_qstream_pdf(),
             PdfOpenOptions {
@@ -493,12 +505,15 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
         )
-        .expect_err("non-stream QStream must escape the catch only for non-qpdf errors");
+        .expect_err("the second (uncaught) accessor call must still propagate");
         assert!(matches!(
             error,
             Error::Internal(message) if message == "pipeStreamData called for non-stream"
         ));
-        assert!(stdout.is_empty());
+        assert_eq!(
+            stdout,
+            b"get unfilterable stream: pipeStreamData called for non-stream\n"
+        );
         assert!(stderr.is_empty());
     }
 
