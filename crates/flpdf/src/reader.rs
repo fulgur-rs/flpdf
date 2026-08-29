@@ -341,19 +341,39 @@ impl<R: Read + Seek> Pdf<R> {
     /// helper snapshots the authenticated file key, the source `/Encrypt`
     /// dictionary, and the permanent `/ID[0]`; the writer then applies qpdf's
     /// canonical copy rules (including forcing AES for V>=4).
+    ///
+    /// `/ID[0]` is read from the value cached at authentication time, not
+    /// from a fresh live-trailer lookup: for a V<5 document `file_key` is
+    /// itself derived from `/ID[0]` (PDF 1.7 §7.6.3.3 Algorithm 2), so this
+    /// source's `id0` must stay paired with the SAME bytes `file_key` was
+    /// derived from even if a caller mutates the live trailer's `/ID` after
+    /// authentication completes -- otherwise the emitted `/ID[0]` and the
+    /// copied `/O`/`/U`/`/P` would imply a different file key than the one
+    /// actually used to encrypt the output. The R5/R6 (V=5) handler does not
+    /// derive `file_key` from `/ID` at all, so no cached value is available
+    /// there and a live read is safe.
     pub fn writer_copy_encryption_source(&mut self) -> Result<Option<CopyEncryptionSource>> {
-        let (file_key, encryption_v) = {
+        let (file_key, encryption_v, cached_id0) = {
             let guard = self.encryption.borrow();
             let Some(encryption) = guard.as_ref() else {
                 return Ok(None);
             };
-            (encryption.file_key.clone(), encryption.encryption_v)
+            (
+                encryption.file_key.clone(),
+                encryption.encryption_v,
+                encryption.id0.clone(),
+            )
         };
         let encrypt_dict = self.encrypt_dictionary()?.ok_or_else(|| {
             Error::Unsupported("authenticated input has no /Encrypt dictionary".into())
         })?;
-        let id_handle = self.trailer_key_handle(b"ID");
-        let id0 = crate::encryption::state::first_file_id_handle(&id_handle)?;
+        let id0 = match cached_id0 {
+            Some(id0) => id0,
+            None => {
+                let id_handle = self.trailer_key_handle(b"ID");
+                crate::encryption::state::first_file_id_handle(&id_handle)?
+            }
+        };
 
         Ok(Some(CopyEncryptionSource {
             encrypt_dict,
@@ -2704,6 +2724,7 @@ mod tests {
             encrypt_ref: None,
             weak_crypto: true,
             permissions: Permissions::new(-4),
+            id0: Some(b"fixture-id0".to_vec()),
             user_password_matched: true,
             owner_password_matched: false,
             user_password: Vec::new(),
@@ -8698,5 +8719,59 @@ mod tests {
 
         assert!(matches!(error, Error::Unsupported(message)
             if message == "authenticated input has no /Encrypt dictionary"));
+    }
+
+    #[test]
+    fn writer_copy_encryption_source_keeps_the_id_paired_with_the_authenticated_file_key() {
+        // A V<5 file key is derived from /ID[0] (PDF 1.7 §7.6.3.3 Algorithm
+        // 2). If a caller mutates the live trailer's /ID after opening --
+        // for example while assembling metadata for a downstream write --
+        // the copy-encryption source must still report the /ID[0] that
+        // `file_key` was actually derived from, not the mutated live value.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+        );
+        let fixture = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            fixture,
+            PdfOpenOptions {
+                password: b"user-v2".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open RC4 fixture");
+
+        let trailer = pdf.trailer();
+        let original_id = trailer
+            .try_get_key(b"/ID")
+            .expect("fetch trailer /ID")
+            .try_array_item(0)
+            .expect("fetch /ID[0]")
+            .expect("/ID[0] present")
+            .as_string()
+            .expect("/ID[0] is a string");
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"mutated-after-authentication".to_vec()),
+                    ObjectHandle::string(b"mutated-after-authentication".to_vec()),
+                ]),
+            )
+            .expect("mutate live trailer /ID after authentication");
+
+        let source = pdf
+            .writer_copy_encryption_source()
+            .expect("authenticated RC4 fixture has a copy-encryption source")
+            .expect("copy source is Some for an encrypted document");
+
+        assert_eq!(
+            source.id0, original_id,
+            "copy-encryption source must use the /ID[0] the file key was derived from, \
+             not a live trailer value mutated after authentication"
+        );
     }
 }

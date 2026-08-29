@@ -33,6 +33,15 @@ pub(crate) struct EncryptionState {
     pub(crate) encrypt_ref: Option<ObjectRef>,
     pub(crate) weak_crypto: bool,
     pub(crate) permissions: Permissions,
+    /// The `/ID[0]` bytes used to derive `file_key`, when derivation is
+    /// `/ID[0]`-dependent (qpdf's Algorithm 2, V<5). `None` for the R5/R6
+    /// AES-256 path, which does not read `/ID` at all
+    /// (`QPDF_encryption.cc:736-743` computes `id1` unconditionally before
+    /// dispatching to a handler, but only the V<5 handler consumes it). A
+    /// consumer that must stay paired with `file_key` (for example a
+    /// preserve-encryption copy source) must use this cached value instead
+    /// of re-reading a possibly-since-mutated live trailer `/ID`.
+    pub(crate) id0: Option<Vec<u8>>,
     pub(crate) user_password_matched: bool,
     pub(crate) owner_password_matched: bool,
     /// qpdf `EncryptionParameters::user_password`: padded/recovered for
@@ -406,6 +415,7 @@ pub(crate) fn authenticate(
         user_password_matched,
         owner_password_matched,
         user_password,
+        id0,
     ) = if password_is_hex_key {
         // qpdf `--password-is-hex-key`: the value passed via --password is
         // the precomputed file encryption key as hex, NOT a user/owner
@@ -421,14 +431,14 @@ pub(crate) fn authenticate(
         // password-independent; compute it with the SAME revision-aware
         // split layer-2 uses.
         let file_key = decode_hex_file_key(raw_password)?;
-        let (encrypt_metadata, weak_crypto) = if matches!(revision, 5 | 6) {
+        let (encrypt_metadata, weak_crypto, id0) = if matches!(revision, 5 | 6) {
             let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
             // Same weak-crypto classification as layer-2's R5/R6 branch.
-            (encrypt_metadata, revision == 5 || rc4_in_use())
+            (encrypt_metadata, revision == 5 || rc4_in_use(), None)
         } else {
             let id0 = first_file_id_handle(id)?;
             let inputs = standard_handler_inputs_with_id0(encrypt, &id0)?;
-            (inputs.encrypt_metadata, rc4_in_use())
+            (inputs.encrypt_metadata, rc4_in_use(), Some(id0))
         };
         // A raw key bypasses authentication, so neither the user nor the
         // owner password was matched. qpdf likewise reports no password
@@ -440,6 +450,7 @@ pub(crate) fn authenticate(
             false,
             false,
             Vec::new(),
+            id0,
         )
     } else if matches!(revision, 5 | 6) {
         // Authentication error behavior must match qpdf (see
@@ -489,6 +500,7 @@ pub(crate) fn authenticate(
             user_password_matched,
             owner_password_matched,
             user_password,
+            None,
         )
     } else {
         let id0 = first_file_id_handle(id)?;
@@ -522,6 +534,7 @@ pub(crate) fn authenticate(
             user_password_matched,
             owner_password_matched,
             user_password,
+            Some(id0),
         )
     };
 
@@ -546,6 +559,7 @@ pub(crate) fn authenticate(
             encrypt_ref,
             weak_crypto,
             permissions,
+            id0,
             user_password_matched,
             owner_password_matched,
             user_password,
