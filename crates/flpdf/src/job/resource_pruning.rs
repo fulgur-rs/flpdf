@@ -206,6 +206,13 @@ mod tests {
         let mut page_local = Pdf::open(Cursor::new(page_local)).unwrap();
         assert!(!should_remove_unreferenced_resources(&mut page_local).unwrap());
 
+        let dangling_resources = one_page_pdf(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 4 0 R >>",
+            &[(6, "<< >>")],
+        );
+        let mut dangling_resources = Pdf::open(Cursor::new(dangling_resources)).unwrap();
+        assert!(!should_remove_unreferenced_resources(&mut dangling_resources).unwrap());
+
         let inherited = build_pdf(
             &[
                 (1, "<< /Type /Catalog /Pages 2 0 R >>"),
