@@ -45,8 +45,9 @@ stream path with selected-page copying. A provider-backed primary `/Metadata`
 or other Catalog/trailer stream therefore remains lazy and depends on the
 source `Pdf` when it is later read.
 
-The first merge-level regression test showed that the current implementation
-calls the provider once before `merge_documents` returns. The call path is:
+The first merge-level regression test showed that, before the `flpdf-3yn9.39`
+writer-reachability split landed, the implementation called the provider once
+before `merge_documents` returned. That call path was:
 
 ```text
 page_merge.rs:1122

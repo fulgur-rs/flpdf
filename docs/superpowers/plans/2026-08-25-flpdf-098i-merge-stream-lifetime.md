@@ -190,7 +190,7 @@ fn merge_provider_catalog_stream_with_immediate_copy_survives_source_drop() {
 Run:
 
 ```bash
-cargo test -p flpdf --test page_merge_tests merge_provider_catalog_stream -- --nocapture
+cargo test -p flpdf --test page_merge_tests provider -- --nocapture
 ```
 
 Expected before `flpdf-3yn9.39`: the default-lazy and retained-source tests fail because the old `subset_prune` sweep invokes the provider during merge; the immediate-copy test passes. The failure must identify `page_merge.rs:1122` -> `subset_prune.rs:166`/`:229` -> `materialize`. After rebasing onto the prerequisite, rerun the same command and expect all three tests to pass.
@@ -253,7 +253,7 @@ Replace the stale final sentence at `reader.rs:1485-1487` with:
 
 ```bash
 cargo fmt --all -- --check
-cargo test -p flpdf --test page_merge_tests merge_provider_catalog_stream -- --nocapture
+cargo test -p flpdf --test page_merge_tests provider -- --nocapture
 cargo test -p flpdf --test page_merge_tests
 ```
 
