@@ -494,12 +494,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // QPDF::getAllPages returns an empty vector when the catalog has no
         // `/Pages` entry, so do not route that malformed-but-readable shape
         // through flpdf's stricter public `page_refs` missing-key error.
-        let pages = self
-            .pdf
-            .root_ref()
-            .map(|root_ref| self.pdf.get_object_handle(root_ref))
-            .map(|root| root.try_get_key(b"/Pages"))
-            .transpose()?;
+        // qpdf's `analyze()` obtains the Catalog through `QPDF::getRoot`
+        // before scanning all pages (`QPDFAcroFormDocumentHelper.cc:235-286`);
+        // use the same direct-or-indirect root gate here. Invalid root shapes
+        // retain the existing no-op analysis behavior.
+        let pages = match self.pdf.root_handle() {
+            Ok(root) => Some(root.try_get_key(b"/Pages")?),
+            Err(_) => None, // cov:ignore: analyze_field_tree returns before this fallback for the same invalid root
+        };
         if let Some(pages) = pages {
             // `QPDF::getAllPages` only enters its page walk when `/Pages`
             // has `/Kids`; `try_has_key` also preserves qpdf's type warning
@@ -1352,9 +1354,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     pub(crate) fn canonical_get_or_create_acroform(&mut self) -> Result<ObjectHandle> {
-        let root_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let root = self.pdf.get_object_handle(root_ref);
-        let root = self.pdf.resolve_to_terminal(&root)?;
+        // qpdf's getOrCreateAcroForm starts from QPDF::getRoot and mutates
+        // that live handle (`QPDFAcroFormDocumentHelper.cc:37-46`). A direct
+        // trailer /Root therefore remains direct; only the newly created
+        // AcroForm gets an indirect identity when needed.
+        let root = self.pdf.root_handle()?;
         let acroform = self
             .pdf
             .resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
@@ -1580,14 +1584,17 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// Propagates errors while resolving the catalog handle.
+    /// A missing or malformed `/Root` is treated as an absent AcroForm, as in
+    /// the helper's existing rootless no-op path. Other errors while reading
+    /// the catalog handle are propagated.
     pub fn has_acro_form(&mut self) -> Result<bool> {
-        let Some(root_ref) = self.pdf.root_ref() else {
+        // qpdf's hasAcroForm calls getRoot().hasKey directly
+        // (`QPDFAcroFormDocumentHelper.cc:32-36`), so a direct Catalog is a
+        // valid receiver just like an indirect one.
+        let Ok(root) = self.pdf.root_handle() else {
             return Ok(false);
         };
-        self.pdf
-            .get_object_handle(root_ref)
-            .try_has_key(b"/AcroForm")
+        root.try_has_key(b"/AcroForm")
     }
 
     /// Return the field's inherited `/V` value.
@@ -1715,9 +1722,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Missing`] when the document has no `/Root`.
-    /// - [`Error::Unsupported`] when the catalog or `/AcroForm` does not resolve
-    ///   to a dictionary, or when the object-number space is exhausted while
+    /// - [`Error::System`] when the document has no valid `/Root` Catalog.
+    /// - [`Error::Unsupported`] when `/AcroForm` does not resolve to a
+    ///   dictionary, or when the object-number space is exhausted while
     ///   creating `/AcroForm`.
     /// - Any error from [`Pdf::resolve`].
     pub fn set_default_appearance(&mut self, appearance: Vec<u8>) -> Result<()> {
@@ -1729,19 +1736,17 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     fn acroform_ref(&mut self) -> Result<Option<ObjectRef>> {
-        let Some(root_ref) = self.pdf.root_ref() else {
-            return Ok(None);
-        };
-        let catalog = self.resolve_dict(root_ref, "catalog")?;
+        let catalog = self.pdf.root_handle()?;
         let acroform = catalog.try_get_key(b"/AcroForm")?;
         Ok(acroform.object_ref().or_else(|| acroform.as_reference()))
     }
 
     fn acroform_dict(&mut self) -> Result<Option<ObjectHandle>> {
-        let Some(root_ref) = self.pdf.root_ref() else {
+        // Keep the helper's established rootless no-op behavior while using
+        // the canonical direct-or-indirect root gate for valid Catalogs.
+        let Ok(catalog) = self.pdf.root_handle() else {
             return Ok(None);
         };
-        let catalog = self.resolve_dict(root_ref, "catalog")?;
         let acroform = self
             .pdf
             .resolve_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
@@ -1753,8 +1758,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(existing_ref);
         }
 
-        let root_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let catalog = self.resolve_dict(root_ref, "catalog")?;
+        // Keep the Catalog as a live handle: qpdf's getOrCreateAcroForm
+        // mutates the result of getRoot() and does not require an ObjectRef
+        // for a direct trailer Catalog (`QPDFAcroFormDocumentHelper.cc:37-46`).
+        let catalog = self.pdf.root_handle()?;
         let existing = catalog.try_get_key(b"/AcroForm")?;
         let acroform = if existing.try_as_dictionary()?.is_some() {
             existing.shallow_copy()?
@@ -2304,6 +2311,75 @@ mod tests {
         Pdf::open(std::io::Cursor::new(bytes)).expect("open")
     }
 
+    /// Build a PDF whose trailer stores `/Root` as a direct Catalog
+    /// dictionary while keeping the page and AcroForm objects indirect. This
+    /// isolates the Catalog identity change from the other direct-object
+    /// cases covered by `direct_root_pdf_with_need_appearances`.
+    fn direct_root_pdf(objects: &[(u32, &str)], root: &str) -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let max = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+        for (number, body) in objects {
+            offsets.insert(*number, bytes.len() as u64);
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+
+        let xref = bytes.len() as u64;
+        let size = max + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..=max {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root {root} >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open(std::io::Cursor::new(bytes)).expect("open")
+    }
+
+    fn direct_root_pdf_with_acroform() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        direct_root_pdf(
+            &[
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (4, "<< /Fields [5 0 R] >>"),
+                (5, "<< /T (field) /FT /Tx >>"),
+            ],
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+        )
+    }
+
+    fn direct_root_pdf_with_orphan_widget() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        direct_root_pdf(
+            &[
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+                ),
+                (4, "<< /Fields [] >>"),
+                (5, "<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] >>"),
+            ],
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+        )
+    }
+
+    fn direct_root_pdf_with_inline_acroform() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        direct_root_pdf(
+            &[
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [] >> >>",
+        )
+    }
+
     #[test]
     fn get_need_appearances_reads_a_direct_root_acroform() {
         let mut pdf = direct_root_pdf_with_need_appearances();
@@ -2313,6 +2389,101 @@ mod tests {
             "a direct-root Catalog's /AcroForm /NeedAppearances must be found, \
              matching qpdf's QPDF::getRoot (trailer.getKey + isDictionary, no \
              indirect-only requirement)"
+        );
+    }
+
+    #[test]
+    fn analyze_maps_orphan_widgets_from_a_direct_root_catalog() {
+        let mut pdf = direct_root_pdf_with_orphan_widget();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        let map = helper.annotation_to_field_map().unwrap();
+
+        assert_eq!(
+            map.get(&ObjectRef::new(5, 0)),
+            Some(&ObjectRef::new(5, 0)),
+            "analyze must use qpdf's getRoot-shaped Catalog lookup before scanning page widgets"
+        );
+    }
+
+    #[test]
+    fn has_acro_form_reads_a_direct_root_catalog() {
+        let mut pdf = direct_root_pdf_with_acroform();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        assert!(helper.has_acro_form().unwrap());
+    }
+
+    #[test]
+    fn fields_reads_an_acroform_beneath_a_direct_root_catalog() {
+        let mut pdf = direct_root_pdf_with_acroform();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        assert_eq!(helper.fields().unwrap(), vec![ObjectRef::new(5, 0)]);
+    }
+
+    #[test]
+    fn canonical_get_or_create_acroform_mutates_a_direct_root_catalog() {
+        let mut pdf = direct_root_pdf(
+            &[
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            "<< /Type /Catalog /Pages 2 0 R >>",
+        );
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        let created = helper
+            .canonical_get_or_create_acroform()
+            .expect("direct-root Catalog should be mutable through its live handle");
+        let catalog = helper.pdf.root_handle().unwrap();
+        let catalog_acroform = catalog.try_get_key(b"/AcroForm").unwrap();
+
+        assert_eq!(created.object_ref(), catalog_acroform.object_ref());
+        assert!(created.try_as_dictionary().unwrap().is_some());
+    }
+
+    #[test]
+    fn ensure_acroform_ref_promotes_inline_acroform_under_a_direct_root() {
+        let mut pdf = direct_root_pdf_with_inline_acroform();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        helper
+            .set_default_appearance(b"/Helv 12 Tf 0 g".to_vec())
+            .expect("direct-root Catalog should support AcroForm mutation");
+        let catalog = helper.pdf.root_handle().unwrap();
+        let acroform = catalog.try_get_key(b"/AcroForm").unwrap();
+        let acroform_ref = acroform
+            .object_ref()
+            .expect("ensure_acroform_ref must promote the inline AcroForm");
+        let acroform = helper.pdf.get_object_handle(acroform_ref);
+
+        assert_eq!(
+            acroform.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Helv 12 Tf 0 g".to_vec())
+        );
+    }
+
+    #[test]
+    fn acroform_ref_reuses_an_indirect_acroform_under_a_direct_root() {
+        let mut pdf = direct_root_pdf_with_acroform();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        helper
+            .set_default_appearance(b"/Helv 12 Tf 0 g".to_vec())
+            .expect("existing indirect AcroForm should be found beneath a direct root");
+        let catalog = helper.pdf.root_handle().unwrap();
+        let acroform = catalog.try_get_key(b"/AcroForm").unwrap();
+
+        assert_eq!(acroform.object_ref(), Some(ObjectRef::new(4, 0)));
+        assert_eq!(
+            helper
+                .pdf
+                .get_object_handle(ObjectRef::new(4, 0))
+                .try_get_key(b"/DA")
+                .unwrap()
+                .as_string(),
+            Some(b"/Helv 12 Tf 0 g".to_vec())
         );
     }
 
