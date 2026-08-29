@@ -2,11 +2,11 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::{
-    NameTree, NumberTree, ObjectHandle, OutlineDocumentHelper, PageDocumentHelper,
+    Error, NameTree, NumberTree, ObjectHandle, OutlineDocumentHelper, PageDocumentHelper,
     PageLabelDocumentHelper, Pdf, PdfWriter,
 };
 
-use super::emit_new_diagnostics;
+use super::{emit_new_diagnostics, format_nntree_exception};
 use crate::output::write_bytes;
 
 // Shared helpers for test_46/test_48 (qpdf's number-tree/name-tree driver
@@ -310,9 +310,10 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     writeln!(stdout, "/Bad1")?;
     let mut bad1 = NumberTree::new(pdf.trailer_key_handle(b"Bad1"), true);
     let bad1_begin = bad1.begin(pdf)?;
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert!(bad1_begin == bad1.end());
-    assert!(bad1.last(pdf)? == bad1.end());
+    let bad1_last = bad1.last(pdf)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(bad1_last == bad1.end());
 
     writeln!(stdout, "/Bad2")?;
     let mut bad2 = NumberTree::new(pdf.trailer_key_handle(b"Bad2"), true);
@@ -323,6 +324,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         write_bytes(stdout, &value.unparse())?;
         writeln!(stdout)?;
         cursor.next(&mut bad2, pdf)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
 
     for key in [&b"Empty1"[..], &b"Empty2"[..]] {
@@ -331,9 +333,10 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         writeln!(stdout)?;
         let mut empty = NumberTree::new(pdf.trailer_key_handle(key), true);
         let empty_begin = empty.begin(pdf)?;
-        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         assert!(empty_begin == empty.end());
-        assert!(empty.last(pdf)? == empty.end());
+        let empty_last = empty.last(pdf)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        assert!(empty_last == empty.end());
 
         let inserted = empty.insert(pdf, 5, ObjectHandle::string(b"5".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("index 5 present");
@@ -364,13 +367,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
 
     writeln!(stdout, "Insert into invalid")?;
     let mut invalid1 = NumberTree::new(ObjectHandle::dictionary(Vec::new()), true);
-    // GAP(QPDFExc::what): qpdf catches the `QPDFExc` this throws (the root
-    // is a direct dictionary with neither `/Nums` nor `/Kids`) and prints
-    // `e.what()`. flpdf's `Error::to_string()` (`error.rs`) is not
-    // verified byte-identical to `QPDFExc::createWhat`'s formatting for
-    // this condition, so the real, invalid `insert` call is still made for
-    // its side effects, but its error text is not printed.
-    let _ = invalid1.insert(pdf, 1, ObjectHandle::null());
+    let invalid_insert = invalid1.insert(pdf, 1, ObjectHandle::null());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    if let Err(error) = invalid_insert {
+        write_nntree_error(stdout, filename, &error)?;
+    }
 
     writeln!(stdout, "/Bad3, no repair")?;
     let bad3_object = pdf.trailer_key_handle(b"Bad3");
@@ -382,6 +383,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         write_bytes(stdout, &value.unparse())?;
         writeln!(stdout)?;
         cursor.next(&mut bad3, pdf)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
     assert!(!kids_item_0_is_indirect(pdf, &bad3_object)?);
 
@@ -394,6 +396,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         write_bytes(stdout, &value.unparse())?;
         writeln!(stdout)?;
         cursor.next(&mut bad3, pdf)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
     assert!(kids_item_0_is_indirect(pdf, &bad3_object)?);
 
@@ -407,6 +410,7 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         write_bytes(stdout, &value.unparse())?;
         writeln!(stdout)?;
         cursor.next(&mut bad4, pdf)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
 
     writeln!(stdout, "/Bad5 -- limit errors")?;
@@ -416,6 +420,21 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(found == bad5.end());
 
     Ok(())
+}
+
+fn write_nntree_error(
+    stdout: &mut dyn Write,
+    filename: &[u8],
+    error: &Error,
+) -> std::io::Result<()> {
+    if let Error::Parse { message, .. } = error {
+        if let Some(exception) = format_nntree_exception(filename, message) {
+            stdout.write_all(&exception)?;
+            stdout.write_all(b"\n")?;
+            return Ok(());
+        }
+    }
+    writeln!(stdout, "{error}")
 }
 
 /// Whether the root's `/Kids` array's first item is stored indirectly --
@@ -726,7 +745,10 @@ pub(crate) fn run_test_49<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, tree_string_value};
+    use super::{
+        chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, run_test_46,
+        tree_string_value, write_nntree_error,
+    };
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
@@ -761,6 +783,42 @@ mod tests {
             )
             .as_bytes(),
         );
+        bytes
+    }
+
+    fn pdf_with_number_trees() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 3];
+        for &(number, body) in objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        let trailer = concat!(
+            "trailer\n<< /Size 3 /Root 1 0 R ",
+            "/QTest << /Nums [",
+            "1 (one) 2 (two) 3 (three) 5 (five) 6 (six) ",
+            "9 (nine) 11 (elephant) 12 (twelve) 15 (fifteen) ",
+            "19 (nineteen) 20 (twenty) 22 (twenty-two) ",
+            "23 (twenty-three) 29 (twenty-nine)] >> ",
+            "/Bad1 << /Nums [] >> ",
+            "/Bad2 << /Nums [10 (10) 15 (15) 35 (35) 38 (38)] >> ",
+            "/Empty1 << /Nums [] >> /Empty2 << /Nums [] >> ",
+            "/Bad3 << /Kids [<< /Nums [0 (zero) 10 (ten)] >>] >> ",
+            "/Bad4 << /Nums [] >> /Bad5 << /Nums [] >> >>\n",
+        );
+        bytes.extend_from_slice(trailer.as_bytes());
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
         bytes
     }
 
@@ -861,6 +919,57 @@ mod tests {
         let root = pdf.trailer_key_handle(b"Root");
         let pages = chase_key(&mut pdf, &root, b"/Pages").expect("resolve /Pages");
         assert!(!kids_item_0_is_indirect(&mut pdf, &pages).expect("inspect /Kids"));
+    }
+
+    #[test]
+    fn number_tree_driver_fixture_covers_qpdf_warning_boundaries() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_number_trees(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "number-tree.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open number-tree fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_46(
+            &mut pdf,
+            b"number-tree.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 46");
+
+        assert!(stdout
+            .windows(b"29 twenty-nine\n".len())
+            .any(|window| window == b"29 twenty-nine\n"));
+        assert!(stdout
+            .windows(
+                b"number-tree.pdf (Name/Number tree node): unable to find a valid items node".len()
+            )
+            .any(|window| {
+                window
+                    == b"number-tree.pdf (Name/Number tree node): unable to find a valid items node"
+            }));
+        assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn nntree_error_writer_falls_back_for_non_structural_errors() {
+        let mut stdout = Vec::new();
+        write_nntree_error(
+            &mut stdout,
+            b"number-tree.pdf",
+            &flpdf::Error::System("ordinary error".to_owned()),
+        )
+        .expect("write fallback error");
+        assert_eq!(stdout, b"ordinary error\n");
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::bit_stream::{BitStream, BitStreamError};
 use crate::ObjectRef;
 use crate::{ObjectHandle, Pdf};
 use std::fmt;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
@@ -139,8 +139,8 @@ impl From<ShowLinearizationError> for ShowTablesError {
     }
 }
 
-fn load_hint_stream_for_show(
-    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+fn load_hint_stream_for_show<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     file_bytes: &[u8],
     offset: usize,
     expected_h_length: u64,
@@ -698,7 +698,7 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
 
 /// Format a qpdf `damagedPDF` warning raised while loading linearization data.
 fn linearization_parameter_warning(
-    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    pdf: &mut Pdf<impl Read + Seek>,
     display_name: &str,
     message: &str,
 ) -> ShowResult<String> {
@@ -766,10 +766,8 @@ pub(crate) fn read_hint_offsets(hint_dict: &ObjectHandle) -> ShowResult<(usize, 
 /// Decode the linearization data of `pdf` and format it like qpdf
 /// `--show-linearization`, using `display_name` for the leading filename line.
 ///
-/// Monomorphic over `Cursor<Vec<u8>>` (both public wrappers open the bytes that
-/// way) so coverage instrumentation attributes its body to a single instance.
-fn show_with_pdf(
-    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+fn show_with_pdf<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     file_bytes: &[u8],
     display_name: &str,
 ) -> ShowResult<ShowLinearizationOutput> {
@@ -1129,6 +1127,25 @@ pub fn show_linearization_bytes_with_warnings(
     let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
     show_with_pdf(&mut pdf, file_bytes, display_name)
+}
+
+/// Decode linearization data from an already-open document and retain the
+/// ordered soft warnings produced by qpdf's show operation.
+///
+/// This is the live-document counterpart of
+/// [`show_linearization_bytes_with_warnings`]. It reads the logical bytes from
+/// the same resolver-owned input source that the supplied [`Pdf`] uses, then
+/// runs the decoder against that same document and its canonical object cache.
+/// In particular, it does not open a second document or lose the document's
+/// logger, warning-suppression state, or source description.
+pub fn show_linearization_pdf_with_warnings<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    display_name: &str,
+) -> std::result::Result<ShowLinearizationOutput, ShowLinearizationError> {
+    let file_bytes = pdf
+        .source_bytes()
+        .map_err(|error| ShowLinearizationError::Io(Box::new(error)))?;
+    show_with_pdf(pdf, &file_bytes, display_name)
 }
 
 /// Decode the linearization data of the PDF at `path` and format it like qpdf

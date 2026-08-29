@@ -147,6 +147,12 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         // The compatibility driver owns byte-exact warning formatting and
         // routes it through the caller-supplied stdout/stderr writers below.
         suppress_warnings: true,
+        // qpdf's processFile/processMemoryFile stores the input name on the
+        // document before any lazy warning can reach QPDF::warn. Keep the
+        // same description on the canonical resolver so a later live logger
+        // route (for example test 12/13's setOutputStreams) includes the
+        // filename in QPDFExc-compatible warning text.
+        description: String::from_utf8_lossy(&filename_diagnostic).into_owned(),
         ..PdfOpenOptions::default()
     };
     if let (true, Some(password)) = (n == 35 || n == 36, arg2) {
@@ -1224,6 +1230,11 @@ pub(crate) fn write_warning(
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
     let message = diagnostic.message.as_str();
+    if let Some(exception) = format_nntree_exception(filename, message) {
+        let mut line = b"WARNING: ".to_vec();
+        line.extend_from_slice(&exception);
+        return write_stderr_bytes(stdout, stderr, &line);
+    }
     let offset = diagnostic.offset;
     let mut line = b"WARNING: ".to_vec();
     line.extend_from_slice(filename);
@@ -1236,6 +1247,49 @@ pub(crate) fn write_warning(
     }
     line.extend_from_slice(message.as_bytes());
     write_stderr_bytes(stdout, stderr, &line)
+}
+
+/// Reproduce qpdf's `QPDFExc::createWhat` for the structural messages emitted
+/// by the canonical NNTree implementation.
+///
+/// flpdf stores the object description and detail together in a diagnostic
+/// message so the core warning sink remains generic. qpdf keeps those fields
+/// separate until `QPDF::warn` constructs the exception. The qtest driver is
+/// the output boundary, so it restores that composition here, including the
+/// filename repeated inside a nested "attempting to repair" detail.
+pub(crate) fn format_nntree_exception(filename: &[u8], message: &str) -> Option<Vec<u8>> {
+    const PREFIX: &str = "Name/Number tree node";
+    if !message.starts_with(PREFIX) {
+        return None;
+    }
+    let separator = message.find(": ")?;
+    let object = &message[..separator];
+    let detail = &message[separator + 2..];
+    let mut result = Vec::new();
+    if filename.is_empty() {
+        result.extend_from_slice(object.as_bytes());
+    } else {
+        result.extend_from_slice(filename);
+        result.extend_from_slice(b" (");
+        result.extend_from_slice(object.as_bytes());
+        result.extend_from_slice(b")");
+    }
+    result.extend_from_slice(b": ");
+
+    if let Some(nested_start) = detail.find(PREFIX) {
+        let before_nested = &detail[..nested_start];
+        if before_nested.ends_with("error: ") {
+            result.extend_from_slice(before_nested.as_bytes());
+            if let Some(nested) = format_nntree_exception(filename, &detail[nested_start..]) {
+                result.extend_from_slice(&nested);
+            } else {
+                result.extend_from_slice(&detail.as_bytes()[nested_start..]);
+            }
+            return Some(result);
+        }
+    }
+    result.extend_from_slice(detail.as_bytes());
+    Some(result)
 }
 
 fn write_error(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &str) -> u8 {
@@ -1260,9 +1314,10 @@ fn write_stderr_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        crt_open_error_message, has_interior_nul, open_error_bytes, open_pdf_error_bytes, run,
-        write_error_bytes,
+        crt_open_error_message, format_nntree_exception, has_interior_nul, open_error_bytes,
+        open_pdf_error_bytes, run, write_error_bytes, write_warning,
     };
+    use flpdf::Diagnostic;
     use std::{
         ffi::{OsStr, OsString},
         io::{self, Write},
@@ -1320,6 +1375,60 @@ mod tests {
     fn interior_nul_guard_rejects_a_path_that_would_be_truncated_by_the_crt() {
         assert!(has_interior_nul(OsStr::new("before\0after")));
         assert!(!has_interior_nul(OsStr::new("ordinary.pdf")));
+    }
+
+    #[test]
+    fn name_number_tree_warning_uses_qpdf_object_context() {
+        let diagnostic = Diagnostic::warning(
+            "Name/Number tree node (object 14): name/number tree node has neither non-empty /Nums nor /Kids",
+            None,
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"number-tree.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: number-tree.pdf (Name/Number tree node (object 14)): name/number tree node has neither non-empty /Nums nor /Kids\n"
+        );
+    }
+
+    #[test]
+    fn name_number_tree_repair_warning_formats_nested_qpdf_contexts() {
+        let diagnostic = Diagnostic::warning(
+            "Name/Number tree node (object 24): attempting to repair after error: Name/Number tree node (object 25): node is missing /Limits",
+            None,
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"number-tree.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert_eq!(
+            stderr,
+            b"WARNING: number-tree.pdf (Name/Number tree node (object 24)): attempting to repair after error: number-tree.pdf (Name/Number tree node (object 25)): node is missing /Limits\n"
+        );
+    }
+
+    #[test]
+    fn name_number_tree_exception_handles_empty_filename_and_malformed_nested_detail() {
+        assert_eq!(
+            format_nntree_exception(b"", "Name/Number tree node: invalid tree")
+                .expect("empty filename context"),
+            b"Name/Number tree node: invalid tree"
+        );
+        assert_eq!(
+            format_nntree_exception(
+                b"number-tree.pdf",
+                "Name/Number tree node (object 24): attempting to repair after error: Name/Number tree node without detail"
+            )
+            .expect("malformed nested context"),
+            b"number-tree.pdf (Name/Number tree node (object 24)): attempting to repair after error: Name/Number tree node without detail"
+        );
     }
 
     #[test]

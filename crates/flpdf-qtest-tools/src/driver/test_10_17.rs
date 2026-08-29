@@ -1,10 +1,108 @@
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf, PdfWriter,
-    StreamDataMode,
+    linearization::show_linearization_pdf_with_warnings, DecodeLevel, Error, ObjectHandle,
+    ObjectRef, PageDocumentHelper, PageInput, Pdf, PdfWriter, Pipeline, PipelineHandle,
+    PipelineResult, QPDFLogger, StreamDataMode,
 };
+
+struct CapturedPipeline {
+    identifier: &'static str,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Pipeline for CapturedPipeline {
+    fn identifier(&self) -> &str {
+        self.identifier
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes
+            .lock()
+            .map_err(|_| flpdf::PipelineError::runtime("captured pipeline mutex poisoned"))?
+            .extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn captured_logger(info: Arc<Mutex<Vec<u8>>>, error: Arc<Mutex<Vec<u8>>>) -> QPDFLogger {
+    let logger = QPDFLogger::create();
+    logger.set_output_streams(
+        Some(PipelineHandle::new(CapturedPipeline {
+            identifier: "qtest linearization output",
+            bytes: info,
+        })),
+        Some(PipelineHandle::new(CapturedPipeline {
+            identifier: "qtest linearization error",
+            bytes: error,
+        })),
+    );
+    logger
+}
+
+fn captured_bytes(bytes: &Arc<Mutex<Vec<u8>>>) -> flpdf::Result<Vec<u8>> {
+    bytes
+        .lock()
+        .map(|bytes| bytes.clone())
+        .map_err(|_| flpdf::PipelineError::runtime("captured pipeline mutex poisoned").into())
+}
+
+fn append_show_warnings(
+    logger: &QPDFLogger,
+    display_name: &str,
+    warnings: &[String],
+) -> flpdf::Result<()> {
+    // `flpdf::linearization::show_with_pdf`'s warnings are a mix of two
+    // shapes: those already formatted by `linearization_parameter_warning`
+    // (always `"{display_name} (...): ..."` or `"{display_name}: ..."`) and
+    // raw `check_linearization_warnings` messages with no filename at all
+    // (e.g. the literal text "first page object (/O) mismatch"). A bare
+    // `starts_with(display_name)` check is fooled whenever a short
+    // display_name coincidentally prefixes an unrelated word in a raw
+    // message (a `display_name` of "first" would wrongly treat that exact
+    // message as already qualified). Match the two literal shapes
+    // `linearization_parameter_warning` actually produces instead.
+    let qualified_with_paren = format!("{display_name} (");
+    let qualified_with_colon = format!("{display_name}: ");
+    for warning in warnings {
+        let warning = if warning.starts_with(&qualified_with_paren)
+            || warning.starts_with(&qualified_with_colon)
+        {
+            format!("WARNING: {warning}\n")
+        } else {
+            format!("WARNING: {display_name}: {warning}\n")
+        };
+        logger.warn(warning)?;
+    }
+    Ok(())
+}
+
+fn capture_live_linearization<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<(Vec<u8>, Vec<u8>)> {
+    let info = Arc::new(Mutex::new(Vec::new()));
+    let error = Arc::new(Mutex::new(Vec::new()));
+    let logger = captured_logger(Arc::clone(&info), Arc::clone(&error));
+    pdf.set_logger(logger.clone());
+    pdf.set_suppress_warnings(false);
+
+    let display_name = String::from_utf8_lossy(filename);
+    let result = show_linearization_pdf_with_warnings(pdf, &display_name)
+        .map_err(|show_error| Error::System(show_error.to_string()))?;
+    append_show_warnings(&logger, &display_name, &result.warnings)?;
+    logger.info(result.dump)?;
+
+    *diagnostics_written = pdf.repair_diagnostics().entries().len();
+    Ok((captured_bytes(&error)?, captured_bytes(&info)?))
+}
 
 /// qpdf source: `qpdf/test_driver.cc:522-535` (`test_10`).
 ///
@@ -114,30 +212,26 @@ pub(crate) fn run_test_11<R: Read + Seek>(
 /// any structural problem it finds before dumping every table field to the
 /// logger's info pipeline (`libqpdf/QPDF_linearization.cc:836-870`).
 ///
-/// GAP(`QPDF::showLinearizationData`): flpdf's only linearization-dump
-/// primitive, [`flpdf::linearization::show_linearization_bytes`], fuses
-/// qpdf's separate read/check/dump phases into one all-or-nothing call — any
-/// malformed hint table or parameter value that qpdf would report as a
-/// non-fatal `linearizationWarning` (continuing on to dump the tables that
-/// did parse) instead aborts the whole call with no partial output. It also
-/// takes raw `file_bytes` and re-opens its own internal `Pdf`, rather than
-/// operating on the already-open `pdf: &mut Pdf<R>` this function receives
-/// (which may already carry repair diagnostics or a non-seekable source).
-/// Neither the warn-and-continue dump behavior nor the print destination
-/// swap between qpdf's info/warn logger pipelines and this test's own
-/// `stdout`/`stderr` parameters has an equivalent here.
+/// The live-document counterpart [`flpdf::linearization::
+/// show_linearization_pdf_with_warnings`] reads the same resolver-owned input
+/// and leaves the qpdf-style logger/suppression state under the caller's
+/// control. The capture below is only the qtest driver's `ostringstream`
+/// equivalent; it does not replace the linearization decoder or reopen the
+/// input.
 pub(crate) fn run_test_12<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDF::showLinearizationData): see module doc above this function;
-    // no flpdf primitive reproduces qpdf's warn-and-continue dump against an
-    // already-open document. Nothing in the test body executes before this
-    // call, so there is no partial real output to emit.
+    let (error, info) = capture_live_linearization(pdf, filename, diagnostics_written)?;
+    // qpdf's error stream is unbuffered while its ordinary output is buffered;
+    // forwarding the captured error first preserves the combined qtest order
+    // of warnings followed by the linearization dump.
+    stderr.write_all(&error)?;
+    stdout.write_all(&info)?;
     Ok(())
 }
 
@@ -148,22 +242,21 @@ pub(crate) fn run_test_12<R: Read + Seek>(
 /// `"---output---\n"` + the captured info text + `"---error---\n"` + the
 /// captured warn text to the real stdout.
 ///
-/// GAP(`QPDF::showLinearizationData`): identical root cause to `test_12` —
-/// see that function's GAP note. The capture-then-print wrapper here adds no
-/// new primitive requirement; the missing piece is the same warn-and-continue
-/// dump against an already-open `pdf`.
+/// The same live-document show operation is used here, with separate captured
+/// info and error pipelines matching qpdf's two `ostringstream` instances.
 pub(crate) fn run_test_13<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
-    _stdout: &mut dyn Write,
+    stdout: &mut dyn Write,
     _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDF::showLinearizationData): see run_test_12's GAP note; the
-    // capture-into-ostringstream wrapper here is irrelevant since the
-    // underlying dump call itself has no equivalent. Nothing in the test
-    // body executes before this call.
+    let (error, info) = capture_live_linearization(pdf, filename, diagnostics_written)?;
+    stdout.write_all(b"---output---\n")?;
+    stdout.write_all(&info)?;
+    stdout.write_all(b"---error---\n")?;
+    stdout.write_all(&error)?;
     Ok(())
 }
 
@@ -540,8 +633,142 @@ pub(crate) fn run_test_17<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::run_test_16;
-    use flpdf::{DecodeLevel, PageDocumentHelper, Pdf, PdfOpenOptions};
+    use super::{
+        append_show_warnings, captured_bytes, captured_logger, run_test_12, run_test_13,
+        run_test_16, CapturedPipeline,
+    };
+    use flpdf::{
+        linearization::show_linearization_bytes, DecodeLevel, PageDocumentHelper, Pdf,
+        PdfOpenOptions, Pipeline,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn captured_pipeline_implements_the_qpdf_sink_lifecycle() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = CapturedPipeline {
+            identifier: "test capture",
+            bytes: Arc::clone(&bytes),
+        };
+        assert_eq!(pipeline.identifier(), "test capture");
+        pipeline.write(b"payload").expect("capture write");
+        pipeline.finish().expect("capture finish");
+        assert_eq!(captured_bytes(&bytes).expect("capture bytes"), b"payload");
+    }
+
+    #[test]
+    fn show_warnings_route_to_the_captured_error_sink_with_or_without_a_name() {
+        let info = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(Vec::new()));
+        let logger = captured_logger(Arc::clone(&info), Arc::clone(&error));
+
+        append_show_warnings(
+            &logger,
+            "input.pdf",
+            &[
+                "input.pdf: named warning".to_owned(),
+                "bare warning".to_owned(),
+            ],
+        )
+        .expect("append show warnings");
+
+        assert_eq!(
+            captured_bytes(&error).expect("captured warning bytes"),
+            b"WARNING: input.pdf: named warning\nWARNING: input.pdf: bare warning\n"
+        );
+        assert!(captured_bytes(&info)
+            .expect("captured info bytes")
+            .is_empty());
+    }
+
+    #[test]
+    fn show_warnings_qualify_a_raw_message_that_coincidentally_shares_the_filename_prefix() {
+        // Regression: "first page object (/O) mismatch" is a real raw
+        // check_linearization_warnings message (linearization/check.rs). A
+        // display_name of "first" is a plain `starts_with` match on this
+        // text without being an actual `"first ("`/`"first: "` qualification
+        // -- it must still get the "first: " prefix, not be passed through.
+        let info = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(Vec::new()));
+        let logger = captured_logger(Arc::clone(&info), Arc::clone(&error));
+
+        append_show_warnings(
+            &logger,
+            "first",
+            &["first page object (/O) mismatch".to_owned()],
+        )
+        .expect("append show warnings");
+
+        assert_eq!(
+            captured_bytes(&error).expect("captured warning bytes"),
+            b"WARNING: first: first page object (/O) mismatch\n"
+        );
+    }
+
+    fn run_output_test(
+        test: impl FnOnce(
+            &mut Pdf<std::io::Cursor<Vec<u8>>>,
+            &mut Vec<u8>,
+            &mut Vec<u8>,
+            &mut usize,
+        ) -> flpdf::Result<()>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let bytes = include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec();
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open minimal fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        test(&mut pdf, &mut stdout, &mut stderr, &mut diagnostics_written)
+            .expect("run output redirection test");
+        (stdout, stderr)
+    }
+
+    #[test]
+    fn test_12_routes_live_pdf_show_output_to_stdout() {
+        let (stdout, stderr) = run_output_test(|pdf, stdout, stderr, diagnostics_written| {
+            run_test_12(
+                pdf,
+                b"minimal.pdf",
+                None,
+                stdout,
+                stderr,
+                diagnostics_written,
+            )
+        });
+        let bytes = include_bytes!("../../../../tests/fixtures/minimal.pdf");
+        let expected = show_linearization_bytes(bytes, "minimal.pdf").expect("show minimal");
+        assert_eq!(stdout, expected.as_bytes());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_13_captures_live_pdf_info_and_error_sections() {
+        let (stdout, stderr) = run_output_test(|pdf, stdout, stderr, diagnostics_written| {
+            run_test_13(
+                pdf,
+                b"minimal.pdf",
+                None,
+                stdout,
+                stderr,
+                diagnostics_written,
+            )
+        });
+        let bytes = include_bytes!("../../../../tests/fixtures/minimal.pdf");
+        let expected = show_linearization_bytes(bytes, "minimal.pdf").expect("show minimal");
+        let mut expected_stdout = b"---output---\n".to_vec();
+        expected_stdout.extend_from_slice(expected.as_bytes());
+        expected_stdout.extend_from_slice(b"---error---\n");
+        assert_eq!(stdout, expected_stdout);
+        assert!(stderr.is_empty());
+    }
+
     use std::collections::BTreeMap;
 
     /// A 10-page PDF whose page `i` has `/Contents` reading exactly
