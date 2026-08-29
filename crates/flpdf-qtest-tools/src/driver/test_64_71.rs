@@ -223,20 +223,10 @@ pub(crate) fn run_test_67<R: Read + Seek>(
 /// own [`DecodeLevel::Generalized`] does per `qpdf-port-design-patterns.md`
 /// parity).
 ///
-/// GAP(the `filtered` out-parameter of `QPDF_Stream::pipeStreamData`):
-/// flpdf's public [`ObjectHandle::get_stream_data`] has no accessible
-/// equivalent of that boolean -- its own internal `filtering_attempted` flag
-/// (`object_handle.rs`'s `pipe_stream_data_inner`), set by the identical
-/// rule, is never surfaced through the public `Result<Rc<Vec<u8>>>` return,
-/// which instead reports only overall pipe I/O success. This exact
-/// try/throw/catch pair therefore cannot be reproduced: neither
-/// `"oops -- didn't throw"` nor `"get unfilterable stream: ..."` is printed.
-/// The call is still made below, matching qpdf's own real evaluation of this
-/// expression (its `try` block always calls it) and any internal state it
-/// would leave behind, even though this file cannot observe or branch on
-/// whether qpdf's real call would have thrown; any error here is discarded
-/// rather than propagated with `?`, matching qpdf's `catch (std::exception&)`
-/// swallowing it rather than letting it escape this function.
+/// [`ObjectHandle::get_stream_data`] preserves the qpdf exception detail and
+/// parsed source context at the canonical stream boundary. The driver catches
+/// that `Error::Unsupported` exactly like qpdf catches `std::exception`, then
+/// continues to the independent all-decoded and raw reads.
 ///
 /// The two sections after it are independent of the missing flag --
 /// [`DecodeLevel::All`] and [`ObjectHandle::get_raw_stream_data`] both exist
@@ -255,9 +245,13 @@ pub(crate) fn run_test_68<R: Read + Seek>(
     let qstream = dict_key(pdf, &root, b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
 
-    // GAP(the `filtered` out-parameter of `QPDF_Stream::pipeStreamData`): see
-    // this function's own doc above.
-    let _ = qstream.get_stream_data(DecodeLevel::Generalized);
+    match qstream.get_stream_data(DecodeLevel::Generalized) {
+        Ok(_) => writeln!(stdout, "oops -- didn't throw")?,
+        Err(flpdf::Error::Unsupported(message)) => {
+            writeln!(stdout, "get unfilterable stream: {message}")?
+        }
+        Err(error) => return Err(error),
+    }
 
     let b1 = qstream.get_stream_data(DecodeLevel::All)?;
     if b1.len() > 10 && b1.starts_with(b"wwwwwwwww") {
@@ -386,4 +380,153 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     writeln!(stdout, "--- get form XObjects, page ---")?;
     writeln!(stdout, "--- get form XObjects, fx ---")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_test_68;
+    use flpdf::{Error, Pdf, PdfOpenOptions};
+
+    fn dct_qstream_pdf() -> Vec<u8> {
+        let mut bytes =
+            include_bytes!("../../../../tests/fixtures/test_driver/stream_dct.pdf").to_vec();
+        let original = b"<< /Type /Catalog /Pages 2 0 R >>";
+        let replacement = b"<< /Type /Catalog /Pages 2 0 R /QStream 6 0 R >>";
+        let start = bytes
+            .windows(original.len())
+            .position(|window| window == original)
+            .expect("catalog dictionary");
+        bytes.splice(start..start + original.len(), replacement.iter().copied());
+        bytes
+    }
+
+    fn non_stream_qstream_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /QStream 2 0 R >>\nendobj\n",
+        );
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        bytes
+    }
+
+    fn unfiltered_qstream_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /QStream 3 0 R >>\nendobj\n",
+        );
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        let off3 = bytes.len();
+        bytes.extend_from_slice(b"3 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n");
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_68_catches_unfilterable_stream_and_continues_to_raw_data() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            dct_qstream_pdf(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open DCT stream fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_68(
+            &mut pdf,
+            b"stream_dct.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 68 should continue after the caught exception");
+
+        assert!(stdout.starts_with(b"get unfilterable stream: "));
+        assert!(stdout.ends_with(b"raw stream data okay\n"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_68_propagates_non_stream_errors_from_the_qpdf_catch_boundary() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            non_stream_qstream_pdf(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open non-stream fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        let error = run_test_68(
+            &mut pdf,
+            b"non-stream.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect_err("non-stream QStream must escape the catch only for non-qpdf errors");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "pipeStreamData called for non-stream"
+        ));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_68_reports_when_a_filterable_stream_does_not_throw() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            unfiltered_qstream_pdf(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open unfiltered fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_68(
+            &mut pdf,
+            b"unfiltered.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("filterable stream should complete");
+
+        assert_eq!(stdout, b"oops -- didn't throw\n");
+        assert!(stderr.is_empty());
+    }
 }

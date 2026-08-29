@@ -352,6 +352,12 @@ pub(crate) trait DocumentResolver {
         None
     }
 
+    /// The input name carried by qpdf's `InputSource`, used when a stream
+    /// accessor constructs a `QPDFExc` at the document boundary.
+    fn input_description(&self) -> String {
+        String::new()
+    }
+
     /// Create qpdf's owned empty stream object for an ObjectHandle operation.
     fn new_stream(&self) -> Result<ObjectHandle> {
         Err(Error::Internal(
@@ -760,6 +766,38 @@ fn expand_description_template(
     if let Some(position) = result.find("$PO") {
         result.replace_range(position..position + 3, &offset);
     }
+    result
+}
+
+/// Format the `QPDFExc::createWhat` boundary used by qpdf stream accessors.
+///
+/// qpdf includes a positive source offset only when it is greater than zero;
+/// a negative parsed offset means that the value was created programmatically
+/// and contributes no location text.
+fn format_qpdf_exception_what(filename: &str, object: &str, offset: i64, message: &str) -> String {
+    let mut result = filename.to_owned();
+    if !(object.is_empty() && offset <= 0) {
+        if !filename.is_empty() {
+            result.push_str(" (");
+        }
+        if !object.is_empty() {
+            result.push_str(object);
+            if offset > 0 {
+                result.push_str(", ");
+            }
+        }
+        if offset > 0 {
+            result.push_str("offset ");
+            result.push_str(&offset.to_string());
+        }
+        if !filename.is_empty() {
+            result.push(')');
+        }
+    }
+    if !result.is_empty() {
+        result.push_str(": ");
+    }
+    result.push_str(message);
     result
 }
 
@@ -4912,7 +4950,19 @@ impl ObjectHandle {
             false,
             false,
         )?; // cov:ignore: multiline call terminator has no executable coverage region
-        if !stream_data_succeeded || !filtering_attempted {
+        if !filtering_attempted {
+            let filename = self
+                .context()
+                .map(|context| context.input_description())
+                .unwrap_or_default();
+            return Err(Error::Unsupported(format_qpdf_exception_what(
+                &filename,
+                "",
+                self.get_parsed_offset(),
+                "getStreamData called on unfilterable stream",
+            )));
+        }
+        if !stream_data_succeeded {
             return Err(Error::Unsupported(
                 "error getting decoded stream data".to_owned(),
             ));
@@ -13280,6 +13330,18 @@ mod mutation_tests {
     use super::*;
 
     #[test]
+    fn qpdf_exception_what_formats_object_and_offset_fields() {
+        assert_eq!(
+            format_qpdf_exception_what("input.pdf", "object 4 0", 28, "detail"),
+            "input.pdf (object 4 0, offset 28): detail"
+        );
+        assert_eq!(
+            format_qpdf_exception_what("", "object 4 0", -1, "detail"),
+            "object 4 0: detail"
+        );
+    }
+
+    #[test]
     fn make_direct_rebinds_only_the_receiver_and_isolates_repeated_indirect_children() {
         let shared_array = ObjectHandle::new_indirect_unresolved(ObjectRef::new(11, 0), -1);
         shared_array.set_resolved(ObjectValue::Array(vec![
@@ -13679,10 +13741,10 @@ mod mutation_tests {
         let error = stream
             .get_stream_data(crate::writer::DecodeLevel::Generalized)
             .expect_err("a failed filtered source must not be reported as decoded data");
-
         assert!(matches!(
             error,
-            Error::Unsupported(message) if message == "error getting decoded stream data"
+            Error::Unsupported(message)
+                if message == "offset 9: getStreamData called on unfilterable stream"
         ));
         assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
     }
@@ -13707,7 +13769,8 @@ mod mutation_tests {
 
             assert!(matches!(
                 error,
-                Error::Unsupported(message) if message == "error getting decoded stream data"
+                Error::Unsupported(message)
+                    if message == "getStreamData called on unfilterable stream"
             ));
         }
     }

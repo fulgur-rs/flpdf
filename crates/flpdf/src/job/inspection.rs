@@ -410,7 +410,9 @@ mod tests {
         let error = quiet_job()
             .show_object(&mut pdf, stream, false, true)
             .expect_err("an unknown filter must remain an operation error");
-        assert!(error.to_string().contains("decoded stream data"));
+        assert!(error
+            .to_string()
+            .contains("getStreamData called on unfilterable stream"));
     }
 
     #[test]
@@ -430,7 +432,9 @@ mod tests {
         let error = quiet_job()
             .show_stream(&mut pdf, stream_ref, false)
             .expect_err("an unknown filter must remain an operation error");
-        assert!(error.to_string().contains("decoded stream data"));
+        assert!(error
+            .to_string()
+            .contains("getStreamData called on unfilterable stream"));
     }
 
     #[test]

@@ -3905,6 +3905,10 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         Some(self.pdf_unique_id)
     }
 
+    fn input_description(&self) -> String {
+        self.core.borrow().description.clone()
+    }
+
     fn new_stream(&self) -> Result<ObjectHandle> {
         self.new_stream_handle()
     }

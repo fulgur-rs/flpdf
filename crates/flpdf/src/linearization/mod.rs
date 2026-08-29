@@ -38,6 +38,7 @@ pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
 pub use renumber::{ObjStmRelocation, RenumberMap};
 pub use show::{
     show_linearization_bytes, show_linearization_bytes_with_warnings, show_linearization_path,
-    show_linearization_path_with_warnings, ShowLinearizationError, ShowLinearizationOutput,
+    show_linearization_path_with_warnings, show_linearization_pdf_with_warnings,
+    ShowLinearizationError, ShowLinearizationOutput,
 };
 pub use writer::{LinearizedDocument, LinearizedOffsets};

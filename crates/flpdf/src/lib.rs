@@ -215,7 +215,7 @@ pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_dept
 pub use parser::parse_object;
 pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, parse_pdf_version_spec, PdfVersion};
-pub use pipeline::{Pipeline, PipelineError, PipelineResult};
+pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::PdfOpenOptions;
 pub use resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
