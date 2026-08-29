@@ -1963,6 +1963,22 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Same rationale as the --normalize-content guard above: the attachment
+    // serializers build their own minimal WriterOptions and never call
+    // apply_cli_decode_level, so a non-`none` --decode-level would silently
+    // be dropped rather than applied.
+    if matches!(args.decode_level, Some(level) if level != CliDecodeLevel::None)
+        && (args.remove_attachment.is_some()
+            || !args.add_attachment.is_empty()
+            || !args.copy_attachments_from.is_empty())
+    {
+        eprintln!(
+            "flpdf: --decode-level is not applied by attachment mutation operations; \
+             rerun with --decode-level=none or without the attachment operation"
+        );
+        std::process::exit(1);
+    }
+
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
     // `preprocess_qpdf_args`, so a stripped group leaves no trace for the
     // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
@@ -4807,7 +4823,9 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // `decode_level == DecodeLevel::None` requirement: `--stream-data`
     // `Uncompress`/`Compress` raise the writer's decode level above `None`
     // (`WriterConfiguration::set_stream_data_mode`, `writer.rs:127-142`),
-    // which `can_preserve` would likewise refuse to auto-preserve through.
+    // and an explicit non-`none` `--decode-level` does the same directly,
+    // both of which `can_preserve` would likewise refuse to auto-preserve
+    // through.
     if page_ops.split_pages.is_none()
         && options.copy_encryption.is_none()
         && !options.qdf
@@ -4816,6 +4834,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             options.stream_data,
             Some(StreamDataMode::Uncompress) | Some(StreamDataMode::Compress)
         )
+        && !(options.decode_level_set && options.decode_level != StreamDecodeLevel::None)
     {
         options.copy_encryption = primary_copy_encryption;
     }

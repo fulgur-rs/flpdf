@@ -2259,3 +2259,55 @@ fn pages_stream_data_uncompress_with_encrypted_primary_produces_cleartext_output
     assert_qpdf_cleartext_chunk(&f);
     assert_eq!(npages_of(&q), npages_of(&f));
 }
+
+#[test]
+fn pages_decode_level_with_encrypted_primary_produces_cleartext_output() {
+    // Same can_preserve guard as
+    // pages_stream_data_uncompress_with_encrypted_primary_produces_cleartext_output,
+    // but reached through an explicit non-`none` `--decode-level` instead of
+    // `--stream-data`: both raise the writer's decode level above `None`, so
+    // the --pages merge path must not carry the primary's encryption donor
+    // forward for either.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let secondary = fixture_abs(THREE_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (ok, stderr) = run_qpdf(&[
+        "--password=secretpw",
+        "--decode-level=generalized",
+        "--pages",
+        secondary.to_str().unwrap(),
+        "1-2",
+        "--",
+        enc.to_str().unwrap(),
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        ok || q.exists(),
+        "qpdf --decode-level merge failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            enc.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--password=secretpw",
+            "--decode-level=generalized",
+            "--pages",
+            secondary.to_str().unwrap(),
+            "1-2",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_cleartext_chunk(&q);
+    assert_qpdf_cleartext_chunk(&f);
+    assert_eq!(npages_of(&q), npages_of(&f));
+}
