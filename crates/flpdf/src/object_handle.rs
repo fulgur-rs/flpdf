@@ -771,12 +771,15 @@ fn expand_description_template(
 
 /// Format the `QPDFExc::createWhat` boundary used by qpdf stream accessors.
 ///
-/// qpdf includes a positive source offset only when it is greater than zero;
-/// a negative parsed offset means that the value was created programmatically
-/// and contributes no location text.
+/// qpdf's `createWhat` (`libqpdf/QPDFExc.cc:16-48`) only skips the
+/// parenthesized `(object, offset)` segment when `object` is empty AND
+/// `offset` is exactly zero. A negative offset with an empty object still
+/// enters that branch and emits an empty `()` — qpdf's own literal behavior,
+/// not a special case flpdf adds. Only a strictly positive offset ever
+/// contributes "offset N" text inside the parentheses.
 fn format_qpdf_exception_what(filename: &str, object: &str, offset: i64, message: &str) -> String {
     let mut result = filename.to_owned();
-    if !(object.is_empty() && offset <= 0) {
+    if !(object.is_empty() && offset == 0) {
         if !filename.is_empty() {
             result.push_str(" (");
         }
@@ -13338,6 +13341,24 @@ mod mutation_tests {
         assert_eq!(
             format_qpdf_exception_what("", "object 4 0", -1, "detail"),
             "object 4 0: detail"
+        );
+    }
+
+    #[test]
+    fn qpdf_exception_what_matches_createwhat_for_a_negative_offset_with_no_object() {
+        // qpdf's createWhat only skips the parenthesized segment when
+        // `object` is empty AND `offset == 0` -- a negative offset with an
+        // empty object still enters that branch and emits an empty `()`
+        // (QPDFExc.cc:16-48). Regression for a prior `offset <= 0` guard
+        // that instead skipped the parentheses entirely for any
+        // non-positive offset.
+        assert_eq!(
+            format_qpdf_exception_what("input.pdf", "", -1, "detail"),
+            "input.pdf (): detail"
+        );
+        assert_eq!(
+            format_qpdf_exception_what("input.pdf", "", 0, "detail"),
+            "input.pdf: detail"
         );
     }
 
