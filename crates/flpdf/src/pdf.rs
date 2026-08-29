@@ -272,14 +272,17 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Adobe extension level from the catalog's `/Extensions /ADBE
-    /// /ExtensionLevel`, resolving indirect references at each step. Returns
-    /// `None` when any link in that chain is absent or is not the expected
-    /// type. Only the `/ADBE` developer prefix is honoured, matching qpdf's
-    /// `--check` version banner and the extension level qpdf accumulates into
-    /// its `max_input_version`.
+    /// /ExtensionLevel`, resolving direct and indirect references at each
+    /// step. Returns `None` when any link in that chain is absent or is not
+    /// the expected type. Only the `/ADBE` developer prefix is honoured,
+    /// matching qpdf's `--check` version banner and the extension level qpdf
+    /// accumulates into its `max_input_version`.
+    ///
+    /// The trailer's `/Root` may itself be a direct Catalog dictionary;
+    /// qpdf's `QPDF::getRoot` accepts that shape via `getKey` rather than
+    /// requiring an indirect object (`libqpdf/QPDF.cc:2329-2367`).
     pub fn adobe_extension_level(&mut self) -> Option<i64> {
-        let root_ref = self.root_ref()?;
-        let catalog = self.get_object_handle(root_ref);
+        let catalog = self.trailer_key_handle(b"Root");
         self.resolve(&catalog).ok()?;
         let extensions = catalog.try_get_key(b"/Extensions").ok()?;
         self.resolve(&extensions).ok()?;

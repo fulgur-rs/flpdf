@@ -5091,6 +5091,19 @@ mod tests {
     }
 
     #[test]
+    fn adobe_extension_level_reads_a_direct_root_catalog() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/direct-root-adbe.pdf"
+            ))
+            .to_vec(),
+        )
+        .expect("open");
+        assert_eq!(pdf.adobe_extension_level(), Some(8));
+    }
+
+    #[test]
     fn adobe_extension_level_absent_when_catalog_has_no_extensions() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         assert_eq!(pdf.adobe_extension_level(), None);
