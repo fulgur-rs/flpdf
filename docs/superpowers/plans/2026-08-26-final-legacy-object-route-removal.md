@@ -77,7 +77,7 @@ git commit -m "refactor: remove reader legacy object materialization bridge"
 **Files:**
 - Modify: `crates/flpdf/src/acroform_document_helper.rs`, `embedded_files.rs`, `filespec_helper/mod.rs`, `job/overlay.rs`, `job/page_merge.rs`, `json_inspect.rs`
 - Modify: `linearization/{check,plan,show,writer}.rs`, `nntree.rs`, `pages/repair.rs`, `pages/tree_rebuild.rs`, `resources.rs`, `signatures.rs`, `struct_tree_pg.rs`, `subset_prune.rs`
-- Modify: `object_copy.rs`, `outline_dest_remap.rs`, `page_label_document_helper.rs`, `ref_chain.rs`, `writer.rs`, `xref.rs`, `reader/resolver.rs`, `writer/{pclm,rewrite_renumber}.rs`, `writer/plain/{body,plan}.rs`, `writer/object_streams/mod.rs`, `crates/flpdf-cli/src/main.rs`
+- Modify: `object_copy.rs`, `job/outline_dest_remap.rs`, `page_label_document_helper.rs`, `ref_chain.rs`, `writer.rs`, `xref.rs`, `reader/resolver.rs`, `writer/{pclm,rewrite_renumber}.rs`, `writer/plain/{body,plan}.rs`, `writer/object_streams/mod.rs`, `crates/flpdf-cli/src/main.rs`
 - Test: the corresponding module and route-contract tests
 
 - [ ] **Step 1: Migrate by qpdf responsibility**

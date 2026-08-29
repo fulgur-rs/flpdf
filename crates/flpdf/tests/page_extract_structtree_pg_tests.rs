@@ -8,9 +8,10 @@
 //! entirely. This is the opposite of the annotation/outline null-out family,
 //! where the reference is kept verbatim and the page object becomes `null`.
 
+use flpdf::job::remap_outline_and_dests;
 use flpdf::{
-    drop_struct_elem_dangling_pg, prune_after_subset, rebuild_page_tree, remap_outline_and_dests,
-    ObjectHandle, ObjectRef, Pdf, RemoveUnreferencedResources,
+    drop_struct_elem_dangling_pg, prune_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef,
+    Pdf, RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;

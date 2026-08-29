@@ -57,7 +57,7 @@
 //!     `/PageLabels`. Serializing only `rebuild_page_tree`'s output
 //!     leaves stale destinations and label ranges pointing at pages no
 //!     longer in the tree. Pair it with
-//!     [`remap_outline_and_dests`] and (when labels matter)
+//!     [`job::remap_outline_and_dests`] and (when labels matter)
 //!     [`PageLabelDocumentHelper::labels_for_selection`] +
 //!     [`PageLabelDocumentHelper::write_reconstructed_labels`] — the
 //!     [`extract_pages`] and [`merge_documents`] pipelines assemble
@@ -112,7 +112,6 @@ pub mod object_copy;
 mod object_handle;
 pub mod objr_obj_annot_p;
 pub(crate) mod optimization;
-pub mod outline_dest_remap;
 pub mod outline_document_helper;
 pub mod outline_object_helper;
 pub(crate) mod overlay_appearance_stream;
@@ -202,7 +201,6 @@ pub use object_handle::{
     ObjectHandle, StreamDataProvider, STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
 };
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
-pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::OutlineDocumentHelper;
 pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use page_document_helper::{PageDocumentHelper, PageInput};

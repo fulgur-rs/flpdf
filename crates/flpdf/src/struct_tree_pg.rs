@@ -15,7 +15,7 @@
 //!
 //! This is the structural-reference *drop* family: the opposite of the
 //! outline/named-destination/annotation handling
-//! ([`crate::outline_dest_remap`]), where qpdf keeps the reference verbatim
+//! ([`crate::job::remap_outline_and_dests`]), where qpdf keeps the reference verbatim
 //! and replaces the removed page object with `null`.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)

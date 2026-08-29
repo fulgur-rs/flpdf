@@ -363,7 +363,7 @@ fn field_has_retained_widget<R: Read + Seek>(
 ///
 /// qpdf establishes `/P` during copied-annotation graph remapping, not through
 /// a generic page-owner repair pass. In the production route, this runs after
-/// [`crate::outline_dest_remap::remap_outline_and_dests`], which already
+/// [`crate::job::remap_outline_and_dests`], which already
 /// replaces every genuinely removed original page-tree leaf with `null` in
 /// place (`null_removed_pages`, page-driven, independent of how it is
 /// referenced) — so a `/P` pointing at a removed page already resolves to

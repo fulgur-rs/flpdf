@@ -12,9 +12,10 @@
 //! fixture that exercises deep outlines, both destination sources, all five
 //! `/A` action subtypes, `/SE`, and `/PageLabels` together.
 
+use flpdf::job::remap_outline_and_dests;
 use flpdf::{
-    drop_struct_elem_dangling_pg, merge_documents, rebuild_page_tree, remap_outline_and_dests,
-    LabelRange, LabelStyle, MergeInput, Object, ObjectRef, Pdf,
+    drop_struct_elem_dangling_pg, merge_documents, rebuild_page_tree, LabelRange, LabelStyle,
+    MergeInput, Object, ObjectRef, Pdf,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;

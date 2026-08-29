@@ -157,7 +157,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Mechanism | Where |
 | --- | --- |
 | Depth limits (= 100) on recursive tree walks: page tree, outlines, name/number trees, embedded files, AcroForm fields, structure tree, signature fields | `DEFAULT_MAX_*_DEPTH` constants in `pages.rs`, `outline_document_helper.rs`, `nntree.rs`, `embedded_files.rs`, `acroform_field_prune.rs`, `struct_tree_pg.rs`, `signatures.rs` |
-| Depth limits (= 64) on destination-reference and action chains | `MAX_DEST_RESOLVE_DEPTH` (`outline_dest_remap.rs`), `MAX_ACTION_CHAIN_DEPTH` (`page_extract.rs`) |
+| Depth limits (= 64) on destination-reference and action chains | `MAX_DEST_RESOLVE_DEPTH` (`job/outline_dest_remap.rs`), `MAX_ACTION_CHAIN_DEPTH` (`page_extract.rs`) |
 | Cycle detection (visited sets) on iterative chain following: xref `/Prev` chains, outline `/Next` chains, field `/Parent` chains (an iterative `while`-loop with a visited set — terminating; the missing depth cap is hardening only, `flpdf-hn1g.3`) | `xref.rs` (`merge_previous_xref_sections`), `outline_document_helper.rs` (`build_item`), `annotation_object_helper.rs`, `signatures.rs`, `json_inspect.rs` |
 | Checked arithmetic and non-negative validation on parser-derived sizes (`/Length` bounds, PNG-predictor row math, LZW table size cap of 4096 entries) | `parser.rs`, `filters.rs` |
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |

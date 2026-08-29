@@ -391,7 +391,7 @@ qtest +9 の実測値は順序を前倒しする根拠にしない。
 固まったあとの別設計とする。**挙動は検証済みで byte-identical を保っているため
 壊してはならない。** 現時点で畳み込みの issue は作らない。
 
-畳み込みの対象は `outline_dest_remap.rs` / `struct_tree_pg.rs` / `thread_bead_p.rs` /
+畳み込みの対象は `job/outline_dest_remap.rs` / `struct_tree_pg.rs` / `thread_bead_p.rs` /
 `objr_obj_annot_p.rs` の 4 つに限る。`acroform_field_prune.rs` は qpdf 側に明示的な
 対応パス（`QPDFJob.cc:2610-2632`）を持ち、`subset_prune.rs` は `/Resources` の stale
 名前エントリ剪定と orphan mark-and-sweep という独立した責務なので、**畳み込むと

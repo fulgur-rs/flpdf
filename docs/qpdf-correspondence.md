@@ -655,7 +655,7 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 
 | flpdf | 行 | 対応する qpdf 挙動 |
 |---|---|---|
-| `outline_dest_remap.rs` | 898 | 削除ページ参照の null 化（配列要素） |
+| `job/outline_dest_remap.rs` | 898 | 削除ページ参照の null 化（配列要素） |
 | `struct_tree_pg.rs` | 379 | `/Pg` の key drop |
 | `thread_bead_p.rs` | 293 | bead `/P` の key drop |
 | `objr_obj_annot_p.rs` | 178 | OBJR 経由 annotation の `/P` key drop |

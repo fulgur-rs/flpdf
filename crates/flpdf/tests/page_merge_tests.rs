@@ -4648,7 +4648,7 @@ fn inline_open_action_no_s_dest_dict_removed_pdf() -> Vec<u8> {
 // codex G4: an inline `/OpenAction` destination dictionary with NO `/S` key
 // (`<< /D [page /Fit] >>`) is a bare destination, not an opaque action. Its `/D`
 // page ref must be remapped (surviving target) or nulled (removed target),
-// mirroring outline_dest_remap::remap_or_null_action_dest. Pre-fix the `is_goto`
+// mirroring job::outline_dest_remap::remap_or_null_action_dest. Pre-fix the `is_goto`
 // gate classified a no-/S dict as a non-GoTo action, so `/D` was left in stale
 // source numbering and a removed target was never collected/nulled.
 #[test]

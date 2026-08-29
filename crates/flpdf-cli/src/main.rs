@@ -6,9 +6,9 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::disable_digital_signatures;
 use flpdf::fix_qdf;
 use flpdf::job::{
-    apply_rotate_to_pages, flatten_rotation_on_pages, AttachmentAddOptions, AttachmentCopyOptions,
-    CheckError, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData,
-    PageSpecInput, QPDFJob, SplitPageOptions,
+    apply_rotate_to_pages, flatten_rotation_on_pages, remap_outline_and_dests,
+    AttachmentAddOptions, AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError,
+    JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -16,7 +16,6 @@ use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
     collate,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
-    outline_dest_remap::remap_outline_and_dests,
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
@@ -4147,7 +4146,7 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 ///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)
 ///      3.5. /PageLabels reconstruction (per selected page, qpdf
 ///      `handlePageSpecs`-observed)
-///   4. outline_dest_remap::remap_outline_and_dests
+///   4. job::remap_outline_and_dests
 ///   5. struct_tree_pg::drop_struct_elem_dangling_pg
 ///   6. thread_bead_p::drop_thread_bead_dangling_p
 ///      6.5. objr_obj_annot_p::drop_objr_obj_annot_dangling_p

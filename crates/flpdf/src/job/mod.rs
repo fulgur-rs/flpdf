@@ -19,6 +19,7 @@ mod inspection;
 mod json;
 mod json_sections;
 mod lifecycle;
+mod outline_dest_remap;
 mod overlay;
 mod page_collate;
 mod page_combine;
@@ -63,6 +64,7 @@ pub(crate) use json_sections::{
     cf_method_string, collect_content_refs, collect_image_refs, parse_pdf_date,
 };
 pub use lifecycle::{JobExitCode, QPDFJob};
+pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,
