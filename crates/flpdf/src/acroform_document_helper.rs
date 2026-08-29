@@ -294,8 +294,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
-    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
+    /// - [`Error::System`] when the catalog does not resolve to a dictionary.
+    /// - [`Error::Unsupported`] when a field-tree node is not a dictionary,
+    ///   when an indirect `/AcroForm` reference does not resolve to a
     ///   dictionary, or when the field-tree depth limit is exceeded. A direct
     ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error from [`Pdf::resolve`].
@@ -324,8 +325,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
-    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
+    /// - [`Error::System`] when the catalog does not resolve to a dictionary.
+    /// - [`Error::Unsupported`] when a field-tree node is not a dictionary,
+    ///   when an indirect `/AcroForm` reference does not resolve to a
     ///   dictionary, or when the field-tree depth limit is exceeded. A direct
     ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error from [`Pdf::resolve`].
@@ -1584,16 +1586,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// A missing or malformed `/Root` is treated as an absent AcroForm, as in
-    /// the helper's existing rootless no-op path. Other errors while reading
-    /// the catalog handle are propagated.
+    /// A missing `/Root` is treated as an absent AcroForm, as in the
+    /// helper's existing rootless no-op path. A malformed (non-dictionary)
+    /// catalog, or any other error while reading the catalog handle, is
+    /// propagated.
     pub fn has_acro_form(&mut self) -> Result<bool> {
         // qpdf's hasAcroForm calls getRoot().hasKey directly
         // (`QPDFAcroFormDocumentHelper.cc:32-36`), so a direct Catalog is a
-        // valid receiver just like an indirect one.
-        let Ok(root) = self.pdf.root_handle() else {
+        // valid receiver just like an indirect one. Only a genuinely absent
+        // `/Root` keeps this helper's established no-op contract; a
+        // malformed catalog or a resolution failure while reaching it must
+        // still propagate, matching this method's pre-existing behavior.
+        if self.pdf.trailer_key_handle(b"Root").is_null() {
             return Ok(false);
-        };
+        }
+        let root = self.pdf.root_handle()?;
         root.try_has_key(b"/AcroForm")
     }
 
@@ -1744,9 +1751,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     fn acroform_dict(&mut self) -> Result<Option<ObjectHandle>> {
         // Keep the helper's established rootless no-op behavior while using
         // the canonical direct-or-indirect root gate for valid Catalogs.
-        let Ok(catalog) = self.pdf.root_handle() else {
+        // Only a genuinely absent `/Root` is a no-op; a malformed catalog or
+        // a resolution failure while reaching it must still propagate, as
+        // `resolve_dict` did before this method accepted a direct root.
+        if self.pdf.trailer_key_handle(b"Root").is_null() {
             return Ok(None);
-        };
+        }
+        let catalog = self.pdf.root_handle()?;
         let acroform = self
             .pdf
             .resolve_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
@@ -2793,6 +2804,41 @@ mod tests {
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn has_acro_form_propagates_a_non_dictionary_root_error() {
+        // Unlike canonical_acroform()'s established leniency (a malformed
+        // root there has always meant "no AcroForm"), has_acro_form must
+        // keep propagating a malformed-catalog error as it did before this
+        // method accepted a direct root -- only a genuinely absent /Root is
+        // a no-op.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Name(b"not-a-catalog".to_vec()),
+        );
+
+        let error = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
+            .has_acro_form()
+            .expect_err("a non-dictionary root must propagate, not read as absent");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
+    }
+
+    #[test]
+    fn fields_propagates_a_non_dictionary_root_error() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Name(b"not-a-catalog".to_vec()),
+        );
+
+        let error = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
+            .fields()
+            .expect_err("a non-dictionary root must propagate, not read as no fields");
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
     }
 
     #[test]
