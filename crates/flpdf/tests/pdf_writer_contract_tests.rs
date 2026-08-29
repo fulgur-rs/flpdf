@@ -2811,6 +2811,41 @@ fn pdf_writer_emits_pclm_header_and_a_qpdf_checked_pdf() -> flpdf::Result<()> {
 }
 
 #[test]
+fn pdf_writer_pclm_preserves_qpdf_recovered_encrypted_stream_bytes() -> flpdf::Result<()> {
+    let mut source = Pdf::open(BufReader::new(File::open(
+        "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+    )?))?;
+    let mut writer = PdfWriter::new(&mut source);
+    writer.set_pclm(true);
+    writer.set_static_id(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let mut rewritten = Pdf::open(Cursor::new(output))?;
+    let stream = rewritten.get_object_handle(ObjectRef::new(2, 0));
+    rewritten.resolve(&stream)?;
+    let data = stream.get_raw_stream_data()?;
+
+    // qpdf test_driver 40 (QPDFWriter::setPCLm(true), static ID) emits the
+    // full recovered source length through its AES pipe. The recovered tail
+    // is therefore part of the PCLm payload, rather than writer-only framing.
+    assert_eq!(data.len(), 12_368);
+    assert_eq!(
+        &data[data.len() - 25..],
+        b"Q\n\x07\x07\x07\x07\x07\x07\x07Gz\xe9\x8b\x18$O}uR1\x85@\xe4b\xce"
+    );
+
+    // The PCLm mode is scoped to the writer operation; ordinary source reads
+    // retain their existing encrypted-recovery framing policy afterwards.
+    drop(writer);
+    let source_stream = source.get_object_handle(ObjectRef::new(4, 0));
+    source.resolve(&source_stream)?;
+    assert_eq!(source_stream.get_raw_stream_data()?.len(), 12_345);
+    Ok(())
+}
+
+#[test]
 fn pdf_writer_pclm_uses_page_strip_fifo_and_synthetic_transforms() -> flpdf::Result<()> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_pclm_image_pdf()))?;
     let mut writer = PdfWriter::new(&mut pdf);
