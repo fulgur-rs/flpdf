@@ -52,6 +52,7 @@
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
 | `crates/flpdf/src/job/page_subset.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-subset completion |
+| `crates/flpdf/src/job/resource_pruning.rs` | correspondence | \`QPDFJob::shouldRemoveUnreferencedResources\` |
 | `crates/flpdf/src/job/rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/job/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |

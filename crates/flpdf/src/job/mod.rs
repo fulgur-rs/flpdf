@@ -8,6 +8,7 @@
 //! `--overlay`/`--underlay` (`handleUnderOverlay`) and `--collate` orchestration,
 //! the post-subset resource/reachability and AcroForm pruning
 //! (`prune_after_subset`, `prune_acroform_after_subset`),
+//! the `--remove-unreferenced-resources` job policy,
 //! attachment listing/formatting, the `--rotate` spec and page-operation route,
 //! and the `--check`
 //! document-check consumer (`QPDFJob::doCheck`/`doInspection`).
@@ -30,6 +31,7 @@ mod page_range;
 mod page_specs;
 mod page_split;
 mod page_subset;
+mod resource_pruning;
 mod rotate;
 mod rotate_spec;
 
@@ -78,5 +80,6 @@ pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_specs::PageSpecInput;
 pub use page_split::SplitPageOptions;
+pub use resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use rotate::{apply_rotate_to_pages, flatten_rotation_on_pages, RotateMode, RotateOp};
 pub use rotate_spec::RotateSpec;

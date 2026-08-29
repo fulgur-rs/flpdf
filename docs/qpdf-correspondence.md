@@ -702,6 +702,11 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 
 `job/page_specs.rs` がqpdfのjob-level orchestration（`QPDFJob.cc:2360-2632`）を所有し、
 `job/page_merge.rs` と `PageDocumentHelper` がforeign page copy/page-tree primitiveを所有する。
+`.40` では `resources.rs` に残る `QPDFPageObjectHelper::removeUnreferencedResources`
+相当の page/Form mutation と、`job/resource_pruning.rs` に移した
+`QPDFJob::shouldRemoveUnreferencedResources` 相当の `auto|yes|no` policy を分離した。
+後者は `QPDFJob.cc:2251-2339` の共有リソース探索だけを所有し、前者の
+`/Font`・`/XObject` pruning algorithmを再実装しない。
 `.18` では `QPDFJob.cc:2251-2337,2442-2455,2520-2555` の
 `--remove-unreferenced-resources={auto,yes,no}` を `job/page_specs.rs` から
 `job/page_merge.rs` の初回 foreign-page copy 境界へ渡す。Auto は source ごとに
