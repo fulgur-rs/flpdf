@@ -2193,6 +2193,34 @@ impl ObjectHandle {
         }
     }
 
+    /// Attach a qpdf document and explicit description to this shared object
+    /// allocation, mirroring `QPDFObjectHandle::setObjectDescription`
+    /// (`libqpdf/QPDFObjectHandle.cc:2056-2063`) and
+    /// `QPDFValue::setDescription` (`libqpdf/qpdf/QPDFValue.hh:60-66`).
+    ///
+    /// This operation does not resolve or clone the handle. It changes the
+    /// warning context seen by every alias of the same handle, just as qpdf
+    /// stores the document pointer and description on the shared
+    /// `QPDFValue`. The supplied `Pdf` must remain alive while the handle may
+    /// emit a warning; the weak resolver preserves that lifetime boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] if the document's canonical resolver link
+    /// is no longer available.
+    pub fn set_object_description<R: std::io::Read + std::io::Seek + 'static>(
+        &self,
+        pdf: &crate::Pdf<R>,
+        description: impl Into<String>,
+    ) -> Result<()> {
+        let resolver = pdf.resolver.document_resolver_weak()?;
+        let mut slot = self.0.borrow_mut();
+        slot.resolver = Some(resolver);
+        slot.active_pdf_unique_id = Some(pdf.unique_id);
+        slot.description = Some(ObjectDescription::Template(description.into()));
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_description(&self, description: String, offset: i64) {
         let mut slot = self.0.borrow_mut();
@@ -2978,7 +3006,10 @@ impl ObjectHandle {
     /// observes — mirrors `QPDFObjectHandle::replaceKey`
     /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`) and
     /// `QPDF_Dictionary::replaceKey`
-    /// (`libqpdf/QPDF_Dictionary.cc:135-153`). Ownership is checked with
+    /// (`libqpdf/QPDF_Dictionary.cc:135-153`). The receiver is dereferenced
+    /// before its dictionary type is inspected, matching qpdf's
+    /// `asDictionary()` boundary. A non-dictionary receiver emits qpdf's
+    /// type warning and is otherwise ignored. Ownership is checked with
     /// qpdf's own shallow `checkOwnership` comparison
     /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`) before insertion — only
     /// `self`'s and `value`'s own owning document, never a walk into
@@ -2986,23 +3017,18 @@ impl ObjectHandle {
     /// document returns qpdf's `checkOwnership` logic error as
     /// [`Error::Internal`]. A programmatic direct value (including a direct
     /// null) is unowned for this check, while a non-null direct value parsed
-    /// from a file carries qpdf's parser QPDF context. In either case,
+    /// from a file carries the parser's QPDF context. In either case,
     /// containment alone never confers ownership. A direct null removes the
-    /// key, while an indirect
-    /// null or dangling indirect reference is retained as the dictionary
-    /// value. A no-op on a
-    /// non-dictionary handle or an unresolved/destroyed indirect
-    /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
-    /// than panicking. Also a no-op if `value` is a direct handle sharing
-    /// `self`'s value state — inserting it into the dictionary would
+    /// key, while an indirect null or dangling indirect reference is retained
+    /// as the dictionary value. Also a no-op if `value` is a direct handle
+    /// sharing `self`'s value state — inserting it into the dictionary would
     /// otherwise create a direct cycle that none of this crate's recursive
     /// walkers (`shallow_copy`, `materialize`, `Debug`) guard against, since
     /// they only stop recursion at an indirect-handle boundary. This does
     /// not detect a multi-hop reciprocal cycle built from two or more
-    /// `replace_key` calls across distinct direct dictionaries. Never performs
-    /// resolution
-    /// itself. `key` must be qpdf's decoded, canonical dictionary key including
-    /// its leading `/`; this API does not normalize slashless input.
+    /// `replace_key` calls across distinct direct dictionaries. `key` must be
+    /// qpdf's decoded, canonical dictionary key including its leading `/`; this
+    /// API does not normalize slashless input.
     ///
     /// This mutates the live handle graph directly. If `self`'s ref has
     /// already been read through [`crate::Pdf::resolve`] or
@@ -3025,12 +3051,53 @@ impl ObjectHandle {
     /// document than the dictionary receiver, matching qpdf's
     /// `checkOwnership` failure boundary.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
-        if !self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
+        if !self.prepare_dictionary_mutation("ignoring key replacement request")? {
             return Ok(());
         }
         self.check_key_value_ownership(&value)?;
         self.replace_key_unchecked(key, value);
         Ok(())
+    }
+
+    /// Replace `key` and return the supplied value, mirroring
+    /// `QPDFObjectHandle::replaceKeyAndGetNew`
+    /// (`libqpdf/QPDFObjectHandle.cc:1213-1217`). The ordinary replacement
+    /// operation owns resolution, warning, ownership, and live-identity
+    /// behavior; this method only returns the same handle after it completes.
+    pub fn replace_key_and_get_new(&self, key: &[u8], value: ObjectHandle) -> Result<ObjectHandle> {
+        self.replace_key(key, value.clone())?;
+        Ok(value)
+    }
+
+    /// Remove `key`, replace it with `value`, and return the old value,
+    /// mirroring `QPDFObjectHandle::replaceKeyAndGetOld`
+    /// (`libqpdf/QPDFObjectHandle.cc:1219-1225`). The removal is deliberately
+    /// performed before the replacement, so an ownership failure in the
+    /// second operation has the same partial-mutation boundary as qpdf.
+    pub fn replace_key_and_get_old(&self, key: &[u8], value: ObjectHandle) -> Result<ObjectHandle> {
+        let old = self.remove_key_and_get_old(key)?;
+        self.replace_key(key, value)?;
+        Ok(old)
+    }
+
+    /// Remove `key` and return its old value, or a fresh direct null when the
+    /// key was absent, mirroring `QPDFObjectHandle::removeKeyAndGetOld`
+    /// (`libqpdf/QPDFObjectHandle.cc:1240-1248`). The receiver is resolved
+    /// before the old dictionary value is read. A non-dictionary receiver
+    /// emits qpdf's `removeKey` type warning and returns a direct null when
+    /// warning delivery succeeds.
+    pub fn remove_key_and_get_old(&self, key: &[u8]) -> Result<ObjectHandle> {
+        self.try_dereference()?;
+        let old = self.with_value(|current| match current {
+            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+            _ => None,
+        });
+        if !self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
+            self.type_warning("dictionary", "ignoring key removal request")?;
+            return Ok(ObjectHandle::null());
+        }
+        self.remove_key(key);
+        Ok(old.unwrap_or_else(ObjectHandle::null))
     }
 
     fn replace_key_unchecked(&self, key: &[u8], value: ObjectHandle) {
@@ -3053,6 +3120,18 @@ impl ObjectHandle {
             }
             self.attach_child_to_state_owners(&value);
         }
+    }
+
+    /// Resolve this handle and emit qpdf's dictionary type warning when a
+    /// dictionary mutation is attempted on another object type. This is the
+    /// `asDictionary()` branch shared by `replaceKey` and its AndGet variant.
+    fn prepare_dictionary_mutation(&self, warning: &str) -> Result<bool> {
+        self.try_dereference()?;
+        if self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
+            return Ok(true);
+        }
+        self.type_warning("dictionary", warning)?;
+        Ok(false)
     }
 
     /// Insert or replace `key` with `value` on a live dictionary, preserving
@@ -14642,11 +14721,18 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replace_key_with_direct_null_on_a_non_dictionary_is_a_no_op() {
+    fn replace_key_with_direct_null_on_a_non_dictionary_reports_qpdf_type_warning() {
         let scalar = ObjectHandle::integer(1);
 
-        scalar.replace_key(b"/A", ObjectHandle::null()).unwrap();
+        let error = scalar
+            .replace_key(b"/A", ObjectHandle::null())
+            .expect_err("a contextless qpdf type warning is an exception");
 
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "operation for dictionary attempted on object of type integer: ignoring key replacement request"
+        ));
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -14681,9 +14767,17 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replace_key_on_a_non_dictionary_handle_is_a_no_op() {
+    fn replace_key_on_a_non_dictionary_handle_reports_qpdf_type_warning() {
         let scalar = ObjectHandle::integer(1);
-        scalar.replace_key(b"/A", ObjectHandle::integer(2)).unwrap();
+        let error = scalar
+            .replace_key(b"/A", ObjectHandle::integer(2))
+            .expect_err("a contextless qpdf type warning is an exception");
+
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "operation for dictionary attempted on object of type integer: ignoring key replacement request"
+        ));
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -16340,12 +16434,17 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replace_key_and_remove_key_are_no_ops_on_an_unresolved_indirect_handle() {
+    fn replace_key_on_an_unresolved_indirect_handle_propagates_resolution_error() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        indirect
+        let error = indirect
             .replace_key(b"/A", ObjectHandle::integer(1))
-            .unwrap(); // must not panic
-        indirect.remove_key(b"/A"); // must not panic
+            .expect_err("qpdf resolves the receiver before replacing a key");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "object 1 0 belongs to a dropped PDF"
+        ));
+        indirect.remove_key(b"/A"); // legacy no-resolution helper remains safe
         assert!(indirect.try_get_key(b"/A").is_err());
     }
 
@@ -18231,5 +18330,82 @@ pub(crate) mod warning_emission_tests {
         let parent = ObjectHandle::dictionary(vec![]);
         let child = parent.try_get_key(b"/EF").unwrap();
         assert_eq!(child.description(), " -> dictionary key /EF");
+    }
+}
+
+#[cfg(test)]
+mod qpdf_mutator_api_tests {
+    use super::*;
+
+    #[test]
+    fn and_get_dictionary_mutators_preserve_qpdf_order_and_identity() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let alias = dict.clone();
+
+        let inserted = dict
+            .replace_key_and_get_new(b"/Three", ObjectHandle::array(vec![]))
+            .expect("replaceKeyAndGetNew should insert into a dictionary");
+        assert!(inserted.is_same_object_as(&dict.get_key(b"/Three")));
+
+        let old = dict
+            .replace_key_and_get_old(b"/Three", ObjectHandle::integer(3))
+            .expect("replaceKeyAndGetOld should replace a dictionary key");
+        assert!(old.is_same_object_as(&inserted));
+        assert_eq!(alias.get_key(b"/Three").as_integer(), Some(3));
+
+        let missing = dict
+            .remove_key_and_get_old(b"/Missing")
+            .expect("removeKeyAndGetOld should return a null for a missing key");
+        assert!(missing.is_null());
+        let removed = dict
+            .remove_key_and_get_old(b"/Three")
+            .expect("removeKeyAndGetOld should return the existing value");
+        assert_eq!(removed.as_integer(), Some(3));
+        assert!(dict.get_key(b"/Three").is_null());
+    }
+
+    #[test]
+    fn and_get_dictionary_mutators_keep_qpdf_type_warning_boundaries() {
+        let (handle, recorder) = warning_emission_tests::handle_resolving(ObjectValue::Integer(7));
+
+        let returned = handle
+            .replace_key_and_get_new(b"/Ignored", ObjectHandle::integer(1))
+            .expect("a contextful qpdf type warning is recoverable");
+        assert_eq!(returned.as_integer(), Some(1));
+
+        let old = handle
+            .remove_key_and_get_old(b"/Ignored")
+            .expect("removeKeyAndGetOld should return null after its warning");
+        assert!(old.is_null());
+
+        assert_eq!(
+            warning_emission_tests::warnings(&recorder),
+            [
+                "object 3 0: operation for dictionary attempted on object of type integer: ignoring key replacement request",
+                "object 3 0: operation for dictionary attempted on object of type integer: ignoring key removal request",
+            ]
+        );
+    }
+
+    #[test]
+    fn set_object_description_routes_array_warning_through_the_document() {
+        let pdf = crate::Pdf::empty().expect("empty PDF should be constructible");
+        let array = ObjectHandle::array(vec![]);
+        array
+            .set_object_description(&pdf, "test array")
+            .expect("live document context should be attachable");
+
+        let erased = array
+            .erase_array_item_and_get_old(50)
+            .expect("qpdf reports an out-of-bounds erase as a warning");
+        assert!(erased.is_null());
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["test array: ignoring attempt to erase out of bounds array item"]
+        );
     }
 }
