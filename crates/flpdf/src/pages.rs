@@ -13,13 +13,14 @@ pub(crate) mod repair;
 pub mod repair;
 pub mod tree_rebuild;
 
+use crate::object_handle::ObjectHandleIdentity;
 use crate::pipeline::buffer::Buffer;
 #[cfg(test)]
 use crate::pipeline::test_support::ascii85_fixture_bytes;
 #[cfg(test)]
 use crate::Object;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::io::{Read, Seek};
 
@@ -339,11 +340,54 @@ pub fn page_content_bytes<R: Read + Seek>(
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+#[derive(Clone)]
+enum PageNode {
+    Indirect(ObjectRef),
+    Direct(ObjectHandle),
+}
+
+impl PageNode {
+    fn from_handle(handle: ObjectHandle) -> Self {
+        match handle.object_ref() {
+            Some(object_ref) => Self::Indirect(object_ref),
+            None => Self::Direct(handle),
+        }
+    }
+
+    fn handle<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> ObjectHandle {
+        match self {
+            Self::Indirect(object_ref) => pdf.get_object_handle(*object_ref),
+            Self::Direct(handle) => handle.clone(),
+        }
+    }
+
+    fn object_ref(&self) -> Option<ObjectRef> {
+        match self {
+            Self::Indirect(object_ref) => Some(*object_ref),
+            Self::Direct(_) => None,
+        }
+    }
+
+    fn label(&self) -> String {
+        self.object_ref().map_or_else(
+            || "direct page-tree object".to_owned(),
+            |reference| reference.to_string(),
+        )
+    }
+}
+
 pub struct PageWalk<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
-    /// Stack of `(node_ref, depth)` yet to be visited.
-    stack: Vec<(ObjectRef, usize)>,
+    /// Stack of page-tree handles and depths yet to be visited. Direct
+    /// `/Pages` dictionaries are valid qpdf children and therefore cannot be
+    /// represented by `ObjectRef` alone.
+    stack: Vec<(PageNode, usize)>,
     seen: BTreeSet<ObjectRef>,
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "direct page-tree cycle detection keys on canonical handle identity"
+    )]
+    seen_direct: HashSet<ObjectHandleIdentity>,
     max_depth: usize,
     /// Set to `true` after yielding `Err`; causes all subsequent calls to return `None`.
     done: bool,
@@ -369,29 +413,28 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - [`Error::Unsupported`] when the catalog is not a dictionary.
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
-        let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve(&catalog)?;
-        if catalog.as_dictionary().is_none() {
-            return Err(Error::Unsupported(format!(
-                "document catalog {catalog_ref} is not a dictionary"
-            )));
+        let root = pdf.trailer_key_handle(b"Root");
+        if root.is_null() {
+            return Err(Error::Missing("/Root"));
         }
-        let pages_ref = catalog
-            .try_get_key(b"/Pages")?
-            .object_ref()
-            .ok_or(Error::Missing("/Pages"))?;
+        let catalog = pdf.root_handle()?;
+        let pages = catalog.try_get_key(b"/Pages")?;
+        if pages.is_null() {
+            return Err(Error::Missing("/Pages"));
+        }
+        let pages = PageNode::from_handle(pages);
         Ok(PageWalk {
             pdf,
-            stack: vec![(pages_ref, 0)],
+            stack: vec![(pages, 0)],
             seen: BTreeSet::new(),
+            seen_direct: HashSet::new(),
             max_depth,
             done: false,
         })
     }
 
-    fn visit_node(&mut self, node: ObjectRef, depth: usize) -> Result<Option<ObjectRef>> {
-        let node_obj = self.pdf.get_object_handle(node);
+    fn visit_node(&mut self, node: &PageNode, depth: usize) -> Result<Option<ObjectRef>> {
+        let node_obj = node.handle(self.pdf);
         self.pdf.resolve(&node_obj)?;
 
         if node_obj.as_dictionary().is_none() {
@@ -408,7 +451,9 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
                 // Push in reverse order so that the first kid is popped first.
                 for kid in kids.iter().rev() {
                     if let Some(r) = kid.object_ref() {
-                        self.stack.push((r, depth + 1));
+                        self.stack.push((PageNode::Indirect(r), depth + 1));
+                    } else if kid.as_dictionary().is_some() {
+                        self.stack.push((PageNode::Direct(kid.clone()), depth + 1));
                     }
                 }
             }
@@ -416,7 +461,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
         }
 
         if node_type.as_name().as_deref() == Some(b"Page") {
-            return Ok(Some(node));
+            return Ok(node.object_ref());
         }
 
         Ok(None)
@@ -438,15 +483,20 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
                 self.done = true;
                 return Some(Err(Error::Unsupported(format!(
                     "page tree depth exceeds maximum of {} at {}",
-                    self.max_depth, node
+                    self.max_depth,
+                    node.label()
                 ))));
             }
 
-            if !self.seen.insert(node) {
+            let first_visit = match &node {
+                PageNode::Indirect(reference) => self.seen.insert(*reference),
+                PageNode::Direct(handle) => self.seen_direct.insert(handle.identity_key()),
+            };
+            if !first_visit {
                 continue; // cycle guard: already visited
             }
 
-            match self.visit_node(node, depth) {
+            match self.visit_node(&node, depth) {
                 Ok(Some(page)) => return Some(Ok(page)),
                 Ok(None) => continue,
                 Err(error) => {
@@ -1388,6 +1438,38 @@ mod tests {
         data
     }
 
+    /// Build a minimal PDF whose trailer stores the Catalog directly rather
+    /// than as an indirect object. The page-tree objects remain ordinary
+    /// indirect objects so the test isolates the document-root shape.
+    fn pdf_from_objects_with_direct_catalog(objects: &[(u32, &str)], catalog: &str) -> Vec<u8> {
+        let mut data: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<(u32, u64)> = Vec::new();
+        for (num, body) in objects {
+            let offset = data.len() as u64;
+            offsets.push((*num, offset));
+            data.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = data.len() as u64;
+        let max_num = offsets.iter().map(|(number, _)| *number).max().unwrap_or(0);
+        let total = max_num as usize + 1;
+        let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+        for number in 1..=max_num {
+            if let Some((_, offset)) = offsets.iter().find(|(candidate, _)| *candidate == number) {
+                xref.push_str(&format!("{offset:010} 00000 n \n"));
+            } else {
+                xref.push_str("0000000000 65535 f \n");
+            }
+        }
+        data.extend_from_slice(xref.as_bytes());
+        data.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {total} /Root {catalog} >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        data
+    }
+
     #[test]
     fn page_walk_single_page_yields_one_ref() {
         let bytes = pdf_from_objects(
@@ -1404,6 +1486,178 @@ mod tests {
             .collect::<Result<_>>()
             .unwrap();
         assert_eq!(refs, vec![ObjectRef::new(3, 0)]);
+    }
+
+    #[test]
+    fn page_walk_accepts_a_direct_catalog_root() {
+        let bytes = pdf_from_objects_with_direct_catalog(
+            &[
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+            ],
+            "<< /Type /Catalog /Pages << /Type /Pages /Kids [3 0 R] /Count 1 >> >>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("direct-root PDF should parse");
+        let first_root = pdf.root_handle().expect("direct Catalog should resolve");
+        let second_root = pdf.root_handle().expect("direct Catalog should stay live");
+        assert!(
+            first_root.is_same_object_as(&second_root),
+            "repeated root access must preserve direct Catalog identity"
+        );
+        first_root
+            .replace_key(b"/Marker", ObjectHandle::integer(7))
+            .expect("direct Catalog should remain mutable");
+        let trailer = pdf.trailer();
+        let trailer_root = trailer
+            .try_get_key(b"/Root")
+            .expect("trailer should expose the Catalog");
+        assert!(
+            trailer_root.is_same_object_as(&first_root),
+            "trailer and root access must share the canonical direct Catalog"
+        );
+        assert_eq!(trailer_root.get_key(b"/Marker").as_integer(), Some(7));
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .expect("PageWalk should accept a direct Catalog")
+            .collect::<Result<_>>()
+            .expect("page walk should succeed");
+        assert_eq!(refs, vec![ObjectRef::new(3, 0)]);
+    }
+
+    #[test]
+    fn page_refs_and_rebuild_accept_a_direct_catalog_with_a_direct_pages_root() {
+        let bytes = pdf_from_objects_with_direct_catalog(
+            &[(3, "<< /Type /Page /MediaBox [0 0 10 10] >>")],
+            "<< /Type /Catalog /Pages << /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >> >>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("direct-root PDF should parse");
+        let refs = page_refs(&mut pdf).expect("page_refs should traverse direct /Pages");
+        assert_eq!(refs, vec![ObjectRef::new(3, 0)]);
+        crate::PageDocumentHelper::new(&mut pdf)
+            .push_inherited_attributes_to_pages()
+            .expect("inherited attributes should traverse a direct Catalog");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).expect("page should resolve");
+        assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+        assert_eq!(
+            crate::PageDocumentHelper::new(&mut pdf)
+                .get_all_pages()
+                .expect("PageDocumentHelper should accept a direct Catalog"),
+            refs
+        );
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .expect("page preparation should succeed")
+            .expect("direct Catalog should provide a page tree");
+        assert!(matches!(
+            prepared.root,
+            crate::pages::repair::PageTreeRoot::DirectCatalog
+        ));
+        crate::pages::tree_rebuild::rebuild_page_tree(&mut pdf, &refs)
+            .expect("page-tree rebuild should mutate a direct Catalog");
+        assert_eq!(page_refs(&mut pdf).expect("rebuilt pages"), refs);
+
+        let bytes = pdf_from_objects_with_direct_catalog(
+            &[(3, "<< /Type /Page /MediaBox [0 0 10 10] >>")],
+            "<< /Type /Catalog /Pages << /Type /Pages /Kids [3 0 R] /Count 1 >> >>",
+        );
+        let mut removable = Pdf::open(Cursor::new(bytes)).expect("direct-root PDF should parse");
+        crate::PageDocumentHelper::new(&mut removable)
+            .remove_page(ObjectRef::new(3, 0))
+            .expect("removing the final direct-root page should succeed");
+        assert!(crate::PageDocumentHelper::new(&mut removable)
+            .get_all_pages()
+            .expect("empty direct-root tree should remain readable")
+            .is_empty());
+    }
+
+    #[test]
+    fn page_walk_preserves_missing_root_and_pages_errors() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+            ],
+        );
+        let mut missing_root = Pdf::open(Cursor::new(bytes.clone())).expect("PDF should parse");
+        missing_root.trailer().remove_key(b"/Root");
+        assert!(matches!(
+            PageWalk::new(&mut missing_root),
+            Err(Error::Missing("/Root"))
+        ));
+        assert!(matches!(
+            crate::pages::tree_rebuild::rebuild_page_tree(
+                &mut missing_root,
+                &[ObjectRef::new(2, 0)]
+            ),
+            Err(Error::Missing("/Root"))
+        ));
+
+        let mut missing_pages = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        missing_pages
+            .trailer()
+            .replace_key(
+                b"/Root",
+                ObjectHandle::dictionary(vec![(
+                    b"/Type".to_vec(),
+                    ObjectHandle::name(b"Catalog".to_vec()),
+                )]),
+            )
+            .expect("replace root");
+        assert!(matches!(
+            PageWalk::new(&mut missing_pages),
+            Err(Error::Missing("/Pages"))
+        ));
+    }
+
+    #[test]
+    fn page_walk_handles_direct_page_tree_children_and_depth_errors() {
+        let bytes = pdf_from_objects_with_direct_catalog(
+            &[],
+            "<< /Type /Catalog /Pages << /Type /Pages /Kids [<< /Type /Page >>] /Count 1 >> >>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("direct-root PDF should parse");
+        let refs: Vec<ObjectRef> = PageWalk::new(&mut pdf)
+            .expect("direct page-tree root should be readable")
+            .collect::<Result<_>>()
+            .expect("direct page-tree child should not error");
+        assert!(
+            refs.is_empty(),
+            "direct page leaves have no ObjectRef identity"
+        );
+
+        let mut limited = Pdf::open(Cursor::new(bytes)).expect("direct-root PDF should parse");
+        let error = PageWalk::with_max_depth(&mut limited, 1)
+            .expect("PageWalk should initialize")
+            .next()
+            .expect("depth boundary should produce an error")
+            .expect_err("direct page child should hit the depth boundary");
+        assert!(error.to_string().contains("direct page-tree object"));
+    }
+
+    #[test]
+    fn root_handle_falls_back_to_its_memo_when_the_trailer_memo_is_null() {
+        let bytes = pdf_from_objects_with_direct_catalog(
+            &[],
+            "<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 0 >> >>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("direct-root PDF should parse");
+        let root = pdf.root_handle().expect("direct Catalog should resolve");
+        pdf.trailer_handle_memo = Some(ObjectHandle::null());
+        let again = pdf
+            .root_handle()
+            .expect("root memo should survive null trailer");
+        assert!(root.is_same_object_as(&again));
+
+        let mut missing = Pdf::open(Cursor::new(pdf_from_objects(
+            1,
+            &[(1, "<< /Type /Catalog /Pages 2 0 R >>"), (2, "<< >>")],
+        )))
+        .expect("PDF should parse");
+        missing.trailer_handle_memo = Some(ObjectHandle::null());
+        assert!(matches!(
+            missing.root_handle(),
+            Err(Error::System(message)) if message == "unable to find /Root dictionary"
+        ));
     }
 
     #[test]

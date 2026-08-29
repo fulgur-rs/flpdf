@@ -30,7 +30,13 @@ pub struct PreparedPages {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageTreeRoot {
     Indirect(ObjectRef),
-    Direct { catalog: ObjectRef },
+    Direct {
+        catalog: ObjectRef,
+    },
+    /// The `/Pages` root is direct and its Catalog is also direct in the
+    /// trailer. The Catalog itself has no `ObjectRef`; consumers recover the
+    /// same canonical handle through `Pdf::root_handle()`.
+    DirectCatalog,
 }
 
 /// Repair the `/Pages` tree and return its effective root and leaf order.
@@ -77,10 +83,14 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     }
     pdf.mark_get_all_pages_called();
 
-    let Some(root_ref) = pdf.root_ref() else {
+    let root_candidate = pdf.trailer_key_handle(b"Root");
+    if root_candidate.is_null() {
         return Ok(None);
-    };
-    let catalog = pdf.get_object_handle(root_ref);
+    }
+    let catalog = pdf.resolve_to_terminal(&root_candidate)?;
+    if catalog.try_as_dictionary()?.is_none() {
+        return Ok(None);
+    }
     let mut pages = catalog.try_get_key(b"/Pages")?;
 
     // qpdf corrects a catalog that points into the tree by following
@@ -154,7 +164,12 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
 
     let root = match pages.object_ref() {
         Some(object_ref) => PageTreeRoot::Indirect(object_ref),
-        None => PageTreeRoot::Direct { catalog: root_ref },
+        None => match catalog.object_ref() {
+            Some(catalog_ref) => PageTreeRoot::Direct {
+                catalog: catalog_ref,
+            },
+            None => PageTreeRoot::DirectCatalog,
+        },
     };
     let prepared = PreparedPages {
         root,

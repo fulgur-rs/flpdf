@@ -80,10 +80,11 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         // page-document boundary here via the same canonical dictionary gate
         // `pages::page_refs` used before this helper replaced it. A trailer
         // with no `/Root` key at all keeps flpdf's established
-        // `Error::Missing("/Root")` (used by every other `root_ref()`-gated
-        // caller in this crate); a `/Root` that resolves but is not a
-        // dictionary goes through `root_handle`'s own error.
-        if self.pdf.root_ref().is_none() {
+        // `Error::Missing("/Root")`; a `/Root` that resolves but is not a
+        // dictionary goes through `root_handle`'s own error. `root_ref()` is
+        // intentionally not used here because a direct Catalog has no
+        // ObjectRef identity.
+        if self.pdf.trailer_key_handle(b"Root").is_null() {
             return Err(Error::Missing("/Root"));
         }
         self.pdf.root_handle()?;
@@ -303,14 +304,12 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// `removePage` permits an empty document.
     fn clear_page_tree(&mut self) -> Result<RebuildResult> {
         let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
-        let catalog_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.pdf.resolve(&catalog)?;
+        let catalog = self.pdf.root_handle()?;
         let Some(catalog_dict) = catalog.as_dictionary() else {
             // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
-            return Err(Error::Unsupported(format!(
-                "document catalog {catalog_ref} is not a dictionary"
-            )));
+            return Err(Error::Unsupported(
+                "document catalog is not a dictionary".into(),
+            ));
             // cov:ignore-end
         };
         // cov:ignore-start: get_all_pages must have found the removed page through catalog /Pages before this final-page path can run

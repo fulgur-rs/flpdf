@@ -291,6 +291,7 @@ fn page_tree_root_handle<R: Read + Seek>(
     match page_root {
         PageTreeRoot::Indirect(root_ref) => Ok(pdf.get_object_handle(root_ref)),
         PageTreeRoot::Direct { catalog } => pdf.get_object_handle(catalog).try_get_key(b"/Pages"),
+        PageTreeRoot::DirectCatalog => pdf.root_handle()?.try_get_key(b"/Pages"),
     }
 }
 
@@ -427,7 +428,11 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // flattening it. That handle can be either an indirect root or a direct
     // dictionary embedded in the catalog. Keep the ownership boundary through
     // this rebuild instead of requiring catalog.get_ref("Pages").
-    let _catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+    let root_candidate = pdf.trailer_key_handle(b"Root");
+    if root_candidate.is_null() {
+        return Err(Error::Missing("/Root"));
+    }
+    pdf.root_handle()?;
     let prepared =
         prepare_for_optimization_with_max_depth(pdf, max_depth)?.ok_or(Error::Missing("/Pages"))?;
     let page_root = prepared.root;
@@ -535,6 +540,9 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                 format!("document /Pages root {root_ref} is not a dictionary")
             }
             PageTreeRoot::Direct { .. } => {
+                "document catalog /Pages root is not a dictionary".into()
+            }
+            PageTreeRoot::DirectCatalog => {
                 "document catalog /Pages root is not a dictionary".into()
             }
         }));
