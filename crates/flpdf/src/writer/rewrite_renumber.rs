@@ -369,6 +369,62 @@ fn ensure_canonical_owner<R: Read + Seek>(
     Ok(())
 }
 
+/// Snapshot and filter a legacy dictionary at the raw-object writer boundary.
+///
+/// The canonical writer path uses [`crate::writer::object::visible_dict_entries`]
+/// directly on `ObjectHandle` slots. PCLm and the compatibility rewrite still
+/// receive materialized [`Object`] values, so they need this narrow adapter to
+/// recover each indirect reference's canonical handle before applying the same
+/// qpdf `isNull()` decision. The adapter deliberately resolves exactly the
+/// referenced handle supplied by the raw value: it does not chase a
+/// `Pdf::set_object` reference-as-value redirect, which has no qpdf counterpart.
+pub(crate) fn visible_raw_dict_entries<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dict: &Dictionary,
+    skip_length: bool,
+) -> crate::Result<Vec<(Vec<u8>, Object)>> {
+    let entries = snapshot_raw_dict_entries(dict, skip_length);
+    visible_raw_entries(pdf, entries)
+}
+
+fn snapshot_raw_dict_entries(dict: &Dictionary, skip_length: bool) -> Vec<(Vec<u8>, Object)> {
+    dict.iter()
+        .filter(|(key, _)| !(skip_length && *key == b"Length"))
+        .map(|(key, value)| (key.to_vec(), value.clone()))
+        .collect()
+}
+
+fn visible_raw_entries<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    entries: Vec<(Vec<u8>, Object)>,
+) -> crate::Result<Vec<(Vec<u8>, Object)>> {
+    let mut visible = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if !raw_value_is_null(pdf, &value)? {
+            visible.push((key, value));
+        }
+    }
+    Ok(visible)
+}
+
+fn raw_value_is_null<R: Read + Seek>(pdf: &mut Pdf<R>, value: &Object) -> crate::Result<bool> {
+    match value {
+        Object::Null => Ok(true),
+        Object::Reference(reference) => {
+            // qpdf treats object zero as a direct null reference. Generation
+            // validity belongs to parser token interpretation; once a raw
+            // object carries an indirect identity, qpdf's object model tests
+            // only whether its object number is nonzero.
+            if reference.number == 0 {
+                return Ok(true);
+            }
+            let handle = pdf.get_object_handle(*reference);
+            handle.try_is_null()
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Compute the set of object references reachable from the trailer roots,
 /// matching qpdf's reachability garbage collection of the linearized object
 /// universe.
@@ -1057,8 +1113,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
             }
         }
         Object::Dictionary(dict) => {
-            let entries = crate::qpdf_null::snapshot_entries(dict, false);
-            let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
+            let entries = visible_raw_dict_entries(pdf, dict, false)?;
             let mut rewritten = Dictionary::new();
             for (key, mut value) in entries {
                 rewrite_qpdf(pdf, &mut value, depth + 1, map, removed_refs)?;
@@ -1069,7 +1124,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
             *dict = rewritten;
         }
         Object::Stream(stream) => {
-            let mut entries = crate::qpdf_null::snapshot_entries(&stream.dict, false);
+            let mut entries = snapshot_raw_dict_entries(&stream.dict, false);
             for (key, value) in &mut entries {
                 if key == b"Length"
                     && matches!(
@@ -1081,7 +1136,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
                     *value = Object::Integer(stream.data.len() as i64);
                 }
             }
-            let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
+            let entries = visible_raw_entries(pdf, entries)?;
             let mut rewritten = Dictionary::new();
             for (key, mut value) in entries {
                 rewrite_qpdf(pdf, &mut value, depth + 1, map, removed_refs)?;
@@ -2027,6 +2082,57 @@ mod tests {
             reachable.contains(&ObjectRef::new(5, 0)),
             "qpdf preserves an array null's indirect identity"
         );
+    }
+
+    #[test]
+    fn raw_writer_visibility_uses_one_canonical_resolution_hop() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+            (3, b"<< /Type /Page /Parent 2 0 R >>"),
+            (4, b"null"),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        // `set_object` is the only supported way to construct the legacy
+        // reference-as-value state. The canonical handle for 5 resolves to a
+        // reference to 4, but qpdf itself never stores such an indirect
+        // replacement value. The writer boundary must therefore inspect one
+        // canonical handle value, not chase this compatibility redirect.
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(4, 0)),
+        );
+
+        let mut dict = Dictionary::new();
+        dict.insert("DirectNull", Object::Null);
+        dict.insert("Length", Object::Integer(5));
+        dict.insert("RealNull", Object::Reference(ObjectRef::new(4, 0)));
+        dict.insert("Holder", Object::Reference(ObjectRef::new(5, 0)));
+        dict.insert("Missing", Object::Reference(ObjectRef::new(99, 0)));
+        dict.insert("Zero", Object::Reference(ObjectRef::new(0, 0)));
+        dict.insert("Visible", Object::Reference(ObjectRef::new(1, 0)));
+        let dict_before = dict.clone();
+
+        let visible = visible_raw_dict_entries(&mut pdf, &dict, false).expect("filter entries");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|(key, _)| key.as_slice())
+                .collect::<Vec<_>>(),
+            [b"Holder".as_slice(), b"Length", b"Visible"]
+        );
+        assert_eq!(dict, dict_before);
+
+        let without_length = visible_raw_dict_entries(&mut pdf, &dict, true)
+            .expect("filter entries without stream length");
+        assert_eq!(
+            without_length
+                .iter()
+                .map(|(key, _)| key.as_slice())
+                .collect::<Vec<_>>(),
+            [b"Holder".as_slice(), b"Visible"]
+        );
+        assert_eq!(dict, dict_before);
     }
 
     #[test]
