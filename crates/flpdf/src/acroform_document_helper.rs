@@ -641,6 +641,70 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         self.update_cached_field(field)
     }
 
+    /// Disable digital signature fields, mirroring
+    /// `QPDFAcroFormDocumentHelper::disableDigitalSignatures`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:419-439`).
+    ///
+    /// The document-level `/Perms` and `/SigFlags` mutation is delegated to
+    /// [`Pdf::remove_security_restrictions`]. This helper then enumerates the
+    /// cached qpdf form fields, removes `/FT`, `/V`, `/SV`, and `/Lock` from
+    /// fields whose inherited type is `/Sig`, and removes those field
+    /// references from the top-level `/Fields` array. A signature dictionary
+    /// is not deleted eagerly; the writer's reachability pass drops it only
+    /// when no other reference, such as catalog `/DSS`, keeps it alive.
+    ///
+    /// The boolean is an flpdf convenience for the CLI warning path. qpdf's
+    /// corresponding helper returns `void`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the document mutation, AcroForm analysis, field
+    /// type resolution, live-handle mutation, and field-array update.
+    pub fn disable_digital_signatures(&mut self) -> Result<bool> {
+        let mut changed = self.pdf.remove_security_restrictions()?;
+        let form_fields = self.form_field_handles()?;
+        let mut to_remove = BTreeSet::new();
+
+        for (field_ref, field) in form_fields {
+            let field_type = {
+                let mut helper = FormFieldObjectHelper::new(field_ref, self.pdf);
+                helper.field_type()?
+            };
+            if field_type.as_deref() != Some(b"/Sig") {
+                continue;
+            }
+
+            // qpdf records every /Sig form field before removing keys. A
+            // non-terminal inherited /Sig field can therefore remain in the
+            // field tree when it has no signature keys of its own.
+            to_remove.insert(field_ref);
+
+            let mut field_changed = false;
+            // qpdf's removeKey erases raw entries unconditionally, including
+            // entries whose stored value is null. Do not use hasKey here,
+            // because QPDF_Dictionary::hasKey intentionally collapses null.
+            let entries = field.as_dictionary();
+            for key in [b"/FT".as_slice(), b"/V", b"/SV", b"/Lock"] {
+                let present = entries
+                    .as_ref()
+                    .is_some_and(|entries| entries.keys().any(|entry| entry.as_slice() == key));
+                if present {
+                    field.remove_key(key);
+                    field_changed = true;
+                }
+            }
+            if field_changed {
+                self.pdf.mark_object_handle_dirty(&field)?;
+                changed = true;
+            }
+        }
+
+        if self.remove_form_fields(&to_remove)? {
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     fn remove_cached_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) {
         let mut cache_store = self.cache.borrow_mut();
         let Some(cache) = cache_store.as_mut() else {

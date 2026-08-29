@@ -40,7 +40,7 @@
 //! These fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
 
-use flpdf::{disable_digital_signatures, NewlineBeforeEndstream, Pdf};
+use flpdf::{AcroFormDocumentHelper, NewlineBeforeEndstream, Pdf};
 use std::path::Path;
 
 /// Full-rewrite `fixture` after `disable_digital_signatures`, with the
@@ -52,7 +52,10 @@ fn remove_restrictions_qpdf_equivalent(fixture: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    disable_digital_signatures(&mut pdf).unwrap();
+    AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap();
 
     let opts = WriterTestSettings {
         static_id: true,
