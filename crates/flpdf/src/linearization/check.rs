@@ -640,17 +640,23 @@ fn length_next_n<R: Read + Seek>(
     warnings: &mut Vec<String>,
 ) -> std::result::Result<i128, LinearizationCheckError> {
     // A valid object sequence cannot contain more entries than the input file
-    // can contain bytes. This bound keeps a corrupt 32-bit hint count from
-    // turning the checker into an unbounded loop while preserving every valid
-    // PDF (each indirect object consumes at least one byte).
+    // can contain bytes, nor drastically more entries than the document
+    // actually has objects. Combine both bounds: `file_len` alone is too
+    // permissive for a large file with a sparse xref (a small malformed PDF
+    // padded with junk bytes could still claim a hint count near the total
+    // file size), and the xref-derived bound alone is too permissive for a
+    // tiny file (a few-KB PDF could still claim up to xref.len() + 1_000_000
+    // objects). Taking the smaller of the two keeps a corrupt 32-bit hint
+    // count from turning the checker into an unbounded loop while preserving
+    // every valid PDF (each indirect object consumes at least one byte, and a
+    // valid hint table never claims more objects than the document has).
     // qpdf 11.9.0's lengthNextN has no corresponding bound
     // (libqpdf/QPDF_linearization.cc:589-604); this is defense-in-depth for
     // malformed input and does not change valid linearization output.
-    if nobjects > file_len {
+    let bound = file_len.min(xref.len() as u64 + 1_000_000);
+    if nobjects > bound {
         return Err(LinearizationCheckError::InvalidParam {
-            message: format!(
-                "hint table object count {nobjects} exceeds input file length {file_len}"
-            ),
+            message: format!("hint table object count {nobjects} exceeds bound {bound}"),
         });
     }
 
@@ -2577,6 +2583,26 @@ mod tests {
             )
             .is_err(),
             "a hint count larger than the input file must be rejected before iteration"
+        );
+
+        // A huge file with a tiny (or empty) xref must not let `file_len`
+        // alone admit a hint count far beyond the document's actual object
+        // count: the xref-derived term must still apply as a ceiling even
+        // when the file itself is large.
+        let huge_file_len = 10_000_000;
+        assert!(
+            length_next_n(
+                &mut pdf,
+                &BTreeMap::new(),
+                1,
+                1_000_001,
+                huge_file_len,
+                true,
+                &mut warnings,
+            )
+            .is_err(),
+            "a hint count exceeding xref.len() + 1_000_000 must be rejected \
+             even when the input file is large"
         );
 
         let no_extent = ObjectRef::new(50, 0);
