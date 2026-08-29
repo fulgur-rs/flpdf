@@ -469,19 +469,22 @@ impl<R: Read + Seek> Pdf<R> {
     /// graph before checking its type. A missing, dangling, or non-dictionary
     /// `/Root` is a document-level error rather than a missing-key fallback.
     pub fn root_handle(&mut self) -> Result<ObjectHandle> {
-        let candidate = if let Some(trailer) = &self.trailer_handle_memo {
-            if !trailer.is_null() {
-                trailer
-                    .try_get_key(b"/Root")
-                    .unwrap_or_else(|_| ObjectHandle::null())
-            } else if let Some(root) = &self.root_handle_memo {
-                root.clone()
-            } else {
-                ObjectHandle::null()
-            }
+        let trailer_is_live =
+            matches!(&self.trailer_handle_memo, Some(trailer) if !trailer.is_null());
+        let candidate = if trailer_is_live {
+            self.trailer_handle_memo
+                .as_ref()
+                .expect("trailer_is_live confirmed a populated, non-null memo")
+                .try_get_key(b"/Root")
+                .unwrap_or_else(|_| ObjectHandle::null())
         } else if let Some(root) = &self.root_handle_memo {
             root.clone()
         } else {
+            // The trailer memo is either absent or was itself degraded to
+            // null by an unrelated sibling entry's nesting depth (see
+            // `Pdf::trailer`'s own doc). Either way, fall back to the
+            // shallow, depth-safe single-key lift so a valid /Root is not
+            // hidden behind that unrelated trailer damage.
             let root = self.trailer_key_handle(b"Root");
             if !root.is_null() {
                 self.root_handle_memo = Some(root.clone());

@@ -1493,14 +1493,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     fn canonical_acroform(&mut self) -> Result<Option<ObjectHandle>> {
-        let Some(root_ref) = self.pdf.root_ref() else {
+        // `root_handle` accepts a direct trailer /Root the same way qpdf's
+        // `getRoot` does; a missing/dangling/non-dictionary root degrades to
+        // "no AcroForm" here exactly as the pre-existing `root_ref()`-based
+        // checks did.
+        let Ok(root) = self.pdf.root_handle() else {
             return Ok(None);
         };
-        let root = self.pdf.get_object_handle(root_ref);
-        let root = self.pdf.resolve_to_terminal(&root)?;
-        if root.as_dictionary().is_none() {
-            return Ok(None);
-        }
         let acroform = self
             .pdf
             .resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
@@ -2283,6 +2282,38 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(std::io::Cursor::new(bytes)).expect("open")
+    }
+
+    /// A PDF whose trailer stores the Catalog directly, with a direct
+    /// `/AcroForm /NeedAppearances true`. All-direct: no indirect objects at
+    /// all, isolating the direct-root Catalog shape.
+    fn direct_root_pdf_with_need_appearances() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \n\
+                 trailer\n<< /Size 1 /Root << /Type /Catalog \
+                 /Pages << /Type /Pages /Kids [] /Count 0 >> \
+                 /AcroForm << /NeedAppearances true /Fields [] >> >> >>\n\
+                 startxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(std::io::Cursor::new(bytes)).expect("open")
+    }
+
+    #[test]
+    fn get_need_appearances_reads_a_direct_root_acroform() {
+        let mut pdf = direct_root_pdf_with_need_appearances();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        assert!(
+            helper.get_need_appearances().unwrap(),
+            "a direct-root Catalog's /AcroForm /NeedAppearances must be found, \
+             matching qpdf's QPDF::getRoot (trailer.getKey + isDictionary, no \
+             indirect-only requirement)"
+        );
     }
 
     fn rootless_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {

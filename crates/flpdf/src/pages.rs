@@ -1648,11 +1648,31 @@ mod tests {
             .expect("root memo should survive null trailer");
         assert!(root.is_same_object_as(&again));
 
+        // A trailer memo degraded to null by an unrelated sibling's nesting
+        // depth must not be read as "no root at all": with no prior
+        // `root_handle()` call to fall back on, `root_handle()` must still
+        // recover a genuinely valid `/Root` through the shallow, depth-safe
+        // `trailer_key_handle("Root")` lookup.
+        let mut valid_without_prior_call = Pdf::open(Cursor::new(pdf_from_objects(
+            1,
+            &[(1, "<< /Type /Catalog /Pages 2 0 R >>"), (2, "<< >>")],
+        )))
+        .expect("PDF should parse");
+        valid_without_prior_call.trailer_handle_memo = Some(ObjectHandle::null());
+        let root = valid_without_prior_call
+            .root_handle()
+            .expect("a genuinely valid /Root must survive a degraded trailer memo");
+        assert!(root.as_dictionary().is_some());
+
+        // A genuinely missing `/Root` key, by contrast, must still be a
+        // document-level error even with the same degraded trailer memo and
+        // no prior `root_handle()` call.
         let mut missing = Pdf::open(Cursor::new(pdf_from_objects(
             1,
             &[(1, "<< /Type /Catalog /Pages 2 0 R >>"), (2, "<< >>")],
         )))
         .expect("PDF should parse");
+        missing.trailer.remove("Root");
         missing.trailer_handle_memo = Some(ObjectHandle::null());
         assert!(matches!(
             missing.root_handle(),
