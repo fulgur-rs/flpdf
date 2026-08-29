@@ -179,9 +179,15 @@ where
         .map(|xref| {
             let source_handle = source.get_object_handle(*xref);
             let copied = dest.copy_foreign_object(&source_handle)?;
-            copied.object_ref().ok_or_else(|| {
-                Error::Unsupported("imported Form XObject is not indirect".to_string())
-            })
+            let copied_ref = copied.object_ref();
+            if copied_ref.is_none() {
+                // cov:ignore-start: qpdf guarantees an indirect result for this indirect Form XObject
+                return Err(Error::Unsupported(
+                    "imported Form XObject is not indirect".to_string(),
+                ));
+                // cov:ignore-end
+            }
+            Ok(copied_ref.expect("copyForeignObject returned an indirect Form XObject"))
         })
         .collect()
 }

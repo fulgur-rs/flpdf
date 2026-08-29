@@ -403,8 +403,9 @@ fn materializes_intermediate_mediabox_and_cropbox() {
 }
 
 /// Ancestor /Pages stores /MediaBox as an INDIRECT reference (obj 6), the qpdf
-/// shared-array pattern. The leaf (obj 3) inherits it. Exercises rewrite_refs'
-/// The extracted leaf's inherited /MediaBox must resolve to a
+/// shared-array pattern. The leaf (obj 3) inherits it. Exercises the canonical
+/// foreign-object copy of an inherited indirect value. The extracted leaf's
+/// inherited /MediaBox must resolve to a
 /// live array, not become Null.
 fn indirect_inherited_mediabox_pdf() -> Vec<u8> {
     build_pdf(

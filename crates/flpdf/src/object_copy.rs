@@ -26,10 +26,12 @@
 //! guards a shape only the public API can produce, not one qpdf itself
 //! defends against.
 //!
-//! # Independence
+//! # Identity reuse
 //!
-//! Each call uses a fresh map, so copying the same source set twice produces
-//! independent, non-shared target copies.
+//! Each source document gets one destination-side map, so copying the same
+//! source handle twice reuses the same target identity. Different source
+//! documents remain independent because their maps are keyed by source
+//! document identity.
 
 use crate::object_handle::{ObjectHandle, ObjectValue};
 use crate::{Error, ObjectRef, Pdf, Result};

@@ -1587,7 +1587,7 @@ mod byte_gate {
     /// `/Annots` array:
     /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
     ///   pointing at the source page — after copy that ref goes stale
-    ///   and gets Null'd by rewrite_refs, so the canonical
+    ///   and gets Null'd by canonical foreign-object replacement, so the
     ///   `PageObjectHelper::copy_annotations_from` path must repoint it at
     ///   dest_page_ref;
     /// - one entry is a DIRECT annot dictionary (an inline
