@@ -53,8 +53,10 @@ pub struct MergeInput<'a, R: Read + Seek + 'static> {
     /// The opened source document.
     ///
     /// The borrow lasts only for the merge call, but a provider-backed stream
-    /// copied from this source remains lazy in the returned document. Keep the
-    /// source [`Pdf`] alive until the returned document has been written, or
+    /// copied from this source remains lazy in the returned document and is
+    /// re-read from this source on every later write or read of the returned
+    /// document, not only the first. Keep the source [`Pdf`] alive for as
+    /// long as the returned document may still access that copied stream, or
     /// call [`Pdf::set_immediate_copy_from`] on the source before merging when
     /// it must be released earlier. Parsed file-backed streams capture their
     /// input source separately and do not require this `Pdf` to remain alive.
@@ -650,16 +652,21 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// tree, and a page selected more than once within an input becomes a shallow
 /// clone of its first copy, matching [`extract_pages`](crate::extract_pages).
 ///
-/// Each source is left unmodified. Each selected page is copied with the
-/// persistent [`Pdf::copy_foreign_object`] route; the result mirrors
-/// [`extract_pages`](crate::extract_pages) for a single input. Write the result
-/// with [`crate::PdfWriter`] to produce one fresh qpdf-style output.
+/// Each source is left unmodified, unless [`Pdf::set_immediate_copy_from`] was
+/// enabled on it beforehand: that opt-in materializes each provider-backed
+/// stream into the source itself as a side effect of copying it. Each selected
+/// page is copied with the persistent [`Pdf::copy_foreign_object`] route; the
+/// result mirrors [`extract_pages`](crate::extract_pages) for a single input.
+/// Write the result with [`crate::PdfWriter`] to produce one fresh qpdf-style
+/// output.
 ///
 /// Provider-backed streams reachable from selected pages or from the primary
-/// Catalog/trailer metadata remain lazy until that write. As with qpdf's
-/// `QPDF::copyForeignObject`, keep the corresponding source [`Pdf`] alive
-/// through the write, or call [`Pdf::set_immediate_copy_from`] on that source
-/// before this function when early release is required. This rule applies to
+/// Catalog/trailer metadata remain lazy and are re-read from their source on
+/// every later write or read of the returned document, not only the first.
+/// As with qpdf's `QPDF::copyForeignObject`, keep the corresponding source
+/// [`Pdf`] alive for as long as the returned document may still access that
+/// stream, or call [`Pdf::set_immediate_copy_from`] on that source before
+/// this function when early release is required. This rule applies to
 /// provider-backed streams only; parsed file-backed streams retain a separate
 /// captured input source and can be written after their source `Pdf` is
 /// dropped.

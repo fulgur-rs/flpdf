@@ -542,7 +542,14 @@ fn merge_provider_stream_supports_source_drop_after_immediate_copy() {
             source: &mut primary,
             pages: vec![0],
         }];
-        merge_documents(&mut inputs).expect("merge immediate-copy source")
+        let merged = merge_documents(&mut inputs).expect("merge immediate-copy source");
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "immediate copy must materialize the provider during merge_documents itself, \
+             before the source goes out of scope"
+        );
+        merged
     };
 
     let output = write_merged_memory(&mut merged).expect("write after source drop");
