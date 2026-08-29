@@ -1994,7 +1994,7 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     }
 
     catalog.replace_key(b"/Extensions", extensions)?;
-    pdf.replace_object(root_ref, catalog)?;
+    replace_writer_catalog(pdf, root_ref, catalog)?;
     Ok(())
 }
 
@@ -2056,7 +2056,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
         if valid_adbe {
             if extensions_was_indirect || adbe_was_indirect {
                 catalog.replace_key(b"/Extensions", extensions)?;
-                pdf.replace_object(root_ref, catalog)?;
+                replace_writer_catalog(pdf, root_ref, catalog)?;
             }
             return Ok(());
         }
@@ -2068,7 +2068,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
     } else {
         catalog.replace_key(b"/Extensions", extensions)?;
     }
-    pdf.replace_object(root_ref, catalog)?;
+    replace_writer_catalog(pdf, root_ref, catalog)?;
     Ok(())
 }
 
@@ -2079,20 +2079,42 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
 /// cache entry after a canonical ObjectHandle mutation. qpdf's writer operates
 /// on a live `QPDFObjectHandle::unsafeShallowCopy` instead, so this boundary
 /// resolves the canonical root slot, makes a direct top-level dictionary copy,
-/// and leaves the final replacement to `Pdf::replace_object`. The immediate
+/// and leaves the final replacement to the writer Catalog replacement helper.
+/// The immediate
 /// entries stay shared; callers replace only top-level keys, so nested direct
-/// values—including streams—are not cloned or rejected.
-fn writer_catalog_copy<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(ObjectRef, ObjectHandle)> {
-    let Some(root_ref) = pdf.root_ref() else {
+/// values—including streams—are not cloned or rejected. A direct Catalog has
+/// no `ObjectRef`, so the returned identity is optional and replacement is
+/// performed through the live root handle.
+fn writer_catalog_copy<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<(Option<ObjectRef>, ObjectHandle)> {
+    let root_candidate = pdf.trailer_key_handle(b"Root");
+    if root_candidate.is_null() {
         return Err(crate::Error::Missing("/Root"));
-    };
-    let source = pdf.get_object_handle(root_ref);
-    pdf.resolve(&source)?;
+    }
+    let root_ref = pdf.root_ref();
+    let source = pdf.root_handle()?;
     let entries = source
         .try_as_dictionary()?
         .ok_or_else(|| crate::Error::Unsupported("Catalog is not a dictionary".to_string()))?;
     let catalog = ObjectHandle::dictionary(entries.into_iter().collect());
     Ok((root_ref, catalog))
+}
+
+/// Replace the writer-owned top-level Catalog copy without inventing an
+/// indirect identity for a direct trailer `/Root`.
+fn replace_writer_catalog<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    root_ref: Option<ObjectRef>,
+    catalog: ObjectHandle,
+) -> Result<()> {
+    if let Some(root_ref) = root_ref {
+        pdf.replace_object(root_ref, catalog).map(|_| ())?;
+        return Ok(());
+    }
+    let root = pdf.root_handle()?;
+    root.share_value_state_with(&catalog)?;
+    pdf.mark_object_handle_dirty(&root)
 }
 
 /// Capture the output-only `/Extensions` value and dirty state of the live
@@ -2208,15 +2230,17 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
 /// - Propagates canonical-handle resolution errors when materialising the
 ///   Catalog or an indirect `/Extensions` value.
 fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    // cov:ignore-start: defensive /Root guard. catalog_has_extensions_adbe is
-    // only reached after emit_canonical_pdf passes its own root_ref check
-    // on the same Pdf.
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(false);
+    let catalog = if let Some(root_ref) = pdf.root_ref() {
+        let catalog = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog)?;
+        catalog
+    } else {
+        let root_candidate = pdf.trailer_key_handle(b"Root");
+        if root_candidate.is_null() {
+            return Ok(false);
+        }
+        pdf.root_handle()?
     };
-    // cov:ignore-end
-    let catalog = pdf.get_object_handle(root_ref);
-    pdf.resolve(&catalog)?;
     if !catalog.try_has_key(b"/Extensions")? {
         return Ok(false);
     }
@@ -2482,9 +2506,7 @@ pub(crate) struct EncryptionContext {
 /// `pub(crate)`: also used by [`crate::linearization::writer::write_linearized_for_pdf_writer`],
 /// which needs the same `--cleartext-metadata` exemption for linearized output.
 pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
-    let root = pdf.root_ref()?;
-    let root_handle = pdf.get_object_handle(root);
-    pdf.resolve(&root_handle).ok()?;
+    let root_handle = pdf.root_handle().ok()?;
     let metadata = root_handle.try_get_key(b"/Metadata").ok()?;
     metadata.object_ref().or_else(|| metadata.as_reference())
 }
@@ -3200,7 +3222,8 @@ fn apply_encrypt_trailer_handle_entries<R: Read + Seek>(
 fn build_writer_trailer_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     size: usize,
-    root: ObjectRef,
+    root: Option<ObjectRef>,
+    direct_root: Option<&ObjectHandle>,
     options: &WriterOptions,
     encrypt_ctx: Option<&EncryptionContext>,
     deterministic_id: bool,
@@ -3237,10 +3260,16 @@ fn build_writer_trailer_handle<R: Read + Seek>(
             // cov:ignore-end
         })?), // cov:ignore: supported writer object counts fit in i64
     )?; // cov:ignore: validated /Size replacement; LLVM attributes this continuation to the call setup
-    trailer.replace_key(
-        b"/Root",
-        ObjectHandle::from_value(ObjectValue::Reference(root)),
-    )?; // cov:ignore: validated /Root replacement; LLVM attributes this continuation to the call setup
+    let root = match (root, direct_root) {
+        (Some(root), None) => ObjectHandle::from_value(ObjectValue::Reference(root)),
+        (None, Some(root)) => root.clone(),
+        _ => {
+            return Err(crate::Error::Unsupported(
+                "writer trailer Catalog root form is inconsistent".to_string(),
+            ));
+        }
+    };
+    trailer.replace_key(b"/Root", root)?; // cov:ignore: validated /Root replacement; LLVM attributes this continuation to the call setup
     apply_encrypt_trailer_handle_entries(
         &trailer,
         pdf,
@@ -3738,6 +3767,27 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
             .and_then(|()| handle.materialize().ok())
             .map(|catalog| (r, catalog, was_dirty))
     });
+    // A direct Catalog has no ObjectRef whose whole-dictionary snapshot can
+    // be restored after the output-only `/Extensions` mutation. Keep the
+    // canonical direct handle and its raw extension entry instead. The
+    // handle identity is important: `replace_writer_catalog` shares the
+    // replacement value into this same direct slot, so restoring through the
+    // saved handle preserves the trailer's direct `/Root` identity while
+    // leaving qpdf-shaped page-tree repairs in place.
+    let direct_catalog_snapshot = if pdf.root_ref().is_none() {
+        let root_candidate = pdf.trailer_key_handle(b"Root");
+        if root_candidate.is_null() {
+            None
+        } else {
+            let root = pdf.root_handle()?;
+            let extensions = root
+                .try_as_dictionary()?
+                .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
+            Some((root, extensions))
+        }
+    } else {
+        None
+    };
 
     // qpdf's full-rewrite writer resolves source streams through the document's
     // single `attempt_recovery` permission while emitting them. The canonical
@@ -3790,6 +3840,22 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
         }
         if !was_dirty {
             pdf.clear_dirty(root_ref);
+        }
+    }
+    if let Some((root, original_extensions)) = direct_catalog_snapshot {
+        let current_extensions = root
+            .try_as_dictionary()?
+            .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
+        let extensions_changed = match (&original_extensions, &current_extensions) {
+            (None, None) => false,
+            (Some(before), Some(after)) => !before.is_same_object_as(after),
+            _ => true,
+        };
+        if extensions_changed {
+            match original_extensions {
+                Some(extensions) => root.restore_key_raw(b"/Extensions", extensions)?,
+                None => root.remove_key(b"/Extensions"),
+            }
         }
     }
     // cov:ignore-end
@@ -4066,8 +4132,15 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // copied encryption, source-encrypted input, and requested Preserve/Generate
     // suppressed to Disable by a forced version below 1.5. Its container planner
     // and generic xref emitter remain live for those explicitly excluded modes.
-    let Some(root_ref) = pdf.root_ref() else {
-        return Err(crate::Error::Missing("/Root"));
+    let root_ref = pdf.root_ref();
+    let root_handle = if root_ref.is_none() {
+        let root_candidate = pdf.trailer_key_handle(b"Root");
+        if root_candidate.is_null() {
+            return Err(crate::Error::Missing("/Root"));
+        }
+        Some(pdf.root_handle()?)
+    } else {
+        None
     };
 
     // Catalog-first renumber (flpdf-9hc.32): assign output object numbers in
@@ -4168,9 +4241,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the preserve qdf call is exercised by the writer contract test.
 
     // The new /Root reference (always seeded first by the walk, so present).
-    let new_root = renumber
-        .new_for_original(root_ref)
-        .ok_or_else(|| crate::Error::Unsupported("renumber: /Root absent from map".to_string()))?;
+    let new_root = root_ref.and_then(|root_ref| renumber.new_for_original(root_ref));
+    if root_ref.is_some() && new_root.is_none() {
+        return Err(crate::Error::Unsupported(
+            "renumber: /Root absent from map".to_string(),
+        ));
+    }
 
     // Pass `false` here because full-rewrite ObjStm emission is only known
     // after planning. The required PDF 1.5 floor is applied below from the
@@ -4735,19 +4811,26 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // In QDF mode, /Root's ref in the trailer is in emission-space; rebind
     // new_root from the qdf_emission_renumber map so trailer rewriting and the
     // explicit trailer.insert("Root", ...) both use the same emission number.
-    let new_root = if options.qdf {
-        qdf_emission_renumber
-            .get(&root_ref)
-            .copied()
-            .ok_or_else(|| {
-                // cov:ignore-start: /Root is always reachable from the BFS seed, so it
-                // is always in renumbered and therefore always in qdf_emission_renumber.
-                crate::Error::Unsupported(
-                    "QDF emission: /Root absent from emission map".to_string(),
-                )
-            })? // cov:ignore-end
+    let new_root = if let Some(root_ref) = root_ref {
+        if options.qdf {
+            Some(
+                qdf_emission_renumber
+                    .get(&root_ref)
+                    .copied()
+                    .ok_or_else(|| {
+                        // cov:ignore-start: /Root is always reachable from the BFS seed, so it
+                        // is always in renumbered and therefore always in qdf_emission_renumber.
+                        crate::Error::Unsupported(
+                            "QDF emission: /Root absent from emission map".to_string(),
+                        )
+                        // cov:ignore-end
+                    })?, // cov:ignore: /Root is always seeded before QDF emission, so this validated map lookup has no reachable error continuation.
+            )
+        } else {
+            new_root
+        }
     } else {
-        new_root
+        None
     };
 
     let mut bytes = Vec::new();
@@ -5511,6 +5594,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 pdf,
                 object_count,
                 new_root,
+                root_handle.as_ref(),
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
@@ -5655,6 +5739,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 pdf,
                 xref_size,
                 new_root,
+                root_handle.as_ref(),
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
@@ -5672,6 +5757,38 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     )?, // cov:ignore: build_writer_trailer_handle constructs the writer-owned /ID in the validated two-string shape
                 }
             };
+            let trailer_map = |object_ref: ObjectRef| {
+                old_to_new.get(&object_ref).copied().ok_or_else(|| {
+                    // cov:ignore-start: the direct Catalog is collected by the
+                    // same canonical traversal that builds `old_to_new`, so a
+                    // live reference can never be absent here.
+                    crate::Error::Unsupported(format!(
+                        "full-rewrite: direct /Root reference {object_ref} absent from renumber map"
+                    ))
+                    // cov:ignore-end
+                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
+            };
+            let direct_root = if new_root.is_none() {
+                let root = trailer_handle.try_get_key(b"/Root")?;
+                let mut direct_root = Vec::new();
+                if options.qdf {
+                    root.write_object_qdf_with_ref_map_and_removed(
+                        &mut direct_root,
+                        0,
+                        &trailer_map,
+                        &skip_ref_set,
+                    )?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+                } else {
+                    root.write_object_with_ref_map_and_removed(
+                        &mut direct_root,
+                        &trailer_map,
+                        &skip_ref_set,
+                    )?; // cov:ignore: the canonical direct-root serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+                }
+                Some(direct_root)
+            } else {
+                None
+            };
             let trailer = plain::xref::TrailerPlan {
                 form: XrefForm::Stream,
                 canonical_entries: plain::plan::canonical_trailer_entries_with_visibility(
@@ -5681,6 +5798,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     suppress_null_values,
                 )?, // cov:ignore: live trailer references are validated by the canonical map
                 root: new_root,
+                direct_root,
                 id,
                 encrypt: encrypt_ctx.as_ref().map(|ctx| ctx.encrypt_ref),
                 structural_filtered: !options.qdf
@@ -6238,8 +6356,9 @@ mod tests {
             ..WriterOptions::default()
         };
 
-        let trimmed = build_writer_trailer_handle(&mut pdf, 4, root, &options, None, true, None)
-            .expect("trim hybrid trailer");
+        let trimmed =
+            build_writer_trailer_handle(&mut pdf, 4, Some(root), None, &options, None, true, None)
+                .expect("trim hybrid trailer");
 
         assert!(trimmed.get_key(b"/XRefStm").is_null());
     }
@@ -9152,6 +9271,57 @@ mod tests {
         bytes
     }
 
+    /// The same metadata shape as [`build_metadata_fixture`], but with the
+    /// Catalog written directly in the trailer. This exercises the writer's
+    /// cleartext-metadata lookup without manufacturing a Catalog ObjectRef.
+    fn build_direct_root_metadata_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"2 0 obj\n<< /Subtype /Marker /Value 1 >>\nendobj\n");
+
+        let xmp: &[u8] =
+            b"<?xpacket?><x:xmpmeta>DIRECT-ROOT-METADATA</x:xmpmeta><?xpacket end=\"w\"?>";
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
+                xmp.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(xmp);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let startxref = bytes.len();
+        let size = offsets.len() + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root << /Type /Catalog /Pages 1 0 R /Metadata 3 0 R >> >>\n\
+                 startxref\n{startxref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn resolve_metadata_stream_ref_accepts_a_direct_catalog_root() {
+        let mut pdf = Pdf::open(Cursor::new(build_direct_root_metadata_fixture()))
+            .expect("direct-root metadata fixture must open");
+        assert_eq!(
+            resolve_metadata_stream_ref(&mut pdf),
+            Some(ObjectRef::new(3, 0)),
+            "cleartext-metadata lookup must follow an inline Catalog"
+        );
+    }
+
     /// With `encrypt_metadata = false` the `/Catalog`'s
     /// `/Metadata` stream is left UNENCRYPTED (its bytes survive in the clear)
     /// without a `/Crypt` filter, and the `/Encrypt` dict carries
@@ -9202,6 +9372,45 @@ mod tests {
         assert!(
             !contains(&ct, b"/Crypt"),
             "cleartext /Metadata must not be tagged with a /Crypt filter"
+        );
+    }
+
+    #[test]
+    fn cleartext_metadata_exempts_a_stream_under_a_direct_catalog_root() {
+        const MARKER: &[u8] = b"DIRECT-ROOT-METADATA";
+        let mut pdf = Pdf::open(Cursor::new(build_direct_root_metadata_fixture()))
+            .expect("direct-root metadata fixture must open");
+        let mut params = crate::encryption::EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec());
+        params.encrypt_metadata = false;
+        let options = WriterOptions {
+            compress_streams: CompressStreams::No,
+            encrypt: Some(params),
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options)
+            .expect("direct-root encrypted write must succeed");
+        assert!(
+            output.windows(MARKER.len()).any(|window| window == MARKER),
+            "cleartext metadata must remain visible under a direct Catalog"
+        );
+
+        let mut reopened = Pdf::open_with_options(
+            Cursor::new(output),
+            crate::PdfOpenOptions {
+                password: b"u".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("direct-root encrypted output must reopen");
+        assert!(
+            reopened.root_ref().is_none(),
+            "encryption must not manufacture an indirect Catalog"
+        );
+        assert_eq!(
+            reopened.adobe_extension_level(),
+            None,
+            "the direct Catalog must remain a normal Catalog after reopening"
         );
     }
 
@@ -9743,6 +9952,186 @@ mod tests {
 
         let error = inject_adbe_extension(&mut pdf, "1.7", 8).expect_err("root is required");
         assert!(matches!(error, crate::Error::Missing("/Root")));
+    }
+
+    #[test]
+    fn full_rewrite_reports_missing_root_for_plain_and_specialized_routes() {
+        let source: Arc<[u8]> = Arc::from(
+            b"%PDF-1.3\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n\
+              startxref\n9\n%%EOF\n" as &[u8],
+        );
+        for qdf in [false, true] {
+            let mut pdf = crate::Pdf::open_mem(source.clone()).expect("rootless fixture");
+            let options = WriterOptions {
+                qdf,
+                object_streams: ObjectStreamMode::Disable,
+                ..WriterOptions::default()
+            };
+            let error = emit_canonical_pdf(&mut pdf, Vec::new(), &options)
+                .expect_err("a rootless document must be rejected");
+            assert!(matches!(error, crate::Error::Missing("/Root")));
+        }
+    }
+
+    #[test]
+    fn specialized_rewrite_reports_an_indirect_root_removed_from_the_map() {
+        let mut pdf =
+            crate::Pdf::open_mem_owned(build_ext_injection_source()).expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        pdf.delete_object(root);
+        // Keep the canonical slot dictionary-shaped while retaining the
+        // deletion record. This models a stale root identity that survives
+        // into the writer's renumber phase, which must reject the missing map
+        // entry rather than manufacture a replacement Catalog.
+        pdf.get_object_handle(root)
+            .set_resolved(ObjectValue::Dictionary(
+                [(b"/Type".to_vec(), ObjectHandle::name(b"Catalog".to_vec()))]
+                    .into_iter()
+                    .collect(),
+            ));
+        let options = WriterOptions {
+            extra_header_text: "% specialized\n".to_string(),
+            object_streams: ObjectStreamMode::Disable,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+
+        let error = emit_canonical_pdf(&mut pdf, Vec::new(), &options)
+            .expect_err("a removed indirect root must not be emitted");
+        assert!(
+            matches!(error, crate::Error::Unsupported(ref message)
+            if message == "renumber: /Root absent from map"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn build_writer_trailer_rejects_inconsistent_catalog_root_forms() {
+        let mut pdf = crate::Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("fixture must open");
+        let error = build_writer_trailer_handle(
+            &mut pdf,
+            4,
+            None,
+            None,
+            &WriterOptions::default(),
+            None,
+            true,
+            None,
+        )
+        .expect_err("a trailer must have exactly one Catalog root form");
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message == "writer trailer Catalog root form is inconsistent"));
+    }
+
+    #[test]
+    fn standard_full_rewrite_accepts_a_direct_catalog_root() {
+        let mut pdf = crate::Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-adbe.pdf").to_vec(),
+        )
+        .expect("direct-root fixture must open");
+        let original_root = pdf.root_handle().expect("source Catalog should resolve");
+        let original_extensions = original_root
+            .try_as_dictionary()
+            .expect("source Catalog must be a dictionary")
+            .expect("source Catalog must be a dictionary")
+            .get(b"/Extensions".as_slice())
+            .cloned()
+            .expect("source fixture must carry /Extensions");
+        let options = WriterOptions {
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+
+        emit_canonical_pdf(&mut pdf, &mut output, &options)
+            .expect("standard rewrite should accept a direct Catalog");
+
+        let mut rewritten = crate::Pdf::open_mem_owned(output).expect("output must reopen");
+        assert!(
+            rewritten.root_ref().is_none(),
+            "qpdf keeps the direct Catalog inline in the output trailer"
+        );
+        let root = rewritten
+            .root_handle()
+            .expect("output Catalog should resolve");
+        assert_eq!(
+            rewritten.adobe_extension_level(),
+            Some(8),
+            "the direct Catalog's extension level must survive the rewrite"
+        );
+        assert_eq!(
+            root.get_key(b"/Type").as_name().as_deref(),
+            Some(&b"Catalog"[..])
+        );
+
+        let restored_root = pdf
+            .root_handle()
+            .expect("source Catalog should remain live");
+        assert!(
+            restored_root.is_same_object_as(&original_root),
+            "writer preparation must preserve the direct Catalog handle identity"
+        );
+        let restored_extensions = restored_root
+            .try_as_dictionary()
+            .expect("source Catalog must remain a dictionary")
+            .expect("source Catalog must remain a dictionary")
+            .get(b"/Extensions".as_slice())
+            .cloned()
+            .expect("source /Extensions must remain present");
+        assert!(
+            restored_extensions.is_same_object_as(&original_extensions),
+            "output-only /Extensions replacement must not leak into the source Catalog"
+        );
+    }
+
+    #[test]
+    fn direct_catalog_root_restores_an_absent_extensions_entry_after_injection() {
+        let mut pdf = crate::Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        )
+        .expect("direct-root fixture must open");
+        let source_root = pdf.root_handle().expect("source Catalog should resolve");
+        let source_catalog = source_root
+            .try_as_dictionary()
+            .expect("source Catalog must be a dictionary")
+            .expect("source Catalog must be a dictionary");
+        assert!(
+            !source_catalog.contains_key(b"/Extensions".as_slice()),
+            "the source fixture must begin without /Extensions"
+        );
+
+        let options = WriterOptions {
+            static_id: true,
+            min_version: Some("1.7".to_string()),
+            min_extension_level: Some(8),
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options)
+            .expect("direct-root rewrite with extension injection must succeed");
+
+        let restored_root = pdf
+            .root_handle()
+            .expect("source Catalog should remain live");
+        let restored_catalog = restored_root
+            .try_as_dictionary()
+            .expect("source Catalog must remain a dictionary")
+            .expect("source Catalog must remain a dictionary");
+        assert!(
+            !restored_catalog.contains_key(b"/Extensions".as_slice()),
+            "the output-only /Extensions injection must not remain in the source Catalog"
+        );
+        assert!(
+            restored_root.is_same_object_as(&source_root),
+            "extension restoration must preserve the direct Catalog identity"
+        );
+
+        let mut rewritten = crate::Pdf::open_mem_owned(output).expect("output must reopen");
+        assert!(rewritten.root_ref().is_none());
+        assert_eq!(rewritten.adobe_extension_level(), Some(8));
     }
 
     #[test]

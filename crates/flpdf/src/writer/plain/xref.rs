@@ -61,7 +61,11 @@ pub(crate) struct TrailerPlan {
     /// Canonical trailer entries from the live ObjectHandle graph. Keys remain
     /// decoded until emission so qpdf's raw-name sort is preserved.
     pub(crate) canonical_entries: Vec<(Vec<u8>, Vec<u8>)>,
-    pub(crate) root: ObjectRef,
+    /// Remapped output reference for an indirect Catalog, when `/Root` is
+    /// indirect in the source.
+    pub(crate) root: Option<ObjectRef>,
+    /// Serialized direct Catalog value for a direct source `/Root`.
+    pub(crate) direct_root: Option<Vec<u8>>,
     pub(crate) id: IdPlan,
     pub(crate) encrypt: Option<ObjectRef>,
     pub(crate) structural_filtered: bool,
@@ -145,7 +149,8 @@ fn append_xref_stream_and_trailer(
         widths,
         index: None,
         info: None,
-        root: Some(trailer.root),
+        root: trailer.root,
+        root_value: trailer.direct_root.as_deref(),
         size,
         prev: None,
         trailer: None,
@@ -292,10 +297,15 @@ fn write_canonical_classic_trailer(
     canonical: &[(Vec<u8>, Vec<u8>)],
 ) {
     let mut entries = canonical.to_vec();
-    entries.push((
-        b"/Root".to_vec(),
-        format!("{} {} R", trailer.root.number, trailer.root.generation).into_bytes(),
-    ));
+    if let Some(root) = trailer.root {
+        entries.push((
+            b"/Root".to_vec(),
+            format!("{} {} R", root.number, root.generation).into_bytes(),
+        ));
+    }
+    if let Some(root) = &trailer.direct_root {
+        entries.push((b"/Root".to_vec(), root.clone()));
+    }
     entries.push((b"/Size".to_vec(), size.to_string().into_bytes()));
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
@@ -432,7 +442,8 @@ mod tests {
         TrailerPlan {
             form,
             canonical_entries: Vec::new(),
-            root: ObjectRef::new(1, 0),
+            root: Some(ObjectRef::new(1, 0)),
+            direct_root: None,
             id: IdPlan::Materialized { value: None },
             encrypt: None,
             structural_filtered: false,
@@ -464,7 +475,8 @@ mod tests {
         let trailer = TrailerPlan {
             form: XrefForm::Table,
             canonical_entries: vec![(b"/Added".to_vec(), b"true".to_vec())],
-            root: ObjectRef::new(1, 0),
+            root: Some(ObjectRef::new(1, 0)),
+            direct_root: None,
             id: IdPlan::Deterministic {
                 source_id0: Some(vec![0x01, 0x02]),
                 info_suffix: vec![0x03, 0x04],

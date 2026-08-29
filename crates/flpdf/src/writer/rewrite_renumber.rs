@@ -145,9 +145,18 @@ impl CanonicalCatalogFirstRenumber {
         removed_refs: &BTreeSet<ObjectRef>,
         stream_parameters_removed: StreamParametersRemoved<'_>,
     ) -> crate::Result<Self> {
-        let root = pdf
-            .root_ref()
-            .ok_or_else(|| Error::Unsupported("plain rewrite: trailer has no /Root".to_string()))?;
+        let root_ref = pdf.root_ref();
+        let direct_root = if root_ref.is_none() {
+            let candidate = pdf.trailer_key_handle(b"Root");
+            if candidate.is_null() {
+                return Err(Error::Unsupported(
+                    "plain rewrite: trailer has no /Root".to_string(),
+                ));
+            }
+            Some(pdf.root_handle()?)
+        } else {
+            None
+        };
         let mut seeds = if preserve_unreferenced_objects {
             let mut seeds = Vec::new();
             let source_objstm_containers = qpdf_source_objstm_containers(pdf);
@@ -168,7 +177,21 @@ impl CanonicalCatalogFirstRenumber {
         } else {
             Vec::new()
         };
-        seeds.push(root);
+        if let Some(root) = root_ref {
+            seeds.push(root);
+        } else if let Some(root) = &direct_root {
+            // qpdf's enqueueObject recurses through a direct Catalog instead
+            // of assigning it an object number. Its indirect descendants are
+            // nevertheless numbered in the Catalog's dictionary order.
+            collect_canonical_enqueue_refs_with_stream_policy(
+                pdf,
+                root,
+                0,
+                skip_length,
+                &mut seeds,
+                stream_parameters_removed,
+            )?; // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+        } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
 
         let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
@@ -845,9 +868,18 @@ impl ObjectStreamRenumber {
         // path (the encryption writer emits it as a plaintext indirect object),
         // not through the renumber walk. Seeding it here would assign it a
         // walk-order number and diverge from qpdf.
-        let root = pdf.root_ref().ok_or_else(|| {
-            Error::Unsupported("object-stream renumber: trailer has no /Root".to_string())
-        })?;
+        let root_ref = pdf.root_ref();
+        let direct_root = if root_ref.is_none() {
+            let candidate = pdf.trailer_key_handle(b"Root");
+            if candidate.is_null() {
+                return Err(Error::Unsupported(
+                    "object-stream renumber: trailer has no /Root".to_string(),
+                ));
+            }
+            Some(pdf.root_handle()?)
+        } else {
+            None
+        };
         let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
             pdf.live_object_refs()
                 .into_iter()
@@ -856,7 +888,18 @@ impl ObjectStreamRenumber {
         } else {
             Vec::new()
         };
-        seeds.push(root);
+        if let Some(root) = root_ref {
+            seeds.push(root);
+        } else if let Some(root) = &direct_root {
+            collect_canonical_enqueue_refs_with_stream_policy(
+                pdf,
+                root,
+                0,
+                skip_length,
+                &mut seeds,
+                stream_parameters_removed,
+            )?; // cov:ignore: direct-root traversal is exercised by the writer tests; LLVM maps this successful-call terminator to a zero-count continuation region.
+        } // cov:ignore: direct-root traversal executes above; LLVM places this branch-exit counter on an uninstrumented continuation line.
         let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
         for (key, value) in trailer_entries {
@@ -1348,6 +1391,25 @@ mod tests {
 
         assert!(matches!(error, Error::Unsupported(message)
             if message == "object-stream renumber: trailer has no /Root"));
+    }
+
+    #[test]
+    fn canonical_renumber_rejects_missing_root() {
+        let mut bytes = build_raw_pdf(&[(1, b"<< /Type /Catalog >>")]);
+        let root_key = bytes
+            .windows(b"/Root".len())
+            .position(|window| window == b"/Root")
+            .expect("fixture trailer has /Root");
+        bytes[root_key..root_key + b"/Root".len()].copy_from_slice(b"/Nope");
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error =
+            CanonicalCatalogFirstRenumber::build_qpdf(&mut pdf, true, false, &BTreeSet::new())
+                .err()
+                .expect("missing root must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "plain rewrite: trailer has no /Root"));
     }
 
     #[test]
