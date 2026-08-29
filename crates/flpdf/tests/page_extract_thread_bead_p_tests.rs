@@ -11,10 +11,11 @@
 //! annotation/outline null-out family, where the reference is kept verbatim and
 //! the page object becomes `null`.
 
+use flpdf::job::remap_outline_and_dests;
 use flpdf::{
     drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, extract_pages, pages,
-    prune_acroform_after_subset, prune_after_subset, rebuild_page_tree, remap_outline_and_dests,
-    ObjectHandle, ObjectRef, Pdf, RemoveUnreferencedResources,
+    prune_acroform_after_subset, prune_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef,
+    Pdf, RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;

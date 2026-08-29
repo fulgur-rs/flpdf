@@ -366,7 +366,7 @@ fn bead_p_drop_via_b_array_without_threads_like_qpdf() {
 /// surviving outline `/Dest` AND a single article-thread bead's `/P`.
 ///
 /// The surviving destination forces the earlier null-out pass
-/// ([`outline_dest_remap`]) to keep the removed page as `null` (rather than
+/// ([`flpdf::job::remap_outline_and_dests`]) to keep the removed page as `null` (rather than
 /// garbage-collect it), so the bead's `/P` resolves to `null` when the bead
 /// `/P`-drop pass runs. The thread (object 10) and its single self-ring bead
 /// (object 11, on the removed page) are kept alive by the catalog `/Threads`.

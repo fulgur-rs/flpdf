@@ -164,7 +164,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
 **Files:**
 
 - Modify `crates/flpdf/src/page_split.rs`, `crates/flpdf/src/page_extract.rs`, `crates/flpdf/src/page_merge.rs`, and `crates/flpdf/src/qdf_fix.rs` documentation/examples.
-- Modify library test consumers in `crates/flpdf/src/acroform_field_prune.rs`, `crates/flpdf/src/form_field_object_helper/rendering.rs`, `crates/flpdf/src/outline_dest_remap.rs`, `crates/flpdf/src/overlay.rs`, `crates/flpdf/src/overlay_annotations.rs`, `crates/flpdf/src/page_annotation_flatten.rs`, `crates/flpdf/src/page_rotate.rs`, `crates/flpdf/src/page_tree_rebuild.rs`, `crates/flpdf/src/reader.rs`, `crates/flpdf/src/reader/resolver.rs`, and `crates/flpdf/src/subset_prune.rs`.
+- Modify library test consumers in `crates/flpdf/src/acroform_field_prune.rs`, `crates/flpdf/src/form_field_object_helper/rendering.rs`, `crates/flpdf/src/job/outline_dest_remap.rs`, `crates/flpdf/src/overlay.rs`, `crates/flpdf/src/overlay_annotations.rs`, `crates/flpdf/src/page_annotation_flatten.rs`, `crates/flpdf/src/page_rotate.rs`, `crates/flpdf/src/page_tree_rebuild.rs`, `crates/flpdf/src/reader.rs`, `crates/flpdf/src/reader/resolver.rs`, and `crates/flpdf/src/subset_prune.rs`.
 - Modify writer-adjacent test/helper files `crates/flpdf/src/writer/object_streams.rs`, `crates/flpdf/src/writer/plain/mod.rs`, `crates/flpdf/src/writer/plain/plan.rs`, `crates/flpdf/src/writer/plain/body.rs`, and `crates/flpdf/src/writer/encrypted_strings.rs`.
 - Modify `crates/flpdf/src/object.rs` and `crates/flpdf/src/object_handle.rs` comments that describe default or required incremental PDF output.
 

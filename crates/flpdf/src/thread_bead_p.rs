@@ -17,7 +17,7 @@
 //! This is the structural-reference *drop* family, alongside the structure-tree
 //! `/Pg` handling ([`crate::struct_tree_pg`]): the reference is removed rather
 //! than replaced with `null` (the opposite of the outline / named-destination /
-//! annotation null-out family in [`crate::outline_dest_remap`]).
+//! annotation null-out family in [`crate::job::remap_outline_and_dests`]).
 //!
 //! # Reaching the beads
 //!
@@ -881,7 +881,7 @@ mod tests {
     fn bead_p_to_nulled_removed_page_still_dropped() {
         // A removed page that a surviving outline / named destination still
         // references is replaced with `null` IN PLACE by the earlier null-out
-        // pass (crate::outline_dest_remap, pipeline Step 4) BEFORE this pass
+        // pass (crate::job::remap_outline_and_dests, pipeline Step 4) BEFORE this pass
         // (Step 6) runs. The bead's /P then resolves to null rather than
         // a /Type /Page dict — but it is still a removed page, and qpdf drops the
         // bead's /P. Object 4 is `null` and is not in `surviving`, so /P must be

@@ -448,7 +448,7 @@ mod tests {
     fn p_to_nulled_removed_page_still_dropped() {
         // A removed page that a surviving outline / named destination still
         // references is replaced with `null` in place by the earlier null-out
-        // pass (crate::outline_dest_remap) BEFORE this pass runs. The /P then
+        // pass (crate::job::remap_outline_and_dests) BEFORE this pass runs. The /P then
         // resolves to a null object rather than a /Type /Page dict — but it is
         // still a removed page, and qpdf drops the annotation's /P. Object 4 is
         // `null` and is not in `surviving`, so /P must be dropped (matching qpdf;

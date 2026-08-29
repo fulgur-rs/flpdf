@@ -7,8 +7,9 @@
 //! removed page referenced by nothing is garbage-collected (absent). This is a
 //! structural parity check, not a byte-compare against qpdf (qpdf renumbers).
 
+use flpdf::job::remap_outline_and_dests;
 use flpdf::{
-    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, ObjectHandle, ObjectRef, Pdf,
+    prune_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
     RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;

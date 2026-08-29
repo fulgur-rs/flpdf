@@ -1,11 +1,10 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
+use flpdf::job::remap_outline_and_dests;
 use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
 use flpdf::json_inspect::{DecodeLevel, JsonKey};
 use flpdf::pages::tree_rebuild::RebuildResult;
-use flpdf::{
-    remap_outline_and_dests, Dictionary, Error, Object, ObjectHandle, ObjectRef, OutlineItem, Pdf,
-};
+use flpdf::{Dictionary, Error, Object, ObjectHandle, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 
@@ -1719,7 +1718,7 @@ fn get_tree_non_dict_first_item_materializes_raw_value() {
 // -----------------------------------------------------------------------
 //
 // `remap_outline_and_dests` already remaps a `/A /GoTo /D` destination (see
-// `outline_dest_remap.rs`, `remap_item_dest`) from earlier work on this
+// `job/outline_dest_remap.rs`, `remap_item_dest`) from earlier work on this
 // epic. The regression coverage below keeps the surviving-page GoTo remap
 // case without exposing a typed action API or changing the remapper itself.
 
@@ -4285,7 +4284,7 @@ fn action_goto_two_page_pdf() -> Vec<u8> {
 /// test meaningful: it proves a GoTo action's `/D` is remapped to the FIRST
 /// occurrence, not silently left pointing at (or accidentally rewritten to)
 /// the second, unrelated clone — the same property
-/// `duplicate_selection_uses_first_new_ref` in `outline_dest_remap.rs`
+/// `duplicate_selection_uses_first_new_ref` in `job/outline_dest_remap.rs`
 /// verifies for a plain `/Dest`.
 #[test]
 fn action_goto_dest_remapped_to_first_occurrence_of_duplicated_page() {
@@ -4305,7 +4304,7 @@ fn action_goto_dest_remapped_to_first_occurrence_of_duplicated_page() {
         "sanity: page 30 was selected twice"
     );
     let first_new = result.ref_map[&ObjectRef::new(30, 0)][0];
-    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+    flpdf::job::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     assert_eq!(
         outline_dest(&root_items(&mut pdf)[0], &mut pdf),
@@ -4350,7 +4349,7 @@ fn action_goto_named_dest_kept_verbatim_while_name_tree_remaps() {
     let mut pdf = Pdf::open(Cursor::new(action_goto_named_dest_pdf())).unwrap();
     let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(30, 0)]).unwrap();
     let new_p2 = result.ref_map[&ObjectRef::new(30, 0)][0];
-    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+    flpdf::job::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     let Object::Dictionary(action) = resolved_raw_action(&mut pdf, ObjectRef::new(5, 0)) else {
         panic!("/A must resolve to a dictionary");
@@ -4411,7 +4410,7 @@ fn action_gotor_two_page_pdf() -> Vec<u8> {
 fn action_gotor_dest_left_unchanged_after_page_rebuild() {
     let mut pdf = Pdf::open(Cursor::new(action_gotor_two_page_pdf())).unwrap();
     let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(30, 0)]).unwrap();
-    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+    flpdf::job::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     let Object::Dictionary(action) = resolved_raw_action(&mut pdf, ObjectRef::new(5, 0)) else {
         panic!("/A must resolve to a dictionary");
@@ -4437,7 +4436,7 @@ fn action_uri_left_unchanged_after_page_rebuild() {
     )))
     .unwrap();
     let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
-    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+    flpdf::job::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     let Object::Dictionary(action) = resolved_raw_action(&mut pdf, ObjectRef::new(5, 0)) else {
         panic!("/A must resolve to a dictionary");
@@ -4455,7 +4454,7 @@ fn action_uri_left_unchanged_after_page_rebuild() {
 fn action_unknown_subtype_unchanged_after_page_rebuild() {
     let mut pdf = Pdf::open(Cursor::new(action_unknown_subtype_pdf())).unwrap();
     let result = flpdf::rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
-    flpdf::remap_outline_and_dests(&mut pdf, &result).unwrap();
+    flpdf::job::remap_outline_and_dests(&mut pdf, &result).unwrap();
 
     let Object::Dictionary(action) = resolved_raw_action(&mut pdf, ObjectRef::new(5, 0)) else {
         panic!("/A must resolve to a dictionary");
