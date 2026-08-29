@@ -859,8 +859,8 @@ impl ObjectWriterEmission for ObjectHandle {
     /// produces the compact (non-QDF) one-line form -- `writeTrailer`'s
     /// own `writeStringQDF` calls (`:1169,1175,1190,1195,1233`) are
     /// QDF-only formatting this primitive does not replicate, matching
-    /// [`crate::object::Dictionary::write_pdf_trailer`]'s identical
-    /// compact-only scope; the QDF classic trailer is emitted separately by
+    /// handle-native trailer serializer's identical compact-only scope; the
+    /// QDF classic trailer is emitted separately by
     /// the canonical writer (`write_qdf_trailer`, `writer.rs`).
     ///
     /// **Narrower than the full C++ function -- read before reusing for a
@@ -880,23 +880,22 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `strip_writer_trailer_history_keys`/`strip_xref_stream_trailer_keys`
     /// (`writer.rs`) do the trimming and `writer.rs:4012`'s
     /// `trailer.insert("Size", ...)` supplies the correct value before
-    /// either the legacy `Dictionary::write_pdf_trailer` or this
-    /// primitive ever runs. This primitive has no `which`/`size`/`prev`
+    /// either the legacy raw serializer or this primitive ever runs. This
+    /// primitive has no `which`/`size`/`prev`
     /// parameters at all, so `t_lin_first` is out of scope for the same
     /// reason `t_lin_second` is (see below). `/ID` and `/Encrypt` are
     /// read from `self`'s own stored values instead of from writer state
     /// -- the caller is expected to have already placed the correct
-    /// values there (`apply_encrypt_trailer_entries`/`generate_id_array`/
-    /// `apply_deterministic_id_placeholder`, `writer.rs`), the same contract
-    /// [`crate::object::Dictionary::write_pdf_trailer`] already
-    /// establishes and this primitive matches for that dimension.
+    /// values there (`apply_encrypt_trailer_handle_entries` and the canonical
+    /// ID helpers in `writer.rs`), the same contract already established by
+    /// qpdf's `writeTrailer` is preserved for that dimension.
     ///
     /// `id_writer`, when `Some`, substitutes for the stored `/ID` value
     /// (used by the deterministic-`/ID` writer to emit a content-derived
     /// identifier inline). When `None`, the stored `/ID` value is written
     /// in qpdf's compact `[<hex1><hex2>]` shape with no spaces
-    /// (mirroring [`crate::object::write_id_style_value`]'s established
-    /// byte shape, reimplemented here directly on `ObjectHandle` rather
+    /// (mirroring qpdf's established compact byte shape, implemented here
+    /// directly on `ObjectHandle` rather
     /// than bridged through `Object` -- see `write_id_style_value_handle`
     /// below); an indirect `/ID` value writes as its own `"N G R"`
     /// reference form instead, matching `write_child`'s reference-vs-recurse

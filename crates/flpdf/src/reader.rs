@@ -352,7 +352,8 @@ impl<R: Read + Seek> Pdf<R> {
         let encrypt_dict = self.encrypt_dictionary()?.ok_or_else(|| {
             Error::Unsupported("authenticated input has no /Encrypt dictionary".into())
         })?;
-        let id0 = crate::encryption::state::first_file_id(self.trailer_dictionary())?.to_vec();
+        let id_handle = self.trailer_key_handle(b"ID");
+        let id0 = crate::encryption::state::first_file_id_handle(&id_handle)?;
 
         Ok(Some(CopyEncryptionSource {
             encrypt_dict,
@@ -577,13 +578,15 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn authenticate_if_encrypted_once(&mut self, options: &PdfOpenOptions) -> Result<()> {
-        let encrypt_ref = self.trailer_dictionary().get_ref("Encrypt");
+        let encrypt_handle = self.trailer_key_handle(b"Encrypt");
+        let encrypt_ref = encrypt_handle.object_ref();
+        let id_handle = self.trailer_key_handle(b"ID");
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(());
         };
         let authenticated = crate::encryption::state::authenticate(
             &encrypt,
-            self.trailer_dictionary(),
+            &id_handle,
             encrypt_ref,
             &options.password,
             options.password_mode,

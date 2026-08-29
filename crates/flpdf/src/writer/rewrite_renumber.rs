@@ -31,7 +31,9 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
-use crate::object::{Dictionary, Object, ObjectRef, MAX_INLINE_DEPTH};
+#[cfg(test)]
+use crate::object::{Dictionary, Object};
+use crate::object::{ObjectRef, MAX_INLINE_DEPTH};
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
@@ -392,15 +394,11 @@ fn ensure_canonical_owner<R: Read + Seek>(
     Ok(())
 }
 
-/// Snapshot and filter a legacy dictionary at the raw-object writer boundary.
-///
-/// The canonical writer path uses [`crate::writer::object::visible_dict_entries`]
-/// directly on `ObjectHandle` slots. PCLm and the compatibility rewrite still
-/// receive materialized [`Object`] values, so they need this narrow adapter to
-/// recover each indirect reference's canonical handle before applying the same
-/// qpdf `isNull()` decision. The adapter deliberately resolves exactly the
-/// referenced handle supplied by the raw value: it does not chase a
-/// `Pdf::set_object` reference-as-value redirect, which has no qpdf counterpart.
+/// Test-only coverage helper for the legacy raw-dictionary visibility rule.
+/// Production writer routes use [`crate::writer::object::visible_dict_entries`]
+/// directly on `ObjectHandle` slots; this helper remains only for focused
+/// regression tests of the removed raw rewrite path.
+#[cfg(test)]
 pub(crate) fn visible_raw_dict_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &Dictionary,
@@ -410,6 +408,7 @@ pub(crate) fn visible_raw_dict_entries<R: Read + Seek>(
     visible_raw_entries(pdf, entries)
 }
 
+#[cfg(test)]
 fn snapshot_raw_dict_entries(dict: &Dictionary, skip_length: bool) -> Vec<(Vec<u8>, Object)> {
     dict.iter()
         .filter(|(key, _)| !(skip_length && *key == b"Length"))
@@ -417,6 +416,7 @@ fn snapshot_raw_dict_entries(dict: &Dictionary, skip_length: bool) -> Vec<(Vec<u
         .collect()
 }
 
+#[cfg(test)]
 fn visible_raw_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     entries: Vec<(Vec<u8>, Object)>,
@@ -430,6 +430,7 @@ fn visible_raw_entries<R: Read + Seek>(
     Ok(visible)
 }
 
+#[cfg(test)]
 fn raw_value_is_null<R: Read + Seek>(pdf: &mut Pdf<R>, value: &Object) -> crate::Result<bool> {
     match value {
         Object::Null => Ok(true),
@@ -1115,6 +1116,7 @@ pub(crate) fn renumber_qpdf_refs_in_place<R: Read + Seek, M: NewNumberLookup>(
     renumber_qpdf_refs_in_place_with_removed(pdf, obj, map, &BTreeSet::new())
 }
 
+#[cfg(test)]
 pub(crate) fn renumber_qpdf_refs_in_place_with_removed<R: Read + Seek, M: NewNumberLookup>(
     pdf: &mut Pdf<R>,
     obj: &mut Object,
@@ -1124,6 +1126,7 @@ pub(crate) fn renumber_qpdf_refs_in_place_with_removed<R: Read + Seek, M: NewNum
     rewrite_qpdf(pdf, obj, 0, map, removed_refs)
 }
 
+#[cfg(test)]
 fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
     pdf: &mut Pdf<R>,
     obj: &mut Object,
