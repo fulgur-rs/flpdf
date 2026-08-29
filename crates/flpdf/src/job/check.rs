@@ -208,9 +208,11 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     let mut warnings = false;
     let mut diagnostics_seen = 0;
 
-    if pdf.root_ref().is_none() {
-        let root_error = "unable to find /Root dictionary";
-        emit_error(logger, message_prefix, input_name, &root_error)?;
+    // qpdf's QPDF::getRoot reads trailer /Root through getKey and accepts
+    // either a direct or indirect Catalog, rejecting only a missing,
+    // dangling, or non-dictionary value (libqpdf/QPDF.cc:2329-2367).
+    if let Err(error) = pdf.root_handle() {
+        emit_error(logger, message_prefix, input_name, &error)?;
         return Err(CheckError::ErrorsDetected);
     }
 
@@ -1064,6 +1066,34 @@ mod tests {
         assert_eq!(
             output,
             "qpdf: rootless.pdf: unable to find /Root dictionary\n"
+        );
+    }
+
+    #[test]
+    fn document_check_accepts_direct_root_fixture_like_qpdf() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/direct-root-adbe.pdf"
+        ))))
+        .expect("direct-root fixture should open");
+
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "direct-root-adbe.pdf")
+            .expect("direct-root fixture should check cleanly");
+
+        assert!(!outcome.warnings);
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "checking direct-root-adbe.pdf\n",
+                "PDF Version: 1.7 extension level 8\n",
+                "File is not encrypted\n",
+                "File is not linearized\n",
+                "No syntax or stream encoding errors found; the file may still contain\n",
+                "errors that qpdf cannot detect\n",
+            )
         );
     }
 
