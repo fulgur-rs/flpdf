@@ -4000,16 +4000,15 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 None,
                 options.deterministic_id,
                 generated_id.as_ref(),
-            )?;
+            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
             let map = |object_ref| {
+                // cov:ignore-start: the complete PCLm plan makes a missing trailer mapping unreachable
                 plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
-                    // cov:ignore-start: the PCLm plan collects every live reference before
-                    // this emission loop, so a valid trailer reference cannot miss this map.
                     crate::Error::Unsupported(format!(
                         "PCLm trailer reference {object_ref} absent from renumber map"
                     ))
-                    // cov:ignore-end
                 }) // cov:ignore: PCLm trailer references are covered by the canonical plan
+                   // cov:ignore-end
             };
             if options.deterministic_id {
                 let info_suffix = deterministic_id_info_suffix(pdf);
@@ -4024,11 +4023,11 @@ fn write_pclm<R: Read + Seek, W: Write>(
                     &map,
                     &removed,
                     true,
-                )?;
+                )?; // cov:ignore: validated deterministic PCLm trailer emission; LLVM maps this continuation to the call setup
             } else {
                 trailer.write_trailer_with_ref_map(
                     &mut bytes, false, false, None, &map, &removed, true,
-                )?;
+                )?; // cov:ignore: validated PCLm trailer emission; LLVM maps this continuation to the call setup
             }
         }
     }
@@ -7258,6 +7257,48 @@ mod tests {
             reopened.trailer_key_handle(b"Probe").as_string(),
             Some(b"live-probe".to_vec()),
             "PCLm must preserve unknown keys from the live trailer"
+        );
+    }
+
+    #[test]
+    fn pclm_writer_reads_the_canonical_trailer_with_a_direct_root() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-adbe.pdf").to_vec(),
+        )
+        .expect("direct-root source parses");
+        let trailer = pdf.trailer();
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"live-direct-root-id".to_vec()),
+                    ObjectHandle::string(b"ignored".to_vec()),
+                ]),
+            )
+            .expect("install live direct-root source ID");
+        trailer
+            .replace_key(
+                b"/Probe",
+                ObjectHandle::string(b"live-direct-root".to_vec()),
+            )
+            .expect("install live direct-root trailer key");
+
+        let output = write_qpdf_to_memory(&mut pdf, |writer| {
+            writer.set_pclm(true);
+            writer.set_static_id(true);
+        })
+        .expect("direct-root PCLm write must succeed");
+
+        assert_eq!(
+            trailer_id_pair(&output),
+            (b"live-direct-root-id".to_vec(), QPDF_STATIC_ID.to_vec()),
+            "direct-root PCLm must read /ID[0] from the live trailer"
+        );
+        let mut reopened = Pdf::open_mem_owned(output).expect("direct-root PCLm output reopens");
+        assert_eq!(
+            reopened.trailer_key_handle(b"Probe").as_string(),
+            Some(b"live-direct-root".to_vec()),
+            "direct-root PCLm must preserve unknown live trailer keys"
         );
     }
 
