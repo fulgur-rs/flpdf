@@ -51,19 +51,12 @@ const OBJECT_COPY_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 ///
 /// This follows the live `ObjectHandle` graph, matching qpdf's
 /// `QPDF::reserveObjects` and `QPDF::replaceForeignIndirectObjects`
-/// (`libqpdf/QPDF.cc:2101-2210`). It is the public cross-document copy
-/// operation; callers must pass an indirect handle owned by another document.
-///
-/// # Errors
-///
-/// Returns [`Err`] when `foreign` is a direct handle, has no owning
-/// document, or is owned by `target` itself, and when the underlying graph
-/// traversal fails: a foreign reserved sentinel encountered mid-copy, an
-/// unresolvable reference, or a prior call against the same source left the
-/// destination's per-source copy state poisoned (qpdf never rolls this back
-/// on failure either, so a failed copy from a given source cannot be
-/// retried).
-pub fn copy_foreign_object<R: Read + Seek>(
+/// (`libqpdf/QPDF.cc:2101-2210`). This is the implementation behind the
+/// public [`Pdf::copy_foreign_object`] method, which is the sole public
+/// cross-document copy entry point; keep this free function crate-private
+/// so callers do not gain a second, redundant public spelling of the same
+/// operation.
+pub(crate) fn copy_foreign_object<R: Read + Seek>(
     target: &mut Pdf<R>,
     foreign: &ObjectHandle,
 ) -> Result<ObjectHandle> {
