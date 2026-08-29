@@ -628,6 +628,15 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// qpdf's source-side `setImmediateCopyFrom` flag. It is read by the
     /// destination stream-copy boundary before a lazy source is registered.
     immediate_copy_from: Cell<bool>,
+    /// Whether the qpdf writer is currently emitting its PCLm stream queue.
+    ///
+    /// PCLm's `QPDFWriter::willFilterStream` calls `pipeStreamData` with the
+    /// full recovered stream length, including bytes found by the
+    /// `endstream` scan. The ordinary compatibility stream path retains its
+    /// existing encrypted-recovery framing policy, so the writer toggles this
+    /// source-side mode only around the PCLm writer (`QPDFWriter.cc:2068-2098,
+    /// 2928-3005`).
+    pclm_mode: Cell<bool>,
     /// The owning document's [`crate::Pdf`] identity, stamped onto every
     /// handle this minted — `ObjectHandle`'s `pdf_unique_id`, whose own doc
     /// traces it to qpdf's `QPDF::getUniqueId`
@@ -698,10 +707,15 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
         let destination = self.destination_resolver.upgrade().ok_or_else(|| {
             Error::Internal("foreign stream destination resolver is no longer live".to_owned())
         })?;
+        let recovered_stream_eol_length = if destination.pclm_mode() {
+            0
+        } else {
+            self.foreign_data.recovered_stream_eol_length
+        };
         pipe_stream_data_from_input(
             &self.foreign_data.input,
             &self.foreign_data.encryption_parameters,
-            self.foreign_data.recovered_stream_eol_length,
+            recovered_stream_eol_length,
             destination.as_ref(),
             Some(self.foreign_data.description.as_str()),
             self.foreign_data.object_ref,
@@ -825,6 +839,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
+            pclm_mode: Cell::new(false),
             pdf_unique_id,
         })
     }
@@ -870,8 +885,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.immediate_copy_from.set(value);
     }
 
+    /// Temporarily select qpdf's PCLm stream-length boundary and return the
+    /// previous mode so the writer can restore it on both success and error.
+    pub(crate) fn set_pclm_mode(&self, value: bool) -> bool {
+        self.pclm_mode.replace(value)
+    }
+
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from.get()
+    }
+
+    fn pclm_mode(&self) -> bool {
+        self.pclm_mode.get()
     }
 
     /// qpdf's `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2216-2272`). Existing
@@ -2289,7 +2314,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<bool> {
         let input = self.stream_input();
         let encryption_parameters = self.encryption_parameters();
-        let recovered_stream_eol_length = self.recovered_stream_eol_len(object_ref);
+        let recovered_stream_eol_length = if self.pclm_mode() {
+            0
+        } else {
+            self.recovered_stream_eol_len(object_ref)
+        };
         pipe_stream_data_from_input(
             &input,
             &encryption_parameters,
@@ -3165,13 +3194,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })
     }
 
-    fn recovered_stream_eol_len(&self, object_ref: ObjectRef) -> usize {
-        self.recovered_stream_eols
-            .borrow()
-            .get(&object_ref)
-            .map_or(0, |eol| eol.as_bytes().len())
-    }
-
     pub(crate) fn recovered_stream_eol(
         &self,
         object_ref: ObjectRef,
@@ -3180,6 +3202,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .borrow()
             .get(&object_ref)
             .copied()
+    }
+
+    fn recovered_stream_eol_len(&self, object_ref: ObjectRef) -> usize {
+        self.recovered_stream_eols
+            .borrow()
+            .get(&object_ref)
+            .map_or(0, |eol| eol.as_bytes().len())
     }
 
     /// Whether the canonical `decryptStream` route treats a recovered source
@@ -3941,6 +3970,10 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from()
+    }
+
+    fn pclm_mode(&self) -> bool {
+        self.pclm_mode()
     }
 
     fn warn(&self, message: String) -> Result<()> {

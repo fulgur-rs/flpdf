@@ -210,9 +210,9 @@ pub(crate) fn canonical_stream_output_with_status(
 /// Full-rewrite variant of [`canonical_stream_output`]. The legacy writer
 /// applies the same qpdf filter/provider pipeline and the cleartext-metadata
 /// policy that belongs to encrypted output. The live handle's source pipe owns
-/// recovered stream framing: Identity streams retain the recovered EOL in the
-/// source length, while the resolver removes it before an actual decryption
-/// stage. The writer must therefore not append that framing a second time.
+/// recovered stream framing for these non-PCLm routes; the PCLm writer selects
+/// its own qpdf `pipeStreamData` length boundary around its queue. The writer
+/// must never append scan framing a second time.
 pub(crate) fn canonical_stream_output_for_rewrite(
     handle: &ObjectHandle,
     options: &WriterOptions,

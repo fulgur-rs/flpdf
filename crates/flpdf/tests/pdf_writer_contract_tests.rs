@@ -9,9 +9,10 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult};
 use flpdf::{
-    apply_stream_compress_policy, CompressStreams, CopyEncryptionSource, DecodeLevel, Dictionary,
-    EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions,
-    PdfWriter, Stream, StreamDataMode, XrefEntry,
+    apply_stream_compress_policy, merge_documents, CompressStreams, CopyEncryptionSource,
+    DecodeLevel, Dictionary, EncryptParams, MergeInput, Object, ObjectKeyAlg, ObjectRef,
+    ObjectStreamMode, PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Stream,
+    StreamDataMode, XrefEntry,
 };
 
 mod common;
@@ -2807,6 +2808,83 @@ fn pdf_writer_emits_pclm_header_and_a_qpdf_checked_pdf() -> flpdf::Result<()> {
     std::fs::write(&path, output)?;
     let check = Command::new("qpdf").arg("--check").arg(&path).output()?;
     assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_pclm_preserves_qpdf_recovered_encrypted_stream_bytes() -> flpdf::Result<()> {
+    let mut source = Pdf::open(BufReader::new(File::open(
+        "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+    )?))?;
+    let mut writer = PdfWriter::new(&mut source);
+    writer.set_pclm(true);
+    writer.set_static_id(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let mut rewritten = Pdf::open(Cursor::new(output))?;
+    let stream = rewritten.get_object_handle(ObjectRef::new(2, 0));
+    rewritten.resolve(&stream)?;
+    let data = stream.get_raw_stream_data()?;
+
+    // qpdf test_driver 40 (QPDFWriter::setPCLm(true), static ID) emits the
+    // full recovered source length through its AES pipe. The recovered tail
+    // is therefore part of the PCLm payload, rather than writer-only framing.
+    assert_eq!(data.len(), 12_368);
+    assert_eq!(
+        &data[data.len() - 25..],
+        b"Q\n\x07\x07\x07\x07\x07\x07\x07Gz\xe9\x8b\x18$O}uR1\x85@\xe4b\xce"
+    );
+
+    // The PCLm mode is scoped to the writer operation; ordinary source reads
+    // retain their existing encrypted-recovery framing policy afterwards.
+    drop(writer);
+    let source_stream = source.get_object_handle(ObjectRef::new(4, 0));
+    source.resolve(&source_stream)?;
+    assert_eq!(source_stream.get_raw_stream_data()?.len(), 12_345);
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_pclm_preserves_recovered_length_for_a_copied_foreign_stream() -> flpdf::Result<()> {
+    // Same fixture and expectation as
+    // `pdf_writer_pclm_preserves_qpdf_recovered_encrypted_stream_bytes`, but
+    // the content stream reaches the PCLm destination through
+    // `merge_documents` (a foreign, provider-backed copy via
+    // `Pdf::copy_foreign_object`) instead of being read directly from the
+    // document that owns it.
+    let mut source = Pdf::open(BufReader::new(File::open(
+        "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+    )?))?;
+
+    let mut merged = {
+        let mut inputs = [MergeInput {
+            source: &mut source,
+            pages: vec![0],
+        }];
+        merge_documents(&mut inputs)?
+    };
+
+    let mut writer = PdfWriter::new(&mut merged);
+    writer.set_pclm(true);
+    writer.set_static_id(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    drop(writer);
+
+    let mut rewritten = Pdf::open(Cursor::new(output))?;
+    let page_ref = PageDocumentHelper::new(&mut rewritten).get_all_pages()?[0];
+    let contents = PageObjectHelper::new(page_ref, &mut rewritten).get_page_contents()?;
+    assert_eq!(contents.len(), 1);
+    let data = contents[0].get_raw_stream_data()?;
+
+    // qpdf pipes the full recovered length through its AES pipe for a
+    // provider-backed foreign stream exactly as it does for a local one
+    // (`QPDF::pipeStreamData`, `libqpdf/QPDF.cc:2477-2538`, does not
+    // distinguish the two once it has a concrete `length`).
+    assert_eq!(data.len(), 12_368);
     Ok(())
 }
 
