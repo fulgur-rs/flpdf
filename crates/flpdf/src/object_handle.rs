@@ -432,6 +432,16 @@ pub(crate) trait DocumentResolver {
         false
     }
 
+    /// Whether this document's writer is currently emitting its PCLm stream
+    /// queue (`QPDFWriter::willFilterStream` -> `QPDF::pipeStreamData`,
+    /// `libqpdf/QPDFWriter.cc:2068-2098,2928-3005`). Checked at the
+    /// *destination* resolver so a foreign, provider-backed stream copied
+    /// into a PCLm document also selects qpdf's full recovered-length
+    /// boundary, matching the local (non-foreign) stream path.
+    fn pclm_mode(&self) -> bool {
+        false
+    }
+
     /// The document-side half of `QPDFObjectHandle::warn`
     /// (`libqpdf/QPDFObjectHandle.cc:2385-2396`): `QPDF::warn`
     /// (`libqpdf/QPDF.cc:487-494`) reached from an object rather than from a

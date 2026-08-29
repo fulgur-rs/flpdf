@@ -707,10 +707,15 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
         let destination = self.destination_resolver.upgrade().ok_or_else(|| {
             Error::Internal("foreign stream destination resolver is no longer live".to_owned())
         })?;
+        let recovered_stream_eol_length = if destination.pclm_mode() {
+            0
+        } else {
+            self.foreign_data.recovered_stream_eol_length
+        };
         pipe_stream_data_from_input(
             &self.foreign_data.input,
             &self.foreign_data.encryption_parameters,
-            self.foreign_data.recovered_stream_eol_length,
+            recovered_stream_eol_length,
             destination.as_ref(),
             Some(self.foreign_data.description.as_str()),
             self.foreign_data.object_ref,
@@ -3965,6 +3970,10 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from()
+    }
+
+    fn pclm_mode(&self) -> bool {
+        self.pclm_mode()
     }
 
     fn warn(&self, message: String) -> Result<()> {
