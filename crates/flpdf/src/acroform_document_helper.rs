@@ -8,19 +8,66 @@
 //! transform path in this module and its job consumers.
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
-use crate::object::MAX_INLINE_DEPTH;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity, ResourceConflicts};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pdf_string::utf8_value;
 use crate::resource_replacer::{replace_resource_names, ResourceRenames};
-use crate::{
-    Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
-    DEFAULT_MAX_ACROFORM_DEPTH,
-};
+use crate::{Error, Matrix, ObjectRef, Pdf, Rectangle, Result, DEFAULT_MAX_ACROFORM_DEPTH};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
+
+/// Per-call resource rename state produced while qpdf's AcroForm helper merges
+/// a source `/DR` into the destination form resources.
+///
+/// This is the Rust counterpart of the `dr_map` passed from
+/// `QPDFAcroFormDocumentHelper::transformAnnotations` into
+/// `adjustAppearanceStream` (`libqpdf/QPDFAcroFormDocumentHelper.cc:615-696,
+/// 699-1047`). It belongs to the AcroForm appearance/resource boundary rather
+/// than to the overlay job orchestration.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DrMap {
+    by_name: ResourceRenames,
+}
+
+impl DrMap {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    pub(crate) fn category(&self, category: &[u8]) -> Option<&BTreeMap<Vec<u8>, Vec<u8>>> {
+        self.by_name.get(category)
+    }
+
+    pub(crate) fn renames(&self) -> &ResourceRenames {
+        &self.by_name
+    }
+
+    pub(crate) fn categories(&self) -> impl Iterator<Item = &Vec<u8>> {
+        self.by_name.keys()
+    }
+
+    pub(crate) fn insert_rename(&mut self, category: &[u8], old: Vec<u8>, new: Vec<u8>) {
+        self.by_name
+            .entry(category.to_vec())
+            .or_default()
+            .insert(old, new);
+    }
+}
+
+#[cfg(test)]
+impl DrMap {
+    pub(crate) fn for_test(category: &[u8], old: &[u8], new: &[u8]) -> Self {
+        let mut map = Self::new();
+        map.insert_rename(category, old.to_vec(), new.to_vec());
+        map
+    }
+}
 
 fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field: ObjectHandle) {
     let annotation_identity = annotation.identity_key();
@@ -127,7 +174,7 @@ struct FieldInheritance {
 /// `QPDFAcroFormDocumentHelper::analyze`.
 ///
 /// The maps are keyed by [`ObjectHandleIdentity`] rather than by a
-/// materialized [`Object`] or by [`ObjectRef`]. This preserves qpdf's shared
+/// materialized [`crate::Object`] or by [`ObjectRef`]. This preserves qpdf's shared
 /// object identity for both indirect fields and direct page annotations. The
 /// handle maps retain the canonical values needed to project the cache to
 /// legacy ref-valued APIs.
@@ -533,7 +580,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// The ref-valued public map is only a projection for legacy callers. A
     /// mutating consumer must retain these canonical handles so a later edit
-    /// cannot fall back to a stale materialized [`Object`].
+    /// cannot fall back to a stale materialized [`crate::Object`].
     pub(crate) fn form_field_handles(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
         self.analyze()?;
         let cache = self.cache.borrow();
@@ -1879,8 +1926,7 @@ fn copy_and_transform_appearance_streams<R: Read + Seek>(
 ///
 /// The resource-replacer implementation is called through the canonical
 /// `ObjectHandle` path immediately after each copied appearance stream, which
-/// preserves qpdf's `transformAnnotations` ordering and keeps the old raw
-/// caller in `overlay_annotations` isolated until its own consumer cutover.
+/// preserves qpdf's `transformAnnotations` ordering at the AcroForm boundary.
 fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annotation: &ObjectHandle,
@@ -1932,7 +1978,7 @@ fn adjust_copied_appearance_resources<R: Read + Seek>(
     let Some(renames) = renames.filter(|renames| !renames.is_empty()) else {
         return Ok(());
     };
-    let mut dr_map = crate::overlay_annotations::DrMap::new();
+    let mut dr_map = DrMap::new();
     for (category, category_renames) in renames {
         for (old_name, new_name) in category_renames {
             dr_map.insert_rename(category, old_name.clone(), new_name.clone());
@@ -2131,8 +2177,8 @@ fn decode_field_name(name: &[u8]) -> String {
 /// `QUtil::double_to_string(v, 6, trim=true)` -- the default `newReal(double)`
 /// precision used by every `newFromRectangle`/`newFromMatrix` array element
 /// (`libqpdf/QUtil.cc:349-369`). Same round-trip trick as
-/// `overlay_annotations.rs`'s `qpdf_real`, adapted to return an
-/// [`ObjectHandle`] instead of the legacy [`Object`] type.
+/// the qpdf `double_to_string` rounding contract, adapted to return an
+/// [`ObjectHandle`] instead of the raw [`crate::Object`] value type.
 fn qpdf_real(v: f64) -> ObjectHandle {
     let s = format!("{v:.6}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
@@ -2168,144 +2214,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         Ok(resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)?.is_some())
     }
-}
-
-pub(crate) fn collect_reachable_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
-    out: &mut BTreeSet<ObjectRef>,
-    seen: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    skip_parent_key: bool,
-) -> Result<()> {
-    // The `seen` cycle guard cannot stop a long *acyclic* indirect-reference chain
-    // (obj1 -> obj2 -> ... -> objN), where recursion depth grows with the chain length.
-    // Bound the reference chain to avoid stack overflow on hostile source PDFs. Two
-    // independent recursion axes are bounded separately: the `depth` parameter bounds the
-    // indirect-reference-hop axis (`DEFAULT_MAX_ACROFORM_DEPTH`), incremented once per
-    // resolved reference; inline structural nesting within a single resolved object is
-    // bounded by the `inline_depth`/`MAX_INLINE_DEPTH` axis (see `collect_refs_in_object`),
-    // reset to 0 at each ref hop because a freshly resolved object starts a new inline walk.
-    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "AcroForm reference chain depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
-        )));
-    }
-    if !seen.insert(object_ref) {
-        return Ok(());
-    }
-    out.insert(object_ref);
-
-    let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve(&handle)?;
-    let obj = handle.materialize()?;
-    collect_refs_in_object(pdf, &obj, out, seen, depth, 0, skip_parent_key)
-}
-
-pub(crate) fn collect_refs_in_object<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    obj: &Object,
-    out: &mut BTreeSet<ObjectRef>,
-    seen: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    inline_depth: usize,
-    skip_parent_key: bool,
-) -> Result<()> {
-    if inline_depth > MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "AcroForm: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
-        )));
-    }
-    match obj {
-        Object::Reference(object_ref) => {
-            // Ref hop: bump the ref-hop axis; `collect_reachable_refs` resets
-            // `inline_depth` to 0 for the freshly resolved object.
-            collect_reachable_refs(pdf, *object_ref, out, seen, depth + 1, skip_parent_key)
-        }
-        Object::Array(items) => {
-            for item in items {
-                collect_refs_in_object(
-                    pdf,
-                    item,
-                    out,
-                    seen,
-                    depth,
-                    inline_depth + 1,
-                    skip_parent_key,
-                )?;
-            }
-            Ok(())
-        }
-        Object::Dictionary(dict) => collect_refs_in_dict(
-            pdf,
-            dict,
-            out,
-            seen,
-            depth,
-            inline_depth + 1,
-            skip_parent_key,
-        ),
-        Object::Stream(stream) => collect_refs_in_dict(
-            pdf,
-            &stream.dict,
-            out,
-            seen,
-            depth,
-            inline_depth + 1,
-            skip_parent_key,
-        ),
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::RealLiteral { .. }
-        | Object::Name(_)
-        | Object::String(_)
-        | Object::Operator(_)
-        | Object::InlineImage(_) => Ok(()),
-    }
-}
-
-fn collect_refs_in_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &Dictionary,
-    out: &mut BTreeSet<ObjectRef>,
-    seen: &mut BTreeSet<ObjectRef>,
-    depth: usize,
-    inline_depth: usize,
-    skip_parent_key: bool,
-) -> Result<()> {
-    for (key, value) in dict.iter() {
-        // Skip /P while it is a page back-pointer (`skip_parent_key` tracks that
-        // context; see the `next_skip_parent_key` derivation below). Inside
-        // resource data /P is an ordinary resource name and must be collected.
-        if skip_parent_key && key == b"P" {
-            continue;
-        }
-        // /P is a page back-pointer throughout the annotation/field graph — field
-        // and widget dicts, but also nested annotations reached via non-field keys
-        // (e.g. a widget's /Popup, whose own /P points at a page). Keep skipping it
-        // across that whole graph. It only becomes an ordinary resource name once
-        // the walk crosses into resource data via /Resources (an appearance
-        // stream's, page's, or XObject's resources — e.g. a font named /P), so the
-        // skip is lifted there and stays off for that resource subtree. (The
-        // inherited /DR /DA walk already enters with the skip off; see the call in
-        // `source_field_copy_set`.)
-        let next_skip_parent_key = skip_parent_key && key != b"Resources";
-        // Forward the same `inline_depth`: the caller incremented it when
-        // descending into this dict, and each value re-enters
-        // `collect_refs_in_object` where the guard re-checks.
-        collect_refs_in_object(
-            pdf,
-            value,
-            out,
-            seen,
-            depth,
-            inline_depth,
-            next_skip_parent_key,
-        )?;
-    }
-    Ok(())
 }
 
 fn resolve_array_value<R: Read + Seek>(
@@ -2346,8 +2254,9 @@ fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{Stream, MAX_INLINE_DEPTH};
+    use crate::object::Stream;
     use crate::pdf_string::decode_pdf_text_string;
+    use crate::{Dictionary, Object};
     use std::rc::Rc;
 
     fn dict(entries: &[(&str, Object)]) -> Dictionary {
@@ -2399,83 +2308,6 @@ mod tests {
 
     fn refs(nums: &[u32]) -> Object {
         Object::Array(refs_vec(nums))
-    }
-
-    /// Build `depth` levels of single-element arrays wrapping `Object::Null`.
-    /// Contains no `Reference`, so walking it never reaches the resolve path.
-    fn nested_arrays(depth: usize) -> Object {
-        let mut o = Object::Null;
-        for _ in 0..depth {
-            o = Object::Array(vec![o]);
-        }
-        o
-    }
-
-    /// Minimal valid `Pdf` for tests that walk a `Reference`-free object. The
-    /// `pdf` argument is required by the walker signature but is never touched
-    /// because pure inline structure never reaches `pdf.resolve`.
-    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
-        let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
-        Pdf::open_mem_owned(bytes.to_vec()).expect("open")
-    }
-
-    #[test]
-    fn collect_refs_in_object_errors_on_excessive_inline_nesting() {
-        let mut pdf = minimal_pdf();
-        let mut out = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        let deep = nested_arrays(MAX_INLINE_DEPTH + 5);
-        // arg order: (pdf, obj, out, seen, depth, inline_depth, skip_parent_key)
-        let err = collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0, true);
-        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
-    }
-
-    #[test]
-    fn collect_refs_in_object_accepts_inline_nesting_within_limit() {
-        let mut pdf = minimal_pdf();
-        let mut out = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        // Null leaf sits at inline_depth = MAX_INLINE_DEPTH, the deepest level
-        // accepted under the strict `>` guard.
-        let deep = nested_arrays(MAX_INLINE_DEPTH);
-        collect_refs_in_object(&mut pdf, &deep, &mut out, &mut seen, 0, 0, true).unwrap();
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn collect_refs_in_object_walks_dict_and_stream_arms_within_limit() {
-        let mut pdf = minimal_pdf();
-        let mut out = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        // Shallow object exercising the Dictionary and Stream arms (no Reference,
-        // so the resolve path is never hit and `pdf` stays unused by the walk).
-        let stream = Object::Stream(Stream::new(
-            dict(&[("Length", Object::Integer(0))]),
-            Vec::new(),
-        ));
-        let obj = Object::Dictionary(dict(&[("S", stream), ("N", Object::Integer(1))]));
-        collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0, true).unwrap();
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn collect_reachable_refs_resolves_each_indirect_object_through_its_handle() {
-        let mut pdf = empty_pdf();
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Dictionary(dict(&[("Child", Object::Reference(ObjectRef::new(6, 0)))])),
-        );
-        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
-
-        let mut out = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        collect_reachable_refs(&mut pdf, ObjectRef::new(5, 0), &mut out, &mut seen, 0, true)
-            .unwrap();
-
-        assert_eq!(
-            out,
-            BTreeSet::from([ObjectRef::new(5, 0), ObjectRef::new(6, 0)])
-        );
     }
 
     #[test]
@@ -5278,6 +5110,18 @@ mod tests {
             .canonical_annotation_to_field_handles()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn acroform_owns_the_appearance_resource_conflict_map() {
+        let mut map = DrMap::new();
+        assert!(map.is_empty());
+
+        map.insert_rename(b"Font", b"F1".to_vec(), b"F1_1".to_vec());
+        assert_eq!(
+            map.category(b"Font").unwrap().get(b"F1".as_slice()),
+            Some(&b"F1_1".to_vec())
+        );
     }
 
     #[test]

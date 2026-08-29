@@ -354,7 +354,6 @@ fn apply_overlays_to_page<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_page_ref: ObjectRef,
     sources: &[OverlaySource],
-    _dr_map: &mut crate::overlay_annotations::DrMap,
 ) -> Result<()> {
     apply_overlays_to_page_with_sources::<R, R>(dest, dest_page_ref, sources, &mut [])
 }
@@ -1270,7 +1269,6 @@ mod byte_gate {
         // Import source page 1 into dest as a Form XObject, then apply it as a
         // single overlay onto dest page 1.
         let imported = import_page_as_form_xobject(&mut dest, &mut source, source_page).unwrap();
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut dest,
             dest_page,
@@ -1279,7 +1277,6 @@ mod byte_gate {
                 xobject_ref: imported,
                 source_page: None,
             }],
-            &mut dr_map,
         )
         .unwrap();
 
@@ -1590,12 +1587,13 @@ mod byte_gate {
     /// `/Annots` array:
     /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
     ///   pointing at the source page — after copy that ref goes stale
-    ///   and gets Null'd by rewrite_refs, so `apply_placement`'s
-    ///   `set_annot_page_ref_if_null` must repoint it at dest_page_ref;
+    ///   and gets Null'd by rewrite_refs, so the canonical
+    ///   `PageObjectHelper::copy_annotations_from` path must repoint it at
+    ///   dest_page_ref;
     /// - one entry is a DIRECT annot dictionary (an inline
     ///   `<< /Subtype /FreeText ... >>` where an indirect ref would
-    ///   normally live) — `survey_source_annotations` must materialize
-    ///   it into a fresh source-doc indirect object (qpdf
+    ///   normally live) — the canonical AcroForm transform path must preserve
+    ///   it as a fresh source-doc indirect object (qpdf
     ///   transformAnnotations line 954-956).
     ///
     /// Fixture: `form-fields-and-annotations-p-and-inline.pdf` is the
@@ -2036,8 +2034,7 @@ mod byte_gate {
     /// same expected annotation copy behaviour (qpdf's
     /// `doUnderOverlayForPage` shares the codepath for both kinds and
     /// differs only in the content-stream placement order), but exercises
-    /// [`apply_overlay_specs`]'s underlay branch and the accompanying
-    /// [`apply_placement`] call inside it — the mirror of the overlay
+    /// [`apply_overlay_specs`]'s underlay branch — the mirror of the overlay
     /// branch already covered above.
     #[test]
     fn underlay_copy_annotations_fxo_red_repeat1_is_byte_identical_qdf() {
@@ -2635,7 +2632,6 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let overlay = insert_form_xobject(&mut pdf, [0, 0, 612, 792], b"overlay content");
 
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2644,7 +2640,6 @@ mod tests {
                 xobject_ref: overlay,
                 source_page: None,
             }],
-            &mut dr_map,
         )
         .unwrap();
 
@@ -2757,7 +2752,6 @@ mod tests {
         let overlay = insert_form_xobject(&mut pdf, [0, 0, 612, 792], b"over");
         let underlay = insert_form_xobject(&mut pdf, [0, 0, 612, 792], b"under");
 
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2773,7 +2767,6 @@ mod tests {
                     source_page: None,
                 },
             ],
-            &mut dr_map,
         )
         .unwrap();
 
@@ -2843,7 +2836,6 @@ mod tests {
         // Source XObject /BBox = the source page's TrimBox.
         let src = insert_form_xobject(&mut pdf, [20, 20, 220, 100], b"src");
 
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2852,7 +2844,6 @@ mod tests {
                 xobject_ref: src,
                 source_page: None,
             }],
-            &mut dr_map,
         )
         .unwrap();
 
@@ -2896,7 +2887,6 @@ mod tests {
         ));
         let page_ref = ObjectRef::new(3, 0);
         let src = insert_form_xobject(&mut pdf, [0, 0, 100, 100], b"src");
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -2905,7 +2895,6 @@ mod tests {
                 xobject_ref: src,
                 source_page: None,
             }],
-            &mut dr_map,
         )
         .unwrap();
         let contents_ref = match resolved_object(&mut pdf, page_ref)
@@ -2953,8 +2942,7 @@ mod tests {
     fn apply_rejects_non_page() {
         // Object 2 is /Type /Pages, not /Page -> /Fx0 conversion fails.
         let mut pdf = open(one_page_doc("x"));
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
-        let err = apply_overlays_to_page(&mut pdf, ObjectRef::new(2, 0), &[], &mut dr_map);
+        let err = apply_overlays_to_page(&mut pdf, ObjectRef::new(2, 0), &[]);
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -2997,8 +2985,6 @@ mod tests {
         ));
         let page_ref = ObjectRef::new(3, 0);
         let source = insert_form_xobject(&mut pdf, [0, 0, 100, 100], b"source");
-        let mut dr_map = crate::overlay_annotations::DrMap::new();
-
         apply_overlays_to_page(
             &mut pdf,
             page_ref,
@@ -3007,7 +2993,6 @@ mod tests {
                 xobject_ref: source,
                 source_page: None,
             }],
-            &mut dr_map,
         )
         .expect("malformed destination TrimBox must warn and continue like qpdf");
 

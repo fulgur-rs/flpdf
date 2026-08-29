@@ -2,15 +2,15 @@
 //! Port of qpdf's `AcroForm::adjustAppearanceStream`, consuming the shared
 //! `ResourceReplacer` / `ResourceFinder` resource-replacement pipeline
 //! (`libqpdf/QPDFAcroFormDocumentHelper.cc:628-849`, `libqpdf/ResourceFinder.cc`),
-//! called from [`crate::overlay_annotations`]'s `transform_annot_ap_streams`
-//! once per (already per-placement-dup'd) `/AP` appearance stream whenever a
-//! placement's [`crate::overlay_annotations::DrMap`] is non-empty.
+//! called from [`crate::AcroFormDocumentHelper::transform_annotations`] once
+//! per copied `/AP` appearance stream whenever an AcroForm placement's
+//! [`crate::acroform_document_helper::DrMap`] is non-empty.
 //!
 //! An appearance stream copied from another document may reference resource
 //! names (a font, an `ExtGState`, ...) through its own `/Resources`
 //! dictionary that collided with the destination `/AcroForm/DR` during the
-//! merge and were renamed there (`DrMap`, populated by
-//! `merge_resources_shallow`). Left alone, the stream's content would still
+//! merge and were renamed there (`DrMap`, populated by the AcroForm resource
+//! merge). Left alone, the stream's content would still
 //! say e.g. `/F1 18 Tf` while the destination's merged `/DR/Font` no longer
 //! has an `F1` entry — only `F1_1`. [`adjust_appearance_stream_handle`] privatizes
 //! the stream's `/Resources`, renames the colliding keys there, and rewrites
@@ -24,8 +24,8 @@
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+use crate::acroform_document_helper::DrMap;
 use crate::object_handle::{ObjectHandle, ResourceConflicts};
-use crate::overlay_annotations::DrMap;
 use crate::resource_replacer::replace_resource_names;
 use crate::writer::DecodeLevel;
 use crate::{Pdf, Result};
@@ -227,12 +227,11 @@ mod tests {
     use std::rc::Rc;
 
     /// Build a `DrMap` with a single category's rename table. `DrMap`'s
-    /// `by_name` field is private to `overlay_annotations`, so tests drive
-    /// it through the `#[cfg(test)]`-only `DrMap::for_test` constructor
-    /// added there for exactly this purpose, rather than round-tripping
-    /// through a full `merge_resources_shallow` call over a real `Pdf`.
+    /// `by_name` is private to the AcroForm owner, so tests drive it through
+    /// the `#[cfg(test)]`-only `DrMap::for_test` constructor rather than
+    /// round-tripping through a full resource merge over a real `Pdf`.
     fn dr_map_with(category: &[u8], old: &[u8], new: &[u8]) -> DrMap {
-        crate::overlay_annotations::DrMap::for_test(category, old, new)
+        DrMap::for_test(category, old, new)
     }
 
     #[derive(Default)]
@@ -919,7 +918,7 @@ mod tests {
         );
         // The unrelated, pre-existing (empty) /Font sub-dict is untouched —
         // it wasn't force-inserted by this call, but since it's ALSO
-        // empty, `merge_resources_shallow`'s qpdf counterpart would still
+        // empty, qpdf's resource merge counterpart would still
         // drop it via the same "remove empty subdictionaries" step, so it
         // must be dropped here too, matching qpdf iterating every
         // subdictionary of the resulting /Resources, not just the ones
@@ -931,7 +930,7 @@ mod tests {
     fn adjust_appearance_stream_rewrites_content_when_category_subdict_is_indirect() {
         // The AP stream's own `/Resources` is direct, but ITS `/Font` entry
         // is itself an indirect reference (`/Font 6 0 R`) — a shape PDF
-        // permits and `merge_resources_shallow` already resolves on the
+        // permits and the AcroForm resource merge already resolves on the
         // /DR-merge side. Before the fix, the pre-rename snapshot the
         // membership guard consults still held the un-resolved
         // an unresolved indirect handle, the non-resolving dictionary view cannot see through it, and

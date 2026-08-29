@@ -24,9 +24,10 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     // GAP(QPDFAcroFormDocumentHelper::transformAnnotations /
     // QPDFAcroFormDocumentHelper::addAndRenameFormFields /
     // QPDFPageObjectHelper::copyAnnotations): flpdf's own faithful port of
-    // this exact machinery lives in `overlay_annotations.rs`
-    // (`survey_source_annotations`, `apply_placement`,
-    // `add_and_rename_form_fields`, ...), but every entry point there is
+    // this exact machinery lives in the canonical AcroForm and page helpers
+    // (`AcroFormDocumentHelper::transform_annotations`,
+    // `PageObjectHelper::copy_annotations_from`,
+    // `add_and_rename_form_fields`, ...), but the standalone sequence is
     // `pub(crate)`, reachable only from inside the `flpdf` crate through the
     // single public `apply_overlay_specs` pipeline (`overlay.rs`) -- a
     // whole-document overlay/underlay operation, not the standalone
