@@ -2270,16 +2270,6 @@ pub(crate) const QPDF_STATIC_ID: [u8; 16] = [
     0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27, 0x95,
 ];
 
-fn apply_deterministic_id_placeholder(trailer: &mut Dictionary) {
-    trailer.insert(
-        "ID",
-        Object::Array(vec![
-            Object::String(vec![0u8; 16]),
-            Object::String(vec![0u8; 16]),
-        ]),
-    );
-}
-
 /// Generate a fresh 16-byte file identifier.
 ///
 /// Mirrors qpdf's default-`/ID` algorithm in spirit: an MD5 digest seeded from
@@ -2308,11 +2298,7 @@ fn fresh_id_bytes() -> [u8; 16] {
     hasher.finalize().into()
 }
 
-fn strip_writer_trailer_history_keys(trailer: &mut Dictionary) {
-    strip_xref_stream_trailer_keys(trailer);
-    trailer.remove("Prev");
-}
-
+#[cfg(test)]
 fn remap_qpdf_trailer_refs_with_removed<
     R: Read + Seek,
     M: crate::writer::rewrite_renumber::NewNumberLookup,
@@ -2333,32 +2319,6 @@ fn remap_qpdf_trailer_refs_with_removed<
         .into_dict()
         .expect("qpdf trailer rewrite preserves the dictionary variant");
     Ok(())
-}
-
-fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
-    let has_xref_stream_markers = matches!(trailer.get("Type"), Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef")
-        || trailer.get("XRefStm").is_some()
-        || trailer.get("W").is_some()
-        || trailer.get("Index").is_some();
-
-    if !has_xref_stream_markers {
-        return;
-    }
-
-    for key in [
-        "Type",
-        "F",
-        "FFilter",
-        "FDecodeParms",
-        "W",
-        "Index",
-        "Length",
-        "Filter",
-        "DecodeParms",
-        "XRefStm",
-    ] {
-        trailer.remove(key);
-    }
 }
 
 #[cfg(test)]
@@ -2514,7 +2474,7 @@ pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> O
 
 /// `id0` is the `/ID[0]` bytes the file encryption key is derived from
 /// (PDF 1.7 §7.6.3.3 Algorithm 2); the caller must have already decided this
-/// value — typically extracted from [`generate_id_array`] — and must write the
+/// value — typically extracted from the writer's generated ID handle — and must write the
 /// SAME bytes into the output trailer's `/ID[0]`, since a reader re-derives
 /// the file key from `/ID[0]` to validate the password. Taking it as a
 /// parameter (rather than resolving it internally from `pdf`) lets a caller
@@ -2933,7 +2893,9 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &
 /// verbatim at any length: qpdf copies `/ID[0]` unchanged and only regenerates
 /// the 16-byte changing identifier `/ID[1]`, so the serialized `/ID` array is
 /// [`deterministic_id_array_len`]`(id0.len())` bytes wide. An empty `/ID[0]` is
-/// treated as absent (not preserved as `""`).
+/// treated as absent (not preserved as `""`). This raw-value helper is used
+/// only by unit tests; production writers use [`source_permanent_id_handle`].
+#[cfg(test)]
 fn source_permanent_id_value(source_id: Option<&Object>) -> Option<Vec<u8>> {
     match source_id {
         Some(Object::Array(values)) => match values.first() {
@@ -2944,16 +2906,17 @@ fn source_permanent_id_value(source_id: Option<&Object>) -> Option<Vec<u8>> {
     }
 }
 
-pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
-    source_permanent_id_value(trailer.get("ID"))
-}
-
 /// Extract the source trailer's non-empty `/ID[0]` through the live qpdf-shaped
-/// handle graph. This is the ObjectHandle counterpart of [`source_permanent_id`]
-/// for writer paths whose caller has already crossed the `QPDF::getTrailer`
-/// boundary.
+/// handle graph for writer paths whose caller has already crossed the
+/// `QPDF::getTrailer` boundary.
 pub(crate) fn source_permanent_id_handle(trailer: &ObjectHandle) -> Option<Vec<u8>> {
     let id = trailer.try_get_key(b"/ID").ok()?;
+    source_permanent_id_value_handle(&id)
+}
+
+/// Extract qpdf's non-empty `/ID[0]` from an already-selected canonical value
+/// handle. This is the one-value counterpart of `getTrailer().getKey("/ID")`.
+pub(crate) fn source_permanent_id_value_handle(id: &ObjectHandle) -> Option<Vec<u8>> {
     let first = id.try_array_item(0).ok()??;
     first.try_dereference().ok()?;
     match first.as_string() {
@@ -2968,6 +2931,7 @@ pub(crate) fn source_permanent_id_handle(trailer: &ObjectHandle) -> Option<Vec<u
 /// source permanent identifier when one is available. An absent or empty
 /// source permanent identifier falls back to that same changing identifier,
 /// so `/ID[0] == /ID[1]` for a first save or an empty source `/ID[0]`.
+#[cfg(test)]
 pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> Object {
     let source_id0 = source_permanent_id_value(source_id);
     generate_id_array_from_source_id0(source_id0.as_deref(), static_id)
@@ -2996,7 +2960,8 @@ pub(crate) fn generate_id_array_from_source_id0(
 
 /// Generate qpdf's ordinary/static two-element `/ID` array as a canonical
 /// handle, preserving the same source-permanent-id and changing-id rules as
-/// [`generate_id_array`] without crossing back through `Object`.
+/// the writer's ordinary/static ID policy without crossing back through
+/// `Object`.
 pub(crate) fn generate_id_handle(source_id0: Option<&[u8]>, static_id: bool) -> ObjectHandle {
     let changing_id = if static_id {
         QPDF_STATIC_ID.to_vec()
@@ -3138,27 +3103,6 @@ pub(crate) fn write_deterministic_id_inline(
     out.push(b']');
 }
 
-fn generated_id_handle(value: &Object) -> Result<ObjectHandle> {
-    let Object::Array(values) = value else {
-        // cov:ignore-start: generate_id_array constructs the validated two-string shape before this boundary
-        return Err(crate::Error::Unsupported(
-            "writer generated /ID is not an array".to_string(),
-        ));
-        // cov:ignore-end
-    };
-    let [Object::String(id0), Object::String(id1)] = values.as_slice() else {
-        // cov:ignore-start: generate_id_array constructs exactly two string elements before this boundary
-        return Err(crate::Error::Unsupported(
-            "writer generated /ID does not contain two strings".to_string(),
-        ));
-        // cov:ignore-end
-    };
-    Ok(ObjectHandle::array(vec![
-        ObjectHandle::string(id0.clone()),
-        ObjectHandle::string(id1.clone()),
-    ]))
-}
-
 /// Apply writer-owned trailer values without converting the live trailer back
 /// through the legacy `Dictionary` bridge. `/Root` and `/Encrypt` are already
 /// output-space references, while `/ID` is a direct writer-owned array.
@@ -3206,7 +3150,7 @@ fn apply_encrypt_trailer_handle_entries<R: Read + Seek>(
         } else if let Some(id) = generated_id {
             trailer.replace_key(b"/ID", id.shallow_copy()?)?;
         } else {
-            // cov:ignore-start: generated_id_handle is required before this non-encrypted trailer path
+            // cov:ignore-start: generated_id is required before this non-encrypted trailer path
             return Err(crate::Error::Unsupported(
                 "writer trailer is missing its generated /ID".to_string(),
             ));
@@ -3997,7 +3941,8 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 crate::Error::Unsupported("PCLm Catalog root is inconsistent".into())
                 // cov:ignore-end
             })?; // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
-            let source_id0 = source_permanent_id(pdf.trailer_dictionary());
+            let id_handle = pdf.trailer_key_handle(b"ID");
+            let source_id0 = source_permanent_id_value_handle(&id_handle);
             let generated_id = (!options.deterministic_id)
                 .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
             let trailer = build_writer_trailer_handle(
@@ -4042,36 +3987,47 @@ fn write_pclm<R: Read + Seek, W: Write>(
             }
         }
         Some(root) => {
-            let mut trailer = pdf.trailer_dictionary().clone();
-            strip_writer_trailer_history_keys(&mut trailer);
-            trailer.remove("Encrypt");
-            remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &plan.old_to_new, &removed)?;
-            trailer.insert("Size", Object::Integer(object_count as i64));
-            trailer.insert("Root", Object::Reference(root));
-            let generated_id = if options.deterministic_id {
-                None
-            } else {
-                Some(generate_id_array(
-                    pdf.trailer_dictionary().get("ID"),
-                    options.static_id,
-                ))
+            let id_handle = pdf.trailer_key_handle(b"ID");
+            let source_id0 = source_permanent_id_value_handle(&id_handle);
+            let generated_id = (!options.deterministic_id)
+                .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
+            let trailer = build_writer_trailer_handle(
+                pdf,
+                object_count,
+                Some(root),
+                None,
+                options,
+                None,
+                options.deterministic_id,
+                generated_id.as_ref(),
+            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
+            let map = |object_ref| {
+                // cov:ignore-start: the complete PCLm plan makes a missing trailer mapping unreachable
+                plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "PCLm trailer reference {object_ref} absent from renumber map"
+                    ))
+                }) // cov:ignore: PCLm trailer references are covered by the canonical plan
+                   // cov:ignore-end
             };
             if options.deterministic_id {
-                apply_deterministic_id_placeholder(&mut trailer);
-            } else if let Some(id) = generated_id {
-                trailer.insert("ID", id);
-            }
-
-            bytes.extend_from_slice(b"trailer ");
-            if options.deterministic_id {
-                let source_id0 = source_permanent_id(pdf.trailer_dictionary());
                 let info_suffix = deterministic_id_info_suffix(pdf);
                 let mut id_writer = |out: &mut Vec<u8>| {
                     write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
                 };
-                trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+                trailer.write_trailer_with_ref_map(
+                    &mut bytes,
+                    false,
+                    false,
+                    Some(&mut id_writer),
+                    &map,
+                    &removed,
+                    true,
+                )?; // cov:ignore: validated deterministic PCLm trailer emission; LLVM maps this continuation to the call setup
             } else {
-                trailer.write_pdf_trailer(&mut bytes, None);
+                trailer.write_trailer_with_ref_map(
+                    &mut bytes, false, false, None, &map, &removed, true,
+                )?; // cov:ignore: validated PCLm trailer emission; LLVM maps this continuation to the call setup
             }
         }
     }
@@ -4327,7 +4283,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // trailer, so both are gathered here while `pdf` is free.
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
-            let id0 = source_permanent_id(pdf.trailer_dictionary());
+            let id_handle = pdf.trailer_key_handle(b"ID");
+            let id0 = source_permanent_id_value_handle(&id_handle);
             let suffix = deterministic_id_info_suffix(pdf);
             (id0, suffix)
         } else {
@@ -4740,12 +4697,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     } else if options.copy_encryption.is_some() {
         None
     } else {
-        Some(generate_id_array(
-            pdf.trailer_dictionary().get("ID"),
-            options.static_id,
-        ))
+        let id_handle = pdf.trailer_key_handle(b"ID");
+        let source_id0 = source_permanent_id_value_handle(&id_handle);
+        Some(generate_id_handle(source_id0.as_deref(), options.static_id))
     };
-    let generated_id_handle = generated_id.as_ref().map(generated_id_handle).transpose()?;
 
     // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
     // Built ONCE up front so /ID[0] is decided before any object is encrypted.
@@ -4770,18 +4725,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         };
         let id0 = generated_id
             .as_ref()
-            .and_then(Object::as_array)
-            .and_then(|values| values.first())
-            .and_then(Object::as_string)
-            .map(<[u8]>::to_vec)
+            .and_then(ObjectHandle::as_array)
+            .and_then(|values| values.first().and_then(ObjectHandle::as_string))
             .ok_or_else(|| {
-                // cov:ignore-start: generate_id_array always returns a valid two-string array here
+                // cov:ignore-start: generate_id_handle always returns a valid two-string array here
                 crate::Error::Unsupported(
                     "full-rewrite: ordinary/static ID generator returned an invalid /ID array"
                         .to_string(),
                 )
                 // cov:ignore-end
-            })?; // cov:ignore: invalid ID guard is unreachable after generate_id_array
+            })?; // cov:ignore: invalid ID guard is unreachable after generate_id_handle
         let context =
             build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
         Some(context?)
@@ -5653,7 +5606,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
-                generated_id_handle.as_ref(),
+                generated_id.as_ref(),
             )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
             let trailer_map = |object_ref: ObjectRef| {
                 if options.qdf {
@@ -5798,7 +5751,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
-                generated_id_handle.as_ref(),
+                generated_id.as_ref(),
             )?; // cov:ignore: validated xref trailer construction; LLVM maps this continuation to the call setup
             let id = if options.deterministic_id {
                 plain::xref::IdPlan::Deterministic {
@@ -7242,6 +7195,111 @@ mod tests {
             "/ID[1] must be the two-level deterministic digest"
         );
         assert_ne!(id0, id1, "permanent and changing identifiers must differ");
+    }
+
+    #[test]
+    fn qdf_writer_reads_source_id_from_the_canonical_trailer_handle() {
+        let mut pdf = Pdf::open_mem_owned(build_det_id_source("", &[])).expect("source parses");
+        let trailer = pdf.trailer();
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"live-id".to_vec()),
+                    ObjectHandle::string(b"ignored".to_vec()),
+                ]),
+            )
+            .expect("install live source ID");
+
+        let output = write_qpdf_to_memory(&mut pdf, |writer| {
+            writer.set_qdf_mode(true);
+            writer.set_static_id(true);
+        })
+        .expect("QDF write must succeed");
+
+        assert_eq!(
+            trailer_id_pair(&output),
+            (b"live-id".to_vec(), QPDF_STATIC_ID.to_vec()),
+            "QDF must read /ID[0] from the live QPDF::getTrailer equivalent"
+        );
+    }
+
+    #[test]
+    fn pclm_writer_reads_the_canonical_trailer_after_live_mutation() {
+        let mut pdf = Pdf::open_mem_owned(build_det_id_source("", &[])).expect("source parses");
+        let trailer = pdf.trailer();
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"live-pclm-id".to_vec()),
+                    ObjectHandle::string(b"ignored".to_vec()),
+                ]),
+            )
+            .expect("install live PCLm source ID");
+        trailer
+            .replace_key(b"/Probe", ObjectHandle::string(b"live-probe".to_vec()))
+            .expect("install live trailer key");
+
+        let output = write_qpdf_to_memory(&mut pdf, |writer| {
+            writer.set_pclm(true);
+            writer.set_static_id(true);
+        })
+        .expect("PCLm write must succeed");
+
+        assert_eq!(
+            trailer_id_pair(&output),
+            (b"live-pclm-id".to_vec(), QPDF_STATIC_ID.to_vec()),
+            "PCLm must read /ID[0] from the live QPDF::getTrailer equivalent"
+        );
+        let mut reopened = Pdf::open_mem_owned(output).expect("PCLm output must reopen");
+        assert_eq!(
+            reopened.trailer_key_handle(b"Probe").as_string(),
+            Some(b"live-probe".to_vec()),
+            "PCLm must preserve unknown keys from the live trailer"
+        );
+    }
+
+    #[test]
+    fn pclm_writer_reads_the_canonical_trailer_with_a_direct_root() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-adbe.pdf").to_vec(),
+        )
+        .expect("direct-root source parses");
+        let trailer = pdf.trailer();
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"live-direct-root-id".to_vec()),
+                    ObjectHandle::string(b"ignored".to_vec()),
+                ]),
+            )
+            .expect("install live direct-root source ID");
+        trailer
+            .replace_key(
+                b"/Probe",
+                ObjectHandle::string(b"live-direct-root".to_vec()),
+            )
+            .expect("install live direct-root trailer key");
+
+        let output = write_qpdf_to_memory(&mut pdf, |writer| {
+            writer.set_pclm(true);
+            writer.set_static_id(true);
+        })
+        .expect("direct-root PCLm write must succeed");
+
+        assert_eq!(
+            trailer_id_pair(&output),
+            (b"live-direct-root-id".to_vec(), QPDF_STATIC_ID.to_vec()),
+            "direct-root PCLm must read /ID[0] from the live trailer"
+        );
+        let mut reopened = Pdf::open_mem_owned(output).expect("direct-root PCLm output reopens");
+        assert_eq!(
+            reopened.trailer_key_handle(b"Probe").as_string(),
+            Some(b"live-direct-root".to_vec()),
+            "direct-root PCLm must preserve unknown live trailer keys"
+        );
     }
 
     #[test]

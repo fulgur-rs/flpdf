@@ -288,6 +288,12 @@ is mode-independent, while `removed_refs` separately excludes explicitly
 deleted identities. The regression and qpdf 11.9.0 probe are tracked in
 `flpdf-9hc.42`.
 
+`flpdf-egzr.3.2.20` で、`QPDF::getTrailer` (`QPDF.hh:311`, `QPDF.cc:2349-2352`)
+に対応する production caller は `Pdf::trailer` / `Pdf::trailer_key_handle` へ移行した。
+`writer/rewrite_renumber.rs::visible_raw_dict_entries` と raw trailer serializer は
+test-only の legacy projection として残り、production の PCLm・QDF・暗号化 writer は
+live `ObjectHandle` から trailer と `/ID` を取得する。
+
 進捗計測の準備境界は `writer.rs:538-563` に固定する。QDF/content-normalization
 または non-none decode level の `PageDocumentHelper::get_all_pages()` による page-tree
 修復を先に実行してから `get_object_count()` を取得し、qpdf の

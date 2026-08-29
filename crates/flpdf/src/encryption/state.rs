@@ -10,7 +10,7 @@ use super::standard::{
 };
 use crate::encryption::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::error::{EncryptedError, Result};
-use crate::{Dictionary, Object, ObjectRef};
+use crate::{Dictionary, Object, ObjectHandle, ObjectRef};
 use std::collections::BTreeMap;
 
 /// qpdf's `QPDF::EncryptionParameters` state for an authenticated document.
@@ -33,6 +33,15 @@ pub(crate) struct EncryptionState {
     pub(crate) encrypt_ref: Option<ObjectRef>,
     pub(crate) weak_crypto: bool,
     pub(crate) permissions: Permissions,
+    /// The `/ID[0]` bytes used to derive `file_key`, when derivation is
+    /// `/ID[0]`-dependent (qpdf's Algorithm 2, V<5). `None` for the R5/R6
+    /// AES-256 path, which does not read `/ID` at all
+    /// (`QPDF_encryption.cc:736-743` computes `id1` unconditionally before
+    /// dispatching to a handler, but only the V<5 handler consumes it). A
+    /// consumer that must stay paired with `file_key` (for example a
+    /// preserve-encryption copy source) must use this cached value instead
+    /// of re-reading a possibly-since-mutated live trailer `/ID`.
+    pub(crate) id0: Option<Vec<u8>>,
     pub(crate) user_password_matched: bool,
     pub(crate) owner_password_matched: bool,
     /// qpdf `EncryptionParameters::user_password`: padded/recovered for
@@ -358,11 +367,12 @@ pub(crate) struct AuthenticationResult {
 }
 
 /// Authenticate one password candidate and construct the canonical encryption
-/// state. The reader supplies only document-owned dictionary/trailer values;
-/// all Standard-handler parsing and key derivation stays in this module.
+/// state. The reader supplies only document-owned dictionary values and the
+/// canonical `/ID` handle selected from the trailer; all Standard-handler
+/// parsing and key derivation stays in this module.
 pub(crate) fn authenticate(
     encrypt: &Dictionary,
-    trailer: &Dictionary,
+    id: &ObjectHandle,
     encrypt_ref: Option<ObjectRef>,
     password: &[u8],
     password_mode: PasswordMode,
@@ -405,6 +415,7 @@ pub(crate) fn authenticate(
         user_password_matched,
         owner_password_matched,
         user_password,
+        id0,
     ) = if password_is_hex_key {
         // qpdf `--password-is-hex-key`: the value passed via --password is
         // the precomputed file encryption key as hex, NOT a user/owner
@@ -420,13 +431,14 @@ pub(crate) fn authenticate(
         // password-independent; compute it with the SAME revision-aware
         // split layer-2 uses.
         let file_key = decode_hex_file_key(raw_password)?;
-        let (encrypt_metadata, weak_crypto) = if matches!(revision, 5 | 6) {
+        let (encrypt_metadata, weak_crypto, id0) = if matches!(revision, 5 | 6) {
             let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
             // Same weak-crypto classification as layer-2's R5/R6 branch.
-            (encrypt_metadata, revision == 5 || rc4_in_use())
+            (encrypt_metadata, revision == 5 || rc4_in_use(), None)
         } else {
-            let inputs = standard_handler_inputs(encrypt, trailer)?;
-            (inputs.encrypt_metadata, rc4_in_use())
+            let id0 = first_file_id_handle(id)?;
+            let inputs = standard_handler_inputs_with_id0(encrypt, &id0)?;
+            (inputs.encrypt_metadata, rc4_in_use(), Some(id0))
         };
         // A raw key bypasses authentication, so neither the user nor the
         // owner password was matched. qpdf likewise reports no password
@@ -438,6 +450,7 @@ pub(crate) fn authenticate(
             false,
             false,
             Vec::new(),
+            id0,
         )
     } else if matches!(revision, 5 | 6) {
         // Authentication error behavior must match qpdf (see
@@ -487,9 +500,11 @@ pub(crate) fn authenticate(
             user_password_matched,
             owner_password_matched,
             user_password,
+            None,
         )
     } else {
-        let inputs = standard_handler_inputs(encrypt, trailer)?;
+        let id0 = first_file_id_handle(id)?;
+        let inputs = standard_handler_inputs_with_id0(encrypt, &id0)?;
         let encrypt_metadata = inputs.encrypt_metadata;
         let weak_crypto = rc4_in_use();
         // Password authentication runs before any state is committed, so
@@ -519,6 +534,7 @@ pub(crate) fn authenticate(
             user_password_matched,
             owner_password_matched,
             user_password,
+            Some(id0),
         )
     };
 
@@ -543,6 +559,7 @@ pub(crate) fn authenticate(
             encrypt_ref,
             weak_crypto,
             permissions,
+            id0,
             user_password_matched,
             owner_password_matched,
             user_password,
@@ -553,9 +570,18 @@ pub(crate) fn authenticate(
     })
 }
 
+#[cfg(test)]
 fn standard_handler_inputs<'a>(
     encrypt: &'a Dictionary,
     trailer: &'a Dictionary,
+) -> Result<StandardHandlerInputs<'a>> {
+    let id0 = first_file_id(trailer)?;
+    standard_handler_inputs_with_id0(encrypt, id0)
+}
+
+fn standard_handler_inputs_with_id0<'a>(
+    encrypt: &'a Dictionary,
+    id0: &'a [u8],
 ) -> Result<StandardHandlerInputs<'a>> {
     let filter = required_name(encrypt, "Filter")?;
     let v = required_integer(encrypt, "V")?;
@@ -582,7 +608,6 @@ fn standard_handler_inputs<'a>(
     let p = required_permissions(encrypt)?;
     let u = required_32_byte_string(encrypt, "U")?;
     let o = required_32_byte_string(encrypt, "O")?;
-    let id0 = first_file_id(trailer)?;
     let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
     Ok(StandardHandlerInputs {
         v,
@@ -818,6 +843,32 @@ fn required_48_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Resul
     }
 }
 
+/// Read qpdf's `/ID[0]` value from the already-selected canonical trailer key.
+/// The caller supplies `QPDF::getTrailer().getKey("/ID")` rather than the
+/// whole trailer so unrelated entries do not affect this one-value lookup.
+pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
+    let Some(ids) = id.try_as_array()? else {
+        return Err(crate::error::EncryptedError::Malformed {
+            reason: "/ID entry is not an array".into(),
+        }
+        .into());
+    };
+    let Some(first) = ids.first() else {
+        return Err(crate::error::EncryptedError::Malformed {
+            reason: "/ID array is empty".into(),
+        }
+        .into());
+    };
+    first.try_dereference()?;
+    first.as_string().ok_or_else(|| {
+        crate::error::EncryptedError::Malformed {
+            reason: "/ID first entry is not a string".into(),
+        }
+        .into()
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn first_file_id(trailer: &Dictionary) -> Result<&[u8]> {
     match trailer.get("ID") {
         Some(Object::Array(ids)) => match ids.first() {
@@ -861,6 +912,53 @@ mod tests {
         let mut trailer = Dictionary::new();
         trailer.insert("ID", Object::Array(vec![Object::String(vec![1, 2, 3])]));
         trailer
+    }
+
+    #[test]
+    fn first_file_id_handle_reads_direct_and_indirect_ids_and_matches_raw_errors() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let trailer = pdf.trailer();
+
+        assert!(first_file_id_handle(&ObjectHandle::null()).is_err());
+
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![ObjectHandle::string(b"direct-id".to_vec())]),
+            )
+            .expect("install direct ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch direct ID");
+        assert_eq!(first_file_id_handle(&id).expect("direct ID"), b"direct-id");
+
+        pdf.set_object(
+            crate::ObjectRef::new(8, 0),
+            Object::String(b"indirect-id".to_vec()),
+        );
+        let indirect = pdf.get_object_handle(crate::ObjectRef::new(8, 0));
+        trailer
+            .replace_key(b"/ID", ObjectHandle::array(vec![indirect]))
+            .expect("install indirect ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch indirect ID");
+        assert_eq!(
+            first_file_id_handle(&id).expect("indirect ID"),
+            b"indirect-id"
+        );
+
+        trailer
+            .replace_key(b"/ID", ObjectHandle::integer(1))
+            .expect("install non-array ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch non-array ID");
+        assert!(first_file_id_handle(&id).is_err());
+        trailer
+            .replace_key(b"/ID", ObjectHandle::array(Vec::new()))
+            .expect("install empty ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch empty ID");
+        assert!(first_file_id_handle(&id).is_err());
+        trailer
+            .replace_key(b"/ID", ObjectHandle::array(vec![ObjectHandle::integer(1)]))
+            .expect("install non-string ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch non-string ID");
+        assert!(first_file_id_handle(&id).is_err());
     }
 
     /// `/Length` is absent for V<5 per the PDF spec's default; V=5 always

@@ -729,7 +729,7 @@ impl Object {
                 // array's compact `[<hex1><hex2>]` shape (goldens produced by
                 // `qpdf --static-id`) comes from qpdf's own hand-rolled
                 // `writeTrailer` (libqpdf/QPDFWriter.cc:1194-1222), not this
-                // path; see [`write_id_style_value`].
+                // path; see the legacy test-only ID-style helper.
                 out.push(b'[');
                 for value in values.iter() {
                     out.push(b' ');
@@ -929,6 +929,7 @@ pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
 /// [`Object::write_pdf`] rather than silently truncate: this keeps the
 /// fallback observable in tests / goldens while still handling the
 /// production-path shape byte-identically to qpdf.
+#[cfg(test)]
 pub(crate) fn write_id_style_value(out: &mut Vec<u8>, obj: &Object) {
     if let Object::Array(values) = obj {
         if let [Object::String(id0), Object::String(id1)] = values.as_slice() {
@@ -1020,8 +1021,9 @@ pub(crate) fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
 }
 
 /// Callback that writes a trailer's `/ID` array value at the current output
-/// position, used by [`Dictionary::write_pdf_trailer`] to emit a value computed
-/// from the bytes written so far (the deterministic-`/ID` direct-write path).
+/// position, used by the legacy test-only trailer serializer to emit a value
+/// computed from the bytes written so far (the deterministic-`/ID` direct-write
+/// path).
 pub(crate) type TrailerIdWriter<'a> = &'a mut dyn FnMut(&mut Vec<u8>);
 
 /// Like [`TrailerIdWriter`] but with the borrow lifetime (`'r`) and the closure
@@ -1275,6 +1277,7 @@ impl Dictionary {
     /// otherwise insert separating spaces). The closure runs only when the
     /// `/ID` key is present in the dictionary; if it is absent, `id_writer`
     /// is ignored.
+    #[cfg(test)]
     pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>, id_writer: Option<TrailerIdWriter>) {
         out.extend_from_slice(b"<<");
         let mut id_value: Option<&Object> = None;
