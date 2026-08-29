@@ -75,7 +75,7 @@ cargo test -p flpdf --test writer_tests objstm
 **Files:**
 
 - Modify: `crates/flpdf/src/reader.rs` at `resolve_compressed_entry`, `parse_object_stream_chain_entry`, `parse_object_stream_entry_from_handle`, and compressed provenance helpers
-- Inspect/modify as needed: `crates/flpdf/src/reader/resolver.rs` provenance tests, `crates/flpdf/src/subset_prune.rs`, `crates/flpdf/src/pdf.rs`
+- Inspect/modify as needed: `crates/flpdf/src/reader/resolver.rs` provenance tests, `crates/flpdf/src/writer/reachability.rs`, `crates/flpdf/src/pdf.rs`
 - Test: `crates/flpdf/tests/reader_tests.rs` and the relevant reader library tests
 
 - [ ] Before implementation, run the failing Task 1 tests and inspect all callers with `rg` so the production route and provenance consumers are explicit.
@@ -84,7 +84,7 @@ cargo test -p flpdf --test writer_tests objstm
 - [ ] Change the canonical compressed-entry route so the type-2 field1 directly resolves the one ObjStm container. Do not call `object_stream_chain_member` or `collect_object_stream_chain` from this route.
 - [ ] Change the object-stream header parser to retain each `(object_number, offset)` pair in an object-number keyed map. Pass the requested `ObjectRef`/object number to selection; do not pass field2 as a positional target.
 - [ ] Before materialization, compare the effective xref entry for the header object with the direct source stream. Only a type-2 entry naming that same stream may be read from the header. A missing header, source-stream mismatch, non-stream container, or malformed header must follow the existing `Result`/known-null behavior established by the oracle tests, not silently fall back to a parent chain.
-- [ ] Record compressed provenance with the direct source `stream_ref`. Keep the raw source `(stream,index)` identity needed by `synchronize_legacy_resolution_state` to reject stale caches, but do not claim that `parent_index` came from a global `/Extends` position. Update the consumer only where its meaning is actually used; `subset_prune` needs the parent reference, not an invented chain index.
+- [ ] Record compressed provenance with the direct source `stream_ref`. Keep the raw source `(stream,index)` identity needed by `synchronize_legacy_resolution_state` to reject stale caches, but do not claim that `parent_index` came from a global `/Extends` position. Update the consumer only where its meaning is actually used; `writer/reachability` needs the parent reference, not an invented chain index.
 - [ ] Preserve the already-correct `xref.rs` bootstrap path and writer/rewrite behavior. Add a regression that resolves the same fixture through `Pdf::resolve` and the CLI-facing path if the existing test harness exposes it.
 - [ ] Run the RED-to-GREEN sequence:
 

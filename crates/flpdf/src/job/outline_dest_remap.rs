@@ -18,7 +18,7 @@
 //!   front and independent of how it is referenced — qpdf enumerates the
 //!   original page tree and `replaceObject`s each unselected `/Page`. A
 //!   destination targeting a removed page is left verbatim, now resolving to
-//!   that `null`. The subsequent subset sweep ([`crate::subset_prune`]) keeps
+//!   that `null`. The subsequent job subset sweep keeps
 //!   the null object only while a surviving destination still references it; a
 //!   removed page referenced by nothing is garbage-collected entirely. Nulling
 //!   the page object — rather than whatever a destination's (possibly indirect,

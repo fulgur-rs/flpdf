@@ -51,6 +51,7 @@
 | `crates/flpdf/src/job/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
+| `crates/flpdf/src/job/page_subset.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-subset completion |
 | `crates/flpdf/src/job/rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/job/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
@@ -141,7 +142,6 @@
 | `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
 | `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values. A materialized Object reader exists only inside cfg(test) equivalence fixtures |
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
-| `crates/flpdf/src/subset_prune.rs` | correspondence | QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
 | `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |
 | `crates/flpdf/src/tokenizer.rs` | mirror | libqpdf/QPDFTokenizer.cc |
@@ -158,6 +158,7 @@
 | `crates/flpdf/src/writer/plain/mod.rs` | correspondence | QPDFWriter.cc standard write pipeline split across plain writer modules |
 | `crates/flpdf/src/writer/plain/plan.rs` | correspondence | QPDFWriter.cc standard-write object placement and renumber planning |
 | `crates/flpdf/src/writer/plain/xref.rs` | correspondence | QPDFWriter.cc classic and stream xref emission for the plain writer |
+| `crates/flpdf/src/writer/reachability.rs` | correspondence | \`QPDFWriter\` reachability and unreferenced-object emission |
 | `crates/flpdf/src/writer/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/writer/serialize.rs` | correspondence | QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives |
 | `crates/flpdf/src/writer/settings.rs` | correspondence | QPDFWriter.cc writer-setting state and conversion to emission options |

@@ -395,7 +395,7 @@ reader.rs に残ったまま）。
   含める**（後述の「未決定」から格上げ）。これらは qtest 専用ではなく
   production consumer が存在する: `writer.rs:1004-1005,1027,1151,1469`
   （xref stream 生成時の source offset 参照）と
-  `subset_prune.rs:196`（`compressed_parent`）。ソース document の
+  `writer/reachability.rs`（`compressed_parent`）。ソース document の
   xref 由来構造情報を返す resolve/seek 隣接の状態なので、`resolve.rs`
   が正しい置き場所。**`previous_xref_offset` が委譲する
   `startxref`(`reader.rs:1060-1062`) 自体も同じ理由でここに含める**

@@ -144,7 +144,6 @@ pub mod resources;
 pub mod signatures;
 pub(crate) mod stream_filter;
 pub mod struct_tree_pg;
-pub mod subset_prune;
 pub mod thread_bead_p;
 pub mod token_filter;
 pub mod tokenizer;
@@ -228,7 +227,6 @@ pub use struct_tree_pg::{
     drop_struct_elem_dangling_pg, drop_struct_elem_dangling_pg_with_max_depth,
     DEFAULT_MAX_STRUCT_TREE_DEPTH,
 };
-pub use subset_prune::prune_after_subset;
 pub use thread_bead_p::drop_thread_bead_dangling_p;
 pub use token_filter::{TokenFilter, TokenFilterOutput};
 pub use tokenizer::{Token as ContentToken, TokenType as ContentTokenType};

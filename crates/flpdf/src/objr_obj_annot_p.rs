@@ -19,7 +19,7 @@
 //! - A `/P` pointing at a **removed** page has the `/P` key **dropped**. The
 //!   annotation itself (and the OBJR `/Obj` reaching it) is retained; the
 //!   now-unreferenced page is garbage-collected by the subsequent subset sweep
-//!   ([`crate::subset_prune`]) and is absent from the output.
+//!   (the subsequent job subset sweep) and is absent from the output.
 //!
 //! This is the structural-reference *drop* family, alongside the structure-tree
 //! `/Pg` handling ([`crate::struct_tree_pg`]) and the article-thread bead `/P`
@@ -83,7 +83,7 @@ fn raw_child(parent: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> 
 /// Each target is resolved through its canonical handle and deduplicated by its
 /// object reference. When the target is a dictionary whose `/P` is a reference to a removed page, the `/P` key is
 /// dropped so the page is garbage-collected by the subsequent subset sweep
-/// ([`crate::subset_prune::prune_after_subset`]); when `/P` points at a
+/// ([`crate::job::QPDFJob::prune_after_subset`]); when `/P` points at a
 /// surviving page it is remapped to the page's new ref. A `/P` pointing at a
 /// non-page object or a page-like object outside the original page tree is left
 /// unchanged. A target with no `/P`, or a `/P` that is not a reference, is also

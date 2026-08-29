@@ -535,6 +535,22 @@ fn handle_page_specs<R: Read + Seek + 'static>(
 }
 
 impl super::QPDFJob {
+    /// Complete qpdf's page-subset cleanup after the page tree and navigation
+    /// references have been updated.
+    ///
+    /// The page-document helper owns per-page `/Font` and `/XObject` pruning;
+    /// the writer reachability module owns xref-level orphan cleanup. This
+    /// method is the job boundary that preserves qpdf's ordering without
+    /// exposing the old mixed resource/reachability module as a public API.
+    /// `Auto` must be the effective mode returned by the caller's pre-rebuild
+    /// qpdf shared-resource heuristic.
+    pub fn prune_after_subset<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        mode: RemoveUnreferencedResources,
+    ) -> Result<()> {
+        super::page_subset::prune_after_subset(pdf, mode)
+    }
+
     /// Apply the qpdf `QPDFJob::handlePageSpecs` final AcroForm field filter
     /// for the single-document page-selection route.
     ///

@@ -39,7 +39,7 @@ use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
-use crate::subset_prune::sweep_unreachable_objects_except;
+use crate::writer::reachability::sweep_unreachable_objects_except;
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,
     Pdf, Result,

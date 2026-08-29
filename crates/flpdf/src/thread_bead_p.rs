@@ -11,7 +11,7 @@
 //! - A bead whose `/P` points at a **removed** page has the `/P` key
 //!   **dropped**. The bead itself — and its `/N`/`/V` ring links, `/T`, and
 //!   `/R` — is retained; the now-unreferenced page is garbage-collected by the
-//!   subsequent subset sweep ([`crate::subset_prune`]) and is absent from the
+//!   subsequent job subset sweep ([`crate::job::QPDFJob::prune_after_subset`]) and is absent from the
 //!   output.
 //!
 //! This is the structural-reference *drop* family, alongside the structure-tree
@@ -94,7 +94,7 @@ use std::io::{Read, Seek};
 /// bead's `/P` is remapped when its target page survived and removed when its
 /// target page was dropped, so that a removed page referenced by nothing else
 /// is garbage-collected by the subsequent subset sweep
-/// ([`crate::subset_prune::prune_after_subset`]). Reference-to-reference chains
+/// ([`crate::job::QPDFJob::prune_after_subset`]). Reference-to-reference chains
 /// at every link are normalized through [`Pdf::resolve_to_terminal_ref`]
 /// before each step is inspected. The function mutates `pdf`
 /// in place (same convention as `rebuild_page_tree`) and succeeds silently when
