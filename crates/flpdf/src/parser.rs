@@ -152,6 +152,7 @@ impl HandleResolver for DetachedHandles {
     }
 }
 
+#[cfg(test)]
 fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
     if let Some(object_ref) = handle.as_reference() {
         return Ok(Object::Reference(object_ref));
@@ -1672,6 +1673,7 @@ pub(crate) fn parse_indirect_object_with_diagnostics(
 /// arrays, dictionaries, and stream dictionaries retain their usual meaning.
 /// Object-stream members use this mode without any `endobj` check because an
 /// ObjStm body contains only adjacent direct-object representations.
+#[cfg(test)]
 pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
     let mut input = SliceLiveInput::new(input);
     let mut handles = DetachedHandles::default();
