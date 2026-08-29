@@ -219,11 +219,11 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     logger.info(format!("checking {input_name}\n"))?;
     let extension_level = pdf.adobe_extension_level();
     match extension_level {
-        Some(level) => {
+        Some(level) if level > 0 => {
             let version = format!("PDF Version: {} extension level {level}\n", pdf.version());
             logger.info(version)?;
         }
-        None => logger.info(format!("PDF Version: {}\n", pdf.version()))?,
+        Some(_) | None => logger.info(format!("PDF Version: {}\n", pdf.version()))?,
     }
     // `check()` only ever renders this report for a document that already
     // opened successfully, so the password-derived `user_password_matched`/
@@ -1133,6 +1133,39 @@ mod tests {
         assert!(outcome.warnings);
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
         assert!(output.contains("WARNING: linearized.pdf: first page object (/O) mismatch\n"));
+    }
+
+    #[test]
+    fn document_check_omits_zero_adobe_extension_level_like_qpdf() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearize-indirect-extensions.pdf"
+        ))))
+        .expect("zero extension-level fixture should open");
+
+        let outcome = check_document(
+            &mut pdf,
+            &logger,
+            "qpdf",
+            "linearize-indirect-extensions.pdf",
+        )
+        .expect("zero extension-level fixture should check cleanly");
+
+        assert!(!outcome.warnings);
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "checking linearize-indirect-extensions.pdf\n",
+                "PDF Version: 1.4\n",
+                "File is not encrypted\n",
+                "File is not linearized\n",
+                "No syntax or stream encoding errors found; the file may still contain\n",
+                "errors that qpdf cannot detect\n",
+            )
+        );
     }
 
     fn check_linearized_candidate_warning(key: &[u8], value: ObjectHandle) -> String {
