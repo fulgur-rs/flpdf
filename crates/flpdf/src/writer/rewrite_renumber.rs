@@ -251,8 +251,8 @@ impl CanonicalCatalogFirstRenumber {
     }
 }
 
-#[allow(dead_code)] // used by the canonical-walk unit tests
-fn collect_canonical_enqueue_refs<R: Read + Seek>(
+#[allow(dead_code)] // used by the canonical-walk unit tests and the PCLm planner
+pub(crate) fn collect_canonical_enqueue_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
     depth: usize,

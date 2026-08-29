@@ -3988,37 +3988,92 @@ fn write_pclm<R: Read + Seek, W: Write>(
         }
     }
 
-    let mut trailer = pdf.trailer_dictionary().clone();
-    strip_writer_trailer_history_keys(&mut trailer);
-    trailer.remove("Encrypt");
     let removed: BTreeSet<_> = pdf.deleted_object_refs().into_iter().collect();
-    remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &plan.old_to_new, &removed)?;
-    trailer.insert("Size", Object::Integer(object_count as i64));
-    trailer.insert("Root", Object::Reference(plan.root));
-    let generated_id = if options.deterministic_id {
-        None
-    } else {
-        Some(generate_id_array(
-            pdf.trailer_dictionary().get("ID"),
-            options.static_id,
-        ))
-    };
-    if options.deterministic_id {
-        apply_deterministic_id_placeholder(&mut trailer);
-    } else if let Some(id) = generated_id {
-        trailer.insert("ID", id);
-    }
+    match plan.root {
+        None => {
+            let root = plan.direct_root.as_ref().ok_or_else(|| {
+                // cov:ignore-start: Plan::build guarantees a direct Catalog
+                // handle whenever its root identity is absent.
+                crate::Error::Unsupported("PCLm Catalog root is inconsistent".into())
+                // cov:ignore-end
+            })?; // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
+            let source_id0 = source_permanent_id(pdf.trailer_dictionary());
+            let generated_id = (!options.deterministic_id)
+                .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
+            let trailer = build_writer_trailer_handle(
+                pdf,
+                object_count,
+                None,
+                Some(root),
+                options,
+                None,
+                options.deterministic_id,
+                generated_id.as_ref(),
+            )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup.
+            let map = |object_ref: ObjectRef| {
+                plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
+                    // cov:ignore-start: the direct Catalog traversal that
+                    // creates the plan also creates every live reference map
+                    // entry reached by this serializer.
+                    crate::Error::Unsupported(format!(
+                        "PCLm direct /Root reference {object_ref} absent from renumber map"
+                    ))
+                    // cov:ignore-end
+                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
+            };
+            if options.deterministic_id {
+                let info_suffix = deterministic_id_info_suffix(pdf);
+                let mut id_writer = |out: &mut Vec<u8>| {
+                    write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
+                };
+                trailer.write_trailer_with_ref_map(
+                    &mut bytes,
+                    false,
+                    false,
+                    Some(&mut id_writer),
+                    &map,
+                    &removed,
+                    true,
+                )?; // cov:ignore: deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
+            } else {
+                trailer.write_trailer_with_ref_map(
+                    &mut bytes, false, false, None, &map, &removed, true,
+                )?; // cov:ignore: non-deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
+            }
+        }
+        Some(root) => {
+            let mut trailer = pdf.trailer_dictionary().clone();
+            strip_writer_trailer_history_keys(&mut trailer);
+            trailer.remove("Encrypt");
+            remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &plan.old_to_new, &removed)?;
+            trailer.insert("Size", Object::Integer(object_count as i64));
+            trailer.insert("Root", Object::Reference(root));
+            let generated_id = if options.deterministic_id {
+                None
+            } else {
+                Some(generate_id_array(
+                    pdf.trailer_dictionary().get("ID"),
+                    options.static_id,
+                ))
+            };
+            if options.deterministic_id {
+                apply_deterministic_id_placeholder(&mut trailer);
+            } else if let Some(id) = generated_id {
+                trailer.insert("ID", id);
+            }
 
-    bytes.extend_from_slice(b"trailer ");
-    if options.deterministic_id {
-        let source_id0 = source_permanent_id(pdf.trailer_dictionary());
-        let info_suffix = deterministic_id_info_suffix(pdf);
-        let mut id_writer = |out: &mut Vec<u8>| {
-            write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
-        };
-        trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
-    } else {
-        trailer.write_pdf_trailer(&mut bytes, None);
+            bytes.extend_from_slice(b"trailer ");
+            if options.deterministic_id {
+                let source_id0 = source_permanent_id(pdf.trailer_dictionary());
+                let info_suffix = deterministic_id_info_suffix(pdf);
+                let mut id_writer = |out: &mut Vec<u8>| {
+                    write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
+                };
+                trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+            } else {
+                trailer.write_pdf_trailer(&mut bytes, None);
+            }
+        }
     }
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     out.write_all(&bytes)?;
