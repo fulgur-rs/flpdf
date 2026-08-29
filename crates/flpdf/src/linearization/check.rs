@@ -635,18 +635,28 @@ fn length_next_n<R: Read + Seek>(
     xref: &BTreeMap<ObjectRef, XrefEntry>,
     first_object: u32,
     nobjects: u64,
+    file_len: u64,
     collect_soft_warnings: bool,
     warnings: &mut Vec<String>,
 ) -> std::result::Result<i128, LinearizationCheckError> {
     // A valid object sequence cannot contain more entries than the input file
-    // can contain bytes. This bound keeps a corrupt 32-bit hint count from
-    // turning the checker into an unbounded loop while preserving every valid
-    // PDF (each indirect object consumes at least one byte).
-    if nobjects > xref.len() as u64 + 1_000_000 {
+    // can contain bytes, nor drastically more entries than the document
+    // actually has objects. Combine both bounds: `file_len` alone is too
+    // permissive for a large file with a sparse xref (a small malformed PDF
+    // padded with junk bytes could still claim a hint count near the total
+    // file size), and the xref-derived bound alone is too permissive for a
+    // tiny file (a few-KB PDF could still claim up to xref.len() + 1_000_000
+    // objects). Taking the smaller of the two keeps a corrupt 32-bit hint
+    // count from turning the checker into an unbounded loop while preserving
+    // every valid PDF (each indirect object consumes at least one byte, and a
+    // valid hint table never claims more objects than the document has).
+    // qpdf 11.9.0's lengthNextN has no corresponding bound
+    // (libqpdf/QPDF_linearization.cc:589-604); this is defense-in-depth for
+    // malformed input and does not change valid linearization output.
+    let bound = file_len.min(xref.len() as u64 + 1_000_000);
+    if nobjects > bound {
         return Err(LinearizationCheckError::InvalidParam {
-            message: format!(
-                "hint table object count {nobjects} is unreasonably large for the xref table"
-            ),
+            message: format!("hint table object count {nobjects} exceeds bound {bound}"),
         });
     }
 
@@ -695,6 +705,7 @@ struct HintTableCheckInput<'a> {
     outline_hints: Option<&'a HGeneric>,
     h_offset: u64,
     h_length: u64,
+    file_len: u64,
     collect_soft_warnings: bool,
     warnings: &'a mut Vec<String>,
 }
@@ -710,6 +721,7 @@ fn check_hint_tables<R: Read + Seek>(
         outline_hints,
         h_offset,
         h_length,
+        file_len,
         collect_soft_warnings,
         warnings,
     } = input;
@@ -802,6 +814,7 @@ fn check_hint_tables<R: Read + Seek>(
                 &xref,
                 current_object,
                 nobjects,
+                file_len,
                 collect_soft_warnings,
                 warnings,
             )?; // cov:ignore: llvm maps this warning closure cleanup to the page-count branch
@@ -872,6 +885,7 @@ fn check_hint_tables<R: Read + Seek>(
             &xref,
             first_object,
             hint_count as u64,
+            file_len,
             collect_soft_warnings,
             warnings,
         )?; // cov:ignore: llvm maps this length-call cleanup to the following page-length comparison
@@ -1403,6 +1417,7 @@ fn check_linearization_inner<R: Read + Seek>(
             outline_hints: outline_hints.as_ref(),
             h_offset,
             h_length,
+            file_len,
             collect_soft_warnings,
             warnings: &mut warnings,
         },
@@ -2322,6 +2337,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: false,
                 warnings: &mut warnings,
             },
@@ -2344,6 +2360,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: false,
                 warnings: &mut warnings,
             },
@@ -2377,6 +2394,7 @@ mod tests {
                 outline_hints: Some(outline_hints),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: false,
                 warnings: &mut warnings,
             },
@@ -2410,6 +2428,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2457,6 +2476,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2522,9 +2542,19 @@ mod tests {
         );
 
         let mut pdf = Pdf::open_mem_owned(tiny_pdf_bytes()).expect("tiny PDF");
+        let file_len = tiny_pdf_bytes().len() as u64;
         let mut warnings = Vec::new();
         assert_eq!(
-            length_next_n(&mut pdf, &BTreeMap::new(), 1, 1, true, &mut warnings,).unwrap(),
+            length_next_n(
+                &mut pdf,
+                &BTreeMap::new(),
+                1,
+                1,
+                file_len,
+                true,
+                &mut warnings,
+            )
+            .unwrap(),
             0
         );
         assert!(warnings
@@ -2535,10 +2565,45 @@ mod tests {
             &BTreeMap::new(),
             1,
             1_000_001,
+            file_len,
             true,
             &mut warnings,
         )
         .is_err());
+
+        assert!(
+            length_next_n(
+                &mut pdf,
+                &BTreeMap::new(),
+                1,
+                file_len + 1,
+                file_len,
+                true,
+                &mut warnings,
+            )
+            .is_err(),
+            "a hint count larger than the input file must be rejected before iteration"
+        );
+
+        // A huge file with a tiny (or empty) xref must not let `file_len`
+        // alone admit a hint count far beyond the document's actual object
+        // count: the xref-derived term must still apply as a ceiling even
+        // when the file itself is large.
+        let huge_file_len = 10_000_000;
+        assert!(
+            length_next_n(
+                &mut pdf,
+                &BTreeMap::new(),
+                1,
+                1_000_001,
+                huge_file_len,
+                true,
+                &mut warnings,
+            )
+            .is_err(),
+            "a hint count exceeding xref.len() + 1_000_000 must be rejected \
+             even when the input file is large"
+        );
 
         let no_extent = ObjectRef::new(50, 0);
         pdf.set_object(no_extent, crate::Object::Integer(1));
@@ -2547,6 +2612,7 @@ mod tests {
             &BTreeMap::from([(no_extent, XrefEntry::Uncompressed { offset: 0 })]),
             no_extent.number,
             1,
+            file_len,
             true,
             &mut warnings,
         )
@@ -2583,6 +2649,7 @@ mod tests {
                 outline_hints: Some(outline_hints),
                 h_offset,
                 h_length,
+                file_len: outline_bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2606,6 +2673,7 @@ mod tests {
                 outline_hints: Some(outline_hints),
                 h_offset,
                 h_length,
+                file_len: outline_bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2629,6 +2697,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2650,6 +2719,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2669,6 +2739,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2691,6 +2762,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2710,6 +2782,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2729,6 +2802,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2750,6 +2824,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2769,6 +2844,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2789,6 +2865,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2810,6 +2887,7 @@ mod tests {
                 outline_hints: outline_hints.as_ref(),
                 h_offset,
                 h_length,
+                file_len: bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
@@ -2830,6 +2908,7 @@ mod tests {
                 outline_hints: Some(outline_hints),
                 h_offset,
                 h_length,
+                file_len: outline_bytes.len() as u64,
                 collect_soft_warnings: true,
                 warnings: &mut warnings,
             },
