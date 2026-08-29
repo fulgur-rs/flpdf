@@ -21,6 +21,10 @@ fn minimal_pdf() -> &'static str {
     )
 }
 
+fn fixture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures"))
+}
+
 fn repairable_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -113,6 +117,51 @@ fn fourth_argument_is_accepted_but_not_used_by_id_one_family() {
         .code(2)
         .stdout("")
         .stderr("invalid test 99\n");
+}
+
+#[test]
+fn qpdf_ignore_filename_tests_do_not_open_the_dash_input() {
+    driver()
+        .args(["87", "-", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 87 done\n")
+        .stderr("");
+
+    driver()
+        .args(["95", "-", "-"])
+        .assert()
+        .code(0)
+        .stdout("test 95 done\n")
+        .stderr("");
+}
+
+#[test]
+fn object_handle_api_test_88_emits_qpdf_warning_output() {
+    driver()
+        .args(["88", "minimal.pdf", "-"])
+        .current_dir(fixture_dir())
+        .assert()
+        .code(0)
+        .stdout("test 88 done\n")
+        .stderr(
+            "WARNING: test array: ignoring attempt to erase out of bounds array item\n\
+             WARNING: minimal.pdf, object 1 0 at offset 19: operation for array attempted on object of type dictionary: ignoring attempt to erase item\n",
+        );
+}
+
+#[test]
+fn object_handle_api_test_93_uses_canonical_promotion_route() {
+    let source = include_str!("../src/driver/test_88_98.rs");
+
+    assert!(
+        source.contains("pdf.make_indirect_from_object_handle(oh1.clone())"),
+        "test 93 must use qpdf-shaped in-place promotion"
+    );
+    assert!(
+        !source.contains("GAP(QPDF::makeIndirectObject)"),
+        "test 93 must not leave the qpdf promotion assertions as a GAP"
+    );
 }
 
 #[test]

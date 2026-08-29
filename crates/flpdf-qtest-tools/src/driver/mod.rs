@@ -79,14 +79,9 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     //    below (obfuscated-file XOR decode).
     //  - n in {61,81,83,84,85,86,87,92,95,96}: qpdf never opens filename1 at
     //    all there -- each such test body ignores its `pdf` argument (and
-    //    opens its own file(s) via arg2 where relevant) instead.
-    //    GAP: this driver still performs the ordinary open below for these
-    //    numbers rather than skipping it (restructuring the shared open
-    //    path to defer opening is out of scope for this scaffolding pass);
-    //    this only diverges from qpdf's own observable output if filename1
-    //    fails to open cleanly or produces spurious repair diagnostics,
-    //    which the fixtures these numbers are actually invoked against do
-    //    not trigger.
+    //    opens its own file(s) via arg2 where relevant) instead. The empty
+    //    Pdf used below is the Rust equivalent of qpdf's default-constructed
+    //    QPDF for these tests; it must be created without touching filename1.
     //  - n==89: QPDF::createFromJSON -- handled above, before this point.
     //  - everything else: read filename1 into memory. qpdf's n%2/n%4
     //    branching there (processFile(name) vs processFile(FILE*) vs
@@ -94,7 +89,8 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     //    own internal QTC::TC coverage tracing; all three parse the same
     //    bytes identically, so it has no observable effect and is
     //    intentionally not reproduced here.
-    let (open_bytes, filename_diagnostic): (Vec<u8>, Vec<u8>) = if n == 45 {
+    let filename_diagnostic = os_str_diagnostic_bytes(filename).into_owned();
+    let (open_bytes, filename_diagnostic): (Option<Vec<u8>>, Vec<u8>) = if n == 45 {
         // qpdf's test 45 (test_driver.cc:3497-3519) reads
         // "<filename1>.obfuscated" through `QUtil::read_file_into_memory`,
         // which opens it via `QUtil::safe_fopen` (`libqpdf/QUtil.cc:1139`,
@@ -125,9 +121,10 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
             }
         };
         let decoded = raw.into_iter().map(|byte| byte ^ 0xcc).collect();
-        (decoded, pdf_name_diagnostic)
+        (Some(decoded), pdf_name_diagnostic)
+    } else if qpdf_ignores_filename(n) {
+        (None, filename_diagnostic)
     } else {
-        let filename_diagnostic = os_str_diagnostic_bytes(filename).into_owned();
         let bytes = match std::fs::read(filename) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -139,7 +136,7 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
                 );
             }
         };
-        (bytes, filename_diagnostic)
+        (Some(bytes), filename_diagnostic)
     };
 
     let mut options = PdfOpenOptions {
@@ -161,11 +158,17 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         // `arg2` value.
         options.password = os_str_diagnostic_bytes(password).into_owned();
     }
-    let mut pdf = match Pdf::open_mem_owned_with_options(open_bytes, options) {
-        Ok(pdf) => pdf,
-        Err(error) => {
-            return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);
-        }
+    let mut pdf = match open_bytes {
+        Some(open_bytes) => match Pdf::open_mem_owned_with_options(open_bytes, options) {
+            Ok(pdf) => pdf,
+            Err(error) => {
+                return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);
+            }
+        },
+        None => match Pdf::empty() {
+            Ok(pdf) => pdf,
+            Err(error) => return write_error(stdout, stderr, &error.to_string()),
+        },
     };
 
     let mut diagnostics_written = 0;
@@ -971,6 +974,14 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     0
 }
 
+/// qpdf's `runtest` input dispatch skips `filename1` for these test numbers
+/// (`qpdf/test_driver.cc:3463-3490`). Keep this list at the driver boundary so
+/// ignored tests do not acquire accidental filesystem or recovery behavior
+/// from the Rust adapter.
+fn qpdf_ignores_filename(n: i32) -> bool {
+    matches!(n, 61 | 81 | 83 | 84 | 85 | 86 | 87 | 92 | 95 | 96)
+}
+
 fn open_pdf_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
     let suffix: Option<Cow<str>> = match error {
         Error::Parse { message, .. } if n == 0 && message == "xref not found" => {
@@ -1233,6 +1244,11 @@ pub(crate) fn write_warning(
     if let Some(exception) = format_nntree_exception(filename, message) {
         let mut line = b"WARNING: ".to_vec();
         line.extend_from_slice(&exception);
+        return write_stderr_bytes(stdout, stderr, &line);
+    }
+    if diagnostic.is_object_warning() {
+        let mut line = b"WARNING: ".to_vec();
+        line.extend_from_slice(message.as_bytes());
         return write_stderr_bytes(stdout, stderr, &line);
     }
     let offset = diagnostic.offset;
