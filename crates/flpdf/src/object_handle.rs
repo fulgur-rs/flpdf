@@ -7597,6 +7597,7 @@ pub(crate) mod identity_tests {
         assert!(!ObjectHandle::integer(1).has_stream_data_provider());
         assert_eq!(ObjectHandle::integer(1).stream_source_length(), None);
         assert!(!resolver.immediate_copy_from());
+        assert!(!resolver.pclm_mode());
     }
 
     #[test]
