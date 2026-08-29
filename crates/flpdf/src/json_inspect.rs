@@ -529,13 +529,12 @@ pub(crate) fn ordered_qpdf_dict<R: Read + Seek>(
     dict: &Dictionary,
 ) -> Result<OrderedPdfJson, ConvertError> {
     let mut entries = Vec::new();
-    for (raw_key, value) in dict.iter() {
-        if crate::qpdf_null::value_is_null(pdf, value)? {
-            continue;
-        }
+    for (raw_key, value) in
+        crate::writer::rewrite_renumber::visible_raw_dict_entries(pdf, dict, false)?
+    {
         entries.push((
-            RawPdfJsonKey::PdfName(RawPdfName::from_decoded(raw_key)),
-            ordered_qpdf_object(pdf, value)?,
+            RawPdfJsonKey::PdfName(RawPdfName::from_decoded(&raw_key)),
+            ordered_qpdf_object(pdf, &value)?,
         ));
     }
     Ok(OrderedPdfJson::Dictionary(entries))
@@ -547,7 +546,7 @@ pub(crate) fn ordered_qpdf_object<R: Read + Seek>(
     object: &Object,
 ) -> Result<OrderedPdfJson, ConvertError> {
     match object {
-        Object::Reference(reference) if !crate::qpdf_null::reference_is_valid(*reference) => {
+        Object::Reference(reference) if reference.number == 0 => {
             Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Null))
         }
         Object::Reference(reference) => Ok(OrderedPdfJson::Scalar(RawPdfJsonScalar::Reference(
@@ -6417,7 +6416,9 @@ mod tests {
         pdf.set_object(first, Object::Reference(second));
         pdf.set_object(second, Object::Reference(first));
 
-        assert!(crate::qpdf_null::reference_is_null(&mut pdf, first).unwrap());
+        let first_handle = pdf.get_object_handle(first);
+        pdf.resolve(&first_handle).unwrap();
+        assert_eq!(first_handle.as_reference(), Some(second));
         assert_eq!(
             qpdf_resolve_top_level_object(&mut pdf, first).unwrap(),
             Object::Null

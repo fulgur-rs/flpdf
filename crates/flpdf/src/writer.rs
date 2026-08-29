@@ -4083,7 +4083,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // from the explicit removed-reference set below: arrays retain null
     // positions, while dictionary entries whose values resolve to null are
     // omitted regardless of QDF or encryption mode.
-    let qpdf_null_visibility = true;
+    let suppress_null_values = true;
     let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
     // QPDFWriter::write calls initializeSpecialStreams() -- which repairs the
     // page tree via QPDF::getAllPages() (promoting a direct /Kids leaf to a
@@ -5562,7 +5562,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         Some(&mut id_writer),
                         &trailer_map,
                         &skip_ref_set,
-                        qpdf_null_visibility,
+                        suppress_null_values,
                     )?;
                     // cov:ignore-end
                 } else {
@@ -5574,7 +5574,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         None,
                         &trailer_map,
                         &skip_ref_set,
-                        qpdf_null_visibility,
+                        suppress_null_values,
                     )?;
                     // cov:ignore-end
                 }
@@ -5600,7 +5600,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         Some(&mut id_writer),
                         &trailer_map,
                         &skip_ref_set,
-                        qpdf_null_visibility,
+                        suppress_null_values,
                     )?;
                     // cov:ignore-end
                 } else {
@@ -5612,7 +5612,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         None,
                         &trailer_map,
                         &skip_ref_set,
-                        qpdf_null_visibility,
+                        suppress_null_values,
                     )?;
                     // cov:ignore-end
                 }
@@ -5674,7 +5674,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     pdf,
                     &old_to_new,
                     &skip_ref_set,
-                    qpdf_null_visibility,
+                    suppress_null_values,
                 )?, // cov:ignore: live trailer references are validated by the canonical map
                 root: new_root,
                 id,

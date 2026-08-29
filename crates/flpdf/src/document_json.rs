@@ -724,8 +724,8 @@ mod tests {
     /// string, not `null`. Live-probed against `/usr/bin/qpdf` 11.9.0: a
     /// real PDF file with `[0 0 R 1 65535 R (marker)]` already collapses to
     /// `[null, null, "u:marker"]` before any writer runs (parser-owned), so
-    /// the replaced `ordered_qpdf_object`/`reference_is_valid` null
-    /// normalization this finding asks to restore was never exercised by a
+    /// the old ordered raw-object validity normalization this finding asks to
+    /// restore was never exercised by a
     /// parsed document and is not qpdf's own array-writer behavior for the
     /// only way this shape can otherwise arise.
     #[test]
