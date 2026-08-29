@@ -1512,14 +1512,18 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// A copied stream's data is not read until this document is written: a
     /// stream backed by [`StreamDataProvider`](crate::StreamDataProvider)
-    /// is not materialized here, only referenced. Matching qpdf's own
-    /// documented contract (`include/qpdf/QPDF.hh:401-410`), **the source
-    /// `Pdf` must remain alive until every copied stream has been written**
-    /// (or otherwise read) from this document; dropping it first produces an
-    /// [`Error::Internal`] when the writer tries to read the now-gone
-    /// source. qpdf's escape hatch, `setImmediateCopyFrom` (materializing
-    /// provider-backed stream data into memory at copy time so the source
-    /// need not survive), has no flpdf counterpart yet.
+    /// stays a provider on the destination, not a materialized buffer, so it
+    /// is re-read from the source on every write or read of the destination
+    /// stream, not only the first. Matching qpdf's own documented contract
+    /// (`include/qpdf/QPDF.hh:401-410`), **the source `Pdf` must remain
+    /// alive for as long as this document may still read that copied
+    /// stream** — including every later write, not just the first —
+    /// because dropping it produces an [`Error::Internal`] the next time the
+    /// writer tries to read the now-gone source. qpdf's escape hatch,
+    /// `setImmediateCopyFrom`, is exposed as
+    /// [`crate::Pdf::set_immediate_copy_from`]. Call it on the source before
+    /// copying when provider-backed stream data must be materialized at copy
+    /// time so the source need not survive until the destination is written.
     ///
     /// # Errors
     ///
