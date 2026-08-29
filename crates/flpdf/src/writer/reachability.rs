@@ -127,8 +127,13 @@ fn walk_refs(object: &ObjectHandle, depth: usize, queue: &mut Vec<ObjectRef>) ->
     } else if let Some(entries) = object.try_as_dictionary()? {
         for value in entries.values() {
             // QPDFWriter::enqueueObject omits dictionary children whose
-            // handles resolve to null (`QPDFWriter.cc:1131-1135`).
-            if !value.try_is_null()? {
+            // handles resolve to null (`QPDFWriter.cc:1131-1135`). A child
+            // that cannot even be resolved is retained conservatively
+            // instead, matching this walker's own top-level resolve-failure
+            // handling above (`collect_reachable`'s `pdf.resolve(&handle)
+            // .is_err()` continue) rather than aborting the whole GC pass.
+            let is_null = value.try_is_null().unwrap_or(false);
+            if !is_null {
                 walk_child(value, depth + 1, queue)?;
             }
         }
@@ -244,6 +249,40 @@ mod tests {
                 .expect("resolution errors are swallowed by the conservative GC walk");
         assert!(reachable.contains(&ObjectRef::new(1, 0)));
         assert!(reachable.contains(&ObjectRef::new(2, 0)));
+    }
+
+    #[test]
+    fn walk_refs_retains_a_dictionary_child_whose_null_check_cannot_resolve() {
+        // Regression: the dictionary-value null-suppression check
+        // (`value.try_is_null()`) used to propagate a lazy-resolve failure
+        // with `?`, aborting the whole GC pass for a single damaged
+        // dictionary child instead of retaining it the way the top-level
+        // resolve-failure handling in `collect_reachable` does.
+        // Object 2 is inert filler between the catalog and the damaged
+        // object: resolving object 1 only needs to read up through object
+        // 2's own bytes to find its own end (this reader's bound-by-next-
+        // offset strategy), so the injected failure must sit at object 3's
+        // offset to isolate "object 1 resolves fine, its /Damaged child
+        // (object 3) does not" rather than making object 1 itself fail.
+        let bytes = build_pdf_from_bodies(&[
+            b"<< /Type /Catalog /Damaged 3 0 R >>",
+            b"<< /Filler true >>",
+            b"<< /Value 1 >>",
+        ]);
+        let child_offset = bytes
+            .windows(b"3 0 obj\n".len())
+            .position(|window| window == b"3 0 obj\n")
+            .expect("damaged object offset") as u64;
+        let mut pdf = Pdf::open(FailAtOffset {
+            inner: Cursor::new(bytes),
+            fail_at: child_offset,
+        })
+        .expect("xref parsing should succeed before lazy child resolution");
+
+        let reachable = collect_reachable(&mut pdf, ObjectRef::new(1, 0), Vec::new())
+            .expect("a damaged dictionary child must not abort the GC walk");
+        assert!(reachable.contains(&ObjectRef::new(1, 0)));
+        assert!(reachable.contains(&ObjectRef::new(3, 0)));
     }
 
     #[test]
