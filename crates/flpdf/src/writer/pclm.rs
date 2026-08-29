@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
+use crate::writer::rewrite_renumber::visible_raw_dict_entries;
 use crate::{Object, ObjectRef, Pdf, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,20 +128,12 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
                 }
             }
             Object::Dictionary(dict) => {
-                for (_, value) in crate::writer::rewrite_renumber::visible_raw_dict_entries(
-                    self.pdf,
-                    dict,
-                    skip_length,
-                )? {
+                for (_, value) in visible_raw_dict_entries(self.pdf, dict, skip_length)? {
                     self.enqueue_value_with_policy(&value, skip_length)?;
                 }
             }
             Object::Stream(stream) => {
-                for (_, value) in crate::writer::rewrite_renumber::visible_raw_dict_entries(
-                    self.pdf,
-                    &stream.dict,
-                    true,
-                )? {
+                for (_, value) in visible_raw_dict_entries(self.pdf, &stream.dict, true)? {
                     self.enqueue_value_with_policy(&value, true)?;
                 }
             }
