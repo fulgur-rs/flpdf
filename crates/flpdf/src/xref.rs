@@ -12,8 +12,7 @@ use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
 use crate::object_handle::{canonical_dictionary_key_from_legacy, DocumentResolver, ObjectValue};
 use crate::parser::{
-    parse_qpdf_file_object, parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, Parser,
-    ParserDiagnostic,
+    parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, Parser, ParserDiagnostic,
 };
 use crate::reader::file_object::{
     finish_file_object, finish_file_object_handle, parse_file_object_handle_syntax,
@@ -1177,38 +1176,71 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                 ));
             }
 
-            let parsed = match parse_qpdf_file_object(&decoded_stream_data[member_start..]) {
-                Ok((object, diagnostics)) => {
-                    for diagnostic in diagnostics {
-                        let offset = member_start.saturating_add(diagnostic.relative_offset);
-                        self.diagnostics.push(Diagnostic::warning(
-                            format!(
-                                "object stream {stream_number} (object {} 0, offset {offset}): {}",
-                                object_ref.number, diagnostic.message
+            let document = self.handle_document().clone();
+            let parsed = {
+                let mut parser = BootstrapHandleParser {
+                    document: document.as_ref(),
+                    description: XrefObjectDescription::Ordinary,
+                };
+                match parse_qpdf_file_object_handle_with_diagnostics(
+                    &decoded_stream_data[member_start..],
+                    i64::try_from(member_start).unwrap_or(i64::MAX),
+                    Some(i64::try_from(member_start).unwrap_or(i64::MAX)),
+                    &mut parser,
+                ) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        // qpdf lets QPDF::readObjectInStream's parse error abort
+                        // resolveObjectsInStream; QPDF::resolve then warns and
+                        // nulls only the requested object. The once-only marker
+                        // above keeps later members unresolved as well.
+                        return Err(match error.rebase_offset(member_start) {
+                            Error::Parse { offset, message } => Error::parse(
+                                offset,
+                                format!(
+                                    "object stream {stream_number} (object {} 0, offset {offset}): {message}",
+                                    object_ref.number
+                                ),
                             ),
-                            Some(offset as u64),
-                        ));
+                            other => other, // cov:ignore: byte-backed direct parser errors are parse errors
+                        });
                     }
-                    object
-                }
-                Err(error) => {
-                    // qpdf lets QPDF::readObjectInStream's parse error abort
-                    // resolveObjectsInStream; QPDF::resolve then warns and
-                    // nulls only the requested object. The once-only marker
-                    // above keeps later members unresolved as well.
-                    return Err(match error.rebase_offset(member_start) {
-                        Error::Parse { offset, message } => Error::parse(
-                            offset,
-                            format!(
-                                "object stream {stream_number} (object {} 0, offset {offset}): {message}",
-                                object_ref.number
-                            ),
-                        ),
-                        other => other, // cov:ignore: byte-backed direct parser errors are parse errors
-                    });
                 }
             };
-            self.cache.insert(object_ref, parsed);
+
+            for diagnostic in parsed.diagnostics {
+                let offset = member_start.saturating_add(diagnostic.relative_offset);
+                self.diagnostics.push(Diagnostic::warning(
+                    format!(
+                        "object stream {stream_number} (object {} 0, offset {offset}): {}",
+                        object_ref.number, diagnostic.message
+                    ),
+                    Some(offset as u64),
+                ));
+            }
+            if let Some(empty_offset) = parsed.empty_offset {
+                let offset = member_start.saturating_add(empty_offset);
+                self.diagnostics.push(Diagnostic::warning(
+                    format!(
+                        "object stream {stream_number} (object {} 0, offset {offset}): empty object treated as null",
+                        object_ref.number
+                    ),
+                    Some(offset as u64),
+                ));
+            }
+
+            let member_handle = document.handle_for_reference(object_ref);
+            let parsed_offset = parsed.parsed_offset;
+            // cov:ignore-start: the handle parser guarantees an exclusively owned direct member value
+            let value = parsed.value.into_direct_value().ok_or_else(|| {
+                Error::Internal(format!(
+                    "object stream member {} {} did not produce a direct value",
+                    object_ref.number, object_ref.generation
+                ))
+            })?;
+            // cov:ignore-end
+            member_handle.set_resolved(value.0);
+            member_handle.set_parsed_offset_if_unset(parsed_offset);
         }
 
         Ok(())
@@ -3842,6 +3874,44 @@ mod tests {
             XrefLoadOptions::default(),
         );
         test(&mut context)
+    }
+
+    #[test]
+    fn xref_bootstrap_objstm_members_keep_the_canonical_handle_graph() {
+        let members = [
+            (2, b"<< /Child 3 0 R >>".as_slice()),
+            (3, b"<< /Value /target >>".as_slice()),
+        ];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 3], |context| {
+            context
+                .resolve_objects_in_stream(8)
+                .expect("bootstrap ObjStm members resolve");
+
+            let member = context
+                .handle_for_reference(ObjectRef::new(2, 0))
+                .expect("member handle");
+            assert!(
+                member.is_resolved(),
+                "ObjStm member must be installed in the canonical handle slot"
+            );
+            let child = member.try_get_key(b"/Child").expect("member dictionary");
+            let canonical_child = context
+                .handle_for_reference(ObjectRef::new(3, 0))
+                .expect("child handle");
+            assert!(child.is_same_object_as(&canonical_child));
+            assert_eq!(
+                child
+                    .try_get_key(b"/Value")
+                    .expect("resolve nested child")
+                    .try_as_name()
+                    .expect("child name"),
+                Some(b"target".to_vec())
+            );
+        });
     }
 
     fn test_flate_objstm_bytes(stream_number: u32, members: &[(u32, &[u8])]) -> Vec<u8> {
