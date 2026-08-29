@@ -296,4 +296,3 @@ Expected: implemented evidence is recorded, no dependency cycles, and output con
 - [ ] **Step 4: Commit and push reviewed branches**
 
 Commit only reviewed files in each repository, re-query remote state, rebase only feature branches if needed, rerun focused checks after a rebase, and push both repositories without force-pushing or modifying main.
-
