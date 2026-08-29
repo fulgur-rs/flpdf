@@ -651,6 +651,7 @@ impl Object {
         self.write_pdf_inner(out);
     }
 
+    #[cfg(test)]
     pub(crate) fn try_write_pdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -765,6 +766,7 @@ impl Object {
     ///
     /// This is used **only** on the qdf full-rewrite path; the non-qdf path is
     /// untouched.
+    #[cfg(test)]
     pub(crate) fn write_pdf_qdf(&self, out: &mut Vec<u8>, indent: usize) {
         match self {
             Object::Array(values) => {
@@ -791,6 +793,7 @@ impl Object {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn try_write_pdf_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -835,6 +838,7 @@ impl Object {
 }
 
 /// Append `n` ASCII space bytes to `out`.
+#[cfg(test)]
 fn push_spaces(out: &mut Vec<u8>, n: usize) {
     out.resize(out.len() + n, b' ');
 }
@@ -1091,6 +1095,7 @@ impl Dictionary {
         out.extend_from_slice(b" >>");
     }
 
+    #[cfg(test)]
     fn try_write_pdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1173,6 +1178,7 @@ impl Dictionary {
     /// `refiltered` selects between the two. The `/Length` value is taken from
     /// this dictionary (the writer stores the on-disk byte count before
     /// serialization); if `/Length` is absent it is simply omitted.
+    #[cfg(test)]
     pub(crate) fn write_pdf_stream(&self, out: &mut Vec<u8>, refiltered: bool) {
         out.extend_from_slice(b"<<");
         // Capture /Length during the single iteration (it is appended after the
@@ -1201,6 +1207,7 @@ impl Dictionary {
         out.extend_from_slice(b" >>");
     }
 
+    #[cfg(test)]
     pub(crate) fn try_write_pdf_stream_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1243,7 +1250,7 @@ impl Dictionary {
     /// **except `/ID` and `/Encrypt`, which are pulled out and emitted last, in
     /// that order** — structurally the same special-casing it applies to
     /// `/Length` in stream dictionaries (see
-    /// [`write_pdf_stream`](Self::write_pdf_stream)). `/Encrypt` sorts
+    /// the stream-dictionary writer)). `/Encrypt` sorts
     /// alphabetically before `/ID`, `/Info`, `/Root`, and `/Size`, but qpdf's
     /// `writeTrailer` writes it last regardless (`QPDFWriter.cc:1224-1231`,
     /// guarded on `which != t_lin_second`). This function's two callers never
@@ -1311,6 +1318,7 @@ impl Dictionary {
     /// `/Length` (and every other key) is emitted verbatim — this serializer
     /// never recomputes or special-cases `/Length`; the stream-write path has
     /// already stored the correct value before serialization.
+    #[cfg(test)]
     pub(crate) fn write_pdf_qdf(&self, out: &mut Vec<u8>, indent: usize) {
         out.extend_from_slice(b"<<\n");
         for (key, value) in self.iter() {
@@ -1325,6 +1333,7 @@ impl Dictionary {
         out.extend_from_slice(b">>");
     }
 
+    #[cfg(test)]
     fn try_write_pdf_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1354,6 +1363,7 @@ impl Dictionary {
     /// [`write_pdf_stream`](Self::write_pdf_stream) special-case in the QDF
     /// multi-line form: every other key stays alphabetical, `/Length` moves
     /// last. Absent `/Length` renders as plain alphabetical order.
+    #[cfg(test)]
     pub(crate) fn write_pdf_stream_qdf(&self, out: &mut Vec<u8>, indent: usize) {
         out.extend_from_slice(b"<<\n");
         let mut length_value: Option<&Object> = None;
@@ -1379,6 +1389,7 @@ impl Dictionary {
         out.extend_from_slice(b">>");
     }
 
+    #[cfg(test)]
     pub(crate) fn try_write_pdf_stream_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
