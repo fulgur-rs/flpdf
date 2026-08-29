@@ -1551,7 +1551,7 @@ mod tests {
     fn helper_tolerates_non_dict_catalog() {
         let mut pdf = pdf_with_pagelabels(vec![]);
         let catalog_ref = pdf.root_ref().unwrap();
-        pdf.replace_object_handle(catalog_ref, ObjectHandle::integer(0))
+        pdf.replace_object(catalog_ref, ObjectHandle::integer(0))
             .unwrap(); // catalog no longer a dict
         let mut h = pdf.page_labels();
         assert!(
@@ -1784,7 +1784,7 @@ mod tests {
     fn write_reconstructed_labels_noop_on_non_dict_catalog() {
         let mut pdf = bare_one_page_pdf();
         let catalog_ref = pdf.root_ref().unwrap();
-        pdf.replace_object_handle(catalog_ref, ObjectHandle::integer(0))
+        pdf.replace_object(catalog_ref, ObjectHandle::integer(0))
             .unwrap(); // catalog no longer a dict
         let mut h = pdf.page_labels();
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();

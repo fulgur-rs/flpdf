@@ -785,7 +785,7 @@ mod tests {
     }
 
     fn set_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, value: ObjectHandle) {
-        pdf.set_object_handle(object_ref, value)
+        pdf.replace_object(object_ref, value)
             .expect("set canonical object handle");
     }
 

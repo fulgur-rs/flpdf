@@ -278,7 +278,7 @@ pub(crate) fn run_test_13<R: Read + Seek>(
 /// (`libqpdf/QPDF.cc`'s `swapObjects`/`swapObjGen`). Everything from this
 /// call onward in `test_14` — the six printed lines, the caught-logic-error
 /// branch around a second GAP (`QPDF::replaceObject`; the crate's own
-/// `replace_object_handle` exists but is `pub(crate)`, unreachable from this
+/// `replace_object` exists but is `pub(crate)`, unreachable from this
 /// crate), the array/dictionary shallow-copy exercises, and both memory-write
 /// passes to `a.pdf`/`b.pdf` — depends on the swap having actually happened,
 /// so none of it can be honestly ported here.

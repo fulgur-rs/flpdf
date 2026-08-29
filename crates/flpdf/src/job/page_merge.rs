@@ -1067,7 +1067,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // placeholder once no surviving reference points at it.
         for src_page_ref in &orphan_pages {
             if let Some(&new_ref) = map.get(src_page_ref) {
-                target.replace_object_handle(new_ref, ObjectHandle::null())?;
+                target.replace_object(new_ref, ObjectHandle::null())?;
             }
         }
         // Append this input's pages to /Kids in selection order, with each

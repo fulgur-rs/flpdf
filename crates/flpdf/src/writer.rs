@@ -1992,7 +1992,7 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     }
 
     catalog.replace_key(b"/Extensions", extensions)?;
-    pdf.set_object_handle(root_ref, catalog)?;
+    pdf.replace_object(root_ref, catalog)?;
     Ok(())
 }
 
@@ -2054,7 +2054,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
         if valid_adbe {
             if extensions_was_indirect || adbe_was_indirect {
                 catalog.replace_key(b"/Extensions", extensions)?;
-                pdf.set_object_handle(root_ref, catalog)?;
+                pdf.replace_object(root_ref, catalog)?;
             }
             return Ok(());
         }
@@ -2066,7 +2066,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
     } else {
         catalog.replace_key(b"/Extensions", extensions)?;
     }
-    pdf.set_object_handle(root_ref, catalog)?;
+    pdf.replace_object(root_ref, catalog)?;
     Ok(())
 }
 
@@ -2077,7 +2077,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
 /// cache entry after a canonical ObjectHandle mutation. qpdf's writer operates
 /// on a live `QPDFObjectHandle::unsafeShallowCopy` instead, so this boundary
 /// resolves the canonical root slot, makes a direct top-level dictionary copy,
-/// and leaves the final replacement to `Pdf::set_object_handle`. The immediate
+/// and leaves the final replacement to `Pdf::replace_object`. The immediate
 /// entries stay shared; callers replace only top-level keys, so nested direct
 /// values—including streams—are not cloned or rejected.
 fn writer_catalog_copy<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(ObjectRef, ObjectHandle)> {
@@ -2181,7 +2181,7 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
             Some(extensions) => catalog.restore_key_raw(b"/Extensions", extensions)?,
             None => catalog.remove_key(b"/Extensions"),
         }
-        pdf.set_object_handle(snapshot.root_ref, catalog)?;
+        pdf.replace_object(snapshot.root_ref, catalog)?;
     }
     if !snapshot.was_dirty {
         pdf.clear_dirty(snapshot.root_ref);

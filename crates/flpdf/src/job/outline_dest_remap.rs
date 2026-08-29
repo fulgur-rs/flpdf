@@ -423,7 +423,7 @@ fn remap_goto_action<R: Read + Seek>(
 /// drops any nulled page that no surviving destination still references.
 fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) -> Result<()> {
     for &removed in &result.removed_pages {
-        pdf.replace_object_handle(removed, ObjectHandle::null())?;
+        pdf.replace_object(removed, ObjectHandle::null())?;
     }
     Ok(())
 }

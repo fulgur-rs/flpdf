@@ -378,7 +378,7 @@ mod tests {
         entries: &[(&str, ObjectHandle)],
     ) -> ObjectRef {
         let r = ObjectRef::new(n, 0);
-        pdf.set_object_handle(r, dictionary(entries))
+        pdf.replace_object(r, dictionary(entries))
             .expect("set canonical dictionary fixture");
         r
     }
@@ -390,7 +390,7 @@ mod tests {
         data: &[u8],
     ) -> ObjectRef {
         let r = ObjectRef::new(n, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             r,
             ObjectHandle::stream(dictionary(entries), Rc::new(data.to_vec())),
         )
@@ -437,7 +437,7 @@ mod tests {
     fn adjust_appearance_stream_empty_dr_map_is_noop() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let font_handle = indirect(&mut pdf, font_ref);
         let font_dict = HandleFixture::dictionary({
@@ -481,7 +481,7 @@ mod tests {
     fn adjust_appearance_stream_rewrites_content_and_privatizes_indirect_resources() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let font_handle = indirect(&mut pdf, font_ref);
         let font_dict = HandleFixture::dictionary({
@@ -530,7 +530,7 @@ mod tests {
     fn canonical_adjust_appearance_stream_rewrites_a_live_handle_without_materializing_it() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let font_handle = indirect(&mut pdf, font_ref);
         let font_dict = HandleFixture::dictionary({
@@ -605,7 +605,7 @@ mod tests {
     fn canonical_adjust_appearance_stream_keeps_direct_resources_direct() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let resources = HandleFixture::dictionary({
             let mut d = HandleDictionary::new();
@@ -690,7 +690,7 @@ mod tests {
     fn canonical_adjust_appearance_stream_keeps_resources_when_content_cannot_decode() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let font_handle = indirect(&mut pdf, font_ref);
         let font_dict = HandleFixture::dictionary({
@@ -740,12 +740,12 @@ mod tests {
         let mut pdf = open_minimal();
         let first_font_ref = ObjectRef::new(5, 0);
         let second_font_ref = ObjectRef::new(6, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             first_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
         .unwrap();
-        pdf.set_object_handle(
+        pdf.replace_object(
             second_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
@@ -829,7 +829,7 @@ mod tests {
     fn adjust_appearance_stream_incomplete_inline_image_keeps_resources_and_prefix_consistent() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let mut font_dict = HandleDictionary::new();
         font_dict.insert("F1", indirect(&mut pdf, font_ref));
@@ -861,7 +861,7 @@ mod tests {
     fn adjust_appearance_stream_direct_resources_stays_direct() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let mut font_dict = HandleDictionary::new();
         font_dict.insert("F1", indirect(&mut pdf, font_ref));
@@ -938,12 +938,12 @@ mod tests {
         // was present under that indirect sub-dict.
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(font_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let font_dict_ref = ObjectRef::new(6, 0);
         let mut font_dict = HandleDictionary::new();
         font_dict.insert("F1", indirect(&mut pdf, font_ref));
-        pdf.set_object_handle(font_dict_ref, HandleFixture::dictionary(font_dict))
+        pdf.replace_object(font_dict_ref, HandleFixture::dictionary(font_dict))
             .unwrap();
         let mut resources = HandleDictionary::new();
         resources.insert("Font", indirect(&mut pdf, font_dict_ref));
@@ -983,13 +983,13 @@ mod tests {
         // source name (`F1`).
         let mut pdf = open_minimal();
         let f1_font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             f1_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
         .unwrap();
         let f1_1_font_ref = ObjectRef::new(6, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             f1_1_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
@@ -1037,7 +1037,7 @@ mod tests {
         let f2_ref = ObjectRef::new(7, 0);
         let f2_1_ref = ObjectRef::new(8, 0);
         for object_ref in [f1_ref, f1_1_ref, f2_ref, f2_1_ref] {
-            pdf.set_object_handle(
+            pdf.replace_object(
                 object_ref,
                 HandleFixture::dictionary(HandleDictionary::new()),
             )
@@ -1085,7 +1085,7 @@ mod tests {
         // exact same object either way) and mints no fresh name at all.
         let mut pdf = open_minimal();
         let shared_font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             shared_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
@@ -1334,13 +1334,13 @@ mod tests {
         // rewrite would be the byte-identical divergence here.
         let mut pdf = open_minimal();
         let f1_font_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             f1_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
         .unwrap();
         let f1_1_font_ref = ObjectRef::new(6, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             f1_1_font_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
@@ -1396,13 +1396,13 @@ mod tests {
         // (F2->F1) instead — no fresh name minted at all.
         let mut pdf = open_minimal();
         let shared_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             shared_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
         .unwrap();
         let other_ref = ObjectRef::new(6, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             other_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
@@ -1498,16 +1498,16 @@ mod tests {
         //         minting a fresh alias (e.g. the wrong "F4_1").
         let mut pdf = open_minimal();
         let shared_ref = ObjectRef::new(5, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             shared_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
         .unwrap();
         let temp_ref = ObjectRef::new(6, 0);
-        pdf.set_object_handle(temp_ref, HandleFixture::dictionary(HandleDictionary::new()))
+        pdf.replace_object(temp_ref, HandleFixture::dictionary(HandleDictionary::new()))
             .unwrap();
         let other_ref = ObjectRef::new(7, 0);
-        pdf.set_object_handle(
+        pdf.replace_object(
             other_ref,
             HandleFixture::dictionary(HandleDictionary::new()),
         )
@@ -1578,7 +1578,7 @@ mod tests {
             temp_c_ref,
             c_original_ref,
         ] {
-            pdf.set_object_handle(
+            pdf.replace_object(
                 object_ref,
                 HandleFixture::dictionary(HandleDictionary::new()),
             )
@@ -1586,7 +1586,7 @@ mod tests {
         }
         let mut b_original = HandleDictionary::new();
         b_original.insert("C_1", HandleFixture::name(b"Inserted".to_vec()));
-        pdf.set_object_handle(b_original_ref, HandleFixture::dictionary(b_original))
+        pdf.replace_object(b_original_ref, HandleFixture::dictionary(b_original))
             .unwrap();
 
         let mut font_dict = HandleDictionary::new();

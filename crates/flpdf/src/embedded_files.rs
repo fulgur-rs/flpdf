@@ -259,8 +259,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             // decides whether the detached Filespec and its streams are
             // emitted: ordinary rewrites garbage-collect them, while
             // preserve-unreferenced retains them.
-            self.pdf
-                .replace_object_handle(object_ref, ObjectHandle::null())?;
+            self.pdf.replace_object(object_ref, ObjectHandle::null())?;
         }
         Ok(true)
     }
@@ -531,7 +530,7 @@ mod tests {
         object_ref: ObjectRef,
         value: ObjectHandle,
     ) -> ObjectHandle {
-        pdf.set_object_handle(object_ref, value)
+        pdf.replace_object(object_ref, value)
             .expect("set canonical test object");
         pdf.get_object_handle(object_ref)
     }
