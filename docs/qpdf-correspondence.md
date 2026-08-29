@@ -254,7 +254,7 @@ walk, `PageDocumentHelper` consumers reuse it across JSON sections, and
 `flpdf-egzr.3.2.6.19` の `pages/tree_rebuild.rs` は、`QPDF_optimization.cc:159-228`
 に合わせて選択ページへ inheritable attributes を materialize した後、元の page-tree
 に残る `/Pages` node から `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を remove する。
-保持する root 以外の中間 node は引き続き orphan として `subset_prune` の xref-level GC に
+保持する root 以外の中間 node は引き続き orphan として writer-owned reachability cleanup に
 委ねるが、writer が orphan を保存する場合にも qpdf の flattening-side cleanup を保つ。
 `--pages` の CLI consumer で qpdf 11.9.0 と同じ root/kids/leaf の正規化 shape を
 比較する回帰テストは `cli_pages_root_inheritable_qpdf.rs` が所有する。
@@ -265,9 +265,9 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 `QPDFPageObjectHelper.cc:539-649` に合わせた parse-gated な page-local route であり、
 剪定対象は `/Font` と `/XObject` のみ（各 category は shallow copy 後に変更）である。
 旧 aggregate API とそれ専用の回帰テストは、qpdf 11.9.0 に対応物がないため削除した。
-`QPDFJob.cc:2251-2337` の Auto 判定は tree rebuild 前に済ませ、`subset_prune` はその
+`QPDFJob.cc:2251-2337` の Auto 判定は tree rebuild 前に済ませ、job の page-subset boundary はその
 結果が prune を許可した場合だけこの per-page route を実行する。xref-level の orphan
-mark-and-sweep は引き続き `subset_prune` の責務として残す。共有 `/XObject` category、
+mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObject` category、
 継承 `/Resources`、非対象 resource category、重複ページの差分回帰は
 `crates/flpdf-cli/tests/cli_tests.rs` が qpdf 11.9.0 と比較する。
 
@@ -665,7 +665,7 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 | flpdf | 行 | 理由 |
 |---|---|---|
 | `job/acroform_field_prune.rs` | 497 | qpdf 側に**明示的な対応パスがある**（`QPDFJob.cc:2610-2632` "Remove unreferenced form fields"）。副作用ではなく移植対象 |
-| `subset_prune.rs` | 251 | `/Resources` の stale 名前エントリ剪定（`removeUnreferencedResources` 相当）と、xref レベルの orphan mark-and-sweep の 2 責務。null 可視性とは独立 |
+| `job/page_subset.rs` + `writer/reachability.rs` | — | `/Resources` の stale 名前エントリ剪定（`removeUnreferencedResources` 相当）と、xref レベルの orphan mark-and-sweep を qpdf の page/job と writer 責務へ分離。null 可視性とは独立 |
 
 **挙動は検証済み**（各モジュール doc に「qpdf 11.9.0 observed behaviour」の節がある）。
 qpdf 側はこれを専用パスで実装していない:
@@ -688,7 +688,7 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 解決するため、`/Pg 5 0 R` で obj 5 が null なら `/Pg` キーごと消える。
 
 **この主張が及ぶのは上表の 4 モジュール 1,748 行のみ。** `job/acroform_field_prune.rs` と
-`subset_prune.rs` は qpdf 側に別の対応先を持つ独立した責務であり、2 機構に還元できない。
+`job/page_subset.rs` と `writer/reachability.rs` は qpdf 側に別々の対応先を持つ独立した責務であり、2 機構に還元できない。
 
 **区別すべきこと**: 挙動は検証済みで byte-identical を保っているので壊してはならない。
 機構が異なるだけ（in-place 個別修復 vs. null 置換 + writer の null 可視性）。

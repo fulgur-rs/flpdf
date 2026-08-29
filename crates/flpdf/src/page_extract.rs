@@ -53,7 +53,7 @@
 
 use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::pages::page_refs;
-use crate::subset_prune::sweep_unreachable_objects;
+use crate::writer::reachability::sweep_unreachable_objects;
 use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};

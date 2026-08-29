@@ -1,5 +1,9 @@
-//! qpdf correspondence: QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability.
-//! Resource pruning after page-subset extraction.
+//! qpdf correspondence: `QPDFJob::handlePageSpecs` page-subset completion.
+//!
+//! This module owns the job-level composition of the page-document resource
+//! pass and the writer-owned reachability sweep. The page/Form resource
+//! algorithm itself remains in `resources.rs`, and the mark-and-sweep walker
+//! remains in `writer::reachability`.
 //!
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has restructured the
 //! document so that only the selected pages remain reachable from `/Root`,
@@ -14,13 +18,13 @@
 //!    content streams, the intermediate `/Pages` nodes that `rebuild_page_tree`
 //!    intentionally leaves as orphans).
 //!
-//! [`prune_after_subset`] addresses both in one call, gated by
+//! [`prune_after_subset`] composes the two qpdf-owned boundaries, gated by
 //! [`RemoveUnreferencedResources`]:
 //!
 //! | Mode | Name-level prune | xref-level GC |
 //! |------|------------------|---------------|
 //! | [`RemoveUnreferencedResources::No`]   | No  | No  |
-//! | [`RemoveUnreferencedResources::Auto`] | Yes | Yes |
+//! | [`RemoveUnreferencedResources::Auto`] | Yes, when the job heuristic enabled it | Yes |
 //! | [`RemoveUnreferencedResources::Yes`]  | Yes | Yes |
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
@@ -45,18 +49,15 @@
 //! This confirms that `Auto` (the qpdf default) performs both name-level
 //! pruning **and** xref-level GC of unreachable objects.  `No` preserves both.
 
-use crate::object::MAX_INLINE_DEPTH;
-use crate::object_handle::ObjectHandle;
-use crate::page_object_helper::PageObjectHelper;
+use crate::page_document_helper::PageDocumentHelper;
 use crate::resources::RemoveUnreferencedResources;
-use crate::{ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
+use crate::{Pdf, Result};
 use std::io::{Read, Seek};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Prune unreferenced resources from a PDF whose page tree has already been
-/// rebuilt by [`crate::pages::tree_rebuild::rebuild_page_tree`].
+/// Complete qpdf's page-subset cleanup after the page tree has been rebuilt by
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`].
 ///
 /// Two passes are performed when `mode` is not [`RemoveUnreferencedResources::No`]:
 ///
@@ -66,11 +67,15 @@ use std::io::{Read, Seek};
 ///    `/Resources` value only after content parsing succeeds, and copies each
 ///    category before mutating it.
 ///
-/// 2. **xref-level GC** (`collect_reachable` + `delete_object`): walks every
+/// 2. **xref-level GC** (the writer reachability pass): walks every
 ///    indirect child handle reachable from `/Root` (transitively), then calls
 ///    [`Pdf::delete_object`] for every live object that was **not** reached.
 ///    This removes orphaned intermediate `/Pages` nodes left by
 ///    `rebuild_page_tree`, dropped-page content streams, and similar debris.
+///
+/// `Auto` is the effective mode selected by the caller's pre-rebuild
+/// `should_remove_unreferenced_resources` check; this function does not repeat
+/// that check after page-tree inheritance has been flattened.
 ///
 /// Calling this function on a PDF that has **not** been rebuilt (i.e. all
 /// pages are still reachable) is safe: no objects will be deleted by the GC
@@ -82,7 +87,7 @@ use std::io::{Read, Seek};
 /// pass deliberately *swallows* [`Pdf::resolve`] errors
 /// (an unresolvable object is conservatively treated as reachable and
 /// kept), so a resolve failure there does not abort the prune.
-pub fn prune_after_subset<R: Read + Seek>(
+pub(crate) fn prune_after_subset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mode: RemoveUnreferencedResources,
 ) -> Result<()> {
@@ -90,280 +95,30 @@ pub fn prune_after_subset<R: Read + Seek>(
         return Ok(());
     }
 
-    // qpdf's --pages path calls QPDFPageObjectHelper::removeUnreferencedResources
-    // on each copied page before it adds that page to the output
-    // (QPDFJob.cc:2520-2555). Keep that responsibility at the page helper
-    // boundary: it parse-gates before getAttribute("/Resources", true), then
-    // shallow-copies only the Font and XObject category dictionaries before
-    // mutating them (QPDFPageObjectHelper.cc:539-649).
-    for page_ref in crate::pages::page_refs(pdf)? {
-        let mut helper = PageObjectHelper::new(page_ref, pdf);
-        helper.remove_unreferenced_resources()?;
-    }
-
-    // ── Pass 2: xref-level GC ─────────────────────────────────────────────────
-    sweep_unreachable_objects(pdf)?;
+    // QPDFPageDocumentHelper owns page iteration and delegates the
+    // parse-gated `/Font` and `/XObject` mutation to each PageObjectHelper.
+    // QPDFJob owns the ordering that follows page selection: resource pruning
+    // first, then writer reachability cleanup.
+    PageDocumentHelper::new(pdf).remove_unreferenced_resources()?;
+    crate::writer::reachability::sweep_unreachable_objects(pdf)?;
 
     Ok(())
 }
 
-/// Mark-and-sweep every indirect object that is **not** reachable from the
-/// document `/Root` or the PDF trailer, mirroring qpdf's complete-rewrite
-/// model (the writer only emits reachable objects; everything else is
-/// implicitly dropped — `truth source /usr/bin/qpdf`).
-///
-/// The trailer is seeded in addition to `/Root` because it can reference
-/// objects that are not reachable through `/Root`, most notably `/Info`
-/// (document information dictionary) and `/Encrypt` (encryption dictionary).
-///
-/// Returns the number of objects deleted (useful for diagnostics/logging;
-/// callers may ignore it). Returns `Ok(0)` when the document has no `/Root`
-/// (nothing can be proven unreachable, so the GC stays maximally
-/// conservative).
-///
-/// Used by [`prune_after_subset`] (after page-subset rebuild) and by
-/// [`crate::embedded_files::remove_attachment`] (after detaching an
-/// attachment): in both cases the mutation makes some objects unreachable and
-/// this single, well-tested sweep is the one place that physically removes
-/// them — no per-feature ad-hoc reachability heuristics.
-pub(crate) fn sweep_unreachable_objects<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<usize> {
-    sweep_unreachable_objects_except(pdf, &BTreeSet::new())
-}
-
-/// Like [`sweep_unreachable_objects`], but treats every ref in `protect` as
-/// an additional reachability seed, so the objects it names (and everything
-/// they in turn reference) survive the sweep even though nothing in the
-/// document's own `/Root`/trailer graph points at them.
-///
-/// Used by the multi-source `--pages --preserve-unreferenced` merge
-/// (`job/page_merge.rs`) to keep the primary's preserved-orphan closure
-/// alive while still sweeping away incidental merge artifacts (copied
-/// ancestor `/Pages` nodes) that are not part of that closure — qpdf's own
-/// writer preserves unreferenced objects only when explicitly asked
-/// (`QPDFWriter.cc:2907-2913`), it does not disable reachability pruning for
-/// everything else.
-pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    protect: &BTreeSet<ObjectRef>,
-) -> Result<usize> {
-    let root_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(0), // no /Root → nothing can be proven unreachable
-    };
-
-    // Snapshot live refs before the walk so we can compute the unreachable
-    // set after marking.
-    let all_live = pdf.live_object_refs();
-
-    // Mark: traverse from /Root, from the trailer (protects /Info,
-    // /Encrypt and any other trailer-only references from the sweep), and
-    // from every explicitly protected ref.
-    let trailer_refs = {
-        // The canonical trailer handle is qpdf's live trailer graph. In
-        // particular, page merge may have copied `/Info` or unknown trailer
-        // entries into this handle after construction; the legacy
-        // `trailer_dictionary()` snapshot would make those objects look
-        // unreachable and delete them before the writer sees them.
-        let trailer = pdf.trailer();
-        let mut refs: Vec<ObjectRef> = Vec::new();
-        walk_refs(&trailer, 0, &mut refs)?;
-        refs.extend(protect.iter().copied());
-        refs
-    };
-    let reachable = collect_reachable(pdf, root_ref, trailer_refs)?;
-
-    // Sweep: delete every live object that was not reached.
-    let mut deleted = 0usize;
-    for obj_ref in all_live {
-        if !reachable.contains(&obj_ref) {
-            pdf.delete_object(obj_ref);
-            deleted += 1;
-        }
-    }
-    Ok(deleted)
-}
-
-// ── Reachability walker ───────────────────────────────────────────────────────
-
-/// Transitively collect every `ObjectRef` reachable from `start` (and any
-/// additional seeds in `extra_seeds`) by following indirect child handles in
-/// the canonical object graph.
-///
-/// `extra_seeds` is used to protect objects referenced by the PDF trailer
-/// (e.g. `/Info`, `/Encrypt`) that are NOT reachable through `/Root`.
-///
-/// Cycles are handled by the `visited` set: an object already in the set is
-/// not resolved again.  Object-number 0 (the free-list head) is never
-/// traversed.
-///
-/// Errors from [`Pdf::resolve`] on individual objects are silently ignored so
-/// that a malformed or partially-corrupt PDF does not abort the entire GC pass.
-/// The conservative effect is that the problematic object stays reachable (the
-/// walk cannot mark it unreachable) and is therefore not deleted.
-fn collect_reachable<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-    extra_seeds: Vec<ObjectRef>,
-) -> Result<BTreeSet<ObjectRef>> {
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut queue: Vec<ObjectRef> = vec![start];
-    queue.extend(extra_seeds);
-
-    while let Some(current) = queue.pop() {
-        if current.number == 0 {
-            continue;
-        }
-        if !visited.insert(current) {
-            continue;
-        }
-
-        // If `current` lives inside an /ObjStm, that container object must
-        // survive the sweep too: walk_refs only follows child handles and
-        // never sees the metadata-level compressed-parent link, so without
-        // this, delete_object would drop the /ObjStm and make every compressed
-        // member unrecoverable in the output.
-        if let Some((objstm_ref, _)) = pdf.compressed_parent(current) {
-            queue.push(objstm_ref);
-        }
-
-        // Resolve the object; skip on error (conservative — keeps the object).
-        let handle = pdf.get_object_handle(current);
-        if pdf.resolve(&handle).is_err() {
-            continue;
-        }
-
-        // Walk all indirect handles contained in the resolved object.
-        walk_refs(&handle, 0, &mut queue)?;
-    }
-
-    Ok(visited)
-}
-
-/// Recursively push every indirect child handle found inside `object` onto
-/// `queue`. Direct containers are traversed in place; indirect children are
-/// queued by identity and resolved by [`collect_reachable`].
-fn walk_refs(object: &ObjectHandle, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(format!(
-            "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
-        )));
-    }
-    if let Some(items) = object.try_as_array()? {
-        for item in items {
-            walk_child(&item, depth + 1, queue)?;
-        }
-    } else if let Some(entries) = object.try_as_dictionary()? {
-        for value in entries.values() {
-            walk_child(value, depth + 1, queue)?;
-        }
-    } else if let Some(stream_dict) = object.as_stream_dict() {
-        // Stream data contains no indirect PDF object references; its
-        // dictionary does.
-        walk_refs(&stream_dict, depth, queue)?;
-    }
-    Ok(())
-}
-
-fn walk_child(child: &ObjectHandle, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
-    if let Some(object_ref) = child.object_ref() {
-        queue.push(object_ref);
-    } else {
-        walk_refs(child, depth, queue)?;
-    }
-    Ok(())
-}
-
+// Reachability cleanup is writer-owned; page-subset orchestration calls it
+// through `crate::writer::reachability` above.
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::job::check_bytes_for_test;
-    use crate::object::MAX_INLINE_DEPTH;
     use crate::pages::page_refs;
     use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
     use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::BTreeMap;
-    use std::io::{Cursor, Read, Seek, SeekFrom};
-
-    // ── Inline-depth guard ───────────────────────────────────────────────────
-
-    fn nested_arrays(depth: usize) -> ObjectHandle {
-        let mut o = ObjectHandle::null();
-        for _ in 0..depth {
-            o = ObjectHandle::array(vec![o]);
-        }
-        o
-    }
-
-    #[test]
-    fn walk_refs_errors_on_excessive_nesting() {
-        let mut queue = Vec::new();
-        let err = walk_refs(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &mut queue);
-        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
-    }
-
-    #[test]
-    fn walk_refs_accepts_nesting_up_to_the_limit() {
-        let mut queue = Vec::new();
-        // Bury one Reference so it is visited at exactly inline depth
-        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
-        // guard); it must be collected, not errored.
-        let mut o = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
-            ObjectRef::new(9, 0),
-            -1,
-        )]);
-        for _ in 0..(MAX_INLINE_DEPTH - 1) {
-            o = ObjectHandle::array(vec![o]);
-        }
-        walk_refs(&o, 0, &mut queue).unwrap();
-        assert_eq!(queue, vec![ObjectRef::new(9, 0)]);
-    }
-
-    struct FailAtOffset {
-        inner: Cursor<Vec<u8>>,
-        fail_at: u64,
-    }
-
-    impl Read for FailAtOffset {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if self.inner.position() == self.fail_at {
-                return Err(std::io::Error::other("injected reachability read failure"));
-            }
-            self.inner.read(buf)
-        }
-    }
-
-    impl Seek for FailAtOffset {
-        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-            self.inner.seek(position)
-        }
-    }
-
-    #[test]
-    fn collect_reachable_keeps_a_seed_when_resolution_fails() {
-        // Let the catalog resolve and then fail while resolving a child object.
-        // The reachability pass must conservatively keep both visited refs and
-        // continue without turning the I/O error into a GC failure.
-        let bytes =
-            build_pdf_from_bodies(&[b"<< /Type /Catalog >>".to_vec(), b"<< /Value 1 >>".to_vec()]);
-        let child_offset = bytes
-            .windows(b"2 0 obj\n".len())
-            .position(|window| window == b"2 0 obj\n")
-            .expect("child object offset") as u64;
-        let mut pdf = Pdf::open(FailAtOffset {
-            inner: Cursor::new(bytes),
-            fail_at: child_offset,
-        })
-        .expect("xref parsing should succeed before lazy child resolution");
-
-        let reachable =
-            collect_reachable(&mut pdf, ObjectRef::new(1, 0), vec![ObjectRef::new(2, 0)])
-                .expect("resolution errors are swallowed by the conservative GC walk");
-        assert!(reachable.contains(&ObjectRef::new(1, 0)));
-        assert!(reachable.contains(&ObjectRef::new(2, 0)));
-    }
+    use std::io::{Cursor, Read, Seek};
 
     // ── Fixture builders ─────────────────────────────────────────────────────
 

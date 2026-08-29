@@ -1,17 +1,14 @@
 //! End-to-end `--pages` outline / named-destination null-out parity with qpdf.
 //!
 //! Drives the real subset pipeline (`rebuild_page_tree` -> `remap_outline_and_dests`
-//! -> `prune_after_subset` -> `write_pdf`) and asserts the qpdf 11.9.0 behaviour:
+//! -> `QPDFJob::prune_after_subset` -> `write_pdf`) and asserts the qpdf 11.9.0 behaviour:
 //! no nav entry is dropped, surviving-page dests are remapped, a removed page
 //! still referenced by a kept dest is emitted as `null` (and stays live), and a
 //! removed page referenced by nothing is garbage-collected (absent). This is a
 //! structural parity check, not a byte-compare against qpdf (qpdf renumbers).
 
-use flpdf::job::remap_outline_and_dests;
-use flpdf::{
-    prune_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
-    RemoveUnreferencedResources,
-};
+use flpdf::job::{remap_outline_and_dests, QPDFJob};
+use flpdf::{rebuild_page_tree, ObjectHandle, ObjectRef, Pdf, RemoveUnreferencedResources};
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
@@ -86,7 +83,7 @@ fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
     let mut pdf = Pdf::open(Cursor::new(build_fixture())).expect("open fixture");
     let result = rebuild_page_tree(&mut pdf, pages).expect("rebuild");
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
-    prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+    QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
     pdf
 }
 
@@ -317,7 +314,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     let mut pdf = Pdf::open(Cursor::new(build_malformed_dest_fixture())).expect("open fixture");
     let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).expect("rebuild");
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
-    prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+    QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
     // The signature field object (obj 7) is NOT nulled and stays live — it is
     // reachable through the `evil` named destination.
@@ -391,7 +388,7 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
             .expect("open fixture");
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).expect("rebuild");
         remap_outline_and_dests(&mut pdf, &result).expect("remap");
-        prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+        QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
         // The removed page object (obj 4) is null, regardless of the indirection.
         assert!(

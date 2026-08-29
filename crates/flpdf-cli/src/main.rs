@@ -19,7 +19,6 @@ use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
-    subset_prune::prune_after_subset,
     thread_bead_p::drop_thread_bead_dangling_p,
     CombinedPage, CombinedPlan, InputSpec, PageRange, RotateSpec,
 };
@@ -4150,7 +4149,7 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 ///   5. struct_tree_pg::drop_struct_elem_dangling_pg
 ///   6. thread_bead_p::drop_thread_bead_dangling_p
 ///      6.5. objr_obj_annot_p::drop_objr_obj_annot_dangling_p
-///   7. subset_prune::prune_after_subset (Auto/Yes/No)
+///   7. QPDFJob::prune_after_subset (Auto/Yes/No)
 ///   8. QPDFJob::prune_acroform_after_subset
 ///   9. write (or split_pages when --split-pages is set)
 ///
@@ -4729,7 +4728,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let objr_obj_targets = drop_struct_elem_dangling_pg(&mut pdf, &result)?;
     drop_thread_bead_dangling_p(&mut pdf, &result)?;
     drop_objr_obj_annot_dangling_p(&mut pdf, &result, &objr_obj_targets)?;
-    prune_after_subset(&mut pdf, prune_mode.into())?;
+    QPDFJob::prune_after_subset(&mut pdf, prune_mode.into())?;
     QPDFJob::prune_acroform_after_subset(&mut pdf, &result)?;
 
     let mut options = options;

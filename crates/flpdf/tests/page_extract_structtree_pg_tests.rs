@@ -1,17 +1,17 @@
 //! End-to-end `--pages` struct-tree `/Pg` drop parity with qpdf.
 //!
 //! Drives the subset pipeline (`rebuild_page_tree` -> `remap_outline_and_dests`
-//! -> `drop_struct_elem_dangling_pg` -> `prune_after_subset` -> inspection) and
+//! -> `drop_struct_elem_dangling_pg` -> `QPDFJob::prune_after_subset` -> inspection) and
 //! asserts the qpdf 11.9.0 behaviour for the structural-reference *drop* family:
 //! a structure element whose `/Pg` points at a removed page has the `/Pg` key
 //! dropped (not nulled), and the page — once unreferenced — is garbage-collected
 //! entirely. This is the opposite of the annotation/outline null-out family,
 //! where the reference is kept verbatim and the page object becomes `null`.
 
-use flpdf::job::remap_outline_and_dests;
+use flpdf::job::{remap_outline_and_dests, QPDFJob};
 use flpdf::{
-    drop_struct_elem_dangling_pg, prune_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef,
-    Pdf, RemoveUnreferencedResources,
+    drop_struct_elem_dangling_pg, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
+    RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -83,7 +83,7 @@ fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
     let result = rebuild_page_tree(&mut pdf, pages).expect("rebuild");
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
     drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg drop");
-    prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+    QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
     pdf
 }
 

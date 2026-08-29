@@ -6,7 +6,8 @@
 //! `doJSON*` section builders, the page-selection merge boundary owned by
 //! `QPDFJob::handlePageSpecs`, the attachment inspection consumers, the
 //! `--overlay`/`--underlay` (`handleUnderOverlay`) and `--collate` orchestration,
-//! the post-subset AcroForm field pruning (`prune_acroform_after_subset`),
+//! the post-subset resource/reachability and AcroForm pruning
+//! (`prune_after_subset`, `prune_acroform_after_subset`),
 //! attachment listing/formatting, the `--rotate` spec and page-operation route,
 //! and the `--check`
 //! document-check consumer (`QPDFJob::doCheck`/`doInspection`).
@@ -28,6 +29,7 @@ mod page_plan;
 mod page_range;
 mod page_specs;
 mod page_split;
+mod page_subset;
 mod rotate;
 mod rotate_spec;
 

@@ -3312,7 +3312,7 @@ fn merge_inherits_primary_acroform_dr_and_da() {
 //
 // Note: this is a GUARD test, not a discriminating one. The leak is benign in the
 // FINAL output by the merge architecture (fresh renumbering + `/Parent` reparent
-// in `materialize_leaf` + the final `sweep_unreachable_objects`): any stray copy
+// in `materialize_leaf` + the final writer reachability sweep): any stray copy
 // of a leaked secondary object is unreferenced and reclaimed by the sweep, so it
 // never reaches the output. Removing the `is_primary` gate does NOT make this
 // test fail (verified empirically). The fix's value is correctness-of-intent and
@@ -3565,7 +3565,7 @@ fn merge_appends_unnamed_secondary_field() {
 }
 
 /// Count live `/Type /Page` objects in `doc` (reachable or not — every object
-/// still present after the merge's `sweep_unreachable_objects`). Used to assert
+/// still present after the merge's writer reachability sweep). Used to assert
 /// that a non-terminal field's unselected-page widget did not leave an orphan
 /// page object behind.
 fn count_live_page_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {

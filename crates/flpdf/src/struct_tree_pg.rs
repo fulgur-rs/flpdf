@@ -11,7 +11,7 @@
 //! - A structure element whose `/Pg` points at a **removed** page has the
 //!   `/Pg` key **dropped**. A removed page referenced by nothing else is then
 //!   garbage-collected by the subsequent subset sweep
-//!   ([`crate::subset_prune`]) and is absent from the output.
+//!   (the subsequent job subset sweep) and is absent from the output.
 //!
 //! This is the structural-reference *drop* family: the opposite of the
 //! outline/named-destination/annotation handling
@@ -91,7 +91,7 @@ fn raw_child(parent: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> 
 /// Each structure element's `/Pg` is remapped when its target page survived
 /// and removed when its target page was dropped, so that a removed page
 /// referenced by nothing else is garbage-collected by the subsequent subset
-/// sweep ([`crate::subset_prune::prune_after_subset`]). The function mutates
+/// sweep ([`crate::job::QPDFJob::prune_after_subset`]). The function mutates
 /// `pdf` in place (same convention as `rebuild_page_tree`) and succeeds
 /// silently when the document has no `/StructTreeRoot`.
 ///

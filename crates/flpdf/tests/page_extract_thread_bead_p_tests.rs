@@ -3,7 +3,7 @@
 //! Drives the subset pipeline in the production order used by
 //! `run_page_extraction` (`rebuild_page_tree` -> `remap_outline_and_dests` ->
 //! `drop_struct_elem_dangling_pg` -> `drop_thread_bead_dangling_p` ->
-//! `prune_after_subset` -> `prune_acroform_after_subset` -> inspection) and
+//! `QPDFJob::prune_after_subset` -> `prune_acroform_after_subset` -> inspection) and
 //! asserts the qpdf 11.9.0 behaviour for the structural-reference *drop* family:
 //! a bead whose `/P` points at a removed page has the `/P` key dropped (not
 //! nulled), the bead and its ring links are kept, and the page — once
@@ -11,11 +11,11 @@
 //! annotation/outline null-out family, where the reference is kept verbatim and
 //! the page object becomes `null`.
 
-use flpdf::job::remap_outline_and_dests;
+use flpdf::job::{remap_outline_and_dests, QPDFJob};
 use flpdf::{
     drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, extract_pages, pages,
-    prune_acroform_after_subset, prune_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef,
-    Pdf, RemoveUnreferencedResources,
+    prune_acroform_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
+    RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -110,7 +110,7 @@ fn run_subset_bytes(bytes: Vec<u8>, pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>>
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
     drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg drop");
     drop_thread_bead_dangling_p(&mut pdf, &result).expect("bead /P drop");
-    prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+    QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
     prune_acroform_after_subset(&mut pdf, &result).expect("acroform prune");
     pdf
 }

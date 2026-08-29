@@ -857,6 +857,12 @@ impl<R: Read + Seek> Pdf<R> {
             .map(|provenance| (provenance.parent_ref, provenance.parent_index))
     }
 
+    /// Return the current source xref entry for `object_ref` without cloning
+    /// the complete xref table.
+    pub(crate) fn source_xref_entry(&self, object_ref: ObjectRef) -> Option<XrefEntry> {
+        self.resolver.xref_entry(object_ref)
+    }
+
     /// Replace `object_ref` with `object` in the in-memory object cache.
     ///
     /// The original on-disk bytes are not touched; [`crate::PdfWriter`] will

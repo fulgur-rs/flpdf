@@ -289,7 +289,7 @@ impl<R: Read + Seek> Pdf<R> {
 ///    (an `/AF` entry, a `/Dests` / `/JavaScript` name tree, another
 ///    Filespec). Associated-files (`/AF`) arrays are not modified, so an
 ///    `/AF` entry that pointed at the removed Filespec now points at null.
-/// 3. **Mark-and-sweep GC** (`crate::subset_prune::sweep_unreachable_objects`):
+/// 3. **Mark-and-sweep GC** through the writer-owned reachability pass:
 ///    every indirect object no longer reachable from `/Root` or the trailer
 ///    is physically deleted. This always drops the Filespec's original
 ///    content — its `/EF` streams (including a filespec carrying distinct
@@ -336,7 +336,7 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
 
     // The null Filespec remains reachable through any existing `/AF` array,
     // while its embedded streams and name-tree ghosts become unreachable.
-    crate::subset_prune::sweep_unreachable_objects(pdf)?;
+    crate::writer::reachability::sweep_unreachable_objects(pdf)?;
 
     Ok(true)
 }
@@ -1252,13 +1252,12 @@ mod tests {
 
     // ── Test: live object referencing the stream (with stream back-ref) ──────
     //
-    // Regression for roborev #949: the stream ref used to be unconditionally
-    // excluded from the filespec-reference scan.  If the stream is preserved
-    // (externally referenced) and its dictionary back-references the filespec,
-    // the filespec would be deleted leaving the live stream dangling.  The
-    // mutual-ref pair must be kept together.
+    // qpdf replaces the removed Filespec with null. The externally referenced
+    // stream survives, but its dictionary's back-reference resolves to null
+    // and is not a writer reachability edge (`QPDFWriter.cc:1131-1135`), so the
+    // Filespec itself is still collected.
     #[test]
-    fn remove_attachment_keeps_pair_when_stream_externally_referenced_and_back_refs() {
+    fn remove_attachment_keeps_external_stream_but_collects_nulled_filespec() {
         let mut pdf = open_minimal();
 
         let fs_ref = FileSpecBuilder::new("paired.txt", b"paired payload")
@@ -1296,10 +1295,7 @@ mod tests {
             live.contains(&stream_ref),
             "externally-referenced stream must be preserved"
         );
-        assert!(
-            live.contains(&fs_ref),
-            "filespec must be preserved because the live stream back-references it"
-        );
+        assert!(!live.contains(&fs_ref), "nulled filespec must be collected");
     }
 
     // ── Test: shared embedded stream is preserved, removed filespec GC'd ──────
