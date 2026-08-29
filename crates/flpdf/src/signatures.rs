@@ -1,4 +1,4 @@
-//! flpdf-only digital signature inspection and value/flag helpers.
+//! qpdf correspondence: no qpdf counterpart for signature inspection; qpdf-owned mutation lives in Pdf and AcroFormDocumentHelper.
 //!
 //! qpdf-owned mutation lives at its corresponding document boundaries:
 //! [`crate::Pdf::remove_security_restrictions`] and

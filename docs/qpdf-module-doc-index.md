@@ -139,7 +139,7 @@
 | `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
-| `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
+| `crates/flpdf/src/signatures.rs` | correspondence | no qpdf counterpart for signature inspection; qpdf-owned mutation lives in Pdf and AcroFormDocumentHelper |
 | `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values. A materialized Object reader exists only inside cfg(test) equivalence fixtures |
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
