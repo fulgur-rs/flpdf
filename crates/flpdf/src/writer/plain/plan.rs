@@ -88,7 +88,10 @@ pub(crate) fn stream_cache_fingerprint(
 pub(crate) struct PlainWritePlan {
     pub(crate) version: String,
     pub(crate) objects: Vec<PlannedIndirectObject>,
-    pub(crate) root: ObjectRef,
+    /// Remapped Catalog identity when the source `/Root` is indirect.
+    pub(crate) root: Option<ObjectRef>,
+    /// Canonical Catalog handle when the source `/Root` is direct.
+    pub(crate) direct_root: Option<crate::ObjectHandle>,
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
     pub(crate) cached_stream_outputs: HashMap<ObjectRef, CachedStreamOutput>,
@@ -115,7 +118,16 @@ impl PlainWritePlan {
         pdf: &mut Pdf<R>,
         options: &WriterOptions,
     ) -> crate::Result<Self> {
-        let source_root = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
+        let source_root_ref = pdf.root_ref();
+        let source_root_handle = if source_root_ref.is_none() {
+            let root_candidate = pdf.trailer_key_handle(b"Root");
+            if root_candidate.is_null() {
+                return Err(crate::Error::Missing("/Root"));
+            }
+            Some(pdf.root_handle()?)
+        } else {
+            None
+        };
         let source_had_compressed_objects = source_has_compressed_entries(pdf);
         let explicitly_removed: BTreeSet<ObjectRef> =
             pdf.deleted_object_refs().into_iter().collect();
@@ -255,15 +267,13 @@ impl PlainWritePlan {
             }
         };
 
-        let root = placement
-            .old_to_new
-            .get(&source_root)
-            .copied()
-            .ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "plain writer plan: /Root absent from renumber map".to_string(),
-                )
-            })?;
+        let root = source_root_ref.and_then(|source| placement.old_to_new.get(&source).copied());
+        if source_root_ref.is_some() && root.is_none() {
+            return Err(crate::Error::Unsupported(
+                "plain writer plan: /Root absent from renumber map".to_string(),
+            ));
+        }
+        let direct_root = source_root_handle;
         let has_object_stream = placement
             .objects
             .iter()
@@ -325,6 +335,7 @@ impl PlainWritePlan {
             pdf,
             trailer_size,
             root,
+            direct_root.as_ref(),
             options,
             None,
             options.deterministic_id,
@@ -341,6 +352,34 @@ impl PlainWritePlan {
             }
         };
         let encrypt = trailer_handle.try_get_key(b"/Encrypt")?.object_ref();
+        let direct_root_bytes = if root.is_none() {
+            let root_handle = trailer_handle.try_get_key(b"/Root")?;
+            let map = |object_ref| {
+                placement
+                    .old_to_new
+                    .get(&object_ref)
+                    .copied()
+                    .ok_or_else(|| {
+                        // cov:ignore-start: the direct Catalog is collected
+                        // by the same traversal that builds this map, so a
+                        // live reference cannot be absent at emission.
+                        crate::Error::Unsupported(format!(
+                            "plain writer: direct /Root reference {} {} R absent from renumber map",
+                            object_ref.number, object_ref.generation
+                        ))
+                        // cov:ignore-end
+                    }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
+            };
+            let mut bytes = Vec::new();
+            root_handle.write_object_with_ref_map_and_removed(
+                &mut bytes,
+                &map,
+                &placement.removed_refs,
+            )?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+            Some(bytes)
+        } else {
+            None
+        };
         let structural_filtered = matches!(
             crate::writer::effective_stream_policy(options),
             Some(CompressStreams::Yes)
@@ -353,6 +392,7 @@ impl PlainWritePlan {
                 &placement.removed_refs,
             )?, // cov:ignore: malformed live trailer graphs are rejected at the helper boundary
             root,
+            direct_root: direct_root_bytes,
             id,
             encrypt,
             structural_filtered,
@@ -363,6 +403,7 @@ impl PlainWritePlan {
             version,
             objects: placement.objects,
             root,
+            direct_root,
             old_to_new: placement.old_to_new,
             removed_refs: placement.removed_refs,
             cached_stream_outputs: cached_stream_outputs.into_inner(),
@@ -443,21 +484,32 @@ impl PlainWritePlan {
             )));
         }
 
-        if !self.old_to_new.values().any(|&output| output == self.root) {
-            return Err(crate::Error::Unsupported(format!(
-                "plain writer plan: root {} {} R is absent from old-to-new map",
-                self.root.number, self.root.generation
-            )));
-        }
-
-        if self.trailer.root != self.root {
-            return Err(crate::Error::Unsupported(format!(
-                "plain writer plan: trailer root {} {} R differs from plan root {} {} R",
-                self.trailer.root.number,
-                self.trailer.root.generation,
-                self.root.number,
-                self.root.generation
-            )));
+        match (
+            self.root,
+            self.direct_root.as_ref(),
+            self.trailer.root,
+            self.trailer.direct_root.as_ref(),
+        ) {
+            (Some(root), None, Some(trailer_root), None) => {
+                if !self.old_to_new.values().any(|&output| output == root) {
+                    return Err(crate::Error::Unsupported(format!(
+                        "plain writer plan: root {} {} R is absent from old-to-new map",
+                        root.number, root.generation
+                    )));
+                }
+                if trailer_root != root {
+                    return Err(crate::Error::Unsupported(format!(
+                        "plain writer plan: trailer root {} {} R differs from plan root {} {} R",
+                        trailer_root.number, trailer_root.generation, root.number, root.generation
+                    )));
+                }
+            }
+            (None, Some(_), None, Some(_)) => {}
+            _ => {
+                return Err(crate::Error::Unsupported(
+                    "plain writer plan: Catalog root form is inconsistent".to_string(),
+                ));
+            }
         }
 
         if let Some(&max_output) = outputs.last() {
@@ -932,7 +984,7 @@ mod tests {
 
             let plan =
                 PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
-            assert_eq!(plan.root, ObjectRef::new(1, 0));
+            assert_eq!(plan.root, Some(ObjectRef::new(1, 0)));
         }
     }
 
@@ -959,14 +1011,16 @@ mod tests {
         PlainWritePlan {
             version: "1.5".to_string(),
             objects,
-            root: root_output,
+            root: Some(root_output),
+            direct_root: None,
             old_to_new: HashMap::from([(root_source, root_output)]),
             removed_refs: BTreeSet::new(),
             cached_stream_outputs: HashMap::new(),
             trailer: TrailerPlan {
                 form: XrefForm::Table,
                 canonical_entries: Vec::new(),
-                root: root_output,
+                root: Some(root_output),
+                direct_root: None,
                 id: IdPlan::Materialized { value: None },
                 encrypt: None,
                 structural_filtered: false,
@@ -978,7 +1032,7 @@ mod tests {
     #[test]
     fn validation_rejects_duplicate_output_numbers() {
         let mut plan = plan_for_test(vec![source(1, 1), source(2, 1)]);
-        plan.root = ObjectRef::new(1, 0);
+        plan.root = Some(ObjectRef::new(1, 0));
         let err = plan.validate().unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(ref message)
             if message.contains("output object 1")));
@@ -1297,9 +1351,17 @@ mod tests {
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();
-        layout
-            .uncompressed
-            .insert(plan.root.number, (plan.root.generation, 0));
+        layout.uncompressed.insert(
+            plan.root
+                .expect("test plan must have an indirect root")
+                .number,
+            (
+                plan.root
+                    .expect("test plan must have an indirect root")
+                    .generation,
+                0,
+            ),
+        );
         append_xref_and_trailer(&mut bytes, &layout, &plan.trailer).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         let escaped_space = text.find("/#20A").expect("escaped space-name key");
@@ -1511,7 +1573,7 @@ mod tests {
     #[test]
     fn validation_rejects_root_absent_from_old_to_new_values() {
         let mut plan = plan_for_test(vec![source(1, 1)]);
-        plan.root = ObjectRef::new(2, 0);
+        plan.root = Some(ObjectRef::new(2, 0));
         plan.trailer.root = plan.root;
 
         let err = plan.validate().unwrap_err();
@@ -1573,10 +1635,19 @@ mod tests {
     #[test]
     fn validation_rejects_trailer_root_that_differs_from_plan_root() {
         let mut plan = plan_for_test(vec![source(1, 1)]);
-        plan.trailer.root = ObjectRef::new(2, 0);
+        plan.trailer.root = Some(ObjectRef::new(2, 0));
         let err = plan.validate().unwrap_err();
         assert!(matches!(err, crate::Error::Unsupported(ref message)
             if message.contains("trailer root 2 0 R differs from plan root 1 0 R")));
+    }
+
+    #[test]
+    fn validation_rejects_inconsistent_catalog_root_forms() {
+        let mut plan = plan_for_test(vec![source(1, 1)]);
+        plan.root = None;
+        let err = plan.validate().unwrap_err();
+        assert!(matches!(err, crate::Error::Unsupported(ref message)
+            if message == "plain writer plan: Catalog root form is inconsistent"));
     }
 
     #[test]

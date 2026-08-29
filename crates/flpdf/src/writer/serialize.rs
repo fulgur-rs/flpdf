@@ -343,6 +343,9 @@ pub(crate) mod xref_stream {
         /// `/Root` reference, when present (omitted on the main xref stream, which
         /// is reached only via the first-page stream's `/Prev` chain).
         pub root: Option<ObjectRef>,
+        /// Serialized direct `/Root` value, when the source trailer carries an
+        /// inline Catalog rather than an indirect object.
+        pub root_value: Option<&'a [u8]>,
         /// `/Size` — the highest object number plus one.
         pub size: u32,
         /// `/Prev` byte offset of the previous xref stream (left-justified in a
@@ -431,6 +434,8 @@ pub(crate) mod xref_stream {
                     b"/Root".to_vec(),
                     format!("{} {} R", root.number, root.generation).into_bytes(),
                 ));
+            } else if let Some(root) = dict.root_value {
+                entries.push((b"/Root".to_vec(), root.to_vec()));
             }
             entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
             entries.sort_by(|left, right| left.0.cmp(&right.0));
@@ -904,6 +909,7 @@ pub(crate) mod xref_stream {
                 index: Some((6, 11)),
                 info: Some(ObjectRef::new(15, 0)),
                 root: Some(ObjectRef::new(8, 0)),
+                root_value: None,
                 size: 17,
                 // `/Prev` and `/ID` are space-/fixed-width fields, so only their
                 // widths (not values) affect the region size.
@@ -1009,6 +1015,7 @@ pub(crate) mod xref_stream {
                 index: None,
                 info: None,
                 root: None,
+                root_value: None,
                 size: 6,
                 prev: None,
                 trailer: None,
@@ -1047,6 +1054,7 @@ pub(crate) mod xref_stream {
                 index: None,
                 info: None,
                 root: None,
+                root_value: None,
                 size: 6,
                 prev: None,
                 trailer: None,
@@ -1202,6 +1210,7 @@ pub(crate) mod xref_stream {
                     index: Some((6, 11)),
                     info: Some(ObjectRef::new(15, 0)),
                     root: Some(ObjectRef::new(8, 0)),
+                    root_value: None,
                     size: 17,
                     prev: Some(2226),
                     trailer: None,
@@ -1241,6 +1250,7 @@ pub(crate) mod xref_stream {
                     index: None,
                     info: None,
                     root: Some(ObjectRef::new(1, 0)),
+                    root_value: None,
                     size: 8,
                     prev: None,
                     trailer: Some(&trailer),
@@ -1270,6 +1280,7 @@ pub(crate) mod xref_stream {
                     index: None,
                     info: Some(ObjectRef::new(2, 0)),
                     root: Some(ObjectRef::new(1, 0)),
+                    root_value: None,
                     size: 8,
                     prev: Some(123),
                     trailer: None,
@@ -1297,6 +1308,7 @@ pub(crate) mod xref_stream {
                     index: None,
                     info: None,
                     root: None,
+                    root_value: None,
                     size: 6,
                     prev: None,
                     trailer: None,
@@ -1344,6 +1356,7 @@ pub(crate) mod xref_stream {
                     index: Some((6, 11)),
                     info: Some(ObjectRef::new(15, 0)),
                     root: Some(ObjectRef::new(8, 0)),
+                    root_value: None,
                     size: 17,
                     prev: Some(2226),
                     trailer: None,
@@ -1370,6 +1383,7 @@ pub(crate) mod xref_stream {
                     index: None,
                     info: None,
                     root: None,
+                    root_value: None,
                     size: 6,
                     prev: None,
                     trailer: None,
@@ -1476,6 +1490,7 @@ mod tests {
             index: None,
             info: None,
             root: Some(ObjectRef::new(1, 0)),
+            root_value: None,
             size: 2,
             prev: None,
             trailer: None,
