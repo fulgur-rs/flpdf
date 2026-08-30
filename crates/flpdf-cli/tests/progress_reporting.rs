@@ -9,17 +9,11 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn progress_lines(output_name: &str) -> String {
-    format!(
-        "flpdf: {output_name}: write progress: 0%\n\
-         flpdf: {output_name}: write progress: 29%\n\
-         flpdf: {output_name}: write progress: 43%\n\
-         flpdf: {output_name}: write progress: 58%\n\
-         flpdf: {output_name}: write progress: 72%\n\
-         flpdf: {output_name}: write progress: 86%\n\
-         flpdf: {output_name}: write progress: 99%\n\
-         flpdf: {output_name}: write progress: 100%\n"
-    )
+fn progress_lines(output_name: &str, percentages: &[u8]) -> String {
+    percentages
+        .iter()
+        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%\n"))
+        .collect()
 }
 
 #[test]
@@ -44,7 +38,10 @@ fn progress_reports_file_output_on_info_stream() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).expect("progress output is UTF-8"),
-        progress_lines(&output_path.display().to_string())
+        progress_lines(
+            &output_path.display().to_string(),
+            &[0, 29, 43, 58, 72, 86, 99, 100]
+        )
     );
     assert!(output.stderr.is_empty());
     assert!(output_path.exists(), "progress write must create the PDF");
@@ -71,7 +68,7 @@ fn progress_keeps_pdf_on_stdout_and_reports_on_stderr() {
     assert!(output.stdout.starts_with(b"%PDF-1.3\n"));
     assert_eq!(
         String::from_utf8(output.stderr).expect("progress output is UTF-8"),
-        progress_lines("standard output")
+        progress_lines("standard output", &[0, 29, 43, 58, 72, 86, 99, 100])
     );
 }
 
@@ -97,8 +94,69 @@ fn native_rewrite_progress_uses_the_same_reporter_route() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).expect("progress output is UTF-8"),
-        progress_lines(&output_path.display().to_string())
+        progress_lines(
+            &output_path.display().to_string(),
+            &[0, 29, 43, 58, 72, 86, 99, 100]
+        )
     );
     assert!(output.stderr.is_empty());
     assert!(output_path.exists(), "progress rewrite must create the PDF");
+}
+
+#[test]
+fn progress_warning_keeps_exit_three_and_completed_output() {
+    let input = fixture_from_path("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let output_path = tempdir.path().join("warning-out.pdf");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id"])
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("progress output is UTF-8"),
+        progress_lines(&output_path.display().to_string(), &[0, 99, 100])
+    );
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
+    assert!(stderr.contains("file is damaged"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("operation succeeded with warnings"),
+        "stderr: {stderr}"
+    );
+    assert!(output_path.exists(), "warning exit must retain the output");
+}
+
+#[test]
+fn progress_error_keeps_exit_two_without_progress_or_output() {
+    let input = fixture_from_path("../../tests/fixtures/test_driver/open_repair_failure.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let output_path = tempdir.path().join("error-out.pdf");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id"])
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
+    assert!(
+        stderr.contains("unable to find trailer dictionary"),
+        "stderr: {stderr}"
+    );
+    assert!(!output_path.exists(), "fatal input must not create output");
+}
+
+fn fixture_from_path(path: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
