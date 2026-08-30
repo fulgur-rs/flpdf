@@ -1014,7 +1014,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }))
     }
 
-    fn document_resolver_weak(&self) -> Result<Weak<dyn DocumentResolver>> {
+    pub(crate) fn document_resolver_weak(&self) -> Result<Weak<dyn DocumentResolver>> {
         let strong = self
             .self_weak
             .upgrade()
