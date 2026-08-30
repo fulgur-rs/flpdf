@@ -22,6 +22,21 @@ STALE_MARKERS = (
 
 
 class DeadCodeAllowanceTests(unittest.TestCase):
+    def test_no_production_dead_code_allowances(self):
+        production_root = ROOT / "crates" / "flpdf" / "src"
+        offenders = []
+        for path in sorted(production_root.rglob("*.rs")):
+            for index, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if ALLOW_RE.search(line):
+                    offenders.append(f"{path.relative_to(ROOT)}:{index}")
+        self.assertEqual(
+            [],
+            offenders,
+            "production dead_code allowance(s):\n" + "\n".join(offenders),
+        )
+
     def test_no_dead_code_allowance_uses_completed_cutover_rationale(self):
         offenders = []
         for path in sorted((ROOT / "crates").rglob("*.rs")):
