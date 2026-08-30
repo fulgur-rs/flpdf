@@ -1292,6 +1292,16 @@ mod tests {
             None
         );
         assert_eq!(
+            r6_perms_warning_from_handle(
+                &ObjectHandle::integer(1),
+                &key,
+                Permissions::new(-4),
+                true,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
             perms_warning(Object::Integer(1), &key, -4, true).as_deref(),
             Some("R=6 /Perms entry is not a string")
         );

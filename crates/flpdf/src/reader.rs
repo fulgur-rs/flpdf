@@ -8445,10 +8445,11 @@ mod tests {
 
         pdf.set_object(stream_ref, Object::Null);
 
-        let Some(CacheEntry::Resolved(cached_member)) = pdf.cache.entry(member_ref) else {
-            panic!("resolved ObjStm member must remain handle-backed in the cache");
-        };
-        assert!(cached_member.is_same_object_as(&member));
+        assert!(matches!(
+            pdf.cache.entry(member_ref),
+            Some(CacheEntry::Resolved(cached_member))
+                if cached_member.is_same_object_as(&member)
+        ));
         assert!(member.as_dictionary().is_some());
     }
 
@@ -8938,7 +8939,17 @@ mod tests {
         assert_eq!(info.r, 4);
         assert_eq!(info.length_bits, 128);
 
-        for replacement in [ObjectHandle::integer(1), ObjectHandle::name(vec![0xff])] {
+        let snapshot = pdf
+            .encrypt_dictionary()
+            .expect("legacy writer snapshot")
+            .expect("encrypted writer snapshot");
+        assert_eq!(snapshot.get("V").and_then(Object::as_integer), Some(4));
+
+        for replacement in [
+            ObjectHandle::integer(1),
+            ObjectHandle::name(vec![0xff]),
+            ObjectHandle::null(),
+        ] {
             let mut malformed = Pdf::open_mem_owned_with_options(
                 fixture.clone(),
                 PdfOpenOptions {
