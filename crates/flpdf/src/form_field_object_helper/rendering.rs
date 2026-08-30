@@ -19,7 +19,9 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 use crate::annotation_object_helper::AnnotationObjectHelper;
-use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+use crate::content_stream::{
+    parse_content_stream_handles, ObjectHandleParserCallbacks, ParseControl,
+};
 use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object::write_literal_string;
@@ -28,7 +30,7 @@ use crate::page_object_helper::PageBox;
 use crate::pipeline::PipelineResult;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
-use crate::{Error, Object, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectRef, Pdf, Result};
 
 /// Resolve one canonical handle hop without materializing a legacy `Object`.
 fn resolve_canonical<R: Read + Seek>(
@@ -635,35 +637,31 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
 /// byte-identical reproduction of qpdf's own token-level bookkeeping.
 fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) -> Vec<u8> {
     struct TfOperandFinder {
-        operands: Vec<(Object, usize, usize)>,
+        operands: Vec<(ObjectHandle, usize, usize)>,
         tf_size_span: Option<(usize, usize, f64)>,
     }
 
-    impl ParserCallbacks for TfOperandFinder {
+    impl ObjectHandleParserCallbacks for TfOperandFinder {
         fn handle_object(
             &mut self,
-            object: Object,
+            object: ObjectHandle,
             offset: usize,
             length: usize,
         ) -> Result<ParseControl> {
-            match object {
-                Object::Operator(operator) => {
-                    if operator == b"Tf" {
-                        if let [.., name, size] = self.operands.as_slice() {
-                            if let (Some(_), Some(value)) = (
-                                name.0.as_name(),
-                                size.0
-                                    .as_real()
-                                    .or_else(|| size.0.as_integer().map(|n| n as f64)),
-                            ) {
-                                self.tf_size_span = Some((size.1, size.2, value));
-                            }
-                        }
+            if object.as_operator().as_deref() == Some(b"Tf") {
+                if let [.., name, size] = self.operands.as_slice() {
+                    if let (Some(_), Some(value)) = (
+                        name.0.as_name(),
+                        size.0
+                            .as_real()
+                            .or_else(|| size.0.as_integer().map(|n| n as f64)),
+                    ) {
+                        self.tf_size_span = Some((size.1, size.2, value));
                     }
-                    self.operands.clear();
                 }
-                Object::InlineImage(_) => {}
-                operand => self.operands.push((operand, offset, length)),
+                self.operands.clear();
+            } else if object.as_inline_image().is_none() {
+                self.operands.push((object, offset, length));
             }
             Ok(ParseControl::Continue)
         }
@@ -680,7 +678,7 @@ fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) 
     // Best-effort, matching parse_default_appearance's own "skip malformed,
     // last wins" recovery: a parse error partway through still leaves
     // whatever valid Tf occurrence was already found in place.
-    let _ = parse_content_stream_data(default_appearance, &mut finder);
+    let _ = parse_content_stream_handles(default_appearance, None, &mut finder);
 
     let Some((offset, length, raw_value)) = finder.tf_size_span else {
         return default_appearance.to_vec();

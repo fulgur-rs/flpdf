@@ -7572,12 +7572,13 @@ mod tests {
         assert_eq!(result, object(vec![]));
     }
 
-    // ── attachments Test 1c: non-ref/non-dict leaf value is skipped ──────────
+    // ── attachments Test 1c: every name-tree value reaches FileSpec ─────────
 
     #[test]
-    fn attachments_non_ref_non_dict_value_skipped() {
-        // A name-tree leaf value that is neither a reference nor a dict is
-        // skipped (covers the `_ => None` arm of the attachments decode hook).
+    fn attachments_non_ref_non_dict_value_uses_qpdf_helper_projection() {
+        // qpdf wraps every name-tree value in QPDFFileSpecObjectHelper,
+        // including a malformed scalar. The helper emits warnings but still
+        // projects the scalar's unparse form and empty optional values.
         let mut pdf = load_one_page_pdf();
         let ef_root_ref = crate::ObjectRef::new(901, 0);
         let mut ef_root = Dictionary::new();
@@ -7598,8 +7599,27 @@ mod tests {
         let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
         assert_eq!(
             result,
-            object(vec![]),
-            "non-ref/non-dict leaf value must be skipped"
+            object(vec![(
+                "weird".to_string(),
+                object(vec![
+                    ("description".to_string(), serde_json::Value::Null),
+                    (
+                        "filespec".to_string(),
+                        serde_json::Value::String("7".to_string()),
+                    ),
+                    ("names".to_string(), object(vec![])),
+                    (
+                        "preferredcontents".to_string(),
+                        serde_json::Value::String("null".to_string()),
+                    ),
+                    (
+                        "preferredname".to_string(),
+                        serde_json::Value::String(String::new()),
+                    ),
+                    ("streams".to_string(), object(vec![])),
+                ]),
+            )]),
+            "malformed scalar leaves follow qpdf's helper projection"
         );
     }
 
@@ -7712,8 +7732,8 @@ mod tests {
         assert_eq!(entry[0].1, serde_json::Value::Null);
         assert_eq!(entry[1].1, serde_json::Value::String("912 0 R".to_string()));
         assert_eq!(entry[2].1, object(vec![]));
-        assert_eq!(entry[3].1, serde_json::Value::Null);
-        assert_eq!(entry[4].1, serde_json::Value::Null);
+        assert_eq!(entry[3].1, serde_json::Value::String("null".to_string()));
+        assert_eq!(entry[4].1, serde_json::Value::String(String::new()));
         assert_eq!(entry[5].1, object(vec![]));
     }
 
@@ -8076,7 +8096,7 @@ mod tests {
     }
 
     #[test]
-    fn attachments_preferredcontents_skips_a_non_reference_ef_entry() {
+    fn attachments_non_stream_ef_entry_reports_qpdf_stream_error() {
         let mut pdf = load_one_page_pdf();
 
         let stream_f_ref = crate::ObjectRef::new(930, 0);
@@ -8091,10 +8111,10 @@ mod tests {
             Object::Stream(crate::object::Stream::new(stream_f_dict, vec![])),
         );
 
-        // /EF/UF is a direct (non-reference) value. qpdf's
-        // getEmbeddedFileStream() requires an indirect stream (isStream()),
-        // so a direct entry must be skipped in favor of the next-priority
-        // key rather than accepted as the preferred contents.
+        // /EF/UF is a direct non-stream value. qpdf's preferred lookup skips
+        // it, but doJSONAttachments still projects every raw /EF ditems entry
+        // through QPDFEFStreamObjectHelper, whose getDict() reports the
+        // stream-type error.
         let mut ef_dict = Dictionary::new();
         ef_dict.insert("UF", Object::Boolean(true));
         ef_dict.insert("F", Object::Reference(stream_f_ref));
@@ -8113,22 +8133,13 @@ mod tests {
             b"attachment.txt",
         );
 
-        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        let pairs = object_pairs(&result);
-        let entry = object_pairs(&pairs[0].1);
-        let preferredcontents = entry
-            .iter()
-            .find(|(k, _)| k == "preferredcontents")
-            .unwrap()
-            .1
-            .clone();
-        assert_eq!(
-            preferredcontents,
-            serde_json::Value::String(format!(
-                "{} {} R",
-                stream_f_ref.number, stream_f_ref.generation
-            )),
-            "a non-reference /EF/UF entry must be skipped in favor of /EF/F"
+        let error = build_attachments_section(&mut pdf)
+            .expect_err("qpdf reports a direct non-stream /EF entry");
+        assert!(
+            error
+                .to_string()
+                .contains("operation for stream attempted on object of type boolean"),
+            "unexpected error: {error}"
         );
     }
 
@@ -8231,7 +8242,7 @@ mod tests {
     }
 
     #[test]
-    fn attachments_ef_entry_resolving_to_non_stream_is_skipped() {
+    fn attachments_ef_entry_resolving_to_non_stream_reports_qpdf_stream_error() {
         let mut pdf = load_one_page_pdf();
         let non_stream_ref = crate::ObjectRef::new(920, 0);
         let filespec_ref = crate::ObjectRef::new(922, 0);
@@ -8253,17 +8264,14 @@ mod tests {
             b"nonstream",
         );
 
-        let result = build_attachments_section(&mut pdf).expect("build_attachments_section failed");
-        let entry = object_pairs(&object_pairs(&result)[0].1);
-        let streams = object_pairs(
-            entry
-                .iter()
-                .find(|(key, _)| key == "streams")
-                .expect("streams")
-                .1
-                .clone(),
+        let error =
+            build_attachments_section(&mut pdf).expect_err("qpdf reports a non-stream /EF entry");
+        assert!(
+            error
+                .to_string()
+                .contains("operation for stream attempted on object of type integer"),
+            "unexpected error: {error}"
         );
-        assert!(streams.is_empty(), "non-stream /EF entry must be skipped");
     }
 
     // ── attachments: direct (non-Reference) filespec value in the name tree ──
@@ -8271,8 +8279,7 @@ mod tests {
     // Regression for CodeRabbit's flpdf-9hc.11.8 review: previously the name
     // tree walker only accepted Object::Reference as the leaf value, silently
     // dropping inline (direct) filespec dictionaries. They must produce an
-    // entry too — the only difference is `filespec` becomes null because
-    // there is no object reference to point at.
+    // entry too, and qpdf serializes the direct helper handle with unparse().
 
     #[test]
     fn attachments_direct_inline_filespec_dictionary_is_serialized() {
@@ -8324,11 +8331,12 @@ mod tests {
                 .map(|(_, v)| v)
                 .unwrap_or_else(|| panic!("key '{k}' missing"))
         };
-        // No indirect reference → filespec must be null.
+        // A direct helper handle is serialized through qpdf's unparse()
+        // boundary, rather than being replaced with JSON null.
         assert_eq!(
             *get("filespec"),
-            serde_json::Value::Null,
-            "filespec must be null when the leaf value was a direct dictionary"
+            serde_json::Value::String("<< /F (inline.txt) /UF (inline.txt) >>".to_string()),
+            "direct filespec must retain qpdf's unparse form"
         );
         // The names sub-object still surfaces the inlined /F and /UF.
         let names = object_pairs(get("names"));

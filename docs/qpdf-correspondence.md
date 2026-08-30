@@ -968,6 +968,26 @@ flpdf は `PageObjectHelper::coalesce_content_streams` /
 `ObjectHandle::coalesce_content_streams` を唯一の production route とする。手動 `Vec` 結合、
 入力 metadata のコピー、legacy stream write-back は削除済みである。
 
+### ObjectHandle consumer slice `flpdf-25kg.3.48.5` (2026-08-30)
+
+The remaining reachable consumer routes audited against qpdf 11.9.0 are now
+handle-native. `form_field_object_helper/rendering.rs` uses the
+`ObjectHandleParserCallbacks` content boundary for `/DA` `Tf` replacement;
+`job/overlay.rs` uses `QPDF::newStream` semantics through
+`Pdf::new_stream_with_data`; and `job/json_sections.rs` projects every
+`QPDFJob::doJSONAttachments` Filespec and `/EF` ditems entry through
+`FileSpec`/`EmbeddedFileStream`. The JSON route preserves qpdf's direct-handle
+`unparse()` fields, name precedence, empty preferred-name string, all `/EF`
+keys, warning/exit behavior, and the 11.9.0 CreationDate-backed
+`modificationdate` quirk (`QPDFJob.cc:1281-1330`).
+
+The earlier D2 notes on the `QPDFEmbeddedFileDocumentHelper` and
+`QPDFFileSpecObjectHelper` rows are superseded by this slice. Live probes for
+normal, all-key, direct-Filespec, malformed-scalar, and non-stream-EF inputs
+match `/usr/bin/qpdf` 11.9.0 in JSON stdout and exit status. Existing raw xref
+bootstrap and documented synthetic `Pdf::set_object` bare-reference bridges
+remain outside this consumer slice.
+
 ## 集計
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
