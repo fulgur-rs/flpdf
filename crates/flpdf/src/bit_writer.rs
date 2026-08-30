@@ -4,14 +4,12 @@ use std::cmp::min;
 
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
-#[allow(dead_code)]
 pub(crate) struct BitWriter<'a> {
     pipeline: &'a mut dyn Pipeline,
     byte: u8,
     bit_offset: usize,
 }
 
-#[allow(dead_code)]
 impl<'a> BitWriter<'a> {
     pub(crate) fn new(pipeline: &'a mut dyn Pipeline) -> Self {
         Self {
@@ -55,10 +53,6 @@ impl<'a> BitWriter<'a> {
             value as u64
         };
         self.write_bits(value, bits)
-    }
-
-    pub(crate) fn write_bits_i32(&mut self, value: i32, bits: usize) -> PipelineResult<()> {
-        self.write_bits(value as u64, bits)
     }
 
     pub(crate) fn flush(&mut self) -> PipelineResult<()> {
@@ -148,7 +142,6 @@ mod tests {
             let mut writer = BitWriter::new(&mut sink);
             writer.write_bits(0xffff_ffff, 0).unwrap();
             writer.write_bits_signed(-1, 0).unwrap();
-            writer.write_bits_i32(-1, 0).unwrap();
             writer.flush().unwrap();
         }
         assert!(sink.bytes.is_empty());
@@ -160,11 +153,7 @@ mod tests {
         let mut sink = TestSink::default();
         {
             let mut writer = BitWriter::new(&mut sink);
-            for result in [
-                writer.write_bits(0, 33),
-                writer.write_bits_signed(-1, 33),
-                writer.write_bits_i32(-1, 33),
-            ] {
+            for result in [writer.write_bits(0, 33), writer.write_bits_signed(-1, 33)] {
                 assert!(matches!(result.unwrap_err(), PipelineError::Logic(_)));
             }
             writer.flush().unwrap();
@@ -195,11 +184,11 @@ mod tests {
     }
 
     #[test]
-    fn i32_writes_use_the_low_requested_bits() {
+    fn writes_use_the_low_requested_bits() {
         let mut sink = TestSink::default();
         {
             let mut writer = BitWriter::new(&mut sink);
-            writer.write_bits_i32(-1, 4).unwrap();
+            writer.write_bits(u64::MAX, 4).unwrap();
             writer.flush().unwrap();
         }
         assert_eq!(sink.bytes, [0xf0]);

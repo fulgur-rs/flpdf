@@ -13,7 +13,6 @@ use crate::stream_filter::DECODE_OUTPUT_LIMIT_PREFIX;
 #[cfg(feature = "qpdf-libjpeg-compat")]
 use flpdf_libjpeg_compat::DecodeError;
 
-#[allow(dead_code)]
 pub(crate) struct PlDct<'a> {
     identifier: String,
     next: PipelineRef<'a>,
@@ -21,7 +20,6 @@ pub(crate) struct PlDct<'a> {
     max_output: Option<usize>,
 }
 
-#[allow(dead_code)]
 impl<'a> PlDct<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {

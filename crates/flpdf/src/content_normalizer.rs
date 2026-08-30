@@ -64,7 +64,6 @@ struct ContentNormalizer {
 /// state and downstream ownership live in one value. This is the output-side
 /// stage used by `ObjectHandle::pipe_stream_data`; the public helper below
 /// remains the small whole-buffer convenience API.
-#[allow(dead_code)]
 pub(crate) struct ContentNormalizerPipeline<'a> {
     identifier: String,
     next: PipelineRef<'a>,
@@ -76,7 +75,7 @@ pub(crate) struct ContentNormalizerPipeline<'a> {
 
 type NormalizerWarningCallback = Box<dyn FnMut(&str) -> PipelineResult<()> + 'static>;
 
-#[allow(dead_code, clippy::type_complexity)]
+#[allow(clippy::type_complexity)]
 impl<'a> ContentNormalizerPipeline<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {

@@ -115,22 +115,6 @@ impl CanonicalCatalogFirstRenumber {
             .map(|(index, &source)| (ObjectRef::new(index as u32 + 1, 0), source))
     }
 
-    #[allow(dead_code)] // compatibility wrapper retained for non-policy callers and tests
-    pub(crate) fn build_qpdf<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        skip_length: bool,
-        preserve_unreferenced_objects: bool,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> crate::Result<Self> {
-        Self::build_qpdf_with_stream_policy(
-            pdf,
-            skip_length,
-            preserve_unreferenced_objects,
-            removed_refs,
-            None,
-        )
-    }
-
     pub(crate) fn build_qpdf_with_stream_policy<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
@@ -244,7 +228,6 @@ impl CanonicalCatalogFirstRenumber {
     }
 }
 
-#[allow(dead_code)] // used by the canonical-walk unit tests and the PCLm planner
 pub(crate) fn collect_canonical_enqueue_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
@@ -282,7 +265,6 @@ fn collect_canonical_enqueue_refs_with_stream_policy<R: Read + Seek>(
     )
 }
 
-#[allow(dead_code)] // used by the canonical-walk unit tests and the PCLm planner
 pub(crate) fn collect_canonical_children<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &crate::ObjectHandle,
@@ -404,14 +386,6 @@ fn ensure_canonical_owner<R: Read + Seek>(
 /// nesting exceeds [`MAX_INLINE_DEPTH`] (via the canonical enqueue collector), and propagates
 /// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
 /// objects during the walk.
-#[allow(dead_code)] // compatibility wrapper retained for existing reachability tests
-pub(crate) fn reachable_object_set<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    skip_length: bool,
-) -> crate::Result<BTreeSet<ObjectRef>> {
-    reachable_object_set_with_stream_parameters(pdf, skip_length, &BTreeSet::new())
-}
-
 pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     skip_length: bool,
@@ -647,9 +621,7 @@ fn walk_resurrectable_handle(
 /// traversal split into even groups); this type only assigns the numbers in
 /// qpdf's order.
 //
-// Shared by Preserve and Generate plain-writer planning. Some accessors remain
-// test-only until later body/xref consumers use the complete plan.
-#[allow(dead_code)]
+// Shared by Preserve and Generate plain-writer planning.
 pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     /// New object number assigned to each input group's container, in group
@@ -657,24 +629,11 @@ pub(crate) struct ObjectStreamRenumber {
     container_new: Vec<Option<u32>>,
 }
 
-#[allow(dead_code)]
 impl ObjectStreamRenumber {
-    /// Return the new reference assigned to `original`, if it was reachable.
-    pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
-        self.old_to_new.get(&original).copied()
-    }
-
-    /// The assigned container object numbers, in input-group order. Panics-free
-    /// accessor used by tests and the emitter; a never-reached group yields no
-    /// entry.
-    pub(crate) fn container_numbers(&self) -> Vec<u32> {
-        self.container_new.iter().flatten().copied().collect()
-    }
-
     /// The container object number assigned to input group `group_index`, or
     /// `None` if the index is out of range or that group was never reached.
-    /// Unlike [`Self::container_numbers`], this preserves the group→number
-    /// correspondence even when some group went unreached.
+    /// This preserves the group-to-number correspondence even when some group
+    /// went unreached.
     pub(crate) fn container_number(&self, group_index: usize) -> Option<u32> {
         self.container_new.get(group_index).copied().flatten()
     }
@@ -687,43 +646,6 @@ impl ObjectStreamRenumber {
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
         self.old_to_new.iter().map(|(&old, &new)| (new, old))
     }
-
-    /// Compute the renumbering for `pdf` given source-backed or synthetic
-    /// object-stream groups. Members are numbered ascending-source within each
-    /// container regardless of their supplied order.
-    ///
-    /// `skip_length` is always `true` here: generate mode emits a direct
-    /// `/Length` (QDF object-stream mode is selected independently), so a stream's indirect
-    /// `/Length` edge is dead and a holder reachable only through it is dropped,
-    /// matching qpdf's reachability GC. An orphan holder is never an object-stream
-    /// member (members are reached via non-`/Length` edges only), so no group is
-    /// affected.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Unsupported`] when the trailer has no `/Root`, and
-    /// propagates load errors from the object walk.
-    pub(crate) fn build<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        groups: &[ObjectStreamGroup],
-        skip_length: bool,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> crate::Result<Self> {
-        Self::build_with_seed_policy(pdf, groups, skip_length, removed_refs, false, None)
-    }
-
-    /// Compute object-stream numbering after qpdf has seeded the queue with
-    /// every source object for `preserveUnreferencedObjects`.
-    pub(crate) fn build_preserving_unreferenced<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        groups: &[ObjectStreamGroup],
-        skip_length: bool,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> crate::Result<Self> {
-        // cov:ignore-start: compatibility wrapper is retained for callers outside the stream-policy route
-        Self::build_with_seed_policy(pdf, groups, skip_length, removed_refs, true, None)
-        // cov:ignore-end
-    } // cov:ignore: compatibility wrapper has no stream-policy production caller
 
     pub(crate) fn build_with_stream_policy<R: Read + Seek>(
         pdf: &mut Pdf<R>,
@@ -958,7 +880,7 @@ enum RenumberWork {
 
 /// Number a plain object directly, or activate its source-backed/synthetic
 /// object-stream group from either the source container or any member.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn enqueue_object_stream(
     r: ObjectRef,
     groups: &[ObjectStreamGroup],

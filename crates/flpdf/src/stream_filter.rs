@@ -318,7 +318,6 @@ pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) 
 /// would reintroduce the shape wrapper this seam exists to avoid. Everything
 /// downstream of [`FilterSpec`] — the codec stack, predictor geometry, limits,
 /// and warning ordering — stays a single copy.
-#[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
 pub(crate) fn decode_filter_specs_from_handle(
     filter: &ObjectHandle,
     decode_params: &ObjectHandle,
@@ -703,14 +702,12 @@ fn param_value_from_handle(
 /// that some earlier read already resolved does not: `ObjectHandle::as_integer`
 /// reports an indirect handle's already-resolved value, so a
 /// `/DecodeParms` value sharing an object with an earlier-visited position
-/// would classify as `Int` here. That is a real difference once
-/// `flpdf-25kg.3.5` wires the live resolver, and it is deliberately not
-/// defended against, because it is unobservable: the only filters routed here
-/// are the ones whose `set_decode_params` reads nothing but `is_absent()`, and
-/// `is_absent()` distinguishes `Absent` from `Present` without looking at a
-/// single [`ParamValue`]. What must not vary is `Absent` vs `Present`, and
-/// that is decided upstream by the two unconditional calls on the parameter
-/// handle itself.
+/// would classify as `Int` here. That distinction is intentionally not exposed
+/// by the non-consuming filter path: the filters routed here read nothing but
+/// `is_absent()`, and `is_absent()` distinguishes `Absent` from `Present`
+/// without looking at a single [`ParamValue`]. What must not vary is `Absent`
+/// versus `Present`, and that is decided upstream by the two unconditional
+/// calls on the parameter handle itself.
 fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
     match value.as_integer() {
         Some(int) => ParamValue::Int(clamp_to_i32(int)),
@@ -801,16 +798,6 @@ pub(crate) enum FilterDecodePhase {
     Finish,
 }
 
-impl FilterDecodeOutcome {
-    #[cfg(test)]
-    fn into_strict_result(self) -> Result<Vec<u8>> {
-        match self.error {
-            Some(error) => Err(error.error),
-            None => Ok(self.data),
-        }
-    }
-}
-
 /// Pipe one complete encoded buffer through a stage with qpdf's error cleanup.
 ///
 /// `QPDF::pipeStreamData` calls `finish` after a failed `write`, ignores that
@@ -867,10 +854,9 @@ fn map_stage_error(error: StagePipelineError) -> FilterDecodeError {
 
 /// Rust equivalent of qpdf's `QPDFStreamFilter` extension boundary.
 ///
-/// `pipe_decode` owns construction and completion of the filter's decode
-/// pipeline. A whole-buffer result keeps flpdf's public API stable while the
-/// individual codecs are migrated to incremental `Pipeline` stages.
-#[allow(dead_code)]
+/// `pipe_decode_recovering` owns construction and completion of the filter's
+/// decode pipeline. A whole-buffer result keeps the legacy decode helpers
+/// stable while the individual codecs use incremental `Pipeline` stages.
 pub(crate) trait StreamFilter {
     /// Port of `QPDFStreamFilter::setDecodeParms`
     /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
@@ -908,44 +894,9 @@ pub(crate) trait StreamFilter {
         Ok(())
     }
 
-    /// Port of `QPDFStreamFilter::getDecodePipeline`
-    /// (`include/qpdf/QPDFStreamFilter.hh:46-49`): build this filter's decode
-    /// stage around `next` and return it without decoding anything. qpdf
-    /// declares it pure virtual, so there is no default here either.
-    ///
-    /// `Result` carries the construction failures qpdf raises from the stage
-    /// constructors themselves; `None` is qpdf's `nullptr`, which the caller
-    /// reads as "this filter contributes no stage" and leaves its own `next`
-    /// in place (`QPDF_Stream.cc:561-563`). In qpdf 11.9.0 the only filter
-    /// that returns it is `SF_Crypt` (`QPDF_Stream.cc:52-56`).
-    ///
-    /// qpdf keeps each constructed stage in the filter instance and hands the
-    /// caller a non-owning pointer. The stage is returned by value here
-    /// instead — see [`crate::pipeline::PipelineRef`] for why, and
-    /// `QPDF_Stream.cc:559-568` for the caller-side loop this feeds.
-    ///
-    /// The Flate warn callback is deliberately absent: qpdf installs it at the
-    /// `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), not here. That
-    /// installation sits *outside* the `if (decode_pipeline)` guard, so a
-    /// filter contributing no stage leaves the stage the preceding iteration
-    /// installed as the chain head and lets it take the callback again.
-    // The qpdf-shaped ObjectHandle consumer owns the production-style caller;
-    // the public legacy decode helpers still use pipe_decode_recovering.
-    fn decode_pipeline<'a>(
-        &mut self,
-        next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        match self.decode_pipeline_owned(PipelineRef::Borrowed(next))? {
-            OwnedDecodePipeline::Stage(stage) => Ok(Some(stage)),
-            OwnedDecodePipeline::NoStage(_) => Ok(None),
-        }
-    }
-
     /// Construct the same stage with a downstream pipeline that may already
-    /// own inner stages. The borrowed [`Self::decode_pipeline`] surface keeps
-    /// qpdf's `Pipeline*` shape for primitive callers; this companion is the
-    /// Rust ownership seam used by `QPDF_Stream::pipeStreamData`'s reverse
-    /// chain construction.
+    /// own inner stages. This is the Rust ownership seam used by
+    /// `QPDF_Stream::pipeStreamData`'s reverse chain construction.
     fn decode_pipeline_owned<'a>(
         &mut self,
         next: PipelineRef<'a>,
@@ -962,27 +913,14 @@ pub(crate) trait StreamFilter {
         warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome>;
 
-    #[cfg(test)]
-    fn pipe_decode(
-        &mut self,
-        data: &[u8],
-        max_output: Option<usize>,
-        warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
-    ) -> Result<Vec<u8>> {
-        self.pipe_decode_recovering(data, max_output, warn)?
-            .into_strict_result()
-    }
-
-    // flpdf's current public decode API always requests full decoding, so
-    // classification becomes a production decision only when decode levels
-    // are introduced. Keep the qpdf extension contract available to later
-    // registered filters.
-    #[allow(dead_code)]
+    /// Whether this filter is a specialized compression codec for qpdf's
+    /// stream capability classification.
     fn is_specialized_compression(&self) -> bool {
         false
     }
 
-    #[allow(dead_code)]
+    /// Whether this filter is a lossy compression codec for qpdf's stream
+    /// capability classification.
     fn is_lossy_compression(&self) -> bool {
         false
     }
@@ -991,7 +929,6 @@ pub(crate) trait StreamFilter {
 /// Result of constructing a stage around a downstream pipeline that may
 /// already own inner stages. `NoStage` returns the downstream slot so the
 /// caller can keep threading it through a filter such as qpdf's `Crypt`.
-#[allow(dead_code)]
 pub(crate) enum OwnedDecodePipeline<'a> {
     Stage(Box<dyn Pipeline + 'a>),
     NoStage(PipelineRef<'a>),
@@ -1442,7 +1379,7 @@ impl FlateLzwStreamFilter {
     /// What installing it here cannot reproduce is qpdf's other case: the cast
     /// runs once per filter rather than once per constructed stage, so an
     /// iteration whose filter builds nothing lands it on a stage constructed
-    /// elsewhere — see [`StreamFilter::decode_pipeline`]. Both that case and
+    /// elsewhere — see qpdf's `getDecodePipeline` boundary. Both that case and
     /// the placement belong with the port of `QPDF_Stream::pipeStreamData`.
     ///
     /// Nothing today can observe the difference: this route decodes each

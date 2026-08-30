@@ -4,13 +4,11 @@ use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-#[allow(dead_code)]
 pub(crate) const DEFAULT_OUT_BUFFER_SIZE: usize = 65_536;
 const Z_BUF_ERROR: i32 = -5;
 const BUF_ERROR_WARNING: &str = "input stream is complete but output may still be valid";
 static COMPRESSION_LEVEL: AtomicI32 = AtomicI32::new(-1);
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlateAction {
     Inflate,
@@ -82,7 +80,6 @@ pub(crate) struct Flate<'a> {
     warn_callback: Option<Box<WarnCallback<'a>>>,
 }
 
-#[allow(dead_code)]
 impl<'a> Flate<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
@@ -114,6 +111,7 @@ impl<'a> Flate<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn set_compression_level(level: i32) -> PipelineResult<()> {
         if level != -1 && !(1..=9).contains(&level) {
             return Err(PipelineError::runtime(

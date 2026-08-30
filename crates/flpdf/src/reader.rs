@@ -1252,7 +1252,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Whether cross-reference table reconstruction has occurred for this document.
     ///
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn reconstructed_xref(&self) -> bool {
         self.resolver.reconstructed_xref()
     }
@@ -1261,7 +1261,6 @@ impl<R: Read + Seek> Pdf<R> {
     /// number (`QPDF::getObjectCount`, `libqpdf/QPDF.cc:1271-1283`). This is
     /// intentionally separate from fresh-object allocation, which belongs to
     /// `flpdf-25kg.3.24`.
-    #[allow(dead_code)]
     pub(crate) fn get_object_count(&mut self) -> Result<u32> {
         // qpdf's getObjectCount observes the same prepared object cache that
         // getAllObjects later enumerates. The document facade also owns
@@ -1280,7 +1279,6 @@ impl<R: Read + Seek> Pdf<R> {
     /// prepared canonical cache. Allocation itself belongs to the document's
     /// resolver so legacy cache values cannot silently become object-number
     /// inputs (`libqpdf/QPDF.cc:1271-1283,1872-1880`).
-    #[allow(dead_code)]
     pub(crate) fn next_obj_gen(&self) -> Result<ObjectRef> {
         self.resolver.next_obj_gen()
     }
@@ -1459,13 +1457,13 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Remove a canonical object from the resolver's xref/cache view and
-    /// leave outstanding handles as floating null values. The legacy cache is
-    /// deliberately not rewritten here; its writer-facing cutover belongs to
-    /// `flpdf-25kg.3.6.3`. This is qpdf `removeObject`'s exact xref/cache
-    /// mutation (`QPDF.cc:1996-2005`), not the separate legacy
-    /// `qpdf_removed_refs` snapshot filter and not xref registration's
-    /// transient free-row state (`QPDF.cc:686-708`, `:1187-1210`).
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    /// leave outstanding handles as floating null values. The legacy snapshot
+    /// metadata is maintained separately by the `Pdf` facade. This is qpdf
+    /// `removeObject`'s exact xref/cache mutation (`QPDF.cc:1996-2005`), not
+    /// the separate `qpdf_removed_refs` snapshot filter and not xref
+    /// registration's transient free-row state (`QPDF.cc:686-708`,
+    /// `:1187-1210`).
+    #[cfg(test)]
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         // Refresh the legacy cache before removing the canonical value, or an
         // old object-stream entry can incorrectly retain provenance (mirrors
@@ -1589,19 +1587,6 @@ impl<R: Read + Seek> Pdf<R> {
         }
         let next_number = max_number + 1;
         Ok(ObjectRef::new(next_number, 0))
-    }
-
-    /// Whether no parsed or canonical object currently owns `number` at any
-    /// generation.
-    ///
-    /// Tree-local allocation caches use this to detect an intervening PDF
-    /// allocation before reusing their generation-zero candidate. qpdf's
-    /// `nextObjGen()` allocates above the maximum object number, so a
-    /// generation-one occupant reserves the number just as generation zero
-    /// does.
-    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
-    pub(crate) fn object_number_is_available(&self, number: u32) -> bool {
-        !self.cache.contains_object_number(number) && !self.resolver.holds_object_number(number)
     }
 
     pub(crate) fn unique_id(&self) -> u64 {

@@ -14,7 +14,6 @@
 
 mod document;
 mod handler;
-#[allow(dead_code)] // consumed by the JSONReactor slice in flpdf-3yn9.15.3
 pub(crate) mod input;
 #[cfg(test)]
 mod input_tests;

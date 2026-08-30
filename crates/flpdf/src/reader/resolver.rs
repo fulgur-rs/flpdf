@@ -116,8 +116,8 @@ use std::rc::{Rc, Weak};
 /// Resolve-time *string* decryption is unrelated and unchanged — qpdf
 /// decrypts strings during `readObjectAtOffset`'s parse
 /// (`StringDecrypter`, `libqpdf/QPDF.cc:1337-1339`) but streams only at pipe
-/// time (`decryptStream`, `QPDF.cc:2491`); wiring the string decrypter in is
-/// still flpdf-25kg.3.5 AC2. See [`ResolverCore::encryption_parameters`].
+/// time (`decryptStream`, `QPDF.cc:2491`). See
+/// [`ResolverCore::encryption_parameters`].
 ///
 /// The shared input source corresponding to qpdf's `m->file`.
 ///
@@ -1212,7 +1212,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// resolution-time xref reconstruction invalidates the in-progress walk;
     /// the caller reruns it against the rebuilt table before marking the cache
     /// prepared.
-    #[allow(dead_code)]
     fn resolve_xref_table(&self) -> Result<bool> {
         let may_change = !self.reconstructed_xref();
         for object_ref in self.xref_refs() {
@@ -1232,7 +1231,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// dangling reference is represented in the canonical cache, matching
     /// qpdf's `QPDF::fixDanglingReferences` (`libqpdf/QPDF.cc:1258-1269`).
     /// Repeated calls are a no-op after the fixed state has been recorded.
-    #[allow(dead_code)]
     pub(crate) fn fix_dangling_references(&self) -> Result<()> {
         if self.core.borrow().fixed_dangling_refs {
             return Ok(());
@@ -1248,7 +1246,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// Return the greatest object number in the prepared canonical cache,
     /// matching qpdf's `QPDF::getObjectCount` (`libqpdf/QPDF.cc:1271-1283`).
-    #[allow(dead_code)]
     pub(crate) fn get_object_count(&self) -> Result<u32> {
         self.fix_dangling_references()?;
         Ok(self.max_object_number().unwrap_or(0))
@@ -1262,7 +1259,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`libqpdf/QPDF.cc:1271-1283,1872-1880`; `QPDFObjGen.hh:41-74`).
     /// Free xref entries and legacy-only values are deliberately absent from
     /// this cache and therefore cannot raise the allocation ceiling.
-    #[allow(dead_code)]
     pub(crate) fn next_obj_gen(&self) -> Result<ObjectRef> {
         let max_object_id = self.get_object_count()?;
         if max_object_id >= i32::MAX as u32 {
@@ -1281,7 +1277,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// primitive `QPDF::makeIndirectFromQPDFObject`
     /// (`libqpdf/QPDF.cc:1882-1895`): the handle aliases held by the caller
     /// and the canonical cache see the same object after promotion.
-    #[allow(dead_code)]
     pub(crate) fn make_indirect_from_object_handle(
         &self,
         handle: ObjectHandle,
@@ -1331,7 +1326,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `QPDFValue` (`QPDF.cc:1986-1993,1835-1857`;
     /// `QPDFObject_private.hh:117-120`), which is represented by
     /// [`ObjectHandle::share_value_state_with`].
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn replace_object(
         &self,
         object_ref: ObjectRef,
@@ -1376,7 +1370,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`QPDF.cc:686-708`, `:1187-1210`), so no mutation-history tombstone
     /// belongs in the resolver. The handle is nullified first so aliases held
     /// by callers observe the transition even after the cache entry is gone.
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    #[cfg(test)]
     pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
         let cached = {
             let mut core = self.core.borrow_mut();
@@ -1415,21 +1409,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(())
     }
 
-    /// Whether a canonical handle occupies `number` at any generation.
-    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
-    pub(crate) fn holds_object_number(&self, number: u32) -> bool {
-        self.core
-            .borrow()
-            .object_cache
-            .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))
-            .next()
-            .is_some()
-    }
-
     /// Whether cross-reference table reconstruction has occurred during resolution.
     ///
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
-    #[allow(dead_code)]
     pub(crate) fn reconstructed_xref(&self) -> bool {
         self.core.borrow().reconstructed_xref
     }
@@ -2235,17 +2217,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Read `[offset, next)` — or `[offset, EOF)` when `next` is `None` — in
     /// qpdf-logical coordinates, into an owned buffer.
     ///
-    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: **not a port of anything in
-    /// qpdf, and the resolver never calls it.** Its only callers are `Pdf`'s
-    /// legacy read helpers, on the other side of the cutover. Delete it once
-    /// they are gone.
-    ///
     /// It lives on [`ResolverHandle`] rather than on [`ResolverCore`] on
     /// purpose. `ResolverCore`'s method surface is meant to be checkable
     /// against qpdf line by line — it is `m->file`'s operations and nothing
-    /// else — and a bounded owned-window read is exactly the flpdf-ism that
-    /// surface must stay free of. Hosting it one level out keeps it built
-    /// *on* the primitives instead of beside them.
+    /// else. This bounded owned-window read remains a helper for the legacy
+    /// `Pdf` read paths; hosting it one level out keeps it built *on* the
+    /// primitives instead of adding it to the qpdf-shaped resolver surface.
     ///
     /// Do not build on its shape. qpdf streams from `m->file` and brackets the
     /// one re-entrant seam by saving and restoring the position
@@ -2310,10 +2287,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     //
     // The parameter list is qpdf's (`QPDF.cc:2542-2550` passes seven beyond
     // the receiver); bundling them would be a shape this port does not have a
-    // counterpart for. Not wired to a production caller until
-    // `QPDF_Stream::pipeStreamData`'s source dispatch lands, the same
-    // not-yet-wired state the other ported primitives carry.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    // counterpart for. The production stream consumers call this resolver
+    // seam directly so source reads and pipe-time decryption stay centralized.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pipe_stream_data(
         &self,
         object_ref: ObjectRef,
@@ -11472,8 +11448,7 @@ mod tests {
         );
     }
 
-    /// `flpdf-k8ln`'s acceptance criterion, folded into `flpdf-25kg.3.5`: a
-    /// nested handle such as `/AP /N 5 0 R` resolves through the owning
+    /// A nested handle such as `/AP /N 5 0 R` resolves through the owning
     /// document.
     ///
     /// The mechanism this exercises — [`ChildHandles::indirect_handle`]

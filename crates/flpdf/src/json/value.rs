@@ -36,7 +36,6 @@ pub(crate) struct Members {
     pub(crate) end: i64,
 }
 
-#[allow(dead_code)] // Values are constructed by the later parser/tree layers.
 pub(crate) enum Value {
     Dictionary {
         members: BTreeMap<Vec<u8>, Json>,

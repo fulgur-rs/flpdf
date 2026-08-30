@@ -14,7 +14,6 @@ pub(crate) struct PlMd5<'a> {
     persist_across_finish: bool,
 }
 
-#[allow(dead_code)]
 impl<'a> PlMd5<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
         Self {
@@ -27,10 +26,12 @@ impl<'a> PlMd5<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn enable(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_across_finish(&mut self, persist: bool) {
         self.persist_across_finish = persist;
     }

@@ -1,6 +1,8 @@
 //! Integration test: qpdf --json=2 vs flpdf --json=2 schema-diff over a curated
 //! fixture corpus (beads flpdf-9hc.11.14).
 
+// The shared compatibility helpers are intentionally broader than this test;
+// individual integration binaries consume different subsets of them.
 #[allow(dead_code, unused_imports)]
 mod support;
 

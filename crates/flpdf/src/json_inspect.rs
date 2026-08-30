@@ -226,8 +226,6 @@ pub fn stream_payload_for_decode_level(
 
 pub(crate) struct StreamPayload<'a> {
     pub(crate) bytes: Cow<'a, [u8]>,
-    #[allow(dead_code)]
-    pub(crate) decode_succeeded: bool,
 }
 
 pub(crate) fn stream_payload_with_decode_status(
@@ -245,7 +243,6 @@ pub(crate) fn stream_payload_with_decode_status(
     if matches!(decode_level, DecodeLevel::None) {
         return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
-            decode_succeeded: false,
         });
     }
 
@@ -260,7 +257,6 @@ pub(crate) fn stream_payload_with_decode_status(
     let Some(capabilities) = crate::filters::stream_filter_capabilities(&stream_dict) else {
         return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
-            decode_succeeded: false,
         });
     };
     let can_filter = if decode_level == DecodeLevel::Generalized {
@@ -275,18 +271,15 @@ pub(crate) fn stream_payload_with_decode_status(
     if !can_filter {
         return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
-            decode_succeeded: false,
         });
     }
 
     match crate::filters::decode_stream_data(&stream_dict, raw_data.as_ref()) {
         Ok(decoded) => Ok(StreamPayload {
             bytes: Cow::Owned(decoded),
-            decode_succeeded: true,
         }),
         Err(_) => Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
-            decode_succeeded: false,
         }),
     }
 }

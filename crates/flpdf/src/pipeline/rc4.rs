@@ -2,6 +2,7 @@
 
 use super::{Pipeline, PipelineError, PipelineResult};
 use crate::encryption::rc4::Rc4;
+#[cfg(test)]
 use std::ffi::CStr;
 
 pub(crate) const DEFAULT_OUT_BUFFER_SIZE: usize = 65_536;
@@ -13,23 +14,6 @@ pub(crate) struct PlRc4<'a> {
     outbuf: Option<Vec<u8>>,
 }
 
-struct DiscardSink;
-
-impl Pipeline for DiscardSink {
-    fn identifier(&self) -> &str {
-        "discard in-place RC4 output"
-    }
-
-    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
-        Ok(())
-    }
-
-    fn finish(&mut self) -> PipelineResult<()> {
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
 impl<'a> PlRc4<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
@@ -39,6 +23,7 @@ impl<'a> PlRc4<'a> {
         Self::with_buffer_size(identifier, next, key, DEFAULT_OUT_BUFFER_SIZE)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_c_str(
         identifier: impl Into<String>,
         next: &'a mut dyn Pipeline,
@@ -90,17 +75,7 @@ impl<'a> PlRc4<'a> {
         })
     }
 
-    pub(crate) fn transform_in_place(
-        identifier: impl Into<String>,
-        data: &mut [u8],
-        key: &[u8],
-    ) -> PipelineResult<()> {
-        let mut sink = DiscardSink;
-        let mut stage = PlRc4::new(identifier, &mut sink, key)?;
-        stage.write_in_place(data)?;
-        stage.finish()
-    }
-
+    #[cfg(test)]
     pub(crate) fn write_in_place(&mut self, data: &mut [u8]) -> PipelineResult<()> {
         let identifier = &self.identifier;
         let chunk_size = self.outbuf.as_ref().map(Vec::len).ok_or_else(|| {
@@ -147,7 +122,7 @@ impl Pipeline for PlRc4<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiscardSink, PlRc4, DEFAULT_OUT_BUFFER_SIZE};
+    use super::{PlRc4, DEFAULT_OUT_BUFFER_SIZE};
     use crate::encryption::rc4::Rc4;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use std::ffi::{CStr, CString};
@@ -270,7 +245,6 @@ mod tests {
 
     #[test]
     fn in_place_write_preserves_allocation_and_forwards_qpdf_chunks() {
-        assert_eq!(DiscardSink.identifier(), "discard in-place RC4 output");
         let mut data = vec![0x42; DEFAULT_OUT_BUFFER_SIZE + 17];
         let original_ptr = data.as_ptr();
         let mut expected = data.clone();

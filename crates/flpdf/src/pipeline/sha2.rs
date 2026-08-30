@@ -56,7 +56,6 @@ pub(crate) struct PlSha2<'a> {
     in_progress: bool,
 }
 
-#[allow(dead_code)]
 impl<'a> PlSha2<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
@@ -108,6 +107,7 @@ impl<'a> PlSha2<'a> {
         // qpdf-deviation-end
     }
 
+    #[cfg(test)]
     pub(crate) fn get_hex_digest(&self) -> PipelineResult<String> {
         self.get_raw_digest().map(hex::encode)
     }

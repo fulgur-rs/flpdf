@@ -21,6 +21,8 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
+// The shared compatibility helpers are intentionally broader than this test;
+// individual integration binaries consume different subsets of them.
 #[allow(dead_code, unused_imports)]
 #[path = "support/mod.rs"]
 mod support;

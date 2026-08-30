@@ -81,7 +81,6 @@ impl Cipher {
 // The reader's `QPDF::pipeStreamData`-shaped decrypt path and the canonical
 // writer stream-encryption path both use this stage. Key-wrap and string
 // helpers also reuse it for their block semantics.
-#[allow(dead_code)]
 pub(crate) struct PlAesPdf<'a> {
     identifier: String,
     next: &'a mut dyn Pipeline,
@@ -106,7 +105,6 @@ pub(crate) struct PlAesPdf<'a> {
     disable_padding: bool,
 }
 
-#[allow(dead_code)]
 impl<'a> PlAesPdf<'a> {
     fn new(
         identifier: impl Into<String>,
@@ -227,6 +225,7 @@ impl<'a> PlAesPdf<'a> {
     /// qpdf `Pl_AES_PDF::useZeroIV` (`Pl_AES_PDF.cc:36-40`): use an all-zero
     /// vector, which AESV3 key wrapping needs. Like a specified vector it is
     /// not written to the output.
+    #[cfg(test)]
     pub(crate) fn use_zero_iv(&mut self) {
         self.use_zero_iv = true;
     }
@@ -234,6 +233,7 @@ impl<'a> PlAesPdf<'a> {
     /// qpdf `Pl_AES_PDF::disablePadding` (`Pl_AES_PDF.cc:42-46`): append no
     /// padding block when encrypting and strip none when decrypting, which
     /// AESV3 key wrapping needs.
+    #[cfg(test)]
     pub(crate) fn disable_padding(&mut self) {
         self.disable_padding = true;
     }
@@ -241,6 +241,7 @@ impl<'a> PlAesPdf<'a> {
     /// qpdf `Pl_AES_PDF::disableCBC` (`Pl_AES_PDF.cc:60-64`), marked "For
     /// testing only; PDF always uses CBC" in qpdf's header
     /// (`libqpdf/qpdf/Pl_AES_PDF.hh:34-35`).
+    #[cfg(test)]
     pub(crate) fn disable_cbc(&mut self) {
         self.cbc_mode = false;
     }
@@ -249,6 +250,7 @@ impl<'a> PlAesPdf<'a> {
     /// stage in the process to a fixed vector. Marked "For testing only" in
     /// qpdf's header (`libqpdf/qpdf/Pl_AES_PDF.hh:36-37`), and global for the
     /// reason [`USE_STATIC_IV`] records.
+    #[cfg(test)]
     pub(crate) fn use_static_iv() {
         USE_STATIC_IV.store(true, Ordering::Relaxed);
     }
@@ -432,7 +434,13 @@ mod tests_support {
     /// depend on its value have to run one at a time and leave it off.
     // The guard is held for its lifetime, not read; `Drop` is what turns the
     // switch back off.
-    pub(super) struct StaticIvGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+    pub(super) struct StaticIvGuard(
+        #[expect(
+            dead_code,
+            reason = "the mutex guard is held for its Drop-based test lock"
+        )]
+        MutexGuard<'static, ()>,
+    );
 
     impl Drop for StaticIvGuard {
         fn drop(&mut self) {

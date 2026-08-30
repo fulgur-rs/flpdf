@@ -17,9 +17,9 @@ use std::collections::BTreeSet;
 /// the removed handle-owned emission route. All implementations and callers
 /// live at the writer boundary, while the handle itself retains only graph
 /// identity, payload, and mutation responsibilities.
-#[allow(dead_code)]
 pub(crate) trait ObjectWriterEmission {
     fn write_object(&self, out: &mut Vec<u8>) -> Result<()>;
+    #[cfg(test)]
     fn write_object_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -27,6 +27,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    #[cfg(test)]
     fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
     fn write_object_qdf_with_ref_map_and_removed(
         &self,
@@ -35,6 +36,7 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    #[cfg(test)]
     fn write_object_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -70,6 +72,7 @@ pub(crate) trait ObjectWriterEmission {
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
 
     fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -78,6 +81,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
@@ -98,6 +102,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -135,6 +140,7 @@ pub(crate) trait ObjectWriterEmission {
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
 
+    #[cfg(test)]
     fn write_trailer(
         &self,
         out: &mut Vec<u8>,
@@ -152,6 +158,7 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         suppress_null_values: bool,
     ) -> Result<()>;
+    #[cfg(test)]
     fn write_dictionary_with_ref_map_and_id_writer(
         &self,
         out: &mut Vec<u8>,
@@ -219,14 +226,13 @@ impl ObjectWriterEmission for ObjectHandle {
     /// stream-writing call produces at this position; this primitive simply
     /// does not implement qpdf's stream-writing path
     /// (`QPDFWriter::unparseObject` entered with `f_stream` flags). The
-    /// dedicated primitive for that, `write_stream_body`, lands in
-    /// a later task of this same plan (flpdf-egzr.3.2.13 Task 6); until
-    /// then, calling `write_object` directly on a stream-resolving handle
+    /// dedicated primitive for that is `write_stream_body`, which current
+    /// writer routes call when stream framing is required; calling
+    /// `write_object` directly on a stream-resolving handle
     /// is an underspecified, undocumented-by-qpdf shape whose current output
     /// is pinned, in `unparse_object_tests`, by
     /// `unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary`
     /// rather than derived from any qpdf oracle.
-    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
     fn write_object(&self, out: &mut Vec<u8>) -> Result<()> {
         unparse_object_walk(self, out)
     }
@@ -240,7 +246,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// (`QPDFWriter.cc:1567-1599`): containers and indirect child identity
     /// remain owned by `ObjectHandle`, while the caller supplies only the
     /// string representation policy.
-    #[allow(dead_code)] // production callers land with the writer cutover
+    #[cfg(test)]
     fn write_object_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -283,7 +289,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// dedicated primitive for [`Self::write_object`]'s own (non-QDF)
     /// identical caveat instead. Do not conflate the two when fixing this
     /// shape at a real call site.
-    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    #[cfg(test)]
     fn write_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
     }
@@ -302,7 +308,7 @@ impl ObjectWriterEmission for ObjectHandle {
 
     /// QDF-mode counterpart of [`Self::write_object_with_string_writer`],
     /// including its cleartext hexadecimal signature `/Contents` exception.
-    #[allow(dead_code)] // production callers land with the writer cutover
+    #[cfg(test)]
     fn write_object_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -418,8 +424,8 @@ impl ObjectWriterEmission for ObjectHandle {
     /// crate's writer never calls it on anything else).
     ///
     /// Forces resolution of `self` before dispatch, the same as
-    /// [`Self::write_object`]/[`Self::write_object_qdf`]'s own
-    /// top-level entry points -- this primitive's usual caller already
+    /// [`Self::write_object`]'s own top-level entry point -- this primitive's
+    /// usual caller already
     /// holds an already-resolved stream's dictionary handle, but nothing
     /// enforces that at the type level, and an as-yet-unresolved indirect
     /// handle whose document has been dropped must surface as an error
@@ -427,7 +433,6 @@ impl ObjectWriterEmission for ObjectHandle {
     /// unresolved [`Self::with_value`] read alone would (see
     /// `unparse_stream_body_propagates_a_dropped_document_error`, which
     /// fails without this call).
-    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
     fn write_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -466,7 +471,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// through `write_string` while retaining qpdf's `/Length` and refilter
     /// ordering. A signature `/Contents` value remains cleartext hexadecimal,
     /// matching qpdf's `f_hex_string | f_no_encryption` flags.
-    #[allow(dead_code)] // production callers land with the writer cutover
+    #[cfg(test)]
     fn write_stream_body_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -503,7 +508,7 @@ impl ObjectWriterEmission for ObjectHandle {
     }
 
     /// QDF-mode counterpart of [`Self::write_stream_body`] -- same
-    /// delegation-target dimension as [`Self::write_object_qdf`] is to
+    /// delegation-target dimension as the QDF object writer is to
     /// [`Self::write_object`] (`m->qdf_mode` set to `true` inside the
     /// same `QPDFWriter::unparseObject` dictionary branch,
     /// `QPDFWriter.cc:1346-1527`; the `f_stream`/`f_filtered` handling at
@@ -515,7 +520,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// surviving key at `indent + 2` with a trailing `\n`, closing `>>` at
     /// `indent`), with `/Length` pulled out of the iteration and written
     /// last, immediately before `>>` -- plus the same null-suppression
-    /// rule as [`Self::write_object_qdf`]/[`Self::write_stream_body`],
+    /// rule as the QDF object writer and [`Self::write_stream_body`],
     /// via the same [`visible_dict_entries`] helper.
     ///
     /// Unlike [`Self::write_stream_body`], this primitive has **no
@@ -546,7 +551,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// primitive's own doc for the full contract, which this one mirrors
     /// exactly except for the QDF layout and the missing `refiltered`
     /// parameter.
-    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    #[cfg(test)]
     fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -677,7 +682,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// QDF-mode stream-dictionary counterpart of
     /// [`Self::write_stream_body_with_string_writer`], including its
     /// cleartext hexadecimal signature `/Contents` exception.
-    #[allow(dead_code)] // production callers land with the writer cutover
+    #[cfg(test)]
     fn write_stream_body_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -845,8 +850,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `unparseObject` or this primitive at all), an unconditional
     /// per-key loop with no `isNull` suppression (`:1174-1192` has no
     /// such check, unlike `unparseObject`'s dictionary branch that
-    /// [`Self::write_object`]/[`Self::write_object_qdf`]/
-    /// [`Self::write_stream_body`] all apply through
+    /// [`Self::write_object`]/[`Self::write_stream_body`] all apply through
     /// `visible_dict_entries`), `/ID` and `/Encrypt` excluded from that
     /// loop and forced last in that order when present, and the closing
     /// `>>` (`:1235`, written unconditionally in both `xref_stream`
@@ -909,7 +913,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// and `which == t_lin_first`'s inline `/Prev` (above) have no
     /// equivalent here. A linearization-writer consumer needing either
     /// form is a different primitive.
-    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    #[cfg(test)]
     fn write_trailer(
         &self,
         out: &mut Vec<u8>,
@@ -985,7 +989,7 @@ impl ObjectWriterEmission for ObjectHandle {
     /// surrounding `<< >>` and therefore does not use the trailer prefix or
     /// `/ID`-last ordering. This is the handle-native counterpart of the
     /// structural dictionary writer in `QPDFWriter.cc:2391-2495`.
-    #[allow(dead_code)] // retained as the handle-native generic xref-dictionary primitive
+    #[cfg(test)]
     fn write_dictionary_with_ref_map_and_id_writer(
         &self,
         out: &mut Vec<u8>,
@@ -1063,7 +1067,6 @@ impl ObjectWriterEmission for ObjectHandle {
 // indirect `/Filter`/`/DecodeParms` reference that is guaranteed to be
 // irrelevant to the refiltered output (Codex Review on PR #644,
 // crates/flpdf/src/object_handle.rs:2425).
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     refiltered: bool,
@@ -1127,7 +1130,7 @@ fn unparse_stream_dict_entries(
 // remove-then-suppress reordering that primitive also needed does not apply
 // here -- there is no `/Filter`/`/DecodeParms` drop in this function for
 // that reordering to fix.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+#[cfg(test)]
 fn unparse_stream_dict_entries_qdf(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
@@ -1268,6 +1271,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn unparse_stream_dict_entries_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     refiltered: bool,
@@ -1318,6 +1322,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn unparse_stream_dict_entries_qdf_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
@@ -1505,7 +1510,6 @@ where
 // runs on whatever handle it is entered with, top-level `self` or a
 // recursed-into direct child alike -- this function does not need its own
 // copy of that check to get the same result.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 pub(crate) fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
         out.extend_from_slice(object_ref.to_string().as_bytes());
@@ -1526,7 +1530,6 @@ pub(crate) fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()
 // resolved type, not deciding whether to suppress it. Neither forced
 // resolution is a contract violation here: `QPDFWriter::unparseObject` is a
 // writer-internal path with no no-hidden-I/O constraint to begin with.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 pub(crate) fn visible_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
 ) -> Result<Vec<(&Vec<u8>, &ObjectHandle)>> {
@@ -1607,7 +1610,6 @@ fn unparse_container(container: UnparseContainer, out: &mut Vec<u8>) -> Result<(
     Ok(())
 }
 
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -1640,7 +1642,6 @@ fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     })
 }
 
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
     match value {
         ObjectValue::Null => out.extend_from_slice(b"null"),
@@ -1702,8 +1703,8 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Re
             // not the `stream`/`endstream` framing: that framing (and the
             // `/Length`-last, optionally re-filtered stream-dictionary
             // layout it wraps) is `write_stream_body`'s own, separately
-            // scoped responsibility (flpdf-egzr.3.2.13 Task 6) -- this
-            // generic dispatch does not implement qpdf's real
+            // scoped responsibility -- this generic dispatch does not
+            // implement qpdf's real
             // stream-writing path for the indirect case either.
             unparse_object_walk(stream_dict, out)?;
         }
@@ -1723,8 +1724,7 @@ type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
 // `unparse_object_walk_with_ref_map`, whose own `is_reserved` check already
 // rejects a *direct* reserved child the same way it rejects a reserved
 // top-level `self`. This is the primitive `writer/plain/body.rs`/
-// `writer/plain/plan.rs` actually call in production (unlike the still-
-// `#[allow(dead_code)]` `write_child` above), so a direct reserved child
+// `writer/plain/plan.rs` actually call in production, so a direct reserved child
 // reaching a live document write is already covered by this path.
 fn write_child_with_ref_map(
     handle: &ObjectHandle,
@@ -1888,7 +1888,6 @@ fn unparse_dict_entries_with_ref_map(
 // force-resolved here as well -- but only after `/Type` was already
 // confirmed `/Sig`, matching qpdf's `&&` short-circuit: a dict whose
 // `/Type` is not `/Sig` never touches `/ByteRange`'s resolver at all.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -> Result<bool> {
     let Some((_, type_value)) = entries.iter().find(|entry| entry.0.as_slice() == b"/Type") else {
         return Ok(false);
@@ -1978,7 +1977,6 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 // implement, matching the scope limits `write_stream_body`/
 // `write_trailer` already document for their own out-of-scope qpdf steps
 // (e.g. the `t_lin_second` branch, the `/Crypt`-filter stripping logic).
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn try_write_sig_contents_hex_string(
     handle: &ObjectHandle,
     force_hex_string: bool,
@@ -2008,7 +2006,6 @@ fn try_write_sig_contents_hex_string(
 // `dict_is_sig_with_byte_range`/`try_write_sig_contents_hex_string`'s own
 // docs for the detection/writing split (Codex Review on PR #644,
 // crates/flpdf/src/object_handle.rs:2087).
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(b"<<");
     for (key, value) in visible_dict_entries(entries)? {
@@ -2050,7 +2047,6 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 // dereferenced here, and a *direct* one is still rejected one level down,
 // by `unparse_object_walk_qdf`'s own `is_reserved` check on whatever
 // handle the `None` branch below recurses into.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
         out.extend_from_slice(object_ref.to_string().as_bytes());
@@ -2065,7 +2061,6 @@ fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> R
 // is forced here rather than left to `with_value`'s ordinary no-hidden-I/O
 // contract, and for the same conservative-null fallback rationale on the
 // `None` arm below.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_object_walk_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         if handle.is_reserved() {
@@ -2135,7 +2130,6 @@ fn unparse_container_qdf(
 // `self.write_pdf(out)` for everything but its three container arms is the
 // same split), so this delegates that whole fallthrough set to
 // `unparse_object_value` itself rather than duplicating its match arms.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8>) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
@@ -2214,7 +2208,6 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
 // survivors are laid out. Applies the same `/Contents`-in-a-`/Sig`-dictionary
 // hex-string special case `unparse_dict_entries` applies -- real qpdf's own
 // guard (`QPDFWriter.cc:1497-1503`) is unconditional across `m->qdf_mode`.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_dict_entries_qdf(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
@@ -2720,6 +2713,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn write_child_with_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut Vec<u8>,
@@ -2735,6 +2729,7 @@ where
     unparse_object_walk_with_string_writer(handle, out, write_string)
 }
 
+#[cfg(test)]
 fn unparse_container_with_string_writer<F>(
     container: UnparseContainer,
     out: &mut Vec<u8>,
@@ -2762,6 +2757,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn unparse_object_walk_with_string_writer<F>(
     handle: &ObjectHandle,
     out: &mut Vec<u8>,
@@ -2798,6 +2794,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn unparse_object_value_with_string_writer<F>(
     value: &ObjectValue,
     out: &mut Vec<u8>,
@@ -2812,6 +2809,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn try_write_sig_contents_with_string_writer(
     handle: &ObjectHandle,
     force_hex_string: bool,
@@ -2836,6 +2834,7 @@ fn try_write_sig_contents_with_string_writer(
     Ok(true)
 }
 
+#[cfg(test)]
 fn unparse_dict_entries_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     out: &mut Vec<u8>,
@@ -2860,6 +2859,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn write_child_qdf_with_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
@@ -2876,6 +2876,7 @@ where
     unparse_object_walk_qdf_with_string_writer(handle, indent, out, write_string)
 }
 
+#[cfg(test)]
 fn unparse_container_qdf_with_string_writer<F>(
     container: UnparseContainer,
     indent: usize,
@@ -2907,6 +2908,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn unparse_object_walk_qdf_with_string_writer<F>(
     handle: &ObjectHandle,
     indent: usize,
@@ -2947,6 +2949,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn unparse_object_value_qdf_with_string_writer<F>(
     value: &ObjectValue,
     _indent: usize,
@@ -2962,6 +2965,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn unparse_dict_entries_qdf_with_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
@@ -3003,7 +3007,7 @@ where
 // `unparseChild(trailer.getKey(key), 1, 0)` directly for every non-`/Size`
 // key (`:1188`), and a trailer is never itself a signature dictionary in
 // any case.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+#[cfg(test)]
 fn unparse_trailer_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     xref_stream: bool,
@@ -3152,7 +3156,7 @@ fn unparse_trailer_entries_with_ref_map(
     Ok(())
 }
 
-#[allow(dead_code)] // retained with its public primitive until a future xref consumer needs it
+#[cfg(test)]
 fn unparse_dictionary_entries_with_ref_map_and_id_writer(
     entries: &[(Vec<u8>, ObjectHandle)],
     mut id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
@@ -3201,7 +3205,7 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
 // direct shape (wrong arity, non-string elements) falls back to
 // `write_child`'s generic form rather than silently truncating -- the
 // same "fall back, don't truncate" choice `write_id_style_value` makes.
-#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+#[cfg(test)]
 fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     if value.object_ref().is_some() {
         return write_child(value, out);

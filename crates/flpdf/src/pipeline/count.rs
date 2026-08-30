@@ -9,7 +9,6 @@ pub(crate) struct Count<'a> {
     last_byte: u8,
 }
 
-#[allow(dead_code)]
 impl<'a> Count<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
         Self {

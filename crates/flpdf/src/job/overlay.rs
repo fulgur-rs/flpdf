@@ -427,42 +427,6 @@ pub(crate) fn resolve_spec_pairs(
 /// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
 /// `QPDFJob::handleUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
 ///
-/// A thin wrapper over [`spec_page_sources`] + [`apply_overlay_specs`]'s
-/// aggregation: the spec's per-destination-page sources are mapped, grouped by
-/// destination page, and each affected page is patched by the canonical
-/// `PageObjectHelper::copy_annotations_from` route exactly once. Destination
-/// pages not in the mapping are left untouched. See [`spec_page_sources`] for
-/// the page-mapping and XObject-sharing semantics.
-///
-/// # Errors
-///
-/// Propagates any error from [`spec_page_sources`], [`page_ref_for`], the
-/// placement facade, or the source document handles.
-// Single-spec convenience wrapper used only by the feature-gated byte gate;
-// the CLI and `apply_overlay_specs` map specs directly via `spec_page_sources`.
-#[allow(dead_code)]
-fn apply_overlay_spec<RS, RT>(
-    dest: &mut Pdf<RT>,
-    source: &mut Pdf<RS>,
-    kind: OverlayKind,
-    from: &PageRange,
-    to: &PageRange,
-    repeat: Option<&PageRange>,
-) -> Result<()>
-where
-    RS: Read + Seek,
-    RT: Read + Seek,
-{
-    let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
-    let sources = spec_page_sources(dest, source, kind, from, to, repeat, n_dest, 0)?;
-    let mut source_documents = [source];
-    apply_aggregated_sources(
-        dest,
-        group_sources_by_dest_page(&sources),
-        &mut source_documents,
-    )
-}
-
 /// A single overlay/underlay specification: a source document, its kind, and its
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.

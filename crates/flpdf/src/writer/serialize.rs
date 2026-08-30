@@ -65,18 +65,6 @@ pub(crate) fn framing_adds_newline_with_qdf(
     }
 }
 
-/// Serialize an object-stream container with qpdf's fixed dictionary key order.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn write_objstm_stream(
-    out: &mut Vec<u8>,
-    body: &object_streams::ObjStmBody,
-    compress: CompressStreams,
-    policy: NewlineBeforeEndstream,
-) -> crate::Result<()> {
-    write_objstm_stream_with_extends(out, body, compress, policy, None)
-}
-
 /// Serialize an object-stream container, preserving qpdf's source `/Extends`
 /// edge when this is a source-backed Preserve group.
 pub(crate) fn write_objstm_stream_with_extends(

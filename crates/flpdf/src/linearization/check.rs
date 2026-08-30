@@ -482,7 +482,6 @@ fn compute_hint_data<R: Read + Seek>(
 
         for user in users {
             match user {
-                ObjectUser::Bad => {} // cov:ignore: Optimization never records the internal Bad sentinel
                 ObjectUser::Page(page) if *page == 0 => in_first_page = true,
                 ObjectUser::Page(_) => other_pages += 1,
                 ObjectUser::Thumbnail(_) => thumbs += 1,

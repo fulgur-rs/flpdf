@@ -7,7 +7,7 @@
 //! then is the encoded payload passed to the handle-native filter pipeline.
 //! The short-lived `BootstrapHandleDocument` supplies the pre-`Pdf` owner
 //! that qpdf's `QPDFParser` already has at this point; it is not the canonical
-//! post-open resolver owned by `flpdf-25kg.3.5`.
+//! post-open resolver owned by `Pdf`.
 use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{

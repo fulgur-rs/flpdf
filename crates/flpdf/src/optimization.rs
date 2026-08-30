@@ -10,8 +10,6 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ObjectUser {
-    #[allow(dead_code)]
-    Bad,
     Page(u32),
     Thumbnail(u32),
     TrailerKey(Vec<u8>),
@@ -353,7 +351,7 @@ impl ObjectUser {
     fn page_number(&self) -> u32 {
         match self {
             Self::Page(page_number) | Self::Thumbnail(page_number) => *page_number,
-            Self::Bad | Self::TrailerKey(_) | Self::RootKey(_) | Self::Root => 0,
+            Self::TrailerKey(_) | Self::RootKey(_) | Self::Root => 0,
         }
     }
 }
@@ -378,4 +376,16 @@ fn empty_object_refs() -> &'static BTreeSet<ObjectRef> {
 fn empty_object_users() -> &'static BTreeSet<ObjectUser> {
     static EMPTY: OnceLock<BTreeSet<ObjectUser>> = OnceLock::new();
     EMPTY.get_or_init(BTreeSet::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectUser;
+
+    #[test]
+    fn non_page_users_have_no_page_number() {
+        assert_eq!(ObjectUser::Root.page_number(), 0);
+        assert_eq!(ObjectUser::RootKey(b"Root".to_vec()).page_number(), 0);
+        assert_eq!(ObjectUser::TrailerKey(b"Info".to_vec()).page_number(), 0);
+    }
 }

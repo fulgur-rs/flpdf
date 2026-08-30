@@ -396,7 +396,7 @@ fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec
 /// 2026-08-03 live-qpdf probe recorded that behavior.
 ///
 /// `stream_data` is the stream's raw bytes; this entry point does not read
-/// them out of the handle, because `flpdf-25kg.3.5` already holds them from
+/// them out of the handle, because the resolver already retained them from
 /// `readObjectAtOffset`.
 ///
 /// # Errors
