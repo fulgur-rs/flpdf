@@ -43,7 +43,7 @@ fn json_attachments_project_through_filespec_helpers() {
     let source = include_str!("../src/job/json_sections.rs").replace("\r\n", "\n");
     let attachments = function_body(
         &source,
-        "pub fn build_attachments_section<",
+        "pub(crate) fn build_attachments_section_with_version<",
         "// ── build_encrypt_section",
     );
 
