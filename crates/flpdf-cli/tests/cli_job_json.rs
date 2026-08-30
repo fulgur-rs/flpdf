@@ -368,6 +368,38 @@ fn job_json_file_rotate_applies_to_the_selected_page() {
 }
 
 #[test]
+fn job_json_file_split_pages_rejects_a_negative_value() {
+    // Unlike a genuinely non-numeric value (which qpdf's strtoll silently
+    // treats as 0, falling through to an unsplit write -- see
+    // job_json_file_split_pages_non_numeric_value_falls_through_to_one_unsplit_output),
+    // a negative value parses successfully in qpdf and is truthy in its
+    // `if (m->split_pages)` checks, only failing later during the actual
+    // split loop's unsigned narrowing conversion (libqpdf/QPDFJob.cc:2970).
+    // flpdf currently rejects it at parse time instead, a known tracked
+    // divergence in diagnostic text/path (not in whether the operation
+    // succeeds; both refuse) -- see flpdf-sp4g.
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-negative.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","splitPages":"-5"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-negative.json")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            ".splitPages: invalid page count -5",
+        ));
+}
+
+#[test]
 fn job_json_file_split_pages_rejects_replace_input_like_qpdf() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
