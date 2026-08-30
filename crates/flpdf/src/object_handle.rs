@@ -90,10 +90,11 @@
 // without the slash and Vec<ObjectHandle>. Dictionary keys, however, retain
 // qpdf's canonical leading slash in the ObjectHandle graph. Inspection
 // compares the same decoded name bytes and clones only one Rc-backed child per
-// valid array access. It emits no bytes or diagnostics; invalid array access
-// (where qpdf warns) is outside the try_array_item contract. See
-// docs/qpdf-correspondence.md.
+// valid array access. It emits no bytes or diagnostics; the warning-producing
+// signed-index surface is try_get_array_item and the try_*_array_item_at
+// mutators. See docs/qpdf-correspondence.md.
 
+use crate::matrix::Rectangle;
 use crate::pdf_string::{decode_pdf_text_string, lossy_utf16_to_utf8, utf8_value};
 use crate::token_filter::TokenFilter;
 use crate::{
@@ -114,7 +115,7 @@ use crate::{
 };
 use crate::{json::Json, Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
@@ -668,6 +669,12 @@ mod parse_tests {
 #[derive(Clone)]
 pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 
+impl Default for ObjectHandle {
+    fn default() -> Self {
+        Self::uninitialized()
+    }
+}
+
 /// Opaque canonical identity for an [`ObjectHandle`].
 ///
 /// The retained slot keeps the allocation alive while a traversal set uses
@@ -820,6 +827,11 @@ fn format_qpdf_exception_what(filename: &str, object: &str, offset: i64, message
 // it keeps the current payload and all indirect metadata together rather
 // than placing direct and indirect forms in separate backing storage.
 struct ObjectSlot {
+    /// Whether this handle points at an actual qpdf object allocation.
+    /// qpdf's default-constructed `QPDFObjectHandle` has no value at all;
+    /// keeping this separate from `ObjectValue::Unresolved` preserves that
+    /// state from both an initialized lazy indirect object and a null value.
+    initialized: bool,
     /// The payload state is separately reference-counted so qpdf's
     /// `QPDFObject::assign` boundary can make two distinct handles observe
     /// one replacement value while retaining their own handle identities.
@@ -1123,7 +1135,226 @@ struct ContainmentOwner {
     object_ref: ObjectRef,
 }
 
+/// The all-zero-default matrix nested inside qpdf's `QPDFObjectHandle`.
+///
+/// This is intentionally distinct from [`crate::Matrix`]. qpdf's nested
+/// `QPDFObjectHandle::Matrix` defaults to six zeroes, while the standalone
+/// affine matrix used by flpdf defaults to the identity transform
+/// (`include/qpdf/QPDFObjectHandle.hh:239-267`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ObjectHandleMatrix {
+    /// Horizontal scale and rotation component.
+    pub a: f64,
+    /// Vertical rotation component.
+    pub b: f64,
+    /// Horizontal rotation component.
+    pub c: f64,
+    /// Vertical scale and rotation component.
+    pub d: f64,
+    /// Horizontal translation.
+    pub e: f64,
+    /// Vertical translation.
+    pub f: f64,
+}
+
+impl ObjectHandleMatrix {
+    /// Construct a qpdf object-handle matrix from its six components.
+    pub const fn new(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Self {
+        Self { a, b, c, d, e, f }
+    }
+}
+
+/// A qpdf-shaped view over the items of an array handle.
+pub struct ArrayItems {
+    array: ObjectHandle,
+}
+
+/// A reversible cursor over [`ArrayItems`]. The cursor keeps the canonical
+/// array handle and returns the live child at its current position.
+pub struct ArrayItemCursor {
+    array: ObjectHandle,
+    index: usize,
+}
+
+/// A qpdf-shaped view over the entries of a dictionary handle.
+pub struct DictItems {
+    dictionary: ObjectHandle,
+}
+
+/// One dictionary entry returned by [`DictItemCursor::current`]. At the end
+/// cursor its value is an explicit uninitialized handle, matching qpdf's
+/// invalidated iterator reference rather than a null object.
+pub struct DictItem {
+    /// The canonical slash-prefixed dictionary key.
+    pub key: Vec<u8>,
+    /// The live value handle, or an uninitialized handle at the end.
+    pub value: ObjectHandle,
+}
+
+/// A reversible cursor over [`DictItems`].
+pub struct DictItemCursor {
+    dictionary: ObjectHandle,
+    index: usize,
+}
+
+impl ArrayItems {
+    /// Return a cursor positioned at the first item, or at end for an empty
+    /// array.
+    pub fn begin(&self) -> ArrayItemCursor {
+        ArrayItemCursor {
+            array: self.array.clone(),
+            index: 0,
+        }
+    }
+
+    /// Return a cursor positioned at the end sentinel.
+    pub fn end(&self) -> ArrayItemCursor {
+        ArrayItemCursor {
+            array: self.array.clone(),
+            index: self.len(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.array.as_array().map_or(0, |items| items.len())
+    }
+}
+
+impl ArrayItemCursor {
+    fn len(&self) -> usize {
+        self.array.as_array().map_or(0, |items| items.len())
+    }
+
+    /// Return the live item at the cursor, or an uninitialized handle at end.
+    pub fn current(&self) -> ObjectHandle {
+        self.array
+            .as_array()
+            .and_then(|items| items.get(self.index).cloned())
+            .unwrap_or_else(ObjectHandle::uninitialized)
+    }
+
+    /// Advance one item, retaining the end sentinel when already at end.
+    pub fn next(&mut self) {
+        self.index = self.index.saturating_add(1).min(self.len());
+    }
+
+    /// Move one item backward, retaining the begin sentinel when already at
+    /// the first item.
+    pub fn previous(&mut self) {
+        self.index = self.index.saturating_sub(1);
+    }
+
+    /// Whether the cursor is at or beyond the current end.
+    pub fn is_end(&self) -> bool {
+        self.index >= self.len()
+    }
+}
+
+impl DictItems {
+    /// Return a cursor positioned at the first key, or at end for an empty
+    /// dictionary.
+    pub fn begin(&self) -> DictItemCursor {
+        DictItemCursor {
+            dictionary: self.dictionary.clone(),
+            index: 0,
+        }
+    }
+
+    /// Return a cursor positioned at the end sentinel.
+    pub fn end(&self) -> DictItemCursor {
+        DictItemCursor {
+            dictionary: self.dictionary.clone(),
+            index: self.len(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.dictionary
+            .as_dictionary()
+            .map_or(0, |entries| entries.len())
+    }
+}
+
+impl DictItemCursor {
+    fn entries(&self) -> Vec<(Vec<u8>, ObjectHandle)> {
+        self.dictionary
+            .as_dictionary()
+            .map(|entries| entries.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Return the current entry. At end, the key is empty and the value is an
+    /// explicit uninitialized handle.
+    pub fn current(&self) -> DictItem {
+        self.entries()
+            .get(self.index)
+            .cloned()
+            .map(|(key, value)| DictItem { key, value })
+            .unwrap_or_else(|| DictItem {
+                key: Vec::new(),
+                value: ObjectHandle::uninitialized(),
+            })
+    }
+
+    /// Advance one entry, retaining the end sentinel when already at end.
+    pub fn next(&mut self) {
+        self.index = self.index.saturating_add(1).min(self.len());
+    }
+
+    /// Move one entry backward, retaining the begin sentinel when already at
+    /// the first entry.
+    pub fn previous(&mut self) {
+        self.index = self.index.saturating_sub(1);
+    }
+
+    /// Whether the cursor is at or beyond the current end.
+    pub fn is_end(&self) -> bool {
+        self.index >= self.len()
+    }
+
+    fn len(&self) -> usize {
+        self.dictionary
+            .as_dictionary()
+            .map_or(0, |entries| entries.len())
+    }
+}
+
 impl ObjectHandle {
+    /// Construct qpdf's default, uninitialized handle.
+    ///
+    /// This is distinct from an initialized indirect handle whose value is
+    /// still unresolved, and from an initialized null. Type predicates return
+    /// false for it without attempting resolution; operations that require a
+    /// value report qpdf's uninitialized-handle error at the dereference
+    /// boundary (`include/qpdf/QPDFObjectHandle.hh:325-326`).
+    pub fn uninitialized() -> Self {
+        let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            initialized: false,
+            state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
+            state_owners: Rc::new(RefCell::new(Vec::new())),
+            object_ref: None,
+            active_pdf_unique_id: None,
+            resolver: None,
+            parsed_offset: NO_PARSED_OFFSET,
+            end_before_space: NO_PARSED_OFFSET,
+            end_after_space: NO_PARSED_OFFSET,
+            pdf_unique_ids: BTreeSet::new(),
+            tree_pdf_unique_id: None,
+            containment_parents: Vec::new(),
+            description: None,
+            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
+            content_normalization_applied: Rc::new(Cell::new(false)),
+            mutation_generation: Rc::new(Cell::new(0)),
+        })));
+        handle.register_state_owner();
+        handle
+    }
+
+    /// Whether this handle has a qpdf object allocation behind it.
+    pub fn is_initialized(&self) -> bool {
+        self.0.borrow().initialized
+    }
+
     /// Parse one standalone PDF object without an owning document context.
     ///
     /// This ports `QPDFObjectHandle::parse(string)`: malformed input that
@@ -1269,6 +1500,7 @@ impl ObjectHandle {
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            initialized: true,
             state: Rc::new(RefCell::new(ObjectValue::Reserved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
@@ -1302,6 +1534,7 @@ impl ObjectHandle {
     /// from.
     pub(crate) fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            initialized: true,
             state: Rc::new(RefCell::new(ObjectValue::Reserved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
@@ -1360,6 +1593,7 @@ impl ObjectHandle {
     ) -> Self {
         let _ = offset;
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            initialized: true,
             state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
@@ -1410,6 +1644,7 @@ impl ObjectHandle {
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            initialized: true,
             state: Rc::new(RefCell::new(value)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
@@ -1673,6 +1908,7 @@ impl ObjectHandle {
     ) -> Self {
         let children = {
             let mut slot = self.0.borrow_mut();
+            slot.initialized = true;
             slot.object_ref = Some(object_ref);
             slot.active_pdf_unique_id = Some(pdf_unique_id);
             slot.resolver = Some(resolver);
@@ -1860,6 +2096,7 @@ impl ObjectHandle {
     /// literal null (`libqpdf/QPDF.cc:1706-1749,1843-1858`).
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if self.is_indirect() {
+            self.0.borrow_mut().initialized = true;
             let value = canonicalize_object_value(value);
             let is_null = matches!(value, ObjectValue::Null);
             self.replace_shared_state(value);
@@ -2061,6 +2298,11 @@ impl ObjectHandle {
     pub(crate) fn try_dereference(&self) -> Result<()> {
         let (object_ref, resolver) = {
             let slot = self.0.borrow();
+            if !slot.initialized {
+                return Err(Error::Internal(
+                    "attempted to dereference an uninitialized QPDFObjectHandle".to_owned(),
+                ));
+            }
             let Some(object_ref) = slot.object_ref else {
                 return Ok(());
             };
@@ -2385,7 +2627,7 @@ impl ObjectHandle {
     ///
     /// Propagates resolution failures.
     #[allow(dead_code)] // consumed by flpdf-h8mv after this prerequisite lands
-    pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
+    pub fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         self.try_dereference()?;
         let Some(entries) = self.as_dictionary() else {
             self.type_warning("dictionary", "treating as empty")?;
@@ -2517,6 +2759,196 @@ impl ObjectHandle {
         Ok(self.as_array())
     }
 
+    /// Test whether the resolved value is an integer. An uninitialized qpdf
+    /// handle has no value and therefore returns false without a warning.
+    pub fn try_is_integer(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        self.try_dereference()?;
+        Ok(self.as_integer().is_some())
+    }
+
+    /// Test whether the resolved value is an array.
+    pub fn try_is_array(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        self.try_dereference()?;
+        Ok(self.as_array().is_some())
+    }
+
+    /// Test whether the resolved value is a dictionary.
+    pub fn try_is_dictionary(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        self.try_dereference()?;
+        Ok(self.as_dictionary().is_some())
+    }
+
+    /// Test whether the resolved value is a name.
+    pub fn try_is_name(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        self.try_dereference()?;
+        Ok(self.as_name().is_some())
+    }
+
+    /// Test whether the resolved value is a scalar in qpdf's sense: boolean,
+    /// integer, name, null, real, or string
+    /// (`libqpdf/QPDFObjectHandle.cc:449-453`).
+    pub fn try_is_scalar(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        is_scalar(self)
+    }
+
+    /// Test whether the resolved value is an integer or real number.
+    pub fn try_is_number(&self) -> Result<bool> {
+        if !self.is_initialized() {
+            return Ok(false);
+        }
+        self.try_dereference()?;
+        Ok(self.as_integer().is_some() || self.as_real().is_some())
+    }
+
+    /// Create a cursor view over this array after resolving the receiver.
+    pub fn try_array_items(&self) -> Result<ArrayItems> {
+        self.try_dereference()?;
+        Ok(ArrayItems {
+            array: self.clone(),
+        })
+    }
+
+    /// Create a cursor view over this dictionary after resolving the
+    /// receiver.
+    pub fn try_dict_items(&self) -> Result<DictItems> {
+        self.try_dereference()?;
+        Ok(DictItems {
+            dictionary: self.clone(),
+        })
+    }
+
+    fn try_get_value_as_number(&self) -> Result<Option<f64>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
+        self.try_dereference()?;
+        Ok(self.with_value(|value| match value {
+            Some(ObjectValue::Integer(value)) => Some(*value as f64),
+            Some(ObjectValue::Real(value)) => Some(*value),
+            Some(ObjectValue::RealLiteral { value, .. }) => Some(*value),
+            _ => None,
+        }))
+    }
+
+    /// Construct a four-item rectangle array owned by this canonical handle
+    /// layer (`libqpdf/QPDFObjectHandle.cc:1987-1991`).
+    pub fn new_from_rectangle(rectangle: Rectangle) -> Self {
+        Self::array(vec![
+            Self::real(rectangle.llx),
+            Self::real(rectangle.lly),
+            Self::real(rectangle.urx),
+            Self::real(rectangle.ury),
+        ])
+    }
+
+    /// Return whether this handle is exactly a four-number array without
+    /// emitting type warnings (`libqpdf/QPDFObjectHandle.cc:789-799`).
+    pub fn try_is_rectangle(&self) -> Result<bool> {
+        let Some(items) = self.try_as_array()? else {
+            return Ok(false);
+        };
+        if items.len() != 4 {
+            return Ok(false);
+        }
+        for item in items {
+            if !item.try_is_number()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Convert a four-number array to qpdf's normalized rectangle, returning
+    /// the zero rectangle for an invalid shape
+    /// (`libqpdf/QPDFObjectHandle.cc:801-824`).
+    pub fn try_get_array_as_rectangle(&self) -> Result<Rectangle> {
+        let Some(items) = self.try_as_array()? else {
+            return Ok(Rectangle::default());
+        };
+        if items.len() != 4 {
+            return Ok(Rectangle::default());
+        }
+        let mut values = [0.0; 4];
+        for (index, item) in items.into_iter().enumerate() {
+            let Some(value) = item.try_get_value_as_number()? else {
+                return Ok(Rectangle::default());
+            };
+            values[index] = value;
+        }
+        Ok(Rectangle::new(
+            values[0].min(values[2]),
+            values[1].min(values[3]),
+            values[0].max(values[2]),
+            values[1].max(values[3]),
+        ))
+    }
+
+    /// Construct a six-item qpdf object-handle matrix array.
+    pub fn new_from_matrix(matrix: ObjectHandleMatrix) -> Self {
+        Self::array(vec![
+            Self::real(matrix.a),
+            Self::real(matrix.b),
+            Self::real(matrix.c),
+            Self::real(matrix.d),
+            Self::real(matrix.e),
+            Self::real(matrix.f),
+        ])
+    }
+
+    /// Return whether this handle is exactly a six-number array without
+    /// emitting type warnings (`libqpdf/QPDFObjectHandle.cc:801-811`).
+    pub fn try_is_matrix(&self) -> Result<bool> {
+        let Some(items) = self.try_as_array()? else {
+            return Ok(false);
+        };
+        if items.len() != 6 {
+            return Ok(false);
+        }
+        for item in items {
+            if !item.try_is_number()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Convert a six-number array to the qpdf nested matrix type, returning
+    /// its all-zero default for an invalid shape
+    /// (`libqpdf/QPDFObjectHandle.cc:826-853`).
+    pub fn try_get_array_as_matrix(&self) -> Result<ObjectHandleMatrix> {
+        let Some(items) = self.try_as_array()? else {
+            return Ok(ObjectHandleMatrix::default());
+        };
+        if items.len() != 6 {
+            return Ok(ObjectHandleMatrix::default());
+        }
+        let mut values = [0.0; 6];
+        for (index, item) in items.into_iter().enumerate() {
+            let Some(value) = item.try_get_value_as_number()? else {
+                return Ok(ObjectHandleMatrix::default());
+            };
+            values[index] = value;
+        }
+        Ok(ObjectHandleMatrix::new(
+            values[0], values[1], values[2], values[3], values[4], values[5],
+        ))
+    }
+
     /// qpdf-compatible array *length* with lazy dereference — the item count
     /// without materializing the items.
     ///
@@ -2571,6 +3003,67 @@ impl ObjectHandle {
         }))
     }
 
+    /// Return qpdf's array length, warning and treating a non-array as empty
+    /// (`libqpdf/QPDFObjectHandle.cc:758-768`).
+    pub fn try_get_array_n_items(&self) -> Result<usize> {
+        self.try_dereference()?;
+        match self.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => Some(children.len()),
+            _ => None,
+        }) {
+            Some(length) => Ok(length),
+            None => {
+                self.type_warning("array", "treating as empty")?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Return one array item using qpdf's signed-index domain. A non-array
+    /// warns with the array fallback; an invalid index on an array warns at
+    /// the object boundary and returns a contextual null
+    /// (`libqpdf/QPDFObjectHandle.cc:770-785`).
+    pub fn try_get_array_item(&self, index: i64) -> Result<ObjectHandle> {
+        self.try_dereference()?;
+        let item = self.with_value(|value| {
+            let Some(ObjectValue::Array(children)) = value else {
+                return Err(false);
+            };
+            let Some(index) = usize::try_from(index).ok() else {
+                return Err(true);
+            };
+            children.get(index).cloned().ok_or(true)
+        });
+        match item {
+            Ok(item) => Ok(item),
+            Err(true) => {
+                self.object_warning("returning null for out of bounds array access")?;
+                let null = ObjectHandle::null();
+                null.set_child_description(self, " -> null returned from invalid array access", "");
+                Ok(null)
+            }
+            Err(false) => {
+                self.type_warning("array", "returning null")?;
+                let null = ObjectHandle::null();
+                null.set_child_description(self, " -> null returned from invalid array access", "");
+                Ok(null)
+            }
+        }
+    }
+
+    /// Return the array children, warning and treating a non-array as an
+    /// empty vector (`libqpdf/QPDFObjectHandle.cc:787-801`).
+    pub fn try_get_array_as_vector(&self) -> Result<Vec<ObjectHandle>> {
+        self.try_dereference()?;
+        match self.as_array() {
+            Some(items) => Ok(items),
+            None => {
+                self.type_warning("array", "treating as empty")?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
     /// qpdf-compatible integer inspection with lazy dereference.
     ///
     /// Ports `QPDFObjectHandle::asInteger`, the silent internal helper.
@@ -2590,15 +3083,135 @@ impl ObjectHandle {
     /// # Errors
     ///
     /// Propagates resolution failures, and — for a receiver with no reachable
-    /// document — the error [`Self::type_warning`] reports in place of the
-    /// warning.
-    #[allow(dead_code)] // same deferred consumers as `context`
-    pub(crate) fn try_get_int_value(&self) -> Result<i64> {
+    /// document — the error reported by the internal type-warning boundary
+    /// appears in place of the warning.
+    #[allow(dead_code)]
+    pub fn try_get_int_value(&self) -> Result<i64> {
         match self.try_as_integer()? {
             Some(value) => Ok(value),
             None => {
                 self.type_warning("integer", "returning 0")?;
                 Ok(0)
+            }
+        }
+    }
+
+    /// Return qpdf's boolean value, warning and yielding `false` on any
+    /// other type (`libqpdf/QPDFObjectHandle.cc:474-487`).
+    pub fn try_get_bool_value(&self) -> Result<bool> {
+        self.try_dereference()?;
+        match self.as_boolean() {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("boolean", "returning false")?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Return qpdf's source spelling for a real, warning and yielding `0.0`
+    /// for any other type (`libqpdf/QPDFObjectHandle.cc:542-560`).
+    pub fn try_get_real_value(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        let value = self.with_value(|value| match value {
+            Some(ObjectValue::RealLiteral { literal, .. }) => Some(literal.clone()),
+            Some(ObjectValue::Real(value)) => Some(value.to_string().into_bytes()),
+            _ => None,
+        });
+        match value {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("real", "returning 0.0")?;
+                Ok(b"0.0".to_vec())
+            }
+        }
+    }
+
+    /// Return qpdf's numeric value for an integer or real, warning and
+    /// yielding `0.0` for any other type (`libqpdf/QPDFObjectHandle.cc:371-389`).
+    pub fn try_get_numeric_value(&self) -> Result<f64> {
+        self.try_dereference()?;
+        let value = self.with_value(|value| match value {
+            Some(ObjectValue::Integer(value)) => Some(*value as f64),
+            Some(ObjectValue::Real(value)) => Some(*value),
+            Some(ObjectValue::RealLiteral { value, .. }) => Some(*value),
+            _ => None,
+        });
+        match value {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("number", "returning 0")?;
+                Ok(0.0)
+            }
+        }
+    }
+
+    /// Return qpdf's canonical slash-prefixed name, warning and yielding
+    /// `/QPDFFakeName` for any other type (`libqpdf/QPDFObjectHandle.cc:542-584`).
+    pub fn try_get_name(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        match self.as_name() {
+            Some(value) => {
+                let mut result = Vec::with_capacity(value.len() + 1);
+                result.push(b'/');
+                result.extend_from_slice(&value);
+                Ok(result)
+            }
+            None => {
+                self.type_warning("name", "returning dummy name")?;
+                Ok(b"/QPDFFakeName".to_vec())
+            }
+        }
+    }
+
+    /// Return stored string bytes, warning and yielding an empty string for
+    /// any other type (`libqpdf/QPDFObjectHandle.cc:587-611`).
+    pub fn try_get_string_value(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        match self.as_string() {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("string", "returning empty string")?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Return qpdf's UTF-8 string view, warning and yielding an empty string
+    /// for any other type (`libqpdf/QPDFObjectHandle.cc:613-640`).
+    pub fn try_get_utf8_value(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        match self.as_string() {
+            Some(value) => Ok(utf8_value(&value)),
+            None => {
+                self.type_warning("string", "returning empty string")?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Return an operator's bytes, warning and yielding qpdf's fake value for
+    /// any other type (`libqpdf/QPDFObjectHandle.cc:642-666`).
+    pub fn try_get_operator_value(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        match self.as_operator() {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("operator", "returning fake value")?;
+                Ok(b"QPDFFAKE".to_vec())
+            }
+        }
+    }
+
+    /// Return inline-image bytes, warning and yielding an empty buffer for
+    /// any other type (`libqpdf/QPDFObjectHandle.cc:668-690`).
+    pub fn try_get_inline_image_value(&self) -> Result<Vec<u8>> {
+        self.try_dereference()?;
+        match self.as_inline_image() {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("inlineimage", "returning empty data")?;
+                Ok(Vec::new())
             }
         }
     }
@@ -2652,7 +3265,7 @@ impl ObjectHandle {
     ///
     /// Propagates resolution failures.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
-    pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
+    pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
         let (is_dictionary, child) = self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
@@ -2687,7 +3300,7 @@ impl ObjectHandle {
     /// `/Type`). Lookup is exact; a slashless key is not an alias. A present
     /// value that resolves to null is treated as absent, matching
     /// `QPDF_Dictionary::hasKey`.
-    pub(crate) fn try_has_key(&self, key: &[u8]) -> Result<bool> {
+    pub fn try_has_key(&self, key: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         let (is_dictionary, child) = self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
@@ -2704,6 +3317,35 @@ impl ObjectHandle {
             Some(child) => Ok(!child.try_is_null()?),
             None => Ok(false),
         }
+    }
+
+    /// Return a child only when this handle is a non-null dictionary. qpdf's
+    /// `getKeyIfDict` short-circuits null values before invoking `getKey`, so
+    /// null receivers do not emit a warning (`libqpdf/QPDFObjectHandle.cc:1008-1014`).
+    pub fn try_get_key_if_dict(&self, key: &[u8]) -> Result<ObjectHandle> {
+        if self.try_is_null()? {
+            return Ok(ObjectHandle::null());
+        }
+        self.try_get_key(key)
+    }
+
+    /// Return qpdf's dictionary snapshot, warning and treating a non-dict as
+    /// empty (`libqpdf/QPDFObjectHandle.cc:1010-1021`).
+    pub fn try_get_dict_as_map(&self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        self.try_dereference()?;
+        match self.as_dictionary() {
+            Some(entries) => Ok(entries),
+            None => {
+                self.type_warning("dictionary", "treating as empty")?;
+                Ok(BTreeMap::new())
+            }
+        }
+    }
+
+    /// Fallible spelling of qpdf's `hasKey` accessor for callers crossing the
+    /// crate boundary.
+    pub fn try_get_has_key(&self, key: &[u8]) -> Result<bool> {
+        self.try_has_key(key)
     }
 
     /// Construct a direct integer value.
@@ -3447,6 +4089,97 @@ impl ObjectHandle {
         };
         self.detach_child_from_state_owners(&old_value);
         Ok(old_value)
+    }
+
+    /// qpdf-facing append spelling used by consumers that need a fallible
+    /// Rust boundary. It preserves the existing canonical mutation path.
+    pub fn try_append_array_item(&self, value: ObjectHandle) -> Result<()> {
+        self.append_array_item(value)
+    }
+
+    /// qpdf-facing vector replacement spelling used by consumers that need a
+    /// fallible Rust boundary. It preserves qpdf's non-transactional prefix
+    /// mutation behavior through [`Self::set_array_items`].
+    pub fn try_set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
+        self.set_array_items(items)
+    }
+
+    /// Set an array item using qpdf's signed index domain. Negative and
+    /// oversized indexes produce an object warning on arrays; a non-array
+    /// receiver produces the type warning and is left unchanged.
+    pub fn try_set_array_item_at(&self, index: i64, value: ObjectHandle) -> Result<()> {
+        self.try_dereference()?;
+        let Some(index) = usize::try_from(index).ok() else {
+            if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+                self.object_warning("ignoring attempt to set out of bounds array item")?;
+            } else {
+                self.type_warning("array", "ignoring attempt to set item")?;
+            }
+            return Ok(());
+        };
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
+        );
+        if !in_bounds {
+            if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+                self.object_warning("ignoring attempt to set out of bounds array item")?;
+            } else {
+                self.type_warning("array", "ignoring attempt to set item")?;
+            }
+            return Ok(());
+        }
+        self.set_array_item(index, value)
+    }
+
+    /// Insert an array item using qpdf's signed index domain. The valid range
+    /// is inclusive of the current length.
+    pub fn try_insert_array_item_at(&self, index: i64, value: ObjectHandle) -> Result<()> {
+        self.try_dereference()?;
+        let Some(index) = usize::try_from(index).ok() else {
+            if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+                self.object_warning("ignoring attempt to insert out of bounds array item")?;
+            } else {
+                self.type_warning("array", "ignoring attempt to insert item")?;
+            }
+            return Ok(());
+        };
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index <= items.len()),
+        );
+        if !in_bounds {
+            if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+                self.object_warning("ignoring attempt to insert out of bounds array item")?;
+            } else {
+                self.type_warning("array", "ignoring attempt to insert item")?;
+            }
+            return Ok(());
+        }
+        self.insert_array_item(index, value)
+    }
+
+    /// Erase an array item using qpdf's signed index domain.
+    pub fn try_erase_array_item_at(&self, index: i64) -> Result<()> {
+        self.try_dereference()?;
+        let Some(index) = usize::try_from(index).ok() else {
+            if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+                self.object_warning("ignoring attempt to erase out of bounds array item")?;
+            } else {
+                self.type_warning("array", "ignoring attempt to erase item")?;
+            }
+            return Ok(());
+        };
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
+        );
+        if !in_bounds {
+            if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+                self.object_warning("ignoring attempt to erase out of bounds array item")?;
+            } else {
+                self.type_warning("array", "ignoring attempt to erase item")?;
+            }
+            return Ok(());
+        }
+        self.erase_array_item(index)
     }
 
     /// Resolve the receiver and emit qpdf's type warning when it is not an
@@ -6375,6 +7108,9 @@ impl<'a> ObjectJsonWriter<'a> {
         dereference_indirect: bool,
         depth: usize,
     ) -> std::result::Result<(), ObjectJsonError> {
+        if !handle.is_initialized() {
+            return Err(ObjectJsonError::Uninitialized);
+        }
         if let Some(object_ref) = handle.object_ref() {
             if !dereference_indirect {
                 return self.write_reference(object_ref);
@@ -17614,6 +18350,102 @@ pub(crate) mod warning_emission_tests {
         assert!(warnings(&recorder)
             .iter()
             .any(|message| message.contains("returning null")));
+    }
+
+    #[test]
+    fn qpdf_uninitialized_handles_are_distinct_from_null_and_unresolved_values() {
+        let handle = ObjectHandle::default();
+
+        assert!(!handle.is_initialized());
+        assert!(!handle.is_null());
+        assert!(!handle.is_resolved());
+        assert!(!handle.try_is_integer().unwrap());
+        assert!(!handle.try_is_dictionary().unwrap());
+        assert!(!handle.try_is_scalar().unwrap());
+        assert!(matches!(
+            handle.try_dereference(),
+            Err(crate::Error::Internal(message))
+                if message == "attempted to dereference an uninitialized QPDFObjectHandle"
+        ));
+    }
+
+    #[test]
+    fn qpdf_geometry_helpers_use_zero_fallbacks_and_silent_number_checks() {
+        let rectangle = ObjectHandle::new_from_rectangle(Rectangle::new(7.8, 5.6, 1.2, 3.4));
+        assert!(rectangle.try_is_rectangle().unwrap());
+        assert_eq!(
+            rectangle.try_get_array_as_rectangle().unwrap(),
+            Rectangle::new(1.2, 3.4, 7.8, 5.6)
+        );
+
+        let invalid_rectangle = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::integer(2),
+            ObjectHandle::integer(3),
+            ObjectHandle::boolean(false),
+        ]);
+        assert!(!invalid_rectangle.try_is_rectangle().unwrap());
+        assert_eq!(
+            invalid_rectangle.try_get_array_as_rectangle().unwrap(),
+            Rectangle::default()
+        );
+
+        let matrix =
+            ObjectHandle::new_from_matrix(ObjectHandleMatrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3));
+        assert!(matrix.try_is_matrix().unwrap());
+        assert_eq!(
+            matrix.try_get_array_as_matrix().unwrap(),
+            ObjectHandleMatrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3)
+        );
+
+        let invalid_matrix = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::integer(2),
+            ObjectHandle::integer(3),
+            ObjectHandle::boolean(false),
+            ObjectHandle::integer(5),
+            ObjectHandle::integer(6),
+        ]);
+        assert!(!invalid_matrix.try_is_matrix().unwrap());
+        assert_eq!(
+            invalid_matrix.try_get_array_as_matrix().unwrap(),
+            ObjectHandleMatrix::default()
+        );
+    }
+
+    #[test]
+    fn qpdf_cursors_return_live_children_and_uninitialized_end_values() {
+        let array = ObjectHandle::array(vec![
+            ObjectHandle::name(b"Item0".to_vec()),
+            ObjectHandle::name(b"Item1".to_vec()),
+            ObjectHandle::name(b"Item2".to_vec()),
+        ]);
+        let items = array.try_array_items().unwrap();
+        let mut cursor = items.begin();
+        assert_eq!(cursor.current().try_get_name().unwrap(), b"/Item0");
+        cursor.previous();
+        assert_eq!(cursor.current().try_get_name().unwrap(), b"/Item0");
+        cursor.next();
+        cursor.next();
+        cursor.next();
+        assert!(cursor.is_end());
+        assert!(!cursor.current().is_initialized());
+        cursor.previous();
+        assert_eq!(cursor.current().try_get_name().unwrap(), b"/Item2");
+
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"Key1".to_vec(), ObjectHandle::name(b"Value1".to_vec())),
+            (b"Key2".to_vec(), ObjectHandle::name(b"Value2".to_vec())),
+        ]);
+        let items = dictionary.try_dict_items().unwrap();
+        let mut cursor = items.begin();
+        let entry = cursor.current();
+        assert_eq!(entry.key, b"/Key1");
+        assert_eq!(entry.value.try_get_name().unwrap(), b"/Value1");
+        cursor.next();
+        cursor.next();
+        assert!(cursor.is_end());
+        assert!(!cursor.current().value.is_initialized());
     }
 
     #[test]

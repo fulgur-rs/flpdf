@@ -196,7 +196,8 @@ pub use nntree::{
 };
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_handle::{
-    ObjectHandle, StreamDataProvider, STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
+    ArrayItemCursor, ArrayItems, DictItem, DictItemCursor, DictItems, ObjectHandle,
+    ObjectHandleMatrix, StreamDataProvider, STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
 };
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline_document_helper::OutlineDocumentHelper;
