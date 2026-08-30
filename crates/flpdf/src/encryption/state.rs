@@ -843,29 +843,53 @@ fn required_48_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Resul
     }
 }
 
+/// qpdf's `/ID[0]` value and whether the trailer satisfied its two-element
+/// array contract. An invalid ID still carries a real empty fallback value;
+/// `valid` keeps that value distinct from a valid empty string so the reader
+/// can emit qpdf's warning exactly once during encryption initialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FirstFileId {
+    pub(crate) value: Vec<u8>,
+    pub(crate) valid: bool,
+}
+
 /// Read qpdf's `/ID[0]` value from the already-selected canonical trailer key.
 /// The caller supplies `QPDF::getTrailer().getKey("/ID")` rather than the
 /// whole trailer so unrelated entries do not affect this one-value lookup.
-pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
+///
+/// qpdf accepts exactly two array elements and only requires the first element
+/// to be a string (`QPDF_encryption.cc:738-746`). Any other shape is a
+/// non-fatal warning with an empty `id1` fallback. The second element is not
+/// inspected because qpdf does not inspect it either.
+pub(crate) fn first_file_id_handle_with_status(id: &ObjectHandle) -> Result<FirstFileId> {
     let Some(ids) = id.try_as_array()? else {
-        return Err(crate::error::EncryptedError::Malformed {
-            reason: "/ID entry is not an array".into(),
-        }
-        .into());
+        return Ok(FirstFileId {
+            value: Vec::new(),
+            valid: false,
+        });
     };
-    let Some(first) = ids.first() else {
-        return Err(crate::error::EncryptedError::Malformed {
-            reason: "/ID array is empty".into(),
-        }
-        .into());
-    };
+    if ids.len() != 2 {
+        return Ok(FirstFileId {
+            value: Vec::new(),
+            valid: false,
+        });
+    }
+    let first = &ids[0];
     first.try_dereference()?;
-    first.as_string().ok_or_else(|| {
-        crate::error::EncryptedError::Malformed {
-            reason: "/ID first entry is not a string".into(),
-        }
-        .into()
-    })
+    let Some(value) = first.as_string() else {
+        return Ok(FirstFileId {
+            value: Vec::new(),
+            valid: false,
+        });
+    };
+    Ok(FirstFileId { value, valid: true })
+}
+
+/// Return only qpdf's effective `id1` value for callers that do not own the
+/// document warning sink. Invalid trailer shapes intentionally return the
+/// empty value selected by qpdf rather than an error.
+pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
+    Ok(first_file_id_handle_with_status(id)?.value)
 }
 
 #[cfg(test)]
@@ -919,16 +943,25 @@ mod tests {
         let mut pdf = crate::Pdf::empty().expect("empty PDF");
         let trailer = pdf.trailer();
 
-        assert!(first_file_id_handle(&ObjectHandle::null()).is_err());
+        assert_eq!(
+            first_file_id_handle(&ObjectHandle::null()).expect("missing ID uses qpdf fallback"),
+            Vec::<u8>::new()
+        );
 
         trailer
             .replace_key(
                 b"/ID",
-                ObjectHandle::array(vec![ObjectHandle::string(b"direct-id".to_vec())]),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"direct-id".to_vec()),
+                    ObjectHandle::string(b"second-id".to_vec()),
+                ]),
             )
             .expect("install direct ID");
         let id = trailer.try_get_key(b"/ID").expect("fetch direct ID");
         assert_eq!(first_file_id_handle(&id).expect("direct ID"), b"direct-id");
+        let direct_status = first_file_id_handle_with_status(&id).expect("direct ID status");
+        assert!(direct_status.valid);
+        assert_eq!(direct_status.value, b"direct-id");
 
         pdf.set_object(
             crate::ObjectRef::new(8, 0),
@@ -936,7 +969,10 @@ mod tests {
         );
         let indirect = pdf.get_object_handle(crate::ObjectRef::new(8, 0));
         trailer
-            .replace_key(b"/ID", ObjectHandle::array(vec![indirect]))
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![indirect, ObjectHandle::string(b"second-id".to_vec())]),
+            )
             .expect("install indirect ID");
         let id = trailer.try_get_key(b"/ID").expect("fetch indirect ID");
         assert_eq!(
@@ -948,17 +984,69 @@ mod tests {
             .replace_key(b"/ID", ObjectHandle::integer(1))
             .expect("install non-array ID");
         let id = trailer.try_get_key(b"/ID").expect("fetch non-array ID");
-        assert!(first_file_id_handle(&id).is_err());
+        assert_eq!(
+            first_file_id_handle(&id).expect("non-array ID uses qpdf fallback"),
+            Vec::<u8>::new()
+        );
         trailer
             .replace_key(b"/ID", ObjectHandle::array(Vec::new()))
             .expect("install empty ID");
         let id = trailer.try_get_key(b"/ID").expect("fetch empty ID");
-        assert!(first_file_id_handle(&id).is_err());
+        assert_eq!(
+            first_file_id_handle(&id).expect("empty ID uses qpdf fallback"),
+            Vec::<u8>::new()
+        );
         trailer
-            .replace_key(b"/ID", ObjectHandle::array(vec![ObjectHandle::integer(1)]))
-            .expect("install non-string ID");
-        let id = trailer.try_get_key(b"/ID").expect("fetch non-string ID");
-        assert!(first_file_id_handle(&id).is_err());
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(1),
+                    ObjectHandle::string(b"second-id".to_vec()),
+                ]),
+            )
+            .expect("install non-string first ID");
+        let id = trailer
+            .try_get_key(b"/ID")
+            .expect("fetch non-string first ID");
+        assert_eq!(
+            first_file_id_handle(&id).expect("non-string ID uses qpdf fallback"),
+            Vec::<u8>::new()
+        );
+
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"first".to_vec()),
+                    ObjectHandle::string(b"second".to_vec()),
+                    ObjectHandle::string(b"extra".to_vec()),
+                ]),
+            )
+            .expect("install wrong-length ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch wrong-length ID");
+        assert_eq!(
+            first_file_id_handle(&id).expect("wrong-length ID uses qpdf fallback"),
+            Vec::<u8>::new()
+        );
+        let invalid_status = first_file_id_handle_with_status(&id).expect("wrong-length ID status");
+        assert!(!invalid_status.valid);
+
+        trailer
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(Vec::new()),
+                    ObjectHandle::integer(7),
+                ]),
+            )
+            .expect("install valid empty first ID");
+        let id = trailer.try_get_key(b"/ID").expect("fetch valid empty ID");
+        let empty_status = first_file_id_handle_with_status(&id).expect("valid empty ID status");
+        assert!(
+            empty_status.valid,
+            "a valid empty string is not a malformed ID"
+        );
+        assert!(empty_status.value.is_empty());
     }
 
     /// `/Length` is absent for V<5 per the PDF spec's default; V=5 always

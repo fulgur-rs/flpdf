@@ -552,6 +552,79 @@ mod tests {
     }
 
     #[test]
+    fn encryption_inspection_tolerates_a_missing_id_with_a_qpdf_warning() {
+        let mut bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        )
+        .expect("encrypted fixture must exist");
+        let id_offset = bytes
+            .windows(b"/ID".len())
+            .rposition(|window| window == b"/ID")
+            .expect("encrypted fixture must contain a trailer /ID");
+        bytes[id_offset..id_offset + b"/ID".len()].copy_from_slice(b"/XX");
+
+        let pdf = Pdf::open_for_encryption_inspection(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                password: b"wrong-password".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf continues encryption inspection after an invalid /ID");
+        let diagnostics = pdf.repair_diagnostics();
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("invalid /ID in trailer dictionary"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_open_accepts_a_missing_id_with_qpdf_empty_id_fallback() {
+        let mut bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        )
+        .expect("encrypted fixture must exist");
+        let id_offset = bytes
+            .windows(b"/ID".len())
+            .rposition(|window| window == b"/ID")
+            .expect("encrypted fixture must contain a trailer /ID");
+        bytes[id_offset..id_offset + b"/ID".len()].copy_from_slice(b"/XX");
+
+        // The qpdf-generated fixture's key is used through the explicit
+        // `--password-is-hex-key` path so this test proves the malformed-ID
+        // fallback reaches an authenticated open without depending on a
+        // second password derivation implementation in the test itself.
+        let pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                password: b"5042ec4efa389ea32a149ab2a34e84fc".to_vec(),
+                password_is_hex_key: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf's empty ID fallback must not reject an authenticated open");
+        assert!(pdf.is_encrypted());
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|diagnostic| diagnostic
+                    .message
+                    .contains("invalid /ID in trailer dictionary"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn empty_returns_canonical_minimal_document() {
         let mut pdf = Pdf::empty().expect("Pdf::empty must succeed");
         assert_eq!(pdf.version(), "1.3");

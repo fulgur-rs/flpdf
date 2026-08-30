@@ -550,6 +550,13 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | clap で代替 | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。 |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
+`QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
+要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を
+warning として記録し、空の `id1` で暗号鍵導出を継続する。`flpdf-ez48` で
+`first_file_id_handle` はこの値と validity を分離し、reader の open-time warning sink が
+一度だけ同じ非致命経路へ送る。正確に2要素で第1要素が文字列なら、空文字列も有効値として
+警告しない。
+
 暗号の責務境界は `QPDFJob.cc:2753-2761` の `setEncryptionOptions` が新規RC4書き込みだけを
 `allow_weak_crypto` で拒否する形であり、既存のRC4/R=5入力を読む経路にはこの拒否がない。
 flpdfも `PdfOpenOptions` のread-side opt-in/error gateを撤去し、`--allow-weak-crypto` は
