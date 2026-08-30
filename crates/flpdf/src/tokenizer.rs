@@ -4,7 +4,6 @@ use std::ops::Range;
 
 use crate::{pdf_syntax::write_name_escaped, Error, Result};
 
-#[allow(dead_code)] // Space, Comment, and InlineImage are produced by Task 2's state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
     Bad,
@@ -35,7 +34,6 @@ pub struct Token {
     pub error_message: Option<Vec<u8>>,
     pub(crate) error_offset: usize,
     pub start: usize,
-    #[allow(dead_code)] // Retained as part of qpdf's token range contract.
     pub(crate) end: usize,
 }
 
@@ -48,7 +46,7 @@ impl PartialEq for Token {
 }
 
 impl Token {
-    #[allow(dead_code)] // Synthetic owned tokens remain part of the Task 1 contract.
+    /// Construct an owned token for token-filter and normalization consumers.
     pub(crate) fn new(token_type: TokenType, value: Vec<u8>) -> Self {
         let raw = match token_type {
             TokenType::Name => canonical_name_raw(&value),
@@ -89,7 +87,6 @@ impl Token {
     }
 }
 
-#[allow(dead_code)] // Used by synthetic owned name tokens.
 fn canonical_name_raw(value: &[u8]) -> Vec<u8> {
     let mut raw = Vec::with_capacity(value.len());
     raw.push(b'/');
@@ -97,7 +94,6 @@ fn canonical_name_raw(value: &[u8]) -> Vec<u8> {
     raw
 }
 
-#[allow(dead_code)] // Used by synthetic owned string tokens.
 fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
     let mut non_ascii = 0usize;
     let mut force_hex = false;
@@ -151,23 +147,19 @@ fn canonical_string_raw(value: &[u8]) -> Vec<u8> {
     raw
 }
 
-#[allow(dead_code)] // ImproperInlineImageState is produced by Task 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerStateError {
     TokenWaiting,
     ImproperInlineImageState,
 }
 
-#[allow(dead_code)] // The push result is consumed by Task 3's pull routing.
 pub(crate) struct PushedToken {
     pub(crate) token: Token,
     pub(crate) unread: Option<u8>,
 }
 
-#[allow(dead_code)] // InlineImage is entered by Task 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    Top,
     InHexString,
     InString,
     InHexStringSecond,
@@ -191,7 +183,6 @@ enum State {
     TokenReady,
 }
 
-#[allow(dead_code)] // State fields are consumed by push mode before Task 3 routes production callers.
 pub struct Tokenizer<'a> {
     input: &'a [u8],
     pos: usize,
@@ -214,7 +205,6 @@ pub struct Tokenizer<'a> {
     token_start: usize,
 }
 
-#[allow(dead_code)] // Push mode becomes a production caller in Task 3.
 impl Tokenizer<'static> {
     pub(crate) fn push() -> Self {
         Self::new(b"")
@@ -247,7 +237,6 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-#[allow(dead_code)] // Push APIs and handlers become production-used in Task 3.
 impl<'a> Tokenizer<'a> {
     pub fn allow_eof(&mut self) {
         self.allow_eof = true;
@@ -284,7 +273,7 @@ impl<'a> Tokenizer<'a> {
                 self.present_character(b'\x0c')?;
                 self.in_token = true;
             }
-            State::Top | State::BeforeToken => {
+            State::BeforeToken => {
                 self.token_type = TokenType::Eof;
             }
             State::InSpace => {
@@ -333,10 +322,6 @@ impl<'a> Tokenizer<'a> {
         Some(PushedToken { token, unread })
     }
 
-    pub(crate) fn between_tokens(&self) -> bool {
-        self.before_token
-    }
-
     fn reset(&mut self) {
         self.state = State::BeforeToken;
         self.token_type = TokenType::Bad;
@@ -373,7 +358,6 @@ impl<'a> Tokenizer<'a> {
 
     fn handle_character(&mut self, byte: u8) {
         match self.state {
-            State::Top => self.in_top(byte), // cov:ignore: legacy qpdf state is never assigned
             State::InSpace => self.in_space(byte),
             State::InComment => self.in_comment(byte),
             State::Lt => self.in_lt(byte),
@@ -727,7 +711,6 @@ impl<'a> Tokenizer<'a> {
         self.pos
     }
 
-    #[allow(dead_code)] // Task 6 routes content-stream inline images through this tokenizer API.
     pub fn expect_inline_image(&mut self) -> std::result::Result<(), TokenizerStateError> {
         if self.state == State::TokenReady {
             self.reset();
@@ -742,7 +725,6 @@ impl<'a> Tokenizer<'a> {
         Ok(())
     }
 
-    #[allow(dead_code)] // Called by expect_inline_image before Task 6 adds its production caller.
     fn find_ei(&mut self) -> Option<usize> {
         let initial_pos = self.pos;
         let mut search_pos = initial_pos;
@@ -927,7 +909,6 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-#[allow(dead_code)] // Called by find_ei before Task 6 adds the production entry path.
 fn word_token_at(input: &[u8], start: usize, expected: &[u8]) -> Option<usize> {
     let end = start.checked_add(expected.len())?;
     if start == 0
@@ -944,7 +925,6 @@ fn word_token_at(input: &[u8], start: usize, expected: &[u8]) -> Option<usize> {
     Some(end)
 }
 
-#[allow(dead_code)] // Called by find_ei before Task 6 adds the production entry path.
 fn inline_lookahead_is_plausible(input: &[u8], after_ei: usize) -> (bool, usize) {
     let mut tokenizer = Tokenizer::new(&input[after_ei..]);
     tokenizer.allow_eof();
@@ -1012,7 +992,6 @@ pub(crate) fn is_delimiter(byte: u8) -> bool {
     )
 }
 
-#[allow(dead_code)] // Used by push handlers before Task 3 routes production callers.
 fn is_token_delimiter(byte: u8) -> bool {
     is_ws(byte) || is_delimiter(byte)
 }

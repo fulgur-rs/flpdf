@@ -4,14 +4,12 @@ use std::cmp::min;
 
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
-#[allow(dead_code)]
 pub(crate) struct BitWriter<'a> {
     pipeline: &'a mut dyn Pipeline,
     byte: u8,
     bit_offset: usize,
 }
 
-#[allow(dead_code)]
 impl<'a> BitWriter<'a> {
     pub(crate) fn new(pipeline: &'a mut dyn Pipeline) -> Self {
         Self {
@@ -57,6 +55,7 @@ impl<'a> BitWriter<'a> {
         self.write_bits(value, bits)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_bits_i32(&mut self, value: i32, bits: usize) -> PipelineResult<()> {
         self.write_bits(value as u64, bits)
     }

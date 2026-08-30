@@ -10,7 +10,6 @@ pub(crate) struct AsciiHexDecoder<'a> {
     eod: bool,
 }
 
-#[allow(dead_code)]
 impl<'a> AsciiHexDecoder<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {

@@ -29,7 +29,7 @@ impl<'a> BitStream<'a> {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
         self.byte_position = 0;
         self.bit_offset = 7;
@@ -71,7 +71,6 @@ impl<'a> BitStream<'a> {
         Ok(result)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn get_bits_signed(&mut self, bits: usize) -> Result<i64, BitStreamError> {
         let value = self.get_bits(bits)?;
         let sign_bit = 1_u64 << bits.saturating_sub(1);

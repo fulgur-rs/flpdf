@@ -198,7 +198,6 @@ where
 /// chain — matching qpdf's `getTrimBox`/`getCropBox`/`getMediaBox` fallback and
 /// flpdf's own [`PageObjectHelper::crop_box`](crate::PageObjectHelper::crop_box).
 #[cfg(test)]
-#[allow(dead_code)]
 fn effective_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -379,24 +378,6 @@ pub(crate) struct PageTransform {
     pub uu_present: bool,
     /// `/UserUnit` numeric value; 1.0 when present-but-not-a-number or absent.
     pub scale: f64,
-}
-
-/// Read a page's `/Rotate` and `/UserUnit` the way qpdf's `getAttribute` does:
-/// `/Rotate` is inheritable (walk the `/Parent` chain), `/UserUnit` is leaf-only.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn read_page_transform<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<PageTransform> {
-    let (rotate_present, rotate) = inherited_rotate_attribute(pdf, page_ref)?;
-    let (uu_present, scale) = leaf_user_unit(pdf, page_ref)?;
-    Ok(PageTransform {
-        rotate_present,
-        rotate,
-        uu_present,
-        scale,
-    })
 }
 
 /// Walk the `/Parent` chain for the first non-null `/Rotate`, mirroring qpdf's

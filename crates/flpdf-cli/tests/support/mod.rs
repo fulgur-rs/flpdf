@@ -99,6 +99,8 @@ pub struct Tuple {
 // ---------------------------------------------------------------------------
 
 /// The output produced when running one tool on one tuple.
+// Different matrix tests inspect different output fields; retain the complete
+// shared record rather than duplicating one narrower record per binary.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     /// Whether the process exited successfully.
@@ -140,6 +142,8 @@ pub enum ComparatorResult {
 }
 
 impl ComparatorResult {
+    // Some matrix binaries use structural matching directly and do not need
+    // this convenience predicate.
     #[allow(dead_code)]
     pub fn is_pass(&self) -> bool {
         matches!(self, Self::Match)

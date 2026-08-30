@@ -36,10 +36,8 @@ fn compute_data_key(
 /// `QPDFWriter::setDataKey` (`libqpdf/QPDFWriter.cc:842-847`). The revision is
 /// retained even though qpdf's `compute_data_key` implementation does not read
 /// it after receiving it.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct WriterEncryptionState {
-    encrypted: bool,
     encryption_key: Vec<u8>,
     encrypt_use_aes: bool,
     encryption_v: i32,
@@ -47,17 +45,15 @@ pub(crate) struct WriterEncryptionState {
     cur_data_key: Option<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 impl WriterEncryptionState {
     pub(crate) fn new(
-        encrypted: bool,
+        _encrypted: bool,
         encryption_key: Vec<u8>,
         encrypt_use_aes: bool,
         encryption_v: i32,
         encryption_r: i32,
     ) -> Self {
         Self {
-            encrypted,
             encryption_key,
             encrypt_use_aes,
             encryption_v,
@@ -66,10 +62,7 @@ impl WriterEncryptionState {
         }
     }
 
-    pub(crate) fn encrypted(&self) -> bool {
-        self.encrypted
-    }
-
+    #[cfg(test)]
     pub(crate) fn encrypt_use_aes(&self) -> bool {
         self.encrypt_use_aes
     }
@@ -180,12 +173,11 @@ mod tests {
     }
 
     #[test]
-    fn disabled_writer_still_follows_qpdf_set_data_key_order() {
+    fn writer_state_still_follows_qpdf_set_data_key_order() {
         let mut state = WriterEncryptionState::new(false, Vec::new(), false, 0, 0);
 
         state.set_data_key(7);
 
-        assert!(!state.encrypted());
         assert_eq!(
             state.current_data_key(),
             Some([0xd7, 0x6b, 0x6e, 0x2a, 0x6e].as_slice())

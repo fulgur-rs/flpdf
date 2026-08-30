@@ -35,7 +35,6 @@ pub enum DecodeLevel {
 /// the qpdf-shaped public setter state separate from the emitter's internal
 /// option representation.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct WriterSettings {
     pub(crate) object_stream_mode: ObjectStreamMode,
     pub(crate) stream_data_mode: Option<StreamDataMode>,

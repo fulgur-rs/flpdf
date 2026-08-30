@@ -197,7 +197,6 @@ pub(crate) struct AcroFormCache {
 /// top-level fields that the caller adds to the destination AcroForm. The
 /// annotation vector is kept separate because qpdf installs it on the page
 /// independently of the field-tree update.
-#[allow(dead_code)] // consumed by the follow-up PageObjectHelper facade slice
 #[derive(Debug, Default)]
 pub(crate) struct AnnotationTransformResult {
     pub(crate) new_annotations: Vec<ObjectHandle>,
@@ -803,12 +802,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Copy annotations into fresh indirect objects and transform their
     /// rectangles, mirroring qpdf's same-document annotation route.
     ///
-    /// This slice covers same-document field-tree and appearance-stream
-    /// copying. Foreign-document defaults, `/DR` resource remapping, and the
-    /// public page-level facade remain in subsequent `flpdf-2tfv` slices; no
-    /// page-level caller switches from the legacy bridge until those slices
-    /// are complete.
-    #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
+    /// This path covers same-document field-tree and appearance-stream
+    /// copying; the page-level facade calls it through the canonical helper.
+    #[allow(clippy::mutable_key_type)]
     pub(crate) fn transform_annotations(
         &mut self,
         old_annots: ObjectHandle,
@@ -870,11 +866,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// the same per-annotation transform loop.
     /// Source/destination `/DA` and `/Q` defaults are reconciled by pinning
     /// the source value onto a copied field that has no explicit value of
-    /// its own, matching qpdf's `adjustInheritedFields`. This slice also
+    /// its own, matching qpdf's `adjustInheritedFields`. This path also
     /// reconciles foreign field `/DA`, `/DR`, and destination `/AcroForm/DR`
-    /// resource-name conflicts; appearance-stream resource privatization
-    /// remains a subsequent slice.
-    #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
+    /// resource-name conflicts and privatizes copied appearance resources.
+    #[allow(clippy::mutable_key_type)]
     pub(crate) fn transform_annotations_from<RS: Read + Seek>(
         &mut self,
         old_annots: ObjectHandle,
@@ -992,7 +987,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(transformed)
     }
 
-    #[allow(dead_code, clippy::mutable_key_type)]
+    #[allow(clippy::mutable_key_type)]
     fn copy_transform_object(
         &mut self,
         source: &ObjectHandle,
@@ -1010,7 +1005,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(Some(copied))
     }
 
-    #[allow(dead_code, clippy::mutable_key_type)]
+    #[allow(clippy::mutable_key_type)]
     fn canonical_top_level_field(&mut self, start: ObjectHandle) -> Result<ObjectHandle> {
         let mut current = self.pdf.resolve_handle(&start)?;
         let mut seen = HashSet::new();
@@ -1034,7 +1029,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
     }
 
-    #[allow(dead_code, clippy::mutable_key_type)]
+    #[allow(clippy::mutable_key_type)]
     fn copy_field_tree(
         &mut self,
         top_field: &ObjectHandle,
@@ -1043,7 +1038,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         self.copy_field_tree_with_overrides(top_field, orig_to_copy, None, None)
     }
 
-    #[allow(dead_code, clippy::mutable_key_type)]
+    #[allow(clippy::mutable_key_type)]
     fn copy_field_tree_with_overrides(
         &mut self,
         top_field: &ObjectHandle,
@@ -1475,7 +1470,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         })
     }
 
-    #[allow(dead_code, clippy::mutable_key_type)]
+    #[allow(clippy::mutable_key_type)]
     fn canonical_fully_qualified_name(&mut self, start: ObjectHandle) -> Result<String> {
         let mut current = self.pdf.resolve_handle(&start)?;
         let mut seen = HashSet::new();
@@ -1946,7 +1941,6 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-#[allow(dead_code)]
 fn copy_and_transform_appearance_streams<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annotation: &ObjectHandle,
@@ -2021,7 +2015,6 @@ fn adjust_copied_appearance_resources<R: Read + Seek>(
     crate::overlay_appearance_stream::adjust_appearance_stream_handle(pdf, copied, &dr_map)
 }
 
-#[allow(dead_code)]
 fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Result<()> {
     let Some(dictionary) = stream.as_stream_dict() else {
         return Ok(());
@@ -2052,7 +2045,6 @@ fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Resu
     Ok(())
 }
 
-#[allow(dead_code)]
 fn matrix_from_handle(handle: &ObjectHandle) -> Option<Matrix> {
     let items = handle.as_array()?;
     if items.len() != 6 {
@@ -2068,7 +2060,6 @@ fn matrix_from_handle(handle: &ObjectHandle) -> Option<Matrix> {
     Some(Matrix::from(numbers))
 }
 
-#[allow(dead_code)]
 fn ensure_foreign_indirect<R: Read + Seek>(
     source: &mut Pdf<R>,
     handle: ObjectHandle,
@@ -2118,7 +2109,6 @@ fn inherited_integer<R: Read + Seek>(
         .and_then(ObjectHandle::as_integer))
 }
 
-#[allow(dead_code)]
 fn transformed_annotation_rectangle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annotation: &ObjectHandle,

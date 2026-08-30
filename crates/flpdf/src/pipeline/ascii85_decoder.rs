@@ -10,7 +10,6 @@ pub(crate) struct Ascii85Decoder<'a> {
     eod: u8,
 }
 
-#[allow(dead_code)]
 impl<'a> Ascii85Decoder<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {

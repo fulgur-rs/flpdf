@@ -149,14 +149,6 @@ impl ObjectCache {
         self.entries.get(&object_ref)
     }
 
-    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
-    pub(crate) fn contains_object_number(&self, number: u32) -> bool {
-        self.entries
-            .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))
-            .next()
-            .is_some()
-    }
-
     pub fn set_resolved(&mut self, object_ref: ObjectRef, handle: ObjectHandle) {
         self.deleted_refs.remove(&object_ref);
         self.entries

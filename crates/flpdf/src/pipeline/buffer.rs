@@ -9,7 +9,6 @@ pub(crate) struct Buffer<'a> {
     ready: bool,
 }
 
-#[allow(dead_code)]
 impl<'a> Buffer<'a> {
     pub(crate) fn new(identifier: impl Into<String>, next: Option<&'a mut dyn Pipeline>) -> Self {
         Self {

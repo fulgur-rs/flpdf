@@ -17,6 +17,8 @@
 //! return when qpdf is absent — they never hard-fail in qpdf-less environments.
 
 #[path = "support/mod.rs"]
+// The shared compatibility helpers are intentionally broader than this test;
+// individual integration binaries consume different subsets of them.
 #[allow(dead_code, unused_imports)]
 mod support;
 

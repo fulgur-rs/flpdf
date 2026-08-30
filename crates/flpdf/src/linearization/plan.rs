@@ -368,33 +368,6 @@ fn is_page_tree_handle(handle: &ObjectHandle) -> Result<bool> {
         || handle.try_is_dictionary_of_type(b"Page", b"")?)
 }
 
-/// Compute the transitive closure of objects reachable from `root`.
-///
-/// Returns the list in discovery order (root first). The walk is breadth-first
-/// over the object graph in general, with one exception for page leaves: a
-/// page's `/Resources` subtree is expanded depth-first and placed ahead of its
-/// `/Contents`. This reproduces qpdf's physical ordering for the first-page
-/// section, where the Resources dictionary (and the fonts/XObjects it points
-/// at) precede the content stream.
-///
-/// ### `/Parent` / `/Kids` handling
-///
-/// When the walker enters a node whose `/Type` is `Pages` (an intermediate
-/// page-tree node), it follows all dictionary entries **except `/Kids`**.
-/// This means page-tree interior nodes (and their inherited `/Resources`) are
-/// included in the closure, but the *sibling pages* hanging off `/Kids` are
-/// not pulled in. The `/Parent` chain is therefore followed at most until the
-/// root Pages node without capturing other pages.
-#[allow(dead_code)] // compatibility wrapper retained for existing closure tests
-fn compute_closure<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    root: ObjectRef,
-    live: &BTreeSet<ObjectRef>,
-    resurrectable: &BTreeSet<ObjectRef>,
-) -> crate::Result<Vec<ObjectRef>> {
-    compute_closure_with_stream_parameters(pdf, root, live, resurrectable, &BTreeSet::new())
-}
-
 fn compute_closure_with_stream_parameters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     root: ObjectRef,
@@ -2298,9 +2271,6 @@ pub(crate) struct ObjStmBatchPlan {
     pub(crate) part4_batches: Vec<RoutedObjStmBatch>,
 }
 
-// These items are consumed by the upcoming ObjStm linearized writer (5.8.2+);
-// suppress dead_code until that code lands.
-#[allow(dead_code)]
 impl LinearizationPlan {
     /// Build a Part-tagged ObjStm packing plan from this `LinearizationPlan`.
     ///

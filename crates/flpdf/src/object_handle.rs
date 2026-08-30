@@ -53,8 +53,8 @@
 //!
 //! The content-family surface below is a direct qpdf 11.9.0 responsibility
 //! mapping. The qpdf declarations and implementation ranges are kept beside
-//! the Rust entry points so a later consumer cutover can verify that it uses
-//! one canonical route rather than adding a second parser or decoder.
+//! the Rust entry points so every consumer can be checked against one
+//! canonical route rather than adding a second parser or decoder.
 //!
 //! | qpdf 11.9.0 declaration/implementation | flpdf entry point | regression evidence |
 //! | --- | --- | --- |
@@ -463,8 +463,6 @@ pub(crate) trait DocumentResolver {
     /// it; qpdf has no resolver that cannot warn, so reaching this default is
     /// the same condition as qpdf's null context, which `QPDFObjectHandle::warn`
     /// also turns into a thrown exception.
-    #[allow(dead_code)] // reached once the try_* accessors gain production
-                        // consumers in flpdf-25kg.3.6
     fn warn(&self, message: String) -> Result<()> {
         Err(Error::Internal(format!(
             "warning raised through a resolver with no document warning sink: {message}"
@@ -742,7 +740,6 @@ pub(crate) struct ChildDescription {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct JsonDescription {
     pub(crate) input: String,
     pub(crate) object: String,
@@ -751,7 +748,6 @@ pub(crate) struct JsonDescription {
 #[derive(Clone)]
 pub(crate) enum ObjectDescription {
     Template(String),
-    #[allow(dead_code)]
     Json(JsonDescription),
     Child(ChildDescription),
 }
@@ -1675,9 +1671,6 @@ impl ObjectHandle {
     /// qpdf-native shape: upstream one `QPDF*` carries both identity and the
     /// resolver, while [`Self::new_indirect_for_pdf_with_resolver`] is what a
     /// handle vended by a `Pdf` needs.
-    #[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5;
-                        // this primitive slice exercises the constructor with
-                        // sealed resolver unit tests only
     pub(crate) fn new_indirect_with_resolver(
         object_ref: ObjectRef,
         resolver: Weak<dyn DocumentResolver>,
@@ -1789,7 +1782,6 @@ impl ObjectHandle {
         }
     }
 
-    #[allow(dead_code)] // consumed by the staged mutation boundary below
     fn remove_state_owner(
         owners: &Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
         slot_to_remove: &Rc<RefCell<ObjectSlot>>,
@@ -1929,7 +1921,6 @@ impl ObjectHandle {
     /// than copying it (`QPDFObject_private.hh:117-120`). The two Rust
     /// [`ObjectHandle`] slots therefore retain separate object metadata while
     /// sharing the payload and its mutation visibility.
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn share_value_state_with(&self, source: &Self) -> Result<()> {
         if self.is_same_object_as(source) {
             return Ok(());
@@ -1988,7 +1979,7 @@ impl ObjectHandle {
 
     /// Turn an indirect canonical slot into the floating null object qpdf
     /// leaves behind after `removeObject`.
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    #[cfg(test)]
     pub(crate) fn remove_from_document(&self) {
         if !self.is_indirect() {
             return;
@@ -2013,7 +2004,6 @@ impl ObjectHandle {
     /// payload during promotion. This is the corresponding primitive here:
     /// every alias keeps its `Rc` identity while this slot receives its active
     /// object reference, document identity, and weak resolver.
-    #[allow(dead_code)] // consumer migration in flpdf-25kg.3.6 will use this primitive
     pub(crate) fn promote_to_indirect(
         &self,
         object_ref: ObjectRef,
@@ -2124,8 +2114,9 @@ impl ObjectHandle {
     /// copy, or `None` for an indirect handle. It is not the qpdf-native
     /// promotion primitive — qpdf promotes by registering and updating the
     /// existing `QPDFObject` allocation (`libqpdf/QPDF.cc:1835-1839,1882-1897`).
-    /// Consumer migration to [`Self::promote_to_indirect`] is scheduled in
-    /// `flpdf-25kg.3.6`.
+    /// Canonical callers use [`Self::promote_to_indirect`]; this helper remains
+    /// for the legacy public allocator whose copy semantics are part of its
+    /// existing contract.
     ///
     /// qpdf shares the *whole* `QPDFObject`: `QPDF::makeIndirectObject`
     /// registers `oh.getObj()`, the caller's existing allocation, under a
@@ -2136,12 +2127,11 @@ impl ObjectHandle {
     /// mutability) while `stream_data` is a per-value field, so sharing the
     /// dictionary alone would let a later [`Self::replace_stream_data`]
     /// rewrite one stream's `/Length`/`/Filter`/`/DecodeParms` while
-    /// swapping the other's bytes — the promoted object would describe
-    /// payload it does not hold. Until whole-object promotion lands, the
-    /// stream dictionary is privatized like any other direct child so each
-    /// slot stays internally consistent; the payload `Rc` is shared, which
-    /// is safe because replacing it swaps a field rather than mutating the
-    /// buffer.
+    /// swapping the other's bytes — the copied object would describe payload
+    /// it does not hold. The stream dictionary is privatized like any other
+    /// direct child so each copied slot stays internally consistent; the
+    /// payload `Rc` is shared, which is safe because replacing it swaps a
+    /// field rather than mutating the buffer.
     ///
     /// # Errors
     ///
@@ -2446,8 +2436,6 @@ impl ObjectHandle {
     /// weak resolver here; programmatic direct handles and
     /// `QPDFObjectHandle::parse`-equivalent explicit parses remain
     /// contextless.
-    #[allow(dead_code)] // reached through the try_* accessors, whose own
-                        // production consumers land with flpdf-25kg.3.6
     pub(crate) fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
         // qpdf's `setChildDescription` copies the owning QPDF onto the child
         // (`libqpdf/QPDFObject_private.hh:79-91`). A missing-key null can be
@@ -2500,7 +2488,6 @@ impl ObjectHandle {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_description_json(&self, input: String, object: String, offset: i64) {
         let mut slot = self.0.borrow_mut();
         slot.description = Some(ObjectDescription::Json(JsonDescription { input, object }));
@@ -2526,7 +2513,6 @@ impl ObjectHandle {
     /// object description and renders a bare message only when that
     /// description is empty; this port forms the same prefix before the
     /// contextless error is returned.
-    #[allow(dead_code)] // same deferred consumers as `context`
     fn warn_through_context(&self, message: String) -> Result<()> {
         match self.context() {
             Some(context) => context.warn(message),
@@ -2578,7 +2564,6 @@ impl ObjectHandle {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_description(&self, description: String, offset: i64) {
         let mut slot = self.0.borrow_mut();
         slot.description = Some(ObjectDescription::Template(description));
@@ -2602,7 +2587,6 @@ impl ObjectHandle {
         self.0.borrow_mut().description = None;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_child_description(
         &self,
         parent: &ObjectHandle,
@@ -2629,7 +2613,6 @@ impl ObjectHandle {
     ///
     /// Returns [`crate::Error::System`] when no owning document is reachable,
     /// mirroring the exception qpdf throws instead of warning.
-    #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn type_warning(&self, expected_type: &str, warning: &str) -> Result<()> {
         self.try_dereference()?;
         let desc = self.description();
@@ -2666,7 +2649,6 @@ impl ObjectHandle {
     ///
     /// Propagates a resolution failure from a document that is still
     /// reachable, and reports a sink that refuses the message.
-    #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn warn_if_possible(&self, warning: &str) -> Result<()> {
         if let Some(context) = self.context() {
             self.try_dereference()?;
@@ -2694,7 +2676,6 @@ impl ObjectHandle {
     ///
     /// Returns [`crate::Error::System`] when no owning document is reachable,
     /// mirroring the exception qpdf throws instead of warning.
-    #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn object_warning(&self, warning: &str) -> Result<()> {
         let desc = self.description();
         let prefix = if desc.is_empty() {
@@ -2717,7 +2698,6 @@ impl ObjectHandle {
     /// dictionary accessors branch on. It raises no warning of its own; the
     /// warning belongs to [`Self::try_get_key`] and [`Self::try_get_keys`],
     /// which is where qpdf places it.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_dictionary(
         &self,
     ) -> Result<Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>>> {
@@ -2741,7 +2721,6 @@ impl ObjectHandle {
     /// # Errors
     ///
     /// Propagates resolution failures.
-    #[allow(dead_code)] // consumed by flpdf-h8mv after this prerequisite lands
     pub fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         self.try_dereference()?;
         let Some(entries) = self.as_dictionary() else {
@@ -2758,7 +2737,6 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible name inspection with lazy dereference.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_name(&self) -> Result<Option<Vec<u8>>> {
         self.try_dereference()?;
         Ok(self.as_name())
@@ -2770,7 +2748,6 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFObjectHandle.cc:456-459`). qpdf's canonical name string
     /// includes its leading slash; [`ObjectValue::Name`] follows this crate's
     /// existing representation and stores the same decoded bytes without it.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
     pub(crate) fn try_is_name_and_equals(&self, name: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         Ok(self.with_value(
@@ -2785,7 +2762,6 @@ impl ObjectHandle {
     /// inspect the holder as a name first, then inspect array items one at a
     /// time (`libqpdf/QPDFObjectHandle.cc:1027-1039`). Each array borrow ends
     /// before the selected child is resolved.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
     pub(crate) fn try_is_or_has_name(&self, name: &[u8]) -> Result<bool> {
         if self.try_is_name_and_equals(name)? {
             return Ok(true);
@@ -2814,7 +2790,6 @@ impl ObjectHandle {
     /// keys use qpdf's canonical leading slash; the requested type names
     /// remain decoded name bytes without it, such as
     /// `CryptFilterDecodeParms`.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
     pub(crate) fn try_is_dictionary_of_type(
         &self,
         type_name: &[u8],
@@ -2868,7 +2843,6 @@ impl ObjectHandle {
 
     /// qpdf-compatible array inspection with lazy dereference. Only the array
     /// itself is resolved; each returned child keeps its own identity.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_array(&self) -> Result<Option<Vec<ObjectHandle>>> {
         if !self.is_initialized() {
             return Ok(None);
@@ -3117,7 +3091,6 @@ impl ObjectHandle {
     /// divergence predates this accessor and is not widened by it; folding
     /// qpdf's treat-as-empty in here would silently turn a rejected `/Filter`
     /// into an accepted unfiltered stream.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_array_len(&self) -> Result<Option<usize>> {
         self.try_dereference()?;
         Ok(self.with_value(|value| match value {
@@ -3137,7 +3110,6 @@ impl ObjectHandle {
     /// index (`:776-785`). This prerequisite's consumer only calls after both
     /// arrays have equal, known lengths, so invalid-domain diagnostics remain
     /// outside this method and are represented as `None` rather than guessed.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
     pub(crate) fn try_array_item(&self, index: usize) -> Result<Option<ObjectHandle>> {
         self.try_dereference()?;
         Ok(self.with_value(|value| match value {
@@ -3211,7 +3183,6 @@ impl ObjectHandle {
     ///
     /// Ports `QPDFObjectHandle::asInteger`, the silent internal helper.
     /// [`Self::try_get_int_value`] is the accessor that warns.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_integer(&self) -> Result<Option<i64>> {
         self.try_dereference()?;
         Ok(self.as_integer())
@@ -3228,7 +3199,6 @@ impl ObjectHandle {
     /// Propagates resolution failures, and — for a receiver with no reachable
     /// document — the error reported by the internal type-warning boundary
     /// appears in place of the warning.
-    #[allow(dead_code)]
     pub fn try_get_int_value(&self) -> Result<i64> {
         match self.try_as_integer()? {
             Some(value) => Ok(value),
@@ -3374,7 +3344,6 @@ impl ObjectHandle {
     /// warning sink itself fails (no default logger sink, a resolver with no
     /// warn receiver) still propagates that failure here, and the saturated
     /// value is not returned in that case.
-    #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn try_get_int_value_as_int(&self) -> Result<i32> {
         let value = self.try_get_int_value()?;
         if value < i64::from(i32::MIN) {
@@ -3407,7 +3376,6 @@ impl ObjectHandle {
     /// # Errors
     ///
     /// Propagates resolution failures.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
         let (is_dictionary, child) = self.with_value(|value| match value {
@@ -3508,7 +3476,6 @@ impl ObjectHandle {
     // `libqpdf/qpdf/QPDFValue.hh:90-100`). The live parser wires up callers;
     // this remains exposed so this module's own tests can exercise the
     // set-once contract independently.
-    #[allow(dead_code)]
     pub(crate) fn set_parsed_offset_if_unset(&self, offset: i64) {
         let mut slot = self.0.borrow_mut();
         if slot.parsed_offset < 0 {
@@ -4315,7 +4282,6 @@ impl ObjectHandle {
     /// latter remains a no-hidden-I/O helper for legacy mutation paths, while
     /// qpdf's public array mutators call `asArray()` and therefore resolve
     /// their holder first.
-    #[allow(dead_code)] // consumed by the array mutator family above
     fn prepare_array_mutation(&self, warning: &str) -> Result<bool> {
         self.try_dereference()?;
         if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
@@ -4386,7 +4352,7 @@ impl ObjectHandle {
     /// Replace an existing array item with `value`, preserving `value`'s
     /// shared handle identity. Returns `false` when this handle is not an
     /// array or `index` is out of bounds.
-    #[allow(dead_code)] // retained for its focused primitive tests until the old NNTree test route is removed
+    #[cfg(test)]
     pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
         if self.would_create_direct_cycle(&value) {
             return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
@@ -4412,7 +4378,7 @@ impl ObjectHandle {
     /// Replace every item in this live array while preserving the array
     /// handle itself. Returns `false` for a non-array handle or when the
     /// replacement would create a direct value-alias cycle.
-    #[allow(dead_code)] // retained for the canonical array-mutation primitive and its tests
+    #[cfg(test)]
     pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
         if items
             .iter()

@@ -95,7 +95,6 @@ pub enum PipelineError {
     Runtime(PipelineErrorDetail),
 }
 
-#[allow(dead_code)]
 impl PipelineError {
     pub fn logic(message: impl AsRef<[u8]>) -> Self {
         Self::Logic(PipelineErrorDetail::new(message))
@@ -117,6 +116,7 @@ impl PipelineError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn message_bytes(&self) -> &[u8] {
         match self {
             Self::Logic(message) | Self::Runtime(message) => message.as_bytes(),
@@ -274,7 +274,6 @@ mod tests {
     use crate::pipeline::count::Count;
     use crate::pipeline::test_support::{RecordingSink, TraceCall};
 
-    #[allow(dead_code)]
     struct FaultSink {
         id: &'static str,
         writes: usize,

@@ -60,47 +60,6 @@ impl EncryptedStringEmitter {
         }
     }
 
-    /// Emit an ObjectHandle tree with qpdf's per-object string-encryption
-    /// lifecycle. The handle walker retains indirect identity and the source
-    /// graph is never materialized or mutated. `/Encrypt` itself is emitted
-    /// through [`write_encryption_dictionary_handle`] and therefore stays
-    /// plaintext.
-    #[allow(dead_code)] // consumed by the writer ObjectHandle cutover
-    pub(crate) fn write_handle_object(
-        &mut self,
-        out: &mut Vec<u8>,
-        emitted_ref: ObjectRef,
-        object_stream_index: Option<u32>,
-        object: &ObjectHandle,
-        qdf: bool,
-    ) -> crate::Result<()> {
-        if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
-        }
-
-        let cipher = self.cipher;
-        let static_aes_iv = self.static_aes_iv;
-        let aes_iv_generator = self.aes_iv_generator.as_mut();
-        self.state
-            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
-                    write_encrypted_or_plain_string(
-                        state,
-                        cipher,
-                        static_aes_iv,
-                        aes_iv_generator,
-                        out,
-                        plaintext,
-                    )
-                };
-                if qdf {
-                    object.write_object_qdf_with_string_writer(out, 0, &mut write_string)
-                } else {
-                    object.write_object_with_string_writer(out, &mut write_string)
-                }
-            })
-    }
-
     /// Handle-based object emission with the writer's output reference map and
     /// qpdf's removed-reference null policy threaded through the same string
     /// encryption lifecycle.
@@ -196,54 +155,6 @@ impl EncryptedStringEmitter {
                     removed_refs,
                     &mut write_string,
                 )
-            })
-    }
-
-    /// Emit an ObjectHandle stream dictionary with the same encryption switch
-    /// used by the legacy writer. Stream payload bytes are intentionally not
-    /// handled here; the caller must put the handle's payload through the
-    /// canonical stream pipeline, and `encrypt_strings` is the cleartext
-    /// metadata exemption selected by qpdf's stream writer.
-    #[allow(dead_code)] // consumed by the writer ObjectHandle cutover
-    pub(crate) fn write_handle_stream_dict(
-        &mut self,
-        out: &mut Vec<u8>,
-        emitted_ref: ObjectRef,
-        object_stream_index: Option<u32>,
-        dict: &ObjectHandle,
-        options: StreamDictOptions,
-    ) -> crate::Result<()> {
-        if !options.encrypt_strings {
-            if options.qdf {
-                return dict.write_stream_body_qdf(out, 0);
-            }
-            return dict.write_stream_body(out, options.refiltered);
-        }
-
-        let cipher = self.cipher;
-        let static_aes_iv = self.static_aes_iv;
-        let aes_iv_generator = self.aes_iv_generator.as_mut();
-        self.state
-            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
-                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
-                    write_encrypted_or_plain_string(
-                        state,
-                        cipher,
-                        static_aes_iv,
-                        aes_iv_generator,
-                        out,
-                        plaintext,
-                    )
-                };
-                if options.qdf {
-                    dict.write_stream_body_qdf_with_string_writer(out, 0, &mut write_string)
-                } else {
-                    dict.write_stream_body_with_string_writer(
-                        out,
-                        options.refiltered,
-                        &mut write_string,
-                    )
-                }
             })
     }
 

@@ -12,9 +12,9 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::json_inspect::{DecodeLevel, StreamDataMode};
-use flpdf::{
-    document_json, Error, ObjectHandle, ObjectRef, Pdf, Pipeline, PipelineError, PipelineResult,
-};
+#[cfg(test)]
+use flpdf::ObjectRef;
+use flpdf::{document_json, Error, ObjectHandle, Pdf, Pipeline, PipelineError, PipelineResult};
 
 use super::emit_new_diagnostics;
 
@@ -173,8 +173,9 @@ pub(crate) fn run_test_88<R: Read + Seek>(
 /// Not wired into `driver::run`'s dispatch: qpdf builds test 89's `pdf` via
 /// `QPDF::createFromJSON`, which has no flpdf equivalent (`driver::run`
 /// short-circuits `n == 89` before it would ever reach a dispatch call).
-/// Kept for when that primitive lands.
-#[allow(dead_code)]
+/// The body remains available to the unit test below so its covered mutation
+/// behavior stays explicit without adding an unreachable production entry.
+#[cfg(test)]
 pub(crate) fn run_test_89<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
