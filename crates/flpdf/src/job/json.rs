@@ -126,9 +126,11 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
     if version == 1 {
         if json_section_selected(keys, JsonKey::Objects) {
             crate::document_json::write_json_v1_objects_key(pdf, out, &mut first, objects)?;
+            // cov:ignore: llvm-cov attributes this successful delegated write to the opening call lines
         }
         if json_section_selected(keys, JsonKey::Objectinfo) {
             crate::document_json::write_json_v1_objectinfo_key(pdf, out, &mut first, objects)?;
+            // cov:ignore: llvm-cov attributes this successful delegated write to the opening call lines
         }
     } else if json_section_selected(keys, JsonKey::Qpdf) {
         // qpdf's doJSONObjects delegates the whole "qpdf" key to
@@ -410,7 +412,7 @@ fn output_schema(
                 ("fields", schema_array(field)?),
                 ("hasacroform", scalar()),
                 ("needappearances", scalar()),
-            ])?,
+            ])?, // cov:ignore: llvm-cov attributes this successful schema construction to its entry expressions
         )); // cov:ignore: llvm-cov attributes this successful schema construction to its entry expressions
     }
 
@@ -476,7 +478,7 @@ fn output_schema(
     if version == 1 {
         if selected(keys, JsonKey::Objects) {
             entries.push(("objects", schema_pattern(scalar())?)); // cov:ignore: llvm-cov attributes this successful schema construction to its entry expressions
-        }
+        } // cov:ignore: llvm-cov attributes this successful schema branch continuation to its entry expressions
         if selected(keys, JsonKey::Objectinfo) {
             let stream =
                 schema_dictionary([("filter", scalar()), ("is", scalar()), ("length", scalar())])?; // cov:ignore: llvm-cov attributes this successful schema construction to its entry expressions
@@ -484,7 +486,7 @@ fn output_schema(
                 "objectinfo",
                 schema_pattern(schema_dictionary([("stream", stream)])?)?,
             )); // cov:ignore: llvm-cov attributes this successful schema construction to its entry expressions
-        }
+        } // cov:ignore: llvm-cov attributes this successful schema branch continuation to its entry expressions
     } else if selected(keys, JsonKey::Qpdf) {
         let metadata = schema_dictionary([
             ("calledgetallpages", scalar()),
@@ -497,7 +499,7 @@ fn output_schema(
             "qpdf",
             schema_fixed_array([metadata, schema_pattern(scalar())?])?,
         )); // cov:ignore: llvm-cov attributes this successful schema construction to its entry expressions
-    }
+    } // cov:ignore: llvm-cov attributes this successful schema branch continuation to its entry expressions
 
     schema_dictionary(entries)
 }

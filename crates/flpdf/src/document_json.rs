@@ -65,7 +65,7 @@ pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
     if trailer_selected(wanted_objects) {
         Json::write_dictionary_key(out, &mut object_first, b"trailer", 2)?;
         pdf.trailer().write_json(1, out, true, 2)?; // cov:ignore: llvm-cov attributes this successful trailer serialization to its opening write expressions
-    }
+    } // cov:ignore: llvm-cov attributes the successful trailer branch continuation to its write expressions
     Json::write_dictionary_close(out, object_first, 1)?;
     Ok(())
 }

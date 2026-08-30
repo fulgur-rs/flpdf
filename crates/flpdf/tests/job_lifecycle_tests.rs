@@ -1437,6 +1437,20 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     bad_job.initialize_from_json(&bad_json).unwrap();
     assert_eq!(bad_job.run().unwrap(), JobExitCode::Error);
 
+    let missing_update = tempdir.path().join("missing-update.json");
+    let missing_update_output = tempdir.path().join("missing-update.pdf");
+    let missing_update_json = serde_json::json!({
+        "inputFile": minimal,
+        "outputFile": missing_update_output,
+        "updateFromJson": missing_update
+    })
+    .to_string();
+    let mut missing_update_job = QPDFJob::new();
+    missing_update_job
+        .initialize_from_json(&missing_update_json)
+        .unwrap();
+    assert_eq!(missing_update_job.run().unwrap(), JobExitCode::Error);
+
     let replace_input = tempdir.path().join("replace.pdf");
     std::fs::copy(&minimal, &replace_input).unwrap();
     let replace_json = serde_json::json!({
