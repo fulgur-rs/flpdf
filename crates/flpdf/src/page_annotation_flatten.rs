@@ -510,7 +510,7 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
         let root = pdf.root_handle()?;
         root.try_get_key(b"/AcroForm")?.warn_if_possible(
             "document does not have updated appearance streams, so form fields will not be flattened",
-        )?;
+        )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
     }
     let default_resources = acroform_default_resources(pdf)?;
     // qpdf resolves the Widget's field helper from one cached
