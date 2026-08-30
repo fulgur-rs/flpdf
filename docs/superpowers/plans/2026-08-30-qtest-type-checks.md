@@ -17,11 +17,11 @@
 - Test: the source-near `#[cfg(test)]` module in the same file
 - Read: `/home/ubuntu/.cache/flpdf/qpdf-11.9.0/qpdf/test_driver.cc:1407-1549`
 
-- [ ] **Step 1: Expand the Rust fixture to contain the qpdf test-42 shape**
+- [x] **Step 1: Expand the Rust fixture to contain the qpdf test-42 shape**
 
 Extend `pdf_with_object_types_qtest()` with a page whose `/Contents` is an indirect stream, a `/QTest/Dictionary` containing `/Key1 /Value1`, `/Key2` with `/Item0` through `/Item2`, and `/Integer` as an indirect integer. Keep this fixture authored in flpdf; do not copy qpdf-qtest fixtures or expected output files into the workspace.
 
-- [ ] **Step 2: Require warning output in the existing driver test**
+- [x] **Step 2: Require warning output in the existing driver test**
 
 Replace the current `assert!(stderr.is_empty())` in `object_type_and_form_presence_paths_use_canonical_resolution` with:
 
@@ -36,7 +36,7 @@ assert!(warning_text.contains("test 42 done"));
 
 Retain the separate test-43 assertions in the same test function.
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 ```bash
 cargo test -p flpdf-qtest-tools --lib object_type_and_form_presence_paths_use_canonical_resolution
@@ -44,7 +44,7 @@ cargo test -p flpdf-qtest-tools --lib object_type_and_form_presence_paths_use_ca
 
 Expected: the test executes the current `run_test_42` GAP and fails because its stderr has no type-operation warnings. A fixture or compile failure is not an acceptable RED result.
 
-- [ ] **Step 4: Commit the RED test**
+- [x] **Step 4: Commit the RED test**
 
 ```bash
 git add crates/flpdf-qtest-tools/src/driver/test_42_49.rs
@@ -58,7 +58,7 @@ git commit -m "test(qtest): require type-check warning output"
 - Test: source-near tests in `object_handle.rs`
 - Modify: `crates/flpdf/src/lib.rs` only when a new public helper type needs re-exporting
 
-- [ ] **Step 1: Add failing core tests for warning context and fallback values**
+- [x] **Step 1: Add failing core tests for warning context and fallback values**
 
 Add a parsed-document test that invokes the warning-producing family and checks both values and `Pdf::repair_diagnostics()`. The assertions must cover:
 
@@ -76,7 +76,7 @@ assert_eq!(dictionary.try_get_numeric_value().unwrap(), 0.0);
 
 The test must verify the actual object description, expected type, found type, and warning order. Add a contextless direct-handle case that expects the existing `Error::System` boundary instead of silently printing.
 
-- [ ] **Step 2: Implement scalar qpdf accessors once in ObjectHandle**
+- [x] **Step 2: Implement scalar qpdf accessors once in ObjectHandle**
 
 Reuse `try_dereference`, silent `as_*` inspection, `type_warning`, and `warn_if_possible`. Add these public fallible facades:
 
@@ -94,7 +94,7 @@ pub fn try_get_inline_image_value(&self) -> Result<Vec<u8>>;
 
 Each wrong-type branch calls `type_warning(expected, fallback_message)` before returning qpdf's zero-like value. Valid real/name values preserve qpdf's spelling and leading-slash conventions.
 
-- [ ] **Step 3: Add failing tests for array/dictionary operations**
+- [x] **Step 3: Add failing tests for array/dictionary operations**
 
 Cover non-array length/vector/item/mutator calls, negative and oversized indexes, non-dictionary key/map operations, missing-key child descriptions, and `getKeyIfDict` null short-circuit:
 
@@ -110,7 +110,7 @@ assert!(null.try_get_key_if_dict(b"/Integer").unwrap().is_null());
 
 Verify that invalid mutations leave the original value unchanged and that a missing dictionary key gets a child description rather than a non-dictionary warning.
 
-- [ ] **Step 4: Implement container accessors and signed-index qpdf faces**
+- [x] **Step 4: Implement container accessors and signed-index qpdf faces**
 
 Promote the already qpdf-shaped `type_warning`, `object_warning`, `try_get_key`, `try_get_keys`, `try_has_key`, `try_get_int_value`, and `try_array_len` as public canonical operations. Add:
 
@@ -128,7 +128,7 @@ pub fn try_erase_array_item_at(&self, index: i64) -> Result<()>;
 
 Perform explicit signed bounds checks before conversion to `usize`; do not encode negative indexes or absence as a sentinel. Preserve qpdf's type-warning versus object-warning distinction.
 
-- [ ] **Step 5: Run core RED/GREEN and commit**
+- [x] **Step 5: Run core RED/GREEN and commit**
 
 ```bash
 cargo test -p flpdf --lib object_handle::qpdf_type_check
@@ -146,7 +146,7 @@ Expected: the new tests and the pre-existing ObjectHandle tests pass.
 - Modify: `crates/flpdf/src/lib.rs`
 - Test: source-near tests in `object_handle.rs`
 
-- [ ] **Step 1: Add failing geometry/state/cursor tests**
+- [x] **Step 1: Add failing geometry/state/cursor tests**
 
 Cover valid and invalid Rectangle/Matrix arrays, non-numeric children, empty/end cursors, decrement-before-begin, increment-after-end, and a default/uninitialized handle:
 
@@ -165,7 +165,7 @@ assert!(!uninitialized.try_is_integer().unwrap());
 assert!(uninitialized.try_dereference().is_err());
 ```
 
-- [ ] **Step 2: Implement qpdf ObjectHandle geometry**
+- [x] **Step 2: Implement qpdf ObjectHandle geometry**
 
 Add public `ObjectHandleMatrix` with fields `a` through `f`, `new`, and all-zero `Default`. Add:
 
@@ -180,11 +180,11 @@ pub fn try_get_array_as_matrix(&self) -> Result<ObjectHandleMatrix>;
 
 Resolve the receiver, inspect exact length and numeric children without warnings, and return qpdf's default geometry for invalid shapes. Do not change `flpdf::Matrix::default()`, which is the affine identity.
 
-- [ ] **Step 3: Implement Rust-native reversible cursors**
+- [x] **Step 3: Implement Rust-native reversible cursors**
 
 Add public `ArrayItems`/`ArrayItemCursor` and `DictItems`/`DictItemCursor` owned by ObjectHandle. Provide `begin`, `current`, `next`, `previous`, `is_end`, and initialized-state transitions. C++ mutable-reference aliasing is not reproduced unsafely; `current()` returns the live handle/value at the cursor position. Cursors use canonical handles and never materialize raw `Object` trees.
 
-- [ ] **Step 4: Add explicit initialized state**
+- [x] **Step 4: Add explicit initialized state**
 
 Add an `initialized: bool` field to `ObjectSlot`, set it for every existing constructor, and add:
 
@@ -200,7 +200,7 @@ pub fn is_initialized(&self) -> bool;
 
 `try_dereference` returns the existing qpdf-equivalent `Error::Internal` for uninitialized state. Initialized null, unresolved, reserved, and destroyed states remain distinct.
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 ```bash
 cargo test -p flpdf --lib object_handle::qpdf_geometry
@@ -216,11 +216,11 @@ git commit -m "feat(object): port qpdf type-check geometry and cursors"
 - Modify: `crates/flpdf-qtest-tools/src/driver/test_42_49.rs`
 - Test: the same file's exact stdout/stderr unit tests
 
-- [ ] **Step 1: Port setup and cursors in source order**
+- [x] **Step 1: Port setup and cursors in source order**
 
 Resolve `/QTest`, `/Dictionary`, `/Key2`, `/Integer`, and the first page through canonical handles. Use the new qpdf-facing methods and cursor state assertions.
 
-- [ ] **Step 2: Port every warning-producing operation**
+- [x] **Step 2: Port every warning-producing operation**
 
 Implement qpdf `test_driver.cc:1449-1495` in order:
 
@@ -239,11 +239,11 @@ integer.try_set_array_item_at(0, ObjectHandle::null())?;
 
 Call `emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?` immediately after every warning-producing operation. Keep the `One error` and `Two errors` markers at qpdf's exact positions.
 
-- [ ] **Step 3: Port nested descriptions, stream dictionary, geometry, and state**
+- [x] **Step 3: Port nested descriptions, stream dictionary, geometry, and state**
 
 Use the warning-producing key and scalar methods for `/Quack`, invalid array items, and the stream dictionary. Keep all Rectangle/Matrix and uninitialized assertions. Return through the existing outer `test 42 done` path; do not print warning literals.
 
-- [ ] **Step 4: Add exact driver assertions and run tests**
+- [x] **Step 4: Add exact driver assertions and run tests**
 
 Assert the synthetic fixture's exact warning bytes in the unit test, then run:
 
@@ -254,7 +254,7 @@ cargo test -p flpdf --lib object_handle
 
 Build release binaries and run `type-checks.test` against a writable copy of `vendor/qpdf-qtest`; require Total tests 6, Passes 6, Failures 0, Errors 0.
 
-- [ ] **Step 5: Commit the driver cutover**
+- [x] **Step 5: Commit the driver cutover**
 
 ```bash
 git add crates/flpdf-qtest-tools/src/driver/test_42_49.rs
@@ -268,7 +268,7 @@ git commit -m "feat(qtest): port test driver type checks"
 - Read: `/home/ubuntu/flpdf-qtest/allowlist.txt`
 - Read: paired final `harness.log` and `qtest-results.xml`
 
-- [ ] **Step 1: Run implementation-worktree quality gates**
+- [x] **Step 1: Run implementation-worktree quality gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -280,11 +280,11 @@ python3 scripts/check-qpdf-deviation-markers.py --check
 bash scripts/qpdf-test-driver-diff.sh --check
 ```
 
-- [ ] **Step 2: Run full qtest with paired artifacts**
+- [x] **Step 2: Run full qtest with paired artifacts**
 
 Use a writable copied datadir and `QTEST_FULL=1 ./scripts/run.sh` with all ten release binary variables from the qtest README. Keep the same-run `harness.log` and `qtest-results.xml` pair. Confirm `type-checks 3` and `type-checks 4` are ordinary PASS outcomes before editing the JSONL ledger.
 
-- [ ] **Step 3: Validate and record evidence**
+- [x] **Step 3: Validate and record evidence**
 
 ```bash
 python3 scripts/verify-parity-manifest.py survey/latest/harness.log survey/latest/qtest-results.xml parity/qtest-11.9.0.jsonl
