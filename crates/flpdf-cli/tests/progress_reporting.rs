@@ -341,6 +341,95 @@ fn remove_attachment_keeps_progress_off_stdout() {
     );
 }
 
+/// Build a classic-xref (no object streams) PDF with an embedded attachment
+/// and then corrupt its `startxref` offset the same way
+/// `tests/fixtures/test_driver/repairable_input.pdf` is corrupted, so
+/// opening it triggers qpdf-shaped xref reconstruction warnings while still
+/// carrying an attachment to remove.
+fn damaged_pdf_with_attachment(dir: &Path, key: &str) -> PathBuf {
+    let input = fixture("one-page.pdf");
+    let attachment_path = dir.join("payload.txt");
+    std::fs::write(&attachment_path, b"attachment payload").expect("attachment");
+    let clean_path = dir.join("clean-with-attachment.pdf");
+
+    let add = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--object-streams=disable", "--add-attachment"])
+        .arg(&attachment_path)
+        .arg(format!("--key={key}"))
+        .arg("--")
+        .arg(&input)
+        .arg(&clean_path)
+        .output()
+        .expect("flpdf invocation");
+    assert!(
+        add.status.success(),
+        "add-attachment failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let bytes = std::fs::read(&clean_path).expect("read clean pdf");
+    let marker_start = rfind_bytes(&bytes, b"startxref\n").expect("startxref present");
+    let eof_offset = rfind_bytes(&bytes, b"%%EOF").expect("%%EOF present");
+    let mut damaged = bytes[..marker_start].to_vec();
+    damaged.extend_from_slice(b"startxref\n0\n");
+    damaged.extend_from_slice(&bytes[eof_offset..]);
+
+    let damaged_path = dir.join("damaged-with-attachment.pdf");
+    std::fs::write(&damaged_path, damaged).expect("write damaged pdf");
+    damaged_path
+}
+
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+#[test]
+fn remove_attachment_stdout_output_omits_the_resulting_file_warning_suffix() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let damaged = damaged_pdf_with_attachment(tempdir.path(), "repkey");
+
+    let file_output_path = tempdir.path().join("removed-file.pdf");
+    let file_output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .arg("--remove-attachment=repkey")
+        .arg(&damaged)
+        .arg(&file_output_path)
+        .output()
+        .expect("flpdf invocation");
+    assert_eq!(file_output.status.code(), Some(3));
+    let file_stderr = String::from_utf8(file_output.stderr).expect("diagnostics are UTF-8");
+    assert!(
+        file_stderr
+            .contains("operation succeeded with warnings; resulting file may have some problems"),
+        "stderr: {file_stderr}"
+    );
+
+    let stdout_output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .arg("--remove-attachment=repkey")
+        .arg(&damaged)
+        .arg("-")
+        .output()
+        .expect("flpdf invocation");
+    assert_eq!(stdout_output.status.code(), Some(3));
+    assert!(stdout_output.stdout.starts_with(b"%PDF-1.3\n"));
+    let stdout_stderr = String::from_utf8(stdout_output.stderr).expect("diagnostics are UTF-8");
+    assert!(
+        stdout_stderr.contains("operation succeeded with warnings\n"),
+        "stderr: {stdout_stderr}"
+    );
+    assert!(
+        !stdout_stderr.contains("resulting file may have some problems"),
+        "stdout output must not report a file-creation warning suffix: {stdout_stderr}"
+    );
+}
+
 #[test]
 fn progress_rotate_to_a_valid_destination_still_reports_progress() {
     let input = fixture("one-page.pdf");
@@ -469,6 +558,39 @@ fn progress_rotate_to_a_fifo_destination_does_not_hang() {
         bytes.starts_with(b"%PDF-1.3\n"),
         "fifo reader did not receive the rewritten PDF"
     );
+}
+
+// Unlike a FIFO, opening a Unix domain socket path as a plain file fails
+// immediately (ENXIO) with no reader-synchronization hazard, so the
+// destination-validation guard must still exempt only FIFOs and continue to
+// fail fast here (Unix-only: this socket kind is not exercised on Windows).
+#[cfg(unix)]
+#[test]
+fn progress_rotate_to_a_socket_destination_fails_before_any_progress_output() {
+    use std::os::unix::net::UnixListener;
+
+    let input = fixture("one-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let socket_path = tempdir.path().join("out.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id", "--rotate=90:1"])
+        .arg(&input)
+        .arg(&socket_path)
+        .output()
+        .expect("flpdf invocation");
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "no progress output must be printed before the destination is validated: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
+    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
 }
 
 #[test]

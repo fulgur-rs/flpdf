@@ -229,18 +229,21 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
 /// already-existing, otherwise-valid destination is left untouched until
 /// the real write.
 ///
-/// Skips the check for an existing destination that is neither a regular
-/// file nor a directory (a named pipe, for example): qpdf itself opens its
-/// real destination exactly once, and a FIFO's reader observes EOF and can
-/// exit as soon as this validation open closes, so the later real write
-/// would reopen a FIFO with no reader left and hang. Directories are still
-/// probed here (opening one for writing fails immediately with no
-/// reader-synchronization side effect), and a nonexistent path is still
-/// probed since `create(true)` there has no such side effect either.
+/// Skips the check for an existing named pipe (Unix only): qpdf itself opens
+/// its real destination exactly once, and a FIFO's reader observes EOF and
+/// can exit as soon as this validation open closes, so the later real write
+/// would reopen a FIFO with no reader left and hang. Every other destination
+/// kind (regular files, directories, sockets, device files, and nonexistent
+/// paths) has no such open/close synchronization hazard and is still probed
+/// here, so this remains a fail-fast guard for those.
 fn validate_progress_output_destination(output: &Path) -> CliResult<()> {
-    if let Ok(metadata) = std::fs::metadata(output) {
-        if !metadata.is_file() && !metadata.is_dir() {
-            return Ok(());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(metadata) = std::fs::metadata(output) {
+            if metadata.file_type().is_fifo() {
+                return Ok(());
+            }
         }
     }
     OpenOptions::new()
@@ -6750,6 +6753,7 @@ fn run_remove_attachment(
     };
     apply_cli_version_options(&mut options, version_options);
     let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let creates_output = standard_output.is_none();
     write_with_pdf_writer(
         &mut pdf,
         &output,
@@ -6758,7 +6762,7 @@ fn run_remove_attachment(
         false,
         None,
     )?;
-    finish_operation_warnings(&pdf, true)
+    finish_operation_warnings(&pdf, creates_output)
 }
 
 /// `--list-attachments [--verbose] input`
