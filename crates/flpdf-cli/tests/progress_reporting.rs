@@ -48,6 +48,49 @@ fn progress_reports_file_output_on_info_stream() {
 }
 
 #[test]
+fn progress_reaches_the_attachment_writer() {
+    let input = fixture("one-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let attachment_path = tempdir.path().join("payload.txt");
+    std::fs::write(&attachment_path, b"attachment payload").expect("attachment");
+    let output_path = tempdir.path().join("attachment-out.pdf");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id", "--add-attachment"])
+        .arg(&attachment_path)
+        .arg("--")
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .expect("flpdf invocation");
+
+    assert!(
+        output.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
+    assert!(
+        stdout.starts_with(&format!(
+            "flpdf: {}: write progress: 0%\n",
+            output_path.display()
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("write progress: 100%\n"), "{stdout}");
+    assert!(stdout
+        .lines()
+        .all(|line| line.contains(&output_path.display().to_string())));
+    assert!(output.stderr.is_empty());
+    assert!(
+        output_path.exists(),
+        "attachment rewrite must create the PDF"
+    );
+}
+
+#[test]
 fn progress_keeps_pdf_on_stdout_and_reports_on_stderr() {
     let input = fixture("one-page.pdf");
 

@@ -2128,6 +2128,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             &top_level_version_options,
         )
     } else if !args.add_attachment.is_empty() {
@@ -2140,6 +2141,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             args.verbose,
             &top_level_version_options,
         )
@@ -2153,6 +2155,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             args.verbose,
             &top_level_version_options,
         )
@@ -6609,6 +6612,7 @@ fn run_add_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6652,6 +6656,7 @@ fn run_add_attachment(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
@@ -6682,6 +6687,7 @@ fn run_remove_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
@@ -6698,6 +6704,7 @@ fn run_remove_attachment(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
@@ -6765,6 +6772,7 @@ fn run_copy_attachments_from(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6813,6 +6821,7 @@ fn run_copy_attachments_from(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut writer_options, version_options);
