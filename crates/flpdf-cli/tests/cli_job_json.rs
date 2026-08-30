@@ -75,6 +75,85 @@ fn job_json_file_coalesce_contents_replaces_a_page_contents_array() {
 }
 
 #[test]
+fn job_json_file_flatten_rotation_bakes_rotate_into_page_content() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page-r90.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("flatten.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flattened.pdf","flattenRotation":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=flatten.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    let mut pdf = Pdf::open(Cursor::new(
+        fs::read(directory.path().join("flattened.pdf")).unwrap(),
+    ))
+    .unwrap();
+    let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert!(
+        !page.has_key(b"/Rotate"),
+        "flattenRotation must remove /Rotate"
+    );
+
+    let media_box = page.try_get_key(b"/MediaBox").unwrap();
+    pdf.resolve(&media_box).unwrap();
+    let media_box = media_box.as_array().unwrap();
+    assert_eq!(
+        media_box
+            .iter()
+            .map(|value| value.as_integer())
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(792), Some(612)]
+    );
+
+    assert!(
+        flpdf::pages::page_content_bytes(&mut pdf, page_ref)
+            .unwrap()
+            .starts_with(b"q\n0 -1 1 0 0 612 cm\n"),
+        "flattenRotation must prepend qpdf's 90-degree matrix"
+    );
+}
+
+#[test]
+fn job_json_file_flatten_rotation_preserves_orphan_widget_warning_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("flatten-warning.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flattened.pdf","flattenRotation":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=flatten-warning.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("this widget annotation is not reachable from /AcroForm"),
+        "flattenRotation must preserve qpdf's orphan-widget warning"
+    );
+    assert!(directory.path().join("flattened.pdf").is_file());
+}
+
+#[test]
 fn job_json_file_usage_errors_use_the_qpdf_job_file_boundary() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
