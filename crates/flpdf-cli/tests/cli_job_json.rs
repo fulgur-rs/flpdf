@@ -1,5 +1,7 @@
 use assert_cmd::Command;
+use flpdf::{PageDocumentHelper, Pdf};
 use std::fs;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 fn expected_usage(message: &str) -> String {
@@ -182,4 +184,115 @@ fn job_json_file_dash_output_is_written_to_stdout() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.starts_with(b"%PDF-"));
     assert!(!directory.path().join("-").exists());
+}
+
+#[test]
+fn job_json_file_split_pages_writes_qpdf_named_chunks() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"split.pdf","splitPages":"1","staticId":""}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    for page in 1..=3 {
+        assert!(
+            directory.path().join(format!("split-{page}.pdf")).is_file(),
+            "qpdf split-pages output split-{page}.pdf is missing"
+        );
+    }
+    assert!(
+        !directory.path().join("split.pdf").exists(),
+        "splitPages must not fall through to one unsplit output"
+    );
+}
+
+#[test]
+fn job_json_file_rotate_applies_to_the_selected_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("rotate.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"rotated.pdf","rotate":"90:2","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=rotate.json")
+        .assert()
+        .code(0);
+
+    assert_eq!(
+        page_rotations(&fs::read(directory.path().join("rotated.pdf")).unwrap()),
+        vec![None, Some(90), None],
+        "qpdf rotate=90:2 targets only output page 2"
+    );
+}
+
+#[test]
+fn job_json_file_remove_restrictions_disables_signature_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/acroform-sig-widget.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("remove.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"removed.pdf","removeRestrictions":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=remove.json")
+        .assert()
+        .code(0);
+
+    let mut pdf = Pdf::open(Cursor::new(
+        fs::read(directory.path().join("removed.pdf")).unwrap(),
+    ))
+    .unwrap();
+    assert!(
+        pdf.signatures().unwrap().is_empty(),
+        "qpdf removeRestrictions removes signature fields"
+    );
+    let root = pdf.root_handle().unwrap();
+    let acroform = root.try_get_key(b"/AcroForm").unwrap();
+    pdf.resolve(&acroform).unwrap();
+    let fields = acroform.try_get_key(b"/Fields").unwrap();
+    pdf.resolve(&fields).unwrap();
+    assert!(fields.as_array().is_some_and(|items| items.is_empty()));
+    let sig_flags = acroform.try_get_key(b"/SigFlags").unwrap();
+    pdf.resolve(&sig_flags).unwrap();
+    assert_eq!(sig_flags.as_integer(), Some(0));
+}
+
+fn page_rotations(bytes: &[u8]) -> Vec<Option<i64>> {
+    let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).unwrap();
+    let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
+    pages
+        .into_iter()
+        .map(|page_ref| {
+            let page = pdf.get_object_handle(page_ref);
+            pdf.resolve(&page).unwrap();
+            let rotate = page.try_get_key(b"/Rotate").unwrap();
+            pdf.resolve(&rotate).unwrap();
+            rotate.as_integer()
+        })
+        .collect()
 }
