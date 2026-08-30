@@ -2932,9 +2932,9 @@ fn json_open_warnings_precede_fatal_output_error_without_success_summary() {
     let output_directory = tempfile::tempdir().unwrap();
     let output = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--repair", "--json=2", "--json-key=qpdf", "--json-output"])
-        .arg(output_directory.path())
+        .args(["--repair", "--json=2", "--json-key=qpdf", "--json-output=2"])
         .arg(fixture.path())
+        .arg(output_directory.path())
         .output()
         .unwrap();
 
@@ -3543,9 +3543,9 @@ fn json_output_open_error_happens_before_json_processing() {
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     let assert = cmd
-        .args(["--json=2", "--json-key=outlines", "--json-output"])
-        .arg(output_directory.path())
+        .args(["--json=2", "--json-key=outlines", "--json-output=2"])
         .arg(fixture.path())
+        .arg(output_directory.path())
         .assert()
         .code(2);
     let output = assert.get_output();
@@ -3575,9 +3575,9 @@ fn json_output_missing_input_preserves_existing_output_and_reports_input_open() 
     );
     let output = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--json=2", "--json-output"])
-        .arg(&output_path)
+        .args(["--json-output=2"])
         .arg(&input)
+        .arg(&output_path)
         .output()
         .unwrap();
 
@@ -3606,10 +3606,9 @@ fn json_output_writes_to_dev_null_without_stdout() {
     let output = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--json=2",
-            "--json-output",
-            "/dev/null",
+            "--json-output=2",
             "../../tests/fixtures/minimal.pdf",
+            "/dev/null",
         ])
         .output()
         .unwrap();
@@ -3694,11 +3693,14 @@ fn json_and_side_files_complete_before_warning_exit_three() {
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     let assert = cmd
-        .args(["--json=2", "--json-output"])
-        .arg(&json_path)
-        .args(["--json-stream-data=file", "--json-stream-prefix"])
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix",
+        ])
         .arg(&prefix)
         .arg(fixture.path())
+        .arg(&json_path)
         .assert()
         .code(3);
     let output = assert.get_output();

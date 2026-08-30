@@ -126,6 +126,46 @@ fn qpdf_oracle_guard_reports_missing_binary_locally_and_fails_ci() {
 }
 
 #[test]
+fn json_output_version_is_a_mode_and_positional_output_is_used() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("input.pdf");
+    let output = tempdir.path().join("output.json");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json-output=2"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stdout("");
+
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(json["qpdf"][0]["jsonversion"], 2);
+    assert!(json.get("version").is_none());
+}
+
+#[test]
+fn test_json_schema_validates_v1_output_without_changing_it() {
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=1", "--test-json-schema"])
+        .arg(fixture)
+        .assert()
+        .success()
+        .stderr("")
+        .stdout(predicates::str::contains("\"version\": 1"));
+}
+
+#[test]
 fn qpdf_oracle_guard_local_skip_child() {
     if std::env::var_os(QPDF_ORACLE_SKIP_CHILD).is_none() {
         return;
@@ -354,8 +394,9 @@ fn json_output_dev_full_matches_qpdf_success() {
         .unwrap();
     let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--json=2", "--json-output=/dev/full"])
+        .args(["--json-output=2"])
         .arg(input.path())
+        .arg("/dev/full")
         .output()
         .unwrap();
     assert!(qpdf.status.success(), "{qpdf:?}");
@@ -395,9 +436,8 @@ fn json_fatal_preserves_partial_output_file() {
         .args([
             "--json=2",
             "--json-key=outlines",
-            "--json-output",
-            output_path.to_str().unwrap(),
             input.path().to_str().unwrap(),
+            output_path.to_str().unwrap(),
         ])
         .output()
         .unwrap();
@@ -448,7 +488,7 @@ fn assert_same_json_output_is_rejected_without_modifying_input(
         cmd.current_dir(dir);
     }
     let output = cmd
-        .args(["--json=2", "--json-output", output_arg, input_arg])
+        .args(["--json-output=2", input_arg, output_arg])
         .output()
         .unwrap();
     assert_eq!(std::fs::read(input_path).unwrap(), original);
@@ -530,10 +570,9 @@ fn json_output_overwrites_distinct_existing_file() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--json=2",
-            "--json-output",
-            output_path.to_str().unwrap(),
+            "--json-output=2",
             input.path().to_str().unwrap(),
+            output_path.to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -558,10 +597,9 @@ fn json_output_overwrites_distinct_write_only_existing_file() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--json=2",
-            "--json-output",
-            output_path.to_str().unwrap(),
+            "--json-output=2",
             input.path().to_str().unwrap(),
+            output_path.to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -586,10 +624,9 @@ fn json_output_reports_identity_check_io_error_without_modifying_input() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--json=2",
-            "--json-output",
-            output_path.to_str().unwrap(),
+            "--json-output=2",
             input.path().to_str().unwrap(),
+            output_path.to_str().unwrap(),
         ])
         .assert()
         .code(2)
@@ -614,9 +651,9 @@ fn json_output_flag_writes_to_file_and_stdout_empty() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-output",
-        out_path.to_str().unwrap(),
+        "--json-output=2",
         input.path().to_str().unwrap(),
+        out_path.to_str().unwrap(),
     ])
     .assert()
     .success()
@@ -624,7 +661,7 @@ fn json_output_flag_writes_to_file_and_stdout_empty() {
 
     let content = std::fs::read_to_string(&out_path).unwrap();
     assert!(
-        content.contains("\"version\""),
+        content.contains("\"jsonversion\""),
         "expected JSON in output file"
     );
 }
@@ -796,6 +833,7 @@ fn json_stream_data_inline_includes_data_field() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
+        "--json-output=2",
         "--json-stream-data",
         "inline",
         input.path().to_str().unwrap(),
@@ -821,13 +859,12 @@ fn json_stream_data_file_creates_side_files() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-output",
-        out_path.to_str().unwrap(),
         "--json-stream-data",
         "file",
         "--json-stream-prefix",
         &prefix,
         input.path().to_str().unwrap(),
+        out_path.to_str().unwrap(),
     ])
     .assert()
     .success();
@@ -996,9 +1033,9 @@ fn json_output_file_mode_defaults_stream_prefix() {
 
     let output = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--json=2", "--json-stream-data=file", "--json-output"])
-        .arg(&output_path)
+        .args(["--json-output=2", "--json-stream-data=file"])
         .arg(&input_path)
+        .arg(&output_path)
         .output()
         .unwrap();
 
@@ -1031,10 +1068,10 @@ fn json_output_file_mode_empty_prefix_defaults_stream_prefix() {
             "--json=2",
             "--json-stream-data=file",
             "--json-stream-prefix=",
-            "--json-output",
+            "--json-output=2",
         ])
-        .arg(&output_path)
         .arg(&input_path)
+        .arg(&output_path)
         .output()
         .unwrap();
 
@@ -1133,16 +1170,15 @@ fn live_qpdf_json_file_stdout_empty_prefix_requires_prefix() {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: --json-output alone must NOT default stream-data to inline.
+// Regression: --json-output follows qpdf's inline stream-data default.
 //
-// CodeRabbit flagged that defaulting to "inline" when --json-output is set
-// exposes stream content based on an unrelated flag and contradicts the
-// help text ("none (default)"). The CLI now only emits stream payloads
-// when --json-stream-data is set explicitly.
+// qpdf's --json-output mode selects inline stream data unless an explicit
+// --json-stream-data value overrides it. The ordinary --json mode retains its
+// separate default.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn json_output_without_stream_data_flag_does_not_emit_stream_payload() {
+fn json_output_without_stream_data_flag_uses_qpdf_inline_payload() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("out.json");
@@ -1150,22 +1186,19 @@ fn json_output_without_stream_data_flag_does_not_emit_stream_payload() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-output",
-        out_path.to_str().unwrap(),
+        "--json-output=2",
         input.path().to_str().unwrap(),
+        out_path.to_str().unwrap(),
     ])
     .assert()
     .success();
 
     let content = std::fs::read_to_string(&out_path).unwrap();
     assert!(
-        !content.contains("\"data\""),
-        "default stream-data is 'none'; --json-output alone must not inline stream bytes (got data field)"
+        content.contains("\"data\""),
+        "qpdf --json-output defaults stream-data to inline"
     );
-    assert!(
-        !content.contains("\"datafile\""),
-        "default stream-data is 'none'; --json-output alone must not produce datafile entries"
-    );
+    assert!(!content.contains("\"datafile\""));
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,13 +1241,11 @@ fn json_key_pages_does_not_write_side_files_for_filtered_streams() {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: JSON sub-flags require --json.
+// Regression: JSON output mode is independently usable.
 //
-// CodeRabbit flagged that --json-output / --json-key / --json-object /
-// --json-stream-data / --json-stream-prefix could be passed without --json,
-// in which case the JSON branch never ran and the flags were silently
-// ignored. Each now has clap `requires = "json"`, so using one without
-// --json is a usage error (exit code 2).
+// qpdf treats --json-output as a mode that selects JSON output even without a
+// separate --json flag. The other selectors still need an explicit output
+// mode; they must not be silently ignored.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1224,23 +1255,26 @@ fn json_key_without_json_flag_is_usage_error() {
     cmd.args(["--json-key", "pages", input.path().to_str().unwrap()])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("--json"));
+        .stderr(predicate::str::contains("missing output file"));
 }
 
 #[test]
-fn json_output_without_json_flag_is_usage_error() {
+fn json_output_without_json_flag_is_a_json_mode() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("out.json");
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
-        "--json-output",
-        out_path.to_str().unwrap(),
+        "--json-output=2",
         input.path().to_str().unwrap(),
+        out_path.to_str().unwrap(),
     ])
     .assert()
-    .code(2)
-    .stderr(predicate::str::contains("--json"));
+    .success()
+    .stdout(predicate::str::is_empty());
+    assert!(std::fs::read_to_string(out_path)
+        .unwrap()
+        .contains("\"jsonversion\": 2"));
 }
 
 #[test]
@@ -1254,7 +1288,7 @@ fn json_stream_data_without_json_flag_is_usage_error() {
     ])
     .assert()
     .code(2)
-    .stderr(predicate::str::contains("--json"));
+    .stderr(predicate::str::contains("missing output file"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,7 +1334,7 @@ fn json_flag_conflicts_with_check_mode() {
 }
 
 #[test]
-fn json_flag_conflicts_with_output_positional() {
+fn json_flag_accepts_output_positional() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let temp = tempfile::tempdir().unwrap();
     let out = temp.path().join("out.pdf");
@@ -1311,7 +1345,11 @@ fn json_flag_conflicts_with_output_positional() {
         out.to_str().unwrap(),
     ])
     .assert()
-    .code(2);
+    .success()
+    .stdout(predicate::str::is_empty());
+    assert!(std::fs::read_to_string(out)
+        .unwrap()
+        .contains("\"version\": 2"));
 }
 
 #[test]
@@ -1716,23 +1754,22 @@ fn json_stream_data_file_side_file_holds_decoded_content() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-output",
-        out_path.to_str().unwrap(),
+        "--json-output=2",
         "--json-stream-data",
         "file",
         "--json-stream-prefix",
         &prefix,
         input.path().to_str().unwrap(),
+        out_path.to_str().unwrap(),
     ])
     .assert()
     .success();
 
     let side_file = format!("{prefix}-4");
     let written = std::fs::read(&side_file).expect("side file must exist");
-    assert_eq!(
+    assert_ne!(
         written, content,
-        "file-mode side file must hold the filter-decoded content \
-         (DecodeLevel::Generalized), not the raw FlateDecode bytes"
+        "qpdf --json-output defaults DecodeLevel to none, so file mode keeps raw FlateDecode bytes"
     );
 }
 

@@ -52,10 +52,15 @@ fn emit_section(
     Ok(())
 }
 
-/// Incrementally write a selected qpdf JSON v2 document from the QPDFJob
-/// command boundary.
-pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
+/// Incrementally write a selected qpdf JSON document from the QPDFJob command
+/// boundary. Version 1 and version 2 share the section builders but differ in
+/// their object-map container (`objects`/`objectinfo` versus `qpdf`).
+#[allow(clippy::too_many_arguments)]
+pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    version: i32,
+    json_output: bool,
+    show_encryption_key: bool,
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
     keys: &[JsonKey],
@@ -64,22 +69,24 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
 ) -> Result<(), JsonOutputError> {
     let mut first = true;
     Json::write_dictionary_open(out, &mut first, 0)?;
-    Json::write_dictionary_item(
-        out,
-        &mut first,
-        b"version",
-        &Json::make_int(i64::from(QPDF_JSON_VERSION)),
-        1,
-    )?;
-    Json::write_dictionary_item(
-        out,
-        &mut first,
-        b"parameters",
-        &build_parameters(decode_level)?,
-        1,
-    )?;
+    if !json_output {
+        Json::write_dictionary_item(
+            out,
+            &mut first,
+            b"version",
+            &Json::make_int(i64::from(version)),
+            1,
+        )?;
+        Json::write_dictionary_item(
+            out,
+            &mut first,
+            b"parameters",
+            &build_parameters(decode_level)?,
+            1,
+        )?;
+    }
     emit_section(out, &mut first, b"pages", keys, JsonKey::Pages, || {
-        super::json_sections::build_pages_section(pdf)
+        super::json_sections::build_pages_section_with_options(pdf, version, decode_level)
     })?;
     emit_section(
         out,
@@ -87,7 +94,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         b"pagelabels",
         keys,
         JsonKey::Pagelabels,
-        || super::json_sections::build_pagelabels_section(pdf),
+        || super::json_sections::build_pagelabels_section_with_version(pdf, version),
     )?;
     emit_section(
         out,
@@ -95,7 +102,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         b"acroform",
         keys,
         JsonKey::Acroform,
-        || super::build_acroform_section(pdf),
+        || super::json_sections::build_acroform_section_with_version(pdf, version),
     )?;
     emit_section(
         out,
@@ -103,10 +110,10 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         b"attachments",
         keys,
         JsonKey::Attachments,
-        || super::json_sections::build_attachments_section(pdf),
+        || super::json_sections::build_attachments_section_with_version(pdf, version),
     )?;
     emit_section(out, &mut first, b"encrypt", keys, JsonKey::Encrypt, || {
-        super::json_sections::build_encrypt_section(pdf)
+        super::json_sections::build_encrypt_section_with_options(pdf, version, show_encryption_key)
     })?;
     emit_section(
         out,
@@ -114,15 +121,22 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         b"outlines",
         keys,
         JsonKey::Outlines,
-        || super::json_sections::build_outlines_section(pdf),
+        || super::json_sections::build_outlines_section_with_version(pdf, version),
     )?;
-    if json_section_selected(keys, JsonKey::Qpdf) {
+    if version == 1 {
+        if json_section_selected(keys, JsonKey::Objects) {
+            crate::document_json::write_json_v1_objects_key(pdf, out, &mut first, objects)?;
+        }
+        if json_section_selected(keys, JsonKey::Objectinfo) {
+            crate::document_json::write_json_v1_objectinfo_key(pdf, out, &mut first, objects)?;
+        }
+    } else if json_section_selected(keys, JsonKey::Qpdf) {
         // qpdf's doJSONObjects delegates the whole "qpdf" key to
         // QPDF::writeJSON with complete=false, letting it continue the
         // dictionary this function opened.
         crate::document_json::write_json_key(
             pdf,
-            QPDF_JSON_VERSION,
+            version,
             out,
             false,
             &mut first,
@@ -136,9 +150,38 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     Ok(())
 }
 
-/// Write selected qpdf JSON v2 output to an ordinary command-boundary handle.
-pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek>(
+/// Backward-compatible v2 entry point used by lower-level JSON tests and
+/// callers that explicitly select qpdf's current JSON version.
+#[cfg(test)]
+pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    keys: &[JsonKey],
+    objects: &[JsonObjectSelector],
+    out: &mut dyn Pipeline,
+) -> Result<(), JsonOutputError> {
+    write_qpdf_json_selected_objects_with_options(
+        pdf,
+        QPDF_JSON_VERSION,
+        false,
+        false,
+        decode_level,
+        stream_mode,
+        keys,
+        objects,
+        out,
+    )
+}
+
+/// Write selected qpdf JSON output to an ordinary command-boundary handle.
+#[allow(clippy::too_many_arguments)]
+pub fn write_qpdf_json_selected_objects_to_output_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+    json_output: bool,
+    show_encryption_key: bool,
+    test_json_schema: bool,
     decode_level: DecodeLevel,
     stream_mode: &StreamDataMode,
     keys: &[JsonKey],
@@ -148,23 +191,33 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
     match output {
         JsonOutput::Stdout(writer) => {
             let mut terminal = PlOStream::new("json output", writer);
-            write_qpdf_json_v2_selected_objects_with_options(
-                pdf,
-                decode_level,
-                stream_mode,
-                keys,
-                objects,
-                &mut terminal,
-            )?;
-            terminal.finish()?;
-            Ok(())
-        }
-        JsonOutput::File(writer) => {
-            let mut buffered = StdioBuffer::new(writer);
-            {
-                let mut terminal = PlStdioFile::new("json output", &mut buffered);
-                write_qpdf_json_v2_selected_objects_with_options(
+            if test_json_schema {
+                let mut captured = Vec::new();
+                {
+                    let mut capture = crate::pipeline::PlString::new(
+                        "capture json",
+                        Some(&mut terminal),
+                        &mut captured,
+                    );
+                    write_qpdf_json_selected_objects_with_options(
+                        pdf,
+                        version,
+                        json_output,
+                        show_encryption_key,
+                        decode_level,
+                        stream_mode,
+                        keys,
+                        objects,
+                        &mut capture,
+                    )?;
+                }
+                validate_json_schema(&captured, version, json_output, keys)?;
+            } else {
+                write_qpdf_json_selected_objects_with_options(
                     pdf,
+                    version,
+                    json_output,
+                    show_encryption_key,
                     decode_level,
                     stream_mode,
                     keys,
@@ -172,9 +225,329 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
                     &mut terminal,
                 )?;
             }
+            terminal.finish()?;
+            Ok(())
+        }
+        JsonOutput::File(writer) => {
+            let mut buffered = StdioBuffer::new(writer);
+            {
+                let mut terminal = PlStdioFile::new("json output", &mut buffered);
+                if test_json_schema {
+                    let mut captured = Vec::new();
+                    {
+                        let mut capture = crate::pipeline::PlString::new(
+                            "capture json",
+                            Some(&mut terminal),
+                            &mut captured,
+                        );
+                        write_qpdf_json_selected_objects_with_options(
+                            pdf,
+                            version,
+                            json_output,
+                            show_encryption_key,
+                            decode_level,
+                            stream_mode,
+                            keys,
+                            objects,
+                            &mut capture,
+                        )?;
+                    }
+                    validate_json_schema(&captured, version, json_output, keys)?;
+                } else {
+                    write_qpdf_json_selected_objects_with_options(
+                        pdf,
+                        version,
+                        json_output,
+                        show_encryption_key,
+                        decode_level,
+                        stream_mode,
+                        keys,
+                        objects,
+                        &mut terminal,
+                    )?;
+                }
+            }
             Ok(())
         }
     }
+}
+
+fn schema_dictionary(
+    entries: impl IntoIterator<Item = (&'static str, Json)>,
+) -> Result<Json, JsonOutputError> {
+    crate::json_inspect::json_dictionary(entries).map_err(JsonOutputError::from)
+}
+
+fn schema_array(item: Json) -> Result<Json, JsonOutputError> {
+    let array = Json::make_array();
+    array.add_array_element(item).map_err(|error| {
+        JsonOutputError::Convert(crate::json_inspect::ConvertError::JsonError(
+            error.to_string(),
+        ))
+    })?;
+    Ok(array)
+}
+
+fn schema_fixed_array(items: impl IntoIterator<Item = Json>) -> Result<Json, JsonOutputError> {
+    let array = Json::make_array();
+    for item in items {
+        array.add_array_element(item).map_err(|error| {
+            JsonOutputError::Convert(crate::json_inspect::ConvertError::JsonError(
+                error.to_string(),
+            ))
+        })?;
+    }
+    Ok(array)
+}
+
+fn schema_pattern(item: Json) -> Result<Json, JsonOutputError> {
+    schema_dictionary([("<key>", item)])
+}
+
+fn selected(keys: &[JsonKey], key: JsonKey) -> bool {
+    keys.is_empty() || keys.contains(&key)
+}
+
+fn output_schema(
+    version: i32,
+    json_output: bool,
+    keys: &[JsonKey],
+) -> Result<Json, JsonOutputError> {
+    let scalar = || Json::make_string("qpdf JSON schema value");
+    let mut entries = Vec::new();
+
+    if !json_output {
+        entries.push(("version", scalar()));
+        entries.push((
+            "parameters",
+            schema_dictionary([("decodelevel", scalar())])?,
+        ));
+    }
+
+    if selected(keys, JsonKey::Pages) {
+        let image = schema_dictionary([
+            ("bitspercomponent", scalar()),
+            ("colorspace", scalar()),
+            ("decodeparms", schema_array(scalar())?),
+            ("filter", schema_array(scalar())?),
+            ("filterable", scalar()),
+            ("height", scalar()),
+            ("name", scalar()),
+            ("object", scalar()),
+            ("width", scalar()),
+        ])?;
+        let page_outline = schema_dictionary([
+            ("dest", scalar()),
+            ("object", scalar()),
+            ("title", scalar()),
+        ])?;
+        let page = schema_dictionary([
+            ("contents", schema_array(scalar())?),
+            ("images", schema_array(image)?),
+            ("label", scalar()),
+            ("object", scalar()),
+            ("outlines", schema_array(page_outline)?),
+            ("pageposfrom1", scalar()),
+        ])?;
+        entries.push(("pages", schema_array(page)?));
+    }
+
+    if selected(keys, JsonKey::Pagelabels) {
+        entries.push((
+            "pagelabels",
+            schema_array(schema_dictionary([
+                ("index", scalar()),
+                ("label", scalar()),
+            ])?)?,
+        ));
+    }
+
+    if selected(keys, JsonKey::Outlines) {
+        let outline = schema_dictionary([
+            ("dest", scalar()),
+            ("destpageposfrom1", scalar()),
+            ("kids", scalar()),
+            ("object", scalar()),
+            ("open", scalar()),
+            ("title", scalar()),
+        ])?;
+        entries.push(("outlines", schema_array(outline)?));
+    }
+
+    if selected(keys, JsonKey::Acroform) {
+        let annotation = schema_dictionary([
+            ("annotationflags", scalar()),
+            ("appearancestate", scalar()),
+            ("object", scalar()),
+        ])?;
+        let field = schema_dictionary([
+            ("alternativename", scalar()),
+            ("annotation", annotation),
+            ("choices", scalar()),
+            ("defaultvalue", scalar()),
+            ("fieldflags", scalar()),
+            ("fieldtype", scalar()),
+            ("fullname", scalar()),
+            ("ischeckbox", scalar()),
+            ("ischoice", scalar()),
+            ("isradiobutton", scalar()),
+            ("istext", scalar()),
+            ("mappingname", scalar()),
+            ("object", scalar()),
+            ("pageposfrom1", scalar()),
+            ("parent", scalar()),
+            ("partialname", scalar()),
+            ("quadding", scalar()),
+            ("value", scalar()),
+        ])?;
+        entries.push((
+            "acroform",
+            schema_dictionary([
+                ("fields", schema_array(field)?),
+                ("hasacroform", scalar()),
+                ("needappearances", scalar()),
+            ])?,
+        ));
+    }
+
+    if selected(keys, JsonKey::Encrypt) {
+        let modify_annotations = if version == 1 {
+            "moddifyannotations"
+        } else {
+            "modifyannotations"
+        };
+        let capabilities = schema_dictionary([
+            ("accessibility", scalar()),
+            ("extract", scalar()),
+            (modify_annotations, scalar()),
+            ("modify", scalar()),
+            ("modifyassembly", scalar()),
+            ("modifyforms", scalar()),
+            ("modifyother", scalar()),
+            ("printhigh", scalar()),
+            ("printlow", scalar()),
+        ])?;
+        let parameters = schema_dictionary([
+            ("P", scalar()),
+            ("R", scalar()),
+            ("V", scalar()),
+            ("bits", scalar()),
+            ("filemethod", scalar()),
+            ("key", scalar()),
+            ("method", scalar()),
+            ("streammethod", scalar()),
+            ("stringmethod", scalar()),
+        ])?;
+        entries.push((
+            "encrypt",
+            schema_dictionary([
+                ("capabilities", capabilities),
+                ("encrypted", scalar()),
+                ("ownerpasswordmatched", scalar()),
+                ("parameters", parameters),
+                ("recovereduserpassword", scalar()),
+                ("userpasswordmatched", scalar()),
+            ])?,
+        ));
+    }
+
+    if selected(keys, JsonKey::Attachments) {
+        let stream = schema_dictionary([
+            ("checksum", scalar()),
+            ("creationdate", scalar()),
+            ("mimetype", scalar()),
+            ("modificationdate", scalar()),
+        ])?;
+        let attachment = schema_dictionary([
+            ("description", scalar()),
+            ("filespec", scalar()),
+            ("names", schema_pattern(scalar())?),
+            ("preferredcontents", scalar()),
+            ("preferredname", scalar()),
+            ("streams", schema_pattern(stream)?),
+        ])?;
+        entries.push(("attachments", schema_pattern(attachment)?));
+    }
+
+    if version == 1 {
+        if selected(keys, JsonKey::Objects) {
+            entries.push(("objects", schema_pattern(scalar())?));
+        }
+        if selected(keys, JsonKey::Objectinfo) {
+            let stream =
+                schema_dictionary([("filter", scalar()), ("is", scalar()), ("length", scalar())])?;
+            entries.push((
+                "objectinfo",
+                schema_pattern(schema_dictionary([("stream", stream)])?)?,
+            ));
+        }
+    } else if selected(keys, JsonKey::Qpdf) {
+        let metadata = schema_dictionary([
+            ("calledgetallpages", scalar()),
+            ("jsonversion", scalar()),
+            ("maxobjectid", scalar()),
+            ("pdfversion", scalar()),
+            ("pushedinheritedpageresources", scalar()),
+        ])?;
+        entries.push((
+            "qpdf",
+            schema_fixed_array([metadata, schema_pattern(scalar())?])?,
+        ));
+    }
+
+    schema_dictionary(entries)
+}
+
+fn validate_json_schema(
+    bytes: &[u8],
+    version: i32,
+    json_output: bool,
+    keys: &[JsonKey],
+) -> Result<(), JsonOutputError> {
+    let value = Json::parse(bytes).map_err(|error| {
+        JsonOutputError::Convert(crate::json_inspect::ConvertError::JsonError(
+            error.to_string(),
+        ))
+    })?;
+    let schema = output_schema(version, json_output, keys)?;
+    let mut errors = Vec::new();
+    if !value.check_schema(&schema, &mut errors) {
+        let details = errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(JsonOutputError::Convert(
+            crate::json_inspect::ConvertError::JsonError(format!(
+                "generated JSON does not match qpdf schema:\n{details}"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Backward-compatible v2 command-boundary output entry point.
+#[cfg(test)]
+pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_level: DecodeLevel,
+    stream_mode: &StreamDataMode,
+    keys: &[JsonKey],
+    objects: &[JsonObjectSelector],
+    output: JsonOutput<'_>,
+) -> Result<(), JsonOutputError> {
+    write_qpdf_json_selected_objects_to_output_with_options(
+        pdf,
+        QPDF_JSON_VERSION,
+        false,
+        false,
+        false,
+        decode_level,
+        stream_mode,
+        keys,
+        objects,
+        output,
+    )
 }
 
 /// Selects how PDF stream payloads appear in JSON output.
@@ -252,6 +625,21 @@ pub fn write_json<R: Read + Seek>(
     options: JsonJobOptions<'_>,
     output: JsonJobOutput<'_>,
 ) -> Result<(), JsonJobError> {
+    write_json_with_version(pdf, QPDF_JSON_VERSION, false, false, false, options, output)
+}
+
+/// Write qpdf JSON output for an explicitly selected version and optionally
+/// validate the generated bytes against the matching qpdf output schema.
+pub fn write_json_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+    test_json_schema: bool,
+    json_output: bool,
+    show_encryption_key: bool,
+    options: JsonJobOptions<'_>,
+    output: JsonJobOutput<'_>,
+) -> Result<(), JsonJobError> {
+    let _ = test_json_schema;
     let stream_prefix = options.stream_prefix.filter(|prefix| !prefix.is_empty());
     let stream_mode = match (options.stream_data, stream_prefix, &output) {
         (JsonStreamData::None, _, _) => StreamDataMode::None,
@@ -274,8 +662,12 @@ pub fn write_json<R: Read + Seek>(
         JsonJobOutput::File { writer, .. } => JsonOutput::File(writer),
     };
 
-    write_qpdf_json_v2_selected_objects_to_output_with_options(
+    write_qpdf_json_selected_objects_to_output_with_options(
         pdf,
+        version,
+        json_output,
+        show_encryption_key,
+        test_json_schema,
         options.decode_level,
         &stream_mode,
         options.keys,

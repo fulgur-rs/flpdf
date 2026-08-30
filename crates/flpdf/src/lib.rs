@@ -216,7 +216,7 @@ pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, parse_pdf_version_spec, PdfVersion};
 pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 pub use qdf_fix::fix_qdf;
-pub use reader::PdfOpenOptions;
+pub use reader::{PdfOpenOptions, ReadSeek};
 pub use signatures::{
     acroform_sig_flags, clear_sig_flags, signatures, signatures_with_max_depth,
     strip_signature_values, SignatureInfo, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,

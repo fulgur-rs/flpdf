@@ -313,11 +313,40 @@ impl WriterConfiguration {
         self.settings.encryption_parameters = None;
     }
 
+    /// Set qpdf's linearized output mode.
+    pub fn set_linearization(&mut self, value: bool) {
+        self.settings.linearization = value;
+        if value {
+            self.settings.pclm = false;
+        }
+    }
+
+    /// Set the optional qpdf linearization pass-one output path.
+    pub fn set_linearization_pass1_filename(&mut self, path: impl Into<PathBuf>) {
+        self.settings.linearization_pass1_filename = Some(path.into());
+    }
+
     /// Apply this configuration to one writer while preserving its output
     /// sink lifecycle. Progress reporting is intentionally configured by the
     /// owning job after this method returns.
     pub fn apply_to<R: Read + Seek + 'static>(&self, writer: &mut PdfWriter<'_, R>) {
         writer.settings = self.settings.clone();
+    }
+
+    /// Return the stream decode level used by qpdf JSON serialization.
+    ///
+    /// qpdf keeps the JSON decode level beside the writer settings and uses
+    /// the same value for `json` sections and writer-side stream policy.
+    #[must_use]
+    pub const fn decode_level(&self) -> DecodeLevel {
+        self.settings.decode_level
+    }
+
+    /// Return whether otherwise-unreferenced objects are preserved by this
+    /// writer configuration.
+    #[must_use]
+    pub const fn preserves_unreferenced_objects(&self) -> bool {
+        self.settings.preserve_unreferenced_objects
     }
 }
 

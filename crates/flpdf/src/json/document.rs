@@ -30,6 +30,28 @@ const JSON_PDF: &[u8] = concat!(
 )
 .as_bytes();
 
+/// Create a complete JSON-input document through the erased source boundary
+/// used by [`crate::job::JobDocument`]. The rootless qpdf JSON seed remains
+/// owned here so the job layer cannot accidentally substitute [`Pdf::empty`]
+/// (`QPDF_json.cc:54-63`).
+pub(crate) fn create_from_json_erased<S>(
+    source: S,
+    input_name: impl Into<String>,
+    mut options: PdfOpenOptions,
+) -> Result<Pdf<Box<dyn crate::ReadSeek>>>
+where
+    S: Read + Seek + 'static,
+{
+    let input_name = input_name.into();
+    options.description = input_name.clone();
+    let mut pdf = Pdf::<Box<dyn crate::ReadSeek>>::open_with_options(
+        Box::new(Cursor::new(JSON_PDF.to_vec())),
+        options,
+    )?;
+    pdf.import_json(source, input_name, true)?;
+    Ok(pdf)
+}
+
 impl Pdf<Cursor<Vec<u8>>> {
     /// Create a PDF from a complete qpdf JSON v2 document.
     ///

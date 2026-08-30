@@ -416,7 +416,7 @@ impl Pdf<Cursor<Vec<u8>>> {
 // Mirrors qpdf's `EMPTY_PDF` (`libqpdf/QPDF.cc:34-51`) byte for byte: PDF
 // 1.3, a Catalog (object 1) pointing at an empty Pages tree (object 2), and
 // a classic xref table whose offsets match this exact literal.
-const EMPTY_PDF_BYTES: &[u8] = concat!(
+pub(crate) const EMPTY_PDF_BYTES: &[u8] = concat!(
     "%PDF-1.3\n",
     "1 0 obj\n",
     "<< /Type /Catalog /Pages 2 0 R >>\n",
@@ -435,6 +435,17 @@ const EMPTY_PDF_BYTES: &[u8] = concat!(
     "%%EOF\n",
 )
 .as_bytes();
+
+/// Open qpdf's canonical empty document through the erased source boundary
+/// used by [`crate::job::JobDocument`].
+pub(crate) fn open_empty_with_options_erased(
+    options: PdfOpenOptions,
+) -> crate::Result<Pdf<Box<dyn crate::ReadSeek>>> {
+    Pdf::<Box<dyn crate::ReadSeek>>::open_with_options(
+        Box::new(Cursor::new(EMPTY_PDF_BYTES.to_vec())),
+        options,
+    )
+}
 
 impl Pdf<Cursor<Vec<u8>>> {
     // CLAUDE.md deviation class (B): qpdf's `QPDF::emptyPDF()` is a `void`

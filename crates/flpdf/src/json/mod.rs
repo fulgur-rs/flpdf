@@ -24,6 +24,7 @@ mod schema;
 mod value;
 mod writer;
 
+pub(crate) use document::create_from_json_erased;
 pub use handler::{JsonHandler, JsonHandlerError, WeakJsonHandler};
 pub use message::JsonMessage;
 pub use parser::{parse, parse_reader, Reactor};
