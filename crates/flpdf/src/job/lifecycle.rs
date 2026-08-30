@@ -1728,11 +1728,9 @@ impl QPDFJob {
                     // must be the writer's actual output paths, not the
                     // template `output` path.
                     for path in &written {
-                        self.logger.info(format!(
-                            "{}: wrote file {}\n",
-                            self.message_prefix,
-                            path.display()
-                        ))?;
+                        let message =
+                            format!("{}: wrote file {}\n", self.message_prefix, path.display());
+                        self.logger.info(message)?;
                     }
                 }
                 self.complete(true)
