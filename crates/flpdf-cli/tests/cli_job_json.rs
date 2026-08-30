@@ -126,6 +126,34 @@ fn job_json_file_flatten_rotation_bakes_rotate_into_page_content() {
 }
 
 #[test]
+fn job_json_file_flatten_rotation_preserves_orphan_widget_warning_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("flatten-warning.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flattened.pdf","flattenRotation":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=flatten-warning.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("this widget annotation is not reachable from /AcroForm"),
+        "flattenRotation must preserve qpdf's orphan-widget warning"
+    );
+    assert!(directory.path().join("flattened.pdf").is_file());
+}
+
+#[test]
 fn job_json_file_usage_errors_use_the_qpdf_job_file_boundary() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(

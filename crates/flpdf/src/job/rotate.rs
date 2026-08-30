@@ -135,6 +135,14 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pages: &[ObjectRef],
 ) -> Result<()> {
+    // qpdf's `QPDFJob::handleTransformations` eagerly constructs its shared
+    // AcroForm helper before entering the page loop
+    // (`QPDFJob.cc:2190-2193`), even when no page later needs annotation
+    // transformation. Construct and drop the facade here to preserve that
+    // canonical analysis warning/cache boundary; the live cache remains on
+    // `Pdf` for the page helpers below.
+    let acroform = crate::AcroFormDocumentHelper::new(pdf)?;
+    drop(acroform);
     for &page_ref in pages {
         let mut page = PageObjectHelper::new(page_ref, pdf);
         page.flatten_rotation()?;
