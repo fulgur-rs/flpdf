@@ -226,6 +226,9 @@ fn job_json_schema() -> crate::json::Json {
         "compressionLevel",
         "externalizeInlineImages",
         "iiMinBytes",
+        "oiMinArea",
+        "oiMinHeight",
+        "oiMinWidth",
         "removeUnreferencedResources",
         "preserveUnreferencedResources",
         "requiresPassword",
@@ -239,6 +242,8 @@ fn job_json_schema() -> crate::json::Json {
         "flattenAnnotations",
         "flattenRotation",
         "generateAppearances",
+        "warningExit0",
+        "jobJsonFile",
     ] {
         schema
             .add_dictionary_member(key, scalar.clone())
@@ -2455,5 +2460,288 @@ mod tests {
         let pipeline = JobOutputPipeline(PipelineHandle::new(crate::pipeline::Discard));
 
         assert_eq!(pipeline.identifier(), "qpdf job output");
+    }
+
+    #[test]
+    fn job_output_writer_forwards_bytes_and_flush() {
+        let mut writer = JobOutputWriter(PipelineHandle::new(crate::pipeline::Discard));
+        std::io::Write::write_all(&mut writer, b"job output").unwrap();
+        std::io::Write::flush(&mut writer).unwrap();
+    }
+
+    #[test]
+    fn job_json_private_handlers_cover_qpdf_scalar_and_choice_shapes() {
+        let members = job_json_members(
+            &crate::json::Json::parse(
+                br#"{"empty":"","choice":"a","string":"text","number":1,"flag":false,"yes":"y"}"#,
+            )
+            .unwrap(),
+        );
+        assert!(job_json_string(&members, b"string").unwrap().is_some());
+        assert!(job_json_string(&members, b"missing").unwrap().is_none());
+        assert!(job_json_bare(&members, b"empty").unwrap());
+        assert!(!job_json_bare(&members, b"missing").unwrap());
+        assert!(job_json_bare(&members, b"string").is_err());
+        assert!(job_json_bare(&members, b"number").is_err());
+        assert_eq!(
+            job_json_choice(&members, b"choice", &["a", "b"], true).unwrap(),
+            Some("a".to_owned())
+        );
+        assert_eq!(
+            job_json_choice(&members, b"missing", &["a", "b"], true).unwrap(),
+            None
+        );
+        assert_eq!(
+            job_json_items(&crate::json::Json::parse(br#"["a","b"]"#).unwrap()).len(),
+            2
+        );
+        assert_eq!(
+            job_json_items(&crate::json::Json::parse(br#""a""#).unwrap()).len(),
+            1
+        );
+        assert!(job_json_required_string(&members, b"string", ".string").is_ok());
+        assert!(job_json_required_string(&members, b"missing", ".missing").is_err());
+        assert!(job_json_yn(&members, b"yes").unwrap().unwrap());
+
+        let empty_optional =
+            job_json_members(&crate::json::Json::parse(br#"{"choice":""}"#).unwrap());
+        assert_eq!(
+            job_json_choice(&empty_optional, b"choice", &["a", "b"], false).unwrap(),
+            Some(String::new())
+        );
+        let wrong_type =
+            job_json_members(&crate::json::Json::parse(br#"{"choice":false}"#).unwrap());
+        assert!(job_json_choice(&wrong_type, b"choice", &["a"], true).is_err());
+        let wrong_value =
+            job_json_members(&crate::json::Json::parse(br#"{"choice":"c"}"#).unwrap());
+        assert!(job_json_choice(&wrong_value, b"choice", &["a"], true).is_err());
+
+        let range_members =
+            job_json_members(&crate::json::Json::parse(br#"{"range":"1-2"}"#).unwrap());
+        assert!(job_json_range(range_members.get(b"range".as_slice()), ".range").is_ok());
+        assert!(job_json_range(None, ".range").is_ok());
+        let bad_range_type =
+            job_json_members(&crate::json::Json::parse(br#"{"range":false}"#).unwrap());
+        assert!(job_json_range(bad_range_type.get(b"range".as_slice()), ".range").is_err());
+        let bad_range_syntax =
+            job_json_members(&crate::json::Json::parse(br#"{"range":"bad"}"#).unwrap());
+        assert!(job_json_range(bad_range_syntax.get(b"range".as_slice()), ".range").is_err());
+    }
+
+    #[test]
+    fn job_json_private_parsers_cover_encryption_and_writer_choices() {
+        for value in ["preserve", "disable", "generate"] {
+            assert!(parse_object_stream_mode(value).is_ok());
+        }
+        assert!(parse_object_stream_mode("other").is_err());
+        for value in ["none", "generalized", "specialized", "all"] {
+            let level = parse_json_decode_level(value);
+            assert_eq!(json_decode_level_for_output(level).as_qpdf_str(), value);
+        }
+        assert_eq!(parse_json_version("1"), 1);
+        assert_eq!(parse_json_version("2"), 2);
+        assert_eq!(parse_json_version("latest"), 2);
+        assert_eq!(parse_json_version(""), 2);
+        assert!(parse_job_version("1.7.3", ".version").is_ok());
+        assert!(parse_job_version("invalid", ".version").is_err());
+        assert_eq!(parse_positive_usize(b"2", ".count").unwrap(), 2);
+        assert!(parse_positive_usize(b"0", ".count").is_err());
+        assert!(parse_positive_usize(b"not-number", ".count").is_err());
+
+        for value in ["all", "annotate", "form", "assembly", "none"] {
+            let mut permissions = crate::PermissionsConfig::default();
+            job_json_modify_permission(value, &mut permissions).unwrap();
+        }
+        assert!(
+            job_json_modify_permission("invalid", &mut crate::PermissionsConfig::default())
+                .is_err()
+        );
+        for value in ["full", "low", "none"] {
+            let mut permissions = crate::PermissionsConfig::default();
+            job_json_print_permission(value, &mut permissions).unwrap();
+        }
+        assert!(
+            job_json_print_permission("invalid", &mut crate::PermissionsConfig::default()).is_err()
+        );
+
+        let encrypt_40 = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"o","40bit":{"annotate":"y","extract":"n","modify":"none","print":"low"}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&encrypt_40, true).is_ok());
+        let encrypt_128 = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"o","128bit":{"accessibility":"y","annotate":"n","assemble":"y","cleartextMetadata":"","extract":"n","form":"y","modifyOther":"n","modify":"all","print":"full","forceV4":"","useAes":"n"}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&encrypt_128, true).is_ok());
+        let encrypt_256 = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"o","256bit":{"forceR5":"","allowInsecure":""}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&encrypt_256, true).is_ok());
+        let missing_password = crate::json::Json::parse(br#"{"128bit":{}}"#).unwrap();
+        assert!(parse_job_encrypt(&missing_password, true).is_err());
+        let duplicate_key_length = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"o","40bit":{},"128bit":{}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&duplicate_key_length, true).is_err());
+        let no_key_length =
+            crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
+        assert!(parse_job_encrypt(&no_key_length, true).is_err());
+        assert!(parse_job_encrypt(&encrypt_40, false).is_err());
+    }
+
+    #[test]
+    fn job_json_private_parser_covers_full_handler_dispatch() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let password_file = tempdir.path().join("password.txt");
+        std::fs::write(&password_file, b"file-password\n").unwrap();
+        let mut root = serde_json::Map::new();
+        for (key, value) in [
+            ("inputFile", "input.pdf"),
+            ("outputFile", "output.pdf"),
+            ("password", "password"),
+            ("jsonInput", ""),
+            ("qdf", ""),
+            ("preserveUnreferenced", ""),
+            ("newlineBeforeEndstream", ""),
+            ("normalizeContent", "y"),
+            ("streamData", "compress"),
+            ("compressStreams", "y"),
+            ("recompressFlate", ""),
+            ("decodeLevel", "all"),
+            ("decrypt", ""),
+            ("deterministicId", ""),
+            ("staticAesIv", ""),
+            ("staticId", ""),
+            ("noOriginalObjectIds", ""),
+            ("allowWeakCrypto", ""),
+            ("progress", ""),
+            ("verbose", ""),
+            ("objectStreams", "generate"),
+            ("minVersion", "1.4"),
+            ("forceVersion", "1.7"),
+            ("linearizePass1", "pass1.pdf"),
+            ("linearize", ""),
+            ("updateFromJson", "update.json"),
+            ("collate", "2"),
+            ("jsonOutput", "latest"),
+            ("jsonStreamPrefix", "stream"),
+            ("jsonStreamData", "file"),
+            ("testJsonSchema", ""),
+            ("showEncryptionKey", ""),
+            ("noWarn", ""),
+            ("warningExit0", ""),
+            ("check", ""),
+            ("showEncryption", ""),
+            ("removePageLabels", ""),
+            ("preserveUnreferencedResources", ""),
+            ("oiMinArea", "100"),
+            ("oiMinHeight", "100"),
+            ("oiMinWidth", "100"),
+            ("reportMemoryUsage", ""),
+            ("jobJsonFile", "nested.json"),
+        ] {
+            root.insert(key.to_owned(), serde_json::json!(value));
+        }
+        root.insert(
+            "passwordFile".to_owned(),
+            serde_json::json!(password_file.to_string_lossy()),
+        );
+        root.insert("jsonKey".to_owned(), serde_json::json!(["qpdf", "pages"]));
+        root.insert(
+            "jsonObject".to_owned(),
+            serde_json::json!(["trailer", "1 0 R"]),
+        );
+        root.insert(
+            "encrypt".to_owned(),
+            serde_json::json!({
+                "userPassword": "u",
+                "ownerPassword": "o",
+                "128bit": {"useAes": "y"}
+            }),
+        );
+        root.insert(
+            "pages".to_owned(),
+            serde_json::json!([{"file": "page.pdf", "password": "page-password", "range": "1"}]),
+        );
+        root.insert(
+            "overlay".to_owned(),
+            serde_json::json!({"file": "overlay.pdf", "from": "1", "to": "1", "repeat": "1"}),
+        );
+        root.insert(
+            "underlay".to_owned(),
+            serde_json::json!([{"file": "underlay.pdf"}]),
+        );
+        root.insert(
+            "addAttachment".to_owned(),
+            serde_json::json!([{
+                "file": "attachment.bin", "filename": "shown.bin", "key": "shown-key",
+                "mimetype": "application/octet-stream", "description": "description",
+                "creationdate": "D:20220131134246-05'00'", "moddate": "D:20220131134246-05'00'",
+                "replace": ""
+            }]),
+        );
+        root.insert(
+            "copyAttachmentsFrom".to_owned(),
+            serde_json::json!([{"file": "copy.pdf", "password": "copy-password", "prefix": "p-"}]),
+        );
+        root.insert(
+            "removeAttachment".to_owned(),
+            serde_json::json!(["old-key"]),
+        );
+        root.insert(
+            "setPageLabels".to_owned(),
+            serde_json::json!(["1:D", "2:a/2/prefix"]),
+        );
+        let json = serde_json::Value::Object(root).to_string();
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(&json)
+            .expect("all parsed qpdf job handlers should accept their valid shapes");
+
+        let mut latest = QPDFJob::new();
+        latest
+            .initialize_from_json_partial(r#"{"json":""}"#)
+            .unwrap();
+        let unknown = crate::json::Json::parse(br#"{"potato":""}"#).unwrap();
+        let error = validate_job_json_schema(&unknown).unwrap_err();
+        assert!(error.to_string().contains("qpdf: job json has errors:"));
+    }
+
+    #[test]
+    fn job_json_page_label_parser_covers_styles_and_failures() {
+        let entries = parse_job_page_labels(
+            &[
+                "1:D".to_owned(),
+                "2:a".to_owned(),
+                "3:A".to_owned(),
+                "4:r".to_owned(),
+                "5:R".to_owned(),
+                "6:".to_owned(),
+            ],
+            6,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 6);
+        assert!(parse_job_page_labels(&["bad".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["q:D".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["2:D".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["1:D".to_owned(), "1:a".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["7:D".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["1:X".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["1:D/foo".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["1:D/0".to_owned()], 6).is_err());
+        let relative = parse_job_page_labels(
+            &[
+                "1:D".to_owned(),
+                "r2:a/2/prefix".to_owned(),
+                "z:R//end".to_owned(),
+            ],
+            6,
+        )
+        .unwrap();
+        assert_eq!(relative[1].0, 4);
+        assert_eq!(relative[2].0, 5);
     }
 }
