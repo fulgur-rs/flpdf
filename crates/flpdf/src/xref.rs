@@ -3533,7 +3533,7 @@ mod final_handle_tests {
             stream_length: 0,
         });
         let detached = detach_bootstrap_handle(&stream).expect("stream detaches");
-        assert_eq!(detached.get_filter_on_write().expect("stream flag"), true);
+        assert!(detached.get_filter_on_write().expect("stream flag"));
         assert_eq!(
             detached
                 .as_stream_dict()
