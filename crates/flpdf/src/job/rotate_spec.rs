@@ -20,8 +20,8 @@
 //! ## Page-range
 //!
 //! If no `:` is present the spec applies to all pages (equivalent to an empty
-//! page-range string in [`PageRange`]).  A `:` must be followed by a non-empty
-//! page-range string; a trailing `:` with nothing after it is an error.
+//! page-range string in [`PageRange`]).  A trailing `:` with nothing after it
+//! also selects all pages, matching qpdf's empty-range fallback.
 //!
 //! ## Multiple `--rotate` flags
 //!
@@ -162,22 +162,18 @@ impl RotateSpec {
             }
             pos += 1; // consume ':'
 
-            // The page-range after ':' must not be empty.
-            if pos >= bytes.len() {
-                return Err(Error::parse(
-                    pos,
-                    "expected a page-range after ':'; got end of input",
-                ));
-            }
-
             let range_str = &input[pos..];
-            PageRange::parse(range_str).map_err(|e| {
-                // Re-wrap with offset adjusted to the page-range substring.
-                match e {
-                    Error::Parse { offset, message } => Error::parse(pos + offset, message),
-                    other => other,
-                }
-            })?
+            if range_str.is_empty() {
+                PageRange::parse("")?
+            } else {
+                PageRange::parse(range_str).map_err(|e| {
+                    // Re-wrap with offset adjusted to the page-range substring.
+                    match e {
+                        Error::Parse { offset, message } => Error::parse(pos + offset, message),
+                        other => other,
+                    }
+                })?
+            }
         } else {
             // No ':' → all pages.
             PageRange::parse("").expect("empty string always yields all-pages sentinel")
@@ -390,13 +386,11 @@ mod tests {
     }
 
     #[test]
-    fn trailing_colon_no_range_is_invalid() {
-        // "90:" — colon present but nothing follows
-        let msg = parse_err("90:");
-        assert!(
-            msg.contains("expected a page-range after ':'") || msg.contains("end of input"),
-            "got: {msg}"
-        );
+    fn trailing_colon_no_range_selects_all_pages_like_qpdf() {
+        // qpdf's parseRotationParameter falls back to "1-z" for an empty
+        // range after the colon (`QPDFJob.cc:373-415`).
+        let spec = parse_ok("90:");
+        assert_eq!(spec.range.resolve(3).unwrap(), vec![1, 2, 3]);
     }
 
     #[test]

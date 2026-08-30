@@ -219,6 +219,57 @@ fn job_json_file_split_pages_writes_qpdf_named_chunks() {
 }
 
 #[test]
+fn job_json_file_split_pages_empty_value_defaults_to_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-empty.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"empty-split.pdf","splitPages":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-empty.json")
+        .assert()
+        .code(0);
+
+    for page in 1..=3 {
+        assert!(directory
+            .path()
+            .join(format!("empty-split-{page}.pdf"))
+            .is_file());
+    }
+    assert!(!directory.path().join("empty-split.pdf").exists());
+}
+
+#[test]
+fn job_json_file_split_pages_rejects_standard_output_like_qpdf() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-stdout.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"-","splitPages":"1"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-stdout.json")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "--split-pages may not be used when writing to standard output",
+        ));
+}
+
+#[test]
 fn job_json_file_rotate_applies_to_the_selected_page() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -239,7 +290,7 @@ fn job_json_file_rotate_applies_to_the_selected_page() {
 
     assert_eq!(
         page_rotations(&fs::read(directory.path().join("rotated.pdf")).unwrap()),
-        vec![None, Some(90), None],
+        vec![Some(0), Some(90), Some(0)],
         "qpdf rotate=90:2 targets only output page 2"
     );
 }

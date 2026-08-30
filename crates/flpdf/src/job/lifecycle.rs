@@ -11,13 +11,16 @@ use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
 use super::page_range::PageRange;
 use super::page_specs::PageSpecInput;
+use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
+use super::rotate::apply_rotate_to_pages;
+use super::rotate_spec::RotateSpec;
 use crate::encryption::{EncryptMethod, EncryptParams};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
-    Error, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result,
-    Severity, UsageError, WriterConfiguration,
+    AcroFormDocumentHelper, Error, ObjectStreamMode, PageDocumentHelper, Pdf, PdfOpenOptions,
+    PdfWriter, QPDFLogger, ReadSeek, Result, Severity, UsageError, WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::fs::File;
@@ -81,6 +84,9 @@ struct JobConfiguration {
     check: bool,
     require_output: bool,
     progress: bool,
+    split_pages: Option<usize>,
+    rotations: Vec<RotateSpec>,
+    remove_restrictions: bool,
     writer: WriterConfiguration,
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
@@ -671,6 +677,21 @@ fn parse_positive_usize(value: &[u8], path: &str) -> Result<usize> {
     Ok(parsed)
 }
 
+fn parse_job_split_pages(value: &[u8]) -> Result<usize> {
+    // qpdf's Config::splitPages treats an empty parameter as one page
+    // (`libqpdf/QPDFJob_config.cc:597-609`); preserve that generated-handler
+    // default instead of treating an empty JSON string as an absent option.
+    if value.is_empty() {
+        return Ok(1);
+    }
+    let value = String::from_utf8_lossy(value);
+    value.parse::<usize>().map_err(|_| {
+        Error::Usage(UsageError::new(format!(
+            ".splitPages: invalid page count {value}"
+        )))
+    })
+}
+
 fn parse_job_attachment(value: &crate::json::Json, path: &str) -> Result<AttachmentAddOptions> {
     let members = job_json_members(value);
     let file = job_json_required_string(&members, b"file", &format!("{path}.file"))?;
@@ -1103,9 +1124,10 @@ impl QPDFJob {
 
     /// Initialize the portable qpdf-job JSON surface used by qtest.
     ///
-    /// This implements a subset of qpdf's `--job-json-file` schema:
-    /// `inputFile`, `outputFile`, `password`, `staticId`, `deterministicId`,
-    /// `decrypt`, `objectStreams`, and `progress`.
+    /// This implements the qpdf job-JSON fields currently owned by this
+    /// lifecycle, including input/output setup, writer settings, page
+    /// transformations (`splitPages`, `rotate`, and `removeRestrictions`),
+    /// attachments, page selection, and JSON output.
     ///
     /// # Errors
     ///
@@ -1262,6 +1284,16 @@ impl QPDFJob {
         configuration.allow_weak_crypto = job_json_bare(&members, b"allowWeakCrypto")?;
         configuration.progress = job_json_bare(&members, b"progress")?;
         configuration.verbose = job_json_bare(&members, b"verbose")?;
+        if let Some(value) = job_json_string(&members, b"splitPages")? {
+            configuration.split_pages = Some(parse_job_split_pages(&value)?);
+        }
+        if let Some(value) = job_json_string(&members, b"rotate")? {
+            let value = String::from_utf8_lossy(&value);
+            let rotation = RotateSpec::parse(&value)
+                .map_err(|error| Error::Usage(UsageError::new(format!(".rotate: {error}"))))?;
+            configuration.rotations.push(rotation);
+        }
+        configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
         if let Some(value) = job_json_choice(
             &members,
             b"objectStreams",
@@ -1640,20 +1672,30 @@ impl QPDFJob {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
         }
         let progress_requested = self.configuration.progress;
-        let write_result = (|| {
-            let mut writer = PdfWriter::new(pdf);
-            writer_configuration.apply_to(&mut writer);
-            if progress_requested {
-                self.configure_writer_progress(&mut writer);
-            }
-            if output == Path::new("-") {
-                self.logger.save_to_standard_output(true)?;
-                writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
+        let write_result =
+            if let Some(chunk_size) = self.configuration.split_pages.filter(|size| *size > 0) {
+                let mut split_options = SplitPageOptions::new(chunk_size, output.clone())
+                    .with_writer_configuration(writer_configuration.clone());
+                if let Some(input) = self.configuration.input_file.clone() {
+                    split_options = split_options.with_input_path(input);
+                }
+                self.split_pages(pdf, split_options).map(|_| ())
             } else {
-                writer.set_output_file(&output)?;
-            }
-            writer.write()
-        })();
+                (|| {
+                    let mut writer = PdfWriter::new(pdf);
+                    writer_configuration.apply_to(&mut writer);
+                    if progress_requested {
+                        self.configure_writer_progress(&mut writer);
+                    }
+                    if output == Path::new("-") {
+                        self.logger.save_to_standard_output(true)?;
+                        writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
+                    } else {
+                        writer.set_output_file(&output)?;
+                    }
+                    writer.write()
+                })()
+            };
         match write_result {
             Ok(()) => {
                 self.record_document_warnings(pdf);
@@ -1714,6 +1756,7 @@ impl QPDFJob {
         }
 
         if configuration.page_specs.is_empty() {
+            self.apply_configured_rotations(&mut primary, configuration)?;
             self.run_document_stages(&mut primary, configuration)
         } else {
             let mut page_sources = vec![primary];
@@ -1737,6 +1780,7 @@ impl QPDFJob {
                 configuration.remove_unreferenced_resources,
                 configuration.writer.preserves_unreferenced_objects(),
             )?; // cov:ignore: llvm-cov attributes this successful page merge continuation to its opening call lines
+            self.apply_configured_rotations(&mut merged, configuration)?;
             let status = self.run_document_stages(&mut merged, configuration);
             // `merged` may retain provider-backed objects from page_sources;
             // both are deliberately alive until every output byte is written.
@@ -1744,6 +1788,38 @@ impl QPDFJob {
             drop(page_sources);
             status
         }
+    }
+
+    fn apply_configured_rotations<R>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        configuration: &JobConfiguration,
+    ) -> Result<()>
+    where
+        R: Read + Seek,
+    {
+        if configuration.rotations.is_empty() {
+            return Ok(());
+        }
+        let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+        let page_count = u32::try_from(page_refs.len())
+            .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
+        for rotation in &configuration.rotations {
+            let selected = rotation.range.resolve(page_count)?;
+            let selected_refs = selected
+                .into_iter()
+                .map(|page| {
+                    let index = usize::try_from(page - 1).map_err(|_| {
+                        Error::Unsupported("rotation page index underflow".to_owned())
+                    })?;
+                    page_refs.get(index).copied().ok_or_else(|| {
+                        Error::Unsupported("rotation page index out of range".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            apply_rotate_to_pages(pdf, &selected_refs, &rotation.op)?;
+        }
+        Ok(())
     }
 
     fn run_document_stages<R>(
@@ -1771,6 +1847,17 @@ impl QPDFJob {
             });
         }
         apply_overlay_specs(pdf, &mut overlay_specs)?;
+
+        // qpdf's `handleTransformations` applies `removeRestrictions` after
+        // underlay/overlay handling and delegates the mutation to
+        // `QPDFAcroFormDocumentHelper::disableDigitalSignatures`
+        // (`libqpdf/QPDFJob.cc:2137-2150`). Keep the same document-level
+        // /Perms, /SigFlags, and signature-field boundary; do not reuse the
+        // CLI's separate rewrite policy.
+        if configuration.remove_restrictions {
+            let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+            let _ = acroform.disable_digital_signatures()?;
+        }
 
         self.apply_page_label_transformations(pdf, configuration)?;
         for key in &configuration.attachments_to_remove {
@@ -2049,6 +2136,12 @@ impl QPDFJob {
             return Err(UsageError::new("no output file may be given for this option").into());
         }
         if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
+            if self.configuration.split_pages.is_some_and(|size| size > 0) {
+                return Err(UsageError::new(
+                    "--split-pages may not be used when writing to standard output",
+                )
+                .into());
+            }
             self.logger.save_to_standard_output(true)?;
         }
         if let (Some(input), Some(output)) = (
