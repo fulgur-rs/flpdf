@@ -3884,23 +3884,25 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         use crate::writer::object_streams::ObjectStreamGroup;
         use crate::writer::rewrite_renumber::ObjectStreamRenumber;
 
-        let source_xref_entries = pdf.source_xref_entries();
+        // The compact Preserve path carries source-container identity for
+        // `/Extends`; QDF's dedicated emission-number pre-scan must keep its
+        // existing synthetic-container ordering (`QPDFWriter.cc:1057-1118`).
+        let source_xref_entries = (!options.qdf
+            && options.object_streams == ObjectStreamMode::Preserve)
+            .then(|| pdf.source_xref_entries());
         let groups = plan
             .batches
             .iter()
             .map(|members| {
                 let members = members.clone();
-                if options.object_streams == ObjectStreamMode::Preserve {
+                if let Some(source_xref_entries) = source_xref_entries.as_ref() {
                     if let Some(source) =
-                        source_objstm_container_for_batch(&members, &source_xref_entries)
+                        source_objstm_container_for_batch(&members, source_xref_entries)
                     {
-                        ObjectStreamGroup::SourceBacked { source, members }
-                    } else {
-                        ObjectStreamGroup::Synthetic { members }
+                        return ObjectStreamGroup::SourceBacked { source, members };
                     }
-                } else {
-                    ObjectStreamGroup::Synthetic { members }
                 }
+                ObjectStreamGroup::Synthetic { members }
             })
             .collect::<Vec<_>>();
         let object_stream_renumber = ObjectStreamRenumber::build_with_stream_policy(
