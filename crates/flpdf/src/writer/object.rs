@@ -3385,6 +3385,7 @@ mod tests {
             )]),
             stream_data: Some(Rc::new(Vec::new())),
             stream_provider: None,
+            filter_on_write: true,
             stream_length: 0,
         };
         let reference = ObjectValue::Reference(ObjectRef::new(9, 0));

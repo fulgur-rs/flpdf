@@ -414,6 +414,7 @@ impl BootstrapHandleDocument {
                 ),
                 stream_data: Some(Rc::new(stream.data.clone())),
                 stream_provider: None,
+                filter_on_write: true,
                 stream_length: stream.data.len(),
             },
             Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),

@@ -877,6 +877,14 @@ fn canonical_stream_filter_plan(
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
+    // QPDFWriter::willFilterStream first derives a filter request from the
+    // stream and writer state, then lets QPDF_Stream::filter_on_write veto
+    // every filtering branch (`QPDFWriter.cc:1254-1285`). Keep that veto
+    // ahead of metadata, normalization, and compression policy construction:
+    // false means raw source dispatch regardless of any of those settings.
+    if !handle.get_filter_on_write()? {
+        return Ok(None);
+    }
     // The CLI may have already normalized and replaced this stream's bytes.
     // Keep that state as an effective normalization request so qpdf's
     // normalization branch still suppresses compression, while avoiding a
@@ -1264,6 +1272,123 @@ mod tests {
         assert_eq!(data, b"metadata");
         assert!(!refiltered);
         assert!(!dict.try_has_key(b"/Filter").unwrap());
+    }
+
+    #[test]
+    fn canonical_stream_output_honors_a_disabled_filter_on_write_flag() {
+        let raw = vec![0x81, b'w', 0xb9, b'w', 0x80];
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"RunLengthDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(raw.len() as i64)),
+            ]),
+            Rc::new(raw.clone()),
+        );
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            decode_level: crate::writer::DecodeLevel::Specialized,
+            ..WriterOptions::default()
+        };
+        let (dict, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
+
+        assert_eq!(data, raw);
+        assert!(!refiltered);
+        assert!(dict
+            .get_key(b"/Filter")
+            .try_is_name_and_equals(b"RunLengthDecode")
+            .unwrap());
+        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(5));
+    }
+
+    #[test]
+    fn disabled_filter_on_write_overrides_the_metadata_filter_policy() {
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let raw =
+            crate::filters::test_dictionary_api::encode_stream_data(&filter_dict, b"metadata")
+                .expect("metadata payload must encode");
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Metadata".to_vec())),
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(raw.len() as i64)),
+            ]),
+            Rc::new(raw.clone()),
+        );
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+
+        let (dict, data, refiltered) = canonical_stream_output(&stream, &WriterOptions::default())
+            .expect("disabled stream should still be emitted");
+
+        assert_eq!(data, raw);
+        assert!(!refiltered);
+        assert!(dict
+            .get_key(b"/Filter")
+            .try_is_name_and_equals(b"FlateDecode")
+            .unwrap());
+        assert_eq!(
+            dict.get_key(b"/Length").as_integer(),
+            Some(raw.len() as i64)
+        );
+    }
+
+    #[test]
+    fn filter_on_write_mutation_invalidates_the_stream_cache_fingerprint() {
+        let stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+        let before = crate::writer::plain::plan::stream_cache_fingerprint(&stream).unwrap();
+
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+        let after = crate::writer::plain::plan::stream_cache_fingerprint(&stream).unwrap();
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn disabled_filter_on_write_applies_to_rewrite_and_linearization_wrappers() {
+        let raw = vec![0x81, b'w', 0xb9, b'w', 0x80];
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"RunLengthDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(raw.len() as i64)),
+            ]),
+            Rc::new(raw.clone()),
+        );
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            decode_level: crate::writer::DecodeLevel::Specialized,
+            ..WriterOptions::default()
+        };
+
+        let (_, rewrite_data, rewrite_refiltered) =
+            canonical_stream_output_for_rewrite(&stream, &options, false).unwrap();
+        let (_, linearization_data, linearization_refiltered) =
+            canonical_stream_output_for_linearization(&stream, &options, false).unwrap();
+
+        assert_eq!(rewrite_data, raw);
+        assert_eq!(linearization_data, raw);
+        assert!(!rewrite_refiltered);
+        assert!(!linearization_refiltered);
     }
 
     #[test]
