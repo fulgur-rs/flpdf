@@ -208,3 +208,31 @@ pub(crate) fn wrap_objstm_body_as_handle(
     );
     Ok((handle, data))
 }
+
+#[cfg(test)]
+mod final_handle_tests {
+    use super::{wrap_objstm_body_as_handle, ObjStmBody};
+    use crate::writer::CompressStreams;
+    use crate::ObjectRef;
+
+    #[test]
+    fn object_stream_wrapper_retains_an_extends_reference_handle() {
+        let body = ObjStmBody {
+            bytes: b"1 0\n7".to_vec(),
+            first_offset: 4,
+            n_members: 1,
+        };
+        let (stream, _) =
+            wrap_objstm_body_as_handle(&body, CompressStreams::No, Some(ObjectRef::new(9, 0)))
+                .expect("object stream wrapper");
+        assert_eq!(
+            stream
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .try_get_key(b"/Extends")
+                .expect("Extends key")
+                .object_ref(),
+            Some(ObjectRef::new(9, 0))
+        );
+    }
+}

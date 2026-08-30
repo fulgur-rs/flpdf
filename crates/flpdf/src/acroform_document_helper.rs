@@ -2284,3 +2284,71 @@ fn resource_renames_from_conflicts(conflicts: &ResourceConflicts) -> ResourceRen
 fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
     value.strip_prefix(b"/").unwrap_or(value).to_vec()
 }
+
+#[cfg(test)]
+mod final_handle_tests {
+    use super::{AcroFormDocumentHelper, InheritedFieldOverrides};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
+    use std::collections::HashMap;
+    use std::io::Cursor;
+
+    fn fixture(name: &str) -> Pdf<Cursor<Vec<u8>>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(name);
+        Pdf::open(Cursor::new(std::fs::read(path).expect("fixture exists"))).expect("fixture opens")
+    }
+
+    #[test]
+    fn field_tree_and_inherited_handle_routes_walk_kids_and_defaults() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+
+        let fields = helper.fields().expect("field refs");
+        assert!(fields.contains(&ObjectRef::new(5, 0)));
+        assert!(fields.contains(&ObjectRef::new(11, 0)));
+        let infos = helper.field_infos().expect("field infos");
+        assert!(infos
+            .iter()
+            .any(|info| info.object_ref == ObjectRef::new(5, 0)));
+        assert!(helper
+            .top_level_fields()
+            .expect("top fields")
+            .contains(&ObjectRef::new(5, 0)));
+
+        let acroform_ref = helper.ensure_acroform_ref().expect("existing AcroForm");
+        assert_ne!(acroform_ref, ObjectRef::new(0, 0));
+
+        let top = helper.pdf.get_object_handle(ObjectRef::new(5, 0));
+        let mut copies = HashMap::new();
+        let overrides = InheritedFieldOverrides {
+            override_da: true,
+            source_default_da: b"/Other 9 Tf".to_vec(),
+            override_q: true,
+            source_default_q: 2,
+        };
+        let copied = helper
+            .copy_field_tree_with_overrides(&top, &mut copies, Some(&overrides), None)
+            .expect("field tree copy");
+        assert!(copied.object_ref().is_some());
+
+        let added =
+            ObjectHandle::dictionary(vec![(b"/FT".to_vec(), ObjectHandle::name(b"Tx".to_vec()))]);
+        helper
+            .add_form_fields(vec![added])
+            .expect("append a field through the canonical array handle");
+    }
+
+    #[test]
+    fn field_info_walk_skips_a_pure_widget_child() {
+        let mut pdf = fixture("acroform-sig-parent-pure-widget-kid.pdf");
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        let infos = helper.field_infos().expect("field infos");
+        assert!(infos
+            .iter()
+            .any(|info| info.object_ref == ObjectRef::new(4, 0)));
+        assert!(!infos
+            .iter()
+            .any(|info| info.object_ref == ObjectRef::new(5, 0)));
+    }
+}

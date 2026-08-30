@@ -462,6 +462,50 @@ fn recover_stream_boundary(
     None
 }
 
+#[cfg(test)]
+mod final_handle_tests {
+    use super::{finish_file_object_handle, parse_file_object_handle_syntax, RecoveryPolicy};
+    use crate::object_handle::{ObjectHandle, ObjectValue};
+    use crate::parser::HandleResolver;
+    use crate::{ObjectRef, Result};
+
+    struct Detached;
+
+    impl HandleResolver for Detached {
+        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::new_indirect_unresolved(object_ref, -1)
+        }
+
+        fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+            ObjectHandle::from_value(value)
+        }
+    }
+
+    #[test]
+    fn require_endstream_rejects_a_usable_length_without_a_terminator() -> Result<()> {
+        let input = b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nnot-endobj";
+        let mut resolver = Detached;
+        let pending = parse_file_object_handle_syntax(input, &mut resolver)?;
+        let error =
+            finish_file_object_handle(input, pending, None, RecoveryPolicy::RequireEndstream)
+                .expect_err("strict qpdf stream framing requires endstream");
+        assert!(error.to_string().contains("expected endstream"));
+        Ok(())
+    }
+
+    #[test]
+    fn require_endstream_rejects_unbounded_stream_data_without_a_terminator() -> Result<()> {
+        let input = b"1 0 obj\n<< >>\nstream\nabc";
+        let mut resolver = Detached;
+        let pending = parse_file_object_handle_syntax(input, &mut resolver)?;
+        let error =
+            finish_file_object_handle(input, pending, None, RecoveryPolicy::RequireEndstream)
+                .expect_err("strict qpdf stream framing requires a recoverable endstream");
+        assert!(error.to_string().contains("stream data exceeds input"));
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryTerminator {
     Endstream { position: usize, after: usize },

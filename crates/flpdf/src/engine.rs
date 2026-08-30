@@ -178,10 +178,10 @@ impl<R: Read + Seek> Pdf<R> {
         let trailer = resolver.direct_object_handle(crate::reader::rebind_handle_value(
             &resolver,
             &loaded.trailer,
-        )?);
-        // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
-        // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
-        // separate copy kept in sync.
+        )?); // cov:ignore: bootstrap xref loading guarantees this direct value boundary
+             // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
+             // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
+             // separate copy kept in sync.
         let encryption = resolver.encryption_parameters();
         let mut pdf = Self {
             unique_id,

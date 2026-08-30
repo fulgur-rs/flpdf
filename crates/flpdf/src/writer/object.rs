@@ -3284,6 +3284,32 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_ref_map_writer_accepts_a_trailer_id_callback() -> Result<()> {
+        let dictionary = ObjectHandle::dictionary(vec![
+            (
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"old-a".to_vec()),
+                    ObjectHandle::string(b"old-b".to_vec()),
+                ]),
+            ),
+            (b"/Keep".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let mut output = Vec::new();
+        let mut write_id = |out: &mut Vec<u8>| out.extend_from_slice(b"[<01><02>]");
+        let map = |object_ref: ObjectRef| Ok(object_ref);
+        dictionary.write_dictionary_with_ref_map_and_id_writer(
+            &mut output,
+            Some(&mut write_id),
+            &map,
+            &BTreeSet::new(),
+            false,
+        )?;
+        assert_eq!(output, b"<< /ID [<01><02>] /Keep 1 >>");
+        Ok(())
+    }
+
+    #[test]
     fn mapped_stream_writer_overrides_length_and_suppresses_null_children() -> Result<()> {
         let stream = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![

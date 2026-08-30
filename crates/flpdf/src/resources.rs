@@ -504,3 +504,53 @@ fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
         Error::Internal("Form XObject handle did not resolve to a stream".to_owned())
     })
 }
+
+#[cfg(test)]
+mod final_handle_tests {
+    use super::remove_unreferenced_resources_in_form_xobjects;
+    use crate::{ObjectHandle, Pdf};
+    use std::rc::Rc;
+
+    #[test]
+    fn form_resource_prepass_resolves_form_and_resource_handles() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
+        let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists"))
+            .expect("fixture opens");
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let page_handle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page_handle).expect("page resolves");
+        let replacement = page_handle.shallow_copy().expect("page is copyable");
+
+        let form = pdf
+            .new_stream_with_data(Rc::new(b"q Q".to_vec()))
+            .expect("form stream");
+        form.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+            .expect("form type");
+        form.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+            .expect("form subtype");
+        form.replace_key(
+            b"/Resources",
+            ObjectHandle::dictionary(vec![(
+                b"/Font".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Unused".to_vec(), ObjectHandle::integer(1))]),
+            )]),
+        )
+        .expect("form resources");
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Fm0".to_vec(), form)]),
+        )]);
+        replacement
+            .replace_key(b"/Resources", resources)
+            .expect("page resources");
+        pdf.replace_object(page_ref, replacement)
+            .expect("replace page");
+
+        let (unresolved, failures) =
+            remove_unreferenced_resources_in_form_xobjects(&mut pdf, page_ref)
+                .expect("form resource prepass");
+        assert!(unresolved.is_empty());
+        assert!(!failures);
+    }
+}

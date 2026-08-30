@@ -561,9 +561,53 @@ pub(crate) fn json_dictionary<K: AsRef<[u8]>>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ConvertError, JsonOutputError};
-    use crate::object_handle::ObjectJsonError;
+    use super::{
+        convert_object_json_error, pdf_object_to_json, qpdf_raw_stream_payload,
+        stream_payload_for_decode_level, ConvertError, DecodeLevel, JsonObjectSelector,
+        JsonOutputError,
+    };
+    use crate::object_handle::{ObjectHandle, ObjectJsonError};
     use crate::pipeline::PipelineError;
+    use crate::Pdf;
+    use std::io::Cursor;
+    use std::rc::Rc;
+
+    fn stream(data: Vec<u8>, filter: Option<&[u8]>) -> ObjectHandle {
+        let mut entries = vec![(
+            b"/Length".to_vec(),
+            ObjectHandle::integer(data.len() as i64),
+        )];
+        if let Some(filter) = filter {
+            entries.push((b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec())));
+        }
+        ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::new(data))
+    }
+
+    fn stream_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>".as_slice(),
+            b"<< /Length 5 >>\nstream\nhello\nendstream".as_slice(),
+        ];
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).expect("stream fixture opens")
+    }
 
     #[test]
     fn conversion_errors_keep_their_public_text_and_categories() {
@@ -600,6 +644,115 @@ mod tests {
             JsonOutputError::from(ObjectJsonError::UnsupportedVersion(3)),
             JsonOutputError::Convert(ConvertError::PdfError(message))
                 if message.contains("only version 1 or 2")
+        ));
+    }
+
+    #[test]
+    fn standalone_json_and_raw_stream_routes_use_canonical_handles() {
+        let scalar = ObjectHandle::integer(7);
+        assert_eq!(
+            pdf_object_to_json(&scalar)
+                .expect("scalar JSON")
+                .unparse()
+                .expect("scalar JSON bytes"),
+            b"7"
+        );
+        assert!(matches!(
+            pdf_object_to_json(&ObjectHandle::real(f64::NAN)),
+            Err(ConvertError::NonFiniteFloat)
+        ));
+
+        let mut pdf = stream_pdf();
+        assert_eq!(
+            qpdf_raw_stream_payload(&mut pdf, crate::ObjectRef::new(4, 0), DecodeLevel::None)
+                .expect("raw stream payload")
+                .expect("stream object"),
+            b"hello"
+        );
+        assert_eq!(
+            qpdf_raw_stream_payload(&mut pdf, crate::ObjectRef::new(1, 0), DecodeLevel::All)
+                .expect("non-stream payload lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_decode_levels_cover_raw_specialized_unsupported_and_corrupt_paths() {
+        let plain = stream(b"plain".to_vec(), None);
+        assert_eq!(
+            stream_payload_for_decode_level(&plain, DecodeLevel::None)
+                .expect("raw payload")
+                .as_ref(),
+            b"plain"
+        );
+        assert_eq!(
+            stream_payload_for_decode_level(&plain, DecodeLevel::Generalized)
+                .expect("plain decoded payload")
+                .as_ref(),
+            b"plain"
+        );
+
+        let unknown = stream(b"raw".to_vec(), Some(b"UnknownDecode"));
+        assert_eq!(
+            stream_payload_for_decode_level(&unknown, DecodeLevel::All)
+                .expect("unknown filter raw fallback")
+                .as_ref(),
+            b"raw"
+        );
+
+        let specialized = stream(b"raw".to_vec(), Some(b"RunLengthDecode"));
+        assert_eq!(
+            stream_payload_for_decode_level(&specialized, DecodeLevel::Generalized)
+                .expect("specialized filter remains raw")
+                .as_ref(),
+            b"raw"
+        );
+
+        let corrupt = stream(b"not-flate".to_vec(), Some(b"FlateDecode"));
+        assert_eq!(
+            stream_payload_for_decode_level(&corrupt, DecodeLevel::All)
+                .expect("corrupt filter raw fallback")
+                .as_ref(),
+            b"not-flate"
+        );
+    }
+
+    #[test]
+    fn selectors_and_object_error_conversion_cover_all_public_boundaries() {
+        assert_eq!(
+            JsonObjectSelector::from_str("trailer"),
+            Some(JsonObjectSelector::Trailer)
+        );
+        assert_eq!(
+            JsonObjectSelector::from_str("12,3"),
+            Some(JsonObjectSelector::Object {
+                number: 12,
+                generation: 3
+            })
+        );
+        assert!(JsonObjectSelector::from_str("").is_none());
+        assert!(JsonObjectSelector::from_str("1,2,3").is_none());
+        assert!(JsonObjectSelector::from_str("1,").is_none());
+
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::NonFiniteFloat),
+            ConvertError::NonFiniteFloat
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::Json("json".to_owned())),
+            ConvertError::JsonError(message) if message == "json"
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::Pipeline(PipelineError::logic("pipeline"))),
+            ConvertError::PdfError(message) if message.contains("pipeline")
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::Pdf("pdf".to_owned())),
+            ConvertError::PdfError(message) if message == "pdf"
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::UnsupportedVersion(4)),
+            ConvertError::PdfError(message) if message.contains("only version 1 or 2")
         ));
     }
 }

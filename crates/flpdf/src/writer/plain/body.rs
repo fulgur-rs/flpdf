@@ -1080,3 +1080,46 @@ fn planned_member_body_violation(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod final_handle_tests {
+    use super::emit_content_container_from_handle_with_ref_map;
+    use crate::writer::{NewlineBeforeEndstream, WriterOptions};
+    use crate::ObjectHandle;
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+
+    #[test]
+    fn content_container_emits_direct_streams_and_uses_the_handle_string_writer() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(4)),
+                (b"/Label".to_vec(), ObjectHandle::string(b"data".to_vec())),
+            ]),
+            Rc::new(b"data".to_vec()),
+        );
+        let container = ObjectHandle::dictionary(vec![(b"/Contents".to_vec(), stream)]);
+        let options = WriterOptions {
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterOptions::default()
+        };
+        let map = |object_ref| Ok(object_ref);
+        let mut output = Vec::new();
+
+        emit_content_container_from_handle_with_ref_map(
+            &container,
+            &options,
+            &mut output,
+            &map,
+            &BTreeSet::new(),
+        )
+        .expect("direct content stream emission");
+
+        assert!(output
+            .windows(b"/Contents".len())
+            .any(|window| window == b"/Contents"));
+        assert!(output
+            .windows(b"stream\ndata\nendstream".len())
+            .any(|window| { window == b"stream\ndata\nendstream" }));
+    }
+}

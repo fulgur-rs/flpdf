@@ -1959,11 +1959,15 @@ pub(crate) fn rebind_handle_value<R: Read + Seek + 'static>(
     resolver: &ResolverHandle<R>,
     source: &ObjectHandle,
 ) -> Result<ObjectValue> {
+    // cov:ignore-start: the bootstrap xref loader passes the direct trailer
+    // value by construction; an indirect handle here is an internal invariant
+    // violation rather than a reachable PDF input shape.
     if let Some(object_ref) = source.object_ref() {
         return Err(Error::Internal(format!(
             "expected a direct bootstrap value, got {object_ref}"
         )));
     }
+    // cov:ignore-end
     source.try_dereference()?;
     let value = source
         .with_value(|value| value.cloned())
@@ -2076,5 +2080,23 @@ impl HandleResolver for SourceFramingHandles {
 
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
         ObjectHandle::from_value(value)
+    }
+}
+
+#[cfg(all(test, feature = "qtest-driver"))]
+mod final_handle_tests {
+    use super::*;
+
+    #[test]
+    fn qtest_decode_parms_offset_reports_absence_and_source_handles_keep_identity() {
+        assert_eq!(
+            decode_parms_value_offset_within(b"1 0 obj\n<< /Length 1 >>\nendobj", 0)
+                .expect("source dictionary parses"),
+            None
+        );
+
+        let mut resolver = SourceFramingHandles;
+        let handle = resolver.indirect_handle(ObjectRef::new(17, 0));
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(17, 0)));
     }
 }

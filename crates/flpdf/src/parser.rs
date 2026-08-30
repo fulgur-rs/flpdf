@@ -799,8 +799,8 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 mod live_input_tests {
     use super::{
         parse_live_file_object, parse_live_file_object_with_decrypter, HandleResolver,
-        LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource, SliceLiveInput,
-        StringDecrypter, MAX_PARSE_DEPTH,
+        LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource,
+        OffsetHandleResolver, SliceLiveInput, StringDecrypter, MAX_PARSE_DEPTH,
     };
     use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
@@ -910,6 +910,24 @@ mod live_input_tests {
         };
 
         assert_eq!(resolver.pdf_unique_id(), None);
+    }
+
+    #[test]
+    fn detached_and_offset_handle_resolvers_preserve_reference_identity() {
+        let mut detached_resolver = super::DetachedHandles {
+            description_template: Some("parsed object,  at offset $PO".to_owned()),
+        };
+        let detached = detached_resolver.indirect_handle(ObjectRef::new(7, 2));
+        assert_eq!(detached.object_ref(), Some(ObjectRef::new(7, 2)));
+
+        let mut base = NullResolver;
+        let mut rebasing = OffsetHandleResolver {
+            resolver: &mut base,
+            base_offset: 100,
+            top_level_offset: Some(500),
+        };
+        let handle = rebasing.indirect_handle_at(ObjectRef::new(8, 0), 0);
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(8, 0)));
     }
 
     struct RecordingDecrypter {

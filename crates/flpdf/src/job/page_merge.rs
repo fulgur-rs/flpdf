@@ -1149,7 +1149,10 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_documents, unique_field_name, MergeInput};
+    use super::{
+        collect_retained_widget_refs, field_kid_refs, merge_documents, rewrite_field_kids,
+        unique_field_name, widget_page_ref, MergeInput,
+    };
     use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1397,6 +1400,66 @@ mod tests {
             "the secondary's colliding field must resolve to F+2, matching qpdf's \
              getUTF8Value()-decoded collision index, not F+1 from an undecoded byte \
              comparison against the UTF-16BE-encoded reservation"
+        );
+    }
+
+    #[test]
+    fn field_kid_and_widget_page_routes_use_resolved_handle_refs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/form-fields-and-annotations-p-and-inline.pdf");
+        let mut source = Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists")).unwrap();
+
+        let kids = field_kid_refs(&mut source, ObjectRef::new(5, 0))
+            .expect("field kids")
+            .expect("non-terminal field");
+        assert_eq!(
+            kids,
+            vec![
+                ObjectRef::new(12, 0),
+                ObjectRef::new(13, 0),
+                ObjectRef::new(14, 0)
+            ]
+        );
+        assert_eq!(
+            widget_page_ref(&mut source, ObjectRef::new(3, 0)).expect("widget page"),
+            Some(ObjectRef::new(10, 0))
+        );
+
+        let mut retained = BTreeSet::new();
+        collect_retained_widget_refs(
+            &mut source,
+            &BTreeSet::from([ObjectRef::new(10, 0)]),
+            &mut retained,
+        )
+        .expect("retained widgets");
+        assert!(retained.contains(&ObjectRef::new(12, 0)));
+
+        let mut target = Pdf::empty().expect("empty target");
+        let target_field = target
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("target field");
+        let target_kid = target
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("target kid");
+        let target_field_ref = target_field.object_ref().expect("target field ref");
+        let target_kid_ref = target_kid.object_ref().expect("target kid ref");
+        let map = BTreeMap::from([
+            (ObjectRef::new(5, 0), target_field_ref),
+            (kids[0], target_kid_ref),
+        ]);
+        rewrite_field_kids(&mut target, ObjectRef::new(5, 0), &[kids[0]], &map)
+            .expect("rewrite copied field kids");
+        target
+            .resolve(&target_field)
+            .expect("resolve rewritten field");
+        assert_eq!(
+            target_field
+                .try_get_key(b"/Kids")
+                .expect("kids key")
+                .as_array()
+                .expect("kids array")
+                .len(),
+            1
         );
     }
 }
