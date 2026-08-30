@@ -1029,11 +1029,13 @@ fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
             stream_dict,
             stream_data,
             stream_provider,
+            filter_on_write,
             stream_length,
         } => ObjectValue::Stream {
             stream_dict: detach_bootstrap_handle(&stream_dict)?,
             stream_data,
             stream_provider,
+            filter_on_write,
             stream_length,
         },
         other => other,

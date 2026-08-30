@@ -1989,11 +1989,13 @@ pub(crate) fn rebind_handle_value<R: Read + Seek + 'static>(
             stream_dict,
             stream_data,
             stream_provider,
+            filter_on_write,
             stream_length,
         } => Ok(ObjectValue::Stream {
             stream_dict: rebind_handle(resolver, &stream_dict)?,
             stream_data,
             stream_provider,
+            filter_on_write,
             stream_length,
         }),
         other => Ok(other),
