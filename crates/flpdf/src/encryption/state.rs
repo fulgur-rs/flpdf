@@ -296,13 +296,7 @@ pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<Encryptio
     let permissions = Permissions::new(required_permissions_from_handle(encrypt)?);
     let filter = required_name_from_handle(encrypt, "Filter")?;
     let length = encrypt.try_get_key(b"/Length")?;
-    let length_bits = match length.try_as_integer()? {
-        Some(value) => value,
-        _ if v <= 1 => 40,
-        _ if v == 4 => 128,
-        _ if v >= 5 => 256,
-        _ => 40,
-    };
+    let length_bits = effective_length_bits(v, &length)?;
     let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
     let crypt_filters = crypt_filter_modes_from_handle(encrypt, v)?;
     let (cf_stream, cf_string, cf_file) = if matches!(v, 4 | 5) {
@@ -643,16 +637,7 @@ fn standard_handler_inputs_from_handle(
         .into());
     }
     let length = encrypt.try_get_key(b"/Length")?;
-    let length_bits = match length.try_as_integer()? {
-        Some(value) => value,
-        None if length.is_null() => 40,
-        None => {
-            return Err(crate::error::EncryptedError::Malformed {
-                reason: "/Length entry is not an integer".into(),
-            }
-            .into())
-        }
-    };
+    let length_bits = effective_length_bits(v, &length)?;
     let p = required_permissions_from_handle(encrypt)?;
     let u = required_32_byte_string_from_handle(encrypt, "U")?;
     let o = required_32_byte_string_from_handle(encrypt, "O")?;
@@ -667,6 +652,26 @@ fn standard_handler_inputs_from_handle(
         o,
         encrypt_metadata,
     })
+}
+
+/// qpdf's `initializeEncryption` length selection
+/// (`QPDF_encryption.cc:835-853`). V=1 always uses 40 bits, V=4 uses 128,
+/// and V=5 uses 256. Other versions honor a valid `/Length`; missing,
+/// malformed, or out-of-range values fall back to qpdf's 128-bit guess.
+pub(crate) fn effective_length_bits(v: i64, length: &ObjectHandle) -> Result<i64> {
+    if v <= 1 {
+        return Ok(40);
+    }
+    if v == 4 {
+        return Ok(128);
+    }
+    if v == 5 {
+        return Ok(256);
+    }
+    match length.try_as_integer()? {
+        Some(value) if (40..=128).contains(&value) && value % 8 == 0 => Ok(value),
+        _ => Ok(128),
+    }
 }
 
 fn standard_handler_r5_inputs_from_handle(
@@ -959,4 +964,27 @@ pub(crate) fn first_file_id_handle_with_status(id: &ObjectHandle) -> Result<Firs
 /// empty value selected by qpdf rather than an error.
 pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
     Ok(first_file_id_handle_with_status(id)?.value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_inspection_state;
+    use crate::ObjectHandle;
+
+    #[test]
+    fn v2_missing_length_uses_qpdf_128_bit_fallback() {
+        let encrypt = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"Standard".to_vec()),
+            ),
+            (b"/V".to_vec(), ObjectHandle::integer(2)),
+            (b"/R".to_vec(), ObjectHandle::integer(3)),
+            (b"/P".to_vec(), ObjectHandle::integer(-4)),
+        ]);
+
+        let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
+
+        assert_eq!(state.length_bits, 128);
+    }
 }

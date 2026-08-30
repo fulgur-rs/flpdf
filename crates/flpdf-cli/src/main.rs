@@ -2078,7 +2078,13 @@ fn main() {
             None => Err("--show-encryption requires an input file".into()),
         }
     } else if args.check {
-        run_check(args.input, args.repair, &args.password, args.no_warn)
+        run_check(
+            args.input,
+            args.repair,
+            &args.password,
+            args.no_warn,
+            args.show_encryption_key,
+        )
     } else if args.list_attachments {
         run_list_attachments(args.input, args.repair, &args.password, args.verbose)
     } else if let Some(key) = args.show_attachment {
@@ -2687,6 +2693,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
     if cli.check {
+        job.set_show_encryption_key(cli.show_encryption_key);
         return finish_check_job(job.check(pdf));
     }
     if cli.show_npages {
@@ -2801,7 +2808,7 @@ fn run_json_document<R: Read + Seek>(
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
     match command {
-        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password, false),
+        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password, false, false),
         Commands::CheckLinearization(cmd) => {
             run_check_linearization(Some(cmd.input), false, &PasswordArgs::default(), false)
         }
@@ -3047,6 +3054,7 @@ fn run_check(
     repair: bool,
     password: &PasswordArgs,
     no_warn: bool,
+    show_encryption_key: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
@@ -3054,6 +3062,7 @@ fn run_check(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);
+    job.set_show_encryption_key(show_encryption_key);
     let mut options = pdf_open_options(repair, password)?;
     // The job emits the collected diagnostics once, after the qpdf check
     // banner, and owns the shared warning completion boundary.
@@ -6461,8 +6470,7 @@ fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
     if is_bad_password_error(&error) {
-        return "encrypted PDF: incorrect password; retry with --password or --password-file"
-            .into();
+        return "invalid password".into();
     }
     error.into()
 }

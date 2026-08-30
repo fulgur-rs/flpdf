@@ -644,6 +644,44 @@ fn top_level_show_encryption_reports_wrong_password_without_failing() {
 }
 
 #[test]
+fn json_encrypt_section_recovers_v2_user_password_from_owner_password() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--json=2", "--json-key=encrypt", "--password=owner-v2"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf JSON encryption inspection");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=encrypt", "--password=owner-v2"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf JSON encryption inspection");
+    assert_eq!(flpdf.status, qpdf.status);
+
+    let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout).unwrap();
+    let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout).unwrap();
+    assert_eq!(
+        flpdf_json["encrypt"]["recovereduserpassword"],
+        qpdf_json["encrypt"]["recovereduserpassword"]
+    );
+    assert_eq!(
+        flpdf_json["encrypt"]["recovereduserpassword"],
+        serde_json::Value::String("user-v2".into())
+    );
+}
+
+#[test]
 fn top_level_show_encryption_matches_qpdf_for_plaintext() {
     if !ensure_qpdf_or_skip() {
         return;

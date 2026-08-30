@@ -37,6 +37,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::process::Command as ShellCommand;
 
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const V4_AES: &str = "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf";
@@ -190,6 +191,31 @@ fn show_encryption_key_v5_r6_matches_qpdf() {
         .assert()
         .success()
         .stdout("fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290\n");
+}
+
+#[test]
+fn check_show_encryption_key_matches_qpdf() {
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(V5_R6);
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--check", "--show-encryption-key", "--password=user-v5-r6"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --check --show-encryption-key");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = ShellCommand::new(env!("CARGO_BIN_EXE_flpdf"))
+        .args(["--check", "--show-encryption-key", "--password=user-v5-r6"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --check --show-encryption-key");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 #[test]
