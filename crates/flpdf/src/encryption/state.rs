@@ -827,12 +827,14 @@ fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -
         }
         .into());
     }
+    // cov:ignore-start: the preceding length guard makes this slice exactly 48 bytes
     bytes[..48].try_into().map_err(|_| {
         crate::error::EncryptedError::Malformed {
             reason: format!("/{key} entry is not 48 bytes"),
         }
         .into()
     })
+    // cov:ignore-end
 }
 
 fn encrypt_metadata_flag_from_handle(encrypt: &ObjectHandle) -> Result<bool> {

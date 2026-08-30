@@ -8403,12 +8403,63 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_promotes_resolved_objstm_members_before_replacing_container() {
-        // Same qpdf invariant as `replacing_an_objstm_container_promotes_resolved_members_to_canonical_handles`
+    fn objstm_cache_reconciliation_reuses_resolved_handles_without_materialization() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(path).expect("open ObjStm fixture"),
+        ))
+        .expect("open ObjStm fixture");
+        let stream_ref = ObjectRef::new(1, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream = pdf.get_object_handle(stream_ref);
+        pdf.resolve(&stream).expect("resolve ObjStm stream");
+        let member = pdf.get_object_handle(member_ref);
+        pdf.resolve(&member).expect("resolve ObjStm member");
+
+        // Seed the compatibility cache with the same canonical identities that
+        // qpdf's `m->obj_cache` retains after both objects were resolved.
+        pdf.cache.set_resolved(stream_ref, stream.clone());
+        pdf.cache.set_resolved(member_ref, member.clone());
+
+        // Exercise both the no-cache and compressed-without-handle filtering
+        // arms while reconciling the already-resolved member.
+        let no_cache_ref = ObjectRef::new(90, 0);
+        let compressed_without_handle_ref = ObjectRef::new(91, 0);
+        pdf.resolver.insert_xref_entry(
+            no_cache_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        pdf.resolver.insert_xref_entry(
+            compressed_without_handle_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 99,
+            },
+        );
+        pdf.cache
+            .set_compressed(compressed_without_handle_ref, stream_ref.number, 99);
+
+        pdf.set_object(stream_ref, Object::Null);
+
+        let Some(CacheEntry::Resolved(cached_member)) = pdf.cache.entry(member_ref) else {
+            panic!("resolved ObjStm member must remain handle-backed in the cache");
+        };
+        assert!(cached_member.is_same_object_as(&member));
+        assert!(member.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn replace_object_keeps_resolved_objstm_members_before_replacing_container() {
+        // Same qpdf invariant as
+        // `replacing_an_objstm_container_promotes_resolved_members_to_canonical_handles`
         // above (`set_object`), exercised through the handle-shaped setter:
         // `QPDF::replaceObject` only changes the requested cache slot, so an
-        // already-resolved ObjStm member must be promoted to its own live
-        // handle before the source container's canonical value is replaced.
+        // already-resolved ObjStm member remains a live canonical handle when
+        // the source container's canonical value is replaced.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/compat/three-page-objstm.pdf");
         let mut pdf = Pdf::open(std::io::BufReader::new(
@@ -8858,6 +8909,55 @@ mod tests {
             .writer_copy_encryption_source()
             .expect("plaintext copy source lookup")
             .is_none());
+    }
+
+    #[test]
+    fn encryption_info_fallback_reads_handles_and_preserves_filter_errors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+        );
+        let fixture = std::fs::read(path).expect("encrypted fixture");
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            fixture.clone(),
+            PdfOpenOptions {
+                password: b"user-v4-aes".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open AES fixture");
+        *pdf.encryption_inspection.borrow_mut() = None;
+        let info = pdf
+            .encryption_info()
+            .expect("handle fallback inspection")
+            .expect("encrypted info");
+        assert_eq!(info.filter, "Standard");
+        assert_eq!(info.v, 4);
+        assert_eq!(info.r, 4);
+        assert_eq!(info.length_bits, 128);
+
+        for replacement in [ObjectHandle::integer(1), ObjectHandle::name(vec![0xff])] {
+            let mut malformed = Pdf::open_mem_owned_with_options(
+                fixture.clone(),
+                PdfOpenOptions {
+                    password: b"user-v4-aes".to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .expect("open AES fixture for malformed filter");
+            let encrypt = malformed.trailer_key_handle(b"Encrypt");
+            malformed.resolve(&encrypt).expect("resolve Encrypt");
+            encrypt
+                .replace_key(b"/Filter", replacement)
+                .expect("replace Filter");
+            *malformed.encryption_inspection.borrow_mut() = None;
+            assert!(matches!(
+                malformed.encryption_info(),
+                Err(Error::Encrypted(EncryptedError::Malformed { .. }))
+            ));
+        }
     }
 
     #[test]

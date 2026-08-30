@@ -228,6 +228,17 @@ pub(crate) fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn dictionary<K: AsRef<[u8]>>(
+        entries: impl IntoIterator<Item = (K, ObjectHandle)>,
+    ) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.as_ref().to_vec(), value))
+                .collect(),
+        )
+    }
+
     #[test]
     fn crypt_filter_method_reports_each_qpdf_shape() {
         assert_eq!(crypt_filter_method(&Dictionary::new()), None);
@@ -267,5 +278,102 @@ mod tests {
         cf.insert("StdCF", Object::Dictionary(std_cf));
         valid.insert("CF", Object::Dictionary(cf));
         assert_eq!(crypt_filter_method(&valid), Some("AESV2".to_owned()));
+    }
+
+    #[test]
+    fn handle_crypt_filter_helpers_cover_qpdf_filter_shapes() {
+        let invalid_cf = dictionary([(b"/CF", ObjectHandle::name(b"not-a-dict".to_vec()))]);
+        assert!(crypt_filter_modes_from_handle(&invalid_cf, 4)
+            .expect("invalid CF shape is ignored")
+            .is_empty());
+
+        let cf = dictionary([
+            (
+                b"/V2".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"V2".to_vec()))]),
+            ),
+            (
+                b"/AESV2".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"AESV2".to_vec()))]),
+            ),
+            (
+                b"/AESV3".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"AESV3".to_vec()))]),
+            ),
+            (
+                b"/Unknown".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"Other".to_vec()))]),
+            ),
+            (
+                b"/NoCfm".as_slice(),
+                dictionary(std::iter::empty::<(&[u8], ObjectHandle)>()),
+            ),
+            (b"/Scalar".as_slice(), ObjectHandle::integer(1)),
+        ]);
+        let encrypt = dictionary([(b"/CF", cf)]);
+        let modes = crypt_filter_modes_from_handle(&encrypt, 4).expect("parse CF table");
+        assert_eq!(modes.get(b"V2".as_slice()), Some(&EncryptionMode::Rc4));
+        assert_eq!(
+            modes.get(b"AESV2".as_slice()),
+            Some(&EncryptionMode::Aes128)
+        );
+        assert_eq!(
+            modes.get(b"AESV3".as_slice()),
+            Some(&EncryptionMode::Aes256)
+        );
+        assert_eq!(
+            modes.get(b"Unknown".as_slice()),
+            Some(&EncryptionMode::Unknown)
+        );
+        assert_eq!(
+            modes.get(b"NoCfm".as_slice()),
+            Some(&EncryptionMode::Identity)
+        );
+        assert!(!modes.contains_key(b"Scalar".as_slice()));
+
+        assert_eq!(
+            crypt_filter_method_from_handle(&ObjectHandle::dictionary(Vec::new()))
+                .expect("missing CF is ignored"),
+            None
+        );
+        let no_std_cf = dictionary([(
+            b"/CF",
+            dictionary(std::iter::empty::<(&[u8], ObjectHandle)>()),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&no_std_cf).expect("missing StdCF is ignored"),
+            None
+        );
+        let std_cf_not_dict = dictionary([(
+            b"/CF",
+            dictionary([(b"/StdCF", ObjectHandle::name(b"not-a-dict".to_vec()))]),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&std_cf_not_dict)
+                .expect("non-dictionary StdCF is ignored"),
+            None
+        );
+        let missing_cfm = dictionary([(
+            b"/CF",
+            dictionary([(
+                b"/StdCF",
+                dictionary(std::iter::empty::<(&[u8], ObjectHandle)>()),
+            )]),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&missing_cfm).expect("missing CFM is ignored"),
+            None
+        );
+        let valid = dictionary([(
+            b"/CF",
+            dictionary([(
+                b"/StdCF",
+                dictionary([(b"/CFM", ObjectHandle::name(b"AESV2".to_vec()))]),
+            )]),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&valid).expect("read CFM"),
+            Some("AESV2".to_owned())
+        );
     }
 }
