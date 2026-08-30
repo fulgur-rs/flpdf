@@ -816,11 +816,8 @@ fn canonical_stream_output_with_rewrite_policy(
             (data, filtering_attempted, normalized_content)
         } else {
             (
-                source_for_pipe
-                    .get_raw_stream_data()
-                    .map_err(|error| stream_data_error(&source_for_pipe, error))?
-                    .as_ref()
-                    .clone(),
+                canonical_stream_source_data(&source_for_pipe)
+                    .map_err(|error| stream_data_error(&source_for_pipe, error))?,
                 false,
                 false,
             )
@@ -855,6 +852,30 @@ fn canonical_stream_output_with_rewrite_policy(
     let refiltered =
         filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content;
     Ok((dict, data, refiltered, filtering_attempted))
+}
+
+/// Read a stream through qpdf's writer-owned unfiltered pipe.
+///
+/// `QPDFWriter::willFilterStream` still calls `pipeStreamData` once when
+/// `filter_on_write` is false, passing `will_retry=true` for that first
+/// attempt (`libqpdf/QPDFWriter.cc:1254-1314`). This is observably different
+/// from `getRawStreamData`, whose public accessor passes `will_retry=false`
+/// (`libqpdf/QPDF_Stream.cc:362-376`). In particular, a retry-aware provider
+/// may return `false` after writing its bytes; qpdf's writer keeps that buffer
+/// because filtering is already disabled and does not enter the retry branch.
+/// Keep the source success bit out of this writer result for the same reason.
+fn canonical_stream_source_data(handle: &ObjectHandle) -> crate::Result<Vec<u8>> {
+    let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
+    let mut filtering_attempted = false;
+    let _source_success = handle.pipe_stream_data(
+        &mut buffer,
+        &mut filtering_attempted,
+        0,
+        crate::writer::DecodeLevel::None,
+        false,
+        true,
+    )?;
+    Ok(buffer.take_buffer()?.to_vec())
 }
 
 fn stream_data_error(handle: &ObjectHandle, error: crate::Error) -> crate::Error {
@@ -1584,6 +1605,45 @@ mod tests {
 
         assert_eq!(*attempts.borrow(), vec![(false, true), (false, false)]);
         assert_eq!(data, b"raw provider bytes");
+        assert!(!refiltered);
+    }
+
+    #[test]
+    fn disabled_filter_on_write_uses_qpdf_retry_flag_and_keeps_provider_bytes() {
+        let pdf = Pdf::empty().unwrap();
+        let stream = pdf.new_stream().unwrap();
+        let attempts = Rc::new(RefCell::new(Vec::new()));
+        let attempts_in_callback = Rc::clone(&attempts);
+
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    attempts_in_callback
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline
+                        .write(b"provider raw bytes")
+                        .map_err(crate::Error::from)?;
+                    pipeline.finish().map_err(crate::Error::from)?;
+                    Ok(false)
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            decode_level: crate::writer::DecodeLevel::Specialized,
+            ..WriterOptions::default()
+        };
+        let (_, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
+
+        assert_eq!(*attempts.borrow(), vec![(false, true)]);
+        assert_eq!(data, b"provider raw bytes");
         assert!(!refiltered);
     }
 
