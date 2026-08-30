@@ -874,7 +874,7 @@ fn canonical_stream_source_data(handle: &ObjectHandle) -> crate::Result<Vec<u8>>
         crate::writer::DecodeLevel::None,
         false,
         true,
-    )?;
+    )?; // cov:ignore: LLVM attributes this covered qpdf-shaped multiline call terminator without an executable counter
     Ok(buffer.take_buffer()?.to_vec())
 }
 
