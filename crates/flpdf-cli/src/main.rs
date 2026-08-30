@@ -28,7 +28,7 @@ use flpdf::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
     ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
     PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission,
-    QPDFLogger, StreamDataMode, UsageError, WriterConfiguration,
+    QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError, WriterConfiguration,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -966,7 +966,7 @@ struct Cli {
     /// `--` are the INPUT / OUTPUT positionals.
     #[arg(
         long = "encrypt",
-        num_args = 3..,
+        num_args = 0..,
         value_terminator = "--",
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
@@ -1363,7 +1363,7 @@ struct RewriteCommand {
     /// `options.encrypt` through correctly.
     #[arg(
         long = "encrypt",
-        num_args = 3..,
+        num_args = 0..,
         value_terminator = "--",
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
@@ -3211,8 +3211,14 @@ fn apply_encryption_options(
 ) {
     if !encrypt.is_empty() {
         match parse_encrypt_segment(encrypt, password_args.allow_weak_crypto) {
-            Ok(params) => {
-                options.encrypt = Some(params);
+            Ok(parsed) => {
+                if parsed.accessibility_warning {
+                    emit_logger_error(format!(
+                        "{}: -accessibility=n is ignored for modern encryption formats\n",
+                        progname()
+                    ));
+                }
+                options.encrypt = Some(parsed.params);
             }
             Err(e) => {
                 eprintln!("flpdf: {e}");
@@ -3326,12 +3332,11 @@ fn build_copy_encryption_source(
 /// qpdf's write-side checkConfiguration.
 ///
 /// Permission sub-flags (`--print`, `--modify`, `--extract`, `--annotate`,
-/// `--form`, `--assemble`, `--accessibility`) use the R>=3 grammar and are
-/// applied left-to-right onto a [`PermissionsConfig`] (matching qpdf's
-/// ordering). They are accepted for 128/256-bit only; on 40-bit (R=2) they are
-/// rejected (the R=2 `/P` encoding differs).
-/// `--cleartext-metadata` is still rejected for V=1/V=2 (40-bit or 128-bit
-/// without AES/--force-V4); `--force-R5` is accepted for 256-bit only.
+/// `--form`, `--assemble`, `--accessibility`, and `--modify-other`) use the
+/// key-length-specific qpdf option table and are applied left-to-right. R=2
+/// uses its separate four-bit permission configuration; R>=3 uses
+/// [`PermissionsConfig`]. `--cleartext-metadata` promotes 128-bit output to
+/// V=4, while `--force-R5` selects the 256-bit R=5 path.
 fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
     match val {
         "y" => Ok(true),
@@ -3339,287 +3344,363 @@ fn parse_perm_yn(flag: &str, val: &str) -> CliResult<bool> {
         other => Err(format!("{flag} must be y or n (got {other:?})").into()),
     }
 }
+#[derive(Debug)]
+struct ParsedEncryptSegment {
+    params: EncryptParams,
+    accessibility_warning: bool,
+}
 
-fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResult<EncryptParams> {
-    if tokens.len() < 3 {
-        return Err(format!(
-            "--encrypt requires USER-PW OWNER-PW KEY-LEN (got {} arg(s))",
-            tokens.len()
-        )
-        .into());
+fn parse_encrypt_segment(
+    tokens: &[String],
+    allow_weak_crypto: bool,
+) -> CliResult<ParsedEncryptSegment> {
+    if tokens.is_empty() {
+        return Err("--encrypt requires USER-PW OWNER-PW KEY-LEN".into());
     }
-    for token in &tokens[..3] {
-        if token.starts_with("-") && token != "-" {
+
+    // qpdf starts in a password-argument table and switches to a
+    // key-length-specific table after the third positional argument or the
+    // named --bits argument. Keep the two password forms distinct so the
+    // mixed-form error is raised at the same boundary as qpdf.
+    let mut positional = Vec::new();
+    let mut dashed_mode = false;
+    let mut positional_mode = false;
+    let mut user_password = None;
+    let mut owner_password = None;
+    let mut key_len = None;
+    let mut key_len_seen = false;
+    let mut subflags = Vec::new();
+
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let (raw_name, attached) = token
+            .split_once('=')
+            .map_or((token.as_str(), None), |(name, value)| (name, Some(value)));
+        let name = raw_name
+            .strip_prefix("--")
+            .or_else(|| raw_name.strip_prefix('-'))
+            .unwrap_or(raw_name);
+        if matches!(name, "user-password" | "owner-password" | "bits") {
+            if positional_mode {
+                return Err("positional and dashed encryption arguments may not be mixed".into());
+            }
+            if key_len_seen {
+                return Err(format!(
+                    "unrecognized argument {token} (encryption options must be terminated with --)"
+                )
+                .into());
+            }
+            dashed_mode = true;
+            let value = if let Some(value) = attached {
+                value.to_owned()
+            } else {
+                index += 1;
+                tokens
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("{token} requires a value"))?
+            };
+            match name {
+                "user-password" => user_password = Some(value.into_bytes()),
+                "owner-password" => owner_password = Some(value.into_bytes()),
+                "bits" => {
+                    key_len = Some(parse_encrypt_key_len(&value)?);
+                    key_len_seen = true;
+                }
+                _ => unreachable!("name was matched above"),
+            }
+            index += 1;
+            continue;
+        }
+
+        if dashed_mode {
+            if !token.starts_with('-') || token == "-" {
+                return Err("positional and dashed encryption arguments may not be mixed".into());
+            }
+            subflags.push(token.clone());
+        } else if positional.len() < 3 {
+            if token.starts_with('-') && token != "-" {
+                return Err(format!(
+                    "unrecognized argument {token} (encryption options must be terminated with --)"
+                )
+                .into());
+            }
+            positional_mode = true;
+            positional.push(token.clone());
+        } else {
+            subflags.push(token.clone());
+        }
+        index += 1;
+    }
+
+    let (user_password, owner_password, key_len) = if dashed_mode {
+        if key_len.is_none() && !subflags.is_empty() {
+            return Err("--encrypt key length is required before encryption options".into());
+        }
+        (
+            user_password.unwrap_or_default(),
+            owner_password.unwrap_or_default(),
+            key_len.ok_or("--encrypt key length is required")?,
+        )
+    } else {
+        if positional.len() < 3 {
             return Err(format!(
-                "unrecognized argument {token} (encryption options must be terminated with --)"
+                "--encrypt requires USER-PW OWNER-PW KEY-LEN (got {} arg(s))",
+                positional.len()
             )
             .into());
         }
-    }
-    let user_pw = tokens[0].as_bytes().to_vec();
-    let owner_pw = tokens[1].as_bytes().to_vec();
-    let key_len: u32 = tokens[2].parse().map_err(|_| {
-        format!(
-            "--encrypt KEY-LEN must be a positive integer (40 / 128 / 256), got: {:?}",
-            tokens[2]
+        let key_len = parse_encrypt_key_len(&positional[2])?;
+        (
+            positional[0].as_bytes().to_vec(),
+            positional[1].as_bytes().to_vec(),
+            key_len,
         )
-    })?;
-    if !matches!(key_len, 40 | 128 | 256) {
-        return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {key_len})").into());
-    }
+    };
 
-    // Parse sub-flags. Unsupported ones are rejected with a clear message so
-    // users do not get a silent shrug when they pass `--print=none`.
-    let mut use_aes: Option<bool> = None;
+    let mut use_aes = None;
     let mut force_v4 = false;
     let mut force_r5 = false;
-    // `--allow-insecure` opts into the V=5 R=6 empty-owner + non-empty-user
-    // "insecure" combination; the gate itself lives in the KEY-LEN=256 arm
-    // below (flpdf-9hc.4.14, mirroring qpdf's checkConfiguration).
     let mut allow_insecure = false;
-    // Permission sub-flags (R>=3 grammar, flpdf-9hc.4.9.5). qpdf applies them
-    // LEFT-TO-RIGHT, so mutate `perms` in place as each flag is seen rather
-    // than collecting and applying in a fixed order (which would break the
-    // observable ordering quirk, e.g. `--modify=none --annotate=y`). Permission
-    // flags are R>=3 only (128/256); on 40-bit they are rejected below.
     let mut perms = PermissionsConfig::default();
-    let mut perm_flag_seen = false;
-    // `--cleartext-metadata` leaves the /Metadata XMP stream unencrypted
-    // (flpdf-9hc.4.9.6). Honored for V=4/V=5 only (the V=1/V=2 dict builder has
-    // no /EncryptMetadata); rejected for 40-bit / 128-without-AES below.
+    let mut r2_permissions = R2PermissionsConfig::default();
     let mut cleartext_metadata = false;
-    for tok in &tokens[3..] {
-        let (flag, val) = tok.split_once('=').unwrap_or((tok.as_str(), ""));
+    let mut accessibility_explicitly_disabled = false;
+
+    for token in &subflags {
+        let (raw_flag, value) = token
+            .split_once('=')
+            .map_or((token.as_str(), ""), |(flag, value)| (flag, value));
+        let flag = raw_flag
+            .strip_prefix("--")
+            .or_else(|| raw_flag.strip_prefix('-'))
+            .unwrap_or(raw_flag);
         match flag {
-            "--use-aes" => {
-                use_aes = Some(match val {
-                    "y" => true,
-                    "n" => false,
-                    other => {
-                        return Err(format!("--use-aes must be y or n (got {other:?})").into());
-                    }
-                });
+            "use-aes" => {
+                if key_len != 128 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
+                }
+                use_aes = Some(parse_perm_yn(flag, value)?);
             }
-            // `--force-V4` forces the V=4 handler; combined with RC4 (i.e. no
-            // `--use-aes=y`) it selects the V=4 /CFM V2 (RC4-128) variant.
-            // Value-less flag.
-            "--force-V4" => {
-                if tok.contains('=') {
-                    return Err(format!("--force-V4 does not take a value (got {tok:?})").into());
+            "force-V4" => {
+                if key_len != 128 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
                 }
                 force_v4 = true;
             }
-            // Value-less; see the KEY-LEN=256 arm. Reject any `=` form so an
-            // opt-out typo (`--allow-insecure=false`) or a generated empty value
-            // (`--allow-insecure=`) cannot silently enable the insecure path.
-            "--allow-insecure" => {
-                if tok.contains('=') {
-                    return Err(
-                        format!("--allow-insecure does not take a value (got {tok:?})").into(),
-                    );
+            "force-R5" => {
+                if key_len != 256 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
+                }
+                force_r5 = true;
+            }
+            "allow-insecure" => {
+                if key_len != 256 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
                 }
                 allow_insecure = true;
             }
-            // Permission sub-flags (R>=3 grammar). Mutate `perms` in place so
-            // the left-to-right ordering matches qpdf. Bit mapping verified
-            // empirically against `qpdf --show-encryption`.
-            "--print" => {
-                perm_flag_seen = true;
-                perms.print = match val {
-                    "full" => PrintPermission::High,
-                    "low" => PrintPermission::Low,
-                    "none" => PrintPermission::None,
-                    other => {
-                        return Err(
-                            format!("--print must be full, low, or none (got {other:?})").into(),
-                        );
-                    }
-                };
-            }
-            "--modify" => {
-                perm_flag_seen = true;
-                // Cumulative ladder (qpdf): all => other+annot+forms+assembly,
-                // annotate => annot+forms+assembly, form => forms+assembly,
-                // assembly => assembly, none => nothing.
-                let (other_, annot, forms, asm) = match val {
-                    "all" => (true, true, true, true),
-                    "annotate" => (false, true, true, true),
-                    "form" => (false, false, true, true),
-                    "assembly" => (false, false, false, true),
-                    "none" => (false, false, false, false),
-                    other => {
-                        return Err(format!(
-                            "--modify must be all, annotate, form, assembly, or none (got {other:?})"
-                        )
-                        .into());
-                    }
-                };
-                perms.modify_contents = other_;
-                perms.annotate = annot;
-                perms.fill_forms = forms;
-                perms.assemble = asm;
-            }
-            "--extract" => {
-                perm_flag_seen = true;
-                perms.extract = parse_perm_yn(flag, val)?;
-            }
-            "--annotate" => {
-                perm_flag_seen = true;
-                perms.annotate = parse_perm_yn(flag, val)?;
-            }
-            "--form" => {
-                perm_flag_seen = true;
-                perms.fill_forms = parse_perm_yn(flag, val)?;
-            }
-            "--assemble" => {
-                perm_flag_seen = true;
-                perms.assemble = parse_perm_yn(flag, val)?;
-            }
-            "--accessibility" => {
-                perm_flag_seen = true;
-                perms.accessibility = parse_perm_yn(flag, val)?;
-            }
-            // Value-less; honored for V=4/V=5 (gated in the dispatch below).
-            "--cleartext-metadata" => {
-                if tok.contains('=') {
+            "cleartext-metadata" => {
+                if !matches!(key_len, 128 | 256) {
                     return Err(format!(
-                        "--cleartext-metadata does not take a value (got {tok:?})"
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
                     )
                     .into());
                 }
                 cleartext_metadata = true;
             }
-            "--force-R5" => {
-                if tok.contains('=') {
-                    return Err(format!("--force-R5 does not take a value (got {tok:?})").into());
+            "print" => {
+                if key_len == 40 {
+                    r2_permissions.print = parse_perm_yn(flag, value)?;
+                } else {
+                    perms.print = match value {
+                        "full" => PrintPermission::High,
+                        "low" => PrintPermission::Low,
+                        "none" => PrintPermission::None,
+                        other => {
+                            return Err(format!(
+                                "--print must be full, low, or none (got {other:?})"
+                            )
+                            .into());
+                        }
+                    };
                 }
-                force_r5 = true;
+            }
+            "modify" => {
+                if key_len == 40 {
+                    r2_permissions.modify = parse_perm_yn(flag, value)?;
+                } else {
+                    let (other, annotate, forms, assemble) = match value {
+                        "all" => (true, true, true, true),
+                        "annotate" => (false, true, true, true),
+                        "form" => (false, false, true, true),
+                        "assembly" => (false, false, false, true),
+                        "none" => (false, false, false, false),
+                        other => {
+                            return Err(format!(
+                                "--modify must be all, annotate, form, assembly, or none (got {other:?})"
+                            )
+                            .into());
+                        }
+                    };
+                    perms.modify_contents = other;
+                    perms.annotate = annotate;
+                    perms.fill_forms = forms;
+                    perms.assemble = assemble;
+                }
+            }
+            "extract" => {
+                let value = parse_perm_yn(flag, value)?;
+                if key_len == 40 {
+                    r2_permissions.extract = value;
+                } else {
+                    perms.extract = value;
+                }
+            }
+            "annotate" => {
+                let value = parse_perm_yn(flag, value)?;
+                if key_len == 40 {
+                    r2_permissions.annotate = value;
+                } else {
+                    perms.annotate = value;
+                }
+            }
+            "form" => {
+                if key_len == 40 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
+                }
+                perms.fill_forms = parse_perm_yn(flag, value)?;
+            }
+            "assemble" => {
+                if key_len == 40 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
+                }
+                perms.assemble = parse_perm_yn(flag, value)?;
+            }
+            "accessibility" => {
+                if key_len == 40 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
+                }
+                perms.accessibility = parse_perm_yn(flag, value)?;
+                accessibility_explicitly_disabled = value == "n";
+            }
+            "modify-other" => {
+                if key_len == 40 {
+                    return Err(format!(
+                        "unrecognized argument {token} (encryption options must be terminated with --)"
+                    )
+                    .into());
+                }
+                perms.modify_contents = parse_perm_yn(flag, value)?;
             }
             other => {
                 return Err(format!(
                     "unknown --encrypt sub-flag {other:?}; supported in this release: \
                      --use-aes=y|n, --force-V4, --force-R5, --allow-insecure, --print, --modify, \
                      --extract, --annotate, --form, --assemble, --accessibility, \
-                     --cleartext-metadata"
+                     --modify-other, --cleartext-metadata"
                 )
                 .into());
             }
         }
     }
 
-    // Enforce qpdf's per-KEY-LEN option tables: `--use-aes` / `--force-V4` are
-    // 128-only and `--allow-insecure` is 256-only. Reject incompatible flags as
-    // a usage error rather than silently ignoring them — otherwise
-    // `--encrypt … 40 --use-aes=y` would quietly write RC4-40 while the user
-    // expected AES (a security-relevant mismatch).
-    match key_len {
-        40 if use_aes.is_some() || force_v4 || force_r5 || allow_insecure || perm_flag_seen => {
-            return Err(
-                "--encrypt KEY-LEN=40 (V=1 RC4-40, R=2) does not accept --use-aes, \
-                 --force-V4, --force-R5, --allow-insecure, or permission sub-flags; the R>=3 \
-                 permission grammar needs a 128- or 256-bit key"
-                    .into(),
-            );
-        }
-        128 if allow_insecure || force_r5 => {
-            return Err(
-                "--encrypt KEY-LEN=128 does not accept --allow-insecure or --force-R5 (256-bit only)".into(),
-            );
-        }
-        256 if use_aes.is_some() || force_v4 => {
-            return Err(
-                "--encrypt KEY-LEN=256 does not accept --use-aes or --force-V4 (128-bit only)"
-                    .into(),
-            );
-        }
-        _ => {}
+    if key_len == 40 && (force_r5 || allow_insecure || cleartext_metadata) {
+        return Err("--encrypt KEY-LEN=40 does not accept this encryption option".into());
+    }
+    if key_len == 128 && (force_r5 || allow_insecure) {
+        return Err("--encrypt KEY-LEN=128 does not accept this encryption option".into());
+    }
+    if key_len == 256 && (force_v4 || use_aes.is_some()) {
+        return Err("--encrypt KEY-LEN=256 does not accept --force-V4 or --use-aes".into());
     }
 
-    // RC4 outputs are weak; qpdf refuses to write them without
-    // --allow-weak-crypto, so apply the same gate here. Deprecated R=5
-    // (AES-256) output is also gated by flpdf's explicit write policy.
     let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {
-        if !allow_weak_crypto {
-            if params.is_weak_rc4() {
-                return Err(
-                    "refusing to write a file with RC4, a weak cryptographic algorithm. \
-                     Please use 256-bit keys for better security. Pass --allow-weak-crypto \
-                     to enable writing insecure files."
-                        .into(),
-                );
-            }
-            if params.is_deprecated_r5() {
-                return Err(
-                    "refusing to write a deprecated revision 5 (R=5) encrypted file. \
-                     256-bit revision 6 (the default without --force-R5) is preferred. \
-                     Pass --allow-weak-crypto to enable writing R=5 files."
-                        .into(),
-                );
-            }
+        if !allow_weak_crypto && params.is_weak_rc4() {
+            return Err(
+                "refusing to write a file with RC4, a weak cryptographic algorithm. \
+                 Please use 256-bit keys for better security. Pass --allow-weak-crypto \
+                 to enable writing insecure files."
+                    .into(),
+            );
         }
         Ok(params)
     };
 
-    // --cleartext-metadata needs /EncryptMetadata, a V>=4 concept; the V=1/V=2
-    // dict builder cannot emit it. Reject it before dispatch when the chosen
-    // method would be V=1 (40-bit) or V=2 (128 without AES / --force-V4).
-    if cleartext_metadata {
-        let is_v4_or_v5 = key_len == 256 || (key_len == 128 && (use_aes == Some(true) || force_v4));
-        if !is_v4_or_v5 {
-            return Err(
-                "--cleartext-metadata requires V=4 or V=5 (256-bit, or 128-bit with \
-                 --use-aes=y or --force-V4); V=1/V=2 have no /EncryptMetadata"
-                    .into(),
-            );
+    let method = match key_len {
+        40 => EncryptMethod::V1Rc440,
+        128 if force_v4 || cleartext_metadata => {
+            if use_aes.unwrap_or(false) {
+                EncryptMethod::V4Aes128
+            } else {
+                EncryptMethod::V4Rc4128
+            }
         }
+        128 if use_aes == Some(true) => EncryptMethod::V4Aes128,
+        128 => EncryptMethod::V2Rc4128,
+        256 if force_r5 => EncryptMethod::V5R5Aes256,
+        256 => EncryptMethod::V5R6Aes256,
+        _ => unreachable!("key length was validated"),
+    };
+
+    if cleartext_metadata
+        && !matches!(
+            method,
+            EncryptMethod::V4Aes128
+                | EncryptMethod::V4Rc4128
+                | EncryptMethod::V5R5Aes256
+                | EncryptMethod::V5R6Aes256
+        )
+    {
+        return Err("--cleartext-metadata requires V=4 or V=5".into());
     }
 
-    match key_len {
-        // KEY-LEN=40 is always V=1 RC4-40; --use-aes / --force-V4 do not apply.
-        40 => guard_weak(EncryptParams::rc4(
-            EncryptMethod::V1Rc440,
-            user_pw,
-            owner_pw,
-        )),
-        128 => {
-            let mut params = match use_aes {
-                Some(true) => EncryptParams::v4_aes128(user_pw, owner_pw),
-                // qpdf's 128-bit default is RC4; `--force-V4` selects the V=4
-                // /CFM V2 variant, otherwise V=2 R=3.
-                Some(false) | None => {
-                    let method = if force_v4 {
-                        EncryptMethod::V4Rc4128
-                    } else {
-                        EncryptMethod::V2Rc4128
-                    };
-                    EncryptParams::rc4(method, user_pw, owner_pw)
-                }
+    let params = match method {
+        EncryptMethod::V1Rc440 => {
+            let mut params = EncryptParams::rc4(method, user_password, owner_password);
+            params.r2_permissions = r2_permissions;
+            params
+        }
+        EncryptMethod::V2Rc4128 => {
+            let mut params = EncryptParams::rc4(method, user_password, owner_password);
+            params.permissions = perms;
+            params
+        }
+        EncryptMethod::V4Rc4128 | EncryptMethod::V4Aes128 => {
+            let mut params = if method == EncryptMethod::V4Aes128 {
+                EncryptParams::v4_aes128(user_password, owner_password)
+            } else {
+                EncryptParams::rc4(method, user_password, owner_password)
             };
             params.permissions = perms;
-            // Accessibility (bit 10) is unconditionally permitted for R>3;
-            // qpdf ignores `--accessibility=n` there. V=4 is R=4, so force it
-            // on; V=2 (R=3) honors the flag.
-            if matches!(
-                params.method,
-                EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128
-            ) {
-                params.permissions.accessibility = true;
-            }
-            // cleartext_metadata was validated to imply V=4 here (the guard
-            // above rejects it for the V=2 default).
-            if cleartext_metadata {
-                params.encrypt_metadata = false;
-            }
-            guard_weak(params)
+            params.permissions.accessibility = true;
+            params.encrypt_metadata = !cleartext_metadata;
+            params
         }
-        256 => {
-            // V=5 R=6 AES-256 — always AES, so `--use-aes` is irrelevant.
-            // Insecure-combination gate (flpdf-9hc.4.14, matching qpdf's
-            // checkConfiguration): a non-empty user password with an EMPTY
-            // owner password under a 256-bit key lets anyone open the file
-            // without the owner password, so the owner restrictions are
-            // meaningless. Require explicit `--allow-insecure`.
-            if owner_pw.is_empty() && !user_pw.is_empty() && !allow_insecure {
+        EncryptMethod::V5R5Aes256 | EncryptMethod::V5R6Aes256 => {
+            if owner_password.is_empty() && !user_password.is_empty() && !allow_insecure {
                 return Err(
                     "A PDF with a non-empty user password and an empty owner password \
                      encrypted with a 256-bit key is insecure as it can be opened without \
@@ -3628,24 +3709,39 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
                         .into(),
                 );
             }
-            let mut params = if force_r5 {
-                EncryptParams::v5_r5(user_pw, owner_pw)
+            let mut params = if method == EncryptMethod::V5R5Aes256 {
+                EncryptParams::v5_r5(user_password, owner_password)
             } else {
-                EncryptParams::v5_r6(user_pw, owner_pw)
+                EncryptParams::v5_r6(user_password, owner_password)
             };
             params.permissions = perms;
-            // V=5 is R=6 (>3): accessibility is unconditionally permitted, so
-            // qpdf ignores `--accessibility=n`. Match that.
             params.permissions.accessibility = true;
-            if cleartext_metadata {
-                params.encrypt_metadata = false;
-            }
-            // R=6 (the default) passes through; --force-R5 selects deprecated
-            // R=5, which guard_weak gates behind --allow-weak-crypto.
-            guard_weak(params)
+            params.encrypt_metadata = !cleartext_metadata;
+            params
         }
-        _ => unreachable!("key_len validated to 40/128/256 above"),
+    };
+
+    Ok(ParsedEncryptSegment {
+        params: guard_weak(params)?,
+        accessibility_warning: accessibility_explicitly_disabled
+            && matches!(
+                method,
+                EncryptMethod::V4Rc4128
+                    | EncryptMethod::V4Aes128
+                    | EncryptMethod::V5R5Aes256
+                    | EncryptMethod::V5R6Aes256
+            ),
+    })
+}
+
+fn parse_encrypt_key_len(value: &str) -> CliResult<u32> {
+    let key_len = value.parse().map_err(|_| {
+        format!("--encrypt KEY-LEN must be a positive integer (40 / 128 / 256), got: {value:?}")
+    })?;
+    if !matches!(key_len, 40 | 128 | 256) {
+        return Err(format!("--encrypt KEY-LEN must be 40, 128, or 256 (got {key_len})").into());
     }
+    Ok(key_len)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7630,9 +7726,68 @@ mod tests {
 
     #[test]
     fn bare_hyphen_encrypt_password_is_accepted() {
-        let params = parse_encrypt_segment(&strs(&["-", "-", "128"]), true).unwrap();
+        let params = parse_encrypt_segment(&strs(&["-", "-", "128"]), true)
+            .unwrap()
+            .params;
         assert_eq!(params.user_password, b"-");
         assert_eq!(params.owner_password, b"-");
+    }
+
+    #[test]
+    fn encrypt_parser_accepts_dashed_passwords_and_bits_before_the_terminator() {
+        let params = parse_encrypt_segment(
+            &strs(&["--user-password=u", "--bits=256", "--allow-insecure"]),
+            false,
+        )
+        .expect("qpdf dashed encryption form")
+        .params;
+        assert_eq!(params.method, EncryptMethod::V5R6Aes256);
+        assert_eq!(params.user_password, b"u");
+        assert!(params.owner_password.is_empty());
+    }
+
+    #[test]
+    fn encrypt_parser_rejects_mixed_positional_and_dashed_passwords() {
+        let error = parse_encrypt_segment(&strs(&["user", "--owner-password=owner", "128"]), true)
+            .expect_err("mixed encryption form");
+        assert!(error
+            .to_string()
+            .contains("positional and dashed encryption arguments may not be mixed"));
+    }
+
+    #[test]
+    fn encrypt_parser_keeps_r2_permissions_separate_from_r3_permissions() {
+        let parsed = parse_encrypt_segment(
+            &strs(&[
+                "user",
+                "owner",
+                "40",
+                "-print=n",
+                "-modify=y",
+                "-extract=n",
+                "-annotate=y",
+            ]),
+            true,
+        )
+        .expect("R=2 encryption options");
+        assert_eq!(parsed.params.method, EncryptMethod::V1Rc440);
+        assert_eq!(parsed.params.r2_permissions.print, false);
+        assert_eq!(parsed.params.r2_permissions.modify, true);
+        assert_eq!(parsed.params.r2_permissions.extract, false);
+        assert_eq!(parsed.params.r2_permissions.annotate, true);
+        assert_eq!(parsed.params.permissions, PermissionsConfig::default());
+    }
+
+    #[test]
+    fn encrypt_parser_reports_ignored_accessibility_for_modern_revisions() {
+        let parsed = parse_encrypt_segment(
+            &strs(&["user", "owner", "128", "--force-V4", "--accessibility=n"]),
+            true,
+        )
+        .expect("modern encryption options");
+        assert!(parsed.accessibility_warning);
+        assert_eq!(parsed.params.method, EncryptMethod::V4Rc4128);
+        assert!(parsed.params.permissions.accessibility);
     }
 
     #[test]

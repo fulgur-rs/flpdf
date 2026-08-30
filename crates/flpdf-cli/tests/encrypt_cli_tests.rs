@@ -956,28 +956,23 @@ fn encrypt_v5_r6_both_passwords_no_allow_insecure_succeeds() {
     assert!(output.exists(), "both-password 256 encryption must succeed");
 }
 
-/// `--allow-insecure` is a value-less flag. Any `=` form — `--allow-insecure=false`
-/// (a user trying to OPT OUT) or the empty `--allow-insecure=` (a typo / a
-/// generated empty value) — must be rejected, not silently treated as enabling
-/// the insecure path, so the empty-owner gate still fires and no file is written.
+/// qpdf's bare-option parser discards an attached `=value` for
+/// `--allow-insecure`, so both forms enable the option.
 #[test]
-fn encrypt_allow_insecure_rejects_a_value() {
+fn encrypt_allow_insecure_ignores_an_attached_value() {
     for form in ["--allow-insecure=false", "--allow-insecure="] {
         let tmp = tempfile::tempdir().unwrap();
-        let output = tmp.path().join("nope.pdf");
+        let output = tmp.path().join("insecure.pdf");
         Command::cargo_bin("flpdf")
             .unwrap()
             .args(["--encrypt", "user-pw", "", "256", form, "--"])
             .arg(fixture(UNENCRYPTED_FIXTURE))
             .arg(&output)
             .assert()
-            .failure()
-            .stderr(predicates::str::contains(
-                "--allow-insecure does not take a value",
-            ));
+            .success();
         assert!(
-            !output.exists(),
-            "no output must be written when {form:?} is rejected"
+            output.exists(),
+            "attached value must be discarded for {form:?}"
         );
     }
 }
@@ -1072,12 +1067,18 @@ fn encrypt_128_force_v4_no_aes_is_v4_rc4() {
 fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
     // (args-after-`--encrypt` excluding the `--` terminator, expected substring)
     let cases: &[(&[&str], &str)] = &[
-        (&["u", "o", "40", "--use-aes=y"], "KEY-LEN=40"),
-        (&["u", "o", "40", "--force-V4"], "KEY-LEN=40"),
-        (&["u", "o", "40", "--allow-insecure"], "KEY-LEN=40"),
-        (&["u", "o", "256", "--use-aes=y"], "KEY-LEN=256"),
-        (&["u", "o", "256", "--force-V4"], "KEY-LEN=256"),
-        (&["u", "", "128", "--allow-insecure"], "KEY-LEN=128"),
+        (&["u", "o", "40", "--use-aes=y"], "unrecognized argument"),
+        (&["u", "o", "40", "--force-V4"], "unrecognized argument"),
+        (
+            &["u", "o", "40", "--allow-insecure"],
+            "unrecognized argument",
+        ),
+        (&["u", "o", "256", "--use-aes=y"], "unrecognized argument"),
+        (&["u", "o", "256", "--force-V4"], "unrecognized argument"),
+        (
+            &["u", "", "128", "--allow-insecure"],
+            "unrecognized argument",
+        ),
     ];
     for (enc_args, needle) in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -1198,9 +1199,9 @@ fn encrypt_permission_sub_flags_match_qpdf() {
     }
 }
 
-/// flpdf-9hc.4.9.6: `--cleartext-metadata` is accepted for V=4/V=5 (the dict
-/// emits `/EncryptMetadata false`) and rejected for V=1/V=2 (40-bit, or 128
-/// without AES) which have no `/EncryptMetadata` concept.
+/// flpdf-9hc.4.9.6: `--cleartext-metadata` is accepted for V=4/V=5 (including
+/// the 128-bit default's forced V=4 path) and rejected by the 40-bit option
+/// table, which has no `/EncryptMetadata` concept.
 #[test]
 fn encrypt_cleartext_metadata_accept_reject_matrix() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1239,18 +1240,11 @@ fn encrypt_cleartext_metadata_accept_reject_matrix() {
         .assert()
         .success();
 
-    // Rejected for 40-bit (V=1) and 128 without AES (V=2).
-    for args in [
-        vec![
-            "--allow-weak-crypto",
-            "--encrypt",
-            "u",
-            "o",
-            "40",
-            "--cleartext-metadata",
-            "--",
-        ],
-        vec![
+    // The 128-bit default selects V=4 when cleartext metadata is requested.
+    let ok_v4_rc4 = tmp.path().join("ct128rc4.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
             "--allow-weak-crypto",
             "--encrypt",
             "u",
@@ -1258,21 +1252,38 @@ fn encrypt_cleartext_metadata_accept_reject_matrix() {
             "128",
             "--cleartext-metadata",
             "--",
-        ],
-    ] {
-        let nope = tmp.path().join("nope.pdf");
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .args(&args)
-            .arg(fixture(UNENCRYPTED_FIXTURE))
-            .arg(&nope)
-            .assert()
-            .failure()
-            .stderr(predicates::str::contains(
-                "--cleartext-metadata requires V=4 or V=5",
-            ));
-        assert!(!nope.exists(), "no output for rejected combo {args:?}");
-    }
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&ok_v4_rc4)
+        .assert()
+        .success();
+    let bytes = std::fs::read(&ok_v4_rc4).unwrap();
+    assert!(bytes
+        .windows(b"/EncryptMetadata false".len())
+        .any(|w| { w == b"/EncryptMetadata false" }));
+
+    // Rejected by qpdf's 40-bit option table.
+    let args = [
+        "--allow-weak-crypto",
+        "--encrypt",
+        "u",
+        "o",
+        "40",
+        "--cleartext-metadata",
+        "--",
+    ];
+    let nope = tmp.path().join("nope.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&nope)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "unrecognized argument --cleartext-metadata",
+        ));
+    assert!(!nope.exists(), "no output for rejected combo {args:?}");
 }
 
 #[test]
@@ -2163,9 +2174,9 @@ fn encrypt_force_r5_rejected_for_40_bit() {
         .stderr(predicates::str::contains("--force-R5"));
 }
 
-/// `--force-R5=value` is rejected: the flag takes no value.
+/// qpdf's bare-option parser discards an attached value on `--force-R5`.
 #[test]
-fn encrypt_force_r5_rejects_value_form() {
+fn encrypt_force_r5_ignores_attached_value() {
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("nope.pdf");
     Command::cargo_bin("flpdf")
@@ -2174,16 +2185,17 @@ fn encrypt_force_r5_rejects_value_form() {
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("does not take a value"));
+        .success();
+    assert!(
+        output.exists(),
+        "attached bare-option value must be discarded"
+    );
 }
 
-/// Creating deprecated R=5 (AES-256) output is gated behind
-/// `--allow-weak-crypto`, symmetric with the reader (which rejects R=5 input
-/// without the same opt-in). Without the flag the write is refused, and the
-/// diagnostic names the flag the user must add.
+/// qpdf accepts `--force-R5` without the RC4 weak-crypto opt-in. R=5 is
+/// deprecated, but it uses AES-256 and is not covered by QPDFJob's RC4 gate.
 #[test]
-fn encrypt_force_r5_rejected_without_allow_weak_crypto() {
+fn encrypt_force_r5_succeeds_without_allow_weak_crypto() {
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("r5-gated.pdf");
     Command::cargo_bin("flpdf")
@@ -2201,11 +2213,10 @@ fn encrypt_force_r5_rejected_without_allow_weak_crypto() {
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("--allow-weak-crypto"));
+        .success();
     assert!(
-        !output.exists(),
-        "no output file must be written when the R=5 weak-crypto gate fires"
+        output.exists(),
+        "qpdf's force-R5 path must write an output PDF"
     );
 }
 
