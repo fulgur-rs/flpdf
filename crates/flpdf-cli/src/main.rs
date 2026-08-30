@@ -214,6 +214,29 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
     Ok(())
 }
 
+/// Fail fast on an unusable output destination before a progress-reporting
+/// page-operation rewrite begins.
+///
+/// qpdf opens (and therefore validates) its real output destination before
+/// any writing -- including progress notifications -- starts. Confirmed
+/// against live qpdf 11.9.0: `qpdf --progress --rotate=90:1 in.pdf
+/// a-directory` fails immediately with no progress line printed at all.
+/// flpdf's page-operation rewrite instead computes the complete output into
+/// an internal memory buffer first (`write_qpdf_to_memory`) and persists it
+/// to `output` only afterward, so without this guard an unusable
+/// destination would let the full 0..100 progress sequence print before the
+/// later persistence step fails. Opens without truncating so an
+/// already-existing, otherwise-valid destination is left untouched until
+/// the real write.
+fn validate_progress_output_destination(output: &Path) -> CliResult<()> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(output)?;
+    Ok(())
+}
+
 /// Attach qpdf's logger-backed progress reporter to a direct CLI writer.
 ///
 /// The event accounting remains owned by `PdfWriter`; `QPDFJob` owns the
@@ -5057,6 +5080,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         // rewrite is flpdf's internal preparation step and is not an
         // observable qpdf writer, so it must not consume the progress stream.
         options.progress = false;
+    } else if options.progress && standard_output.is_none() {
+        validate_progress_output_destination(output)?;
     }
     let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
@@ -5276,6 +5301,8 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
         // rewrite is flpdf's internal preparation step and is not an
         // observable qpdf writer, so it must not consume the progress stream.
         options.progress = false;
+    } else if options.progress && creates_output {
+        validate_progress_output_destination(output)?;
     }
     let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
 
@@ -6708,7 +6735,7 @@ fn run_remove_attachment(
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
-    let mut standard_output = None;
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
     write_with_pdf_writer(
         &mut pdf,
         &output,
