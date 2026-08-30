@@ -345,6 +345,29 @@ fn job_json_file_rotate_trailing_colon_means_all_pages_like_qpdf() {
 }
 
 #[test]
+fn job_json_file_split_pages_rejects_a_non_numeric_value() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-invalid.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","splitPages":"not-a-number"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-invalid.json")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            ".splitPages: invalid page count not-a-number",
+        ));
+}
+
+#[test]
 fn job_json_file_remove_restrictions_disables_signature_fields() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

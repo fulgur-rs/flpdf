@@ -1809,12 +1809,16 @@ impl QPDFJob {
             let selected_refs = selected
                 .into_iter()
                 .map(|page| {
+                    // cov:ignore-start: PageRange::resolve guarantees each
+                    // selected page is a 1-based member of page_refs, so these
+                    // defensive conversion/index failures are unreachable.
                     let index = usize::try_from(page - 1).map_err(|_| {
                         Error::Unsupported("rotation page index underflow".to_owned())
                     })?;
                     page_refs.get(index).copied().ok_or_else(|| {
                         Error::Unsupported("rotation page index out of range".to_owned())
                     })
+                    // cov:ignore-end
                 })
                 .collect::<Result<Vec<_>>>()?;
             apply_rotate_to_pages(pdf, &selected_refs, &rotation.op)?;

@@ -170,7 +170,7 @@ impl RotateSpec {
                     // Re-wrap with offset adjusted to the page-range substring.
                     match e {
                         Error::Parse { offset, message } => Error::parse(pos + offset, message),
-                        other => other,
+                        other => other, // cov:ignore: PageRange::parse returns only Parse errors for this parser
                     }
                 })?
             }
