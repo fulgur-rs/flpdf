@@ -1174,3 +1174,311 @@ fn json_job_output_matches_qpdf_11_9_json_input_route() {
 
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn json_job_parser_accepts_all_covered_qpdf_handler_shapes() {
+    let valid_documents = [
+        r#"{"streamData":"compress"}"#,
+        r#"{"streamData":"preserve"}"#,
+        r#"{"streamData":"uncompress"}"#,
+        r#"{"jsonStreamData":"none"}"#,
+        r#"{"jsonStreamData":"inline"}"#,
+        r#"{"jsonStreamData":"file","jsonStreamPrefix":"streams"}"#,
+        r#"{"removeUnreferencedResources":"auto"}"#,
+        r#"{"removeUnreferencedResources":"yes"}"#,
+        r#"{"removeUnreferencedResources":"no"}"#,
+        r#"{"allowWeakCrypto":"","encrypt":{"userPassword":"u","ownerPassword":"o","128bit":{"modify":"all"}}}"#,
+        r#"{"pages":{"file":"page.pdf","password":"p","range":"1-2"}}"#,
+        r#"{"overlay":{"file":"overlay.pdf","from":"1","to":"1","repeat":"1"},"underlay":{"file":"underlay.pdf"}}"#,
+        r#"{"addAttachment":{"file":"attachment.bin","filename":"shown.bin","key":"shown-key","replace":""}}"#,
+        r#"{"copyAttachmentsFrom":{"file":"copy.pdf","password":"p","prefix":"copy-"}}"#,
+        r#"{"removeAttachment":["old-key"],"setPageLabels":["1:D"]}"#,
+        r#"{"jsonKey":["pages","qpdf"],"jsonObject":["trailer","1 0 R"]}"#,
+    ];
+
+    for json in valid_documents {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(json)
+            .unwrap_or_else(|error| panic!("valid job JSON rejected: {json}: {error}"));
+    }
+
+    let invalid_documents = [
+        r#"{"addAttachment":[{"file":"/"}]}"#,
+        r#"{"overlay":[{}]}"#,
+        r#"{"pages":[{}]}"#,
+        r#"{"jsonKey":[1]}"#,
+        r#"{"jsonKey":["unknown"]}"#,
+        r#"{"jsonObject":[1]}"#,
+        r#"{"jsonObject":["unknown"]}"#,
+        r#"{"removeAttachment":[1]}"#,
+        r#"{"setPageLabels":[1]}"#,
+        r#"{"inputFile":"input.pdf","empty":""}"#,
+    ];
+    for json in invalid_documents {
+        let mut job = QPDFJob::new();
+        assert!(
+            job.initialize_from_json_partial(json).is_err(),
+            "invalid job JSON unexpectedly accepted: {json}"
+        );
+    }
+}
+
+#[test]
+fn json_job_run_covers_update_page_labels_and_linearized_writer_stages() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+    let update = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/update.json");
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("input.pdf");
+    let output = tempdir.path().join("output.pdf");
+    let pass1 = tempdir.path().join("pass1.pdf");
+    std::fs::copy(fixture, &input).unwrap();
+
+    let json = serde_json::json!({
+        "inputFile": input,
+        "jsonInput": "",
+        "outputFile": output,
+        "updateFromJson": update,
+        "pages": [{"file": ".", "range": "1"}],
+        "removePageLabels": "",
+        "setPageLabels": ["1:D"],
+        "linearize": "",
+        "linearizePass1": pass1,
+        "verbose": "",
+        "staticId": ""
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.exists());
+}
+
+#[test]
+fn json_job_run_covers_overlay_attachment_and_copy_stages() {
+    let one_page =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let attachment_pdf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let overlay_output = tempdir.path().join("overlay.pdf");
+    let overlay_json = serde_json::json!({
+        "inputFile": one_page,
+        "outputFile": overlay_output,
+        "overlay": {"file": one_page, "from": "1", "to": "1", "repeat": "1"},
+        "underlay": [{"file": one_page}],
+        "staticId": ""
+    })
+    .to_string();
+    let mut overlay_job = QPDFJob::new();
+    overlay_job.initialize_from_json(&overlay_json).unwrap();
+    assert_eq!(overlay_job.run().unwrap(), JobExitCode::Success);
+
+    let attachment_output = tempdir.path().join("attachments.pdf");
+    let attachment_json = serde_json::json!({
+        "inputFile": attachment_pdf,
+        "outputFile": attachment_output,
+        "removeAttachment": ["attachment.txt"],
+        "copyAttachmentsFrom": [{"file": attachment_pdf, "prefix": "copy-"}],
+        "verbose": "",
+        "staticId": ""
+    })
+    .to_string();
+    let mut attachment_job = QPDFJob::new();
+    attachment_job
+        .initialize_from_json(&attachment_json)
+        .unwrap();
+    assert_eq!(attachment_job.run().unwrap(), JobExitCode::Success);
+    assert!(attachment_output.exists());
+}
+
+#[test]
+fn json_job_output_covers_v1_sections_images_outlines_encryption_and_schema() {
+    let one_page =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let image_pdf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/shared-stream-objstm.pdf");
+    let outline_pdf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/json-diff/direct-outlines.pdf");
+    let encrypted_pdf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let v1_output = tempdir.path().join("v1.json");
+    let v1_json = serde_json::json!({
+        "inputFile": one_page,
+        "outputFile": v1_output,
+        "json": "1",
+        "jsonKey": ["objects", "objectinfo"],
+        "staticId": ""
+    })
+    .to_string();
+    let mut v1_job = QPDFJob::new();
+    v1_job.initialize_from_json(&v1_json).unwrap();
+    assert_eq!(v1_job.run().unwrap(), JobExitCode::Success);
+    let v1_text = std::fs::read_to_string(v1_output).unwrap();
+    assert!(v1_text.contains("\"objects\""));
+    assert!(v1_text.contains("\"objectinfo\""));
+
+    for (name, input) in [("images", image_pdf), ("outlines", outline_pdf)] {
+        let output = tempdir.path().join(format!("{name}.json"));
+        let json = serde_json::json!({
+            "inputFile": input,
+            "outputFile": output,
+            "json": "2",
+            "jsonKey": ["pages"],
+        })
+        .to_string();
+        let mut job = QPDFJob::new();
+        job.initialize_from_json(&json).unwrap();
+        assert_eq!(job.run().unwrap(), JobExitCode::Success);
+        assert!(std::fs::metadata(output).unwrap().len() > 0);
+    }
+
+    let encrypted_output = tempdir.path().join("encrypted.json");
+    let encrypted_json = serde_json::json!({
+        "inputFile": encrypted_pdf,
+        "outputFile": encrypted_output,
+        "password": "user-v4-aes",
+        "json": "2",
+        "jsonKey": ["encrypt"],
+        "showEncryptionKey": ""
+    })
+    .to_string();
+    let mut encrypted_job = QPDFJob::new();
+    encrypted_job.initialize_from_json(&encrypted_json).unwrap();
+    assert_eq!(encrypted_job.run().unwrap(), JobExitCode::Success);
+
+    let schema_output = tempdir.path().join("schema.json");
+    let schema_json = serde_json::json!({
+        "inputFile": one_page,
+        "outputFile": schema_output,
+        "jsonOutput": "2",
+        "testJsonSchema": ""
+    })
+    .to_string();
+    let mut schema_job = QPDFJob::new();
+    schema_job.initialize_from_json(&schema_json).unwrap();
+    assert_eq!(schema_job.run().unwrap(), JobExitCode::Success);
+}
+
+#[test]
+fn json_job_stdout_schema_uses_the_job_save_pipeline() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let (logger, state) = logger_with_info_sink();
+    let save_state = Arc::new(Mutex::new(SinkState::default()));
+    logger
+        .set_save(
+            Some(PipelineHandle::new(RecordingSink {
+                state: Arc::clone(&save_state),
+            })),
+            false,
+        )
+        .unwrap();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    let json = serde_json::json!({
+        "inputFile": input,
+        "jsonOutput": "2",
+        "testJsonSchema": ""
+    })
+    .to_string();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(save_state.lock().unwrap().bytes.starts_with(b"{\n"));
+    assert!(state.lock().unwrap().bytes.is_empty());
+}
+
+#[test]
+fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() {
+    let minimal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let json_input = tempdir.path().join("input.json");
+    std::fs::write(&json_input, COMPLETE_JSON).unwrap();
+    let created_output = tempdir.path().join("created.pdf");
+    let create_json = serde_json::json!({
+        "inputFile": json_input,
+        "jsonInput": "",
+        "outputFile": created_output,
+        "staticId": ""
+    })
+    .to_string();
+    let mut create_job = QPDFJob::new();
+    create_job.initialize_from_json(&create_json).unwrap();
+    assert_eq!(create_job.run().unwrap(), JobExitCode::Success);
+
+    let bad_json_input = tempdir.path().join("bad.json");
+    std::fs::write(&bad_json_input, b"{").unwrap();
+    let bad_output = tempdir.path().join("bad.pdf");
+    let bad_json = serde_json::json!({
+        "inputFile": bad_json_input,
+        "jsonInput": "",
+        "outputFile": bad_output
+    })
+    .to_string();
+    let mut bad_job = QPDFJob::new();
+    bad_job.initialize_from_json(&bad_json).unwrap();
+    assert_eq!(bad_job.run().unwrap(), JobExitCode::Error);
+
+    let replace_input = tempdir.path().join("replace.pdf");
+    std::fs::copy(&minimal, &replace_input).unwrap();
+    let replace_json = serde_json::json!({
+        "inputFile": replace_input,
+        "replaceInput": "",
+        "staticId": ""
+    })
+    .to_string();
+    let mut replace_job = QPDFJob::new();
+    replace_job.initialize_from_json(&replace_json).unwrap();
+    assert_eq!(replace_job.run().unwrap(), JobExitCode::Success);
+    assert!(replace_input.exists());
+
+    let failed_replace_input = tempdir.path().join("failed-replace.pdf");
+    std::fs::copy(&minimal, &failed_replace_input).unwrap();
+    let failed_replace_json = serde_json::json!({
+        "inputFile": failed_replace_input,
+        "replaceInput": "",
+        "removeAttachment": ["missing"]
+    })
+    .to_string();
+    let mut failed_replace_job = QPDFJob::new();
+    failed_replace_job
+        .initialize_from_json(&failed_replace_json)
+        .unwrap();
+    assert_eq!(failed_replace_job.run().unwrap(), JobExitCode::Error);
+    assert!(failed_replace_input.exists());
+}
+
+#[test]
+fn json_job_show_encryption_and_setter_boundaries_are_reachable() {
+    let encrypted = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let (logger, info_state) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.set_input_file("placeholder.pdf").unwrap();
+    assert!(job.set_input_file("second.pdf").is_err());
+    job.set_output_file("placeholder-output.pdf").unwrap();
+    assert!(job.set_output_file("second-output.pdf").is_err());
+    job.set_password(b"placeholder-password".to_vec());
+
+    let json = serde_json::json!({
+        "inputFile": encrypted,
+        "password": "user-v4-aes",
+        "showEncryption": ""
+    })
+    .to_string();
+    let mut inspection_job = QPDFJob::new();
+    inspection_job.set_logger(job.logger());
+    inspection_job.initialize_from_json(&json).unwrap();
+    assert_eq!(inspection_job.run().unwrap(), JobExitCode::Success);
+    assert!(info_state
+        .lock()
+        .unwrap()
+        .bytes
+        .windows(b"R = 4".len())
+        .any(|window| { window == b"R = 4" }));
+}
