@@ -162,7 +162,7 @@ fn show_encryption_key_wrong_password_is_not_reported_as_plaintext() {
         .args(["show-encryption-key", "--password=wrong", V5_R6])
         .assert()
         .code(2)
-        .stderr(predicates::str::contains("incorrect password"))
+        .stderr(predicates::str::contains("invalid password"))
         .stderr(predicates::str::contains("not encrypted").not());
 }
 

@@ -86,10 +86,7 @@ fn read_options(input: &std::path::Path, password: Vec<u8>) -> PdfOpenOptions {
 fn open_input(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Result<Pdf<File>> {
     let input = PathBuf::from(input_arg);
     let password = password_bytes(password_arg);
-    Ok(Pdf::open_with_options(
-        File::open(&input)?,
-        read_options(&input, password),
-    )?)
+    Pdf::open_with_options(File::open(&input)?, read_options(&input, password))
 }
 
 fn is_bad_password(error: &Error) -> bool {

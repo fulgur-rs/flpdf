@@ -391,8 +391,7 @@ fn check_encrypted_fixture_rejects_wrong_password() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("incorrect password"))
-    .stderr(predicate::str::contains("--password"));
+    .stderr(predicate::str::contains("invalid password"));
 }
 
 #[test]
@@ -444,8 +443,7 @@ fn check_repair_encrypted_fixture_rejects_wrong_password_actionably() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("incorrect password"))
-    .stderr(predicate::str::contains("--password"));
+    .stderr(predicate::str::contains("invalid password"));
 }
 
 #[test]

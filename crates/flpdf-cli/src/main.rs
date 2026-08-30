@@ -5988,7 +5988,7 @@ fn run_show_encryption_key(
             logger_info(format!("{}\n", hex_lower(&key)))?;
             finish_operation_warnings(&pdf, false)
         }
-        None if pdf.is_encrypted() => Err("encrypted PDF: incorrect password".into()),
+        None if pdf.is_encrypted() => Err("invalid password".into()),
         None => Err("file is not encrypted; no encryption key to show".into()),
     }
 }
@@ -7621,10 +7621,10 @@ mod tests {
         )
         .expect("R=2 encryption options");
         assert_eq!(parsed.params.method, EncryptMethod::V1Rc440);
-        assert_eq!(parsed.params.r2_permissions.print, false);
-        assert_eq!(parsed.params.r2_permissions.modify, true);
-        assert_eq!(parsed.params.r2_permissions.extract, false);
-        assert_eq!(parsed.params.r2_permissions.annotate, true);
+        assert!(!parsed.params.r2_permissions.print);
+        assert!(parsed.params.r2_permissions.modify);
+        assert!(!parsed.params.r2_permissions.extract);
+        assert!(parsed.params.r2_permissions.annotate);
         assert_eq!(parsed.params.permissions, PermissionsConfig::default());
     }
 
