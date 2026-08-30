@@ -8,8 +8,8 @@
 //! movement, repair, split, insert, and remove (`libqpdf/NNTree.cc:34-75,
 //! 106-168, 216-390, 391-520, 560-700`). The public `NameTree` and
 //! `NumberTree` facades and the shared generic engine are handle-native with no
-//! raw `Object` fixture or projection route remaining. Production tree
-//! mutations do not write nodes back through `Pdf::set_object`. Array replacement
+//! independent value fixture or projection route remaining. Production tree
+//! mutations do not leave the canonical handle graph. Array replacement
 //! follows qpdf's `QPDFObjectHandle` live-array mutators and
 //! `QPDF_Array::setFromVector` ownership/order boundary
 //! (`libqpdf/QPDFObjectHandle.cc:869-955`, `libqpdf/QPDF_Array.cc:220-313`),

@@ -81,9 +81,9 @@
 | `crates/flpdf/src/logger.rs` | correspondence | QPDFLogger.cc shared info, warning, error, and binary-save pipeline routing |
 | `crates/flpdf/src/matrix.rs` | mirror | libqpdf/QPDFMatrix.cc |
 | `crates/flpdf/src/nntree.rs` | correspondence | NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries |
-| `crates/flpdf/src/object.rs` | correspondence | QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model |
 | `crates/flpdf/src/object_copy.rs` | correspondence | the canonical \`QPDF::copyForeignObject\` graph copy lives here |
 | `crates/flpdf/src/object_handle.rs` | correspondence | \`QPDFObjectHandle\`, \`QPDFObject\`, and \`QPDFValue\` identity and payload ownership, \`QPDF::newReserved\`/\`QPDF_Reserved\`, \`QPDFObjectHandle::copyStream\`/\`QPDF::copyStreamData\` stream-copy primitives, and \`QPDF::setImmediateCopyFrom\` |
+| `crates/flpdf/src/object_ref.rs` | correspondence | \`QPDFObjGen\` identity and command-line object-reference parsing |
 | `crates/flpdf/src/objr_obj_annot_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations |
 | `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding |
 | `crates/flpdf/src/optimization/inherited_attrs.rs` | correspondence | QPDF_optimization.cc inherited-page-attribute push |
@@ -103,6 +103,7 @@
 | `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries |
 | `crates/flpdf/src/pdf.rs` | correspondence | QPDF's central document container, direct document-state accessors, and teardown (\`include/qpdf/QPDF.hh:1438-1518\`; \`libqpdf/QPDF.cc:215-232,2323-2358,2647-2651\`) |
 | `crates/flpdf/src/pdf_string.rs` | correspondence | \`libqpdf/QPDF_String.cc\` PDF string semantics |
+| `crates/flpdf/src/pdf_syntax.rs` | correspondence | shared PDF token serialization helpers used by canonical handle writers |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
 | `crates/flpdf/src/pipeline/aes.rs` | correspondence | Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time |
@@ -135,12 +136,11 @@
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |
 | `crates/flpdf/src/reader/resolver.rs` | correspondence | \`QPDF::resolve\` (\`libqpdf/QPDF.cc:1700-1753\`) and the \`QPDF::Members\` fields it touches |
-| `crates/flpdf/src/ref_chain.rs` | correspondence | no shared reference-to-reference chain primitive |
 | `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
 | `crates/flpdf/src/signatures.rs` | correspondence | no qpdf counterpart for signature inspection; qpdf-owned mutation lives in Pdf and AcroFormDocumentHelper |
-| `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values. A materialized Object reader exists only inside cfg(test) equivalence fixtures |
+| `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values |
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
 | `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |

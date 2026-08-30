@@ -101,7 +101,7 @@ fn embedded_names_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
         if names.as_dictionary().is_some() {
             return names;
         }
-        let Some(next_ref) = names.as_reference() else {
+        let Some(next_ref) = names.object_ref() else {
             panic!("missing /Names dictionary");
         };
         names = pdf.get_object_handle(next_ref);

@@ -93,19 +93,19 @@ fn normal_rewrite_recovers_bare_reference_and_exits_3_after_writing() {
         .resolve_canonical_object(flpdf::ObjectRef::new(3, 0))
         .unwrap();
     assert_eq!(
-        page.as_dict().unwrap().get_ref("Contents"),
+        page.try_get_key(b"/Contents").unwrap().object_ref(),
         Some(flpdf::ObjectRef::new(4, 0))
     );
     assert_eq!(
         pdf.resolve_canonical_object(flpdf::ObjectRef::new(4, 0))
-            .unwrap(),
-        flpdf::Object::Integer(6)
+            .unwrap()
+            .as_integer(),
+        Some(6)
     );
-    assert_eq!(
-        pdf.resolve_canonical_object(flpdf::ObjectRef::new(5, 0))
-            .unwrap(),
-        flpdf::Object::Null
-    );
+    assert!(pdf
+        .resolve_canonical_object(flpdf::ObjectRef::new(5, 0))
+        .unwrap()
+        .is_null());
 }
 
 #[test]
@@ -136,7 +136,8 @@ fn qdf_subcommand_exits_3_after_writing_complete_output() {
     let mut pdf = flpdf::Pdf::open_mem_owned(bytes).expect("QDF output opens");
     assert_eq!(
         pdf.resolve_canonical_object(flpdf::ObjectRef::new(4, 0))
-            .unwrap(),
-        flpdf::Object::Integer(6)
+            .unwrap()
+            .as_integer(),
+        Some(6)
     );
 }

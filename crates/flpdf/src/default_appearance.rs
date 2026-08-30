@@ -14,7 +14,7 @@
 //! field-level `/DA` is absent) is the caller's responsibility.
 
 use crate::content_stream::{parse_content_operations, ParseControl};
-use crate::Object;
+use crate::ObjectHandle;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -163,11 +163,11 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
 
 // ── Private helpers ──────────────────────────────────────────────────────────
 
-/// Convert a PDF [`Object`] (Integer or Real) to `f64`.
+/// Convert a PDF [`ObjectHandle`] (Integer or Real) to `f64`.
 ///
 /// Returns `None` for any other object type, including indirect references
 /// (which do not appear in content-stream fragments).
-fn obj_as_f64(obj: &Object) -> Option<f64> {
+fn obj_as_f64(obj: &ObjectHandle) -> Option<f64> {
     obj.as_real().or_else(|| obj.as_integer().map(|i| i as f64))
 }
 

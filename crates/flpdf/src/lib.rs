@@ -5,7 +5,7 @@
 //!
 //! - [`Pdf`] is the parsed-but-lazy document handle. [`Pdf::open`] reads the trailer
 //!   and cross-reference table, then resolves objects on demand via [`Pdf::resolve`].
-//! - [`Object`], [`Dictionary`], [`Stream`], and [`ObjectRef`] are the data model.
+//! - [`ObjectHandle`] and [`ObjectRef`] are the data model.
 //! - [`pages`] and [`outline_object_helper`] are traversal helpers built on top of `Pdf`. They
 //!   mirror the read-only inspection surface that `qpdf --show-pages` and
 //!   `--json-key=outlines` provide.
@@ -35,7 +35,7 @@
 //! ```
 //!
 //! Errors flow through the unified [`Error`] enum and the crate-level [`Result`] alias,
-//! except for the small [`object::ParseObjectRefError`] returned by
+//! except for the small [`ParseObjectRefError`] returned by
 //! [`ObjectRef::parse`].
 //!
 //! # Known limitations
@@ -107,9 +107,9 @@ pub mod linearization;
 pub mod logger;
 pub mod matrix;
 mod nntree;
-pub mod object;
 pub mod object_copy;
 mod object_handle;
+pub mod object_ref;
 pub mod objr_obj_annot_p;
 pub(crate) mod optimization;
 pub mod outline_document_helper;
@@ -126,17 +126,13 @@ pub mod pages;
 pub mod parser;
 pub mod pdf;
 pub mod pdf_string;
+mod pdf_syntax;
 pub mod pdf_version;
 pub mod pipeline;
 pub mod qdf_fix;
 mod qpdf_time;
 pub mod qutil;
 pub mod reader;
-#[cfg(not(feature = "qtest-driver"))]
-pub(crate) mod ref_chain;
-#[cfg(feature = "qtest-driver")]
-#[doc(hidden)]
-pub mod ref_chain;
 mod resource_finder;
 mod resource_replacer;
 pub mod resources;
@@ -157,10 +153,7 @@ pub use annotation_object_helper::AnnotationObjectHelper;
 pub use cache::{CacheEntry, ObjectCache};
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
-pub use content_stream::{
-    parse_content_operations, parse_content_stream_data, ObjectHandleParserCallbacks, ParseControl,
-    ParserCallbacks,
-};
+pub use content_stream::{parse_content_operations, ObjectHandleParserCallbacks, ParseControl};
 pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use embedded_files::{
@@ -194,11 +187,11 @@ pub use matrix::{Matrix, Rectangle};
 pub use nntree::{
     NameTree, NameTreeCursor, NumberTree, NumberTreeCursor, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
 };
-pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_handle::{
     ArrayItemCursor, ArrayItems, DictItem, DictItemCursor, DictItems, ObjectHandle,
     ObjectHandleMatrix, StreamDataProvider, STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
 };
+pub use object_ref::{ObjectRef, ParseObjectRefError};
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline_document_helper::OutlineDocumentHelper;
 pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
@@ -211,7 +204,6 @@ pub use page_label_document_helper::{
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
-pub use parser::parse_object;
 pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, parse_pdf_version_spec, PdfVersion};
 pub use pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};

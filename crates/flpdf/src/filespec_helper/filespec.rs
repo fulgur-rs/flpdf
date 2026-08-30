@@ -87,7 +87,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         ensure_indirect_handle_belongs_to_pdf(&filespec, pdf, "Filespec")?;
         // QPDFFileSpecObjectHelper.cc:10-18 warns at construction time for a
         // non-dictionary value or a dictionary with the wrong /Type.
-        let resolved = pdf.resolve_to_terminal(&filespec)?;
+        let resolved = pdf.resolve_handle(&filespec)?;
         if resolved.try_as_dictionary()?.is_none() {
             resolved.warn_if_possible("Embedded file object is not a dictionary")?;
         } else if !resolved.try_is_dictionary_of_type(b"Filespec", b"")? {
@@ -101,7 +101,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// `typeWarning` that qpdf's `QPDFObjectHandle::getKey` emits for a
     /// non-dictionary Filespec.
     fn filespec_handle(&mut self) -> Result<ObjectHandle> {
-        let (filespec, terminal_ref) = self.pdf.resolve_to_terminal_ref(&self.filespec)?;
+        let (filespec, terminal_ref) = self.pdf.resolve_handle_ref(&self.filespec)?;
         Ok(match terminal_ref {
             Some(object_ref) => {
                 let filespec = self.pdf.get_object_handle(object_ref);
@@ -121,7 +121,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     }
 
     fn resolved_string_value_handle(&mut self, value: ObjectHandle) -> Result<Option<Vec<u8>>> {
-        let value = self.pdf.resolve_to_terminal(&value)?;
+        let value = self.pdf.resolve_handle(&value)?;
         Ok(value.as_string())
     }
 
@@ -213,7 +213,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn af_relationship(&mut self) -> Result<Option<Vec<u8>>> {
         let value = self.filespec_value(b"/AFRelationship")?;
-        Ok(self.pdf.resolve_to_terminal(&value)?.as_name())
+        Ok(self.pdf.resolve_handle(&value)?.as_name())
     }
 
     /// Return `/Desc` through qpdf's UTF-8 string view.
@@ -264,7 +264,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// a stream, preserving the original reference when it was indirect.
     pub fn get_embedded_file_stream(&mut self, key: &str) -> Result<ObjectHandle> {
         let ef = self.get_embedded_file_streams()?;
-        let ef = self.pdf.resolve_to_terminal(&ef)?;
+        let ef = self.pdf.resolve_handle(&ef)?;
         let Some(entries) = ef.try_as_dictionary()? else {
             return Ok(ObjectHandle::null());
         };
@@ -279,7 +279,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             let Some(candidate) = entries.get(&key).cloned() else {
                 continue;
             };
-            let terminal = self.pdf.resolve_to_terminal(&candidate)?;
+            let terminal = self.pdf.resolve_handle(&candidate)?;
             if terminal.as_stream_dict().is_some() {
                 return Ok(candidate);
             }
@@ -352,7 +352,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// ```
     pub fn embedded_file(&mut self) -> Result<Option<EmbeddedFileStream<'_, R>>> {
         let candidate = self.get_embedded_file_stream("")?;
-        let (stream, terminal_ref) = self.pdf.resolve_to_terminal_ref(&candidate)?;
+        let (stream, terminal_ref) = self.pdf.resolve_handle_ref(&candidate)?;
         let Some(stream) = stream.as_stream_dict().map(|_| stream) else {
             return Ok(None);
         };

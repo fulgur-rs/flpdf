@@ -92,8 +92,11 @@ fn count_objstm_containers(bytes: &[u8]) -> usize {
     let refs = pdf.object_refs();
     let mut n = 0;
     for r in refs {
-        if let Ok(flpdf::Object::Stream(s)) = pdf.resolve_canonical_object(r) {
-            if matches!(s.dict.get("Type"), Some(flpdf::Object::Name(t)) if t.as_slice() == b"ObjStm")
+        if let Ok(stream) = pdf.resolve_canonical_object(r) {
+            if stream
+                .as_stream_dict()
+                .and_then(|dict| dict.get_key(b"/Type").as_name())
+                .is_some_and(|name| name.as_slice() == b"ObjStm")
             {
                 n += 1;
             }

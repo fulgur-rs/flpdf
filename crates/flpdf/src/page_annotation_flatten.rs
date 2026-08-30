@@ -142,7 +142,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
             helper.get_appearance_dictionary()?
         };
-        let appearance_dictionary = pdf.resolve_to_terminal(&appearance_dictionary)?;
+        let appearance_dictionary = pdf.resolve_handle(&appearance_dictionary)?;
         let appearance = {
             let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
             helper.get_appearance_stream(b"N", None)?
@@ -207,7 +207,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // behavior. The qpdf-shaped helper owns the rectangle and appearance
         // geometry calculation for both paths.
         if !qpdf_flag_contract {
-            let rect_value = pdf.resolve_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
+            let rect_value = pdf.resolve_handle(&annotation.try_get_key(b"/Rect")?)?;
             let has_rect = !rect_value.is_null();
             if !has_rect {
                 continue;
@@ -308,7 +308,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // below, once content is known to be non-empty), so peek at it
         // read-only here without creating it.
         let existing_xobj = resources.try_get_key(b"/XObject")?;
-        let existing_xobj = pdf.resolve_to_terminal(&existing_xobj)?;
+        let existing_xobj = pdf.resolve_handle(&existing_xobj)?;
         let xobj_name = loop {
             let candidate = format!("Fxo{xobj_counter}");
             let candidate_key = format!("/{candidate}");
@@ -453,7 +453,7 @@ fn add_qpdf_flatten_contents<R: Read + Seek>(
     after.extend_from_slice(&append_bytes);
     let after = add_content_stream(pdf, after)?;
     let old = page.try_get_key(b"/Contents")?;
-    let old = pdf.resolve_to_terminal(&old)?;
+    let old = pdf.resolve_handle(&old)?;
     let mut contents = vec![before];
     if let Some(items) = old.as_array() {
         contents.extend(items);
@@ -552,7 +552,7 @@ fn direct_page_rotate<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> 
     if page.as_dictionary().is_none() {
         return Ok(0); // cov:ignore: repaired page snapshot is always a dictionary
     }
-    let rotate = pdf.resolve_to_terminal(&page.try_get_key(b"/Rotate")?)?;
+    let rotate = pdf.resolve_handle(&page.try_get_key(b"/Rotate")?)?;
     Ok(rotate
         .as_integer()
         .and_then(|value| i32::try_from(value).ok())
@@ -625,7 +625,7 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
     let Ok(root) = pdf.root_handle() else {
         return Ok(None); // cov:ignore: a parsed Pdf always has a resolvable root
     };
-    let acroform = pdf.resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+    let acroform = pdf.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
     if acroform.as_dictionary().is_none() {
         return Ok(None); // cov:ignore: malformed AcroForm is ignored like qpdf
     }
@@ -648,7 +648,7 @@ fn resolve_array_item_handles<R: Read + Seek>(
 ) -> Result<()> {
     let mut changed = false;
     for (index, item) in array.as_array().unwrap_or_default().into_iter().enumerate() {
-        let terminal = pdf.resolve_to_terminal(&item)?;
+        let terminal = pdf.resolve_handle(&item)?;
         if !terminal.is_same_object_as(&item) {
             array.set_array_item(index, terminal)?;
             changed = true;
@@ -702,7 +702,7 @@ fn resolve_matched_category_handles<R: Read + Seek>(
     let mut dirty_arrays = Vec::new();
     let dest_entries = resources.as_dictionary().unwrap_or_default();
     for (category, source_value) in default_resources.as_dictionary().unwrap_or_default() {
-        let source_terminal = pdf.resolve_to_terminal(&source_value)?;
+        let source_terminal = pdf.resolve_handle(&source_value)?;
         if !source_terminal.is_same_object_as(&source_value) {
             default_resources.replace_key(&category, source_terminal.clone())?;
         }
@@ -710,7 +710,7 @@ fn resolve_matched_category_handles<R: Read + Seek>(
             continue; // cov:ignore: qpdf's merge never inspects a destination-only category
         };
         let dest_was_indirect = dest_value.is_indirect();
-        let dest_terminal = pdf.resolve_to_terminal(dest_value)?;
+        let dest_terminal = pdf.resolve_handle(dest_value)?;
         if !dest_terminal.is_same_object_as(dest_value) {
             resources.replace_key(&category, dest_terminal.clone())?;
         }
@@ -815,7 +815,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // whatever value is already resolved and does not fetch on its own,
         // so the handle must be resolved to its terminal value first.
         let was_indirect = resources.is_indirect();
-        let resources = pdf.resolve_to_terminal(&resources)?;
+        let resources = pdf.resolve_handle(&resources)?;
         let resources = if was_indirect {
             let privatized = resources.shallow_copy()?;
             appearance_dict.replace_key(b"/Resources", privatized.clone())?;
@@ -834,7 +834,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // Lazy: qpdf only ever reads /DR from inside this same per-widget
         // merge path (see acroform_default_resources's doc), so resolving
         // it earlier than this would touch a value flattening may not need.
-        let default_resources = pdf.resolve_to_terminal(default_resources)?;
+        let default_resources = pdf.resolve_handle(default_resources)?;
         if default_resources.as_dictionary().is_none() {
             continue; // cov:ignore: malformed AcroForm DR is ignored like qpdf
         }
@@ -901,7 +901,7 @@ fn build_pruned_annots_array<R: Read + Seek>(
 ) -> Result<ObjectHandle> {
     let page = pdf.get_object_handle(page_ref);
     pdf.resolve(&page)?;
-    let annots = pdf.resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
+    let annots = pdf.resolve_handle(&page.try_get_key(b"/Annots")?)?;
     let Some(annots_arr) = annots.as_array() else {
         return Ok(ObjectHandle::array(Vec::new()));
     };

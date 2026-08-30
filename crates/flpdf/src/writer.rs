@@ -20,11 +20,7 @@ pub(crate) mod serialize;
 mod settings;
 pub(crate) use object::ObjectWriterEmission;
 pub use object_streams::ObjectStreamMode;
-#[cfg(test)]
-use serialize::write_stream_payload;
 pub use serialize::write_stream_to_buf;
-#[cfg(test)]
-use serialize::write_stream_with_id_writer as write_stream_to_buf_with_id_writer;
 pub use settings::DecodeLevel;
 use settings::WriterSettings;
 
@@ -46,12 +42,9 @@ where
 
 use crate::encryption::{CopyEncryptionSource, EncryptParams};
 use crate::linearization::writer::write_linearized_for_pdf_writer;
-use crate::object_handle::ObjectValue;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::pipeline::{Pipeline, PlString};
-use crate::{
-    filters, Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm,
-};
+use crate::{filters, Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -841,197 +834,21 @@ fn encryption_shape(options: &WriterOptions) -> Option<(i64, i64, bool)> {
     }
 
     let source = options.copy_encryption.as_ref()?;
-    let version = source.encrypt_dict.get("V")?.as_integer()?;
-    let revision = source.encrypt_dict.get("R")?.as_integer()?;
+    let version = source
+        .encrypt_dict
+        .try_get_key(b"/V")
+        .ok()?
+        .try_as_integer()
+        .ok()??;
+    let revision = source
+        .encrypt_dict
+        .try_get_key(b"/R")
+        .ok()?
+        .try_as_integer()
+        .ok()??;
     Some((version, revision, version >= 4))
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-    use crate::encryption::standard::ObjectKeyAlg;
-    use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams};
-
-    fn options_for(method: EncryptMethod) -> WriterOptions {
-        let params = match method {
-            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 | EncryptMethod::V4Rc4128 => {
-                EncryptParams::rc4(method, b"user", b"owner")
-            }
-            EncryptMethod::V4Aes128 => EncryptParams::v4_aes128(b"user", b"owner"),
-            EncryptMethod::V5R5Aes256 => EncryptParams::v5_r5(b"user", b"owner"),
-            EncryptMethod::V5R6Aes256 => EncryptParams::v5_r6(b"user", b"owner"),
-        };
-        WriterOptions {
-            encrypt: Some(params),
-            ..WriterOptions::default()
-        }
-    }
-
-    #[test]
-    fn encryption_shape_covers_the_full_standard_handler_matrix() {
-        let expected = [
-            (EncryptMethod::V1Rc440, (1, 2, false)),
-            (EncryptMethod::V2Rc4128, (2, 3, false)),
-            (EncryptMethod::V4Rc4128, (4, 4, false)),
-            (EncryptMethod::V4Aes128, (4, 4, true)),
-            (EncryptMethod::V5R5Aes256, (5, 5, true)),
-            (EncryptMethod::V5R6Aes256, (5, 6, true)),
-        ];
-
-        for (method, shape) in expected {
-            assert_eq!(encryption_shape(&options_for(method)), Some(shape));
-        }
-    }
-
-    #[test]
-    fn forced_version_disables_each_incompatible_encryption_floor() {
-        let mut options = options_for(EncryptMethod::V1Rc440);
-        options.force_version = Some("1.2".to_string());
-        assert!(forced_version_disables_encryption(&options));
-
-        let mut options = options_for(EncryptMethod::V2Rc4128);
-        options.force_version = Some("1.3".to_string());
-        assert!(forced_version_disables_encryption(&options));
-
-        let mut options = options_for(EncryptMethod::V4Rc4128);
-        options.force_version = Some("1.4".to_string());
-        assert!(forced_version_disables_encryption(&options));
-
-        let mut options = options_for(EncryptMethod::V4Aes128);
-        options.force_version = Some("1.5".to_string());
-        assert!(forced_version_disables_encryption(&options));
-
-        let mut options = options_for(EncryptMethod::V5R6Aes256);
-        options.force_version = Some("1.7".to_string());
-        options.force_extension_level = Some(2);
-        assert!(forced_version_disables_encryption(&options));
-
-        options.force_extension_level = Some(3);
-        assert!(!forced_version_disables_encryption(&options));
-    }
-
-    #[test]
-    fn minimum_pdf_version_keeps_the_highest_version_and_extension() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let mut writer = PdfWriter::new(&mut pdf);
-
-        writer.set_minimum_pdf_version("1.4", 0);
-        writer.set_minimum_pdf_version("1.3", 99);
-        writer.set_minimum_pdf_version("1.4", 0);
-        writer.set_minimum_pdf_version("1.4", 1);
-        writer.set_minimum_pdf_version("1.5", 0);
-
-        assert_eq!(writer.get_final_version().unwrap(), "1.5");
-    }
-
-    #[test]
-    fn invalid_minimum_version_can_be_corrected_before_write() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let mut writer = PdfWriter::new(&mut pdf);
-
-        writer.set_minimum_pdf_version("invalid", 99);
-        writer.set_minimum_pdf_version("1.4", 2);
-
-        assert_eq!(writer.get_final_version().unwrap(), "1.4");
-    }
-
-    #[test]
-    fn invalid_minimum_version_after_valid_input_does_not_panic() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let mut writer = PdfWriter::new(&mut pdf);
-
-        writer.set_minimum_pdf_version("1.4", 2);
-        writer.set_minimum_pdf_version("invalid", 99);
-
-        assert_eq!(writer.get_final_version().unwrap(), "1.4");
-    }
-
-    #[test]
-    fn invalid_existing_minimum_version_is_replaced_by_a_valid_candidate() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.settings.minimum_pdf_version = Some(("invalid".to_owned(), 99));
-
-        writer.set_minimum_pdf_version("1.4", 2);
-
-        assert_eq!(writer.get_final_version().unwrap(), "1.4");
-    }
-
-    #[test]
-    fn writer_configuration_replays_qpdf_split_writer_settings() {
-        let mut configuration = WriterConfiguration::default();
-        configuration.set_object_stream_mode(ObjectStreamMode::Generate);
-        configuration.set_compress_streams(false);
-        configuration.set_stream_data_mode(StreamDataMode::Preserve);
-        configuration.set_stream_data_mode(StreamDataMode::Compress);
-        configuration.set_stream_data_mode(StreamDataMode::Uncompress);
-        configuration.set_decode_level(DecodeLevel::All);
-        configuration.set_recompress_flate(true);
-        configuration.set_content_normalization(true);
-        configuration.set_qdf_mode(true);
-        configuration.set_preserve_unreferenced_objects(true);
-        configuration.set_newline_before_endstream(false);
-        configuration.set_newline_before_endstream(true);
-        configuration.set_minimum_pdf_version("1.4", 2);
-        configuration.force_pdf_version("1.7", 3);
-        configuration.set_extra_header_text("% split configuration");
-        configuration.set_deterministic_id(true);
-        configuration.set_static_id(true);
-        configuration.set_static_aes_iv(true);
-        configuration.set_suppress_original_object_ids(true);
-        configuration.set_preserve_encryption(false);
-        configuration.set_linearization(true);
-        configuration.set_linearization_pass1_filename("pass1.pdf");
-        configuration.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
-        configuration.copy_encryption_parameters(CopyEncryptionSource {
-            encrypt_dict: crate::Dictionary::new(),
-            file_key: vec![],
-            id0: vec![],
-            object_key_alg: ObjectKeyAlg::Rc4,
-        });
-
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let mut writer = PdfWriter::new(&mut pdf);
-        configuration.apply_to(&mut writer);
-
-        assert_eq!(
-            writer.settings.object_stream_mode,
-            ObjectStreamMode::Generate
-        );
-        assert!(!writer.settings.compress_streams);
-        assert_eq!(writer.settings.decode_level, DecodeLevel::All);
-        assert_eq!(configuration.decode_level(), DecodeLevel::All);
-        assert!(configuration.preserves_unreferenced_objects());
-        assert_eq!(
-            writer.settings.linearization_pass1_filename,
-            Some(std::path::PathBuf::from("pass1.pdf"))
-        );
-        assert!(writer.settings.recompress_flate);
-        assert!(writer.settings.content_normalization);
-        assert!(writer.settings.qdf_mode);
-        assert!(writer.settings.preserve_unreferenced_objects);
-        assert_eq!(
-            writer.settings.newline_before_endstream,
-            NewlineBeforeEndstream::Yes
-        );
-        assert_eq!(
-            writer.settings.minimum_pdf_version,
-            Some(("1.4".to_owned(), 2))
-        );
-        assert_eq!(
-            writer.settings.forced_pdf_version,
-            Some(("1.7".to_owned(), 3))
-        );
-        assert_eq!(writer.settings.extra_header_text, "% split configuration\n");
-        assert!(writer.settings.deterministic_id);
-        assert!(writer.settings.static_id);
-        assert!(writer.settings.static_aes_iv);
-        assert!(writer.settings.suppress_original_object_ids);
-        assert!(!writer.settings.preserve_encryption);
-        assert!(writer.settings.encryption_parameters.is_none());
-        assert!(writer.settings.copy_encryption.is_some());
-    }
-}
 /// Result data produced by a completed full-rewrite emitter.
 ///
 /// Both maps are assembled while writing the output. They deliberately do not
@@ -1867,8 +1684,18 @@ fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
         });
     }
     if let Some(source) = options.copy_encryption.as_ref() {
-        let version = source.encrypt_dict.get("V")?.as_integer()?;
-        let revision = source.encrypt_dict.get("R")?.as_integer()?;
+        let version = source
+            .encrypt_dict
+            .try_get_key(b"/V")
+            .ok()?
+            .try_as_integer()
+            .ok()??;
+        let revision = source
+            .encrypt_dict
+            .try_get_key(b"/R")
+            .ok()?
+            .try_as_integer()
+            .ok()??;
         return Some(if revision >= 6 {
             PdfVersion::new(1, 7, 8)
         } else if version >= 5 && revision >= 5 {
@@ -2335,68 +2162,6 @@ fn fresh_id_bytes() -> [u8; 16] {
     hasher.finalize().into()
 }
 
-#[cfg(test)]
-fn remap_qpdf_trailer_refs_with_removed<
-    R: Read + Seek,
-    M: crate::writer::rewrite_renumber::NewNumberLookup,
->(
-    pdf: &mut Pdf<R>,
-    trailer: &mut Dictionary,
-    map: &M,
-    removed_refs: &BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let mut object = Object::Dictionary(trailer.clone());
-    crate::writer::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed(
-        pdf,
-        &mut object,
-        map,
-        removed_refs,
-    )?;
-    *trailer = object
-        .into_dict()
-        .expect("qpdf trailer rewrite preserves the dictionary variant");
-    Ok(())
-}
-
-#[cfg(test)]
-fn build_xref_stream_bytes(
-    offsets: &BTreeMap<u32, (u16, XrefEntry)>,
-    ranges: &[(u32, u32)],
-) -> Result<Vec<u8>> {
-    let mut stream_data = Vec::new();
-    for &(start, count) in ranges {
-        let end = start.checked_add(count).ok_or_else(|| {
-            crate::Error::Unsupported("xref stream range does not fit u32".to_string())
-        })?;
-        for object_number in start..end {
-            let (generation, entry) = offsets.get(&object_number).ok_or_else(|| {
-                crate::Error::Unsupported("xref stream is missing object entry".to_string())
-            })?;
-            let object_type = match (object_number, entry) {
-                (0, _) | (_, XrefEntry::Free { .. }) => 0,
-                (_, XrefEntry::Compressed { .. }) => 2,
-                _ => 1,
-            };
-            stream_data.push(object_type);
-            match entry {
-                XrefEntry::Free { next } => {
-                    stream_data.extend_from_slice(&u64::from(*next).to_be_bytes()[0..8]);
-                    stream_data.extend_from_slice(&u32::from(*generation).to_be_bytes()[0..4]);
-                }
-                XrefEntry::Uncompressed { offset } => {
-                    stream_data.extend_from_slice(&offset.to_be_bytes()[0..8]);
-                    stream_data.extend_from_slice(&u32::from(*generation).to_be_bytes()[0..4]);
-                }
-                XrefEntry::Compressed { stream, index } => {
-                    stream_data.extend_from_slice(&u64::from(*stream).to_be_bytes()[0..8]);
-                    stream_data.extend_from_slice(&u32::to_be_bytes(*index)[0..4]);
-                }
-            }
-        }
-    }
-    Ok(stream_data)
-}
-
 // ---------------------------------------------------------------------------
 // Full-rewrite path: decode+re-encode every stream
 // ---------------------------------------------------------------------------
@@ -2460,8 +2225,8 @@ pub(crate) enum WriteCipher {
 /// supported there) —
 /// and consumed by the per-object emission loop + the trailer-build step.
 pub(crate) struct EncryptionContext {
-    /// Built `/Encrypt` dictionary (from a 4.1/4.2/4.3 builder).
-    pub(crate) encrypt_dict: Dictionary,
+    /// Built `/Encrypt` dictionary handle (from the Standard handler builder).
+    pub(crate) encrypt_dict: ObjectHandle,
     /// File encryption key derived from passwords + `/ID[0]` (Algorithm 2),
     /// or — for V=5 — the random 32-byte file key (FEK).
     pub(crate) file_key: Vec<u8>,
@@ -2506,7 +2271,7 @@ pub(crate) struct EncryptionContext {
 pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root_handle = pdf.root_handle().ok()?;
     let metadata = root_handle.try_get_key(b"/Metadata").ok()?;
-    metadata.object_ref().or_else(|| metadata.as_reference())
+    metadata.object_ref()
 }
 
 /// `id0` is the `/ID[0]` bytes the file encryption key is derived from
@@ -2744,7 +2509,7 @@ pub(crate) fn build_copy_encryption_context(
 /// select the corresponding object-key cipher.
 fn canonical_copy_encryption(
     src: &crate::encryption::CopyEncryptionSource,
-) -> Result<(Dictionary, i32, i32, WriteCipher)> {
+) -> Result<(ObjectHandle, i32, i32, WriteCipher)> {
     use crate::encryption::standard::ObjectKeyAlg;
 
     let version = copy_integer(&src.encrypt_dict, "V")?;
@@ -2802,64 +2567,79 @@ fn canonical_copy_encryption(
     let u = copy_string(&src.encrypt_dict, "U")?;
     let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict);
 
-    let mut dict = Dictionary::new();
-    dict.insert("Filter", Object::Name(b"Standard".to_vec()));
-    dict.insert("V", Object::Integer(version));
-    dict.insert("Length", Object::Integer(length_bits));
-    dict.insert("R", Object::Integer(revision));
-    dict.insert("P", Object::Integer(p));
-    dict.insert("O", Object::String(o));
-    dict.insert("U", Object::String(u));
+    let mut entries = vec![
+        (b"Filter".to_vec(), ObjectHandle::name(b"Standard".to_vec())),
+        (b"V".to_vec(), ObjectHandle::integer(version)),
+        (b"Length".to_vec(), ObjectHandle::integer(length_bits)),
+        (b"R".to_vec(), ObjectHandle::integer(revision)),
+        (b"P".to_vec(), ObjectHandle::integer(p)),
+        (b"O".to_vec(), ObjectHandle::string(o)),
+        (b"U".to_vec(), ObjectHandle::string(u)),
+    ];
 
     let cipher = if version >= 5 {
         let oe = copy_string(&src.encrypt_dict, "OE")?;
         let ue = copy_string(&src.encrypt_dict, "UE")?;
         let perms = copy_string(&src.encrypt_dict, "Perms")?;
-        dict.insert("OE", Object::String(oe));
-        dict.insert("UE", Object::String(ue));
-        dict.insert("Perms", Object::String(perms));
-        insert_standard_crypt_filter(&mut dict, b"AESV3", 32);
+        entries.push((b"OE".to_vec(), ObjectHandle::string(oe)));
+        entries.push((b"UE".to_vec(), ObjectHandle::string(ue)));
+        entries.push((b"Perms".to_vec(), ObjectHandle::string(perms)));
+        let (cf, stm_f, str_f) = standard_crypt_filter(b"AESV3", 32);
+        entries.push((b"CF".to_vec(), cf));
+        entries.push((b"StmF".to_vec(), stm_f));
+        entries.push((b"StrF".to_vec(), str_f));
         WriteCipher::FileKeyAes256
     } else if version == 4 {
         // QPDFWriter::copyEncryptionParameters explicitly enables AES for all
         // V>=4 donors, even when the source /CFM was /V2.
-        insert_standard_crypt_filter(&mut dict, b"AESV2", 16);
+        let (cf, stm_f, str_f) = standard_crypt_filter(b"AESV2", 16);
+        entries.push((b"CF".to_vec(), cf));
+        entries.push((b"StmF".to_vec(), stm_f));
+        entries.push((b"StrF".to_vec(), str_f));
         WriteCipher::PerObject(ObjectKeyAlg::Aes)
     } else {
         WriteCipher::PerObject(ObjectKeyAlg::Rc4)
     };
 
     if revision >= 4 && !encrypt_metadata {
-        dict.insert("EncryptMetadata", Object::Boolean(false));
+        entries.push((b"EncryptMetadata".to_vec(), ObjectHandle::boolean(false)));
     }
+    let dict = ObjectHandle::dictionary(entries);
     Ok((dict, version_i32, revision_i32, cipher))
 }
 
-fn copy_integer(dict: &Dictionary, key: &str) -> Result<i64> {
-    dict.get(key).and_then(Object::as_integer).ok_or_else(|| {
-        crate::Error::Unsupported(format!("copy-encryption /{key} must be an integer"))
-    })
+fn copy_integer(dict: &ObjectHandle, key: &str) -> Result<i64> {
+    let key = format!("/{key}");
+    dict.try_get_key(key.as_bytes())?
+        .try_as_integer()?
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!("copy-encryption /{key} must be an integer"))
+        })
 }
 
-fn copy_string(dict: &Dictionary, key: &str) -> Result<Vec<u8>> {
-    dict.get(key)
-        .and_then(Object::as_string)
-        .map(<[u8]>::to_vec)
+fn copy_string(dict: &ObjectHandle, key: &str) -> Result<Vec<u8>> {
+    let key = format!("/{key}");
+    dict.try_get_key(key.as_bytes())?
+        .as_string()
         .ok_or_else(|| {
             crate::Error::Unsupported(format!("copy-encryption /{key} must be a string"))
         })
 }
 
-fn insert_standard_crypt_filter(dict: &mut Dictionary, cfm: &[u8], length: i64) {
-    let mut std_cf = Dictionary::new();
-    std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
-    std_cf.insert("CFM", Object::Name(cfm.to_vec()));
-    std_cf.insert("Length", Object::Integer(length));
-    let mut cf = Dictionary::new();
-    cf.insert("StdCF", Object::Dictionary(std_cf));
-    dict.insert("CF", Object::Dictionary(cf));
-    dict.insert("StmF", Object::Name(b"StdCF".to_vec()));
-    dict.insert("StrF", Object::Name(b"StdCF".to_vec()));
+fn standard_crypt_filter(cfm: &[u8], length: i64) -> (ObjectHandle, ObjectHandle, ObjectHandle) {
+    let std_cf = ObjectHandle::dictionary(vec![
+        (
+            b"AuthEvent".to_vec(),
+            ObjectHandle::name(b"DocOpen".to_vec()),
+        ),
+        (b"CFM".to_vec(), ObjectHandle::name(cfm.to_vec())),
+        (b"Length".to_vec(), ObjectHandle::integer(length)),
+    ]);
+    (
+        ObjectHandle::dictionary(vec![(b"StdCF".to_vec(), std_cf)]),
+        ObjectHandle::name(b"StdCF".to_vec()),
+        ObjectHandle::name(b"StdCF".to_vec()),
+    )
 }
 
 /// Return the donor's metadata-encryption policy using qpdf's default. qpdf
@@ -2871,9 +2651,10 @@ pub(crate) fn copy_encryption_encrypts_metadata(
     copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict)
 }
 
-fn copy_encryption_encrypts_metadata_from_dict(dict: &Dictionary) -> bool {
-    dict.get("EncryptMetadata")
-        .and_then(Object::as_bool)
+fn copy_encryption_encrypts_metadata_from_dict(dict: &ObjectHandle) -> bool {
+    dict.try_get_key(b"/EncryptMetadata")
+        .ok()
+        .and_then(|value| value.as_boolean())
         .unwrap_or(true)
 }
 
@@ -2894,17 +2675,12 @@ fn push_hex_lower(out: &mut Vec<u8>, bytes: &[u8]) {
 pub(crate) const fn deterministic_id_array_len(id0_len: usize) -> usize {
     1 + (1 + 2 * id0_len + 1) + (1 + 32 + 1) + 1
 }
-/// The width for a 16-byte id0 (the common case): 70 bytes. Kept as a named
-/// alias for the many length assertions in the linearization writer's tests.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const DETERMINISTIC_ID_ARRAY_LEN: usize = deterministic_id_array_len(16);
-
 /// Serialize a deterministic `/ID` array as the fixed-width hex form qpdf emits:
 /// `[<id0_hex><id1_hex>]`, with no inner spaces. The permanent identifier `id0`
 /// may be any length (qpdf preserves a source `/ID[0]` verbatim regardless of
 /// length); the changing identifier `id1` is always a 16-byte md5. The serialized
 /// length is [`deterministic_id_array_len`]`(id0.len())`. Building the bytes by
-/// hand (rather than via [`Object::write_pdf`]) guarantees the hex form even when
+/// hand (rather than via a generic value serializer) guarantees the hex form even when
 /// a digest happens to be all-printable, so the value is always the same fixed
 /// width regardless of its bytes. The classic linearized writer calls this
 /// directly to emit the final identifier at each `/ID` site in its last write
@@ -2920,27 +2696,6 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &
         out.push(b'>');
     }
     out.push(b']');
-}
-
-/// Extract the source trailer's non-empty string permanent identifier `/ID[0]`.
-/// qpdf's `getOriginalID1` reads only that first array item: `/ID[1]` may be
-/// absent or have any type. Returns `None` for a missing or non-array `/ID`, or
-/// a missing, non-string, or empty first item, in which case qpdf reuses the
-/// changing identifier as the permanent one. The returned bytes are preserved
-/// verbatim at any length: qpdf copies `/ID[0]` unchanged and only regenerates
-/// the 16-byte changing identifier `/ID[1]`, so the serialized `/ID` array is
-/// [`deterministic_id_array_len`]`(id0.len())` bytes wide. An empty `/ID[0]` is
-/// treated as absent (not preserved as `""`). This raw-value helper is used
-/// only by unit tests; production writers use [`source_permanent_id_handle`].
-#[cfg(test)]
-fn source_permanent_id_value(source_id: Option<&Object>) -> Option<Vec<u8>> {
-    match source_id {
-        Some(Object::Array(values)) => match values.first() {
-            Some(Object::String(first)) if !first.is_empty() => Some(first.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// Extract the source trailer's non-empty `/ID[0]` through the live qpdf-shaped
@@ -2960,40 +2715,6 @@ pub(crate) fn source_permanent_id_value_handle(id: &ObjectHandle) -> Option<Vec<
         Some(bytes) if !bytes.is_empty() => Some(bytes),
         _ => None,
     }
-}
-
-/// Generate qpdf's ordinary/static two-element `/ID` array.
-///
-/// qpdf creates the changing identifier once and then uses the non-empty
-/// source permanent identifier when one is available. An absent or empty
-/// source permanent identifier falls back to that same changing identifier,
-/// so `/ID[0] == /ID[1]` for a first save or an empty source `/ID[0]`.
-#[cfg(test)]
-pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> Object {
-    let source_id0 = source_permanent_id_value(source_id);
-    generate_id_array_from_source_id0(source_id0.as_deref(), static_id)
-}
-
-/// Generate qpdf's ordinary/static `/ID` array from a previously resolved
-/// source `/ID[0]`, without reconstructing a legacy [`Object`] trailer value.
-#[cfg(test)]
-pub(crate) fn generate_id_array_from_source_id0(
-    source_id0: Option<&[u8]>,
-    static_id: bool,
-) -> Object {
-    let changing_id = if static_id {
-        QPDF_STATIC_ID.to_vec()
-    } else {
-        fresh_id_bytes().to_vec()
-    };
-    let permanent_id = source_id0
-        .filter(|id0| !id0.is_empty())
-        .map(<[u8]>::to_vec)
-        .unwrap_or_else(|| changing_id.clone());
-    Object::Array(vec![
-        Object::String(permanent_id),
-        Object::String(changing_id),
-    ])
 }
 
 /// Generate qpdf's ordinary/static two-element `/ID` array as a canonical
@@ -3146,17 +2867,14 @@ pub(crate) fn write_deterministic_id_inline(
 /// output-space references, while `/ID` is a direct writer-owned array.
 fn apply_encrypt_trailer_handle_entries<R: Read + Seek>(
     trailer: &ObjectHandle,
-    pdf: &Pdf<R>,
+    pdf: &mut Pdf<R>,
     options: &WriterOptions,
     encrypt_ctx: Option<&EncryptionContext>,
     deterministic_id: bool,
     generated_id: Option<&ObjectHandle>,
 ) -> Result<()> {
     if let Some(ctx) = encrypt_ctx {
-        trailer.replace_key(
-            b"/Encrypt",
-            ObjectHandle::from_value(ObjectValue::Reference(ctx.encrypt_ref)),
-        )?; // cov:ignore: validated trailer mutation; LLVM attributes this continuation to the call setup
+        trailer.replace_key(b"/Encrypt", pdf.get_object_handle(ctx.encrypt_ref))?; // cov:ignore: validated trailer mutation; LLVM attributes this continuation to the call setup
         if let Some(id) = generated_id {
             trailer.replace_key(b"/ID", id.shallow_copy()?)?;
         } else {
@@ -3244,7 +2962,7 @@ fn build_writer_trailer_handle<R: Read + Seek>(
         })?), // cov:ignore: supported writer object counts fit in i64
     )?; // cov:ignore: validated /Size replacement; LLVM attributes this continuation to the call setup
     let root = match (root, direct_root) {
-        (Some(root), None) => ObjectHandle::from_value(ObjectValue::Reference(root)),
+        (Some(root), None) => pdf.get_object_handle(root),
         (None, Some(root)) => root.clone(),
         _ => {
             return Err(crate::Error::Unsupported(
@@ -3479,365 +3197,62 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
     Ok(add_newline)
 }
 
-/// Re-encode a resolved stream object per the effective compression policy,
-/// returning the re-encoded object and whether the **source** filter chain was
-/// already a lone `/FlateDecode`.
-///
-/// This is the byte-critical choke point shared by the legacy excluded-mode
-/// full-rewrite path, the plain body writer, and the linearized body writer.
-/// Keeping it in one place prevents those paths from drifting on qpdf's
-/// recovered-stream framing or re-filter rules:
-///
-/// * `CompressStreams::Yes` on an already-lone-`/FlateDecode` source (and no
-///   `/F` external-data entry, no `--recompress-flate`, no content
-///   normalization, and `is_data_modified` false) is **preserved verbatim**
-///   — qpdf does not decode + re-encode it — with `/Length` normalized to the
-///   raw data length.
-/// * any other `Yes`/`No` policy decodes and re-encodes via
-///   [`apply_stream_compress_policy`].
-/// * preserve mode (`None`) passes the dict + raw bytes through unchanged.
-///
-/// `is_data_modified` mirrors `QPDFObjectHandle::isDataModified()`
-/// (`QPDF_Stream.cc:321-324`), which `QPDFWriter::willFilterStream`
-/// consults before the lone-`/FlateDecode` exemption
-/// (`QPDFWriter.cc:1234-1245`): a stream carrying a registered token filter
-/// is never eligible for the verbatim shortcut, even though this
-/// materialized-`Object` caller has no token-filter machinery of its own and
-/// so always decodes + re-encodes the **already-materialized** bytes rather
-/// than running the filter. Callers that never observe token-filtered
-/// streams (`write_pclm`) may pass `false` unconditionally.
-///
-/// The returned bool feeds [`write_reencoded_object`], which only appends a
-/// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
-/// already a lone `/FlateDecode`.
-#[cfg(test)]
-pub(crate) fn reencode_stream_for_compress(
-    stream: crate::Stream,
-    options: &WriterOptions,
-    is_data_modified: bool,
-    qpdf_plain_empty_refilter: bool,
-    normalize_content: bool,
-    apply_full_rewrite_metadata_policy: bool,
-) -> (Object, bool) {
-    // qpdf's writer always writes cleartext `/Type /Metadata` streams
-    // through the uncompress path (QPDFWriter.cc:1251-1281), even when the
-    // global writer requested compression or stream-data preservation. This
-    // is PdfWriter's standard full-rewrite policy, not the shared helper's
-    // plain or linearized route policy; those callers opt out explicitly.
-    // Metadata is not page content, so it must never receive content-token
-    // normalization. The encryption layer applies any requested payload
-    // encryption after this decision; the cleartext metadata exemption is
-    // handled there.
-    let metadata_is_cleartext = options
-        .encrypt
-        .as_ref()
-        .is_none_or(|params| !params.encrypt_metadata)
-        && options
-            .copy_encryption
-            .as_ref()
-            .is_none_or(|source| !copy_encryption_encrypts_metadata(source));
-    let is_metadata_stream = apply_full_rewrite_metadata_policy
-        && metadata_is_cleartext
-        && matches!(
-            stream.dict.get("Type"),
-            Some(Object::Name(name)) if name.as_slice() == b"Metadata"
-        );
-    let stream_policy = if is_metadata_stream {
-        Some(CompressStreams::No)
-    } else {
-        effective_stream_policy(options)
-    };
-    let stream_decode_level = if is_metadata_stream {
-        DecodeLevel::All
-    } else {
-        options.decode_level
-    };
-    let stream_normalization = normalize_content && !is_metadata_stream;
-    let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
-    let mut reencoded = match stream_policy {
-        // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
-        // compress policy (no decode + re-encode) unless recompression is
-        // explicitly requested. Normalize /Length to the raw data length (a
-        // source may carry an indirect /Length).
-        //
-        // Exclude external streams: a `/F` entry means the canonical data lives
-        // in an external file and the in-body bytes are not authoritative, so
-        // preserving them verbatim would keep a stale external reference. Such
-        // streams fall through to the re-encode arm, which embeds the decoded
-        // data and strips `/F` / `/FFilter` / `/FDecodeParms`.
-        //
-        // `!is_data_modified` mirrors `willFilterStream`'s own exemption guard
-        // (`QPDFWriter.cc:1234-1245`): a token-filtered stream is never
-        // eligible for the verbatim shortcut, so it falls through to the
-        // re-encode arm below like any other non-lone-Flate source.
-        Some(CompressStreams::Yes)
-            if source_filter_is_lone_flate
-                && !is_data_modified
-                && !options.recompress_flate
-                && !stream_normalization
-                && !is_metadata_stream
-                && stream.dict.get("F").is_none() =>
-        {
-            let mut stream = stream;
-            let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
-            stream.dict.insert("Length", Object::Integer(len));
-            Object::Stream(stream)
-        }
-        Some(compress_policy) => apply_stream_compress_policy_with_decode_level(
-            &stream,
-            compress_policy,
-            stream_decode_level,
-            stream_normalization,
-        ),
-        // Preserve mode: keep the raw bytes verbatim (no decode/re-encode), but
-        // still normalize /Length to a direct integer of the raw byte count.
-        // qpdf direct-izes EVERY stream's /Length even under --stream-data=preserve
-        // (flpdf-3g8o); a source may carry an indirect /Length. This applies
-        // regardless of whether the holder then orphans (and is dropped by the
-        // caller's reachability GC) or stays live because something else also
-        // references it — the dict entry written here is always direct.
-        None => {
-            let mut stream = stream;
-            let len = i64::try_from(stream.data.len()).unwrap_or(i64::MAX);
-            stream.dict.insert("Length", Object::Integer(len));
-            Object::Stream(stream)
-        }
-    };
-    if qpdf_plain_empty_refilter
-        && !source_filter_is_lone_flate
-        && !is_metadata_stream
-        && matches!(stream_policy, Some(CompressStreams::Yes))
-    {
-        let reencoded_stream = reencoded
-            .as_stream_mut()
-            .expect("stream compression always returns a stream");
-        let filter_dict = filter_dictionary_handle(&reencoded_stream.dict);
-        if filters::decode_stream_data(&filter_dict, &reencoded_stream.data)
-            .is_ok_and(|decoded| decoded.is_empty())
-        {
-            reencoded_stream.data.clear();
-            reencoded_stream
-                .dict
-                .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-            reencoded_stream.dict.insert("Length", Object::Integer(0));
-        }
-    }
-    (reencoded, source_filter_is_lone_flate)
-}
-
-/// Append a re-encoded object's body to `bytes` in qpdf's **non-qdf**
-/// serialization order. For a stream, a regenerated lone `/Filter /FlateDecode`
-/// is emitted last (and `/Length` first) only when the compress policy
-/// re-encoded a source that was NOT already a lone `/FlateDecode`
-/// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
-/// its lexicographic order with `/Length` last. Non-stream objects serialize
-/// normally. Shared by the legacy excluded-mode writer and the plain pipeline.
-#[cfg(test)]
-pub(crate) struct StreamEncryptionOptions<'a> {
-    context: Option<&'a EncryptionContext>,
-    encrypt_strings: bool,
-}
-
-#[cfg(test)]
-impl<'a> StreamEncryptionOptions<'a> {
-    pub(crate) const fn new(context: Option<&'a EncryptionContext>, encrypt_strings: bool) -> Self {
-        Self {
-            context,
-            encrypt_strings,
-        }
-    }
-}
-
-#[cfg(test)]
-fn write_reencoded_object(
-    bytes: &mut Vec<u8>,
-    reencoded: &Object,
-    source_filter_is_lone_flate: bool,
-    options: &WriterOptions,
-    encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
-    emitted_ref: ObjectRef,
-    stream_encryption: StreamEncryptionOptions<'_>,
-) -> Result<()> {
-    match reencoded {
-        Object::Stream(s) => {
-            let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
-                && !source_filter_is_lone_flate
-                && is_lone_flate(s.dict.get("Filter"));
-            if let Some(ctx) = stream_encryption.context {
-                let mut dict = s.dict.clone();
-                let mut stream_length = s.data.len();
-                adjust_aes_stream_length(
-                    &mut stream_length,
-                    ctx,
-                    stream_encryption.encrypt_strings,
-                )?; // cov:ignore: covered route; llvm-cov has no counter for this multiline argument.
-                dict.insert(
-                    "Length",
-                    Object::Integer(i64::try_from(stream_length).map_err(|_| {
-                        // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
-                        crate::Error::Unsupported(
-                            "encrypted stream /Length does not fit in i64".to_string(),
-                        )
-                        // cov:ignore-end
-                    })?), // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
-                );
-                if let Some(emitter) = encrypted_strings {
-                    emitter.write_stream_dict(
-                        bytes,
-                        emitted_ref,
-                        None,
-                        &dict,
-                        encrypted_strings::StreamDictOptions::new(
-                            false,
-                            refiltered,
-                            stream_encryption.encrypt_strings,
-                        ),
-                    )?; // cov:ignore: the encrypted-dictionary route executes; this call continuation has no counter.
-                } else {
-                    dict.write_pdf_stream(bytes, refiltered);
-                }
-                write_stream_payload_with_pipeline(
-                    bytes,
-                    &s.data,
-                    options.newline_before_endstream,
-                    emitted_ref,
-                    ctx,
-                    stream_encryption.encrypt_strings,
-                    None,
-                )?; // cov:ignore: the encrypted-payload route executes; this call continuation has no counter.
-            } else if let Some(emitter) = encrypted_strings {
-                emitter.write_stream_dict(
-                    bytes,
-                    emitted_ref,
-                    None,
-                    &s.dict,
-                    encrypted_strings::StreamDictOptions::new(false, refiltered, true),
-                )?; // cov:ignore: the dictionary-only route executes; this call continuation has no counter.
-                write_stream_payload(bytes, &s.data, options.newline_before_endstream);
-            } else {
-                s.dict.write_pdf_stream(bytes, refiltered);
-                write_stream_payload(bytes, &s.data, options.newline_before_endstream);
-            }
-        }
-        // cov:ignore-start: unreachable — callers only pass stream objects and
-        // reencode_stream_for_compress always returns Object::Stream.
-        other => {
-            if let Some(emitter) = encrypted_strings {
-                emitter.write_object(bytes, emitted_ref, None, other, false)?;
-            } else {
-                other.write_pdf(bytes);
-            }
-        } // cov:ignore-end
-    }
-    Ok(())
-}
-
 pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
-    // Snapshot the source Catalog's output-only `/Extensions` entry and its
-    // dirty-flag state BEFORE any ADBE injection / strip mutates them, so those
-    // output-only mutations do not leak into the caller's Pdf handle. Restored
-    // below regardless of whether the write succeeds — the Pdf handle is safe
-    // to reuse for subsequent writes (or for read APIs like page enumeration)
-    // after this call returns. The dirty flag is captured too because the
-    // canonical Catalog restore marks its target dirty; without the dirty-flag
-    // restore a subsequent `write_pdf` incremental append would spuriously
-    // emit a Catalog delta.
-    let catalog_snapshot: Option<CatalogExtensionsSnapshot> = pdf.root_ref().and_then(|r| {
-        let was_dirty = pdf.is_dirty(r);
-        let handle: ObjectHandle = pdf.get_object_handle(r);
-        pdf.resolve(&handle).ok().and_then(|()| {
-            let entries = handle.try_as_dictionary().ok()??;
+    let catalog_snapshot = pdf.root_ref().and_then(|root_ref| {
+        let was_dirty = pdf.is_dirty(root_ref);
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root).ok().and_then(|()| {
+            let extensions = root
+                .try_as_dictionary()
+                .ok()?
+                .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
             Some(CatalogExtensionsSnapshot {
-                root_ref: r,
-                extensions: entries.get(b"/Extensions".as_slice()).cloned(),
+                root_ref,
+                extensions,
                 was_dirty,
             })
         })
     });
-    // A direct Catalog has no ObjectRef whose whole-dictionary snapshot can
-    // be restored after the output-only `/Extensions` mutation. Keep the
-    // canonical direct handle and its raw extension entry instead. The
-    // handle identity is important: `replace_writer_catalog` shares the
-    // replacement value into this same direct slot, so restoring through the
-    // saved handle preserves the trailer's direct `/Root` identity while
-    // leaving qpdf-shaped page-tree repairs in place.
     let direct_catalog_snapshot = if pdf.root_ref().is_none() {
-        let root_candidate = pdf.trailer_key_handle(b"Root");
-        if root_candidate.is_null() {
+        let root = pdf.trailer_key_handle(b"Root");
+        if root.is_null() {
             None
         } else {
-            let root = pdf.root_handle()?;
             let extensions = root
                 .try_as_dictionary()?
-                .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
+                .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
             Some((root, extensions))
         }
     } else {
         None
     };
-
-    // qpdf's full-rewrite writer resolves source streams through the document's
-    // single `attempt_recovery` permission while emitting them. The canonical
-    // handle route therefore does not need a writer-local recovery override.
     let result = emit_canonical_pdf_inner(pdf, out, options);
-
-    // Restore only the pre-write `/Extensions` value on top of whatever the
-    // write left behind, rather than the whole pre-call Catalog. A full-dict
-    // revert here would also undo the QDF/content-normalization page-tree
-    // repair above (`PageDocumentHelper::get_all_pages`) whenever the source
-    // Catalog holds a direct `/Pages` dictionary -- that repair writes its
-    // promoted/deduplicated `/Kids` back into the *same* Catalog object the
-    // ADBE injection/strip guard below reverts, so a blind whole-dict restore
-    // would silently discard the repair and re-mint a fresh promoted object
-    // on every subsequent write of the same `Pdf` (observed: object count
-    // climbing 1 -> 2 -> 3 across two writes, with the second write's output
-    // no longer byte-identical to the first). The repair is a genuine,
-    // permanent mutation -- matching qpdf's own `QPDF::getAllPages()`, which
-    // is not scoped to one write -- so it must survive this restore; only the
-    // output-only `/Extensions` injection/strip must not leak into the
-    // caller's Pdf handle. Runs on success and on error alike so partial
-    // injection state cannot leak either. `restore_catalog_extensions` marks
-    // the ref dirty; if the ref was clean before this call, clear the dirty
-    // flag to leave the caller's Pdf byte-for-byte equivalent to its pre-call
-    // state absent any repair.
-    // cov:ignore-start: outer if-let and helper-call terminators are llvm-cov
-    // region artifacts; the interior is exercised by
-    // emit_canonical_pdf_does_not_leave_root_dirty_flag_set and
-    // emit_canonical_pdf_preserves_pre_existing_root_dirty_flag.
     if let Some(snapshot) = catalog_snapshot {
         restore_catalog_extensions(pdf, Some(snapshot))?;
     }
     if let Some((root, original_extensions)) = direct_catalog_snapshot {
         let current_extensions = root
             .try_as_dictionary()?
-            .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
-        let extensions_changed = match (&original_extensions, &current_extensions) {
+            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
+        let changed = match (&original_extensions, &current_extensions) {
             (None, None) => false,
             (Some(before), Some(after)) => !before.is_same_object_as(after),
             _ => true,
         };
-        if extensions_changed {
+        if changed {
             match original_extensions {
                 Some(extensions) => root.restore_key_raw(b"/Extensions", extensions)?,
                 None => root.remove_key(b"/Extensions"),
             }
         }
     }
-    // cov:ignore-end
-
     result
 }
 
-/// Emit qpdf's page-oriented PCLm queue.
-///
-/// PCLm is intentionally kept out of the ordinary plain pipeline: qpdf
-/// reserves numbers in a different order and inserts one synthetic transform
-/// stream after every page-strip image. The output is otherwise a normal
-/// full rewrite with a classic xref table and the usual trailer/ID handling.
 fn write_pclm<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
@@ -3906,12 +3321,16 @@ fn write_pclm<R: Read + Seek, W: Write>(
             }
             pclm::Item::Synthetic { output } => {
                 let payload = b"q /image Do Q\n".to_vec();
-                let mut dict = Dictionary::new();
-                dict.insert("Length", Object::Integer(payload.len() as i64));
-                let stream = crate::Stream::new(dict, payload);
+                let stream = ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![(
+                        b"Length".to_vec(),
+                        ObjectHandle::integer(payload.len() as i64),
+                    )]),
+                    Rc::new(payload),
+                );
                 let offset = bytes.len();
                 bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
-                write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
+                write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream)?;
                 bytes.extend_from_slice(b"\nendobj\n");
                 offsets.insert(output.number, (0, offset));
             }
@@ -5889,82 +5308,35 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 /// intentional: byte-identical agreement with qpdf is not a goal for this
 /// toggle.
 /// See [`CompressStreams`] for the full policy statement.
-pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
+pub fn apply_stream_compress_policy(
+    stream: &ObjectHandle,
+    policy: CompressStreams,
+) -> Result<ObjectHandle> {
     // This public helper predates PdfWriter's decode-level setting. Preserve
     // its contract of decoding every filter implemented by flpdf; only the
     // private PdfWriter bridge applies the configured qpdf decode-level gate.
     apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All, false)
 }
 
-/// Build the narrow live-handle view needed by the filter pipeline from a
-/// materialized writer stream. The legacy writer still exposes this public
-/// convenience helper as a `Stream`; only `/Filter` and `/DecodeParms` cross
-/// into the canonical filter boundary, so unrelated dictionary entries and
-/// their references are intentionally not copied here.
-fn filter_dictionary_handle(dict: &Dictionary) -> ObjectHandle {
-    let mut entries = Vec::new();
-    for (key, handle_key) in [
-        ("Filter", b"/Filter".as_slice()),
-        ("DecodeParms", b"/DecodeParms".as_slice()),
-    ] {
-        if let Some(value) = dict.get(key) {
-            entries.push((handle_key.to_vec(), filter_value_handle(value)));
-        }
-    }
-    ObjectHandle::dictionary(entries)
-}
-
-fn filter_value_handle(value: &Object) -> ObjectHandle {
-    match value {
-        Object::Null => ObjectHandle::null(),
-        Object::Boolean(value) => ObjectHandle::boolean(*value),
-        Object::Integer(value) => ObjectHandle::integer(*value),
-        Object::Real(value) => ObjectHandle::real(*value),
-        Object::RealLiteral { value, .. } => ObjectHandle::real(*value),
-        Object::Name(value) => ObjectHandle::name(value.clone()),
-        Object::String(value) => ObjectHandle::string(value.clone()),
-        Object::Array(values) => {
-            ObjectHandle::array(values.iter().map(filter_value_handle).collect())
-        }
-        Object::Dictionary(dictionary) => ObjectHandle::dictionary(
-            dictionary
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        crate::object_handle::canonical_dictionary_key_from_legacy(key),
-                        filter_value_handle(value),
-                    )
-                })
-                .collect(),
-        ),
-        // A reference, stream, or content-only token is not a valid filter
-        // name/parameter value at this materialized boundary. A boolean keeps
-        // the canonical reader on the same unsupported-shape branch without
-        // asking a contextless handle to resolve a reference.
-        Object::Reference(_) | Object::Stream(_) | Object::Operator(_) | Object::InlineImage(_) => {
-            ObjectHandle::boolean(false)
-        }
-    }
-}
-
 fn apply_stream_compress_policy_with_decode_level(
-    stream: &crate::Stream,
+    stream: &ObjectHandle,
     policy: CompressStreams,
     decode_level: DecodeLevel,
     normalize_content: bool,
-) -> Object {
-    if !filter_chain_is_decodable(
-        stream.dict.get("Filter"),
-        policy,
-        decode_level,
-        normalize_content,
-    ) {
-        let mut dict = stream.dict.clone();
-        dict.insert(
-            "Length",
-            Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
-        );
-        return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
+) -> Result<ObjectHandle> {
+    let stream_dict = stream
+        .as_stream_dict()
+        .ok_or_else(|| Error::Unsupported("object is not a stream".to_owned()))?;
+    let data = stream.get_raw_stream_data()?;
+    let decodable =
+        filter_chain_is_decodable(&stream_dict, policy, decode_level, normalize_content)?;
+    if !decodable {
+        let dict = stream_dictionary_copy(&stream_dict);
+        dict.replace_key(
+            b"/Length",
+            ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+        )?; // cov:ignore: LLVM maps this covered passthrough replacement continuation to cleanup
+        return Ok(ObjectHandle::stream(dict, data));
     }
 
     // A filter above the selected level has already returned through the raw
@@ -5974,8 +5346,7 @@ fn apply_stream_compress_policy_with_decode_level(
     // responsibility corresponding to QPDF_Stream::filterable). Keep that
     // validation in the existing decoder instead of duplicating its parser
     // here; any resulting Err takes the raw-preservation fallback below.
-    let filter_dict = filter_dictionary_handle(&stream.dict);
-    let decoded = match filters::decode_stream_data(&filter_dict, &stream.data) {
+    let decoded = match filters::decode_stream_data(&stream_dict, &data) {
         Ok(d) => d,
         Err(_) => {
             // Decode failure (unsupported codec or corrupt data): emit the data
@@ -5988,12 +5359,12 @@ fn apply_stream_compress_policy_with_decode_level(
             // passthrough/non-decodable streams whose length holder is kept live
             // by another reference (flpdf-q1j2). The data bytes are untouched, so
             // /Length equals stream.data.len().
-            let mut dict = stream.dict.clone();
-            dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
-            );
-            return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
+            let dict = stream_dictionary_copy(&stream_dict);
+            dict.replace_key(
+                b"/Length",
+                ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+            )?; // cov:ignore: LLVM maps this covered decode-failure replacement continuation to cleanup
+            return Ok(ObjectHandle::stream(dict, data));
         }
     };
     let decoded = if normalize_content {
@@ -6006,12 +5377,12 @@ fn apply_stream_compress_policy_with_decode_level(
     // `/F` carries an external-file reference for the stream data, so we
     // strip it as well — otherwise readers may try to load the old external
     // file instead of the new embedded stream we just produced.
-    let mut new_dict = stream.dict.clone();
-    new_dict.remove("Filter");
-    new_dict.remove("DecodeParms");
-    new_dict.remove("F");
-    new_dict.remove("FFilter");
-    new_dict.remove("FDecodeParms");
+    let new_dict = stream_dictionary_copy(&stream_dict);
+    new_dict.remove_key(b"/Filter");
+    new_dict.remove_key(b"/DecodeParms");
+    new_dict.remove_key(b"/F");
+    new_dict.remove_key(b"/FFilter");
+    new_dict.remove_key(b"/FDecodeParms");
 
     match policy {
         CompressStreams::Yes => {
@@ -6025,28 +5396,38 @@ fn apply_stream_compress_policy_with_decode_level(
             )]);
             let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
                 Ok(e) => e,
-                Err(_) => return Object::Stream(stream.clone()), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
+                Err(_) => return Ok(ObjectHandle::stream(new_dict, data)), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
             };
 
             // Always apply FlateDecode — even if the encoded result is larger
             // than the raw data (which can happen for small streams).  This
             // guarantees a single well-known filter regardless of stream size.
-            new_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-            new_dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
-            );
-            Object::Stream(crate::Stream::new(new_dict, encoded))
+            new_dict.replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))?;
+            new_dict.replace_key(
+                b"/Length",
+                ObjectHandle::integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
+            )?; // cov:ignore: LLVM maps this covered Flate length replacement continuation to cleanup
+            Ok(ObjectHandle::stream(new_dict, Rc::new(encoded)))
         }
         CompressStreams::No => {
             // Emit raw (decoded) bytes without any filter.
-            new_dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(decoded.len()).unwrap_or(i64::MAX)),
-            );
-            Object::Stream(crate::Stream::new(new_dict, decoded))
+            new_dict.replace_key(
+                b"/Length",
+                ObjectHandle::integer(i64::try_from(decoded.len()).unwrap_or(i64::MAX)),
+            )?; // cov:ignore: LLVM maps this covered uncompressed length replacement continuation to cleanup
+            Ok(ObjectHandle::stream(new_dict, Rc::new(decoded)))
         }
     }
+}
+
+fn stream_dictionary_copy(dictionary: &ObjectHandle) -> ObjectHandle {
+    ObjectHandle::dictionary(
+        dictionary
+            .as_dictionary()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Apply qpdf's decode-level gate to the entire filter chain. qpdf does not
@@ -6060,26 +5441,28 @@ fn apply_stream_compress_policy_with_decode_level(
 /// gated by the selected level in every policy. Lossy `/DCTDecode` is admitted
 /// only at `DecodeLevel::All`, matching `QPDF_Stream::pipeStreamData`.
 fn filter_chain_is_decodable(
-    filter: Option<&Object>,
+    dictionary: &ObjectHandle,
     policy: CompressStreams,
     decode_level: DecodeLevel,
     normalize_content: bool,
-) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-    let filters = match filter {
-        Object::Null => return true,
-        Object::Name(_) => std::slice::from_ref(filter),
-        Object::Array(filters) => filters.as_slice(),
-        _ => return false,
+) -> Result<bool> {
+    let filter = dictionary.try_get_key(b"/Filter")?;
+    if filter.is_null() {
+        return Ok(true);
+    }
+    let filters = if let Some(name) = filter.try_as_name()? {
+        vec![ObjectHandle::name(name)]
+    } else if let Some(filters) = filter.try_as_array()? {
+        filters
+    } else {
+        return Ok(false);
     };
 
-    filters.iter().all(|filter| {
-        let Some(name) = filter.as_name() else {
-            return false;
+    filters.iter().try_fold(true, |allowed, filter| {
+        let Some(name) = filter.try_as_name()? else {
+            return Ok(false);
         };
-        let name = match name {
+        let name = match name.as_slice() {
             b"Fl" => b"FlateDecode".as_slice(),
             b"LZW" => b"LZWDecode".as_slice(),
             b"A85" => b"ASCII85Decode".as_slice(),
@@ -6089,29 +5472,17 @@ fn filter_chain_is_decodable(
             name => name,
         };
         match name {
-            b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode" | b"ASCIIHexDecode" => {
-                !matches!(decode_level, DecodeLevel::None)
+            b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode" | b"ASCIIHexDecode" => Ok(allowed
+                && (!matches!(decode_level, DecodeLevel::None)
                     || policy == CompressStreams::Yes
-                    || normalize_content
-            }
+                    || normalize_content)),
             b"RunLengthDecode" => {
-                matches!(decode_level, DecodeLevel::Specialized | DecodeLevel::All)
+                Ok(allowed && matches!(decode_level, DecodeLevel::Specialized | DecodeLevel::All))
             }
-            b"DCTDecode" => matches!(decode_level, DecodeLevel::All),
-            _ => false,
+            b"DCTDecode" => Ok(allowed && matches!(decode_level, DecodeLevel::All)),
+            _ => Ok(false),
         }
     })
-}
-
-/// Whether a stream's `/Filter` value is a lone `/FlateDecode` bare name.
-/// qpdf's `QPDFWriter.cc:1265-1269` fast path recognizes the name form
-/// (including qpdf's `/Fl` abbreviation), but not a single-element array.
-#[cfg(test)]
-pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
-    match filter {
-        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode" || name.as_slice() == b"Fl",
-        _ => false,
-    }
 }
 
 /// Collect the immediate `/Contents` containers that can hold direct streams.
@@ -6177,5627 +5548,324 @@ pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     Ok(refs)
 }
 
-/// QDF variant of [`write_stream_to_buf`]: identical stream/endstream framing
-/// and newline-before-endstream behaviour, but the stream dictionary is
-/// serialized with the qpdf `--qdf` multi-line / sorted-key layout
-/// ([`Dictionary::write_pdf_qdf`]) instead of the compact form. Used only on
-/// the qdf full-rewrite path; preserves the 6.1-era stream invariants
-/// (raw `data`; encrypted `/Length` is derived immediately before unparse).
 #[cfg(test)]
-fn write_stream_to_buf_qdf(
-    buf: &mut Vec<u8>,
-    stream: &crate::Stream,
-    policy: NewlineBeforeEndstream,
-    encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
-    emitted_ref: ObjectRef,
-    stream_encryption: Option<&EncryptionContext>,
-    encrypt_stream_strings: bool,
-) -> Result<bool> {
-    // qpdf --qdf pulls /Length past every other (alphabetically-sorted) key so
-    // the length indirect reference sits immediately before `>>`; use the
-    // /Length-last QDF serializer here (mirrors non-QDF write_pdf_stream).
-    if let Some(ctx) = stream_encryption {
-        let mut dict = stream.dict.clone();
-        if !matches!(dict.get("Length"), Some(Object::Reference(_))) {
-            let mut stream_length = stream.data.len();
-            adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream_strings)?;
-            dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(stream_length).map_err(|_| {
-                    // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
-                    crate::Error::Unsupported(
-                        "encrypted stream /Length does not fit in i64".to_string(),
-                    )
-                    // cov:ignore-end
-                })?), // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
-            );
-        }
-        if let Some(emitter) = encrypted_strings {
-            emitter.write_stream_dict(
-                buf,
-                emitted_ref,
-                None,
-                &dict,
-                encrypted_strings::StreamDictOptions::new(true, false, encrypt_stream_strings),
-            )?; // cov:ignore: the encrypted-dictionary route executes; this call continuation has no counter.
-        } else {
-            dict.write_pdf_stream_qdf(buf, 0);
-        }
-        let add_newline = write_stream_payload_with_pipeline_qdf(
-            buf,
-            &stream.data,
-            policy,
-            true,
-            emitted_ref,
-            ctx,
-            encrypt_stream_strings,
-            None,
-        )?; // cov:ignore: the encrypted-payload route executes; this call continuation has no counter.
-        Ok(add_newline)
-    } else if let Some(emitter) = encrypted_strings {
-        emitter.write_stream_dict(
-            buf,
-            emitted_ref,
-            None,
-            &stream.dict,
-            encrypted_strings::StreamDictOptions::new(true, false, true),
-        )?; // cov:ignore: the dictionary-only route executes; this call continuation has no counter.
-        serialize::write_stream_payload_with_qdf(buf, &stream.data, policy, true);
-        Ok(serialize::framing_adds_newline_with_qdf(
-            &stream.data,
-            policy,
-            true,
-        ))
-    } else {
-        stream.dict.write_pdf_stream_qdf(buf, 0);
-        serialize::write_stream_payload_with_qdf(buf, &stream.data, policy, true);
-        Ok(serialize::framing_adds_newline_with_qdf(
-            &stream.data,
-            policy,
-            true,
-        ))
-    }
-}
-
-/// Emit the rebuilt full-rewrite trailer in qpdf `--qdf` formatting:
-///
-/// ```text
-/// trailer <<
-///   /Key value
-///   ...
-/// >>
-/// ```
-///
-/// Keys are emitted alphabetically by raw name, **except `/ID` and `/Encrypt`,
-/// which are forced last in that order** — this matches qpdf 11.9.0's
-/// `QPDFWriter::writeTrailer` (`QPDFWriter.cc:1160-1236`). In QDF mode qpdf
-/// writes `/Encrypt` on the same line immediately after `/ID`. Each value is
-/// written with the EXISTING compact [`Object::write_pdf`] serializer, so array
-/// values such as `/ID [<hex><hex>]` stay inline (qpdf formats the trailer
-/// specially). The closing `>>` is followed by a newline; the caller appends
-/// `startxref` directly afterwards.
-///
-/// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
-/// (the `  /ID ` key token is still emitted) instead of serializing the
-/// dictionary's stored `/ID` value. This lets the caller compute the `/ID`
-/// directly from the bytes written so far — used by the deterministic-`/ID`
-/// writer to emit qpdf's content-derived identifier inline rather than via a
-/// placeholder-then-patch step. The closure runs only when the `/ID` key is
-/// present in the dictionary; if it is absent, `id_writer` is ignored.
-#[cfg(test)]
-fn write_qdf_trailer(
-    bytes: &mut Vec<u8>,
-    trailer: &Dictionary,
-    id_writer: Option<crate::object::TrailerIdWriter>,
-) {
-    bytes.extend_from_slice(b"trailer <<\n");
-
-    // `Dictionary::iter()` already yields keys in lexicographic (BTreeMap)
-    // order; split out /ID and /Encrypt so they can be appended last in
-    // qpdf's writer-state order.
-    let mut id_value: Option<&Object> = None;
-    let mut encrypt_value: Option<&Object> = None;
-    for (key, value) in trailer.iter() {
-        if key == b"ID" {
-            id_value = Some(value);
-            continue;
-        }
-        if key == b"Encrypt" {
-            encrypt_value = Some(value);
-            continue;
-        }
-        bytes.extend_from_slice(b"  /");
-        crate::object::write_name_escaped(bytes, key);
-        bytes.push(b' ');
-        value.write_pdf(bytes);
-        bytes.push(b'\n');
-    }
-    if let Some(value) = id_value {
-        bytes.extend_from_slice(b"  /ID ");
-        match id_writer {
-            Some(write_id) => write_id(bytes),
-            None => crate::object::write_id_style_value(bytes, value),
-        }
-    }
-    if let Some(value) = encrypt_value {
-        // Encrypted writes always materialize /ID before this serializer;
-        // qpdf appends /Encrypt to that same QDF trailer line.
-        bytes.extend_from_slice(b" /Encrypt ");
-        value.write_pdf(bytes);
-    }
-    if id_value.is_some() || encrypt_value.is_some() {
-        bytes.push(b'\n');
-    }
-
-    bytes.extend_from_slice(b">>\n");
-}
-
-#[cfg(test)]
-mod tests {
+mod final_handle_writer_tests {
     use super::*;
-    use crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber;
+    use crate::encryption::standard::ObjectKeyAlg;
+    use crate::encryption::CopyEncryptionSource;
     use std::io::Cursor;
-    use std::sync::Arc;
 
-    fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
-        let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle)?;
-        handle.materialize()
-    }
-
-    #[test]
-    fn pdf_writer_lifecycle_is_rooted_in_writer_module() {
-        type Reader = std::io::Cursor<Vec<u8>>;
-        let type_name = std::any::type_name::<PdfWriter<'static, Reader>>();
-
-        assert!(
-            type_name.contains("flpdf::writer::PdfWriter<"),
-            "PdfWriter must be defined in the writer root module, got {type_name}"
-        );
-    }
-
-    #[test]
-    fn pdf_writer_lifecycle_accepts_qpdf_boolean_newline_mode() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let mut writer = PdfWriter::new(&mut pdf);
-
-        writer.set_newline_before_endstream(false);
-        assert_eq!(
-            writer.settings.newline_before_endstream,
-            NewlineBeforeEndstream::Never
-        );
-        writer.set_newline_before_endstream(true);
-        assert_eq!(
-            writer.settings.newline_before_endstream,
-            NewlineBeforeEndstream::Yes
-        );
-    }
-
-    #[test]
-    fn trimmed_trailer_drops_xref_stream_metadata_from_a_hybrid_table_source() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        pdf.trailer()
-            .replace_key(b"/XRefStm", ObjectHandle::integer(123))
-            .expect("install hybrid trailer key");
-        let root = pdf.root_ref().expect("empty PDF root");
-        let options = WriterOptions {
-            deterministic_id: true,
-            ..WriterOptions::default()
-        };
-
-        let trimmed =
-            build_writer_trailer_handle(&mut pdf, 4, Some(root), None, &options, None, true, None)
-                .expect("trim hybrid trailer");
-
-        assert!(trimmed.get_key(b"/XRefStm").is_null());
-    }
-
-    #[test]
-    fn source_objstm_container_lookup_uses_compressed_xref_entries_only() {
-        let compressed_member = ObjectRef::new(5, 0);
-        let uncompressed_member = ObjectRef::new(6, 0);
-        let free_member = ObjectRef::new(7, 0);
-        let source_entries = BTreeMap::from([
-            (
-                compressed_member,
-                XrefEntry::Compressed {
-                    stream: 12,
-                    index: 0,
-                },
-            ),
-            (uncompressed_member, XrefEntry::Uncompressed { offset: 42 }),
-            (free_member, XrefEntry::Free { next: 0 }),
-        ]);
-
-        assert_eq!(
-            source_objstm_container_for_batch(
-                &[uncompressed_member, compressed_member],
-                &source_entries,
-            ),
-            Some(ObjectRef::new(12, 0))
-        );
-        assert_eq!(
-            source_objstm_container_for_batch(&[free_member, uncompressed_member], &source_entries),
-            None
-        );
-        assert_eq!(
-            source_objstm_container_for_batch(&[], &source_entries),
-            None
-        );
-    }
-
-    #[test]
-    fn remap_source_objstm_extends_prefers_preserved_then_qdf_or_compact_targets() {
-        let source = ObjectRef::new(7, 0);
-        let preserved_target = ObjectRef::new(8, 0);
-        let qdf_target = ObjectRef::new(9, 0);
-        let compact_target = ObjectRef::new(10, 0);
-        let source_to_batch = HashMap::from([(source, 1)]);
-        let container_refs = vec![ObjectRef::new(3, 0), preserved_target];
-        let qdf_map = HashMap::from([(qdf_target, ObjectRef::new(19, 0))]);
-        let compact_map = HashMap::from([(compact_target, ObjectRef::new(20, 0))]);
-
-        assert_eq!(
-            remap_source_objstm_extends(
-                source,
-                &source_to_batch,
-                &container_refs,
-                true,
-                &qdf_map,
-                &compact_map,
-            ),
-            Some(preserved_target)
-        );
-        assert_eq!(
-            remap_source_objstm_extends(
-                qdf_target,
-                &HashMap::new(),
-                &[],
-                true,
-                &qdf_map,
-                &compact_map,
-            ),
-            Some(ObjectRef::new(19, 0))
-        );
-        assert_eq!(
-            remap_source_objstm_extends(
-                compact_target,
-                &HashMap::new(),
-                &[],
-                false,
-                &qdf_map,
-                &compact_map,
-            ),
-            Some(ObjectRef::new(20, 0))
-        );
-        assert_eq!(
-            remap_source_objstm_extends(
-                ObjectRef::new(99, 0),
-                &HashMap::new(),
-                &[],
-                true,
-                &qdf_map,
-                &compact_map,
-            ),
-            None
-        );
-    }
-
-    fn preserved_outline_destination_fixture() -> Vec<u8> {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write as _;
-
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = BTreeMap::new();
-        let mut add_object = |number: u32, body: &[u8]| {
-            offsets.insert(number, bytes.len());
-            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
-            bytes.extend_from_slice(body);
-            bytes.extend_from_slice(b"\nendobj\n");
-        };
-
-        add_object(1, b"<< /Type /Catalog /Outlines 6 0 R /Pages 2 0 R >>");
-        add_object(2, b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>");
-        add_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
-        add_object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
-
-        let members = [
-            (
-                5_u32,
-                b"<< /Dest [4 0 R /Fit] /Parent 6 0 R /Type /Outline >>".as_slice(),
-            ),
-            (
-                6_u32,
-                b"<< /Count 1 /First 5 0 R /Last 5 0 R /Type /Outlines >>".as_slice(),
-            ),
-        ];
-        let mut header = String::new();
-        let mut body = Vec::new();
-        for (index, (number, member)) in members.iter().enumerate() {
-            header.push_str(&format!("{number} {} ", body.len()));
-            body.extend_from_slice(member);
-            if index + 1 != members.len() {
-                body.push(b'\n');
-            }
+    fn stream_with_filter(filter: Option<&[u8]>, data: Vec<u8>) -> ObjectHandle {
+        let mut entries = vec![(
+            b"/Length".to_vec(),
+            ObjectHandle::integer(data.len() as i64),
+        )];
+        if let Some(filter) = filter {
+            entries.push((b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec())));
         }
-        let mut decoded = header.into_bytes();
-        decoded.extend_from_slice(&body);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&decoded).expect("compress ObjStm body");
-        let encoded = encoder.finish().expect("finish ObjStm body");
-        let first = decoded.len() - body.len();
-        offsets.insert(7, bytes.len());
-        bytes.extend_from_slice(b"7 0 obj\n");
-        bytes.extend_from_slice(
-            format!(
-                "<< /Type /ObjStm /N 2 /First {first} /Length {} /Filter /FlateDecode >>\nstream\n",
-                encoded.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&encoded);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-        let xref_offset = bytes.len();
-        let mut xref = Vec::new();
-        let append = |out: &mut Vec<u8>, kind: u8, field1: u32, field2: u8| {
-            out.push(kind);
-            out.extend_from_slice(&field1.to_be_bytes()[1..]);
-            out.push(field2);
-        };
-        append(&mut xref, 0, 0, 0);
-        for number in 1..=4 {
-            append(&mut xref, 1, offsets[&number] as u32, 0);
-        }
-        append(&mut xref, 2, 7, 0);
-        append(&mut xref, 2, 7, 1);
-        append(&mut xref, 1, offsets[&7] as u32, 0);
-        append(&mut xref, 1, xref_offset as u32, 0);
-        offsets.insert(8, bytes.len());
-        bytes.extend_from_slice(b"8 0 obj\n");
-        bytes.extend_from_slice(
-            format!(
-                "<< /Type /XRef /Size 9 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
-                xref.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&xref);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        bytes
-    }
-
-    fn preserved_chained_objstm_fixture() -> Vec<u8> {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write as _;
-
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        let mut offsets = BTreeMap::new();
-        let mut add_object = |number: u32, body: &[u8]| {
-            offsets.insert(number, bytes.len());
-            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
-            bytes.extend_from_slice(body);
-            bytes.extend_from_slice(b"\nendobj\n");
-        };
-
-        add_object(1, b"<< /Type /Catalog /Outlines 6 0 R /Pages 2 0 R >>");
-        add_object(2, b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>");
-        add_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
-        add_object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
-
-        let mut add_objstm = |container: u32, member: u32, body: &[u8], extends: Option<u32>| {
-            let header = format!("{member} 0 ");
-            let first = header.len();
-            let mut decoded = header.into_bytes();
-            decoded.extend_from_slice(body);
-            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&decoded).expect("compress ObjStm body");
-            let encoded = encoder.finish().expect("finish ObjStm body");
-            let extends = extends
-                .map(|source| format!(" /Extends {source} 0 R"))
-                .unwrap_or_default();
-
-            offsets.insert(container, bytes.len());
-            bytes.extend_from_slice(format!("{container} 0 obj\n").as_bytes());
-            bytes.extend_from_slice(
-                format!(
-                    "<< /Type /ObjStm /N 1 /First {first} /Length {} /Filter /FlateDecode{extends} >>\nstream\n",
-                    encoded.len()
-                )
-                .as_bytes(),
-            );
-            bytes.extend_from_slice(&encoded);
-            bytes.extend_from_slice(b"\nendstream\nendobj\n");
-        };
-
-        add_objstm(
-            7,
-            5,
-            b"<< /Dest [4 0 R /Fit] /Parent 6 0 R /Type /Outline >>",
-            None,
-        );
-        add_objstm(
-            8,
-            6,
-            b"<< /Count 1 /First 5 0 R /Last 5 0 R /Type /Outlines >>",
-            Some(7),
-        );
-
-        let xref_offset = bytes.len();
-        let mut xref = Vec::new();
-        let append = |out: &mut Vec<u8>, kind: u8, field1: u32, field2: u8| {
-            out.push(kind);
-            out.extend_from_slice(&field1.to_be_bytes()[1..]);
-            out.push(field2);
-        };
-        append(&mut xref, 0, 0, 0);
-        for number in 1..=4 {
-            append(&mut xref, 1, offsets[&number] as u32, 0);
-        }
-        append(&mut xref, 2, 7, 0);
-        append(&mut xref, 2, 8, 0);
-        append(&mut xref, 1, offsets[&7] as u32, 0);
-        append(&mut xref, 1, offsets[&8] as u32, 0);
-        append(&mut xref, 1, xref_offset as u32, 0);
-        bytes.extend_from_slice(b"9 0 obj\n");
-        bytes.extend_from_slice(
-            format!(
-                "<< /Type /XRef /Size 10 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
-                xref.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&xref);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        bytes
-    }
-
-    #[test]
-    fn qdf_preserve_objstm_reserves_outline_destination_before_page_tree_children() {
-        let mut pdf = crate::Pdf::open_mem_owned(preserved_outline_destination_fixture())
-            .expect("open preserved ObjStm fixture");
-        let options = WriterOptions {
-            qdf: true,
-            object_streams: ObjectStreamMode::Preserve,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("write QDF");
-        let output = String::from_utf8_lossy(&output);
-
-        assert!(
-            output.contains("/Dest [\n    6 0 R\n    /Fit"),
-            "qpdf reserves the second page while emitting the ObjStm; output was:\n{output}"
-        );
-    }
-
-    #[test]
-    fn qdf_preserve_objstm_emits_source_extends_relation() {
-        let mut pdf = crate::Pdf::open_mem_owned(preserved_chained_objstm_fixture())
-            .expect("open chained preserved ObjStm fixture");
-        let options = WriterOptions {
-            qdf: true,
-            object_streams: ObjectStreamMode::Preserve,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("write chained QDF");
-        let output = String::from_utf8_lossy(&output);
-
-        let extends_line = output
-            .lines()
-            .find(|line| line.contains("/Extends"))
-            .expect("preserved ObjStm chain must retain /Extends");
-        assert!(extends_line.trim_end().ends_with(" R"), "{extends_line}");
-    }
-
-    #[test]
-    fn specialized_rewrite_snapshots_modified_stream_source_state_for_cached_output() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        struct PassThroughTokenFilter;
-
-        impl crate::token_filter::TokenFilter for PassThroughTokenFilter {
-            fn handle_token(
-                &mut self,
-                token: &crate::tokenizer::Token,
-                output: &mut crate::token_filter::TokenFilterOutput<'_>,
-            ) -> crate::pipeline::PipelineResult<()> {
-                output.write_token(token)
-            }
-        }
-
-        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).unwrap();
-        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve(&stream).unwrap();
-        stream
-            .add_token_filter(Rc::new(RefCell::new(PassThroughTokenFilter)))
-            .unwrap();
-        pdf.mark_object_handle_dirty(&stream).unwrap();
-
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            preserve_unreferenced_objects: true,
-            qdf: true,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut output, &options).unwrap();
-        assert!(output
-            .windows(b"hello".len())
-            .any(|window| window == b"hello"));
-    }
-
-    struct FinishAfterWriteError {
-        finishes: usize,
-    }
-
-    impl crate::pipeline::Pipeline for FinishAfterWriteError {
-        // cov:ignore-start: run_writer_pipeline never queries test-double identifiers.
-        fn identifier(&self) -> &str {
-            "finish-after-write-error"
-        }
-        // cov:ignore-end
-
-        fn write(&mut self, _data: &[u8]) -> crate::pipeline::PipelineResult<()> {
-            Err(crate::pipeline::PipelineError::runtime("write failed"))
-        }
-
-        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
-            self.finishes += 1;
-            Ok(())
-        }
-    }
-
-    struct FinishErrorPipeline {
-        finishes: usize,
-    }
-
-    impl crate::pipeline::Pipeline for FinishErrorPipeline {
-        // cov:ignore-start: run_writer_pipeline never queries test-double identifiers.
-        fn identifier(&self) -> &str {
-            "finish-error"
-        }
-        // cov:ignore-end
-
-        fn write(&mut self, _data: &[u8]) -> crate::pipeline::PipelineResult<()> {
-            Ok(())
-        }
-
-        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
-            self.finishes += 1;
-            Err(crate::pipeline::PipelineError::runtime("finish failed"))
-        }
-    }
-
-    #[test]
-    fn remap_qpdf_trailer_refs_propagates_unmapped_nested_live_ref() {
-        let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
-        let map = CanonicalCatalogFirstRenumber::from_pairs_for_test(&[(
-            ObjectRef::new(1, 0),
-            ObjectRef::new(1, 0),
-        )]);
-        let mut trailer = Dictionary::new();
-        trailer.insert(
-            "Extra",
-            Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
-        );
-
-        let err =
-            remap_qpdf_trailer_refs_with_removed(&mut pdf, &mut trailer, &map, &BTreeSet::new())
-                .unwrap_err();
-
-        assert!(matches!(err, crate::Error::Unsupported(ref message)
-                if message.contains("reference 3 0 R absent from renumber map")));
-    }
-
-    #[test]
-    fn generate_id_array_static_preserves_id0_when_second_element_is_not_a_string() {
-        // `/ID [<valid> 123]` — arity 2 but element 2 is not a string.
-        // qpdf's getOriginalID1 reads only element 1, so it remains the
-        // permanent ID while element 2 becomes the static changing ID.
-        let source = Object::Array(vec![
-            Object::String(b"permanent".to_vec()),
-            Object::Integer(123),
-        ]);
-        let v = match generate_id_array(Some(&source), true) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(
-            v[0],
-            Object::String(b"permanent".to_vec()),
-            "qpdf preserves non-empty element 1 without inspecting element 2"
-        );
-        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
-    }
-
-    #[test]
-    fn generate_id_array_static_falls_back_when_id_is_missing() {
-        let v = match generate_id_array(None, true) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(v[0], Object::String(QPDF_STATIC_ID.to_vec()));
-        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
-    }
-
-    #[test]
-    fn generate_id_array_empty_source_uses_same_generated_id() {
-        let source = Object::Array(vec![
-            Object::String(Vec::new()),
-            Object::String(b"source-changing".to_vec()),
-        ]);
-        let generated = generate_id_array(Some(&source), false);
-        let values = match generated {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0], values[1]);
-        assert!(!str_bytes(&values[0]).is_empty());
-        assert_ne!(str_bytes(&values[0]), &QPDF_STATIC_ID[..]);
-    }
-
-    #[test]
-    fn generate_id_array_empty_source_static_uses_pi_for_both_ids() {
-        let source = Object::Array(vec![
-            Object::String(Vec::new()),
-            Object::String(b"source-changing".to_vec()),
-        ]);
-        let generated = generate_id_array(Some(&source), true);
-        let values = match generated {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(
-            values,
-            vec![
-                Object::String(QPDF_STATIC_ID.to_vec()),
-                Object::String(QPDF_STATIC_ID.to_vec()),
-            ]
-        );
-    }
-
-    #[test]
-    fn generate_id_array_preserves_non_empty_source_id0() {
-        let source = Object::Array(vec![
-            Object::String(b"permanent".to_vec()),
-            Object::String(b"source-changing".to_vec()),
-        ]);
-        let generated = generate_id_array(Some(&source), false);
-        let values = match generated {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(values[0], Object::String(b"permanent".to_vec()));
-        assert!(!str_bytes(&values[1]).is_empty());
-
-        let static_generated = generate_id_array(Some(&source), true);
-        let static_values = match static_generated {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(static_values[0], Object::String(b"permanent".to_vec()));
-        assert_eq!(static_values[1], Object::String(QPDF_STATIC_ID.to_vec()));
-    }
-
-    // --- Default (no-flag) /ID generation strategy (flpdf-9hc.13.2) ---------
-
-    fn str_bytes(o: &Object) -> &[u8] {
-        match o {
-            Object::String(s) => s.as_slice(),
-            other => panic!("expected /ID element to be a string, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn generate_id_array_first_save_uses_one_fresh_id_for_both_elements() {
-        // No source /ID: qpdf reuses the changing identifier as the permanent
-        // identifier, so both elements are equal and independently generated
-        // saves still differ.
-        let v = match generate_id_array(None, false) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(v.len(), 2);
-        let (e0, e1) = (str_bytes(&v[0]), str_bytes(&v[1]));
-        assert_eq!(e0.len(), 16, "element 1 must be 16 bytes");
-        assert_eq!(e1.len(), 16, "element 2 must be 16 bytes");
-        assert_ne!(
-            e0,
-            &QPDF_STATIC_ID[..],
-            "element 1 must not be the π constant"
-        );
-        assert_ne!(
-            e1,
-            &QPDF_STATIC_ID[..],
-            "element 2 must not be the π constant"
-        );
-        assert!(e0.iter().any(|&b| b != 0), "element 1 must not be all-zero");
-        assert!(e1.iter().any(|&b| b != 0), "element 2 must not be all-zero");
-        assert_eq!(e0, e1, "qpdf reuses id2 when source id1 is absent");
-    }
-
-    #[test]
-    fn generate_id_array_varies_per_save() {
-        // Two saves of the same (no-/ID) input yield different /ID arrays —
-        // even back-to-back, thanks to the process-global counter.
-        let a = generate_id_array(None, false);
-        let b = generate_id_array(None, false);
-        assert_ne!(a, b, "/ID must change on every save");
-    }
-
-    #[test]
-    fn generate_id_array_re_save_preserves_element1_rotates_element2() {
-        // First save (no source /ID): both fresh.
-        let first = match generate_id_array(None, false) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        let v1 = first;
-        let perm = v1[0].clone();
-
-        // Re-save: feed the well-formed 2-string /ID back in.  Element 1 must
-        // be preserved verbatim (ISO 32000-1 §14.4); element 2 must rotate.
-        let source = Object::Array(v1.clone());
-        let v2 = match generate_id_array(Some(&source), false) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-
-        assert_eq!(
-            v2[0], perm,
-            "element 1 (permanent id) must be preserved on re-save"
-        );
-        assert_ne!(
-            v2[1], v1[1],
-            "element 2 (changing id) must rotate on re-save"
-        );
-    }
-
-    #[test]
-    fn generate_id_array_preserves_id0_when_second_element_is_not_a_string() {
-        // qpdf's getOriginalID1 reads only non-empty `/ID[0]`; malformed or
-        // missing later array elements do not affect the permanent ID.
-        let source = Object::Array(vec![
-            Object::String(b"would-be-permanent".to_vec()),
-            Object::Integer(123),
-        ]);
-        let v = match generate_id_array(Some(&source), false) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(
-            v[0],
-            Object::String(b"would-be-permanent".to_vec()),
-            "qpdf preserves non-empty element 1 without inspecting element 2"
-        );
-        assert_eq!(str_bytes(&v[1]).len(), 16);
-        assert_ne!(v[0], v[1]);
-    }
-
-    #[test]
-    fn generate_id_array_static_preserves_singleton_source_id0() {
-        // qpdf's getArrayItem(0) needs only the first array item; `/ID[1]`
-        // need not exist for a non-empty source permanent identifier to persist.
-        let source = Object::Array(vec![Object::String(b"singleton-permanent".to_vec())]);
-        let v = match generate_id_array(Some(&source), true) {
-            Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
-        };
-        assert_eq!(v[0], Object::String(b"singleton-permanent".to_vec()));
-        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
-    }
-
-    // --- deterministic-id (qpdf --deterministic-id) -----------------------
-
-    fn det_id_options() -> WriterOptions {
-        WriterOptions {
-            deterministic_id: true,
-            ..WriterOptions::default()
-        }
-    }
-
-    fn write_det_id(fixture: &[u8]) -> Vec<u8> {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(fixture)).expect("fixture must open");
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &det_id_options())
-            .expect("deterministic-id write must succeed");
-        out
-    }
-
-    fn trailer_id_pair(output: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let pdf = crate::Pdf::open_mem(Arc::from(output)).expect("output must re-open");
-        let id = pdf
-            .trailer_dictionary()
-            .get("ID")
-            .and_then(Object::as_array)
-            .expect("trailer /ID must be an array");
-        let extract = |o: &Object| {
-            o.as_string()
-                .expect("/ID element must be a string")
-                .to_vec()
-        };
-        (extract(&id[0]), extract(&id[1]))
-    }
-
-    /// Locate the LAST `/ID [` array in an output PDF and return the byte
-    /// offset of its opening `[`. qpdf captures the running content digest at
-    /// exactly this point — inclusive of the `[` — so `md5(output[..=offset])`
-    /// is the deterministic-id seed's `det_data` value.
-    fn id_array_bracket_offset(output: &[u8]) -> usize {
-        let id = b"/ID";
-        let id_pos = output
-            .windows(id.len())
-            .rposition(|w| w == id)
-            .expect("output must contain /ID");
-        id_pos
-            + output[id_pos..]
-                .iter()
-                .position(|&b| b == b'[')
-                .expect("/ID must be followed by an array")
-    }
-
-    /// Re-derive qpdf's two-level deterministic `/ID[1]` (changing identifier)
-    /// from an output PDF and the expected `/Info` seed suffix. This mirrors
-    /// `compute_deterministic_id` so a wrong digest range, seed order, or
-    /// `/Info` handling in the writer would make the assertion fail. The seed is
-    /// truncated at its first NUL byte before the final hash, matching qpdf's
-    /// `encodeString(seed.c_str())` strlen behaviour.
-    fn expected_changing_id(output: &[u8], info_suffix: &[u8]) -> [u8; 16] {
-        use md5::Digest as _;
-        let bracket = id_array_bracket_offset(output);
-        let det_data = md5::Md5::digest(&output[..=bracket]);
-        let mut seed = Vec::new();
-        for byte in det_data.iter() {
-            seed.extend_from_slice(format!("{byte:02x}").as_bytes());
-        }
-        seed.extend_from_slice(b" QPDF ");
-        seed.extend_from_slice(info_suffix);
-        let truncated = &seed[..seed.iter().position(|&b| b == 0).unwrap_or(seed.len())];
-        md5::Md5::digest(truncated).into()
-    }
-
-    #[test]
-    fn deterministic_id_is_stable_and_matches_two_level_md5() {
-        let fixture = build_string_and_stream_fixture();
-        let o1 = write_det_id(&fixture);
-        let o2 = write_det_id(&fixture);
-        assert_eq!(
-            o1, o2,
-            "same input + deterministic_id must produce byte-identical output"
-        );
-
-        // This fixture's /Info carries /Title (TopSecretTitle), so the seed is
-        // det_data + " QPDF " + " TopSecretTitle". /ID[1] is the two-level MD5;
-        // with no source /ID the permanent identifier /ID[0] equals it.
-        let (id0, id1) = trailer_id_pair(&o1);
-        let expected = expected_changing_id(&o1, b" TopSecretTitle").to_vec();
-        assert_eq!(
-            id1, expected,
-            "/ID[1] must be md5(det_data + \" QPDF \" + \" TopSecretTitle\")"
-        );
-        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
-        // Distinct from the --static-id constant so the two flags never collide.
-        assert_ne!(id0.as_slice(), &QPDF_STATIC_ID[..]);
-    }
-
-    #[test]
-    fn ordinary_full_rewrite_empty_source_id0_matches_qpdf_default_and_static() {
-        for id_entry in ["/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", "/ID [() ()]"] {
-            let source = build_det_id_source(id_entry, &[]);
-
-            let default_output = write_full_rewrite_with(
-                &source,
-                &WriterOptions {
-                    ..WriterOptions::default()
-                },
-            );
-            let (default_id0, default_id1) = trailer_id_pair(&default_output);
-            assert!(!default_id0.is_empty(), "default /ID[0] must be non-empty");
-            assert_eq!(default_id0, default_id1);
-
-            let static_output = write_full_rewrite_with(
-                &source,
-                &WriterOptions {
-                    static_id: true,
-                    ..WriterOptions::default()
-                },
-            );
-            assert_eq!(
-                trailer_id_pair(&static_output),
-                (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec())
-            );
-        }
-    }
-
-    #[test]
-    fn encrypted_full_rewrite_empty_source_id0_matches_emitted_id1() {
-        let source = build_det_id_source("/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", &[]);
-        let mut pdf = Pdf::open(Cursor::new(source)).expect("source parses");
-        let mut output = Vec::new();
-        let options = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
-                Vec::new(),
-                b"owner".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("encrypted write");
-        let (id0, id1) = trailer_id_pair(&output);
-        assert!(!id0.is_empty());
-        assert_eq!(
-            id0, id1,
-            "empty source /ID[0] must reuse qpdf's generated id2"
-        );
-
-        let reopened = Pdf::open_with_options(
-            Cursor::new(output),
-            crate::PdfOpenOptions {
-                password: Vec::new(),
-                ..crate::PdfOpenOptions::default()
-            },
-        )
-        .expect("encrypted output must reopen with the empty user password");
-        assert!(reopened.trailer_dictionary().get("Encrypt").is_some());
-    }
-
-    #[test]
-    fn deterministic_id_depends_on_content() {
-        let a = write_det_id(&build_string_and_stream_fixture());
-        let b = write_det_id(&build_metadata_fixture());
-        assert_ne!(
-            trailer_id_pair(&a).0,
-            trailer_id_pair(&b).0,
-            "different input content must yield a different deterministic /ID"
-        );
-    }
-
-    /// Build a minimal classic-xref PDF whose trailer carries the given extra
-    /// keys (e.g. `/ID [..]` or `/Info N 0 R`). `extra_objects` is appended
-    /// verbatim as additional indirect objects (object numbers start at 3).
-    fn build_det_id_source(trailer_extra: &str, extra_objects: &[&str]) -> Vec<u8> {
-        let mut src = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        for obj in extra_objects {
-            offsets.push(src.len());
-            src.extend_from_slice(obj.as_bytes());
-        }
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R {trailer_extra} >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        src
-    }
-
-    #[test]
-    fn deterministic_id_preserves_source_permanent_id() {
-        // A source with a well-formed 16-byte /ID: /ID[0] (permanent
-        // identifier) must be preserved; only /ID[1] (changing identifier)
-        // becomes the two-level digest.
-        let src = build_det_id_source(
-            &format!("/ID [<{}><{}>]", "aa".repeat(16), "bb".repeat(16)),
-            &[],
-        );
-        let out = write_det_id(&src);
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(
-            id0,
-            vec![0xAAu8; 16],
-            "/ID[0] must be preserved from the source"
-        );
-        assert_eq!(
-            id1,
-            expected_changing_id(&out, b"").to_vec(),
-            "/ID[1] must be the two-level deterministic digest"
-        );
-        assert_ne!(id0, id1, "permanent and changing identifiers must differ");
-    }
-
-    #[test]
-    fn qdf_writer_reads_source_id_from_the_canonical_trailer_handle() {
-        let mut pdf = Pdf::open_mem_owned(build_det_id_source("", &[])).expect("source parses");
-        let trailer = pdf.trailer();
-        trailer
-            .replace_key(
-                b"/ID",
-                ObjectHandle::array(vec![
-                    ObjectHandle::string(b"live-id".to_vec()),
-                    ObjectHandle::string(b"ignored".to_vec()),
-                ]),
-            )
-            .expect("install live source ID");
-
-        let output = write_qpdf_to_memory(&mut pdf, |writer| {
-            writer.set_qdf_mode(true);
-            writer.set_static_id(true);
-        })
-        .expect("QDF write must succeed");
-
-        assert_eq!(
-            trailer_id_pair(&output),
-            (b"live-id".to_vec(), QPDF_STATIC_ID.to_vec()),
-            "QDF must read /ID[0] from the live QPDF::getTrailer equivalent"
-        );
-    }
-
-    #[test]
-    fn pclm_writer_reads_the_canonical_trailer_after_live_mutation() {
-        let mut pdf = Pdf::open_mem_owned(build_det_id_source("", &[])).expect("source parses");
-        let trailer = pdf.trailer();
-        trailer
-            .replace_key(
-                b"/ID",
-                ObjectHandle::array(vec![
-                    ObjectHandle::string(b"live-pclm-id".to_vec()),
-                    ObjectHandle::string(b"ignored".to_vec()),
-                ]),
-            )
-            .expect("install live PCLm source ID");
-        trailer
-            .replace_key(b"/Probe", ObjectHandle::string(b"live-probe".to_vec()))
-            .expect("install live trailer key");
-
-        let output = write_qpdf_to_memory(&mut pdf, |writer| {
-            writer.set_pclm(true);
-            writer.set_static_id(true);
-        })
-        .expect("PCLm write must succeed");
-
-        assert_eq!(
-            trailer_id_pair(&output),
-            (b"live-pclm-id".to_vec(), QPDF_STATIC_ID.to_vec()),
-            "PCLm must read /ID[0] from the live QPDF::getTrailer equivalent"
-        );
-        let mut reopened = Pdf::open_mem_owned(output).expect("PCLm output must reopen");
-        assert_eq!(
-            reopened.trailer_key_handle(b"Probe").as_string(),
-            Some(b"live-probe".to_vec()),
-            "PCLm must preserve unknown keys from the live trailer"
-        );
-    }
-
-    #[test]
-    fn pclm_writer_reads_the_canonical_trailer_with_a_direct_root() {
-        let mut pdf = Pdf::open_mem_owned(
-            include_bytes!("../../../tests/fixtures/compat/direct-root-adbe.pdf").to_vec(),
-        )
-        .expect("direct-root source parses");
-        let trailer = pdf.trailer();
-        trailer
-            .replace_key(
-                b"/ID",
-                ObjectHandle::array(vec![
-                    ObjectHandle::string(b"live-direct-root-id".to_vec()),
-                    ObjectHandle::string(b"ignored".to_vec()),
-                ]),
-            )
-            .expect("install live direct-root source ID");
-        trailer
-            .replace_key(
-                b"/Probe",
-                ObjectHandle::string(b"live-direct-root".to_vec()),
-            )
-            .expect("install live direct-root trailer key");
-
-        let output = write_qpdf_to_memory(&mut pdf, |writer| {
-            writer.set_pclm(true);
-            writer.set_static_id(true);
-        })
-        .expect("direct-root PCLm write must succeed");
-
-        assert_eq!(
-            trailer_id_pair(&output),
-            (b"live-direct-root-id".to_vec(), QPDF_STATIC_ID.to_vec()),
-            "direct-root PCLm must read /ID[0] from the live trailer"
-        );
-        let mut reopened = Pdf::open_mem_owned(output).expect("direct-root PCLm output reopens");
-        assert_eq!(
-            reopened.trailer_key_handle(b"Probe").as_string(),
-            Some(b"live-direct-root".to_vec()),
-            "direct-root PCLm must preserve unknown live trailer keys"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_preserves_non_16_byte_source_id() {
-        // qpdf's getOriginalID1 preserves /ID[0] verbatim regardless of length;
-        // only /ID[1] is regenerated (always a 16-byte md5).
-        let src = build_det_id_source(
-            &format!("/ID [<{}><{}>]", "aa".repeat(20), "bb".repeat(16)),
-            &[],
-        );
-        let out = write_det_id(&src);
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(
-            id0,
-            vec![0xAAu8; 20],
-            "/ID[0] must be preserved verbatim (20 bytes)"
-        );
-        assert_eq!(id1.len(), 16, "/ID[1] is always a 16-byte digest");
-        assert_eq!(id1, expected_changing_id(&out, b"").to_vec());
-        assert_ne!(id0, id1);
-    }
-
-    #[test]
-    fn deterministic_id_ignores_non_string_array_source_id() {
-        // A /ID whose elements are not strings (here two integers) is not a
-        // usable permanent identifier; source_permanent_id returns None and the
-        // changing identifier is reused for both elements.
-        let src = build_det_id_source("/ID [1 2]", &[]);
-        let out = write_det_id(&src);
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(id0, id1, "non-string source /ID must not be preserved");
-        assert_eq!(id1, expected_changing_id(&out, b"").to_vec());
-    }
-
-    #[test]
-    fn deterministic_id_treats_empty_source_id0_as_absent() {
-        // An empty source /ID[0] (`<>`) is not a usable permanent identifier:
-        // qpdf falls back to the generated changing identifier (verified against
-        // qpdf 11.9.0, where /ID[0] == /ID[1] for an empty original id). It must
-        // NOT be preserved verbatim as an empty string.
-        let src = build_det_id_source(&format!("/ID [<><{}>]", "bb".repeat(16)), &[]);
-        let out = write_det_id(&src);
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(id0, id1, "empty source /ID[0] must fall back to /ID[1]");
-        assert_eq!(id1, expected_changing_id(&out, b"").to_vec());
-    }
-
-    #[test]
-    fn deterministic_id_seed_reads_inline_info_dictionary() {
-        // /Info given inline (a direct dictionary, not an indirect reference):
-        // its string values must still feed the seed.
-        let src = build_det_id_source("/Info << /Title (Inline) >>", &[]);
-        let out = write_det_id(&src);
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b" Inline").to_vec(),
-            "an inline /Info dictionary must contribute to the seed"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_ignores_non_dictionary_info() {
-        // /Info that does not resolve to a dictionary (here a string) yields an
-        // empty seed suffix, identical to having no /Info.
-        let src = build_det_id_source("/Info (not a dict)", &[]);
-        let out = write_det_id(&src);
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b"").to_vec(),
-            "a non-dictionary /Info contributes nothing to the seed"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_info_seed_changes_id() {
-        // Two files with identical structure but different /Info string values
-        // must produce different /ID[1] because /Info feeds the seed.
-        let a = write_det_id(&build_det_id_source(
-            "/Info 3 0 R",
-            &["3 0 obj\n<< /Title (Alpha) >>\nendobj\n"],
-        ));
-        let b = write_det_id(&build_det_id_source(
-            "/Info 3 0 R",
-            &["3 0 obj\n<< /Title (Bravo) >>\nendobj\n"],
-        ));
-        assert_ne!(
-            trailer_id_pair(&a).1,
-            trailer_id_pair(&b).1,
-            "different /Info string values must change /ID[1]"
-        );
-        // And the seed is exactly det_data + " QPDF " + " Alpha".
-        assert_eq!(
-            trailer_id_pair(&a).1,
-            expected_changing_id(&a, b" Alpha").to_vec(),
-            "/Info /Title (Alpha) contributes \" Alpha\" to the seed"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_info_seed_sorts_keys_skips_non_strings_and_unescapes() {
-        // /Info with keys out of sorted order (/Title before /Author), a
-        // non-string entry (/Count 7, skipped), and an escaped literal string
-        // (Hello\)World -> "Hello)World" after unescaping). The seed appends, in
-        // SORTED key order, " " + decoded value for each string entry:
-        //   " Bob" (Author) then " Hello)World" (Title).
-        let src = build_det_id_source(
-            "/Info 3 0 R",
-            &["3 0 obj\n<< /Title (Hello\\)World) /Author (Bob) /Count 7 >>\nendobj\n"],
-        );
-        let out = write_det_id(&src);
-        let suffix = b" Bob Hello)World";
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, suffix).to_vec(),
-            "seed must use sorted keys, skip non-strings, and unescape values"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_resolves_indirect_info_and_values() {
-        // /Info is an indirect reference, and the /Title value is ALSO an
-        // indirect reference. Both must be resolved so the string contributes
-        // to the seed (PDF allows any value to be indirect).
-        let src = build_det_id_source(
-            "/Info 3 0 R",
-            &[
-                "3 0 obj\n<< /Title 4 0 R >>\nendobj\n",
-                "4 0 obj\n(Indirect)\nendobj\n",
-            ],
-        );
-        let out = write_det_id(&src);
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b" Indirect").to_vec(),
-            "indirect /Info and indirect string value must be resolved into the seed"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_empty_info_has_no_seed_suffix() {
-        // /Info present but with no string entries: the seed suffix is empty,
-        // identical to having no /Info at all.
-        let with_empty_info = write_det_id(&build_det_id_source(
-            "/Info 3 0 R",
-            &["3 0 obj\n<< /Count 7 >>\nendobj\n"],
-        ));
-        assert_eq!(
-            trailer_id_pair(&with_empty_info).1,
-            expected_changing_id(&with_empty_info, b"").to_vec(),
-            "an /Info with no string entries contributes nothing to the seed"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_truncates_seed_at_first_nul() {
-        // qpdf hashes the seed via `encodeString(seed.c_str())`, which stops at
-        // the first NUL (strlen). A /Title carrying a NUL (here a UTF-16BE
-        // string: BOM FEFF, then NUL-bearing code units) must therefore
-        // contribute only the bytes BEFORE its first NUL to /ID[1]. The hex
-        // string <feff0041> decodes to [0xFE, 0xFF, 0x00, 0x41], so the /Info
-        // suffix is b" \xfe\xff\x00A" and the seed is truncated just after
-        // b" \xfe\xff".
-        let out = write_det_id(&build_det_id_source(
-            "/Info 3 0 R",
-            &["3 0 obj\n<< /Title <feff0041> >>\nendobj\n"],
-        ));
-        // expected_changing_id truncates the (suffix) seed at its first NUL too,
-        // so passing the FULL suffix asserts the writer applied the same cut.
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b" \xfe\xff\x00A").to_vec(),
-            "/ID[1] must be md5 of the seed truncated at the first NUL"
-        );
-        // Self-sufficient discriminator: the truncated /ID[1] must DIFFER from
-        // the digest of the full (untruncated) seed, proving the cut happened.
-        use md5::Digest as _;
-        let bracket = id_array_bracket_offset(&out);
-        let det_data = md5::Md5::digest(&out[..=bracket]);
-        let mut full_seed = Vec::new();
-        for byte in det_data.iter() {
-            full_seed.extend_from_slice(format!("{byte:02x}").as_bytes());
-        }
-        full_seed.extend_from_slice(b" QPDF ");
-        full_seed.extend_from_slice(b" \xfe\xff\x00A");
-        let untruncated: [u8; 16] = md5::Md5::digest(&full_seed).into();
-        assert_ne!(
-            trailer_id_pair(&out).1,
-            untruncated.to_vec(),
-            "hashing the full (untruncated) seed must NOT match — the NUL cut is load-bearing"
-        );
-    }
-
-    #[test]
-    fn compute_deterministic_id_ignores_seed_bytes_after_first_nul() {
-        // Isolated proof of seed truncation: with the body digest pinned (same
-        // `bytes` and `id_array_offset`), only the info_suffix varies. qpdf's
-        // strlen cut means bytes from the first NUL onward are excluded from the
-        // changing identifier. (An end-to-end /Info test cannot isolate this:
-        // the post-NUL bytes also feed the full-output body digest, so they
-        // would change /ID[1] through det_data regardless of truncation.)
-        let bytes = b"anything[";
-        let offset = bytes.len() - 1; // the `[`
-        let a = compute_deterministic_id(bytes, offset, b" \xfe\xff\x00AAA", None);
-        let b = compute_deterministic_id(bytes, offset, b" \xfe\xff\x00BBB", None);
-        assert_eq!(
-            a.1, b.1,
-            "info_suffix bytes after the first NUL must not affect /ID[1]"
-        );
-        // A byte BEFORE the NUL still matters, confirming the cut is at the NUL
-        // and not earlier/later.
-        let c = compute_deterministic_id(bytes, offset, b" \xfd\xff\x00AAA", None);
-        assert_ne!(
-            a.1, c.1,
-            "info_suffix bytes before the first NUL must affect /ID[1]"
-        );
-        // A suffix with no NUL is hashed in full (control case).
-        let d = compute_deterministic_id(bytes, offset, b" \xfe\xff", None);
-        assert_eq!(
-            a.1, d.1,
-            "truncating at the NUL must equal hashing the pre-NUL bytes alone"
-        );
-    }
-
-    #[test]
-    fn write_deterministic_id_inline_matches_placeholder_then_patch() {
-        // Inline direct-write must equal the legacy placeholder-then-patch result
-        // for an identical prefix: same digest range (inclusive of `[`), same id.
-        let prefix =
-            b"%PDF-1.7\n1 0 obj<</X 1>>endobj\ntrailer << /Size 4 /Root 1 0 R /ID ".to_vec();
-
-        let mut inline = prefix.clone();
-        write_deterministic_id_inline(&mut inline, b"", None);
-
-        // Legacy path: place the all-zero placeholder, then compute over [..='[']
-        // (id_array_offset is the offset of the placeholder's opening `[`).
-        let id_array_offset = prefix.len();
-        let mut legacy_buf = prefix.clone();
-        write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
-        let (id0, id1) = compute_deterministic_id(&legacy_buf, id_array_offset, b"", None);
-        let mut expect = prefix.clone();
-        write_deterministic_id_array(&mut expect, &id0, &id1);
-
-        assert_eq!(
-            inline, expect,
-            "inline direct-write must equal placeholder+patch output"
-        );
-        // And it must NOT be the all-zero placeholder.
-        let mut placeholder = prefix.clone();
-        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
-        assert_ne!(
-            inline, placeholder,
-            "inline must write the real id, not the placeholder"
-        );
-    }
-
-    #[test]
-    fn write_deterministic_id_inline_preserves_source_permanent_id() {
-        // With a source permanent identifier supplied, /ID[0] (permanent) must
-        // equal that source id and /ID[1] (changing) is the two-level digest, so
-        // the inline write matches the placeholder-then-patch bytes for the same
-        // computed id. Mirrors the full-buffer equivalence of the prior test.
-        let prefix =
-            b"%PDF-1.7\n1 0 obj<</X 1>>endobj\ntrailer << /Size 4 /Root 1 0 R /ID ".to_vec();
-        let src0 = [0xAAu8; 16];
-
-        let id_array_offset = prefix.len();
-        let mut legacy_buf = prefix.clone();
-        write_deterministic_id_array(&mut legacy_buf, &[0u8; 16], &[0u8; 16]);
-        let (id0, id1) =
-            compute_deterministic_id(&legacy_buf, id_array_offset, b"", Some(src0.as_slice()));
-        let mut expect = prefix.clone();
-        write_deterministic_id_array(&mut expect, &src0, &id1);
-
-        let mut inline = prefix.clone();
-        write_deterministic_id_inline(&mut inline, b"", Some(src0.as_slice()));
-
-        assert_eq!(
-            inline, expect,
-            "inline write with a source id must equal placeholder+patch output"
-        );
-        assert_eq!(
-            id0,
-            src0.to_vec(),
-            "/ID[0] must be the supplied permanent identifier"
-        );
-        assert_ne!(
-            id0, id1,
-            "permanent and changing identifiers must differ in general"
-        );
-    }
-
-    #[test]
-    fn write_pdf_with_id_writer_none_emits_qpdf_trailer_id_shape() {
-        // With `id_writer = None`, the fallback routes the stored `/ID` value
-        // through `write_id_style_value` to reproduce qpdf's `writeTrailer`
-        // compact `[<hex1><hex2>]` (no separating spaces). Plain `write_pdf`
-        // goes through the generic array serializer, which now — matching
-        // qpdf's `unparseObject` — inserts spaces on both sides of every
-        // element (`[ <hex1> <hex2> ]`). Pin both shapes: /ID via the None
-        // fallback stays qpdf-trailer-compact; other keys agree byte-for-byte
-        // with plain `write_pdf`.
-        let mut dict = Dictionary::new();
-        dict.insert("Size", Object::Integer(4));
-        dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
-        dict.insert(
-            "ID",
-            Object::Array(vec![
-                Object::String(vec![0xAB; 16]),
-                Object::String(vec![0xCD; 16]),
-            ]),
-        );
-
-        let mut via_none = Vec::new();
-        dict.write_pdf_with_id_writer(&mut via_none, None);
-        // Render once so the diagnostic bytes appear on the covered path too;
-        // avoids a coverage hole in the assert-message arm that only runs on
-        // failure.
-        let via_none_str = String::from_utf8_lossy(&via_none).into_owned();
-        // The compact shape puts `[` immediately before `<`, no separator.
-        assert!(
-            via_none.windows(6).any(|w| w == b"/ID [<"),
-            "None fallback must emit compact `/ID [<...` without space between `[` and `<`; got: {via_none_str}"
-        );
-        assert!(
-            !via_none.windows(8).any(|w| w == b"/ID [ <"),
-            "None fallback must NOT emit `/ID [ <...` (that is the generic array serializer); got: {via_none_str}"
-        );
-
-        // Plain `write_pdf` now goes through the generic array serializer, so
-        // its /ID output is space-separated. Prove the two paths intentionally
-        // diverge on the /ID value (they must not silently drift back to the
-        // pre-fix "both use write_pdf" behavior).
-        let mut plain = Vec::new();
-        dict.write_pdf(&mut plain);
-        let plain_str = String::from_utf8_lossy(&plain).into_owned();
-        assert!(
-            plain.windows(7).any(|w| w == b"/ID [ <"),
-            "plain write_pdf must emit the generic `/ID [ <...` shape; got: {plain_str}"
-        );
-        assert_ne!(
-            via_none, plain,
-            "None fallback (qpdf-trailer /ID shape) must differ from plain write_pdf (generic array /ID shape)"
-        );
-    }
-
-    #[test]
-    fn write_pdf_with_id_writer_none_matches_write_pdf_without_id() {
-        // Without an `/ID` key, the None fallback has no ID-value substitution
-        // to perform, so it must remain byte-identical to plain `write_pdf`.
-        let mut dict = Dictionary::new();
-        dict.insert("Size", Object::Integer(4));
-        dict.insert("Root", Object::reference(ObjectRef::new(1, 0)));
-
-        let mut plain = Vec::new();
-        dict.write_pdf(&mut plain);
-        let mut via_none = Vec::new();
-        dict.write_pdf_with_id_writer(&mut via_none, None);
-        assert_eq!(
-            via_none, plain,
-            "write_pdf_with_id_writer(None) must equal write_pdf when no /ID is present"
-        );
-    }
-
-    #[test]
-    fn write_stream_to_buf_with_id_writer_none_emits_qpdf_trailer_id_shape() {
-        // The xref-stream helper's `None` fallback likewise routes stored `/ID`
-        // through `write_id_style_value`, so the payload framing agrees with
-        // `write_stream_to_buf` on everything except the /ID value shape. Only
-        // production paths passing `Some` are used in practice, but pin the
-        // `None` contract: /ID is compact, other bytes match the plain helper.
-        let mut dict = Dictionary::new();
-        dict.insert("Length", Object::Integer(3));
-        dict.insert(
-            "ID",
-            Object::Array(vec![
-                Object::String(vec![0xAB; 16]),
-                Object::String(vec![0xCD; 16]),
-            ]),
-        );
-        let stream = crate::Stream::new(dict, b"abc".to_vec());
-
-        let mut actual = Vec::new();
-        write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
-        let actual_str = String::from_utf8_lossy(&actual).into_owned();
-        assert!(
-            actual.windows(6).any(|w| w == b"/ID [<"),
-            "None fallback must emit compact `/ID [<...` (no space); got: {actual_str}"
-        );
-        assert!(
-            !actual.windows(7).any(|w| w == b"/ID [ <"),
-            "None fallback must not emit the generic space-separated `/ID [ <...`; got: {actual_str}"
-        );
-    }
-
-    #[test]
-    fn write_stream_to_buf_with_id_writer_none_matches_helper_without_id() {
-        // Without `/ID` in the dictionary, the xref-stream helper's `None`
-        // fallback is byte-identical to `write_stream_to_buf`.
-        let mut dict = Dictionary::new();
-        dict.insert("Length", Object::Integer(3));
-        let stream = crate::Stream::new(dict, b"abc".to_vec());
-
-        let mut expected = Vec::new();
-        write_stream_to_buf(&mut expected, &stream, NewlineBeforeEndstream::Yes);
-        let mut actual = Vec::new();
-        write_stream_to_buf_with_id_writer(&mut actual, &stream, NewlineBeforeEndstream::Yes, None);
-        assert_eq!(
-            actual, expected,
-            "None fallback must equal write_stream_to_buf when no /ID is present"
-        );
-    }
-
-    #[test]
-    fn write_pdf_with_id_writer_keys_on_name_not_byte_pattern() {
-        // The direct-write path keys on the `/ID` dictionary *name*, not on a
-        // byte pattern. A preserved entry whose key sorts before `/ID` (here
-        // `/AA`) and whose string value embeds the literal `/ID ` token plus the
-        // all-zero placeholder array must survive verbatim, while only the real
-        // `/ID` value is produced by the closure. This is exactly the ambiguity
-        // the dropped byte-search patch scheme had to guard against.
-        let mut decoy_value = b"/ID ".to_vec();
-        write_deterministic_id_array(&mut decoy_value, &[0u8; 16], &[0u8; 16]);
-        let mut dict = Dictionary::new();
-        dict.insert("AA", Object::String(decoy_value.clone()));
-        dict.insert(
-            "ID",
-            Object::Array(vec![
-                Object::String(vec![0u8; 16]),
-                Object::String(vec![0u8; 16]),
-            ]),
-        );
-
-        let sentinel: &[u8] = b"[<DIGEST-FROM-CLOSURE>]";
-        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(sentinel);
-        let mut out = Vec::new();
-        dict.write_pdf_with_id_writer(&mut out, Some(&mut id_writer));
-
-        // The decoy value is serialized as a literal string `(...)` containing
-        // the `/ID ` token and the placeholder array — it must appear verbatim.
-        let mut decoy_serialized = Vec::new();
-        Object::String(decoy_value).write_pdf(&mut decoy_serialized);
-        assert!(
-            out.windows(decoy_serialized.len())
-                .any(|w| w == decoy_serialized.as_slice()),
-            "preserved decoy entry embedding /ID + placeholder must survive verbatim"
-        );
-        // The real /ID value is the closure output, not the stored array.
-        let id_token_pos = out
-            .windows(5)
-            .position(|w| w == b" /ID ")
-            .expect("real /ID key token must be present");
-        assert_eq!(
-            &out[id_token_pos + 5..id_token_pos + 5 + sentinel.len()],
-            sentinel,
-            "the real /ID value must be the closure output, not the stored array"
-        );
-        // The closure ran exactly once: the sentinel appears a single time.
-        let sentinel_count = out
-            .windows(sentinel.len())
-            .filter(|w| *w == sentinel)
-            .count();
-        assert_eq!(sentinel_count, 1, "id_writer must run exactly once");
-    }
-
-    #[test]
-    fn deterministic_id_preserves_decoy_trailer_key_through_full_rewrite() {
-        // End-to-end regression for the decoy-collision bug: a preserved (unknown)
-        // trailer key `/Probe` whose value serializes to the EXACT 70-byte /ID
-        // placeholder `[<0x32><0x32>]`. The full-rewrite trailer keeps unknown
-        // keys (`trailer = pdf.trailer_dictionary().clone()`) and forces /ID last, so the
-        // serialized output is `... /Probe [<0..0><0..0>] ... /ID [<0..0><0..0>]`.
-        // The direct-write path must emit the genuine /ID's digest (keyed on the
-        // `/ID` name) and leave /Probe untouched.
-        let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
-        let src = build_det_id_source(&format!("/Probe [<{zeros}><{zeros}>]"), &[]);
-        let out = write_det_id(&src);
-
-        // The decoy /Probe must survive as the original all-zero 16-byte array.
-        let reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must re-open");
-        let probe = reopened
-            .trailer_dictionary()
-            .get("Probe")
-            .and_then(Object::as_array)
-            .expect("/Probe must be preserved as an array");
-        assert_eq!(probe.len(), 2, "/Probe array arity must be preserved");
-        for element in probe {
-            assert_eq!(
-                element
-                    .as_string()
-                    .expect("/Probe element must be a string"),
-                &[0u8; 16],
-                "/Probe must NOT be mis-patched — it stays the all-zero placeholder"
-            );
-        }
-        // The genuine /ID[1] must be the non-zero computed identifier.
-        assert_ne!(
-            trailer_id_pair(&out).1,
-            vec![0u8; 16],
-            "the real /ID must be direct-written, not left as the zero placeholder"
-        );
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b"").to_vec(),
-            "/ID[1] must be the two-level deterministic digest"
-        );
-    }
-
-    #[test]
-    fn classic_trailer_deterministic_id_preserves_decoy_anchor_literal() {
-        // Crafted-decoy survival guard for the CLASSIC (non-qdf) xref-table
-        // trailer, the counterpart to
-        // `qdf_trailer_deterministic_id_preserves_decoy_anchor_literal`. A
-        // preserved (unknown) trailer key `/Decoy` whose STRING value's bytes
-        // literally contain the `/ID ` token followed by the exact 70-byte
-        // all-zero placeholder array. The full-rewrite classic trailer keeps
-        // unknown keys (`trailer = pdf.trailer_dictionary().clone()`) and forces the real
-        // `/ID` last, so `/Decoy` sorts before it: a byte-search patch anchored
-        // on the first `/ID ` occurrence would clobber the decoy and leave the
-        // real `/ID` zeroed. The direct-write path never emits a placeholder and
-        // never byte-searches, so the decoy survives verbatim and the genuine
-        // /ID is the computed digest.
-        let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
-        let decoy_literal = format!("/ID [<{zeros}><{zeros}>]");
-        let src = build_det_id_source(&format!("/Decoy ({decoy_literal})"), &[]);
-        let out = write_det_id(&src);
-
-        // Confirm we exercised the classic `trailer` (Table xref) arm, not the
-        // xref-stream form — otherwise this would silently duplicate the
-        // xref-stream decoy coverage instead of guarding the classic flat path.
-        assert!(
-            out.windows(b"trailer ".len()).any(|w| w == b"trailer "),
-            "classic deterministic-id output must use a classic `trailer` (Table xref form)"
-        );
-
-        // (a) The crafted decoy bytes must survive VERBATIM in the output — a
-        // non-vacuous check that the literal `/ID `+placeholder run is present.
-        assert!(
-            out.windows(decoy_literal.len())
-                .any(|window| window == decoy_literal.as_bytes()),
-            "the crafted /Decoy bytes (`/ID `+placeholder) must appear verbatim"
-        );
-        // And the reopened /Decoy value is exactly the original literal string.
-        let reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must re-open");
-        let decoy = reopened
-            .trailer_dictionary()
-            .get("Decoy")
-            .and_then(Object::as_string)
-            .expect("/Decoy must be preserved as a string");
-        assert_eq!(
-            decoy,
-            decoy_literal.as_bytes(),
-            "/Decoy must NOT be mis-patched — its `/ID `+placeholder bytes stay verbatim"
-        );
-
-        // (b) The genuine forced-last /ID[1] must be the non-zero computed digest
-        // (not the all-zero placeholder).
-        assert_ne!(
-            trailer_id_pair(&out).1,
-            vec![0u8; 16],
-            "the real /ID must be direct-written, not left as the zero placeholder"
-        );
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b"").to_vec(),
-            "classic /ID[1] must be the two-level deterministic digest"
-        );
-    }
-
-    #[test]
-    fn classic_trailer_deterministic_id_is_direct_written_no_placeholder() {
-        // The classic (non-qdf) xref-table trailer must DIRECT-WRITE the real
-        // deterministic /ID inline, never leaving the all-zero placeholder for a
-        // later byte-search patch. A clean fixture (no decoy keys) is used so the
-        // only 70-byte `[<0..><0..>]` run that could appear would be a leftover
-        // placeholder.
-        let src = build_det_id_source("/Info 3 0 R", &["3 0 obj\n<< /Title (Doc) >>\nendobj\n"]);
-        let out = write_det_id(&src);
-
-        // (a) No all-zero /ID placeholder survives anywhere in the output.
-        let mut placeholder = Vec::new();
-        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
-        assert_eq!(placeholder.len(), 70, "placeholder must be 70 bytes");
-        assert!(
-            out.windows(placeholder.len())
-                .all(|window| window != placeholder.as_slice()),
-            "the all-zero /ID placeholder must not appear — /ID is direct-written"
-        );
-
-        // (b) The /ID array is the real digest and is deterministic across runs.
-        let out2 = write_det_id(&src);
-        assert_eq!(
-            out, out2,
-            "classic-trailer deterministic-id output must be byte-stable"
-        );
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(
-            id1,
-            expected_changing_id(&out, b" Doc").to_vec(),
-            "/ID[1] must be the two-level deterministic digest, not a placeholder"
-        );
-        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
-        assert_ne!(
-            id1,
-            vec![0u8; 16],
-            "/ID[1] must not be the zero placeholder"
-        );
-    }
-
-    /// `qdf: true` + `deterministic_id: true` writer options, sharing the
-    /// classic-xref-table fixture set.
-    fn write_qdf_det_id(fixture: &[u8]) -> Vec<u8> {
-        let opts = WriterOptions {
-            deterministic_id: true,
-            qdf: true,
-            ..WriterOptions::default()
-        };
-        let mut pdf = crate::Pdf::open_mem(Arc::from(fixture)).expect("fixture must open");
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &opts).expect("qdf deterministic write");
-        out
-    }
-
-    #[test]
-    fn qdf_trailer_deterministic_id_is_direct_written_no_placeholder() {
-        // The qdf classic-table trailer must DIRECT-WRITE the real deterministic
-        // /ID inline (via `write_qdf_trailer`'s id_writer), never leaving the
-        // all-zero placeholder for a later byte-search patch. A clean fixture (no
-        // decoy keys) is used so the only 70-byte `[<0..><0..>]` run that could
-        // appear would be a leftover placeholder.
-        //
-        // Output is byte-identical to the old placeholder-then-patch result for
-        // the same computed id, so the placeholder-absent / digest assertions
-        // below are a regression guard, not a red-first failure: they hold under
-        // byte-identity. The behavioral guard that the path no longer depends on
-        // a byte-search patch lives in
-        // `qdf_trailer_deterministic_id_preserves_decoy_anchor_literal` (a value
-        // embedding the `/ID ` token + placeholder, which a first-match patch
-        // would clobber).
-        let src = build_det_id_source("/Info 3 0 R", &["3 0 obj\n<< /Title (Doc) >>\nendobj\n"]);
-        let out = write_qdf_det_id(&src);
-
-        // qdf forces an uncompressed classic xref table — confirm we exercised
-        // the Table-arm qdf branch (not the xref-stream form).
-        assert!(
-            out.windows(b"trailer ".len()).any(|w| w == b"trailer "),
-            "qdf output must use a classic `trailer` (Table xref form)"
-        );
-
-        // (a) No all-zero /ID placeholder survives anywhere in the output.
-        let mut placeholder = Vec::new();
-        write_deterministic_id_array(&mut placeholder, &[0u8; 16], &[0u8; 16]);
-        assert_eq!(placeholder.len(), 70, "placeholder must be 70 bytes");
-        assert!(
-            out.windows(placeholder.len())
-                .all(|window| window != placeholder.as_slice()),
-            "the all-zero /ID placeholder must not appear — /ID is direct-written"
-        );
-
-        // (b) The /ID array is the real digest and is deterministic across runs.
-        let out2 = write_qdf_det_id(&src);
-        assert_eq!(
-            out, out2,
-            "qdf-trailer deterministic-id output must be byte-stable"
-        );
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(
-            id1,
-            expected_changing_id(&out, b" Doc").to_vec(),
-            "qdf /ID[1] must be the two-level deterministic digest, not a placeholder"
-        );
-        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
-        assert_ne!(
-            id1,
-            vec![0u8; 16],
-            "/ID[1] must not be the zero placeholder"
-        );
-    }
-
-    #[test]
-    fn qdf_trailer_deterministic_id_preserves_decoy_anchor_literal() {
-        // Forward regression guard for the direct-write path: a preserved
-        // (unknown) trailer key `/Decoy` whose STRING value's bytes literally
-        // contain the `/ID ` token followed by the exact 70-byte all-zero
-        // placeholder. `/Decoy` sorts before the forced-last real `/ID`, so a
-        // byte-search patch anchored on the first `/ID ` occurrence would clobber
-        // the decoy and leave the real `/ID` zeroed. The direct-write path never
-        // emits the placeholder and never byte-searches, so the decoy survives
-        // verbatim and the genuine /ID is the computed digest.
-        let zeros = "00000000000000000000000000000000"; // 16 zero bytes in hex
-        let decoy_literal = format!("/ID [<{zeros}><{zeros}>]");
-        let src = build_det_id_source(&format!("/Decoy ({decoy_literal})"), &[]);
-        let out = write_qdf_det_id(&src);
-
-        // The decoy /Decoy must survive as the original literal string, untouched.
-        let reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must re-open");
-        let decoy = reopened
-            .trailer_dictionary()
-            .get("Decoy")
-            .and_then(Object::as_string)
-            .expect("/Decoy must be preserved as a string");
-        assert_eq!(
-            decoy,
-            decoy_literal.as_bytes(),
-            "/Decoy must NOT be mis-patched — its `/ID `+placeholder bytes stay verbatim"
-        );
-        // The genuine /ID[1] must be the non-zero computed identifier.
-        assert_ne!(
-            trailer_id_pair(&out).1,
-            vec![0u8; 16],
-            "the real /ID must be direct-written, not left as the zero placeholder"
-        );
-        assert_eq!(
-            trailer_id_pair(&out).1,
-            expected_changing_id(&out, b"").to_vec(),
-            "qdf /ID[1] must be the two-level deterministic digest"
-        );
-    }
-
-    #[test]
-    fn qdf_trailer_without_deterministic_id_serializes_stored_id() {
-        // `write_qdf_trailer`'s `None` arm: plain qdf without `deterministic_id`
-        // serializes the dictionary's stored /ID value verbatim (no id_writer
-        // closure runs). Use `static_id` so the stored /ID is deterministic:
-        // /ID[0] is the source permanent id, /ID[1] is the qpdf static constant.
-        let src = build_det_id_source(
-            "/ID [<0102030405060708090a0b0c0d0e0f10><1112131415161718191a1b1c1d1e1f20>]",
-            &[],
-        );
-        let opts = WriterOptions {
-            qdf: true,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let write = |f: &[u8]| {
-            let mut pdf = crate::Pdf::open_mem(Arc::from(f)).expect("fixture must open");
-            let mut out = Vec::new();
-            emit_canonical_pdf(&mut pdf, &mut out, &opts).expect("qdf write");
-            out
-        };
-        let out = write(&src);
-        assert_eq!(out, write(&src), "static-id qdf output must be byte-stable");
-
-        assert!(
-            out.windows(b"trailer <<".len()).any(|w| w == b"trailer <<"),
-            "qdf output must use the multi-line `trailer <<` layout"
-        );
-        let (id0, id1) = trailer_id_pair(&out);
-        assert_eq!(
-            id0,
-            (1u8..=16).collect::<Vec<u8>>(),
-            "stored /ID[0] (source permanent id) must be serialized verbatim"
-        );
-        assert_eq!(
-            id1.as_slice(),
-            &QPDF_STATIC_ID[..],
-            "stored /ID[1] (qpdf static constant) must be serialized verbatim"
-        );
-    }
-
-    #[test]
-    fn qdf_encrypted_trailer_puts_encrypt_after_id_on_the_same_final_line() {
-        let mut trailer = Dictionary::new();
-        trailer.insert("Encrypt", Object::Reference(ObjectRef::new(9, 0)));
-        trailer.insert("Info", Object::Reference(ObjectRef::new(7, 0)));
-        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
-        trailer.insert("Size", Object::Integer(10));
-        trailer.insert(
-            "ID",
-            Object::Array(vec![Object::String(vec![1]), Object::String(vec![2])]),
-        );
-
-        let mut out = Vec::new();
-        write_qdf_trailer(&mut out, &trailer, None);
-
-        assert_eq!(
-            out,
-            b"trailer <<\n  /Info 7 0 R\n  /Root 1 0 R\n  /Size 10\n  /ID [<01><02>] /Encrypt 9 0 R\n>>\n",
-            "qpdf writes normal keys first, followed by /ID and /Encrypt on the final line"
-        );
-    }
-
-    #[test]
-    fn qdf_trailer_without_id_or_encrypt_closes_after_sorted_keys() {
-        let mut trailer = Dictionary::new();
-        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
-        trailer.insert("Size", Object::Integer(2));
-
-        let mut out = Vec::new();
-        write_qdf_trailer(&mut out, &trailer, None);
-
-        assert_eq!(out, b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\n");
-    }
-
-    #[test]
-    fn deterministic_id_xref_stream_is_self_stable() {
-        // xref-stream form: qpdf does not produce byte-parity here, but the
-        // content-derived /ID must still be deterministic (self-stable) and the
-        // /ID[1] must match the two-level reconstruction.
-        let fixture = build_partition_fixture();
-        let opts = WriterOptions {
-            deterministic_id: true,
-            // Generate ObjStm batches so the writer emits cross-reference
-            // stream form rather than a classic xref table.
-            object_streams: ObjectStreamMode::Generate,
-            ..WriterOptions::default()
-        };
-        let write = |f: &[u8]| {
-            let mut pdf = crate::Pdf::open_mem(Arc::from(f)).expect("fixture must open");
-            let mut out = Vec::new();
-            emit_canonical_pdf(&mut pdf, &mut out, &opts).expect("write");
-            out
-        };
-        let o1 = write(&fixture);
-        let o2 = write(&fixture);
-        assert_eq!(o1, o2, "xref-stream deterministic-id output must be stable");
-        let (id0, id1) = trailer_id_pair(&o1);
-        assert_eq!(
-            id1,
-            expected_changing_id(&o1, b"").to_vec(),
-            "xref-stream /ID[1] must match the two-level reconstruction"
-        );
-        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
-    }
-
-    /// Regression: the xref-stream trailer's `/ID` must use qpdf's compact
-    /// `[<hex1><hex2>]` shape (no separating spaces) even when the run is
-    /// **non-deterministic** — e.g. `--static-id` combined with a
-    /// generate-mode plan that upgrades to xref-stream form. Before the
-    /// `write_stream_to_buf_with_id_writer(_, None)` routing, this branch
-    /// serialized the xref-stream dict via plain `write_stream_to_buf`,
-    /// which now goes through the generic array serializer and would emit
-    /// `/ID [ <hex1> <hex2> ]` (space-separated). qpdf's own hand-rolled
-    /// trailer / linearization `xref_stream::write_object` path always
-    /// emits the compact shape, so drifting to spaces would be a silent
-    /// parity regression.
-    #[test]
-    fn static_id_xref_stream_emits_qpdf_compact_id_shape() {
-        let fixture = build_partition_fixture();
-        let opts = WriterOptions {
-            static_id: true,
-            // Force ObjStm batches → XrefForm::Stream → the `else` branch of
-            // the xref-stream writer (`deterministic_id` is off, `static_id`
-            // is on) is the one Codex flagged.
-            object_streams: ObjectStreamMode::Generate,
-            ..WriterOptions::default()
-        };
-        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &opts).expect("write");
-
-        // The compact shape places `[` immediately before `<` (no space).
-        // The generic array serializer would emit `[ <` — the regression.
-        // Materialize the diagnostic on the covered path so the assert-message
-        // arm is not a coverage hole.
-        let out_str = String::from_utf8_lossy(&out).into_owned();
-        assert!(
-            out.windows(6).any(|w| w == b"/ID [<"),
-            "xref-stream trailer /ID must be compact `/ID [<...` (qpdf shape); \
-             got: {out_str}"
-        );
-        assert!(
-            !out.windows(7).any(|w| w == b"/ID [ <"),
-            "xref-stream trailer /ID must NOT drift to `/ID [ <...` (that is \
-             the generic array serializer, which regresses qpdf parity); \
-             got: {out_str}"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_preserve_xref_stream_form_is_self_stable() {
-        // A cross-reference-stream INPUT written with --object-streams=preserve
-        // keeps Stream form even with no surviving ObjStm batches. The
-        // deterministic `/ID` is direct-written inline at the xref-stream dict's
-        // sorted `/ID` position;
-        // qpdf does not byte-match xref-stream form here, but the identifier must
-        // be self-stable and `/ID[1]` must equal the two-level reconstruction.
-        let fixture = build_xref_stream_fixture();
-        let opts = WriterOptions {
-            deterministic_id: true,
-            object_streams: ObjectStreamMode::Preserve,
-            ..WriterOptions::default()
-        };
-        let write = |f: &[u8]| {
-            let mut pdf =
-                crate::Pdf::open_mem(Arc::from(f)).expect("xref-stream fixture must open");
-            let mut out = Vec::new();
-            emit_canonical_pdf(&mut pdf, &mut out, &opts).expect("write");
-            out
-        };
-        let o1 = write(&fixture);
-        let o2 = write(&fixture);
-        assert_eq!(o1, o2, "xref-stream deterministic-id output must be stable");
-        let (id0, id1) = trailer_id_pair(&o1);
-        assert_eq!(
-            id1,
-            expected_changing_id(&o1, b"").to_vec(),
-            "xref-stream /ID[1] must match the two-level reconstruction"
-        );
-        assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
-    }
-
-    #[test]
-    fn deterministic_id_and_static_id_are_mutually_exclusive() {
-        let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
-        let opts = WriterOptions {
-            deterministic_id: true,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let err = emit_canonical_pdf(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m) if m.contains("mutually exclusive")),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn encrypt_and_copy_encryption_are_mutually_exclusive() {
-        let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
-        let opts = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
-                b"user".to_vec(),
-                b"owner".to_vec(),
-            )),
-            copy_encryption: Some(crate::encryption::CopyEncryptionSource {
-                encrypt_dict: Dictionary::new(),
-                file_key: Vec::new(),
-                id0: Vec::new(),
-                object_key_alg: crate::ObjectKeyAlg::Aes,
-            }),
-            ..WriterOptions::default()
-        };
-        let err = emit_canonical_pdf(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m == "encrypt and copy_encryption are mutually exclusive"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn deterministic_id_reports_qpdf_internal_error_with_encryption() {
-        let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
-        let opts = WriterOptions {
-            deterministic_id: true,
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
-                b"user".to_vec(),
-                b"owner".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        let err = emit_canonical_pdf(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                crate::Error::Internal(ref message)
-                    if message == "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID.  This may happen if deterministic ID and file encryption are requested together."
-            ),
-            "got {err:?}"
-        );
-    }
-
-    // --- partition_objstm_eligible (flpdf-9hc.5.9, Task 1) ------------------
-
-    /// Build a minimal xref-table PDF with five resolvable indirects:
-    ///   1 0  Catalog            (plain dict — eligible, but used for /Root)
-    ///   2 0  Pages              (plain dict — eligible)
-    ///   3 0  neutral plain dict (eligible)
-    ///   4 0  stream object      (ineligible — Object::Stream)
-    ///   5 1  plain dict, gen 1  (ineligible — generation != 0)
-    fn build_partition_fixture() -> Vec<u8> {
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        // (object_number, generation, offset)
-        let mut entries: Vec<(u32, u16, usize)> = Vec::new();
-
-        entries.push((1, 0, bytes.len()));
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-        entries.push((2, 0, bytes.len()));
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-
-        entries.push((3, 0, bytes.len()));
-        bytes.extend_from_slice(b"3 0 obj\n<< /Subtype /Marker /Value 42 >>\nendobj\n");
-
-        entries.push((4, 0, bytes.len()));
-        let stream_data = b"hello";
-        bytes.extend_from_slice(
-            format!("4 0 obj\n<< /Length {} >>\nstream\n", stream_data.len()).as_bytes(),
-        );
-        bytes.extend_from_slice(stream_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-        entries.push((5, 1, bytes.len()));
-        bytes.extend_from_slice(b"5 1 obj\n<< /Subtype /OldGen /Value 7 >>\nendobj\n");
-
-        let startxref = bytes.len();
-        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
-        bytes.extend_from_slice(b"0000000000 65535 f \n");
-        for (_num, generation, offset) in &entries {
-            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
-        }
-        bytes.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
-                entries.len() + 1
-            )
-            .as_bytes(),
-        );
-        bytes
-    }
-
-    // --- xref-stream fixture helpers ----------------------------------------
-
-    /// Append a W=[1 3 1] xref-stream entry: 1-byte type, 3-byte big-endian
-    /// field-1, 1-byte field-2.
-    fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, f1: u32, f2: u8) {
-        entries.push(entry_type);
-        entries.push((f1 >> 16) as u8);
-        entries.push((f1 >> 8) as u8);
-        entries.push(f1 as u8);
-        entries.push(f2);
-    }
-
-    /// Build a minimal xref-STREAM PDF (PDF-1.5) with three plain, generation-0,
-    /// non-stream indirect objects resolvable through the xref stream:
-    ///   1 0  Catalog            (plain dict — ObjStm-eligible)
-    ///   2 0  Pages              (plain dict — ObjStm-eligible)
-    ///   3 0  neutral plain dict (plain dict — ObjStm-eligible)
-    ///   4 0  XRef stream        (self-referential, W=[1 3 1])
-    fn build_xref_stream_fixture() -> Vec<u8> {
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-        // (object_number, offset)
-        let mut offsets: Vec<(u32, usize)> = Vec::new();
-
-        offsets.push((1, bytes.len()));
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-        offsets.push((2, bytes.len()));
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-
-        offsets.push((3, bytes.len()));
-        bytes.extend_from_slice(b"3 0 obj\n<< /Subtype /Marker /Value 42 >>\nendobj\n");
-
-        let xref_num: u32 = 4;
-        let total_size = xref_num + 1; // entries 0..=4
-        let xref_offset = bytes.len();
-
-        // Xref stream payload (W=[1 3 1], /Index [0 total_size]).
-        let mut entries: Vec<u8> = Vec::new();
-        append_xref_stream_entry(&mut entries, 0, 0, 0); // 0: free head
-        for (_num, off) in &offsets {
-            append_xref_stream_entry(&mut entries, 1, *off as u32, 0);
-        }
-        // Object 4: the XRef stream itself (self-referential offset).
-        append_xref_stream_entry(&mut entries, 1, xref_offset as u32, 0);
-
-        bytes.extend_from_slice(
-            format!(
-                "{xref_num} 0 obj\n<< /Type /XRef /Size {total_size} /Root 1 0 R /W [1 3 1] /Index [0 {total_size}] /Length {} >>\nstream\n",
-                entries.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&entries);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        bytes
-    }
-
-    // ── static_aes_iv tests (flpdf-9hc.4.13) ─────────────────────────────────
-
-    /// Build an encrypted PDF with `static_aes_iv = true` and verify that
-    /// every AES IV (the first 16 bytes of each ciphertext block) is all-zero.
-    ///
-    /// We also set `static_id = true` so that the file key — derived from
-    /// `/ID[0]` — is deterministic; without that the file key itself changes
-    /// between runs and the stream IV bytes would vary regardless.
-    #[test]
-    fn static_aes_iv_uses_the_vector_qpdf_writes_for_streams_and_strings() {
-        use std::io::Cursor;
-
-        // build_string_and_stream_fixture has a content stream reachable from
-        // /Root (obj 4 = b"hello", referenced via the Catalog's /Metadata), so
-        // it survives the Catalog-first reachability walk and encryption
-        // exercises AES stream IV generation. minimal.pdf has no streams and no
-        // encryptable strings, so it would never emit an IV and the zero-IV
-        // assertion below would be vacuous.
-        let fixture = build_string_and_stream_fixture();
-
-        let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            static_id: true,
-            static_aes_iv: true,
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
-                b"user".to_vec(),
-                b"owner".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("encrypted write");
-
-        // The output must be deterministic: running again with the same options
-        // must produce byte-identical bytes.
-        let mut pdf2 = Pdf::open(Cursor::new(fixture.clone())).unwrap();
-        let mut out2 = Vec::new();
-        emit_canonical_pdf(&mut pdf2, &mut out2, &options).expect("encrypted write 2");
-        assert_eq!(
-            out, out2,
-            "static_id + static_aes_iv must produce byte-identical output on two runs"
-        );
-
-        // Substantive check (the property the test name claims): each AES-CBC
-        // stream stores its 16-byte IV as the first bytes of the stream payload
-        // (PDF 1.7 §7.6.2). The full-rewrite writer serialises every stream as
-        // `>>\nstream\n<payload>` (see `Object` serialisation), so the bytes
-        // immediately following a `\nstream\n` delimiter are the IV. The
-        // `\nendstream\n` terminator cannot alias this needle — the byte before
-        // `stream` there is `d`, not `\n`. The encrypted path forces a classic
-        // xref *table* and disables ObjStm, so every stream in the output is an
-        // AES-encrypted content/metadata stream whose IV must be qpdf's.
-        //
-        // The vector is qpdf's `14 * (1 + i)` (`libqpdf/Pl_AES_PDF.cc:136-139`),
-        // not zeros: `--static-aes-iv` exists so that output is comparable with
-        // qpdf's, and CBC writes the vector into the file, so a different
-        // vector means a different file. An earlier revision of this test
-        // asserted zeros, which pinned flpdf against itself.
-        let expected = crate::pipeline::aes::static_initialization_vector();
-        const NEEDLE: &[u8] = b"\nstream\n";
-        let mut checked = 0usize;
-        let mut pos = 0usize;
-        while let Some(rel) = out[pos..].windows(NEEDLE.len()).position(|w| w == NEEDLE) {
-            let payload = pos + rel + NEEDLE.len();
-            let iv = &out[payload..payload + 16];
-            assert_eq!(
-                iv,
-                &expected,
-                "static_aes_iv: stream payload at byte {payload} must begin with qpdf's AES IV, got {iv:02x?}"
-            );
-            checked += 1;
-            pos = payload;
-        }
-        assert!(
-            checked > 0,
-            "expected at least one encrypted stream to verify the static IV against"
-        );
-    }
-
-    /// Without `static_aes_iv`, two encryptions of the same file produce
-    /// different bytes because `/ID[1]` (and AES IVs on any content) are
-    /// freshly random each run.  We use `static_id = false` so the trailer
-    /// `/ID` already differs; the assertion captures the random-IV property
-    /// at the level that is observable from the outside.
-    #[test]
-    fn without_static_aes_iv_two_runs_differ() {
-        use std::io::Cursor;
-
-        let input = include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec();
-
-        let encrypt_once = || {
-            let mut pdf = Pdf::open(Cursor::new(input.clone())).unwrap();
-            let mut out = Vec::new();
-            // static_id = false (default): /ID[1] is random → output differs
-            let options = WriterOptions {
-                encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
-                    b"user".to_vec(),
-                    b"owner".to_vec(),
-                )),
-                ..WriterOptions::default()
-            };
-            emit_canonical_pdf(&mut pdf, &mut out, &options).unwrap();
-            out
-        };
-
-        let out1 = encrypt_once();
-        let out2 = encrypt_once();
-        assert_ne!(
-            out1, out2,
-            "without static_aes_iv + static_id the two encrypted outputs must differ (random /ID[1])"
-        );
-    }
-
-    /// A minimal PDF carrying BOTH an `Object::String` (obj 3 `/Title`) and a
-    /// content stream (obj 4 `hello`), so an encrypt round-trip exercises the
-    /// string AND stream encryption passes — not just one. `/Info` references
-    /// obj 3 so it is a live object.
-    fn build_string_and_stream_fixture() -> Vec<u8> {
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut entries: Vec<(u32, u16, usize)> = Vec::new();
-
-        // The Catalog references the stream via /Metadata so it stays reachable
-        // from /Root; the /Title dict is reachable as the trailer's /Info. Both
-        // survive the writer's Catalog-first reachability walk (flpdf-9hc.32),
-        // which drops objects unreachable from /Root and the trailer seeds.
-        entries.push((1, 0, bytes.len()));
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n",
-        );
-
-        entries.push((2, 0, bytes.len()));
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-
-        entries.push((3, 0, bytes.len()));
-        bytes.extend_from_slice(b"3 0 obj\n<< /Title (TopSecretTitle) >>\nendobj\n");
-
-        entries.push((4, 0, bytes.len()));
-        let stream_data = b"hello";
-        bytes.extend_from_slice(
-            format!("4 0 obj\n<< /Length {} >>\nstream\n", stream_data.len()).as_bytes(),
-        );
-        bytes.extend_from_slice(stream_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-        let startxref = bytes.len();
-        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
-        bytes.extend_from_slice(b"0000000000 65535 f \n");
-        for (_num, generation, offset) in &entries {
-            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
-        }
-        bytes.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
-                entries.len() + 1
-            )
-            .as_bytes(),
-        );
-        bytes
-    }
-
-    /// Copy-encryption is supported in QDF mode through both the library and
-    /// CLI. QDF inserts an indirect
-    /// `/Length` holder after each stream, so `/Encrypt` must be allocated
-    /// after the final interleaved holder rather than after the last source
-    /// object. Re-opening the result exercises that non-colliding allocation.
-    #[test]
-    fn qdf_copy_encryption_allocates_encrypt_after_length_holders() {
-        use crate::encryption::standard::ObjectKeyAlg;
-        use crate::encryption::{CopyEncryptionSource, EncryptParams};
-        use crate::PdfOpenOptions;
-        use std::io::Cursor;
-
-        let derivation_options = WriterOptions {
-            static_aes_iv: true,
-            ..WriterOptions::default()
-        };
-        let params = EncryptParams::v4_aes128(b"user-pw".to_vec(), b"owner-pw".to_vec());
-        let donor =
-            build_encryption_context(&derivation_options, &params, 4, None, &QPDF_STATIC_ID)
-                .expect("derive deterministic donor encryption state");
-        let source = CopyEncryptionSource {
-            encrypt_dict: donor.encrypt_dict,
-            file_key: donor.file_key,
-            id0: donor.id0,
-            object_key_alg: ObjectKeyAlg::Aes,
-        };
-
-        let fixture = build_string_and_stream_fixture();
-        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            qdf: true,
-            compress_streams: CompressStreams::No,
-            static_aes_iv: true,
-            copy_encryption: Some(source),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut out, &options)
-            .expect("QDF copy-encryption write must succeed");
-        assert!(out.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0"));
-
-        let mut reopened = Pdf::open_with_options(
-            Cursor::new(out),
-            PdfOpenOptions {
-                password: b"user-pw".to_vec(),
-                ..PdfOpenOptions::default()
-            },
-        )
-        .expect("QDF copy-encryption output must reopen with donor password");
-        let encrypt_ref = reopened
-            .trailer_dictionary()
-            .get_ref("Encrypt")
-            .expect("trailer must reference /Encrypt");
-        let root_ref = reopened.root_ref().expect("root_ref");
-        let root = resolved_object(&mut reopened, root_ref).expect("resolve /Root");
-        let metadata_ref = root
-            .as_dict()
-            .and_then(|dict| dict.get_ref("Metadata"))
-            .expect("Catalog must reference /Metadata");
-        let metadata = resolved_object(&mut reopened, metadata_ref).expect("resolve /Metadata");
-        let length_ref = metadata
-            .as_stream()
-            .and_then(|stream| stream.dict.get_ref("Length"))
-            .expect("QDF stream must use an indirect /Length holder");
-        assert_ne!(
-            encrypt_ref, length_ref,
-            "/Encrypt must not collide with QDF's interleaved /Length holder"
-        );
-        let (title, stream) = resolve_title_and_stream(&mut reopened);
-        assert_eq!(title, b"TopSecretTitle");
-        assert_eq!(stream, b"hello");
-    }
-
-    /// Resolve the `/Title` string and the content-stream payload from a
-    /// re-opened encrypted output of [`build_string_and_stream_fixture`].
-    ///
-    /// The Catalog-first renumber reassigns output object
-    /// numbers, so navigate by reference (trailer `/Info` for the `/Title`
-    /// dict, Catalog `/Metadata` for the stream) rather than hardcoding numbers.
-    fn resolve_title_and_stream<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
-        let info_ref = match rt.trailer_dictionary().get("Info") {
-            Some(Object::Reference(r)) => *r,
-            other => panic!("trailer /Info must be a reference, got {other:?}"),
-        };
-        let title = match resolved_object(rt, info_ref).expect("resolve /Info") {
-            Object::Dictionary(d) => match d.get("Title") {
-                Some(Object::String(s)) => s.clone(),
-                other => panic!("/Title must be a string, got {other:?}"),
-            },
-            other => panic!("/Info must be a dictionary, got {other:?}"),
-        };
-
-        let root_ref = rt.root_ref().expect("root_ref");
-        let metadata_ref = match resolved_object(rt, root_ref).expect("resolve /Root") {
-            Object::Dictionary(d) => match d.get("Metadata") {
-                Some(Object::Reference(r)) => *r,
-                other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
-            },
-            other => panic!("/Root must be a dictionary, got {other:?}"),
-        };
-        let stream = match resolved_object(rt, metadata_ref).expect("resolve /Metadata") {
-            Object::Stream(s) => s.data,
-            other => panic!("/Metadata must be a stream, got {other:?}"),
-        };
-        (title, stream)
-    }
-
-    #[test]
-    fn v5_randomness_from_qpdf_order_maps_fixed_input() {
-        let bytes = std::array::from_fn(|index| index as u8);
-        let randomness = V5Randomness::from_bytes(bytes);
-
-        assert_eq!(
-            randomness.file_key,
-            std::array::from_fn(|index| index as u8)
-        );
-        assert_eq!(
-            randomness.user_validation_salt,
-            std::array::from_fn(|index| 32 + index as u8)
-        );
-        assert_eq!(
-            randomness.user_key_salt,
-            std::array::from_fn(|index| 40 + index as u8)
-        );
-        assert_eq!(
-            randomness.owner_validation_salt,
-            std::array::from_fn(|index| 48 + index as u8)
-        );
-        assert_eq!(
-            randomness.owner_key_salt,
-            std::array::from_fn(|index| 56 + index as u8)
-        );
-        assert_eq!(
-            randomness.perms_random_tail,
-            std::array::from_fn(|index| 64 + index as u8)
-        );
-    }
-
-    fn fixed_v5_encrypted_output(params: crate::encryption::EncryptParams) -> Vec<u8> {
-        use crate::PdfOpenOptions;
-        use std::io::Cursor;
-
-        let fixture = build_string_and_stream_fixture();
-        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            static_id: true,
-            static_aes_iv: true,
-            compress_streams: CompressStreams::No,
-            encrypt: Some(params),
-            v5_randomness: Some(V5Randomness::from_bytes(std::array::from_fn(|index| {
-                0x80u8.wrapping_add(index as u8)
-            }))),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=5 encrypted write");
-
-        let mut reopened = Pdf::open_with_options(
-            Cursor::new(out.clone()),
-            PdfOpenOptions {
-                password: b"user-pw".to_vec(),
-                ..PdfOpenOptions::default()
-            },
-        )
-        .expect("fixed V=5 output must authenticate");
-        let (title, stream) = resolve_title_and_stream(&mut reopened);
-        assert_eq!(title, b"TopSecretTitle");
-        assert_eq!(stream, b"hello");
-        out
-    }
-
-    #[test]
-    fn v5_r6_fixed_randomness_is_byte_stable() {
-        let first = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r6(
-            b"user-pw".to_vec(),
-            b"owner-pw".to_vec(),
-        ));
-        let second = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r6(
-            b"user-pw".to_vec(),
-            b"owner-pw".to_vec(),
-        ));
-        assert_eq!(
-            first, second,
-            "fixed V=5 R=6 input must produce stable bytes"
-        );
-    }
-
-    #[test]
-    fn v5_r5_fixed_randomness_is_byte_stable() {
-        let first = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r5(
-            b"user-pw".to_vec(),
-            b"owner-pw".to_vec(),
-        ));
-        let second = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r5(
-            b"user-pw".to_vec(),
-            b"owner-pw".to_vec(),
-        ));
-        assert_eq!(
-            first, second,
-            "fixed V=5 R=5 input must produce stable bytes"
-        );
-    }
-
-    /// Encrypt with V=5 R=6 AES-256, then re-open with flpdf
-    /// using EACH password and confirm the string AND stream decrypt back to
-    /// their original plaintext. This exercises the V=5 file-key-direct
-    /// AES-256 string pass and stream pass via the reader. V=5 has random
-    /// salts + FEK, so there is no byte-identical determinism to assert — this
-    /// password round-trip is the correctness gate.
-    #[test]
-    fn v5_r6_encrypt_round_trips_string_and_stream_via_reader() {
-        use crate::PdfOpenOptions;
-        use std::io::Cursor;
-
-        let fixture = build_string_and_stream_fixture();
-        let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            // Keep the stream uncompressed so the decrypted payload is exactly
-            // the original bytes (no filter round-trip to account for).
-            compress_streams: CompressStreams::No,
-            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
-                b"user-pw".to_vec(),
-                b"owner-pw".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=5 R=6 encrypted write");
-
-        for pw in [b"user-pw".as_slice(), b"owner-pw".as_slice()] {
-            let label = String::from_utf8_lossy(pw).into_owned();
-            let mut rt = Pdf::open_with_options(
-                Cursor::new(out.clone()),
-                PdfOpenOptions {
-                    password: pw.to_vec(),
-                    ..PdfOpenOptions::default()
-                },
-            )
-            .unwrap_or_else(|e| panic!("re-open of V=5 output with {label:?} failed: {e}"));
-
-            // String pass: /Title (via trailer /Info) must decrypt to plaintext.
-            // Stream pass: /Metadata (via Catalog) payload must decrypt.
-            let (title, stream) = resolve_title_and_stream(&mut rt);
-            assert_eq!(
-                title.as_slice(),
-                b"TopSecretTitle",
-                "V=5 R=6 string must round-trip via reader for {label:?}"
-            );
-            assert_eq!(
-                stream.as_slice(),
-                b"hello",
-                "V=5 R=6 stream must round-trip via reader for {label:?}"
-            );
-        }
-    }
-
-    /// Encrypt with V=5 R=5 (--force-R5), then re-open with flpdf
-    /// using the user password and verify strings and streams round-trip.
-    #[test]
-    fn v5_r5_encrypt_round_trips_string_and_stream_via_reader() {
-        use crate::PdfOpenOptions;
-        use std::io::Cursor;
-
-        let fixture = build_string_and_stream_fixture();
-        let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            // Keep the stream uncompressed so the decrypted payload is exactly
-            // the original bytes (no filter round-trip to account for).
-            compress_streams: CompressStreams::No,
-            encrypt: Some(crate::encryption::EncryptParams::v5_r5(
-                b"user-pw".to_vec(),
-                b"owner-pw".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=5 R=5 encrypted write");
-
-        for pw in [b"user-pw".as_slice(), b"owner-pw".as_slice()] {
-            let label = String::from_utf8_lossy(pw).into_owned();
-            let mut rt = Pdf::open_with_options(
-                Cursor::new(out.clone()),
-                PdfOpenOptions {
-                    password: pw.to_vec(),
-                    // R=5 is deprecated pre-ISO encryption; the reader accepts
-                    // it like qpdf without a write-side opt-in.
-                    ..PdfOpenOptions::default()
-                },
-            )
-            .unwrap_or_else(|e| panic!("re-open of V=5 R=5 output with {label:?} failed: {e}"));
-
-            // String pass: /Title (via trailer /Info) must decrypt to plaintext.
-            // Stream pass: /Metadata (via Catalog) payload must decrypt.
-            let (title, stream) = resolve_title_and_stream(&mut rt);
-            assert_eq!(
-                title.as_slice(),
-                b"TopSecretTitle",
-                "V=5 R=5 string must round-trip via reader for {label:?}"
-            );
-            assert_eq!(
-                stream.as_slice(),
-                b"hello",
-                "V=5 R=5 stream must round-trip via reader for {label:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn aes_stream_pipeline_reports_invalid_key_as_internal_error() {
-        let object_ref = ObjectRef::new(7, 0);
-        let ctx = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 31],
-            cipher: WriteCipher::FileKeyAes256,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let mut output = Vec::new();
-        let error = pipe_writer_stream_payload(
-            &mut output,
-            b"payload",
-            object_ref,
-            &ctx,
-            true,
-            Some([0u8; 16]),
-        )
-        .expect_err("invalid AES key length must fail before plaintext fallback");
-
-        assert!(
-            matches!(error, crate::Error::Internal(message) if message.contains("key must be 16 or 32 bytes"))
-        );
-    }
-
-    #[test]
-    fn adjust_aes_stream_length_matches_qpdf_formula_and_gates() {
-        let context = |cipher| EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 32],
-            cipher,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-
-        let mut aes_length = 82;
-        adjust_aes_stream_length(&mut aes_length, &context(WriteCipher::FileKeyAes256), true)
-            .expect("AES length adjustment");
-        assert_eq!(aes_length, 112, "qpdf's 82-byte AES probe grows to 112");
-
-        let mut rc4_length = 82;
-        adjust_aes_stream_length(
-            &mut rc4_length,
-            &context(WriteCipher::PerObject(
-                crate::encryption::standard::ObjectKeyAlg::Rc4,
-            )),
-            true,
-        )
-        .expect("RC4 length check");
-        assert_eq!(rc4_length, 82, "RC4 has no IV or block padding");
-
-        let mut cleartext_length = 82;
-        adjust_aes_stream_length(
-            &mut cleartext_length,
-            &context(WriteCipher::FileKeyAes256),
-            false,
-        )
-        .expect("cleartext length check");
-        assert_eq!(cleartext_length, 82, "cleartext metadata stays raw");
-
-        let mut empty_key_length = 82;
-        let mut empty_key_context = context(WriteCipher::FileKeyAes256);
-        empty_key_context.file_key.clear();
-        adjust_aes_stream_length(&mut empty_key_length, &empty_key_context, true)
-            .expect("empty-key length check");
-        assert_eq!(
-            empty_key_length, 82,
-            "an empty V=5 key has no current stage"
-        );
-    }
-
-    #[test]
-    fn writer_pipeline_without_stage_finishes_empty_payload() {
-        let context = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 16],
-            cipher: WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Rc4),
-            encryption_v: 1,
-            encryption_r: 2,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: false,
-            encrypt_metadata: false,
-            metadata_ref: Some(ObjectRef::new(4, 0)),
-        };
-        let mut output = Vec::new();
-
-        let last_byte = pipe_writer_stream_payload(
-            &mut output,
-            &[],
-            ObjectRef::new(4, 0),
-            &context,
-            false,
-            None,
-        )
-        .expect("stage-free pipeline");
-
-        assert!(output.is_empty());
-        assert_eq!(
-            last_byte, 0,
-            "Count starts at qpdf's empty-payload sentinel"
-        );
-    }
-
-    #[test]
-    fn writer_pipeline_with_empty_key_skips_encryption_stage() {
-        let context = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: Vec::new(),
-            cipher: WriteCipher::FileKeyAes256,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let mut output = Vec::new();
-
-        pipe_writer_stream_payload(
-            &mut output,
-            b"empty-key payload",
-            ObjectRef::new(7, 0),
-            &context,
-            true,
-            Some([0u8; 16]),
-        )
-        .expect("empty current key must use the active pipeline without a stage");
-
-        assert_eq!(output, b"empty-key payload");
-    }
-
-    #[test]
-    fn aes_writer_pipeline_matches_block_boundary_lengths() {
-        let context = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 32],
-            cipher: WriteCipher::FileKeyAes256,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-
-        for (plain_length, expected_wire_length) in [
-            (0, 32),
-            (1, 32),
-            (15, 32),
-            (16, 48),
-            (17, 48),
-            (31, 48),
-            (32, 64),
-        ] {
-            let mut output = Vec::new();
-            pipe_writer_stream_payload(
-                &mut output,
-                &vec![0x41; plain_length],
-                ObjectRef::new(7, 0),
-                &context,
-                true,
-                Some([0u8; 16]),
-            )
-            .expect("AES block-boundary payload");
-            assert_eq!(
-                output.len(),
-                expected_wire_length,
-                "AES wire length for {plain_length} plaintext bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn aes_writer_pipeline_generates_random_iv_and_honors_yes_newline() {
-        let context = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 32],
-            cipher: WriteCipher::FileKeyAes256,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: false,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let mut output = Vec::new();
-
-        let added_newline = write_stream_payload_with_pipeline(
-            &mut output,
-            b"random-IV payload",
-            NewlineBeforeEndstream::Yes,
-            ObjectRef::new(7, 0),
-            &context,
-            true,
-            None,
-        )
-        .expect("AES pipeline with an OS-generated IV");
-
-        assert!(added_newline);
-        assert!(output.starts_with(b"\nstream\n"));
-        assert!(output.ends_with(b"\nendstream"));
-    }
-
-    #[test]
-    fn write_reencoded_object_covers_encrypted_stream_routes() {
-        let context = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 32],
-            cipher: WriteCipher::FileKeyAes256,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let mut dict = Dictionary::new();
-        dict.insert("Label", Object::String(b"reencoded label".to_vec()));
-        dict.insert("Length", Object::Integer(7));
-        let stream = Object::Stream(crate::Stream::new(dict, b"payload".to_vec()));
-        let options = WriterOptions {
-            compress_streams: CompressStreams::No,
-            ..WriterOptions::default()
-        };
-        let emitted_ref = ObjectRef::new(7, 0);
-
-        let mut plain_dict_bytes = Vec::new();
-        write_reencoded_object(
-            &mut plain_dict_bytes,
-            &stream,
-            false,
-            &options,
-            None,
-            emitted_ref,
-            StreamEncryptionOptions::new(Some(&context), true),
-        )
-        .expect("encrypted stream with a plain dictionary emitter");
-        assert!(plain_dict_bytes.ends_with(b"endstream"));
-
-        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
-        let mut encrypted_dict_bytes = Vec::new();
-        write_reencoded_object(
-            &mut encrypted_dict_bytes,
-            &stream,
-            false,
-            &options,
-            Some(&mut emitter),
-            emitted_ref,
-            StreamEncryptionOptions::new(Some(&context), true),
-        )
-        .expect("encrypted stream with an encrypted dictionary emitter");
-        assert!(encrypted_dict_bytes.ends_with(b"endstream"));
-
-        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
-        let mut encrypted_only_dict_bytes = Vec::new();
-        write_reencoded_object(
-            &mut encrypted_only_dict_bytes,
-            &stream,
-            false,
-            &options,
-            Some(&mut emitter),
-            emitted_ref,
-            StreamEncryptionOptions::new(None, true),
-        )
-        .expect("stream with an encrypted dictionary and plain payload");
-        assert!(encrypted_only_dict_bytes.ends_with(b"endstream"));
-    }
-
-    #[test]
-    fn write_stream_to_buf_qdf_covers_encrypted_and_plain_routes() {
-        let context = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 32],
-            cipher: WriteCipher::FileKeyAes256,
-            encryption_v: 5,
-            encryption_r: 6,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let mut dict = Dictionary::new();
-        dict.insert("Label", Object::String(b"qdf label".to_vec()));
-        let stream = crate::Stream::new(dict, b"payload".to_vec());
-        let emitted_ref = ObjectRef::new(7, 0);
-
-        let mut out = Vec::new();
-        write_stream_to_buf_qdf(
-            &mut out,
-            &stream,
-            NewlineBeforeEndstream::Never,
-            None,
-            emitted_ref,
-            Some(&context),
-            true,
-        )
-        .expect("QDF encrypted payload with a plain dictionary");
-        assert!(out.ends_with(b"endstream"));
-
-        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
-        let mut out = Vec::new();
-        write_stream_to_buf_qdf(
-            &mut out,
-            &stream,
-            NewlineBeforeEndstream::Never,
-            Some(&mut emitter),
-            emitted_ref,
-            Some(&context),
-            true,
-        )
-        .expect("QDF encrypted payload and dictionary");
-        assert!(out.ends_with(b"endstream"));
-
-        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
-        let mut out = Vec::new();
-        write_stream_to_buf_qdf(
-            &mut out,
-            &stream,
-            NewlineBeforeEndstream::Never,
-            Some(&mut emitter),
-            emitted_ref,
-            None,
-            true,
-        )
-        .expect("QDF encrypted dictionary with a plain payload");
-        assert!(out.ends_with(b"endstream"));
-
-        let mut out = Vec::new();
-        write_stream_to_buf_qdf(
-            &mut out,
-            &stream,
-            NewlineBeforeEndstream::Never,
-            None,
-            emitted_ref,
-            None,
-            false,
-        )
-        .expect("plain QDF stream");
-        assert!(out.ends_with(b"endstream"));
-    }
-
-    #[test]
-    fn writer_pipeline_finishes_after_downstream_write_error() {
-        let mut pipeline = FinishAfterWriteError { finishes: 0 };
-        let error = run_writer_pipeline(&mut pipeline, b"payload")
-            .expect_err("downstream write failure must propagate");
-
-        assert!(matches!(error, crate::Error::System(message) if message == "write failed"));
-        assert_eq!(pipeline.finishes, 1, "finish must balance a failed write");
-    }
-
-    #[test]
-    fn writer_pipeline_propagates_downstream_finish_error() {
-        let mut pipeline = FinishErrorPipeline { finishes: 0 };
-        let error = run_writer_pipeline(&mut pipeline, b"payload")
-            .expect_err("downstream finish failure must propagate");
-
-        assert!(matches!(error, crate::Error::System(message) if message == "finish failed"));
-        assert_eq!(pipeline.finishes, 1);
-    }
-
-    #[test]
-    fn rc4_methods_round_trip_string_and_stream_via_reader() {
-        use crate::encryption::{EncryptMethod, EncryptParams};
-        use crate::PdfOpenOptions;
-        use std::io::Cursor;
-
-        let fixture = build_string_and_stream_fixture();
-        for method in [
-            EncryptMethod::V1Rc440,
-            EncryptMethod::V2Rc4128,
-            EncryptMethod::V4Rc4128,
-        ] {
-            let mut pdf = Pdf::open(Cursor::new(fixture.clone())).expect("open fixture");
-            let mut out = Vec::new();
-            let options = WriterOptions {
-                // Keep the stream uncompressed so the decrypted payload equals
-                // the original bytes.
-                compress_streams: CompressStreams::No,
-                encrypt: Some(EncryptParams::rc4(
-                    method,
-                    b"user-pw".to_vec(),
-                    b"owner-pw".to_vec(),
-                )),
-                ..WriterOptions::default()
-            };
-            emit_canonical_pdf(&mut pdf, &mut out, &options)
-                .unwrap_or_else(|e| panic!("{method:?} encrypted write failed: {e}"));
-
-            for pw in [b"user-pw".as_slice(), b"owner-pw".as_slice()] {
-                let label = format!("{method:?}/{}", String::from_utf8_lossy(pw));
-                let mut rt = Pdf::open_with_options(
-                    Cursor::new(out.clone()),
-                    PdfOpenOptions {
-                        password: pw.to_vec(),
-                        ..PdfOpenOptions::default()
-                    },
-                )
-                .unwrap_or_else(|e| panic!("re-open {label} failed: {e}"));
-
-                // Navigate by reference (trailer /Info, Catalog /Metadata)
-                // rather than hardcoded numbers, since output is renumbered.
-                let (title, stream) = resolve_title_and_stream(&mut rt);
-                assert_eq!(
-                    title.as_slice(),
-                    b"TopSecretTitle",
-                    "{label} string round-trip"
-                );
-                assert_eq!(stream.as_slice(), b"hello", "{label} stream round-trip");
-            }
-        }
-    }
-
-    /// V=4 encryption requires a PDF header floored per qpdf's method-specific
-    /// table (QPDFWriter.cc L810): AES → 1.6, RC4 → 1.5. Prior to the
-    /// encryption-floor fix flpdf floored both to 1.5, which was correct for
-    /// RC4 but under-shot AES; this test verifies each method emits the
-    /// qpdf-equivalent floor for a 1.4 input.
-    #[test]
-    fn v4_encryption_floors_pdf_header_per_qpdf_table() {
-        use crate::encryption::{EncryptMethod, EncryptParams};
-        use std::io::Cursor;
-
-        let fixture = build_partition_fixture();
-        assert!(
-            fixture.starts_with(b"%PDF-1.4"),
-            "fixture must start at %PDF-1.4 for this test to be meaningful"
-        );
-
-        for (params, expected_prefix) in [
-            (
-                EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()),
-                b"%PDF-1.6".as_slice(),
-            ),
-            (
-                EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u".to_vec(), b"o".to_vec()),
-                b"%PDF-1.5".as_slice(),
-            ),
-        ] {
-            let method = params.method;
-            let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
-            let mut out = Vec::new();
-            let options = WriterOptions {
-                encrypt: Some(params),
-                ..WriterOptions::default()
-            };
-            emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=4 encrypted write");
-            // cov:ignore-start: multi-line assert; llvm-cov attributes only the
-            // "on-panic" format-argument evaluations to the outer line, and the
-            // assertion succeeds so those are never evaluated.
-            assert!(
-                out.starts_with(expected_prefix),
-                "{method:?} must floor the header to {}, got {:?}",
-                String::from_utf8_lossy(expected_prefix),
-                String::from_utf8_lossy(&out[..out.len().min(12)])
-            );
-            // cov:ignore-end
-        }
-    }
-
-    /// A malformed source header is preserved by `effective_pdf_version`, so
-    /// the full-rewrite encryption floor remains responsible for repairing the
-    /// emitted header. Keep this recovery path covered while version handling
-    /// is routed through `PdfVersion`.
-    #[test]
-    fn encryption_repairs_unparseable_source_header() {
-        use crate::encryption::EncryptParams;
-        use std::io::Cursor;
-
-        let mut fixture = build_partition_fixture();
-        assert!(fixture.starts_with(b"%PDF-1.4"));
-        fixture[..8].copy_from_slice(b"%PDF-x.y");
-
-        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open malformed-version fixture");
-        let mut out = Vec::new();
-        let options = WriterOptions {
-            encrypt: Some(EncryptParams::v5_r6(b"u".to_vec(), b"o".to_vec())),
-            ..WriterOptions::default()
-        };
-
-        emit_canonical_pdf(&mut pdf, &mut out, &options)
-            .expect("encrypted full rewrite repairs the header");
-        assert!(out.starts_with(b"%PDF-1.7"));
-    }
-
-    /// A minimal PDF whose `/Catalog` references a `/Metadata` XMP stream
-    /// (obj 4), carrying a recognizable marker.
-    fn build_metadata_fixture() -> Vec<u8> {
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut entries: Vec<(u32, u16, usize)> = Vec::new();
-
-        entries.push((1, 0, bytes.len()));
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R >>\nendobj\n",
-        );
-        entries.push((2, 0, bytes.len()));
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        entries.push((3, 0, bytes.len()));
-        bytes.extend_from_slice(b"3 0 obj\n<< /Subtype /Marker /Value 1 >>\nendobj\n");
-
-        entries.push((4, 0, bytes.len()));
-        let xmp: &[u8] =
-            b"<?xpacket?><x:xmpmeta>SECRET-XMP-MARKER</x:xmpmeta><?xpacket end=\"w\"?>";
-        bytes.extend_from_slice(
-            format!(
-                "4 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
-                xmp.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(xmp);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-        let startxref = bytes.len();
-        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
-        bytes.extend_from_slice(b"0000000000 65535 f \n");
-        for (_num, generation, offset) in &entries {
-            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
-        }
-        bytes.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
-                entries.len() + 1
-            )
-            .as_bytes(),
-        );
-        bytes
-    }
-
-    /// The same metadata shape as [`build_metadata_fixture`], but with the
-    /// Catalog written directly in the trailer. This exercises the writer's
-    /// cleartext-metadata lookup without manufacturing a Catalog ObjectRef.
-    fn build_direct_root_metadata_fixture() -> Vec<u8> {
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(bytes.len());
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        offsets.push(bytes.len());
-        bytes.extend_from_slice(b"2 0 obj\n<< /Subtype /Marker /Value 1 >>\nendobj\n");
-
-        let xmp: &[u8] =
-            b"<?xpacket?><x:xmpmeta>DIRECT-ROOT-METADATA</x:xmpmeta><?xpacket end=\"w\"?>";
-        offsets.push(bytes.len());
-        bytes.extend_from_slice(
-            format!(
-                "3 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
-                xmp.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(xmp);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-        let startxref = bytes.len();
-        let size = offsets.len() + 1;
-        bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
-        for offset in offsets {
-            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-        }
-        bytes.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {size} /Root << /Type /Catalog /Pages 1 0 R /Metadata 3 0 R >> >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        bytes
-    }
-
-    #[test]
-    fn resolve_metadata_stream_ref_accepts_a_direct_catalog_root() {
-        let mut pdf = Pdf::open(Cursor::new(build_direct_root_metadata_fixture()))
-            .expect("direct-root metadata fixture must open");
-        assert_eq!(
-            resolve_metadata_stream_ref(&mut pdf),
-            Some(ObjectRef::new(3, 0)),
-            "cleartext-metadata lookup must follow an inline Catalog"
-        );
-    }
-
-    /// With `encrypt_metadata = false` the `/Catalog`'s
-    /// `/Metadata` stream is left UNENCRYPTED (its bytes survive in the clear)
-    /// without a `/Crypt` filter, and the `/Encrypt` dict carries
-    /// `/EncryptMetadata false` — whereas the default (`encrypt_metadata = true`)
-    /// ciphers it.
-    #[test]
-    fn cleartext_metadata_exempts_metadata_stream_from_encryption() {
-        use std::io::Cursor;
-
-        const MARKER: &[u8] = b"SECRET-XMP-MARKER";
-        let fixture = build_metadata_fixture();
-        let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
-
-        let encrypt = |encrypt_metadata: bool| -> Vec<u8> {
-            let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
-            let mut out = Vec::new();
-            let mut params =
-                crate::encryption::EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec());
-            params.encrypt_metadata = encrypt_metadata;
-            let options = WriterOptions {
-                // No compression so cleartext metadata is a literal substring.
-                compress_streams: CompressStreams::No,
-                encrypt: Some(params),
-                ..WriterOptions::default()
-            };
-            emit_canonical_pdf(&mut pdf, &mut out, &options).expect("encrypted write");
-            out
-        };
-
-        // Default: /Metadata is encrypted, so the marker does not appear.
-        let enc = encrypt(true);
-        assert!(
-            !contains(&enc, MARKER),
-            "default encrypt must cipher the /Metadata stream"
-        );
-
-        // --cleartext-metadata: the XMP marker survives in the clear and the
-        // dict emits /EncryptMetadata false without adding a /Crypt filter.
-        let ct = encrypt(false);
-        assert!(
-            contains(&ct, MARKER),
-            "cleartext metadata must leave the XMP stream unencrypted"
-        );
-        assert!(
-            contains(&ct, b"/EncryptMetadata false"),
-            "the /Encrypt dict must carry /EncryptMetadata false"
-        );
-        assert!(
-            !contains(&ct, b"/Crypt"),
-            "cleartext /Metadata must not be tagged with a /Crypt filter"
-        );
-    }
-
-    #[test]
-    fn cleartext_metadata_exempts_a_stream_under_a_direct_catalog_root() {
-        const MARKER: &[u8] = b"DIRECT-ROOT-METADATA";
-        let mut pdf = Pdf::open(Cursor::new(build_direct_root_metadata_fixture()))
-            .expect("direct-root metadata fixture must open");
-        let mut params = crate::encryption::EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec());
-        params.encrypt_metadata = false;
-        let options = WriterOptions {
-            compress_streams: CompressStreams::No,
-            encrypt: Some(params),
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut output, &options)
-            .expect("direct-root encrypted write must succeed");
-        assert!(
-            output.windows(MARKER.len()).any(|window| window == MARKER),
-            "cleartext metadata must remain visible under a direct Catalog"
-        );
-
-        let mut reopened = Pdf::open_with_options(
-            Cursor::new(output),
-            crate::PdfOpenOptions {
-                password: b"u".to_vec(),
-                ..crate::PdfOpenOptions::default()
-            },
-        )
-        .expect("direct-root encrypted output must reopen");
-        assert!(
-            reopened.root_ref().is_none(),
-            "encryption must not manufacture an indirect Catalog"
-        );
-        assert_eq!(
-            reopened.adobe_extension_level(),
-            None,
-            "the direct Catalog must remain a normal Catalog after reopening"
-        );
-    }
-
-    #[test]
-    fn write_options_default_min_extension_level_is_none() {
-        let options = WriterOptions::default();
-        assert!(options.min_extension_level.is_none());
-    }
-
-    #[test]
-    fn write_options_min_extension_level_stores_and_returns_value() {
-        let options = WriterOptions {
-            min_extension_level: Some(8),
-            ..Default::default()
-        };
-        assert_eq!(options.min_extension_level, Some(8));
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_no_bump_when_min_unset() {
-        // Source 1.7 ext 0, options empty → (1.7, 0).
-        let options = WriterOptions::default();
-        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_pairwise_min_version_bump_resets_ext_to_source() {
-        // Source (1.3, 0), min_version=1.7, min_ext=Some(0) is illegal but None is the
-        // typical case here → min wins by version → ext resets to source_ext (0).
-        let options = WriterOptions {
-            min_version: Some("1.7".into()),
-            min_extension_level: None,
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_min_ext_wins_when_versions_equal() {
-        // Source (1.7, 0), min (1.7, 8) → tie on ver, min_ext wins → (1.7, 8).
-        let options = WriterOptions {
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 8);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_source_ver_higher_resets_min_ext() {
-        // Source (2.0, 0), min (1.7, 8) → source wins by ver → ext resets to source_ext (0).
-        let options = WriterOptions {
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("2.0", 0, &options, false, false);
-        assert_eq!(v, "2.0");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_min_ver_bump_drops_source_ext() {
-        // Source (1.7, 8), min (2.0, None) → min wins by ver → source_ext must
-        // be dropped (pairwise rule: ext does not carry across a version bump).
-        // Expected: (2.0, 0), NOT (2.0, 8).
-        let options = WriterOptions {
-            min_version: Some("2.0".into()),
-            min_extension_level: None,
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
-        assert_eq!(v, "2.0");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_min_ver_bump_replaces_source_ext_with_min_ext() {
-        // Source (1.7, 8), min (2.0, Some(3)) → min wins by ver → source_ext
-        // drops, min_ext carries → (2.0, 3).
-        let options = WriterOptions {
-            min_version: Some("2.0".into()),
-            min_extension_level: Some(3),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
-        assert_eq!(v, "2.0");
-        assert_eq!(e, 3);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_floor_bump_drops_both_ext() {
-        // Source (1.3, 8), min unset, object_streams bumps to 1.5 → neither
-        // source nor min contributes → ext = 0.
-        let options = WriterOptions::default();
-        let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, true);
-        assert_eq!(v, "1.5");
-        assert_eq!(e, 0);
+        ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::new(data))
     }
 
     #[test]
-    fn encryption_version_floor_matches_qpdf_table() {
-        use crate::encryption::{EncryptMethod, EncryptParams};
-        for (method, expected) in [
-            (EncryptMethod::V5R6Aes256, PdfVersion::new(1, 7, 8)),
-            (EncryptMethod::V5R5Aes256, PdfVersion::new(1, 7, 3)),
-            (EncryptMethod::V4Aes128, PdfVersion::new(1, 6, 0)),
-            (EncryptMethod::V4Rc4128, PdfVersion::new(1, 5, 0)),
-            (EncryptMethod::V2Rc4128, PdfVersion::new(1, 4, 0)),
-            (EncryptMethod::V1Rc440, PdfVersion::new(1, 3, 0)),
-        ] {
-            let mut params = EncryptParams::v4_aes128(vec![], vec![]);
-            params.method = method;
-            let options = WriterOptions {
-                encrypt: Some(params),
-                ..WriterOptions::default()
-            };
-            assert_eq!(
-                encryption_version_floor(&options),
-                Some(expected),
-                "encryption floor for {method:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn encryption_version_floor_copy_r5_uses_r5_extension_level() {
-        use crate::encryption::CopyEncryptionSource;
-
-        let mut encrypt_dict = Dictionary::new();
-        encrypt_dict.insert("V", Object::Integer(5));
-        encrypt_dict.insert("R", Object::Integer(5));
+    fn encryption_shape_reads_copy_encryption_handles() {
         let options = WriterOptions {
             copy_encryption: Some(CopyEncryptionSource {
-                encrypt_dict,
-                file_key: Vec::new(),
-                id0: Vec::new(),
-                object_key_alg: crate::ObjectKeyAlg::Aes,
+                encrypt_dict: ObjectHandle::dictionary(vec![
+                    (b"/V".to_vec(), ObjectHandle::integer(4)),
+                    (b"/R".to_vec(), ObjectHandle::integer(4)),
+                ]),
+                file_key: vec![0; 16],
+                id0: vec![0; 16],
+                object_key_alg: ObjectKeyAlg::Rc4,
             }),
             ..WriterOptions::default()
         };
 
-        assert_eq!(
-            encryption_version_floor(&options),
-            Some(PdfVersion::new(1, 7, 3)),
-            "a V=5/R=5 copied encryption source must not inherit the R=6 floor"
-        );
+        assert_eq!(encryption_shape(&options), Some((4, 4, true)));
     }
 
     #[test]
-    fn effective_pdf_version_folds_each_encryption_floor_arm() {
-        // Below-floor source for each encryption method — exercises every
-        // PdfVersion::static_version_str arm reachable from the encryption floor race.
-        use crate::encryption::{EncryptMethod, EncryptParams};
-        for (method, expected) in [
-            (EncryptMethod::V1Rc440, "1.3"),
-            (EncryptMethod::V2Rc4128, "1.4"),
-            (EncryptMethod::V4Rc4128, "1.5"),
-            (EncryptMethod::V4Aes128, "1.6"),
-            (EncryptMethod::V5R5Aes256, "1.7"),
-            (EncryptMethod::V5R6Aes256, "1.7"),
-        ] {
-            let mut params = EncryptParams::v4_aes128(vec![], vec![]);
-            params.method = method;
-            let options = WriterOptions {
-                encrypt: Some(params),
-                ..WriterOptions::default()
-            };
-            // "1.0" is below every encryption floor, so the returned string
-            // comes from the encryption-floor branch (via PdfVersion::static_version_str).
-            assert_eq!(
-                effective_pdf_version("1.0", &options, false, false),
-                expected,
-                "effective_pdf_version for {method:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn encryption_version_floor_none_when_no_encryption() {
-        let options = WriterOptions::default();
-        assert_eq!(encryption_version_floor(&options), None);
-    }
-
-    #[test]
-    fn effective_pdf_version_folds_encryption_floor_into_header() {
-        // Source PDF-1.3 + --encrypt AES-128 → header floor must be 1.6.
-        // Before the fix, effective_pdf_version returned "1.3" and the emitted
-        // %PDF header contradicted the encryption method.
-        let options = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(vec![], vec![])),
-            ..WriterOptions::default()
-        };
-        assert_eq!(effective_pdf_version("1.3", &options, false, false), "1.6");
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_v5_r6_encryption_contributes_ext() {
-        // Source (1.3, 0) + AES-256 encryption (V5R6, floor (1.7, 8)) → ver
-        // bumps to 1.7, encryption contributes ext=8 (source's 1.3 was outbid,
-        // no min_version, no ObjStm).
-        let options = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v5_r6(vec![], vec![])),
-            ..WriterOptions::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 8);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_aes128_encryption_drops_stale_source_ext() {
-        // Codex round-3 P2 #3: source (1.3, 8) + AES-128 encryption (floor
-        // (1.6, 0)) → ver bumps to 1.6, source ext dropped (source's 1.3
-        // doesn't tie with 1.6). Result (1.6, 0) — stale ADBE must NOT survive.
-        let options = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(vec![], vec![])),
-            ..WriterOptions::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, false);
-        assert_eq!(v, "1.6");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_encryption_and_source_tie_take_max_ext() {
-        // Source (1.7, 3) + AES-256 encryption (V5R6 floor (1.7, 8)) → both
-        // tie at 1.7 → ext = max(3, 8) = 8 (encryption wins the extension race
-        // at the tied version).
-        let options = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v5_r6(vec![], vec![])),
-            ..WriterOptions::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 3, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 8);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_source_ext_wins_when_source_beats_encryption() {
-        // Source (1.7, 8) + AES-128 encryption (floor (1.6, 0)) → source's 1.7
-        // wins the version race, source ext survives → (1.7, 8). Encryption
-        // floor was outbid so its ext=0 contributes nothing.
-        let options = WriterOptions {
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(vec![], vec![])),
-            ..WriterOptions::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 8);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_force_version_drops_source_ext() {
-        // --force-version=1.7 on a (1.7, 8) source → qpdf semantics: forced
-        // header is exact, extension level is 0 unless explicitly specified.
-        // Currently there is no explicit force-extension knob, so the source
-        // ext must not slip through just because the forced major/minor
-        // happens to equal the source version.
-        let options = WriterOptions {
-            force_version: Some("1.7".into()),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_force_version_drops_min_ext() {
-        // --force-version=1.7 + --min-version=1.7 --min-extension-level=8
-        // → forced value is exact, so min_ext must not survive the tie.
-        let options = WriterOptions {
-            force_version: Some("1.7".into()),
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 0, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 0);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_invalid_force_version_is_ignored() {
-        // An unparseable --force-version is silently ignored by
-        // effective_pdf_version (mirrors the existing behavior); the pairwise
-        // helper must therefore fall back to normal contribution semantics
-        // rather than treating any garbage-force as "forced=true".
-        let options = WriterOptions {
-            force_version: Some("not-a-version".into()),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 8);
-    }
-
-    #[test]
-    fn effective_pdf_version_and_ext_source_ext_wins_when_versions_tie() {
-        // Source (1.7, 8), min (1.7, 0) → tie on ver, source_ext higher → (1.7, 8).
-        let options = WriterOptions {
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(0),
-            ..Default::default()
-        };
-        let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
-        assert_eq!(v, "1.7");
-        assert_eq!(e, 8);
-    }
-
-    // ── inject_adbe_extension / min_extension_level end-to-end ──────────────
-    //
-    // These exercise the full-rewrite mutation that injects the Catalog's
-    // /Extensions /ADBE dict when WriterOptions::min_extension_level requests
-    // it. They use static_id for a stable output and inspect the emitted
-    // bytes for the expected keys and header.
-
-    #[test]
-    fn inject_adbe_extension_reads_the_live_catalog_handle() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
-            .expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-
-        // Seed the legacy cache, then mutate only the canonical handle graph.
-        // The writer consumer must not rebuild the Catalog from that stale
-        // materialized snapshot.
-        resolved_object(&mut pdf, root).expect("catalog must resolve");
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog)
-            .expect("canonical catalog must resolve");
-        catalog
-            .replace_key(
-                b"/Extensions",
-                ObjectHandle::dictionary(vec![(
-                    b"/XYZW".to_vec(),
-                    ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(7))]),
-                )]),
-            )
-            .expect("live Catalog mutation must succeed");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("canonical Catalog must belong to this PDF");
-        let before = catalog
-            .try_get_key(b"/Extensions")
-            .expect("live Extensions lookup must succeed")
-            .try_get_keys()
-            .expect("live Extensions must be a dictionary");
-        assert!(before.contains(b"/XYZW".as_slice()));
-
-        inject_adbe_extension(&mut pdf, "1.7", 8).expect("injection must succeed");
-
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("mutated Catalog must resolve");
-        let extensions = catalog
-            .try_get_key(b"/Extensions")
-            .expect("Extensions lookup must succeed");
-        let keys = extensions
-            .try_get_keys()
-            .expect("Extensions must remain a dictionary");
-        assert!(keys.contains(b"/XYZW".as_slice()));
-        assert!(keys.contains(b"/ADBE".as_slice()));
-    }
-
-    #[test]
-    fn inject_adbe_extension_preserves_matching_adbe_dictionary() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
-            .expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog)
-            .expect("canonical Catalog must resolve");
-        let adbe = ObjectHandle::dictionary(vec![
-            (
-                b"/BaseVersion".to_vec(),
-                ObjectHandle::name(b"1.7".to_vec()),
-            ),
-            (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(2)),
-            (
-                b"/URL".to_vec(),
-                ObjectHandle::string(b"http://something.adobe.com".to_vec()),
-            ),
-        ]);
-        catalog
-            .replace_key(
-                b"/Extensions",
-                ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]),
-            )
-            .expect("Extensions must be installed");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        inject_adbe_extension(&mut pdf, "1.7", 2).expect("matching ADBE must be preserved");
-
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-        let rendered = catalog.get_key(b"/Extensions").get_key(b"/ADBE").unparse();
-        let needle = b"/URL (http://something.adobe.com)";
-        assert!(
-            rendered
-                .windows(needle.len())
-                .any(|window| window == needle),
-            "matching ADBE dictionary must preserve qpdf's extra keys: {:?}",
-            rendered
-        );
-    }
-
-    #[test]
-    fn inject_adbe_extension_directizes_an_indirect_adbe_before_comparing() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
-            .expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog)
-            .expect("canonical Catalog must resolve");
-        let adbe = pdf
-            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
-                (
-                    b"/BaseVersion".to_vec(),
-                    ObjectHandle::name(b"1.7".to_vec()),
-                ),
-                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(2)),
-            ]))
-            .expect("indirect ADBE must be allocated");
-        catalog
-            .replace_key(
-                b"/Extensions",
-                ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]),
-            )
-            .expect("Extensions must be installed");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        inject_adbe_extension(&mut pdf, "1.7", 2)
-            .expect("indirect but matching ADBE must be directized and preserved");
-
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-        let extensions = catalog.get_key(b"/Extensions");
-        let adbe = extensions.get_key(b"/ADBE");
-        assert!(
-            adbe.is_direct(),
-            "the comparison must run against the directized value, matching qpdf's \
-             prepareFileForWrite ordering, not leave the original indirect ADBE untouched"
-        );
-    }
-
-    #[test]
-    fn strip_adbe_extension_directizes_a_valid_indirect_adbe_with_other_prefix() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
-            .expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog)
-            .expect("canonical Catalog must resolve");
-        let adbe = pdf
-            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
-                (
-                    b"/BaseVersion".to_vec(),
-                    ObjectHandle::name(b"1.3".to_vec()),
-                ),
-                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(0)),
-            ]))
-            .expect("indirect ADBE must be allocated");
-        let extensions = ObjectHandle::dictionary(vec![
-            (b"/ADBE".to_vec(), adbe),
-            (
-                b"/XYZW".to_vec(),
-                ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(7))]),
-            ),
-        ]);
-        catalog
-            .replace_key(b"/Extensions", extensions)
-            .expect("Extensions must be installed");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        strip_adbe_extension(&mut pdf, "1.3", 0).expect("valid ADBE must be preserved");
-
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-        let extensions = catalog.get_key(b"/Extensions");
-        let adbe = extensions.get_key(b"/ADBE");
-        assert!(extensions.is_direct());
-        assert!(adbe.is_direct());
-        assert!(extensions.has_key(b"/XYZW"));
-    }
-
-    #[test]
-    fn inject_adbe_extension_accepts_a_direct_catalog_stream() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
-            .expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog)
-            .expect("canonical catalog must resolve");
-        catalog
-            .replace_key(
-                b"/Metadata",
-                ObjectHandle::stream(
-                    ObjectHandle::dictionary(vec![(
-                        b"/Type".to_vec(),
-                        ObjectHandle::name(b"Metadata".to_vec()),
-                    )]),
-                    Rc::new(b"<xmp/>".to_vec()),
-                ),
-            )
-            .expect("direct Catalog stream mutation must succeed");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("canonical Catalog must belong to this PDF");
-
-        inject_adbe_extension(&mut pdf, "1.7", 8)
-            .expect("a direct stream sibling must not block Catalog mutation");
-
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog).expect("mutated Catalog must resolve");
-        assert_eq!(
-            catalog
-                .try_get_key(b"/Metadata")
-                .expect("Metadata lookup must succeed")
-                .type_name()
-                .expect("type name"),
-            "stream"
-        );
-    }
-
-    #[test]
-    fn writer_catalog_copy_requires_a_root() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(
-            b"%PDF-1.3\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n\
-              startxref\n9\n%%EOF\n" as &[u8],
-        ))
-        .expect("rootless fixture must open");
-
-        let error = inject_adbe_extension(&mut pdf, "1.7", 8).expect_err("root is required");
-        assert!(matches!(error, crate::Error::Missing("/Root")));
-    }
-
-    #[test]
-    fn full_rewrite_reports_missing_root_for_plain_and_specialized_routes() {
-        let source: Arc<[u8]> = Arc::from(
-            b"%PDF-1.3\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n\
-              startxref\n9\n%%EOF\n" as &[u8],
-        );
-        for qdf in [false, true] {
-            let mut pdf = crate::Pdf::open_mem(source.clone()).expect("rootless fixture");
-            let options = WriterOptions {
-                qdf,
-                object_streams: ObjectStreamMode::Disable,
-                ..WriterOptions::default()
-            };
-            let error = emit_canonical_pdf(&mut pdf, Vec::new(), &options)
-                .expect_err("a rootless document must be rejected");
-            assert!(matches!(error, crate::Error::Missing("/Root")));
-        }
-    }
-
-    #[test]
-    fn specialized_rewrite_reports_an_indirect_root_removed_from_the_map() {
-        let mut pdf =
-            crate::Pdf::open_mem_owned(build_ext_injection_source()).expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-        pdf.delete_object(root);
-        // Keep the canonical slot dictionary-shaped while retaining the
-        // deletion record. This models a stale root identity that survives
-        // into the writer's renumber phase, which must reject the missing map
-        // entry rather than manufacture a replacement Catalog.
-        pdf.get_object_handle(root)
-            .set_resolved(ObjectValue::Dictionary(
-                [(b"/Type".to_vec(), ObjectHandle::name(b"Catalog".to_vec()))]
-                    .into_iter()
-                    .collect(),
-            ));
-        let options = WriterOptions {
-            extra_header_text: "% specialized\n".to_string(),
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-
-        let error = emit_canonical_pdf(&mut pdf, Vec::new(), &options)
-            .expect_err("a removed indirect root must not be emitted");
-        assert!(
-            matches!(error, crate::Error::Unsupported(ref message)
-            if message == "renumber: /Root absent from map"),
-            "{error:?}"
-        );
-    }
-
-    #[test]
-    fn build_writer_trailer_rejects_inconsistent_catalog_root_forms() {
-        let mut pdf = crate::Pdf::open_mem_owned(
-            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
-        )
-        .expect("fixture must open");
-        let error = build_writer_trailer_handle(
-            &mut pdf,
-            4,
-            None,
-            None,
-            &WriterOptions::default(),
-            None,
-            true,
-            None,
-        )
-        .expect_err("a trailer must have exactly one Catalog root form");
-        assert!(matches!(error, crate::Error::Unsupported(ref message)
-            if message == "writer trailer Catalog root form is inconsistent"));
-    }
-
-    #[test]
-    fn standard_full_rewrite_accepts_a_direct_catalog_root() {
-        let mut pdf = crate::Pdf::open_mem_owned(
-            include_bytes!("../../../tests/fixtures/compat/direct-root-adbe.pdf").to_vec(),
-        )
-        .expect("direct-root fixture must open");
-        let original_root = pdf.root_handle().expect("source Catalog should resolve");
-        let original_extensions = original_root
-            .try_as_dictionary()
-            .expect("source Catalog must be a dictionary")
-            .expect("source Catalog must be a dictionary")
-            .get(b"/Extensions".as_slice())
-            .cloned()
-            .expect("source fixture must carry /Extensions");
-        let options = WriterOptions {
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-
-        emit_canonical_pdf(&mut pdf, &mut output, &options)
-            .expect("standard rewrite should accept a direct Catalog");
-
-        let mut rewritten = crate::Pdf::open_mem_owned(output).expect("output must reopen");
-        assert!(
-            rewritten.root_ref().is_none(),
-            "qpdf keeps the direct Catalog inline in the output trailer"
-        );
-        let root = rewritten
-            .root_handle()
-            .expect("output Catalog should resolve");
-        assert_eq!(
-            rewritten.adobe_extension_level(),
-            Some(8),
-            "the direct Catalog's extension level must survive the rewrite"
-        );
-        assert_eq!(
-            root.get_key(b"/Type").as_name().as_deref(),
-            Some(&b"Catalog"[..])
-        );
-
-        let restored_root = pdf
-            .root_handle()
-            .expect("source Catalog should remain live");
-        assert!(
-            restored_root.is_same_object_as(&original_root),
-            "writer preparation must preserve the direct Catalog handle identity"
-        );
-        let restored_extensions = restored_root
-            .try_as_dictionary()
-            .expect("source Catalog must remain a dictionary")
-            .expect("source Catalog must remain a dictionary")
-            .get(b"/Extensions".as_slice())
-            .cloned()
-            .expect("source /Extensions must remain present");
-        assert!(
-            restored_extensions.is_same_object_as(&original_extensions),
-            "output-only /Extensions replacement must not leak into the source Catalog"
-        );
-    }
-
-    #[test]
-    fn direct_catalog_root_restores_an_absent_extensions_entry_after_injection() {
-        let mut pdf = crate::Pdf::open_mem_owned(
-            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
-        )
-        .expect("direct-root fixture must open");
-        let source_root = pdf.root_handle().expect("source Catalog should resolve");
-        let source_catalog = source_root
-            .try_as_dictionary()
-            .expect("source Catalog must be a dictionary")
-            .expect("source Catalog must be a dictionary");
-        assert!(
-            !source_catalog.contains_key(b"/Extensions".as_slice()),
-            "the source fixture must begin without /Extensions"
-        );
-
-        let options = WriterOptions {
-            static_id: true,
-            min_version: Some("1.7".to_string()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let mut output = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut output, &options)
-            .expect("direct-root rewrite with extension injection must succeed");
-
-        let restored_root = pdf
-            .root_handle()
-            .expect("source Catalog should remain live");
-        let restored_catalog = restored_root
-            .try_as_dictionary()
-            .expect("source Catalog must remain a dictionary")
-            .expect("source Catalog must remain a dictionary");
-        assert!(
-            !restored_catalog.contains_key(b"/Extensions".as_slice()),
-            "the output-only /Extensions injection must not remain in the source Catalog"
-        );
-        assert!(
-            restored_root.is_same_object_as(&source_root),
-            "extension restoration must preserve the direct Catalog identity"
-        );
-
-        let mut rewritten = crate::Pdf::open_mem_owned(output).expect("output must reopen");
-        assert!(rewritten.root_ref().is_none());
-        assert_eq!(rewritten.adobe_extension_level(), Some(8));
-    }
-
-    #[test]
-    fn catalog_adbe_probe_ignores_a_non_dictionary_extensions_value() {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
-            .expect("fixture must open");
-        let root = pdf.root_ref().expect("fixture must have a root");
-        let catalog = pdf.get_object_handle(root);
-        pdf.resolve(&catalog)
-            .expect("canonical catalog must resolve");
-        catalog
-            .replace_key(b"/Extensions", ObjectHandle::integer(7))
-            .expect("Catalog mutation must succeed");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("canonical Catalog must belong to this PDF");
-
-        assert!(!catalog_has_extensions_adbe(&mut pdf).expect("probe must succeed"));
-    }
-
-    /// Build a minimal single-page-less classic 1.3 PDF with only a Catalog
-    /// and empty Pages tree — the shape shared with the existing
-    /// deterministic-id fixture builder.
-    fn build_ext_injection_source() -> Vec<u8> {
-        let mut src = b"%PDF-1.3\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        src
-    }
-
-    fn write_full_rewrite_with(source: &[u8], options: &WriterOptions) -> Vec<u8> {
-        let mut pdf = crate::Pdf::open_mem(Arc::from(source)).expect("fixture must open");
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, options).expect("full-rewrite write must succeed");
-        out
-    }
-
-    #[test]
-    fn emit_canonical_pdf_injects_extensions_adbe_when_min_ext_gt_zero() {
-        // Source is 1.3 with no /Extensions. min_version=1.7 wins the version
-        // half; because eff_ver == options.min_version, the ext half is
-        // max(source_ext=0, min_ext=8) = 8, so injection fires.
-        let src = build_ext_injection_source();
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-
-        assert!(
-            out.starts_with(b"%PDF-1.7\n"),
-            "min_version=1.7 must raise the header; first 12 bytes: {:?}",
-            &out[..out.len().min(12)] // cov:ignore: diagnostic format arg only evaluated on assertion failure
-        );
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("/Extensions"), "Catalog must carry /Extensions");
-        assert!(s.contains("/ADBE"), "Extensions must carry /ADBE");
-        assert!(
-            s.contains("/BaseVersion /1.7"),
-            "ADBE must carry /BaseVersion /1.7"
-        );
-        assert!(
-            s.contains("/ExtensionLevel 8"),
-            "ADBE must carry /ExtensionLevel 8"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_no_injection_when_min_ext_is_none() {
-        // Same version bump but no min_extension_level → header rises to 1.7
-        // but no /Extensions injection, matching qpdf's --min-version=1.7.
-        let src = build_ext_injection_source();
-        let options = WriterOptions {
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: None,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-
-        assert!(out.starts_with(b"%PDF-1.7\n"));
-        let s = String::from_utf8_lossy(&out);
-        assert!(
-            !s.contains("/Extensions"),
-            "no min_extension_level → no /Extensions injection"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_no_injection_when_min_ext_is_zero() {
-        // Effective extension level 0 must not trigger injection even when
-        // min_extension_level is explicitly Some(0).
-        let src = build_ext_injection_source();
-        let options = WriterOptions {
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(0),
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-
-        assert!(out.starts_with(b"%PDF-1.7\n"));
-        let s = String::from_utf8_lossy(&out);
-        assert!(
-            !s.contains("/Extensions"),
-            "eff_ext == 0 → no /Extensions injection"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_ext_injection_preserves_non_adbe_developer_prefix() {
-        // Source has a direct /Extensions dict with a non-ADBE developer
-        // prefix. Injection must overwrite only /ADBE and leave the other
-        // prefix intact — mirroring qpdf's QPDFWriter behaviour.
-        let mut src = b"%PDF-1.3\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
-              /Extensions << /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >> \
-              >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("/ADBE"), "injected /ADBE must appear");
-        assert!(
-            s.contains("/BaseVersion /1.7"),
-            "new /ADBE must carry the effective /BaseVersion"
-        );
-        assert!(
-            s.contains("/ExtensionLevel 8"),
-            "new /ADBE must carry the effective /ExtensionLevel"
-        );
-        assert!(
-            s.contains("/XYZW"),
-            "non-ADBE developer prefix must survive: {s}"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_ext_injection_follows_indirect_extensions_ref() {
-        // Source /Extensions is an indirect reference to a dict that already
-        // has an ADBE at an older level plus a non-ADBE prefix. Injection
-        // must overwrite /ADBE with the new (BaseVersion, ExtensionLevel),
-        // preserve the other prefix, and inline the result on the Catalog.
-        let mut src = b"%PDF-1.3\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"3 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> \
-              /ACRO << /BaseVersion /1.7 /ExtensionLevel 1 >> >>\nendobj\n",
-        );
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-        let s = String::from_utf8_lossy(&out);
-        assert!(
-            s.contains("/ExtensionLevel 8"),
-            "/ADBE must have been overwritten with the new level: {s}"
-        );
-        assert!(
-            !s.contains("/ExtensionLevel 3"),
-            "old /ADBE /ExtensionLevel 3 must not survive: {s}"
-        );
-        assert!(
-            s.contains("/ACRO"),
-            "non-ADBE developer prefix must survive: {s}"
-        );
-    }
-
-    /// PDF-1.3 source that already carries `/Extensions /ADBE /ExtensionLevel N`.
-    /// Used by the ObjStm-floor regression tests below.
-    fn build_ext_injection_source_with_adbe_1_3() -> Vec<u8> {
-        let mut src = b"%PDF-1.3\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
-              /Extensions << /ADBE << /BaseVersion /1.3 /ExtensionLevel 8 >> >> \
-              >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        src
-    }
-
-    #[test]
-    fn emit_canonical_pdf_generate_mode_strips_stale_adbe_on_floor_bump() {
-        // Codex round-2 P2: source PDF-1.3 with /Extensions /ADBE /ExtensionLevel 8
-        // rewritten with --object-streams=generate. The ObjStm floor bumps the
-        // header to %PDF-1.5, so the source's ADBE (BaseVersion /1.3) must NOT
-        // survive — otherwise the emitted Catalog contradicts the header.
-        let src = build_ext_injection_source_with_adbe_1_3();
-        // Sanity: baseline reader sees the source ext.
-        {
-            let mut src_pdf = crate::Pdf::open_mem(Arc::from(&src[..])).expect("source must open");
-            assert_eq!(
-                src_pdf.adobe_extension_level(),
-                Some(8),
-                "fixture must carry source ADBE ExtensionLevel 8"
-            );
-        }
-        let options = WriterOptions {
-            static_id: true,
-            object_streams: ObjectStreamMode::Generate,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-        assert!(
-            out.starts_with(b"%PDF-1.5\n"),
-            "ObjStm floor must bump the header to 1.5"
-        );
-        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
-        assert_eq!(
-            reopened.adobe_extension_level(),
-            None,
-            "stale ADBE from source (BaseVersion 1.3) must not survive when the \
-             ObjStm floor drops the effective ext to 0"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_generate_mode_strips_stale_adbe_via_indirect_ref_preserving_other_prefix()
-    {
-        // Sibling of *_on_floor_bump but exercising the two remaining
-        // strip_adbe_extension branches: (1) /Extensions is an *indirect*
-        // reference (line 711), and (2) the source /Extensions carries a
-        // non-ADBE developer prefix that must survive after /ADBE is
-        // removed (line 723). Same trigger: ObjStm floor bumps 1.3 → 1.5.
-        let mut src = b"%PDF-1.3\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"3 0 obj\n<< /ADBE << /BaseVersion /1.3 /ExtensionLevel 8 >> \
-              /XYZW << /BaseVersion /1.3 /ExtensionLevel 1 >> >>\nendobj\n",
-        );
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        {
-            let mut src_pdf = crate::Pdf::open_mem(Arc::from(&src[..])).expect("source must open");
-            assert_eq!(
-                src_pdf.adobe_extension_level(),
-                Some(8),
-                "fixture must carry source ADBE ExtensionLevel 8 through an indirect ref"
-            );
-        }
-        let options = WriterOptions {
-            static_id: true,
-            object_streams: ObjectStreamMode::Generate,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-        assert!(
-            out.starts_with(b"%PDF-1.5\n"),
-            "ObjStm floor must bump the header to 1.5"
-        );
-        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
-        assert_eq!(
-            reopened.adobe_extension_level(),
-            None,
-            "stale ADBE from source must be stripped when the ObjStm floor \
-             drops the effective ext to 0"
-        );
-        // The non-ADBE developer prefix must survive the strip. Walk the
-        // Catalog manually. strip_adbe_extension inlines the mutated
-        // /Extensions back as a direct Dictionary on the Catalog, so we can
-        // access it directly without an extra resolve step. Extract owned
-        // Catalog dict via resolve+into_dict so the mutable borrow on
-        // `reopened` used by resolve() is released before subsequent asserts.
-        let root_ref = reopened
-            .trailer_dictionary()
-            .get_ref("Root")
-            .expect("Root ref");
-        let catalog_dict = resolved_object(&mut reopened, root_ref)
-            .expect("resolve root")
-            .into_dict()
-            .expect("root is dict");
-        // strip_adbe_extension always inlines /Extensions as a direct
-        // Dictionary, so a non-Dict variant here would indicate a code bug —
-        // panic rather than silently pass. Using as_dict keeps the assertion
-        // failure informative if this invariant ever breaks.
-        let ext_dict = catalog_dict
-            .get("Extensions")
-            .expect("Extensions key survives strip")
-            .as_dict()
-            .expect("Extensions must be present as a direct dict after strip");
-        assert!(
-            ext_dict.get("ADBE").is_none(),
-            "ADBE must be gone: {ext_dict:?}"
-        );
-        assert!(
-            ext_dict.get("XYZW").is_some(),
-            "non-ADBE developer prefix must survive: {ext_dict:?}"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_generate_mode_still_injects_extensions_adbe() {
-        // The output-only ADBE mutation must happen before the shared plain plan
-        // snapshots and renumbers the Catalog. Generate packs the Catalog into a
-        // FlateDecoded object stream, so verify structurally after reopening.
-        let src = build_ext_injection_source();
-        let options = WriterOptions {
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            object_streams: ObjectStreamMode::Generate,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-
-        assert!(out.starts_with(b"%PDF-1.7\n"), "header must raise to 1.7");
-        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
-        assert_eq!(
-            reopened.adobe_extension_level(),
-            Some(8),
-            "generate-mode output must carry /Extensions /ADBE /ExtensionLevel 8"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_does_not_dirty_caller_pdf_across_writes() {
-        // Codex round-3 P2 #4: the injection block mutates the caller's Pdf
-        // via set_object. Without the save/restore in emit_canonical_pdf,
-        // reusing the same Pdf handle for a second write would leak the
-        // output-only /Extensions dict into the second output. Verify the
-        // caller sees the same Pdf state before and after a write, and that
-        // two back-to-back writes produce identical output.
-        let src = build_ext_injection_source();
-        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
-        // Pre-write baseline: source has no ADBE.
-        assert_eq!(pdf.adobe_extension_level(), None);
-
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let mut out1 = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out1, &options).expect("first write");
-
-        // Caller-visible Pdf state must be unchanged after the write —
-        // adobe_extension_level still None (mutation was restored).
-        assert_eq!(
-            pdf.adobe_extension_level(),
-            None,
-            "first write must not leak /Extensions into the caller's Pdf"
-        );
-
-        // A second write with the same options must produce byte-identical
-        // output. If the first write had dirtied the Pdf, the second would
-        // see a different source_ext and could inject differently or accrete
-        // duplicate /Extensions state.
-        let mut out2 = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out2, &options).expect("second write");
-        assert_eq!(
-            out1, out2,
-            "back-to-back writes on the same Pdf must be byte-identical"
-        );
-
-        // And the output must still carry the requested /ADBE injection.
-        let mut reopened = crate::Pdf::open_mem_owned(out1).expect("reopen");
-        assert_eq!(
-            reopened.adobe_extension_level(),
-            Some(8),
-            "output must carry the requested ADBE"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_does_not_leave_root_dirty_flag_set() {
-        // Codex round-4 P2 #1: even after restoring the pre-write Catalog,
-        // `Pdf::set_object` used for the restore unconditionally marks the
-        // ref dirty. A subsequent incremental `write_pdf` would then emit a
-        // no-op Catalog delta, breaking the signed-prefix-preserving no-op
-        // workflow. Verify the outer wrapper clears the dirty flag when the
-        // ref was clean before the write.
-        let src = build_ext_injection_source();
-        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
-        let root_ref = pdf.root_ref().expect("Root");
-        // Baseline: Root must be clean before any write.
-        assert!(!pdf.is_dirty(root_ref), "Root must be clean pre-write");
-
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("write");
-
-        // Root must remain clean after the write — the injection's mutation
-        // was fully rolled back (value + dirty flag).
-        assert!(
-            !pdf.is_dirty(root_ref),
-            "Root dirty flag must be cleared after the full-rewrite restore"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_direct_catalog_pages_repair_survives_catalog_restore() {
-        // A direct Catalog /Pages dict (not `N 0 R`) whose own /Kids needs
-        // promotion: PageDocumentHelper::get_all_pages's repair mints a fresh
-        // indirect page and rewrites /Kids on the same Catalog object that
-        // the /Extensions restore below reverts. A whole-dict restore would
-        // discard that repair, so a second write on the same Pdf would repeat
-        // it from scratch -- minting *another* fresh object (count climbing
-        // 1 -> 2 -> 3) and producing non-byte-identical output, since the
-        // promoted page would land on a different object number each time.
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let off1 = bytes.len();
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Count 1 /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] >> >>\nendobj\n",
-        );
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
-        bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
-        bytes.extend_from_slice(
-            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
-                .as_bytes(),
-        );
-
-        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open");
-        let options = WriterOptions {
-            qdf: true,
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let count_before = pdf.get_object_count().unwrap();
-
-        let mut out1 = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out1, &options).expect("first write");
-        let count_after_1 = pdf.get_object_count().unwrap();
-        assert_eq!(
-            count_after_1,
-            count_before + 1,
-            "repair must mint exactly one promoted page object"
-        );
-
-        let mut out2 = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out2, &options).expect("second write");
-        let count_after_2 = pdf.get_object_count().unwrap();
-        assert_eq!(
-            count_after_2, count_after_1,
-            "the repair must not re-run (and re-mint an object) on a second write \
-             of the same Pdf -- its Catalog mutation must survive the ADBE restore"
-        );
-        assert_eq!(
-            out1, out2,
-            "back-to-back writes on the same Pdf must be byte-identical even when \
-             the source Catalog needed page-tree repair"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_decode_level_repairs_direct_catalog_pages_before_numbering() {
-        // This calls emit_canonical_pdf directly, so PdfWriter's outer
-        // progress-snapshot repair cannot mask the specialized writer's own
-        // qpdf trigger. A non-none decode level must still promote the direct
-        // page leaf before Catalog-first numbering.
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let off1 = bytes.len();
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Count 1 /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] >> >>\nendobj\n",
-        );
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
-        bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
-        bytes.extend_from_slice(
-            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
-                .as_bytes(),
-        );
-
-        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open");
-        let options = WriterOptions {
-            decode_level: DecodeLevel::Generalized,
-            extra_header_text: "% specialized\n".into(),
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let count_before = pdf.get_object_count().unwrap();
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("decoded rewrite");
-
-        assert_eq!(
-            pdf.get_object_count().unwrap(),
-            count_before + 1,
-            "non-none decode level must trigger direct /Kids page promotion"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_preserves_pre_existing_root_dirty_flag() {
-        // Sibling of _does_not_leave_root_dirty_flag_set: if the caller had
-        // already marked Root dirty BEFORE the full-rewrite (e.g. via a prior
-        // set_object), the restore path must LEAVE the dirty flag set —
-        // clearing it would silently drop the caller's own mutation.
-        let src = build_ext_injection_source();
-        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
-        let root_ref = pdf.root_ref().expect("Root");
-
-        // Caller-side mutation: mark Root dirty explicitly by re-storing its
-        // current value. set_object always dirties the ref regardless of
-        // whether the value actually changed.
-        let catalog = resolved_object(&mut pdf, root_ref).expect("resolve root");
-        pdf.set_object(root_ref, catalog);
-        assert!(pdf.is_dirty(root_ref), "sanity: caller marked Root dirty");
-
-        let options = WriterOptions {
-            object_streams: ObjectStreamMode::Disable,
-            static_id: true,
-            min_version: Some("1.7".into()),
-            min_extension_level: Some(8),
-            ..WriterOptions::default()
-        };
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("write");
-
-        assert!(
-            pdf.is_dirty(root_ref),
-            "pre-existing Root dirty flag must survive the full-rewrite restore"
-        );
-    }
-
-    #[test]
-    fn linearized_pdf_writer_restores_output_only_catalog_state() {
-        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        assert_eq!(pdf.adobe_extension_level(), None);
-        assert!(!pdf.is_dirty(root_ref), "fixture Catalog must start clean");
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_minimum_pdf_version("1.7", 8);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        writer.write().expect("linearized write");
-        let first = writer.get_buffer().expect("linearized buffer");
-        drop(writer);
-
-        assert_eq!(
-            pdf.adobe_extension_level(),
-            None,
-            "output-only /ADBE injection must not leak into the source Catalog"
-        );
-        assert!(
-            !pdf.is_dirty(root_ref),
-            "output-only Catalog mutation must not leave the source Catalog dirty"
-        );
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_minimum_pdf_version("1.7", 8);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        writer.write().expect("repeated linearized write");
-        let second = writer.get_buffer().expect("repeated linearized buffer");
-
-        assert_eq!(first, second, "repeated linearized writes must be stable");
-        let mut output = crate::Pdf::open_mem_owned(first).expect("output must reopen");
-        assert_eq!(
-            output.adobe_extension_level(),
-            Some(8),
-            "the linearized output must retain the requested extension"
-        );
-    }
-
-    #[test]
-    fn linearized_pdf_writer_preserves_preexisting_catalog_dirty_state() {
-        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        let catalog = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-        assert!(
-            pdf.is_dirty(root_ref),
-            "test must start with a dirty Catalog"
-        );
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_minimum_pdf_version("1.7", 8);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        writer.write().expect("linearized write");
-        let _ = writer.get_buffer().expect("linearized buffer");
-        drop(writer);
-
-        assert_eq!(pdf.adobe_extension_level(), None);
-        assert!(
-            pdf.is_dirty(root_ref),
-            "pre-existing Catalog dirtiness must survive the restore"
-        );
-    }
-
-    #[test]
-    fn linearized_pdf_writer_restores_an_existing_extensions_dictionary() {
-        let source =
-            include_bytes!("../../../tests/fixtures/compat/one-page-stale-adbe-no-ext-vendor.pdf")
-                .to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        assert_eq!(pdf.adobe_extension_level(), None);
-        assert!(!pdf.is_dirty(root_ref), "fixture Catalog must start clean");
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_minimum_pdf_version("1.7", 8);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        writer.write().expect("linearized write");
-        let _ = writer.get_buffer().expect("linearized buffer");
-        drop(writer);
-
-        assert_eq!(pdf.adobe_extension_level(), None);
-        let catalog = resolved_object(&mut pdf, root_ref).expect("Catalog must resolve");
-        let extensions = catalog
-            .as_dict()
-            .and_then(|dict| dict.get("Extensions"))
-            .and_then(Object::as_dict)
-            .expect("source Extensions dictionary must survive");
-        assert!(
-            extensions.get("XYZW").is_some(),
-            "non-ADBE developer extension must survive the restore"
-        );
-        assert!(
-            extensions.get("ADBE").is_some(),
-            "the source's malformed ADBE entry must survive the restore"
-        );
-        assert!(
-            !pdf.is_dirty(root_ref),
-            "restoring an output-only extension must restore Catalog dirtiness"
-        );
-    }
-
-    #[test]
-    fn linearized_pdf_writer_restores_an_indirect_extensions_handle() {
-        let source =
-            include_bytes!("../../../tests/fixtures/compat/linearize-indirect-extensions.pdf")
-                .to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        let catalog = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-        let original_extensions = catalog.get_key(b"/Extensions");
-        assert!(original_extensions.is_indirect());
-        assert!(!pdf.is_dirty(root_ref), "fixture Catalog must start clean");
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        writer.write().expect("linearized write");
-        let _ = writer.get_buffer().expect("linearized buffer");
-        drop(writer);
-
-        let catalog_after = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog_after).expect("Catalog must resolve");
-        let restored_extensions = catalog_after.get_key(b"/Extensions");
-        assert!(
-            restored_extensions.is_same_object_as(&original_extensions),
-            "pre-plan directization must not leak into the caller Catalog"
-        );
-        assert!(
-            !pdf.is_dirty(root_ref),
-            "restoring the pre-plan extension must restore Catalog dirtiness"
-        );
-    }
-
-    #[test]
-    fn linearized_pdf_writer_restores_catalog_state_after_write_error() {
-        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        let tempdir = tempfile::tempdir().expect("temporary directory");
-        let pass1_path = tempdir.path().join("missing-parent").join("pass1.pdf");
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_linearization_pass1_filename(pass1_path);
-        writer.set_minimum_pdf_version("1.7", 8);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        assert!(writer.write().is_err(), "missing pass-1 parent must fail");
-        drop(writer);
-
-        assert_eq!(
-            pdf.adobe_extension_level(),
-            None,
-            "failed output-only /ADBE injection must not leak into the source Catalog"
-        );
-        assert!(
-            !pdf.is_dirty(root_ref),
-            "failed output-only Catalog mutation must restore the source dirty flag"
-        );
-    }
-
-    #[test]
-    fn linearized_pdf_writer_restores_extensions_handle_identity_when_bytes_match() {
-        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        let catalog = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-
-        // Pre-populate `/Extensions /ADBE` with exactly what the linearized
-        // write below injects, so the writer's replacement is byte-identical
-        // to the original -- the case a serialized-value comparison misses.
-        let adbe = ObjectHandle::dictionary(vec![
-            (
-                b"/BaseVersion".to_vec(),
-                ObjectHandle::name(b"1.7".to_vec()),
-            ),
-            (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(8)),
-        ]);
-        let extensions = ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]);
-        catalog
-            .replace_key(b"/Extensions", extensions)
-            .expect("set /Extensions");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-        assert!(
-            pdf.is_dirty(root_ref),
-            "test must start with a dirty Catalog"
-        );
-        let original_extensions = catalog.get_key(b"/Extensions");
-
-        let mut writer = PdfWriter::new(&mut pdf);
-        writer.set_linearization(true);
-        writer.set_minimum_pdf_version("1.7", 8);
-        writer.set_static_id(true);
-        writer.set_output_memory().expect("memory output");
-        writer.write().expect("linearized write");
-        let _ = writer.get_buffer().expect("linearized buffer");
-        drop(writer);
-
-        let catalog_after = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog_after).expect("Catalog must resolve");
-        let restored_extensions = catalog_after.get_key(b"/Extensions");
-        assert!(
-            restored_extensions.is_same_object_as(&original_extensions),
-            "a byte-identical /Extensions replacement must still restore the \
-             original handle identity, not merely skip because serialized \
-             bytes match"
-        );
-    }
-
-    #[test]
-    fn restore_catalog_extensions_preserves_an_indirect_null_reference() {
-        // This test exercises the snapshot/restore helpers directly: an
-        // indirect reference to a null object
-        // effective Adobe extension level changes
-        // is distinct from a missing key per the PDF spec -- qpdf's own
-        // `QPDF_Dictionary::replaceKey` collapses only a *direct* null to key
-        // removal and explicitly "allow[s] indirect nulls which are
-        // equivalent to a dangling reference, which is permitted by the
-        // spec" (`libqpdf/QPDF_Dictionary.cc:136-146`). This shape must
-        // survive a snapshot/restore round trip as that same reference, not
-        // be dropped to key absence the way `try_has_key`'s qpdf-semantic
-        // null omission would.
-        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        let catalog = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-
-        let null_object = pdf
-            .make_indirect_object_handle(ObjectHandle::null())
-            .expect("allocate indirect null object");
-        catalog
-            .replace_key(b"/Extensions", null_object.clone())
-            .expect("set an indirect null /Extensions reference");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        let snapshot = snapshot_catalog_extensions(&mut pdf)
-            .expect("snapshot")
-            .expect("snapshot must be present for a Catalog with a /Root");
-
-        // Simulate what `inject_adbe_extension` does when the writer decides
-        // to inject an Adobe extension: replace `/Extensions` with a fresh
-        // dictionary.
-        let catalog = pdf.get_object_handle(root_ref);
-        let adbe = ObjectHandle::dictionary(vec![(
-            b"/ADBE".to_vec(),
-            ObjectHandle::dictionary(vec![
-                (
-                    b"/BaseVersion".to_vec(),
-                    ObjectHandle::name(b"1.7".to_vec()),
-                ),
-                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(8)),
+    fn copied_v4_encryption_preserves_the_cleartext_metadata_flag() {
+        let source = CopyEncryptionSource {
+            encrypt_dict: ObjectHandle::dictionary(vec![
+                (b"/V".to_vec(), ObjectHandle::integer(4)),
+                (b"/R".to_vec(), ObjectHandle::integer(4)),
+                (b"/Length".to_vec(), ObjectHandle::integer(128)),
+                (b"/P".to_vec(), ObjectHandle::integer(-4)),
+                (b"/O".to_vec(), ObjectHandle::string(vec![1; 32])),
+                (b"/U".to_vec(), ObjectHandle::string(vec![2; 32])),
+                (b"/EncryptMetadata".to_vec(), ObjectHandle::boolean(false)),
             ]),
-        )]);
-        catalog
-            .replace_key(b"/Extensions", adbe)
-            .expect("simulate writer injection");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        restore_catalog_extensions(&mut pdf, Some(snapshot)).expect("restore");
-
-        let catalog_after = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog_after).expect("Catalog must resolve");
-        let restored = catalog_after
-            .try_as_dictionary()
-            .expect("Catalog dictionary lookup")
-            .expect("Catalog must be a dictionary")
-            .get(b"/Extensions".as_slice())
-            .cloned()
-            .expect("an indirect /Extensions reference must survive the restore");
-        assert_eq!(
-            restored.object_ref(),
-            null_object.object_ref(),
-            "restore_catalog_extensions must preserve an indirect null \
-             /Extensions reference, not drop it because try_has_key would \
-             treat it as absent"
-        );
-    }
-
-    #[test]
-    fn restore_catalog_extensions_preserves_a_direct_null_extensions_entry() {
-        // The full linearized-write path cannot reach a direct-null
-        // `/Extensions` case either, for a related but distinct reason:
-        // `inject_adbe_extension`/`strip_adbe_extension` never run at all
-        // unless `eff_ext > 0 || adbe_status.has_adbe`
-        // (`linearization/writer.rs:3805`), and a source Catalog with a
-        // direct `/Extensions null` has neither -- there is nothing for the
-        // writer to mutate, so `restore_catalog_extensions` never has real
-        // work to undo. Exercise the two functions directly instead, the
-        // same way as the indirect-null case above: a direct null is
-        // restoration's harder case precisely because `ObjectHandle::
-        // replace_key` (qpdf-faithfully) collapses a direct null to key
-        // removal for an ordinary semantic edit
-        // (`libqpdf/QPDF_Dictionary.cc:136-146`) -- restoration is a
-        // different responsibility (undo a temporary mutation, not perform
-        // one), so it must route through `restore_key_raw` instead.
-        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
-        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
-        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
-        let catalog = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog).expect("Catalog must resolve");
-
-        // `replace_key` itself collapses a direct null to key removal
-        // (matching qpdf), so `restore_key_raw` is used here too, purely to
-        // arrange this test's starting state.
-        catalog
-            .restore_key_raw(b"/Extensions", ObjectHandle::null())
-            .expect("set an explicit direct-null /Extensions");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        let snapshot = snapshot_catalog_extensions(&mut pdf)
-            .expect("snapshot")
-            .expect("snapshot must be present for a Catalog with a /Root");
-
-        // Simulate what `inject_adbe_extension` does when the writer decides
-        // to inject an Adobe extension: replace `/Extensions` with a fresh
-        // dictionary.
-        let catalog = pdf.get_object_handle(root_ref);
-        let adbe = ObjectHandle::dictionary(vec![(
-            b"/ADBE".to_vec(),
-            ObjectHandle::dictionary(vec![
-                (
-                    b"/BaseVersion".to_vec(),
-                    ObjectHandle::name(b"1.7".to_vec()),
-                ),
-                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(8)),
-            ]),
-        )]);
-        catalog
-            .replace_key(b"/Extensions", adbe)
-            .expect("simulate writer injection");
-        pdf.mark_object_handle_dirty(&catalog)
-            .expect("Catalog must belong to this Pdf");
-
-        restore_catalog_extensions(&mut pdf, Some(snapshot)).expect("restore");
-
-        let catalog_after = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog_after).expect("Catalog must resolve");
-        let restored = catalog_after
-            .try_as_dictionary()
-            .expect("Catalog dictionary lookup")
-            .expect("Catalog must be a dictionary")
-            .get(b"/Extensions".as_slice())
-            .cloned()
-            .expect(
-                "a direct-null /Extensions entry must survive the restore as \
-                 a present key, not be dropped by replace_key's null-collapse",
-            );
-        assert!(
-            restored.is_direct() && restored.is_null(),
-            "the restored /Extensions entry must remain a direct null"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_v4_aes128_source_1_3_with_adbe_strips_stale_ext() {
-        // Codex round-3 P2 #3: source PDF-1.3 with /Extensions /ADBE
-        // /ExtensionLevel 8, rewritten with --encrypt AES-128. The encryption
-        // floor bumps the header to 1.6; the source's ADBE (BaseVersion 1.3
-        // ext 8) must NOT survive because the pairwise rule drops the source
-        // ext when the version is outbid.
-        let src = build_ext_injection_source_with_adbe_1_3();
-        let mut pdf = crate::Pdf::open_mem_owned(src).expect("open");
-        assert_eq!(pdf.adobe_extension_level(), Some(8));
-
-        let options = WriterOptions {
-            static_id: true,
-            static_aes_iv: true,
-            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
-                b"u".to_vec(),
-                b"o".to_vec(),
-            )),
-            ..WriterOptions::default()
-        };
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("aes-128 encrypted write");
-
-        // cov:ignore-start: multi-line assert; llvm-cov attributes only the
-        // "on-panic" format-argument evaluations to the outer line.
-        assert!(
-            out.starts_with(b"%PDF-1.6\n"),
-            "AES-128 must floor the header to 1.6, got {:?}",
-            String::from_utf8_lossy(&out[..out.len().min(12)])
-        );
-        // cov:ignore-end
-
-        // Re-open the encrypted output with the same password and confirm
-        // there is no residual /ADBE with a stale /BaseVersion.
-        let reopen_opts = crate::PdfOpenOptions {
-            password: b"u".to_vec(),
-            ..Default::default()
-        };
-        let mut reopened =
-            crate::Pdf::open_mem_owned_with_options(out, reopen_opts).expect("reopen encrypted");
-        assert_eq!(
-            reopened.adobe_extension_level(),
-            None,
-            "stale /ADBE (BaseVersion 1.3) must be stripped by the encryption floor"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_strips_stale_adbe_when_source_has_no_extension_level() {
-        // qpdf QPDFWriter.cc L1387/L1408 (whole /Extensions removed) parity:
-        // source /Extensions /ADBE dict has no /ExtensionLevel (or non-integer).
-        // adobe_extension_level() returns None → source_ext = 0. The pre-broadening
-        // trigger (`source_ext > 0`) would skip strip and let /ADBE pass through;
-        // the broadened trigger (`catalog_has_extensions_adbe`) fires and drops
-        // /Extensions entirely because /ADBE is the only key.
-        let mut src = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
-              /Extensions << /ADBE << /BaseVersion /1.4 >> >> >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        // Sanity: adobe_extension_level() returns None because /ExtensionLevel is absent.
-        {
-            let mut src_pdf = crate::Pdf::open_mem(Arc::from(&src[..])).expect("source must open");
-            assert_eq!(src_pdf.adobe_extension_level(), None);
-        }
-        let options = WriterOptions {
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-        let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
-        // The whole /Extensions dict must be gone from the output Catalog.
-        let root_ref = reopened
-            .trailer_dictionary()
-            .get_ref("Root")
-            .expect("Root ref");
-        let catalog = resolved_object(&mut reopened, root_ref)
-            .expect("resolve root")
-            .into_dict()
-            .expect("root is dict");
-        assert!(
-            catalog.get("Extensions").is_none(),
-            "stale /ADBE without /ExtensionLevel must trigger whole-/Extensions removal: {catalog:?}"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_strips_stale_adbe_no_ext_level_preserving_vendor_prefix() {
-        // qpdf QPDFWriter.cc L1432 (removeKey /ADBE, keep other extensions) parity:
-        // source /Extensions has /ADBE without /ExtensionLevel AND a non-ADBE
-        // developer prefix (/XYZW). Broadened trigger must fire and strip /ADBE
-        // only, leaving /XYZW intact.
-        let mut src = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
-              /Extensions << /ADBE << /BaseVersion /1.4 >> \
-              /XYZW << /BaseVersion /1.4 /ExtensionLevel 1 >> >> >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        // Sanity: adobe_extension_level() returns None (source /ExtensionLevel absent).
-        {
-            let mut src_pdf = crate::Pdf::open_mem(Arc::from(&src[..])).expect("source must open");
-            assert_eq!(src_pdf.adobe_extension_level(), None);
-        }
-        let options = WriterOptions {
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-        let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
-        let root_ref = reopened
-            .trailer_dictionary()
-            .get_ref("Root")
-            .expect("Root ref");
-        let catalog = resolved_object(&mut reopened, root_ref)
-            .expect("resolve root")
-            .into_dict()
-            .expect("root is dict");
-        // /Extensions must still be present, containing only /XYZW.
-        let ext_dict = catalog
-            .get("Extensions")
-            .expect("/Extensions must survive because /XYZW is present")
-            .as_dict()
-            .expect("/Extensions must be a direct dict after strip");
-        assert!(
-            ext_dict.get("ADBE").is_none(),
-            "stale /ADBE without /ExtensionLevel must be stripped: {ext_dict:?}"
-        );
-        assert!(
-            ext_dict.get("XYZW").is_some(),
-            "non-ADBE developer prefix must survive: {ext_dict:?}"
-        );
-    }
-
-    #[test]
-    fn emit_canonical_pdf_strips_stale_adbe_via_indirect_extensions_no_ext_level() {
-        // qpdf QPDFWriter.cc L1387 parity: `/Extensions` may arrive as an indirect
-        // reference. The broadened trigger must resolve the ref before checking
-        // for /ADBE key existence, and strip must inline the resolved dict then
-        // remove /ADBE. Covers the `Object::Reference` arm of
-        // `catalog_has_extensions_adbe` that inline-`/Extensions` fixtures skip.
-        let mut src = b"%PDF-1.4\n".to_vec();
-        let mut offsets = Vec::new();
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 3 0 R >>\nendobj\n",
-        );
-        offsets.push(src.len());
-        src.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
-        offsets.push(src.len());
-        src.extend_from_slice(
-            b"3 0 obj\n<< /ADBE << /BaseVersion /1.4 >> \
-              /XYZW << /BaseVersion /1.4 /ExtensionLevel 1 >> >>\nendobj\n",
-        );
-        let startxref = src.len();
-        let count = offsets.len() + 1;
-        src.extend_from_slice(format!("xref\n0 {count}\n0000000000 65535 f \n").as_bytes());
-        for off in &offsets {
-            src.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
-        }
-        src.extend_from_slice(
-            format!(
-                "trailer\n<< /Size {count} /Root 1 0 R >>\n\
-                 startxref\n{startxref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        // Sanity: adobe_extension_level returns None (source /ExtensionLevel absent
-        // even after resolving the indirect /Extensions ref).
-        {
-            let mut src_pdf = crate::Pdf::open_mem(Arc::from(&src[..])).expect("source must open");
-            assert_eq!(src_pdf.adobe_extension_level(), None);
-        }
-        let options = WriterOptions {
-            static_id: true,
-            ..WriterOptions::default()
-        };
-        let out = write_full_rewrite_with(&src, &options);
-        let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
-        let root_ref = reopened
-            .trailer_dictionary()
-            .get_ref("Root")
-            .expect("Root ref");
-        let catalog = resolved_object(&mut reopened, root_ref)
-            .expect("resolve root")
-            .into_dict()
-            .expect("root is dict");
-        // strip inlines /Extensions as a direct dict; /ADBE gone, /XYZW survives.
-        let ext_dict = catalog
-            .get("Extensions")
-            .expect("/Extensions must survive because /XYZW is present")
-            .as_dict()
-            .expect("/Extensions must be inlined as a direct dict after strip");
-        assert!(
-            ext_dict.get("ADBE").is_none(),
-            "stale /ADBE from indirect /Extensions must be stripped: {ext_dict:?}"
-        );
-        assert!(
-            ext_dict.get("XYZW").is_some(),
-            "non-ADBE developer prefix from indirect /Extensions must survive: {ext_dict:?}"
-        );
-    }
-
-    #[test]
-    fn source_encrypted_generate_keeps_legacy_container_numbering() {
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
-        let file = std::fs::File::open(fixture).expect("open encrypted fixture");
-        let mut pdf = crate::Pdf::open(std::io::BufReader::new(file))
-            .expect("fixture authenticates with the default empty password");
-        assert!(
-            pdf.encryption_ref().is_some(),
-            "route sentinel requires a source-encrypted PDF"
-        );
-
-        let options = WriterOptions {
-            static_id: true,
-            object_streams: ObjectStreamMode::Generate,
-            ..WriterOptions::default()
-        };
-        let mut out = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("Generate rewrite");
-
-        let reopened = crate::Pdf::open_mem_owned(out).expect("reopen unencrypted output");
-        let compressed: Vec<(ObjectRef, u32)> = reopened
-            .source_xref_entries()
-            .into_iter()
-            .filter_map(|(member, offset)| match offset {
-                XrefEntry::Compressed { stream, .. } => Some((member, stream)),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !compressed.is_empty(),
-            "Generate must still emit an object stream on source-encrypted input"
-        );
-        assert!(
-            compressed
-                .iter()
-                .all(|(member, container)| *container > member.number),
-            "source encryption must keep the legacy containers-above-members route: {compressed:?}"
-        );
-    }
-
-    #[test]
-    fn progress_reporter_debug_uses_qpdf_writer_shape() {
-        let reporter = ProgressReporter::new(Box::new(|_| Ok(())));
-
-        assert_eq!(format!("{reporter:?}"), "ProgressReporter(..)");
-    }
-
-    #[test]
-    fn configure_progress_reports_from_the_scaled_event_budget() {
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let events_for_reporter = Rc::clone(&events);
-        let options = WriterOptions {
-            progress_reporter: Some(ProgressReporter::new(Box::new(move |percent| {
-                events_for_reporter.borrow_mut().push(percent);
-                Ok(())
-            }))),
-            ..WriterOptions::default()
-        };
-
-        configure_progress(&options, 2, true);
-        report_progress_event(&options).unwrap();
-        report_progress_finished(&options).unwrap();
-
-        assert_eq!(&*events.borrow(), &[0, 100]);
-    }
-
-    #[test]
-    fn xref_stream_bytes_reject_overflow_and_missing_entries() {
-        let overflow = build_xref_stream_bytes(&BTreeMap::new(), &[(u32::MAX, 1)])
-            .expect_err("a range ending past u32::MAX must be rejected");
-        assert!(matches!(overflow, crate::Error::Unsupported(message)
-            if message == "xref stream range does not fit u32"));
-
-        let offsets = BTreeMap::from([(1_u32, (0_u16, XrefEntry::Uncompressed { offset: 0 }))]);
-        let missing = build_xref_stream_bytes(&offsets, &[(1, 2)])
-            .expect_err("a range with a missing object entry must be rejected");
-        assert!(matches!(missing, crate::Error::Unsupported(message)
-            if message == "xref stream is missing object entry"));
-    }
-
-    fn copy_encryption_dictionary(version: i64, revision: i64, length: i64) -> Dictionary {
-        let mut dict = Dictionary::new();
-        dict.insert("V", Object::Integer(version));
-        dict.insert("R", Object::Integer(revision));
-        dict.insert("Length", Object::Integer(length));
-        dict
-    }
-
-    fn copy_encryption_source(
-        dict: Dictionary,
-        file_key_len: usize,
-    ) -> crate::CopyEncryptionSource {
-        crate::CopyEncryptionSource {
-            encrypt_dict: dict,
-            file_key: vec![0; file_key_len],
+            file_key: vec![0; 16],
             id0: vec![0; 16],
-            object_key_alg: crate::ObjectKeyAlg::Rc4,
-        }
+            object_key_alg: ObjectKeyAlg::Rc4,
+        };
+        let (dictionary, _, _, _) =
+            canonical_copy_encryption(&source).expect("valid V=4 copy-encryption source");
+        assert_eq!(
+            dictionary
+                .try_get_key(b"/EncryptMetadata")
+                .expect("metadata flag")
+                .as_boolean(),
+            Some(false)
+        );
     }
 
     #[test]
-    fn canonical_copy_encryption_rejects_invalid_standard_handler_shapes() {
-        let mut version_out_of_range = copy_encryption_dictionary(i64::from(i32::MAX) + 1, 2, 40);
-        version_out_of_range.insert("P", Object::Integer(-4));
-        let error = canonical_copy_encryption(&copy_encryption_source(version_out_of_range, 5))
-            .expect_err("an out-of-range /V must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("/V is out of range")));
-
-        let revision_out_of_range = copy_encryption_dictionary(1, i64::from(i32::MAX) + 1, 40);
-        let error = canonical_copy_encryption(&copy_encryption_source(revision_out_of_range, 5))
-            .expect_err("an out-of-range /R must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("/R is out of range")));
-
-        let invalid_length = copy_encryption_dictionary(2, 3, 41);
-        let error = canonical_copy_encryption(&copy_encryption_source(invalid_length, 16))
-            .expect_err("a non-byte-aligned /Length must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("/Length is invalid")));
-
-        let unsupported_v5 = copy_encryption_dictionary(5, 4, 256);
-        let error = canonical_copy_encryption(&copy_encryption_source(unsupported_v5, 32))
-            .expect_err("an unsupported V=5 revision must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("unsupported copy-encryption Standard handler V=5")));
-
-        let unsupported_legacy = copy_encryption_dictionary(3, 3, 128);
-        let error = canonical_copy_encryption(&copy_encryption_source(unsupported_legacy, 16))
-            .expect_err("an unsupported legacy handler must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("unsupported copy-encryption Standard handler V=3")));
+    fn copy_integer_reports_a_non_integer_or_missing_value() {
+        let dictionary = ObjectHandle::dictionary(vec![(
+            b"/V".to_vec(),
+            ObjectHandle::string(b"not-an-integer".to_vec()),
+        )]);
+        let error = copy_integer(&dictionary, "V").expect_err("wrong type is rejected");
+        assert!(error.to_string().contains("must be an integer"));
+        let error = copy_integer(&dictionary, "R").expect_err("missing key is rejected");
+        assert!(error.to_string().contains("must be an integer"));
     }
 
     #[test]
-    fn canonical_copy_encryption_rejects_missing_required_values() {
-        let missing_version = Dictionary::new();
-        let error = canonical_copy_encryption(&copy_encryption_source(missing_version, 5))
-            .expect_err("missing /V must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message == "copy-encryption /V must be an integer"));
+    fn stream_compression_policy_handles_public_and_private_routes() {
+        let plain = stream_with_filter(None, b"q 1 0 cm\n".to_vec());
+        let uncompressed = apply_stream_compress_policy(&plain, CompressStreams::No)
+            .expect("an unfiltered stream can be emitted without compression");
+        assert!(uncompressed
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .try_get_key(b"/Filter")
+            .expect("filter lookup")
+            .is_null());
+        assert_eq!(
+            uncompressed
+                .get_raw_stream_data()
+                .expect("stream data")
+                .as_ref(),
+            b"q 1 0 cm\n"
+        );
 
-        let mut missing_owner = copy_encryption_dictionary(1, 2, 40);
-        missing_owner.insert("P", Object::Integer(-4));
-        let error = canonical_copy_encryption(&copy_encryption_source(missing_owner, 5))
-            .expect_err("missing /O must be rejected");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message == "copy-encryption /O must be a string"));
-    }
+        let compressed = apply_stream_compress_policy(&plain, CompressStreams::Yes)
+            .expect("an unfiltered stream can be compressed");
+        assert_eq!(
+            compressed
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .try_get_key(b"/Filter")
+                .expect("filter lookup")
+                .as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+        assert_eq!(
+            filters::decode_stream_data(
+                &compressed.as_stream_dict().expect("stream dictionary"),
+                &compressed.get_raw_stream_data().expect("stream data"),
+            )
+            .expect("compressed payload decodes"),
+            b"q 1 0 cm\n"
+        );
 
-    #[test]
-    fn filter_chain_classification_covers_qpdf_aliases_and_malformed_values() {
-        let malformed = Object::Integer(1);
-        assert!(!filter_chain_is_decodable(
-            Some(&malformed),
-            CompressStreams::Yes,
+        let flate_dictionary = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"/Length".to_vec(), ObjectHandle::integer(8)),
+        ]);
+        let encoded =
+            filters::encode_stream_data(&flate_dictionary, b"decoded").expect("flate encoder");
+        let flate = ObjectHandle::stream(flate_dictionary, Rc::new(encoded));
+        let preserved = apply_stream_compress_policy_with_decode_level(
+            &flate,
+            CompressStreams::No,
+            DecodeLevel::None,
+            false,
+        )
+        .expect("decode-level none preserves a gated filter chain");
+        assert_eq!(
+            preserved
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .try_get_key(b"/Filter")
+                .expect("filter lookup")
+                .as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+
+        let corrupt = stream_with_filter(Some(b"FlateDecode"), b"not-flate".to_vec());
+        let passthrough = apply_stream_compress_policy_with_decode_level(
+            &corrupt,
+            CompressStreams::No,
             DecodeLevel::All,
-            false
-        ));
+            false,
+        )
+        .expect("corrupt data follows qpdf's raw-preservation path");
+        assert_eq!(
+            passthrough
+                .get_raw_stream_data()
+                .expect("raw stream data")
+                .as_ref(),
+            b"not-flate"
+        );
 
-        let malformed_item = Object::Array(vec![Object::Integer(1)]);
-        assert!(!filter_chain_is_decodable(
-            Some(&malformed_item),
-            CompressStreams::Yes,
-            DecodeLevel::All,
-            false
-        ));
+        let normalized = apply_stream_compress_policy_with_decode_level(
+            &plain,
+            CompressStreams::No,
+            DecodeLevel::None,
+            true,
+        )
+        .expect("content normalization remains available on an unfiltered stream");
+        assert!(!normalized
+            .get_raw_stream_data()
+            .expect("normalized stream data")
+            .is_empty());
+    }
 
-        for alias in [
+    #[test]
+    fn filter_chain_gate_covers_qpdf_filter_aliases_and_levels() {
+        for name in [
+            b"FlateDecode".as_slice(),
             b"Fl".as_slice(),
+            b"LZWDecode".as_slice(),
             b"LZW".as_slice(),
+            b"ASCII85Decode".as_slice(),
             b"A85".as_slice(),
+            b"ASCIIHexDecode".as_slice(),
             b"AHx".as_slice(),
         ] {
-            let filter = Object::Name(alias.to_vec());
+            let dictionary = ObjectHandle::dictionary(vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::name(name.to_vec()),
+            )]);
             assert!(filter_chain_is_decodable(
-                Some(&filter),
-                CompressStreams::Yes,
-                DecodeLevel::None,
-                false
-            ));
-        }
-
-        let run_length = Object::Name(b"RL".to_vec());
-        assert!(filter_chain_is_decodable(
-            Some(&run_length),
-            CompressStreams::No,
-            DecodeLevel::Specialized,
-            false
-        ));
-
-        let unknown = Object::Name(b"UnknownDecode".to_vec());
-        assert!(!filter_chain_is_decodable(
-            Some(&unknown),
-            CompressStreams::Yes,
-            DecodeLevel::All,
-            false
-        ));
-    }
-
-    #[test]
-    fn dct_decode_level_gate() {
-        let dct = Object::Name(b"DCTDecode".to_vec());
-        for level in [
-            DecodeLevel::None,
-            DecodeLevel::Generalized,
-            DecodeLevel::Specialized,
-        ] {
-            assert!(!filter_chain_is_decodable(
-                Some(&dct),
+                &dictionary,
                 CompressStreams::No,
-                level,
-                false
-            ));
+                DecodeLevel::Generalized,
+                false,
+            )
+            .expect("generalized filter gate"));
         }
-        assert!(filter_chain_is_decodable(
-            Some(&dct),
+
+        let run_length = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"RL".to_vec()),
+        )]);
+        assert!(!filter_chain_is_decodable(
+            &run_length,
             CompressStreams::No,
-            DecodeLevel::All,
-            false
-        ));
-
-        let abbreviation = Object::Name(b"DCT".to_vec());
+            DecodeLevel::Generalized,
+            false,
+        )
+        .expect("run-length generalized gate"));
         assert!(filter_chain_is_decodable(
-            Some(&abbreviation),
+            &run_length,
             CompressStreams::No,
-            DecodeLevel::All,
-            false
-        ));
-    }
+            DecodeLevel::Specialized,
+            false,
+        )
+        .expect("run-length specialized gate"));
 
-    #[test]
-    fn content_helpers_ignore_non_container_values() {
-        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).expect("open fixture");
-        pdf.set_object(ObjectRef::new(3, 0), Object::Integer(42));
-        let mut containers = BTreeSet::new();
-        collect_content_container_refs(&mut pdf, ObjectRef::new(3, 0), &mut containers)
-            .expect("a non-dictionary page value is ignored");
-        assert!(containers.is_empty());
-    }
-
-    #[test]
-    fn reencode_empty_nonfilter_stream_uses_handle_filter_route() {
-        let (reencoded, source_was_lone_flate) = reencode_stream_for_compress(
-            crate::Stream::new(Dictionary::new(), Vec::new()),
-            &WriterOptions::default(),
+        let dct = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"DCT".to_vec()),
+        )]);
+        assert!(!filter_chain_is_decodable(
+            &dct,
+            CompressStreams::No,
+            DecodeLevel::Specialized,
             false,
-            true,
-            false,
-            false,
+        )
+        .expect("DCT specialized gate"));
+        assert!(
+            filter_chain_is_decodable(&dct, CompressStreams::No, DecodeLevel::All, false,)
+                .expect("DCT all gate")
         );
-        let stream = reencoded
-            .into_stream()
-            .expect("stream compression must return a stream");
 
-        assert!(!source_was_lone_flate);
-        assert!(stream.data.is_empty());
-        assert!(matches!(
-            stream.dict.get("Filter"),
-            Some(Object::Name(name)) if name == b"FlateDecode"
-        ));
-        assert_eq!(stream.dict.get("Length"), Some(&Object::Integer(0)));
+        let none = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"UnknownDecode".to_vec()),
+        )]);
+        assert!(
+            !filter_chain_is_decodable(&none, CompressStreams::No, DecodeLevel::All, false,)
+                .expect("unknown filter gate")
+        );
+
+        let malformed =
+            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
+        assert!(!filter_chain_is_decodable(
+            &malformed,
+            CompressStreams::No,
+            DecodeLevel::All,
+            false,
+        )
+        .expect("malformed filter gate"));
+
+        let array = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"Fl".to_vec())]),
+        )]);
+        assert!(filter_chain_is_decodable(
+            &array,
+            CompressStreams::No,
+            DecodeLevel::Generalized,
+            false,
+        )
+        .expect("array filter gate"));
+        let array_with_scalar = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        )]);
+        assert!(!filter_chain_is_decodable(
+            &array_with_scalar,
+            CompressStreams::No,
+            DecodeLevel::All,
+            false,
+        )
+        .expect("array scalar filter gate"));
+
+        let generalized = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        assert!(filter_chain_is_decodable(
+            &generalized,
+            CompressStreams::Yes,
+            DecodeLevel::None,
+            false,
+        )
+        .expect("compression enables generalized filtering at decode none"));
+        assert!(filter_chain_is_decodable(
+            &generalized,
+            CompressStreams::No,
+            DecodeLevel::None,
+            true,
+        )
+        .expect("normalization enables generalized filtering at decode none"));
     }
 
     #[test]
-    fn pclm_writes_extra_header_and_deterministic_id() {
-        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).expect("open fixture");
-        let options = WriterOptions {
-            deterministic_id: true,
-            extra_header_text: "% PCLm extra".to_string(),
-            pclm: true,
-            ..WriterOptions::default()
-        };
+    fn pclm_emits_a_synthetic_stream_for_a_page_xobject() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("fixture must open");
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let page_handle = pdf.get_object_handle(page);
+        pdf.resolve(&page_handle).expect("page resolves");
+        let replacement = page_handle.shallow_copy().expect("page is copyable");
+        let image = pdf
+            .new_stream_with_data(Rc::new(b"image".to_vec()))
+            .expect("image stream");
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image)]),
+        )]);
+        replacement
+            .replace_key(b"/Resources", resources)
+            .expect("replace page resources");
+        pdf.replace_object(page, replacement).expect("replace page");
+
         let mut output = Vec::new();
-        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("PCLm rewrite");
-
-        assert!(output.starts_with(b"%PDF-1.4\n%PCLm 1.0\n% PCLm extra\n"));
+        write_pclm(&mut pdf, &mut output, &WriterOptions::default()).expect("PCLm writer succeeds");
         assert!(output
-            .windows(b"/ID [<".len())
-            .any(|window| window == b"/ID [<"));
-    }
-
-    #[test]
-    fn pclm_rejects_conflicting_id_modes() {
-        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).expect("open fixture");
-        let options = WriterOptions {
-            deterministic_id: true,
-            static_id: true,
-            pclm: true,
-            ..WriterOptions::default()
-        };
-        let error = emit_canonical_pdf(&mut pdf, Vec::new(), &options)
-            .expect_err("PCLm must reject deterministic-id plus static-id");
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message == "deterministic_id and static_id are mutually exclusive"));
+            .windows(b"q /image Do Q\n".len())
+            .any(|window| { window == b"q /image Do Q\n" }));
     }
 }

@@ -291,3 +291,18 @@ fn invalid_byte_ranges_return_parse_errors() {
         );
     }
 }
+
+#[test]
+fn strip_signature_values_removes_the_indirect_signature_value() {
+    let mut pdf = open(signed_acroform_pdf());
+
+    assert!(flpdf::signatures::strip_signature_values(&mut pdf).expect("strip signature"));
+    let field = pdf.get_object_handle(ObjectRef::new(5, 0));
+    pdf.resolve(&field).expect("field resolves");
+    assert!(field
+        .try_get_key(b"/V")
+        .expect("signature value key")
+        .is_null());
+    let signature = pdf.get_object_handle(ObjectRef::new(6, 0));
+    assert!(pdf.resolve(&signature).is_ok());
+}

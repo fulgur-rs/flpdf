@@ -554,28 +554,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             return Ok(copied);
         }
 
-        // `ObjectValue::Reference` -- an indirect object whose own resolved
-        // value is itself a bare reference to another object, e.g. via the
-        // legacy `Pdf::set_object(holder, Object::Reference(target))` API --
-        // has no qpdf counterpart: a live `QPDFObjectHandle` can never carry
-        // this shape (see `ObjectValue::Reference`'s own doc). Falling
-        // through to the generic scalar copy below would preserve `target`'s
-        // raw source-document `ObjectRef` verbatim (`shallow_copy` clones an
-        // unrecognized value as-is) without reserving or remapping it, so the
-        // copied holder would point at whatever object happens to share that
-        // number in the destination document -- an unrelated object, or a
-        // dangling reference -- rather than a copy of the actual source
-        // target. Reject explicitly instead, matching the direct-stream
-        // rejection above for the same reason: this is a value shape qpdf's
-        // copy machinery cannot express, not one this port can silently
-        // reinterpret.
-        if foreign.as_reference().is_some() {
-            return Err(Error::System(
-                "QPDF::copyForeign encountered an object whose value is itself a reference"
-                    .to_owned(),
-            ));
-        }
-
         let direct = foreign.shallow_copy()?;
         // cov:ignore-start: shallow_copy always returns a direct value, so this
         // is an invariant guard for a future ObjectHandle state.
@@ -590,7 +568,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Object, ObjectHandle, ObjectStreamMode, PdfWriter};
+    use crate::{ObjectHandle, ObjectStreamMode, PdfWriter};
     use std::io::Cursor;
     use std::rc::Rc;
 
@@ -970,33 +948,6 @@ mod tests {
             .expect_err("a direct stream has no qpdf foreign-copy route");
         assert!(matches!(error, Error::System(message)
             if message == "QPDF::copyForeign encountered a direct stream object"));
-    }
-
-    #[test]
-    fn copy_foreign_object_rejects_a_bare_reference_value() {
-        // `ObjectValue::Reference` -- an indirect object whose own resolved
-        // value is itself a bare reference, constructed the way
-        // `Pdf::set_object(holder, Object::Reference(target))`-based
-        // holder-chain redirects do -- has no qpdf counterpart. Falling
-        // through to the generic scalar-copy branch would preserve the raw
-        // source-document `ObjectRef` verbatim, unremapped, into the
-        // destination document.
-        let mut source = minimal_pdf();
-        let mut target = minimal_pdf();
-
-        let redirect_ref = ObjectRef::new(10, 0);
-        source.set_object(redirect_ref, Object::Reference(ObjectRef::new(1, 0)));
-        let redirect = source.get_object_handle(redirect_ref);
-        let root = source
-            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
-            .expect("root");
-        root.replace_key(b"/Redirect", redirect).unwrap();
-
-        let error = target
-            .copy_foreign_object(&root)
-            .expect_err("a bare-reference value has no qpdf foreign-copy route");
-        assert!(matches!(error, Error::System(message)
-            if message == "QPDF::copyForeign encountered an object whose value is itself a reference"));
     }
 
     #[test]

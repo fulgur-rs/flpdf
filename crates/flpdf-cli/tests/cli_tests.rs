@@ -1,9 +1,6 @@
-#[path = "support/filter_handles.rs"]
-mod filter_handles;
-
 use assert_cmd::Command;
 use flpdf::{
-    acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper, Object, Pdf,
+    acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper, Pdf,
 };
 use predicates::prelude::*;
 use std::fs::File;
@@ -1338,15 +1335,17 @@ fn first_page_content(path: &std::path::Path) -> Vec<u8> {
     flpdf::pages::page_content_bytes(&mut pdf, page).unwrap()
 }
 
-fn first_page_content_filter(path: &std::path::Path) -> Option<Object> {
+fn first_page_content_filter(path: &std::path::Path) -> Option<Vec<u8>> {
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     let page = pdf.resolve_canonical_object(page_ref).unwrap().clone();
-    let contents_ref = page.as_dict().unwrap().get_ref("Contents").unwrap();
-    let stream = pdf.resolve_canonical_object(contents_ref).unwrap().clone();
+    let contents_ref = page.try_get_key(b"/Contents").ok()?.object_ref()?;
+    let stream = pdf.resolve_canonical_object(contents_ref).ok()?;
     stream
-        .as_stream()
-        .and_then(|stream| stream.dict.get("Filter").cloned())
+        .as_stream_dict()?
+        .try_get_key(b"/Filter")
+        .ok()?
+        .as_name()
 }
 
 #[test]
@@ -2239,13 +2238,10 @@ fn pages_external_source_matches_qpdf_resource_copy_modes() {
 
         let mut pdf = Pdf::open(std::io::BufReader::new(File::open(&output).unwrap())).unwrap();
         let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
-        let page = pdf
-            .resolve_canonical_object(page_ref)
-            .unwrap()
-            .into_dict()
-            .unwrap();
+        let page = pdf.resolve_canonical_object(page_ref).unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
         assert_eq!(
-            matches!(page.get("Resources"), Some(Object::Dictionary(_))),
+            resources.is_direct(),
             expected_direct,
             "--remove-unreferenced-resources={mode}: {page:?}"
         );
@@ -4282,33 +4278,19 @@ fn resource_category_keys_from_path(
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
     let page_ref = pages::page_refs(&mut pdf).unwrap()[page_index];
     let page = pdf.resolve_canonical_object(page_ref).unwrap();
-    let resources = match page {
-        Object::Dictionary(page) => match page.get("Resources").cloned() {
-            Some(Object::Reference(resources_ref)) => {
-                pdf.resolve_canonical_object(resources_ref).unwrap()
-            }
-            Some(Object::Dictionary(resources)) => Object::Dictionary(resources),
-            other => panic!("page resources should be a dictionary or reference: {other:?}"),
-        },
-        other => panic!("page should be a dictionary: {other:?}"),
-    };
-    let Object::Dictionary(resources) = resources else {
-        panic!("resources should resolve to a dictionary");
-    };
-    let category = match resources.get(category).cloned() {
-        Some(Object::Reference(category_ref)) => {
-            pdf.resolve_canonical_object(category_ref).unwrap()
-        }
-        Some(Object::Dictionary(category)) => Object::Dictionary(category),
-        None => return Vec::new(),
-        other => panic!("resource category should be a dictionary: {other:?}"),
-    };
-    let Object::Dictionary(category) = category else {
-        panic!("resource category should resolve to a dictionary");
-    };
+    let resources = page
+        .try_get_key(b"/Resources")
+        .expect("page resources should exist");
+    let category_key = format!("/{category}");
+    let category = resources
+        .try_get_key(category_key.as_bytes())
+        .expect("resource category should be readable");
+    pdf.resolve(&category).expect("resolve resource category");
     category
-        .iter()
-        .map(|(name, _)| String::from_utf8(name.to_vec()).unwrap())
+        .as_dictionary()
+        .unwrap_or_default()
+        .keys()
+        .map(|name| String::from_utf8(name.strip_prefix(b"/").unwrap_or(name).to_vec()).unwrap())
         .collect()
 }
 
@@ -4810,20 +4792,12 @@ fn circular_historical_trailer_json_pdf() -> Vec<u8> {
 /// `Some(0)` (an AcroForm that survives with an emptied `/Fields`).
 fn acroform_fields_len(pdf: &mut Pdf<BufReader<File>>) -> Option<usize> {
     let root_ref = pdf.root_ref()?;
-    let Object::Dictionary(catalog) = pdf.resolve_canonical_object(root_ref).ok()? else {
-        return None;
-    };
-    let acroform = resolve_maybe_indirect(pdf, catalog.get("AcroForm")?.clone())?;
-    let fields = resolve_maybe_indirect(pdf, acroform.as_dict()?.get("Fields")?.clone())?;
+    let catalog = pdf.resolve_canonical_object(root_ref).ok()?;
+    let acroform = catalog.try_get_key(b"/AcroForm").ok()?;
+    pdf.resolve(&acroform).ok()?;
+    let fields = acroform.try_get_key(b"/Fields").ok()?;
+    pdf.resolve(&fields).ok()?;
     Some(fields.as_array()?.len())
-}
-
-/// Resolve `object` if it is an indirect reference, otherwise return it as-is.
-fn resolve_maybe_indirect(pdf: &mut Pdf<BufReader<File>>, object: Object) -> Option<Object> {
-    match object {
-        Object::Reference(object_ref) => pdf.resolve_canonical_object(object_ref).ok(),
-        direct => Some(direct),
-    }
 }
 
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
@@ -5149,21 +5123,21 @@ fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     let page = pdf.resolve_canonical_object(page_ref).unwrap();
     let contents = page
-        .as_dict()
-        .and_then(|dict| dict.get("Contents"))
-        .and_then(Object::as_array)
+        .try_get_key(b"/Contents")
+        .expect("rewritten page must have /Contents");
+    pdf.resolve(&contents).unwrap();
+    let contents = contents
+        .as_array()
         .expect("rewritten page must retain its /Contents array");
-    let Object::Reference(stream_ref) = contents[0] else {
-        panic!("first /Contents element must remain a stream reference");
-    };
-    let stream = pdf
-        .resolve_canonical_object(stream_ref)
-        .unwrap()
-        .into_stream()
-        .expect("first /Contents element must resolve to a stream");
+    let stream_ref = contents[0]
+        .object_ref()
+        .expect("first /Contents element must remain a stream reference");
+    let stream = pdf.resolve_canonical_object(stream_ref).unwrap();
     assert_eq!(
-        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
-            .unwrap(),
+        stream
+            .get_stream_data(flpdf::DecodeLevel::All)
+            .unwrap()
+            .as_slice(),
         b"q\nQ"
     );
 }
@@ -6601,9 +6575,9 @@ fn pages_extraction_materializes_inherited_indirect_resources_before_prune() {
         let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
         let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
         let page = pdf.resolve_canonical_object(page_ref).unwrap();
-        let resources = page.as_dict().and_then(|dict| dict.get("Resources"));
+        let resources = page.try_get_key(b"/Resources").unwrap();
         assert!(
-            matches!(resources, Some(Object::Dictionary(_))),
+            resources.try_is_dictionary().unwrap(),
             "{label}: qpdf's copy_if_shared route must materialize /Resources directly on the page; got {resources:?}"
         );
     }
@@ -6641,20 +6615,26 @@ fn pages_extraction_resource_modes_match_qpdf_copy_boundary() {
         let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
         let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
         let page = pdf.resolve_canonical_object(page_ref).unwrap();
-        let resources = page.as_dict().and_then(|dict| dict.get("Resources"));
+        let resources = page.try_get_key(b"/Resources").unwrap();
         if should_materialize {
-            let Some(Object::Dictionary(resources)) = resources else {
-                panic!("{label}: qpdf Yes must materialize /Resources; got {resources:?}");
-            };
-            let font = resources.get("Font");
             assert!(
-                font.is_none()
-                    || matches!(font, Some(Object::Dictionary(font)) if font.iter().next().is_none()),
-                "{label}: qpdf Yes must prune unused /F1 after materializing /Resources; got {font:?}"
+                resources.try_is_dictionary().unwrap(),
+                "{label}: qpdf Yes must materialize /Resources; got {resources:?}"
+            );
+            let font_present = resources.try_has_key(b"/Font").unwrap();
+            assert!(
+                !font_present
+                    || resources
+                        .try_get_key(b"/Font")
+                        .unwrap()
+                        .try_get_keys()
+                        .unwrap()
+                        .is_empty(),
+                "{label}: qpdf Yes must prune unused /F1 after materializing /Resources"
             );
         } else {
             assert!(
-                matches!(resources, Some(Object::Reference(_))),
+                resources.object_ref().is_some(),
                 "{label}: qpdf must leave an unshared page-local indirect /Resources reference intact; got {resources:?}"
             );
         }
@@ -7284,18 +7264,14 @@ fn add_attachment_non_ascii_basename_uses_qpdf_unicode_filename_for_f_and_uf() {
         .find(|(key, _)| key == b"unicode-key")
         .expect("unicode attachment must be present");
     let fs_obj = pdf.resolve_canonical_object(*filespec_ref).unwrap();
-    let Object::Dictionary(fs_dict) = fs_obj else {
-        panic!("expected filespec dictionary");
-    };
-
     assert_eq!(
-        fs_dict.get("F"),
-        Some(&Object::String(encode_utf16be("レポート.pdf"))),
+        fs_obj.try_get_key(b"/F").unwrap().as_string(),
+        Some(encode_utf16be("レポート.pdf")),
         "/F must match qpdf's Unicode filename when no compatibility name is supplied"
     );
     assert_eq!(
-        fs_dict.get("UF"),
-        Some(&Object::String(encode_utf16be("レポート.pdf"))),
+        fs_obj.try_get_key(b"/UF").unwrap().as_string(),
+        Some(encode_utf16be("レポート.pdf")),
         "/UF must preserve the Unicode basename"
     );
 }
@@ -8519,11 +8495,8 @@ fn rewrite_flatten_rotation_removes_rotate() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
     let page = pdf.resolve_canonical_object(page_refs[0]).unwrap();
-    let Object::Dictionary(dict) = page else {
-        panic!("page is not a dictionary");
-    };
     // After flattening, /Rotate is either absent or normalized to 0.
-    let rotate = dict.get("Rotate").and_then(|o| o.as_integer());
+    let rotate = page.try_get_key(b"/Rotate").unwrap().as_integer();
     assert!(
         rotate.is_none() || rotate == Some(0),
         "page /Rotate should be absent or 0 after --flatten-rotation, got {rotate:?}"

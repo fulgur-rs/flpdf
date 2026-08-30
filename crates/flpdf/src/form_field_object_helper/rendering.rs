@@ -24,9 +24,9 @@ use crate::content_stream::{
 };
 use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
-use crate::object::write_literal_string;
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
+use crate::pdf_syntax::write_literal_string;
 use crate::pipeline::PipelineResult;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};

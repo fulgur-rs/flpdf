@@ -29,7 +29,7 @@
 //! (OS CSPRNG). The deterministic-IV opt-in for byte-identical CI
 //! testing is the separate `--static-aes-iv` flag.
 
-use crate::object::Dictionary;
+use crate::ObjectHandle;
 pub(crate) mod crypt_filters;
 pub(crate) mod keys;
 pub(crate) mod password;
@@ -215,7 +215,7 @@ pub struct CopyEncryptionSource {
     /// The donor's `/Encrypt` dictionary, copied verbatim.  The writer emits
     /// it as a new indirect object in the output, referencing it from the
     /// trailer's `/Encrypt` entry.
-    pub encrypt_dict: Dictionary,
+    pub encrypt_dict: ObjectHandle,
     /// The donor's recovered file encryption key (from
     /// [`crate::Pdf::encryption_file_key`]).  The writer uses it directly
     /// instead of re-deriving a key from a password, so that encrypted strings

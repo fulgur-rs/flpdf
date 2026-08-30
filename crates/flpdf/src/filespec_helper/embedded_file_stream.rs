@@ -24,8 +24,8 @@ use std::rc::Rc;
 /// All accessors are cheap: only [`payload`](EmbeddedFileStream::payload)
 /// performs I/O (decoding the filter chain).
 pub struct EmbeddedFileStream<'a, R: Read + Seek + 'static> {
-    /// qpdf's shared `/EmbeddedFile` object handle. Unlike a copied
-    /// [`crate::Stream`], this preserves identity and lets metadata setters
+    /// qpdf's shared `/EmbeddedFile` object handle. Unlike a copied stream
+    /// value, this preserves identity and lets metadata setters
     /// update its dictionary without cloning its payload.
     stream: ObjectHandle,
     // The wrapper still owns the document's exclusive borrow. RefCell only
@@ -196,10 +196,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         // (libqpdf/QPDFEFStreamObjectHelper.cc:20-28), whose
         // asStreamWithAssert/assertType path raises this runtime error for a
         // non-stream object (libqpdf/QPDFObjectHandle.cc:319-324, 2215-2223).
-        let (stream, terminal_ref) = self
-            .pdf
-            .borrow_mut()
-            .resolve_to_terminal_ref(&self.stream)?;
+        let (stream, terminal_ref) = self.pdf.borrow_mut().resolve_handle_ref(&self.stream)?;
         let stream = match terminal_ref {
             Some(object_ref) => {
                 let mut pdf = self.pdf.borrow_mut();
@@ -225,7 +222,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
         let key = canonical_dictionary_key(key);
         let value = dictionary.get_key(&key);
-        self.pdf.borrow_mut().resolve_to_terminal(&value)
+        self.pdf.borrow_mut().resolve_handle(&value)
     }
 
     fn param_value(&self, key: &[u8]) -> Result<ObjectHandle> {
@@ -404,7 +401,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(());
         };
         let params = stream_dict.get_key(b"/Params");
-        let (resolved, terminal_ref) = self.pdf.borrow_mut().resolve_to_terminal_ref(&params)?;
+        let (resolved, terminal_ref) = self.pdf.borrow_mut().resolve_handle_ref(&params)?;
         if resolved.as_dictionary().is_some() {
             let target = match terminal_ref {
                 Some(object_ref) => {

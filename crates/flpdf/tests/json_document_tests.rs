@@ -290,10 +290,10 @@ fn update_from_json_replaces_only_named_objects_and_runs_update_flags() {
 
     let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
     assert_eq!(catalog.get_key(b"/Marker").as_boolean(), Some(true));
-    assert_eq!(
-        pdf.resolve_canonical_object(ObjectRef::new(2, 0)).unwrap(),
-        original_pages
-    );
+    assert!(pdf
+        .resolve_canonical_object(ObjectRef::new(2, 0))
+        .unwrap()
+        .is_same_object_as(&original_pages));
     assert!(pdf.ever_called_get_all_pages());
 }
 

@@ -163,14 +163,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if !outlines.try_has_key(b"/First")? {
             return Ok(false);
         }
-        // Chase the same `Pdf::set_object` + `shallow_copy` redirect every
-        // other exit path in this file already chases via
-        // `resolve_value_handle` before inspecting the resolved value:
-        // `try_is_null` dereferences only the receiver itself, so a direct
-        // reference-valued `/First` whose terminal target is null would
-        // otherwise report non-null here while `get_tree` (which chases
-        // inside `materialize_item`) terminal-chases the same cursor and
-        // produces zero roots — the two would disagree on the same document.
+        // Resolve `/First` through the owning document before applying the
+        // null check, matching the other outline traversal entry points.
         let first = outlines.try_get_key(b"/First")?;
         let first = self.resolve_value_handle(first)?;
         Ok(!first.try_is_null()?)
@@ -184,17 +178,10 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         self.pdf.resolve(handle)
     }
 
-    /// Follow the temporary bare-reference redirect that `Pdf::set_object`
-    /// can install in a canonical slot. Parsed qpdf objects never contain
-    /// this state: a normal indirect child resolves in one hop and is
-    /// returned unchanged. Keeping this compatibility chase handle-native
-    /// lets the outline consumer preserve live identity without reopening the
-    /// raw `Object` route while the legacy replacement bridge is removed.
-    // qpdf-deviation: chases a Pdf::set_object bare-reference redirect that
-    // has no qpdf counterpart (QPDF::replaceObject rejects indirect
-    // replacement, libqpdf/QPDF.cc:1986-1991).
+    /// Resolve one child handle through the owning document while preserving
+    /// the canonical handle identity used by the outline walk.
     pub(crate) fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        self.pdf.resolve_to_terminal(&handle)
+        self.pdf.resolve_handle(&handle)
     }
 
     /// Chase `cursor` to its terminal target (see [`Self::resolve_value_handle`])
@@ -405,19 +392,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
     ) -> Result<Option<OutlineId>> {
-        // Chase a direct handle whose own resolved value is itself a bare
-        // `Object::Reference` (installed via `shallow_copy` on a
-        // `Pdf::set_object`-redirected holder, then set as `/First`/`/Next`
-        // through the public `ObjectHandle::replace_key` API) to its real
-        // target, the same way every other exit path in this file already
-        // chases this shape via `resolve_value_handle`. Both callers
-        // (`get_tree`'s loop and `build_item`'s frame loop) already chase
-        // `cursor` through `chase_and_mark_seen` before calling here, so
-        // this re-chase is normally a redundant no-op —
-        // `resolve_to_terminal` returns an already-terminal
-        // handle unchanged — kept so this function's own `source_ref`
-        // capture stays correct standalone, independent of caller
-        // discipline. `object_ref()` is captured AFTER chasing so cycle
+        // Both callers (`get_tree`'s loop and `build_item`'s frame loop)
+        // already resolve `cursor` through `chase_and_mark_seen` before
+        // calling here. Resolve once more so this function's own `source_ref`
+        // capture remains correct when it is called independently. The
+        // canonical handle identity is captured AFTER resolution so cycle
         // detection (`source_ref`, used by `build_item`'s
         // `constructor_seen`) keys off the terminal identity, not the
         // pre-chase holder.
@@ -466,10 +445,8 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if !dests.try_has_key(&key)? {
             return Ok(None);
         }
-        // Chase the selected entry the same way every other exit path in
-        // this file does: a `Pdf::set_object` legacy redirect can still sit
-        // behind this dictionary entry even after `dests` itself was chased
-        // in `cached_dest_dict`.
+        // Resolve the selected entry through the canonical document resolver
+        // after the destination dictionary itself has been validated.
         let value = dests.try_get_key(&key)?;
         Ok(Some(self.resolve_value_handle(value)?))
     }

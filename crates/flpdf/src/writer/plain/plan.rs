@@ -601,9 +601,6 @@ pub(crate) fn canonical_trailer_entries_with_visibility(
         if value
             .object_ref()
             .is_some_and(|object_ref| object_ref.number == 0 || removed_refs.contains(&object_ref))
-            || value.as_reference().is_some_and(|object_ref| {
-                object_ref.number == 0 || removed_refs.contains(&object_ref)
-            })
             || (suppress_null_values && value.try_is_null()?)
         {
             continue;
@@ -995,16 +992,6 @@ mod tests {
         }
     }
 
-    fn resolved_reference<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        object_ref: ObjectRef,
-        target: ObjectRef,
-    ) -> ObjectHandle {
-        let handle = pdf.get_object_handle(object_ref);
-        handle.set_resolved(ObjectValue::Reference(target));
-        handle
-    }
-
     fn plan_for_test(objects: Vec<PlannedIndirectObject>) -> PlainWritePlan {
         let root_source = ObjectRef::new(1, 0);
         let root_output = ObjectRef::new(1, 0);
@@ -1161,42 +1148,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_rewrite_uses_live_trailer_and_suppresses_nested_null_dictionary_entries() {
-        let mut pdf = Pdf::open(std::io::BufReader::new(
-            std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
-        ))
-        .unwrap();
-        pdf.delete_object(ObjectRef::new(999, 0));
-        let zero = resolved_reference(&mut pdf, ObjectRef::new(100, 0), ObjectRef::new(0, 0));
-        let removed = resolved_reference(&mut pdf, ObjectRef::new(101, 0), ObjectRef::new(999, 0));
-        pdf.trailer().replace_key(b"/Zero", zero).unwrap();
-        pdf.trailer().replace_key(b"/Removed", removed).unwrap();
-        let missing = pdf.get_object_handle(ObjectRef::new(999, 0));
-        let added = ObjectHandle::dictionary(vec![
-            (b"Gone".to_vec(), missing),
-            (
-                b"Array".to_vec(),
-                ObjectHandle::array(vec![ObjectHandle::null()]),
-            ),
-        ]);
-        pdf.trailer().replace_key(b"/Added", added).unwrap();
-
-        let output = {
-            let mut writer = PdfWriter::new(&mut pdf);
-            writer.set_object_stream_mode(ObjectStreamMode::Disable);
-            writer.set_output_memory().unwrap();
-            writer.write().unwrap();
-            writer.get_buffer().unwrap()
-        };
-        let text = String::from_utf8_lossy(&output);
-
-        assert!(text.contains("/Added << /Array [ null ] >>"));
-        assert!(!text.contains("/Gone"));
-        assert!(!text.contains("/Zero"));
-        assert!(!text.contains("/Removed"));
-    }
-
-    #[test]
     fn canonical_trailer_entries_follow_qpdf_null_visibility() {
         let mut pdf = Pdf::open(std::io::BufReader::new(
             std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
@@ -1263,7 +1214,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(pdf.trailer_dictionary().get("ID").is_some());
+        assert!(pdf.trailer().try_has_key(b"/ID").unwrap());
         let id0 = live_source_id0(&mut pdf).unwrap();
         assert!(
             id0.is_some(),
@@ -1385,31 +1336,6 @@ mod tests {
 
         assert!(matches!(error, crate::Error::Unsupported(message)
             if message.contains("trailer /Info reference")
-                && message.contains("absent from renumber map")));
-    }
-
-    #[test]
-    fn canonical_trailer_entries_reject_an_unmapped_nested_value() {
-        let mut pdf = Pdf::open(std::io::BufReader::new(
-            std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
-        ))
-        .unwrap();
-        let trailer = pdf.trailer();
-        trailer.remove_key(b"/Info");
-        let nested_ref =
-            resolved_reference(&mut pdf, ObjectRef::new(1000, 0), ObjectRef::new(999, 0));
-        trailer
-            .replace_key(
-                b"/Nested",
-                ObjectHandle::dictionary(vec![(b"Bare".to_vec(), nested_ref)]),
-            )
-            .unwrap();
-
-        let error =
-            canonical_trailer_entries(&mut pdf, &HashMap::new(), &BTreeSet::new()).unwrap_err();
-
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("trailer nested reference 1000 0 R")
                 && message.contains("absent from renumber map")));
     }
 

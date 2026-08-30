@@ -2,8 +2,7 @@
 //! (`libqpdf/QPDF_json.cc:233-832`; `libqpdf/QUtil.cc:642-663`).
 //!
 //! This is the canonical value boundary for the JSON input importer. It builds
-//! document-owned `ObjectHandle` values and never routes through the legacy
-//! `Object`/`Pdf::set_object` representation.
+//! document-owned `ObjectHandle` values directly in the live document graph.
 //!
 //! The importer has two intentional category (B) internal substitutions whose
 //! observable JSON contract is pinned to qpdf:
@@ -440,8 +439,7 @@ struct StackFrame {
 /// container. `next_obj` and `next_state` therefore mirror qpdf's reactor
 /// hand-off: `make_object` installs an empty canonical container, and
 /// `container_start` puts that same handle on the stack before the child
-/// members arrive. The importer owns this route; it never calls the legacy
-/// `Pdf::set_object` bridge.
+/// members arrive. The importer owns this live-handle route.
 pub(crate) struct JsonReactor<'a, P, S>
 where
     P: Read + Seek + 'static,

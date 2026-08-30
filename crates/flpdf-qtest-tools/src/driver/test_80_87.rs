@@ -217,7 +217,7 @@ fn value_as_uint_u32(handle: &ObjectHandle, out: &mut u32) -> bool {
 // getValueAsReal (`libqpdf/QPDFObjectHandle.cc:622-630`): only a real value
 // succeeds, yielding `QPDF_Real`'s own stored source string. This crate's
 // `ObjectValue::RealLiteral` keeps that exact source string alongside the
-// parsed `f64` (`Object::RealLiteral`'s own invariant: the literal differs
+// parsed `f64` (the handle's preserved-literal invariant: the literal differs
 // from `value.to_string()`, which is exactly why `42.0` -- whose
 // `f64::to_string()` is `"42"` -- must be built via `real_literal` here
 // rather than the literal-free `ObjectHandle::real` constructor, whose

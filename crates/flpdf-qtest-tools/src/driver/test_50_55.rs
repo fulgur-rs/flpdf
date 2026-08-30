@@ -341,7 +341,7 @@ pub(crate) fn run_test_53<R: Read + Seek>(
     // std::endl`) -- qpdf allocates a fresh object number from its own
     // internal object cache (`libqpdf/QPDF.cc`), not from the trailer
     // `/Size` or any other document-visible counter, so it cannot be
-    // emulated by picking an unused number and calling `Pdf::set_object`.
+    // emulated by picking an unused number and calling a replacement API.
     // flpdf's `Pdf` exposes no public equivalent (only `version`/
     // `trailer`/`trailer_handle`/`trailer_key_handle`/`root_ref`; the
     // private `next_object_ref` helper in `page_form_xobject.rs` is

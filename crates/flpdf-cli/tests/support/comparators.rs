@@ -5,14 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::io::{BufReader, Cursor};
 use std::process::Command as ShellCommand;
 
-use super::filter_handles;
-use flpdf::{filters::decode_stream_data, Dictionary, Object, ObjectRef, Pdf};
 use tempfile::TempDir;
 
-use super::{is_qpdf_available, Comparator, ComparatorResult, PdfCanonicalTestExt, RunOutputs};
+use super::{is_qpdf_available, Comparator, ComparatorResult, RunOutputs};
 
 // ---------------------------------------------------------------------------
 // Minimal hand-rolled JSON parser
@@ -459,7 +456,7 @@ impl Comparator for QpdfJsonComparator {
             }
         };
 
-        let qpdf_json = match run_qpdf_json(qpdf_bytes, "qpdf-side.pdf", &tmp) {
+        let qpdf_json = match run_qpdf_json(qpdf_bytes, "qpdf-side.pdf", &tmp, None) {
             Ok(j) => j,
             Err(e) => {
                 return ComparatorResult::Skipped {
@@ -468,7 +465,7 @@ impl Comparator for QpdfJsonComparator {
             }
         };
 
-        let flpdf_json = match run_qpdf_json(flpdf_bytes, "flpdf-side.pdf", &tmp) {
+        let flpdf_json = match run_qpdf_json(flpdf_bytes, "flpdf-side.pdf", &tmp, None) {
             Ok(j) => j,
             Err(e) => {
                 return ComparatorResult::Skipped {
@@ -485,13 +482,25 @@ impl Comparator for QpdfJsonComparator {
 }
 
 /// Run `qpdf --json=2 <file>` on the given byte slice (written to `tmp/<name>`).
-/// Returns parsed `JsonValue` on success, or an error string.
-fn run_qpdf_json(bytes: &[u8], file_name: &str, tmp: &TempDir) -> Result<JsonValue, String> {
+/// `stream_data_mode`, when given, is passed as `--json-stream-data=<mode>`
+/// (e.g. `"inline"` to embed base64-encoded stream payloads in the
+/// projection instead of qpdf's default `none`). Returns parsed `JsonValue`
+/// on success, or an error string.
+fn run_qpdf_json(
+    bytes: &[u8],
+    file_name: &str,
+    tmp: &TempDir,
+    stream_data_mode: Option<&str>,
+) -> Result<JsonValue, String> {
     let pdf_path = tmp.path().join(file_name);
     std::fs::write(&pdf_path, bytes).map_err(|e| format!("write failed: {e}"))?;
 
-    let result = ShellCommand::new("qpdf")
-        .arg("--json=2")
+    let mut command = ShellCommand::new("qpdf");
+    command.arg("--json=2");
+    if let Some(mode) = stream_data_mode {
+        command.arg(format!("--json-stream-data={mode}"));
+    }
+    let result = command
         .arg(&pdf_path)
         .output()
         .map_err(|e| format!("spawn qpdf: {e}"))?;
@@ -512,8 +521,15 @@ fn run_qpdf_json(bytes: &[u8], file_name: &str, tmp: &TempDir) -> Result<JsonVal
 // StructuralComparator
 // ---------------------------------------------------------------------------
 
-/// Compares two PDF outputs by loading each with `flpdf::Pdf` and recursively
-/// diffing the object graph starting from the trailer dictionary.
+/// Compares the two outputs through qpdf's canonical JSON object projection,
+/// with inline stream payloads so content corruption is not masked by
+/// [`QpdfJsonComparator`]'s default `--json-stream-data=none` projection.
+///
+/// The former implementation reconstructed a second raw `Object` tree inside
+/// the test harness. That duplicated the library's removed object model and
+/// could disagree with qpdf about lazy references; qpdf JSON already supplies
+/// the semantic projection needed by this comparator, and requesting inline
+/// stream data folds the old decoded-payload check into the same JSON diff.
 pub struct StructuralComparator;
 
 impl Comparator for StructuralComparator {
@@ -537,284 +553,50 @@ impl Comparator for StructuralComparator {
             return ComparatorResult::Skipped { reason };
         };
 
-        let mut pdf_q = match Pdf::open(BufReader::new(Cursor::new(qpdf_bytes.clone()))) {
-            Ok(p) => p,
+        if !is_qpdf_available() {
+            return ComparatorResult::Skipped {
+                reason: "qpdf not available".to_string(),
+            };
+        }
+
+        let tmp = match tempfile::tempdir() {
+            Ok(t) => t,
             Err(e) => {
                 return ComparatorResult::Skipped {
-                    reason: format!("flpdf failed to open qpdf output: {e}"),
+                    reason: format!("failed to create tempdir: {e}"),
                 }
             }
         };
 
-        let mut pdf_f = match Pdf::open(BufReader::new(Cursor::new(flpdf_bytes.clone()))) {
-            Ok(p) => p,
+        let qpdf_json = match run_qpdf_json(qpdf_bytes, "qpdf-side.pdf", &tmp, Some("inline")) {
+            Ok(j) => j,
             Err(e) => {
                 return ComparatorResult::Skipped {
-                    reason: format!("flpdf failed to open flpdf output: {e}"),
+                    reason: format!(
+                        "qpdf --json=2 --json-stream-data=inline failed on qpdf side: {e}"
+                    ),
                 }
             }
         };
 
-        // Compare trailer dictionaries, then follow /Root recursively.
-        let trailer_q = pdf_q.trailer_dictionary().clone();
-        let trailer_f = pdf_f.trailer_dictionary().clone();
+        let flpdf_json = match run_qpdf_json(flpdf_bytes, "flpdf-side.pdf", &tmp, Some("inline")) {
+            Ok(j) => j,
+            Err(e) => {
+                return ComparatorResult::Skipped {
+                    reason: format!(
+                        "qpdf --json=2 --json-stream-data=inline failed on flpdf side: {e}"
+                    ),
+                }
+            }
+        };
 
-        let mut visited: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
-
-        match compare_dicts(
-            "/trailer",
-            &trailer_q,
-            &trailer_f,
-            &mut pdf_q,
-            &mut pdf_f,
-            &mut visited,
-        ) {
+        match compare_json("", &qpdf_json, &flpdf_json) {
             Ok(()) => ComparatorResult::Match,
             Err(reason) => ComparatorResult::Diverge { reason },
         }
     }
 }
 
-/// Recursively compare two `Object` values.
-fn compare_objects(
-    path: &str,
-    obj_q: &Object,
-    obj_f: &Object,
-    pdf_q: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
-    pdf_f: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
-    visited: &mut BTreeSet<(ObjectRef, ObjectRef)>,
-) -> Result<(), String> {
-    match (obj_q, obj_f) {
-        (Object::Null, Object::Null) => Ok(()),
-        (Object::Boolean(a), Object::Boolean(b)) => {
-            if a == b {
-                Ok(())
-            } else {
-                Err(format!("{path}: Boolean({a}) vs Boolean({b})"))
-            }
-        }
-        (Object::Integer(a), Object::Integer(b)) => {
-            if a == b {
-                Ok(())
-            } else {
-                Err(format!("{path}: Integer({a}) vs Integer({b})"))
-            }
-        }
-        // Two reals compare equal on value (either variant carries the value),
-        // ignoring source-literal preservation since compat comparisons already
-        // treat integers and reals independently on other keys.
-        (
-            Object::Real(a) | Object::RealLiteral { value: a, .. },
-            Object::Real(b) | Object::RealLiteral { value: b, .. },
-        ) => {
-            if a == b {
-                Ok(())
-            } else {
-                Err(format!("{path}: Real({a}) vs Real({b})"))
-            }
-        }
-        (Object::Name(a), Object::Name(b)) => {
-            if a == b {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{path}: Name({}) vs Name({})",
-                    lossy_name(a),
-                    lossy_name(b)
-                ))
-            }
-        }
-        (Object::String(a), Object::String(b)) => {
-            if a == b {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{path}: String differs (len {} vs {})",
-                    a.len(),
-                    b.len()
-                ))
-            }
-        }
-        (Object::Array(a), Object::Array(b)) => {
-            if a.len() != b.len() {
-                return Err(format!("{path}: Array length {} vs {}", a.len(), b.len()));
-            }
-            // Clone to avoid borrow conflicts when passing pdf_q/pdf_f mutably.
-            let a_clone: Vec<Object> = a.clone();
-            let b_clone: Vec<Object> = b.clone();
-            for (i, (av, bv)) in a_clone.iter().zip(b_clone.iter()).enumerate() {
-                compare_objects(&format!("{path}[{i}]"), av, bv, pdf_q, pdf_f, visited)?;
-            }
-            Ok(())
-        }
-        (Object::Dictionary(a), Object::Dictionary(b)) => {
-            compare_dicts(path, a, b, pdf_q, pdf_f, visited)
-        }
-        (Object::Stream(a), Object::Stream(b)) => {
-            // Try decoded comparison first; encoding-dependent dict keys are
-            // skipped only when both sides decode successfully (i.e. we're
-            // comparing semantic content, not the raw encoded form).
-            let decoded_a = decode_stream_data(&filter_handles::dictionary(&a.dict), &a.data);
-            let decoded_b = decode_stream_data(&filter_handles::dictionary(&b.dict), &b.data);
-            match (decoded_a, decoded_b) {
-                (Ok(da), Ok(db)) => {
-                    compare_dicts_with_excluded(
-                        &format!("{path}/dict"),
-                        &a.dict,
-                        &b.dict,
-                        STREAM_ENCODING_KEYS,
-                        pdf_q,
-                        pdf_f,
-                        visited,
-                    )?;
-                    if da != db {
-                        return Err(format!(
-                            "{path}/stream: decoded content differs ({} vs {} bytes)",
-                            da.len(),
-                            db.len()
-                        ));
-                    }
-                }
-                _ => {
-                    // Raw fallback: the bytes' relationship to the dictionary
-                    // is significant, so compare the dict as-is.
-                    compare_dicts(
-                        &format!("{path}/dict"),
-                        &a.dict,
-                        &b.dict,
-                        pdf_q,
-                        pdf_f,
-                        visited,
-                    )?;
-                    if a.data != b.data {
-                        return Err(format!(
-                            "{path}/stream: raw content differs (decode failed; {} vs {} bytes)",
-                            a.data.len(),
-                            b.data.len()
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        (Object::Reference(r_q), Object::Reference(r_f)) => {
-            // Follow both references; cycle detection via (r_q, r_f) pair.
-            let pair = (*r_q, *r_f);
-            if visited.contains(&pair) {
-                // Already in progress on this pair — treat as equal.
-                return Ok(());
-            }
-            visited.insert(pair);
-            let resolved_q = pdf_q
-                .resolve_canonical_object(*r_q)
-                .map_err(|e| format!("{path}: failed to resolve {r_q}: {e}"))?;
-            let resolved_f = pdf_f
-                .resolve_canonical_object(*r_f)
-                .map_err(|e| format!("{path}: failed to resolve {r_f}: {e}"))?;
-            compare_objects(
-                &format!("{path}[{r_q}]"),
-                &resolved_q,
-                &resolved_f,
-                pdf_q,
-                pdf_f,
-                visited,
-            )
-        }
-        // Variant mismatch.
-        _ => Err(format!(
-            "{path}: variant mismatch {} vs {}",
-            object_type_name(obj_q),
-            object_type_name(obj_f)
-        )),
-    }
-}
-
-fn compare_dicts(
-    path: &str,
-    dict_q: &Dictionary,
-    dict_f: &Dictionary,
-    pdf_q: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
-    pdf_f: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
-    visited: &mut BTreeSet<(ObjectRef, ObjectRef)>,
-) -> Result<(), String> {
-    compare_dicts_with_excluded(path, dict_q, dict_f, &[], pdf_q, pdf_f, visited)
-}
-
-/// Dictionary keys that describe how a stream is encoded rather than what it
-/// semantically contains. When both sides decode successfully the structural
-/// comparator excludes these because qpdf and flpdf may legitimately pick
-/// different encoded lengths or filter chains for the same decoded payload.
-const STREAM_ENCODING_KEYS: &[&[u8]] = &[
-    b"Length",
-    b"Filter",
-    b"DecodeParms",
-    b"F",
-    b"FFilter",
-    b"FDecodeParms",
-];
-
-fn compare_dicts_with_excluded(
-    path: &str,
-    dict_q: &Dictionary,
-    dict_f: &Dictionary,
-    excluded_keys: &[&[u8]],
-    pdf_q: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
-    pdf_f: &mut Pdf<BufReader<Cursor<Vec<u8>>>>,
-    visited: &mut BTreeSet<(ObjectRef, ObjectRef)>,
-) -> Result<(), String> {
-    let mut all_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (k, _) in dict_q.iter() {
-        all_keys.insert(k.to_vec());
-    }
-    for (k, _) in dict_f.iter() {
-        all_keys.insert(k.to_vec());
-    }
-    for key in &all_keys {
-        if excluded_keys.contains(&key.as_slice()) {
-            continue;
-        }
-        let key_str = lossy_name(key);
-        let child_path = format!("{path}/{key_str}");
-        match (dict_q.get(key), dict_f.get(key)) {
-            (Some(vq), Some(vf)) => {
-                let vq_clone = vq.clone();
-                let vf_clone = vf.clone();
-                compare_objects(&child_path, &vq_clone, &vf_clone, pdf_q, pdf_f, visited)?;
-            }
-            (None, Some(_)) => {
-                return Err(format!("{child_path}: key absent in qpdf output"));
-            }
-            (Some(_), None) => {
-                return Err(format!("{child_path}: key absent in flpdf output"));
-            }
-            (None, None) => unreachable!(),
-        }
-    }
-    Ok(())
-}
-
-fn lossy_name(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn object_type_name(obj: &Object) -> &'static str {
-    match obj {
-        Object::Null => "Null",
-        Object::Boolean(_) => "Boolean",
-        Object::Integer(_) => "Integer",
-        Object::Real(_) | Object::RealLiteral { .. } => "Real",
-        Object::Name(_) => "Name",
-        Object::String(_) => "String",
-        Object::Operator(_) => "Operator",
-        Object::InlineImage(_) => "InlineImage",
-        Object::Array(_) => "Array",
-        Object::Dictionary(_) => "Dictionary",
-        Object::Stream(_) => "Stream",
-        Object::Reference(_) => "Reference",
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -963,64 +745,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn compare_dicts_with_excluded_skips_listed_keys() {
-        // Build two dictionaries that differ only in /Length and /Filter —
-        // exactly the keys a real encoder would vary even when the decoded
-        // stream content is identical.
-        let mut dict_q = Dictionary::new();
-        dict_q.insert("Type", Object::Name(b"XObject".to_vec()));
-        dict_q.insert("Length", Object::Integer(100));
-        dict_q.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    /// A minimal, xref-valid one-page PDF with a single uncompressed
+    /// content-stream object, otherwise structurally identical regardless
+    /// of `content`. A correct xref table (rather than relying on qpdf's
+    /// reconstruction fallback) keeps `run_qpdf_json` seeing a clean qpdf
+    /// exit code instead of the "warnings" status a repaired file produces.
+    fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(4);
 
-        let mut dict_f = Dictionary::new();
-        dict_f.insert("Type", Object::Name(b"XObject".to_vec()));
-        dict_f.insert("Length", Object::Integer(200));
-        dict_f.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        offsets.push(out.len());
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
 
-        // Open a fixture twice solely to obtain Pdf instances; the dict
-        // values we compare contain no indirect references, so no resolution
-        // actually happens.
-        let bytes = fixture_bytes("one-page.pdf");
-        let mut pdf_q = Pdf::open(BufReader::new(Cursor::new(bytes.clone()))).unwrap();
-        let mut pdf_f = Pdf::open(BufReader::new(Cursor::new(bytes))).unwrap();
-        let mut visited = BTreeSet::new();
+        offsets.push(out.len());
+        out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>\nendobj\n");
 
-        // Without the exclusion list, an encoding-key divergence is
-        // reported (BTreeSet ordering picks /Filter first, then /Length —
-        // either is acceptable as long as the error points at one).
-        let err = compare_dicts_with_excluded(
-            "/x",
-            &dict_q,
-            &dict_f,
-            &[],
-            &mut pdf_q,
-            &mut pdf_f,
-            &mut visited,
-        )
-        .expect_err("expected an encoding-key divergence");
-        assert!(
-            err.contains("/Length") || err.contains("/Filter"),
-            "expected encoding-key in error, got: {err}"
+        offsets.push(out.len());
+        out.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 100 100 ] /Contents 4 0 R >>\nendobj\n",
         );
 
-        // With STREAM_ENCODING_KEYS exclusion (the production setting for
-        // streams whose decoded content matched), the same dictionaries
-        // compare as equivalent.
-        let mut visited = BTreeSet::new();
-        compare_dicts_with_excluded(
-            "/x",
-            &dict_q,
-            &dict_f,
-            STREAM_ENCODING_KEYS,
-            &mut pdf_q,
-            &mut pdf_f,
-            &mut visited,
-        )
-        .expect("encoding-only divergences must be tolerated when decoded content matches");
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        out.extend_from_slice(content);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = out.len();
+        out.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
     }
 
-    // --- JSON parser unit tests ---
+    #[test]
+    fn structural_detects_stream_payload_corruption_that_json_structure_hides() {
+        // Both PDFs have byte-identical structure (same dictionaries, same
+        // keys, same /Length) and differ only in the content-stream bytes.
+        // qpdf's default `--json-stream-data=none` omits stream payloads
+        // entirely, so QpdfJsonComparator alone would report Match here;
+        // StructuralComparator must request inline stream data to catch it.
+        let qpdf_bytes = one_page_pdf_with_content(b"1 0 0 RG 0 0 50 50 re S");
+        let flpdf_bytes = one_page_pdf_with_content(b"0 1 0 RG 0 0 50 50 re S");
+        let outputs = make_outputs(Some(qpdf_bytes), Some(flpdf_bytes));
+
+        if !is_qpdf_available() {
+            return;
+        }
+
+        let json_result = QpdfJsonComparator.compare(&outputs);
+        assert_eq!(
+            json_result,
+            ComparatorResult::Match,
+            "qpdf-json (stream data omitted) is expected to miss this corruption"
+        );
+
+        let structural_result = StructuralComparator.compare(&outputs);
+        match &structural_result {
+            ComparatorResult::Diverge { reason } => {
+                assert!(
+                    reason.contains("stream"),
+                    "expected a stream-payload divergence, got: {reason}"
+                );
+            }
+            other => {
+                panic!("structural comparator must catch stream content corruption, got {other:?}")
+            }
+        }
+    }
 
     #[test]
     fn json_parse_primitives() {

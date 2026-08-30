@@ -654,7 +654,7 @@ mod tests {
     }
 
     fn reference_target(value: &ObjectHandle) -> Option<ObjectRef> {
-        value.object_ref().or_else(|| value.as_reference())
+        value.object_ref()
     }
 
     fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<ObjectRef> {
@@ -700,7 +700,7 @@ mod tests {
     // precondition (nulling the dropped page, before or after
     // `rebuild_page_tree`) surfaces a pre-existing, unrelated staleness in
     // how `rebuild_page_tree` materializes a *direct* widget's `/P` redirect
-    // relative to a same-call `Pdf::set_object` null-out -- tracked
+    // relative to a same-call canonical null-out -- tracked
     // separately (flpdf-25kg.3.38.2.1) since it does not reproduce through
     // any real call path: `flpdf --pages . 1 --` on this exact direct-widget
     // shape strips `/P` correctly, byte-identical with qpdf (verified

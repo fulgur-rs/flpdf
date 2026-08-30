@@ -10,18 +10,15 @@
 //! original — proving the per-object key derivation, AES IV/padding, and
 //! `/Length` updates all line up with what the reader path expects.
 
-#[path = "support/filter_handles.rs"]
-mod filter_handles;
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Cursor;
 use std::process::Command;
 
 use flpdf::{
-    load_xref_and_trailer, CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, Object,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, Pdf, PdfOpenOptions,
-    StreamDataMode, XrefEntry,
+    load_xref_and_trailer, CopyEncryptionSource, DecodeLevel, EncryptMethod, EncryptParams,
+    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, Pdf,
+    PdfOpenOptions, StreamDataMode, XrefEntry,
 };
 
 const INFO_PLAINTEXT: &[u8] = b"Task4NestedPrintable";
@@ -319,51 +316,50 @@ fn encrypted_standard_writes_preserve_missing_page_resources_like_qpdf_11_9() {
             .resolve_canonical_object(pages[0])
             .expect("resolve rewritten page");
         assert!(
-            page.as_dict().is_some_and(|dict| dict.get("Resources").is_none()),
+            page.as_dictionary()
+                .is_some_and(|dict| !dict.contains_key(b"/Resources".as_slice())),
             "qdf={qdf}, object_streams={object_streams:?}: qpdf 11.9 standard writes do not synthesize /Resources"
         );
     }
 }
 
 fn resolve_nested_info_marker(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
-    let info_ref = match pdf.trailer_dictionary().get("Info") {
-        Some(Object::Reference(reference)) => *reference,
-        other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
-    };
+    let info_ref = pdf
+        .trailer()
+        .try_get_key(b"/Info")
+        .expect("read trailer /Info")
+        .object_ref()
+        .expect("trailer /Info must be an indirect reference");
     let info = pdf
         .resolve_canonical_object(info_ref)
         .expect("resolve /Info");
     let nested = info
-        .as_dict()
-        .and_then(|dict| dict.get("Nested"))
-        .and_then(Object::as_dict)
+        .try_get_key(b"/Nested")
+        .expect("read /Nested")
+        .as_dictionary()
         .expect("/Info /Nested dictionary");
-    match nested.get("Marker") {
-        Some(Object::String(value)) => value.clone(),
-        other => panic!("/Info /Nested /Marker must be a string, got {other:?}"),
-    }
+    nested
+        .get(b"/Marker".as_slice())
+        .and_then(|value| value.as_string())
+        .expect("/Info /Nested /Marker must be a string")
 }
 
 fn resolve_metadata_label(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
     let root_ref = pdf.root_ref().expect("encrypted output has /Root");
-    let metadata_ref = match pdf
+    let metadata_ref = pdf
         .resolve_canonical_object(root_ref)
         .expect("resolve Catalog")
-        .as_dict()
-        .and_then(|dict| dict.get("Metadata"))
-    {
-        Some(Object::Reference(reference)) => *reference,
-        other => panic!("Catalog /Metadata must be an indirect reference, got {other:?}"),
-    };
-    match pdf
+        .try_get_key(b"/Metadata")
+        .expect("read Catalog /Metadata")
+        .object_ref()
+        .expect("Catalog /Metadata must be an indirect reference");
+    let metadata = pdf
         .resolve_canonical_object(metadata_ref)
-        .expect("resolve Metadata stream")
-        .as_stream()
-        .and_then(|stream| stream.dict.get("Label"))
-    {
-        Some(Object::String(value)) => value.clone(),
-        other => panic!("Metadata /Label must be a string, got {other:?}"),
-    }
+        .expect("resolve Metadata stream");
+    metadata
+        .as_stream_dict()
+        .and_then(|dict| dict.get_key(b"/Label").as_string())
+        .expect("Metadata /Label must be a string")
 }
 
 fn object_number_before_marker(bytes: &[u8], marker: &[u8]) -> u32 {
@@ -509,12 +505,12 @@ fn v4_aes128_round_trip_on_one_page_resolves_to_same_root() {
     let catalog = enc_pdf
         .resolve_canonical_object(enc_root)
         .expect("decrypted /Catalog object resolves");
-    let Object::Dictionary(dict) = catalog else {
-        panic!("expected /Catalog Dictionary");
-    };
     assert_eq!(
-        dict.get("Type"),
-        Some(&Object::Name(b"Catalog".to_vec())),
+        catalog
+            .as_dictionary()
+            .and_then(|dict| dict.get(b"/Type".as_slice()).cloned())
+            .and_then(|value| value.as_name()),
+        Some(b"Catalog".to_vec()),
         "/Catalog /Type must round-trip across encrypt + decrypt"
     );
 }
@@ -559,16 +555,21 @@ fn aes_encrypted_strings_use_hex_in_compact_and_qdf() {
         let mut reopened = open_encrypted(&bytes, b"");
         assert!(reopened.is_encrypted());
         assert!(reopened.user_password_matched());
-        let encrypt_ref = match reopened.trailer_dictionary().get("Encrypt") {
-            Some(Object::Reference(reference)) => *reference,
-            other => panic!("trailer /Encrypt must be an indirect reference, got {other:?}"),
-        };
+        let encrypt_ref = reopened
+            .trailer()
+            .try_get_key(b"/Encrypt")
+            .expect("read trailer /Encrypt")
+            .object_ref()
+            .expect("trailer /Encrypt must be an indirect reference");
         let encrypt_dict = reopened
             .resolve_canonical_object(encrypt_ref)
             .expect("resolve dedicated /Encrypt object");
         assert_eq!(
-            encrypt_dict.as_dict().and_then(|dict| dict.get("Filter")),
-            Some(&Object::Name(b"Standard".to_vec())),
+            encrypt_dict
+                .as_dictionary()
+                .and_then(|dict| dict.get(b"/Filter".as_slice()).cloned())
+                .and_then(|value| value.as_name()),
+            Some(b"Standard".to_vec()),
             "trailer /Encrypt must reference the dedicated encryption dictionary"
         );
         assert_eq!(resolve_nested_info_marker(&mut reopened), INFO_PLAINTEXT);
@@ -601,10 +602,12 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
     assert_qpdf_check(&bytes);
 
     let mut reopened = open_encrypted(&bytes, b"");
-    let info_ref = match reopened.trailer_dictionary().get("Info") {
-        Some(Object::Reference(reference)) => *reference,
-        other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
-    };
+    let info_ref = reopened
+        .trailer()
+        .try_get_key(b"/Info")
+        .expect("read trailer /Info")
+        .object_ref()
+        .expect("trailer /Info must be an indirect reference");
     let object_header = format!("\n{} 0 obj\n", info_ref.number);
     assert!(
         !bytes
@@ -635,18 +638,26 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
     let container = reopened
         .resolve_canonical_object(ObjectRef::new(container_number, 0))
         .expect("resolve and decrypt ObjStm container");
-    let stream = container.as_stream().expect("ObjStm object is a stream");
-    let decoded =
-        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
-            .expect("decode decrypted ObjStm payload");
-    let first = match stream.dict.get("First") {
-        Some(Object::Integer(value)) => usize::try_from(*value).expect("non-negative /First"),
-        other => panic!("ObjStm /First must be an integer, got {other:?}"),
-    };
-    let member_count = match stream.dict.get("N") {
-        Some(Object::Integer(value)) => u32::try_from(*value).expect("non-negative /N"),
-        other => panic!("ObjStm /N must be an integer, got {other:?}"),
-    };
+    let stream_dict = container
+        .as_stream_dict()
+        .expect("ObjStm object is a stream");
+    let decoded = container
+        .get_stream_data(DecodeLevel::Generalized)
+        .expect("decode decrypted ObjStm payload");
+    let first = usize::try_from(
+        stream_dict
+            .get_key(b"/First")
+            .as_integer()
+            .expect("ObjStm /First must be an integer"),
+    )
+    .expect("non-negative /First");
+    let member_count = u32::try_from(
+        stream_dict
+            .get_key(b"/N")
+            .as_integer()
+            .expect("ObjStm /N must be an integer"),
+    )
+    .expect("non-negative /N");
     assert!(
         member_index < member_count,
         "type-2 index must be within /N"
@@ -697,10 +708,11 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
             static_aes_iv: true,
             ..WriterTestSettings::default()
         };
-        let mut encrypt_dict = Dictionary::new();
-        encrypt_dict.insert("V", Object::Integer(4));
-        encrypt_dict.insert("R", Object::Integer(4));
-        encrypt_dict.insert("Length", Object::Integer(128));
+        let encrypt_dict = ObjectHandle::dictionary(vec![
+            (b"/V".to_vec(), ObjectHandle::integer(4)),
+            (b"/R".to_vec(), ObjectHandle::integer(4)),
+            (b"/Length".to_vec(), ObjectHandle::integer(128)),
+        ]);
         options.copy_encryption = Some(CopyEncryptionSource {
             encrypt_dict,
             file_key: vec![0x31; 15],
@@ -770,30 +782,19 @@ fn rc4_128_printable_ciphertext_uses_literal_string_syntax() {
 
 /// Resolve the JavaScript stream (catalog `/OpenAction` -> action `/JS`) in the
 /// re-opened encrypted `pdf` and return its `/Length` dictionary entry.
-fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
+fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
     let root = pdf.root_ref().expect("/Root");
     let catalog = pdf.resolve_canonical_object(root).expect("catalog");
     let open_action = catalog
-        .as_dict()
-        .and_then(|d| d.get("OpenAction").cloned())
-        .expect("/OpenAction");
-    let action = match open_action {
-        Object::Reference(r) => pdf.resolve_canonical_object(r).expect("action"),
-        other => other,
-    };
-    let js_ref = action
-        .as_dict()
-        .and_then(|d| d.get("JS").cloned())
-        .expect("/JS");
-    let js = match js_ref {
-        Object::Reference(r) => pdf.resolve_canonical_object(r).expect("js stream"),
-        other => other,
-    };
-    js.as_stream()
-        .expect("/JS is a stream")
-        .dict
-        .get("Length")
-        .cloned()
+        .try_get_key(b"/OpenAction")
+        .expect("read /OpenAction");
+    pdf.resolve(&open_action).expect("resolve /OpenAction");
+    let action = open_action;
+    let js_ref = action.try_get_key(b"/JS").expect("read /JS");
+    pdf.resolve(&js_ref).expect("resolve /JS");
+    let stream_dict = js_ref.as_stream_dict().expect("/JS is a stream");
+    stream_dict
+        .try_get_key(b"/Length")
         .expect("/Length present")
 }
 
@@ -838,7 +839,7 @@ fn v4_aes128_preserve_drops_orphan_length_holder() {
          (6 logical objects + /Encrypt = 7; the stale holder is gone)"
     );
     assert!(
-        matches!(js_stream_length(&mut pdf), Object::Integer(_)),
+        js_stream_length(&mut pdf).as_integer().is_some(),
         "preserve + encrypt must direct-ize the JS stream's /Length"
     );
 }

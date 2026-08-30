@@ -50,7 +50,7 @@
 //! # Value types
 //!
 //! Each name-tree value should be an indirect reference to a `/Filespec`
-//! dictionary.  Values that are not [`crate::Object::Reference`] are skipped with a
+//! dictionary. Values that are not indirect handles are skipped with a
 //! diagnostic comment in source but no error; direct-dict filespecs embedded
 //! directly in name arrays are exceedingly rare in practice and out of scope for
 //! this read-only enumerator.
@@ -112,12 +112,12 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     // move name-tree repair diagnostics before the tree walker sees the
     // malformed child.
     let names_seed = catalog.try_get_key(b"/Names")?;
-    let names = pdf.resolve_to_terminal(&names_seed)?;
+    let names = pdf.resolve_handle(&names_seed)?;
     if names.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
-    let root = pdf.resolve_to_terminal(&root_seed)?;
+    let root = pdf.resolve_handle(&root_seed)?;
     if root.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
@@ -157,7 +157,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
 
         let names = if catalog.has_key(b"/Names") {
             let candidate = catalog.get_key(b"/Names");
-            let names = self.pdf.resolve_to_terminal(&candidate)?;
+            let names = self.pdf.resolve_handle(&candidate)?;
             if names.try_as_dictionary()?.is_some() {
                 names
             } else {
@@ -423,7 +423,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         .filter_map(|(key, value)| {
             value
                 .object_ref()
-                .or_else(|| value.as_reference())
+                .or_else(|| value.object_ref())
                 .map(|object_ref| (key, object_ref))
         })
         .collect())

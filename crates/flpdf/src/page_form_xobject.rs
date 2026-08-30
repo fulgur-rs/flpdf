@@ -41,19 +41,14 @@
 //! creates the stream, calls `warnIfPossible`, and continues
 //! (`libqpdf/QPDFPageObjectHelper.cc:706-733`). The production wrapper below
 //! therefore delegates directly to the canonical `PageObjectHelper` instead
-//! of pre-validating the box through a legacy `Object` snapshot. Attribute
+//! of pre-validating the box through a separate value snapshot. Attribute
 //! inheritance and content streaming remain owned by the live handle route
 //! (`libqpdf/QPDFPageObjectHelper.cc:220-310,439-476`;
 //! `libqpdf/QPDFObjectHandle.cc:1289-1341`).
 //!
-//! The historical raw-object geometry/import helpers are `cfg(test)` only;
-//! they are retained solely for old unit fixtures and cannot be reached by a
-//! production consumer.
-
-// The production entry points below are consumed by the overlay/underlay
-// content-wiring path. The old raw-object geometry helpers remain only as
-// `cfg(test)` fixtures for historical edge coverage; the production module has
-// one canonical PageObjectHelper/ObjectHandle implementation.
+// The production entry point below is consumed by the overlay/underlay
+// content-wiring path. Test-only helpers, where present, use the same
+// PageObjectHelper/ObjectHandle implementation.
 use std::io::{Read, Seek};
 
 use crate::page_object_helper::PageObjectHelper;
@@ -295,7 +290,7 @@ fn inherited_box_array<R: Read + Seek>(
             }
         }
 
-        match parent_val.and_then(|value| value.object_ref().or_else(|| value.as_reference())) {
+        match parent_val.and_then(|value| value.object_ref()) {
             Some(r) => {
                 current = r;
                 depth += 1;
@@ -314,7 +309,7 @@ fn resolve_rect_array<R: Read + Seek>(
     node: ObjectRef,
     key: &[u8],
 ) -> Result<Option<Vec<ObjectHandle>>> {
-    if val.is_indirect() || val.as_reference().is_some() {
+    if val.is_indirect() || val.object_ref().is_some() {
         pdf.resolve(&val)?;
     }
     let resolved = val;
@@ -341,7 +336,7 @@ fn resolve_rect_array<R: Read + Seek>(
 /// the private redirect shape used by older mutation fixtures.
 #[cfg(test)]
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
-    handle.object_ref().or_else(|| handle.as_reference())
+    handle.object_ref()
 }
 
 /// Compute the normalized `(width, height)` of a rectangle array, coercing each
@@ -441,7 +436,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 
         if let Some(val) = rotate_val {
             // /Rotate may be stored as an indirect reference; resolve it first.
-            if val.is_indirect() || val.as_reference().is_some() {
+            if val.is_indirect() || val.object_ref().is_some() {
                 pdf.resolve(&val)?;
             }
             let resolved = val;
@@ -477,7 +472,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
     let Some(val) = uu_val else {
         return Ok((false, 1.0));
     };
-    if val.is_indirect() || val.as_reference().is_some() {
+    if val.is_indirect() || val.object_ref().is_some() {
         pdf.resolve(&val)?;
     }
     let resolved = val;
@@ -564,7 +559,7 @@ fn page_group<R: Read + Seek>(
         // indirect: an indirect value is first resolved one level (ref ->
         // direct dict), then both branches shallow-copy so the returned
         // handle never shares mutable identity with the page's own /Group.
-        Some(value) if value.is_indirect() || value.as_reference().is_some() => {
+        Some(value) if value.is_indirect() || value.object_ref().is_some() => {
             pdf.resolve(&value)?;
             Ok(Some(value.shallow_copy()?))
         }
@@ -604,7 +599,7 @@ mod tests {
         }
 
         fn object_ref(&self) -> Option<ObjectRef> {
-            self.0.object_ref().or_else(|| self.0.as_reference())
+            self.0.object_ref()
         }
     }
 
