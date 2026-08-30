@@ -3,7 +3,9 @@
 
 use super::state::{EncryptionMode, EncryptionState};
 use crate::error::{EncryptedError, Result};
-use crate::{Dictionary, Object, ObjectHandle};
+use crate::ObjectHandle;
+#[cfg(test)]
+use crate::{Dictionary, Object};
 use std::collections::{BTreeMap, HashMap};
 
 /// Crypt-filter method from PDF 1.7 `/CFM`.
@@ -89,6 +91,7 @@ fn interpret_cf_name(
 }
 
 /// qpdf `QPDF::interpretCF` for materialized dictionary values.
+#[cfg(test)]
 pub(crate) fn interpret_cf(
     crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
     cf: Option<&Object>,
@@ -101,14 +104,82 @@ pub(crate) fn interpret_cf_from_handle(
     encryption: &EncryptionState,
     cf: &ObjectHandle,
 ) -> Result<EncryptionMode> {
+    interpret_cf_selector_from_handle(&encryption.crypt_filters, cf)
+}
+
+/// Resolve a `/StmF`, `/StrF`, or `/EFF` selector against a parsed handle
+/// crypt-filter table.
+pub(crate) fn interpret_cf_selector_from_handle(
+    crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
+    cf: &ObjectHandle,
+) -> Result<EncryptionMode> {
     let filter = cf.try_as_name()?;
-    Ok(interpret_cf_name(
-        &encryption.crypt_filters,
-        filter.as_deref(),
-    ))
+    Ok(interpret_cf_name(crypt_filters, filter.as_deref()))
+}
+
+/// Parse qpdf's `/CF` table directly from the canonical encryption handle.
+/// The caller has already resolved `encrypt`; child dictionary and `/CFM`
+/// handles retain their qpdf identity and are resolved only at the accessor
+/// that needs their value.
+pub(crate) fn crypt_filter_modes_from_handle(
+    encrypt: &ObjectHandle,
+    v: i64,
+) -> Result<BTreeMap<Vec<u8>, EncryptionMode>> {
+    let mut modes = BTreeMap::new();
+    if !matches!(v, 4 | 5) {
+        return Ok(modes);
+    }
+    let cf = encrypt.try_get_key(b"/CF")?;
+    let Some(cf) = cf.try_as_dictionary()? else {
+        return Ok(modes);
+    };
+    for (name, value) in cf {
+        let Some(filter) = value.try_as_dictionary()? else {
+            continue;
+        };
+        let mut mode = EncryptionMode::Identity;
+        let cfm = filter
+            .get(b"/CFM".as_slice())
+            .cloned()
+            .unwrap_or_else(ObjectHandle::null);
+        cfm.try_dereference()?;
+        if let Some(cfm) = cfm.try_as_name()? {
+            mode = match cfm.as_slice() {
+                b"V2" => EncryptionMode::Rc4,
+                b"AESV2" => EncryptionMode::Aes128,
+                b"AESV3" => EncryptionMode::Aes256,
+                _ => EncryptionMode::Unknown,
+            };
+        }
+        let selector = name.strip_prefix(b"/").unwrap_or(&name).to_vec();
+        modes.insert(selector, mode);
+    }
+    Ok(modes)
+}
+
+/// Report `/CF/StdCF/CFM` without materializing the encryption dictionary.
+pub(crate) fn crypt_filter_method_from_handle(encrypt: &ObjectHandle) -> Result<Option<String>> {
+    let cf = encrypt.try_get_key(b"/CF")?;
+    let Some(cf) = cf.try_as_dictionary()? else {
+        return Ok(None);
+    };
+    let Some(std_cf) = cf.get(b"/StdCF".as_slice()).cloned() else {
+        return Ok(None);
+    };
+    let Some(std_cf) = std_cf.try_as_dictionary()? else {
+        return Ok(None);
+    };
+    let Some(cfm) = std_cf.get(b"/CFM".as_slice()).cloned() else {
+        return Ok(None);
+    };
+    cfm.try_dereference()?;
+    Ok(cfm
+        .try_as_name()?
+        .map(|name| String::from_utf8_lossy(&name).into_owned()))
 }
 
 /// qpdf's `/CF` loop inside `QPDF::initializeEncryption`.
+#[cfg(test)]
 pub(crate) fn crypt_filter_modes(
     encrypt: &Dictionary,
     v: i64,
@@ -139,6 +210,7 @@ pub(crate) fn crypt_filter_modes(
 }
 
 /// Report the named `/CF/StdCF/CFM` method for qpdf-compatible diagnostics.
+#[cfg(test)]
 pub(crate) fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
     let Some(Object::Dictionary(cf)) = encrypt.get("CF") else {
         return None;
@@ -155,6 +227,17 @@ pub(crate) fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dictionary<K: AsRef<[u8]>>(
+        entries: impl IntoIterator<Item = (K, ObjectHandle)>,
+    ) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.as_ref().to_vec(), value))
+                .collect(),
+        )
+    }
 
     #[test]
     fn crypt_filter_method_reports_each_qpdf_shape() {
@@ -195,5 +278,102 @@ mod tests {
         cf.insert("StdCF", Object::Dictionary(std_cf));
         valid.insert("CF", Object::Dictionary(cf));
         assert_eq!(crypt_filter_method(&valid), Some("AESV2".to_owned()));
+    }
+
+    #[test]
+    fn handle_crypt_filter_helpers_cover_qpdf_filter_shapes() {
+        let invalid_cf = dictionary([(b"/CF", ObjectHandle::name(b"not-a-dict".to_vec()))]);
+        assert!(crypt_filter_modes_from_handle(&invalid_cf, 4)
+            .expect("invalid CF shape is ignored")
+            .is_empty());
+
+        let cf = dictionary([
+            (
+                b"/V2".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"V2".to_vec()))]),
+            ),
+            (
+                b"/AESV2".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"AESV2".to_vec()))]),
+            ),
+            (
+                b"/AESV3".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"AESV3".to_vec()))]),
+            ),
+            (
+                b"/Unknown".as_slice(),
+                dictionary([(b"/CFM", ObjectHandle::name(b"Other".to_vec()))]),
+            ),
+            (
+                b"/NoCfm".as_slice(),
+                dictionary(std::iter::empty::<(&[u8], ObjectHandle)>()),
+            ),
+            (b"/Scalar".as_slice(), ObjectHandle::integer(1)),
+        ]);
+        let encrypt = dictionary([(b"/CF", cf)]);
+        let modes = crypt_filter_modes_from_handle(&encrypt, 4).expect("parse CF table");
+        assert_eq!(modes.get(b"V2".as_slice()), Some(&EncryptionMode::Rc4));
+        assert_eq!(
+            modes.get(b"AESV2".as_slice()),
+            Some(&EncryptionMode::Aes128)
+        );
+        assert_eq!(
+            modes.get(b"AESV3".as_slice()),
+            Some(&EncryptionMode::Aes256)
+        );
+        assert_eq!(
+            modes.get(b"Unknown".as_slice()),
+            Some(&EncryptionMode::Unknown)
+        );
+        assert_eq!(
+            modes.get(b"NoCfm".as_slice()),
+            Some(&EncryptionMode::Identity)
+        );
+        assert!(!modes.contains_key(b"Scalar".as_slice()));
+
+        assert_eq!(
+            crypt_filter_method_from_handle(&ObjectHandle::dictionary(Vec::new()))
+                .expect("missing CF is ignored"),
+            None
+        );
+        let no_std_cf = dictionary([(
+            b"/CF",
+            dictionary(std::iter::empty::<(&[u8], ObjectHandle)>()),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&no_std_cf).expect("missing StdCF is ignored"),
+            None
+        );
+        let std_cf_not_dict = dictionary([(
+            b"/CF",
+            dictionary([(b"/StdCF", ObjectHandle::name(b"not-a-dict".to_vec()))]),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&std_cf_not_dict)
+                .expect("non-dictionary StdCF is ignored"),
+            None
+        );
+        let missing_cfm = dictionary([(
+            b"/CF",
+            dictionary([(
+                b"/StdCF",
+                dictionary(std::iter::empty::<(&[u8], ObjectHandle)>()),
+            )]),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&missing_cfm).expect("missing CFM is ignored"),
+            None
+        );
+        let valid = dictionary([(
+            b"/CF",
+            dictionary([(
+                b"/StdCF",
+                dictionary([(b"/CFM", ObjectHandle::name(b"AESV2".to_vec()))]),
+            )]),
+        )]);
+        assert_eq!(
+            crypt_filter_method_from_handle(&valid).expect("read CFM"),
+            Some("AESV2".to_owned())
+        );
     }
 }

@@ -1,12 +1,20 @@
 //! qpdf correspondence: QPDF.cc xref-backed object cache represented as a standalone Rust module.
-use crate::{Object, ObjectRef, XrefEntry};
+use crate::{ObjectHandle, ObjectRef, XrefEntry};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 pub enum CacheEntry {
-    Unresolved { offset: u64 },
-    Compressed { stream: u32, index: u32 },
-    Resolved(Object),
+    Unresolved {
+        offset: u64,
+    },
+    Compressed {
+        stream: u32,
+        index: u32,
+    },
+    /// qpdf's resolved `QPDFObject` cache cell. The handle, not a detached
+    /// value snapshot, is the identity-preserving source of truth
+    /// (`QPDF.cc:1843-1857,1980-1993`).
+    Resolved(ObjectHandle),
     Missing,
     Reserved,
     Deleted,
@@ -40,10 +48,10 @@ impl ObjectCache {
         }
     }
 
-    /// Reconcile the legacy cache with the resolver's live xref after recovery.
+    /// Reconcile the compatibility cache metadata with the resolver's live xref after recovery.
     ///
     /// Reconstruction replaces the source offsets owned by the canonical resolver. The
-    /// legacy cache must follow those entries before a later legacy read, while preserving
+    /// compatibility metadata must follow those entries before a later legacy read, while preserving
     /// caller-owned values and transient resolution guards that do not come from the source.
     pub(crate) fn synchronize_with_xref(&mut self, xref: &BTreeMap<ObjectRef, XrefEntry>) {
         let previous = std::mem::take(&mut self.entries);
@@ -149,10 +157,10 @@ impl ObjectCache {
             .is_some()
     }
 
-    pub fn set_resolved(&mut self, object_ref: ObjectRef, object: Object) {
+    pub fn set_resolved(&mut self, object_ref: ObjectRef, handle: ObjectHandle) {
         self.deleted_refs.remove(&object_ref);
         self.entries
-            .insert(object_ref, CacheEntry::Resolved(object));
+            .insert(object_ref, CacheEntry::Resolved(handle));
     }
 
     #[cfg(test)]
@@ -225,7 +233,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{CacheEntry, ObjectCache};
-    use crate::{Object, ObjectRef, XrefEntry};
+    use crate::{ObjectHandle, ObjectRef, XrefEntry};
     use std::collections::BTreeMap;
 
     #[test]
@@ -251,7 +259,7 @@ mod tests {
         );
         initial.insert(missing_ref, XrefEntry::Uncompressed { offset: 60 });
         let mut cache = ObjectCache::from_offsets(&initial);
-        cache.set_resolved(resolved_ref, Object::Integer(1));
+        cache.set_resolved(resolved_ref, ObjectHandle::integer(1));
         cache.set_reserved(reserved_ref);
         cache.set_deleted(deleted_ref);
         cache.set_unresolved(unresolved_ref, 999);
@@ -275,7 +283,7 @@ mod tests {
 
         assert!(matches!(
             cache.entry(resolved_ref),
-            Some(CacheEntry::Resolved(Object::Integer(1)))
+            Some(CacheEntry::Resolved(handle)) if handle.as_integer() == Some(1)
         ));
         assert!(matches!(
             cache.entry(reserved_ref),
