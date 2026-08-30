@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn indirect_array_children_resolve_but_remain_reference_opaque_during_compare() {
+    fn indirect_array_children_remain_opaque_during_compare() {
         let mut actual_pdf = dummy_pdf();
         let mut expected_pdf = dummy_pdf();
         let actual_missing = actual_pdf.get_object_handle(ObjectRef::new(99, 0));
@@ -412,7 +412,13 @@ mod tests {
             .unwrap(),
             "array: object contents differ"
         );
-        assert!(actual_missing.is_resolved() && expected_missing.is_resolved());
+        // unparse_resolved_child checks object_ref() before resolving (see
+        // object_handle.rs's own doc for that function), so an array's
+        // indirect children are never resolved just to report their own
+        // indirectness -- matching qpdf's array unparse, which needs the
+        // resolve() call to succeed only to read the element's own
+        // object/generation identity, not to serialize it.
+        assert!(!actual_missing.is_resolved() && !expected_missing.is_resolved());
         assert_eq!(actual_missing.unparse(), b"99 0 R");
         assert_eq!(expected_missing.unparse(), b"100 0 R");
     }

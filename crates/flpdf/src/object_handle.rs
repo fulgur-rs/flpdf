@@ -7058,8 +7058,17 @@ fn unparse_resolved_into(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool)
     })
 }
 
+// `QPDF_Array::unparse` resolves each element only to read its own object/
+// generation identity (`item.second->resolve(); auto og =
+// item.second->getObjGen();`, `libqpdf/QPDF_Array.cc:130-132`), but that
+// identity is a property of the *handle itself*, not of whatever it resolves
+// to — an indirect handle already carries its object/generation number
+// before resolution ever runs. Checking `object_ref()` first, the same way
+// `ObjectRef` is already known on this handle, avoids resolving a dangling or
+// malformed indirect child purely to report its own indirectness; qpdf's own
+// array unparse never needs that resolution to succeed to emit `N G R` for
+// such a child.
 fn unparse_resolved_child(handle: &ObjectHandle, out: &mut Vec<u8>, strict: bool) -> Result<()> {
-    handle.try_dereference()?;
     if let Some(object_ref) = handle.object_ref() {
         write_unparse_reference(object_ref, out);
         Ok(())
@@ -11590,6 +11599,30 @@ mod unparse_tests {
         let (child, _resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), child]);
         assert_eq!(array.unparse(), b"[ 1 20 0 R ]");
+    }
+
+    #[test]
+    fn unparse_resolved_writes_an_unresolvable_indirect_array_child_as_a_reference() {
+        // qpdf's array unparse resolves each element only to read the
+        // element's OWN object/generation identity (`item.second->resolve();
+        // auto og = item.second->getObjGen();`, `libqpdf/QPDF_Array.cc:
+        // 130-132`) -- that identity is already known on the handle before
+        // resolution ever runs, so qpdf never needs resolution to SUCCEED to
+        // emit `N G R` for a dangling or otherwise unresolvable child. Drop
+        // the child's resolver to force `try_dereference` to fail, matching
+        // Codex's finding on PR #1354 that eagerly dereferencing before the
+        // `object_ref()` check let a single unresolvable element fail the
+        // whole array.
+        let (child, resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
+        drop(resolver);
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), child]);
+
+        assert_eq!(
+            array
+                .try_unparse_resolved()
+                .expect("an unresolvable indirect child must not fail the whole array"),
+            b"[ 1 20 0 R ]"
+        );
     }
 
     #[test]
