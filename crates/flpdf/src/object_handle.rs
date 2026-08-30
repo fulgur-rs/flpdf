@@ -1174,11 +1174,13 @@ pub struct ArrayItems {
 pub struct ArrayItemCursor {
     array: ObjectHandle,
     index: usize,
+    current: ObjectHandle,
 }
 
 /// A qpdf-shaped view over the entries of a dictionary handle.
 pub struct DictItems {
     dictionary: ObjectHandle,
+    keys: Rc<Vec<Vec<u8>>>,
 }
 
 /// One dictionary entry returned by [`DictItemCursor::current`]. At the end
@@ -1194,25 +1196,21 @@ pub struct DictItem {
 /// A reversible cursor over [`DictItems`].
 pub struct DictItemCursor {
     dictionary: ObjectHandle,
+    keys: Rc<Vec<Vec<u8>>>,
     index: usize,
+    current: ObjectHandle,
 }
 
 impl ArrayItems {
     /// Return a cursor positioned at the first item, or at end for an empty
     /// array.
     pub fn begin(&self) -> ArrayItemCursor {
-        ArrayItemCursor {
-            array: self.array.clone(),
-            index: 0,
-        }
+        ArrayItemCursor::new(self.array.clone(), 0)
     }
 
     /// Return a cursor positioned at the end sentinel.
     pub fn end(&self) -> ArrayItemCursor {
-        ArrayItemCursor {
-            array: self.array.clone(),
-            index: self.len(),
-        }
+        ArrayItemCursor::new(self.array.clone(), self.len())
     }
 
     fn len(&self) -> usize {
@@ -1221,27 +1219,49 @@ impl ArrayItems {
 }
 
 impl ArrayItemCursor {
+    fn new(array: ObjectHandle, index: usize) -> Self {
+        let mut cursor = Self {
+            array,
+            index,
+            current: ObjectHandle::uninitialized(),
+        };
+        cursor.update_current();
+        cursor
+    }
+
     fn len(&self) -> usize {
         self.array.as_array().map_or(0, |items| items.len())
     }
 
-    /// Return the live item at the cursor, or an uninitialized handle at end.
-    pub fn current(&self) -> ObjectHandle {
-        self.array
+    fn update_current(&mut self) {
+        let target = self
+            .array
             .as_array()
             .and_then(|items| items.get(self.index).cloned())
-            .unwrap_or_else(ObjectHandle::uninitialized)
+            .filter(|item| item.is_initialized());
+        self.current.rebind_cursor_value(target);
+    }
+
+    /// Return the live item at the cursor, or an uninitialized handle at end.
+    /// Every clone returned by this method shares the cursor's value cell, so
+    /// a prior value observes the same end/next-item transition as qpdf's
+    /// iterator `ivalue` reference (`QPDFObjectHandle.cc:2488-2543`).
+    pub fn current(&mut self) -> ObjectHandle {
+        self.update_current();
+        self.current.clone()
     }
 
     /// Advance one item, retaining the end sentinel when already at end.
     pub fn next(&mut self) {
         self.index = self.index.saturating_add(1).min(self.len());
+        self.update_current();
     }
 
     /// Move one item backward, retaining the begin sentinel when already at
     /// the first item.
     pub fn previous(&mut self) {
         self.index = self.index.saturating_sub(1);
+        self.update_current();
     }
 
     /// Whether the cursor is at or beyond the current end.
@@ -1254,57 +1274,62 @@ impl DictItems {
     /// Return a cursor positioned at the first key, or at end for an empty
     /// dictionary.
     pub fn begin(&self) -> DictItemCursor {
-        DictItemCursor {
-            dictionary: self.dictionary.clone(),
-            index: 0,
-        }
+        DictItemCursor::new(self.dictionary.clone(), self.keys.clone(), 0)
     }
 
     /// Return a cursor positioned at the end sentinel.
     pub fn end(&self) -> DictItemCursor {
-        DictItemCursor {
-            dictionary: self.dictionary.clone(),
-            index: self.len(),
-        }
+        DictItemCursor::new(self.dictionary.clone(), self.keys.clone(), self.len())
     }
 
     fn len(&self) -> usize {
-        self.dictionary
-            .as_dictionary()
-            .map_or(0, |entries| entries.len())
+        self.keys.len()
     }
 }
 
 impl DictItemCursor {
-    fn entries(&self) -> Vec<(Vec<u8>, ObjectHandle)> {
-        self.dictionary
-            .as_dictionary()
-            .map(|entries| entries.into_iter().collect())
-            .unwrap_or_default()
+    fn new(dictionary: ObjectHandle, keys: Rc<Vec<Vec<u8>>>, index: usize) -> Self {
+        let mut cursor = Self {
+            dictionary,
+            keys,
+            index,
+            current: ObjectHandle::uninitialized(),
+        };
+        cursor.update_current();
+        cursor
+    }
+
+    fn update_current(&mut self) {
+        let target = self.keys.get(self.index).and_then(|key| {
+            self.dictionary
+                .as_dictionary()
+                .and_then(|entries| entries.get(key).cloned())
+        });
+        self.current.rebind_cursor_value(target);
     }
 
     /// Return the current entry. At end, the key is empty and the value is an
-    /// explicit uninitialized handle.
-    pub fn current(&self) -> DictItem {
-        self.entries()
-            .get(self.index)
-            .cloned()
-            .map(|(key, value)| DictItem { key, value })
-            .unwrap_or_else(|| DictItem {
-                key: Vec::new(),
-                value: ObjectHandle::uninitialized(),
-            })
+    /// explicit uninitialized handle. The returned value shares the cursor's
+    /// live value cell, matching qpdf's iterator `ivalue.second` reference.
+    pub fn current(&mut self) -> DictItem {
+        self.update_current();
+        DictItem {
+            key: self.keys.get(self.index).cloned().unwrap_or_default(),
+            value: self.current.clone(),
+        }
     }
 
     /// Advance one entry, retaining the end sentinel when already at end.
     pub fn next(&mut self) {
         self.index = self.index.saturating_add(1).min(self.len());
+        self.update_current();
     }
 
     /// Move one entry backward, retaining the begin sentinel when already at
     /// the first entry.
     pub fn previous(&mut self) {
         self.index = self.index.saturating_sub(1);
+        self.update_current();
     }
 
     /// Whether the cursor is at or beyond the current end.
@@ -1313,9 +1338,7 @@ impl DictItemCursor {
     }
 
     fn len(&self) -> usize {
-        self.dictionary
-            .as_dictionary()
-            .map_or(0, |entries| entries.len())
+        self.keys.len()
     }
 }
 
@@ -1353,6 +1376,97 @@ impl ObjectHandle {
     /// Whether this handle has a qpdf object allocation behind it.
     pub fn is_initialized(&self) -> bool {
         self.0.borrow().initialized
+    }
+
+    /// Rebind the stable value cell owned by an iterator cursor to the item it
+    /// currently denotes. qpdf's C++ iterator stores an `ivalue` handle and
+    /// assigns a new `QPDFObjectHandle` into that same member as the cursor
+    /// moves; clones of the reference returned by `operator*` therefore see
+    /// the later end/next-item assignment too
+    /// (`libqpdf/QPDFObjectHandle.cc:2534-2542`).
+    fn rebind_cursor_value(&self, target: Option<ObjectHandle>) {
+        let old_owners = self.0.borrow().state_owners.clone();
+        Self::remove_state_owner(&old_owners, &self.0);
+
+        let target = target.map(|target| {
+            let slot = target.0.borrow();
+            (
+                slot.initialized,
+                slot.state.clone(),
+                slot.state_owners.clone(),
+                slot.object_ref,
+                slot.active_pdf_unique_id,
+                slot.resolver.clone(),
+                slot.parsed_offset,
+                slot.end_before_space,
+                slot.end_after_space,
+                slot.pdf_unique_ids.clone(),
+                slot.tree_pdf_unique_id,
+                slot.description.clone(),
+                slot.stream_token_filters.clone(),
+                slot.content_normalization_applied.clone(),
+                slot.mutation_generation.clone(),
+            )
+        });
+
+        {
+            let mut slot = self.0.borrow_mut();
+            match target {
+                Some((
+                    initialized,
+                    state,
+                    state_owners,
+                    object_ref,
+                    active_pdf_unique_id,
+                    resolver,
+                    parsed_offset,
+                    end_before_space,
+                    end_after_space,
+                    pdf_unique_ids,
+                    tree_pdf_unique_id,
+                    description,
+                    stream_token_filters,
+                    content_normalization_applied,
+                    mutation_generation,
+                )) => {
+                    slot.initialized = initialized;
+                    slot.state = state;
+                    slot.state_owners = state_owners;
+                    slot.object_ref = object_ref;
+                    slot.active_pdf_unique_id = active_pdf_unique_id;
+                    slot.resolver = resolver;
+                    slot.parsed_offset = parsed_offset;
+                    slot.end_before_space = end_before_space;
+                    slot.end_after_space = end_after_space;
+                    slot.pdf_unique_ids = pdf_unique_ids;
+                    slot.tree_pdf_unique_id = tree_pdf_unique_id;
+                    slot.description = description;
+                    slot.stream_token_filters = stream_token_filters;
+                    slot.content_normalization_applied = content_normalization_applied;
+                    slot.mutation_generation = mutation_generation;
+                    slot.containment_parents.clear();
+                }
+                None => {
+                    slot.initialized = false;
+                    slot.state = Rc::new(RefCell::new(ObjectValue::Unresolved));
+                    slot.state_owners = Rc::new(RefCell::new(Vec::new()));
+                    slot.object_ref = None;
+                    slot.active_pdf_unique_id = None;
+                    slot.resolver = None;
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
+                    slot.pdf_unique_ids.clear();
+                    slot.tree_pdf_unique_id = None;
+                    slot.containment_parents.clear();
+                    slot.description = None;
+                    slot.stream_token_filters = Rc::new(RefCell::new(Vec::new()));
+                    slot.content_normalization_applied = Rc::new(Cell::new(false));
+                    slot.mutation_generation = Rc::new(Cell::new(0));
+                }
+            }
+        }
+        self.register_state_owner();
     }
 
     /// Parse one standalone PDF object without an owning document context.
@@ -2755,6 +2869,9 @@ impl ObjectHandle {
     /// itself is resolved; each returned child keeps its own identity.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_array(&self) -> Result<Option<Vec<ObjectHandle>>> {
+        if !self.is_initialized() {
+            return Ok(None);
+        }
         self.try_dereference()?;
         Ok(self.as_array())
     }
@@ -2827,8 +2944,17 @@ impl ObjectHandle {
     /// receiver.
     pub fn try_dict_items(&self) -> Result<DictItems> {
         self.try_dereference()?;
+        let mut keys = Vec::new();
+        if let Some(entries) = self.as_dictionary() {
+            for (key, value) in entries {
+                if !value.try_is_null()? {
+                    keys.push(key);
+                }
+            }
+        }
         Ok(DictItems {
             dictionary: self.clone(),
+            keys: Rc::new(keys),
         })
     }
 
@@ -2900,6 +3026,22 @@ impl ObjectHandle {
 
     /// Construct a six-item qpdf object-handle matrix array.
     pub fn new_from_matrix(matrix: ObjectHandleMatrix) -> Self {
+        Self::array(vec![
+            Self::real(matrix.a),
+            Self::real(matrix.b),
+            Self::real(matrix.c),
+            Self::real(matrix.d),
+            Self::real(matrix.e),
+            Self::real(matrix.f),
+        ])
+    }
+
+    /// Construct a six-item array from flpdf's standalone `QPDFMatrix`
+    /// equivalent. This is the second qpdf `newFromMatrix` overload; its
+    /// identity-default behavior belongs to [`crate::Matrix`], not to the
+    /// nested [`ObjectHandleMatrix`]
+    /// (`include/qpdf/QPDFObjectHandle.hh:254-285`).
+    pub fn new_from_qpdf_matrix(matrix: crate::Matrix) -> Self {
         Self::array(vec![
             Self::real(matrix.a),
             Self::real(matrix.b),
@@ -6449,8 +6591,9 @@ impl ObjectHandle {
     ///
     /// Reserved and destroyed handles are checked before resolution and retain
     /// qpdf's `1` (`ot_reserved`) and `14` (`ot_destroyed`) ordinals. The
-    /// `ot_uninitialized` state is a construction-time-only qpdf state that
-    /// this port's `ObjectHandle` never occupies.
+    /// An uninitialized handle returns qpdf's `ot_uninitialized` code (`0`)
+    /// without entering the resolver, matching `getTypeCode`'s null-handle
+    /// fallback (`libqpdf/QPDFObjectHandle.cc:240-244`).
     ///
     /// A resolved indirect handle whose own value is itself a bare
     /// reference (mirroring [`crate::Object::Reference`]; see
@@ -6468,6 +6611,9 @@ impl ObjectHandle {
     /// Returns the resolver error when an unresolved indirect handle cannot be
     /// resolved, such as when its owning document has been dropped.
     pub fn type_code(&self) -> Result<u8> {
+        if !self.is_initialized() {
+            return Ok(0);
+        }
         self.try_dereference()?;
         self.with_value(|value| {
             Ok(value
@@ -6479,9 +6625,13 @@ impl ObjectHandle {
     /// The qpdf-compatible type name string for this handle's value.
     /// `QPDFObjectHandle::getTypeName` dereferences and delegates to
     /// `QPDFObject::getTypeName` (`libqpdf/QPDFObjectHandle.cc:247-250`),
-    /// which reads the value-layer `type_name` field. Resolution errors are
-    /// propagated unchanged.
+    /// which reads the value-layer `type_name` field. An uninitialized handle
+    /// returns `"uninitialized"`; other resolution errors are propagated
+    /// unchanged.
     pub fn type_name(&self) -> Result<&'static str> {
+        if !self.is_initialized() {
+            return Ok("uninitialized");
+        }
         self.try_dereference()?;
         self.with_value(|value| {
             Ok(value
@@ -18365,6 +18515,18 @@ pub(crate) mod warning_emission_tests {
         assert!(!handle.try_is_name().unwrap());
         assert!(!handle.try_is_scalar().unwrap());
         assert!(!handle.try_is_number().unwrap());
+        assert_eq!(handle.type_code().unwrap(), 0);
+        assert_eq!(handle.type_name().unwrap(), "uninitialized");
+        assert!(!handle.try_is_rectangle().unwrap());
+        assert_eq!(
+            handle.try_get_array_as_rectangle().unwrap(),
+            Rectangle::default()
+        );
+        assert!(!handle.try_is_matrix().unwrap());
+        assert_eq!(
+            handle.try_get_array_as_matrix().unwrap(),
+            ObjectHandleMatrix::default()
+        );
         assert!(matches!(
             handle.try_dereference(),
             Err(crate::Error::Internal(message))
@@ -18444,6 +18606,12 @@ pub(crate) mod warning_emission_tests {
             matrix.try_get_array_as_matrix().unwrap(),
             ObjectHandleMatrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3)
         );
+        let qpdf_matrix =
+            ObjectHandle::new_from_qpdf_matrix(crate::Matrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3));
+        assert_eq!(
+            qpdf_matrix.try_get_array_as_matrix().unwrap(),
+            ObjectHandleMatrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3)
+        );
 
         let invalid_matrix = ObjectHandle::array(vec![
             ObjectHandle::integer(1),
@@ -18469,16 +18637,17 @@ pub(crate) mod warning_emission_tests {
         ]);
         let items = array.try_array_items().unwrap();
         let mut cursor = items.begin();
-        assert_eq!(cursor.current().try_get_name().unwrap(), b"/Item0");
+        let held = cursor.current();
+        assert_eq!(held.try_get_name().unwrap(), b"/Item0");
         cursor.previous();
-        assert_eq!(cursor.current().try_get_name().unwrap(), b"/Item0");
+        assert_eq!(held.try_get_name().unwrap(), b"/Item0");
         cursor.next();
         cursor.next();
         cursor.next();
         assert!(cursor.is_end());
-        assert!(!cursor.current().is_initialized());
+        assert!(!held.is_initialized());
         cursor.previous();
-        assert_eq!(cursor.current().try_get_name().unwrap(), b"/Item2");
+        assert_eq!(held.try_get_name().unwrap(), b"/Item2");
 
         let dictionary = ObjectHandle::dictionary(vec![
             (b"Key1".to_vec(), ObjectHandle::name(b"Value1".to_vec())),
@@ -18492,7 +18661,7 @@ pub(crate) mod warning_emission_tests {
         cursor.next();
         cursor.next();
         assert!(cursor.is_end());
-        assert!(!cursor.current().value.is_initialized());
+        assert!(!entry.value.is_initialized());
         cursor.previous();
         assert_eq!(cursor.current().key, b"/Key2");
 
@@ -18574,6 +18743,10 @@ pub(crate) mod warning_emission_tests {
         assert_eq!(dictionary.try_get_dict_as_map().unwrap().len(), 2);
         assert!(dictionary.try_get_has_key(b"/A").unwrap());
         assert!(!dictionary.try_get_has_key(b"/B").unwrap());
+        let mut items = dictionary.try_dict_items().unwrap().begin();
+        assert_eq!(items.current().key, b"/A");
+        items.next();
+        assert!(items.is_end());
     }
 
     #[test]
