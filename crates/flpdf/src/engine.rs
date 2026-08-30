@@ -135,6 +135,12 @@ impl<R: Read + Seek> Pdf<R> {
                 return Err(error);
             }
         };
+        // Keep the temporary bootstrap resolver alive until every returned
+        // handle has been rebound to this Pdf's canonical resolver. Its Drop
+        // intentionally disconnects the temporary cache to break cycles, so
+        // allowing a partial-move drop here would invalidate `loaded.trailer`
+        // before the rebind below.
+        let bootstrap_cache = loaded_state.bootstrap_cache;
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
         let header_offset = loaded_state.header_offset;
@@ -212,6 +218,7 @@ impl<R: Read + Seek> Pdf<R> {
             encryption_inspection: Rc::new(RefCell::new(None)),
         };
         pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
+        drop(bootstrap_cache);
         if let Err(error) = pdf.initialize_encryption_inspection() {
             // Same diagnostic-wrapping boundary as the authentication
             // failure below: xref recovery may have already recorded

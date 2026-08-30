@@ -54,6 +54,49 @@ pub(crate) struct BootstrapCache {
     handle_document_owners: Vec<Rc<BootstrapHandleDocument>>,
 }
 
+impl Drop for BootstrapCache {
+    /// Bootstrap parsing builds the same strong object-reference cycles as the
+    /// live document cache, but it runs before `Pdf` owns a `ResolverHandle`
+    /// that could perform the normal qpdf-style disconnect walk. Break those
+    /// cycles while the temporary cache is still being destroyed, mirroring
+    /// `QPDF::~QPDF()`'s replacement of cached values with
+    /// `QPDF_Destroyed()` (`libqpdf/QPDF.cc:215-235`).
+    fn drop(&mut self) {
+        let mut states: Vec<(Rc<RefCell<BootstrapHandleState>>, usize)> = Vec::new();
+        let mut add_state = |state: Rc<RefCell<BootstrapHandleState>>| {
+            if let Some((_, references)) = states
+                .iter_mut()
+                .find(|(candidate, _)| Rc::ptr_eq(candidate, &state))
+            {
+                *references += 1;
+            } else {
+                states.push((state, 1));
+            }
+        };
+        add_state(Rc::clone(&self.handle_state));
+        if let Some(document) = &self.handle_document {
+            add_state(Rc::clone(&document.state));
+        }
+        for document in &self.handle_document_owners {
+            add_state(Rc::clone(&document.state));
+        }
+
+        for (state, internal_references) in states {
+            // A merge can leave an older BootstrapCache pointing at the same
+            // state as the cache that superseded it. Only the final owner may
+            // disconnect the handles; otherwise it invalidates the newer
+            // cache's trailer before it can be rebound.
+            if Rc::strong_count(&state) != internal_references + 1 {
+                continue;
+            }
+            let handles: Vec<_> = state.borrow().handles.values().cloned().collect();
+            for handle in handles {
+                handle.disconnect();
+            }
+        }
+    }
+}
+
 type SharedBootstrapCache = Rc<RefCell<BootstrapCache>>;
 
 fn empty_bootstrap_cache() -> SharedBootstrapCache {
@@ -945,7 +988,57 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
             ..XrefLoadOptions::default()
         },
     )
-    .map(|state| state.loaded)
+    .and_then(|mut state| {
+        // The bootstrap resolver is intentionally temporary: callers receive
+        // the xref/trailer snapshot, not a live Pdf. Preserve the trailer's
+        // observable indirect references as detached handles before the
+        // temporary cache's cycle-breaking Drop runs.
+        let bootstrap_cache = state.bootstrap_cache;
+        state.loaded.trailer = detach_bootstrap_handle(&state.loaded.trailer)?;
+        drop(bootstrap_cache);
+        Ok(state.loaded)
+    })
+}
+
+fn detach_bootstrap_handle(source: &ObjectHandle) -> Result<ObjectHandle> {
+    if let Some(object_ref) = source.object_ref() {
+        return Ok(ObjectHandle::new_indirect_unresolved(
+            object_ref,
+            source.get_parsed_offset(),
+        ));
+    }
+
+    source.try_dereference()?;
+    let value = source
+        .with_value(|value| value.cloned())
+        .ok_or_else(|| Error::Internal("bootstrap trailer has no value".to_owned()))?;
+    let value = match value {
+        ObjectValue::Array(children) => ObjectValue::Array(
+            children
+                .iter()
+                .map(detach_bootstrap_handle)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        ObjectValue::Dictionary(entries) => ObjectValue::Dictionary(
+            entries
+                .into_iter()
+                .map(|(key, child)| Ok((key, detach_bootstrap_handle(&child)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?,
+        ),
+        ObjectValue::Stream {
+            stream_dict,
+            stream_data,
+            stream_provider,
+            stream_length,
+        } => ObjectValue::Stream {
+            stream_dict: detach_bootstrap_handle(&stream_dict)?,
+            stream_data,
+            stream_provider,
+            stream_length,
+        },
+        other => other,
+    };
+    Ok(ObjectHandle::from_value(value))
 }
 
 pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
@@ -3377,5 +3470,35 @@ mod final_handle_tests {
         let (trailer, diagnostics) = parse_trailer_candidate(&malformed, 0);
         assert!(trailer.is_none());
         assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_cache_disconnects_reference_cycles_before_drop() {
+        let first_ref = ObjectRef::new(1, 0);
+        let second_ref = ObjectRef::new(2, 0);
+        let first = ObjectHandle::new_indirect_unresolved(first_ref, -1);
+        let second = ObjectHandle::new_indirect_unresolved(second_ref, -1);
+        first.set_resolved(ObjectValue::Dictionary(BTreeMap::from([(
+            b"/next".to_vec(),
+            second.clone(),
+        )])));
+        second.set_resolved(ObjectValue::Dictionary(BTreeMap::from([(
+            b"/next".to_vec(),
+            first.clone(),
+        )])));
+
+        let cache = BootstrapCache {
+            handle_state: Rc::new(RefCell::new(BootstrapHandleState {
+                handles: BTreeMap::from([(first_ref, first.clone()), (second_ref, second.clone())]),
+                ..BootstrapHandleState::default()
+            })),
+            handle_document: None,
+            handle_document_owners: Vec::new(),
+        };
+
+        drop(cache);
+
+        assert!(!first.is_indirect());
+        assert!(!second.is_indirect());
     }
 }
