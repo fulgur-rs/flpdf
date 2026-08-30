@@ -123,11 +123,6 @@ fn convert_object_json_error(error: ObjectJsonError) -> ConvertError {
 /// parent was serialized with). Confirmed against live qpdf 11.9.0: `/Dest 8
 /// 0 R` with object 8 holding `[3 0 R /Fit]` emits `"dest": ["3 0 R",
 /// "/Fit"]`.
-#[cfg(test)]
-pub(crate) fn pdf_dest_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
-    pdf_dest_to_json_with_version(handle, QPDF_JSON_VERSION)
-}
-
 pub(crate) fn pdf_dest_to_json_with_version(
     handle: &ObjectHandle,
     version: i32,

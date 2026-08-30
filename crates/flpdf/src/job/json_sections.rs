@@ -79,53 +79,6 @@ pub(crate) fn collect_content_refs<R: Read + Seek>(
     }
 }
 
-/// Collect image XObject reference strings for a single page.
-///
-/// Walks the inherited `/Resources /XObject` dictionary and, for each entry
-/// whose resolved value is a Stream with `/Subtype /Image`, appends
-/// `"N M R"` (the *original* reference string) to the result. Entries that
-/// are direct inline Streams (no ref number) are skipped. The output is
-/// sorted by XObject name (alphabetical byte-lex order).
-#[cfg(test)]
-pub(crate) fn collect_image_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: crate::ObjectRef,
-) -> Result<Vec<String>, ConvertError> {
-    // qpdf's doJSONPages calls QPDFPageObjectHelper::getImages directly
-    // (`QPDFJob.cc:1030-1078`), so keep inherited-resource resolution inside
-    // the canonical page helper instead of lifting a legacy Dictionary.
-    let images = {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
-        page.get_images()?
-    };
-
-    let mut image_refs: Vec<String> = Vec::new();
-    for value in images.into_values() {
-        // Each XObject entry should be an indirect Reference.
-        let Some(xobj_ref) = value.object_ref() else {
-            // Direct inline stream — no ref string available, skip.
-            continue;
-        };
-        pdf.resolve(&value)?;
-        let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
-            continue;
-        };
-        let is_image = match stream_dict.get(b"/Subtype".as_slice()) {
-            Some(subtype_handle) => {
-                pdf.resolve(subtype_handle)?;
-                subtype_handle
-                    .as_name()
-                    .is_some_and(|subtype| subtype.as_slice() == b"Image")
-            }
-            None => false,
-        };
-        if is_image {
-            image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
-        }
-    }
-    Ok(image_refs)
-}
-
 fn image_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     name: &[u8],
@@ -232,19 +185,6 @@ fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {
 ///
 /// Returns a [`ConvertError`] if the page tree cannot be traversed or any
 /// object resolution fails.
-#[cfg(test)]
-pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    build_pages_section_with_version(pdf, 2)
-}
-
-#[cfg(test)]
-pub(crate) fn build_pages_section_with_version<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    version: i32,
-) -> Result<Json, ConvertError> {
-    build_pages_section_with_options(pdf, version, DecodeLevel::Generalized)
-}
-
 pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
@@ -384,11 +324,6 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
 /// `getFieldForAnnotation` (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-232`),
 /// `QPDFFormFieldObjectHelper` (`libqpdf/QPDFFormFieldObjectHelper.cc:29-285`),
 /// and `QPDFAnnotationObjectHelper` (`libqpdf/QPDFAnnotationObjectHelper.cc:13-47`).
-#[cfg(test)]
-pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    build_acroform_section_with_version(pdf, 2)
-}
-
 pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
@@ -556,11 +491,6 @@ pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails during tree walk.
-#[cfg(test)]
-pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    build_pagelabels_section_with_version(pdf, 2)
-}
-
 pub(crate) fn build_pagelabels_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
@@ -672,11 +602,6 @@ fn outline_item_to_json<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
-#[cfg(test)]
-pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    build_outlines_section_with_version(pdf, 2)
-}
-
 pub(crate) fn build_outlines_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
@@ -956,11 +881,6 @@ fn filespec_handle_to_json<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
-#[cfg(test)]
-pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    build_attachments_section_with_version(pdf, 2)
-}
-
 pub(crate) fn build_attachments_section_with_version<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _version: i32,
@@ -1174,19 +1094,6 @@ fn all_true_capabilities(version: i32) -> Result<Json, ConvertError> {
 /// nested entries (`/V`, `/R`, `/P`, `/Length`, `/StmF`, `/StrF`, `/EFF`,
 /// `/CF`, `/CFM`) that happen to be stored as indirect references, cannot be
 /// resolved (i.e. an underlying I/O or parse error).
-#[cfg(test)]
-pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    build_encrypt_section_with_version(pdf, 2)
-}
-
-#[cfg(test)]
-pub(crate) fn build_encrypt_section_with_version<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    version: i32,
-) -> Result<Json, ConvertError> {
-    build_encrypt_section_with_options(pdf, version, false)
-}
-
 pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: i32,
@@ -1461,7 +1368,8 @@ mod tests {
         pdf.mark_object_handle_dirty(&catalog)
             .expect("mark catalog dirty");
 
-        let pages = build_pages_section_with_version(&mut pdf, 2).expect("pages with outline");
+        let pages = build_pages_section_with_options(&mut pdf, 2, DecodeLevel::Generalized)
+            .expect("pages with outline");
         assert!(pages.is_array());
     }
 }

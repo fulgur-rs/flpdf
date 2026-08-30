@@ -150,30 +150,6 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
     Ok(())
 }
 
-/// Backward-compatible v2 entry point used by lower-level JSON tests and
-/// callers that explicitly select qpdf's current JSON version.
-#[cfg(test)]
-pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-    stream_mode: &StreamDataMode,
-    keys: &[JsonKey],
-    objects: &[JsonObjectSelector],
-    out: &mut dyn Pipeline,
-) -> Result<(), JsonOutputError> {
-    write_qpdf_json_selected_objects_with_options(
-        pdf,
-        QPDF_JSON_VERSION,
-        false,
-        false,
-        decode_level,
-        stream_mode,
-        keys,
-        objects,
-        out,
-    )
-}
-
 /// Write selected qpdf JSON output to an ordinary command-boundary handle.
 #[allow(clippy::too_many_arguments)]
 pub fn write_qpdf_json_selected_objects_to_output_with_options<R: Read + Seek>(
@@ -530,30 +506,6 @@ fn validate_json_schema(
     Ok(())
 }
 
-/// Backward-compatible v2 command-boundary output entry point.
-#[cfg(test)]
-pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-    stream_mode: &StreamDataMode,
-    keys: &[JsonKey],
-    objects: &[JsonObjectSelector],
-    output: JsonOutput<'_>,
-) -> Result<(), JsonOutputError> {
-    write_qpdf_json_selected_objects_to_output_with_options(
-        pdf,
-        QPDF_JSON_VERSION,
-        false,
-        false,
-        false,
-        decode_level,
-        stream_mode,
-        keys,
-        objects,
-        output,
-    )
-}
-
 /// Selects how PDF stream payloads appear in JSON output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JsonStreamData {
@@ -700,8 +652,11 @@ mod tests {
         let mut output = PlString::new("job json order", None, &mut bytes);
         let stream_mode = StreamDataMode::None;
 
-        write_qpdf_json_v2_selected_objects_with_options(
+        write_qpdf_json_selected_objects_with_options(
             &mut pdf,
+            QPDF_JSON_VERSION,
+            false,
+            false,
             DecodeLevel::Generalized,
             &stream_mode,
             &[],
