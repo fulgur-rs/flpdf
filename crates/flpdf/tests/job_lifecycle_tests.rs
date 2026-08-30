@@ -819,6 +819,120 @@ fn invalid_qpdf_job_json_is_rejected_at_initialization() {
 }
 
 #[test]
+fn job_json_rejects_v1_only_keys_under_json_version_2() {
+    // qpdf validates jsonKey/version compatibility unconditionally in
+    // checkConfiguration (`QPDFJob.cc:630-637`), confirmed against live
+    // qpdf 11.9.0: `--json-key=objects` errors with this exact message even
+    // without `--json` at all, since `m->json_version` defaults to 0, which
+    // falls into the "not version 1" branch.
+    let one_page =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("out.json");
+    let json = serde_json::json!({
+        "inputFile": one_page,
+        "outputFile": output,
+        "json": "2",
+        "jsonKey": ["objects"]
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    let error = job.initialize_from_json(&json).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "json keys \"objects\" and \"objectinfo\" are only valid for json version 1"
+    ));
+}
+
+#[test]
+fn job_json_rejects_qpdf_key_under_json_version_1() {
+    let one_page =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("out.json");
+    let json = serde_json::json!({
+        "inputFile": one_page,
+        "outputFile": output,
+        "json": "1",
+        "jsonKey": ["qpdf"]
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    let error = job.initialize_from_json(&json).unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Usage(usage)
+            if usage.to_string() == "json key \"qpdf\" is only valid for json version > 1"
+    ));
+}
+
+#[test]
+fn job_json_password_file_reads_raw_bytes_and_keeps_only_the_first_line() {
+    // The discarded second line contains a raw non-UTF-8 byte (0xFF is never
+    // a valid UTF-8 lead byte on its own): `read_to_string` rejects the
+    // whole file before authentication even gets a chance to run, while the
+    // byte-preserving first-line split (`QUtil::read_lines_from_file` +
+    // `lines.front()`, `QUtil.cc:1231-1286`) only ever looks at the first
+    // line's bytes, so the password authenticates successfully.
+    let encrypted_pdf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let password_file = tempdir.path().join("password.txt");
+    std::fs::write(
+        &password_file,
+        b"user-v4-aes\nignored line with \xffinvalid utf-8\n",
+    )
+    .unwrap();
+    let output = tempdir.path().join("out.pdf");
+    let json = serde_json::json!({
+        "inputFile": encrypted_pdf,
+        "outputFile": output,
+        "passwordFile": password_file,
+        "decrypt": ""
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let written = std::fs::read(&output).unwrap();
+    let mut opened = Pdf::open(Cursor::new(written))
+        .expect("output must be decrypted and openable without a password");
+    let _ = opened.root_handle().unwrap();
+}
+
+#[test]
+fn job_json_no_warn_suppresses_document_open_warnings_not_just_the_summary() {
+    // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`) applies
+    // `pdf.setSuppressWarnings(true)` to every QPDF the job opens
+    // (`QPDFJob.cc:663-665`), not just the final completion summary.
+    let (logger, state) = logger_with_warning_sink();
+    let damaged = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("out.pdf");
+    let json = serde_json::json!({
+        "inputFile": damaged,
+        "outputFile": output,
+        "noWarn": ""
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json(&json).unwrap();
+    // The repaired document still recorded a warning internally (qpdf's
+    // `QPDF::warn` always pushes to `m->warnings` regardless of
+    // `suppress_warnings`, which only gates whether it is printed), so the
+    // job's own exit code is still `Warning` even though nothing is printed.
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    assert!(
+        state.lock().unwrap().bytes.is_empty(),
+        "noWarn must suppress recovery warnings emitted while opening the document, not just \
+         the final completion summary"
+    );
+}
+
+#[test]
 fn completion_emits_one_qpdf_warning_summary_and_warning_status() {
     let (logger, state) = logger_with_warning_sink();
     let mut job = QPDFJob::new();

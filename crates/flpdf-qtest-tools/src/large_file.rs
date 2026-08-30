@@ -51,7 +51,12 @@ struct ImageProvider {
     width: usize,
     stripesize: usize,
     output: Output,
-    stripe: RefCell<Option<Vec<u8>>>,
+    // qpdf's `test_large_file.cc:47,120-121` allocates `buf` as a single
+    // namespace-scope pointer shared by every `ImageProvider` instance
+    // across all `npages`, not a per-page buffer. Share the same allocation
+    // across every provider the same way, rather than retaining one stripe
+    // buffer per page (200 buffers x up to 500 rows in `large` mode).
+    stripe: Rc<RefCell<Option<Vec<u8>>>>,
 }
 
 impl StreamDataProvider for ImageProvider {
@@ -186,6 +191,7 @@ fn create_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
         ObjectHandle::integer(612),
         ObjectHandle::integer(792),
     ]);
+    let stripe: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
 
     for page_number in 1..=NPAGES {
         let image = pdf.new_stream()?;
@@ -207,7 +213,7 @@ fn create_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
                 width,
                 stripesize,
                 output: output.clone(),
-                stripe: RefCell::new(None),
+                stripe: stripe.clone(),
             }),
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),

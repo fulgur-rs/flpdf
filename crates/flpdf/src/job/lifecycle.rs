@@ -1166,14 +1166,26 @@ impl QPDFJob {
         configuration.password = job_json_string(&members, b"password")?.unwrap_or_default();
         if let Some(password_file) = job_json_string(&members, b"passwordFile")? {
             let path = PathBuf::from(String::from_utf8_lossy(&password_file).into_owned());
-            let contents = std::fs::read_to_string(&path)
+            // Byte-preserving, first-line-only contract, matching qpdf's
+            // `QUtil::read_lines_from_file` + `lines.front()`
+            // (`QUtil.cc:1231-1286`, `QPDFJob_config.cc:661-679`): split on
+            // raw `\n` bytes, stripping a preceding `\r`, and use the first
+            // line's bytes as the password verbatim. A password need not be
+            // valid UTF-8, so this reads raw bytes rather than
+            // `read_to_string` + `.lines().next()`, which both rejects
+            // non-UTF-8 password bytes and (for a file with no trailing
+            // newline at all) can differ on whether a lone final line counts.
+            let bytes = std::fs::read(&path)
                 .map_err(|error| Error::file_io("read password file", path.clone(), error))?;
-            configuration.password = contents
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .as_bytes()
-                .to_vec();
+            let first_line_len = bytes
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .unwrap_or(bytes.len());
+            let mut first_line = bytes[..first_line_len].to_vec();
+            if first_line.ends_with(b"\r") {
+                first_line.pop();
+            }
+            configuration.password = first_line;
         }
         configuration.json_input = job_json_bare(&members, b"jsonInput")?;
 
@@ -1484,6 +1496,14 @@ impl QPDFJob {
         self.input_name = input_name.clone();
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
+        // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
+        // opens (`QPDFJob.cc:663-665`), not just the final completion
+        // summary that `self.suppress_warnings` alone gates in `complete()`.
+        // OR rather than overwrite: a caller that already asked for
+        // suppression on this specific open must keep it regardless of the
+        // job's own setting.
+        options.suppress_warnings |= self.suppress_warnings;
         let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_with_options(Box::new(source), options)?;
         // qpdf's createQPDF resolves the root while establishing the
         // document's version/extension state before operation dispatch
@@ -1496,8 +1516,14 @@ impl QPDFJob {
     /// Create qpdf's canonical empty document through the same job document
     /// boundary as file and JSON input.
     pub fn create_empty_document(&mut self) -> Result<JobDocument> {
+        // qpdf's `setQPDFOptions` (`QPDFJob.cc:651-665`) runs unconditionally
+        // right after `QPDF` construction, before dispatching to empty,
+        // JSON-input, or file-based creation (`QPDFJob.cc:1701-1710`), so
+        // `noWarn` suppresses warnings for an empty document exactly like the
+        // other two creation kinds.
         let mut pdf = crate::engine::open_empty_with_options_erased(PdfOpenOptions {
             logger: Some(self.logger.clone()),
+            suppress_warnings: self.suppress_warnings,
             ..PdfOpenOptions::default()
         })?;
         self.input_name.clear();
@@ -1518,11 +1544,14 @@ impl QPDFJob {
     {
         let input_name = input_name.into();
         self.input_name = input_name.clone();
+        // See `create_empty_document`: qpdf applies `noWarn` to every
+        // creation kind uniformly, including JSON-input.
         let pdf = crate::json::create_from_json_erased(
             source,
             input_name,
             PdfOpenOptions {
                 logger: Some(self.logger.clone()),
+                suppress_warnings: self.suppress_warnings,
                 ..PdfOpenOptions::default()
             },
         )?;
@@ -2023,6 +2052,30 @@ impl QPDFJob {
                 )
                 .into());
             }
+        }
+        // qpdf validates jsonKey/version compatibility unconditionally, not
+        // only when JSON output was requested: `m->json_version` defaults to
+        // 0, which falls into the "not version 1" branch below
+        // (`QPDFJob.cc:630-637`). Confirmed against live qpdf 11.9.0:
+        // `--json-key=objects` alone (no `--json`) still errors with this
+        // exact message.
+        if self.configuration.json_version == Some(1) {
+            if self.configuration.json_keys.contains(&JsonKey::Qpdf) {
+                return Err(UsageError::new(
+                    "json key \"qpdf\" is only valid for json version > 1",
+                )
+                .into());
+            }
+        } else if self
+            .configuration
+            .json_keys
+            .iter()
+            .any(|key| matches!(key, JsonKey::Objects | JsonKey::Objectinfo))
+        {
+            return Err(UsageError::new(
+                "json keys \"objects\" and \"objectinfo\" are only valid for json version 1",
+            )
+            .into());
         }
         Ok(())
     }
