@@ -13,7 +13,7 @@ use super::page_range::PageRange;
 use super::page_specs::PageSpecInput;
 use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
-use super::rotate::apply_rotate_to_pages;
+use super::rotate::{apply_rotate_to_pages, flatten_rotation_on_pages};
 use super::rotate_spec::RotateSpec;
 use crate::encryption::{EncryptMethod, EncryptParams};
 use crate::json::input::{qpdf_string_to_int_checked, QpdfIntParse};
@@ -90,6 +90,7 @@ struct JobConfiguration {
     rotations: Vec<RotateSpec>,
     remove_restrictions: bool,
     coalesce_contents: bool,
+    flatten_rotation: bool,
     writer: WriterConfiguration,
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
@@ -1146,8 +1147,8 @@ impl QPDFJob {
     ///
     /// This implements the qpdf job-JSON fields currently owned by this
     /// lifecycle, including input/output setup, writer settings, page
-    /// transformations (`splitPages`, `rotate`, `removeRestrictions`, and
-    /// `coalesceContents`),
+    /// transformations (`splitPages`, `rotate`, `removeRestrictions`,
+    /// `coalesceContents`, and `flattenRotation`),
     /// attachments, page selection, and JSON output.
     ///
     /// # Errors
@@ -1316,6 +1317,7 @@ impl QPDFJob {
         }
         configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
         configuration.coalesce_contents = job_json_bare(&members, b"coalesceContents")?;
+        configuration.flatten_rotation = job_json_bare(&members, b"flattenRotation")?;
         if let Some(value) = job_json_choice(
             &members,
             b"objectStreams",
@@ -1901,6 +1903,15 @@ impl QPDFJob {
             for page_ref in page_refs {
                 PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
             }
+        }
+
+        // qpdf's `handleTransformations` flattens rotation after coalescing
+        // content streams and before page-label/output completion
+        // (`QPDFJob.cc:2190-2194`). The existing job rotation module owns the
+        // page-level matrix, box, and annotation semantics.
+        if configuration.flatten_rotation {
+            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+            flatten_rotation_on_pages(pdf, &page_refs)?;
         }
 
         self.apply_page_label_transformations(pdf, configuration)?;

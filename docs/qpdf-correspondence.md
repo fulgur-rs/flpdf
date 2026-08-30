@@ -575,6 +575,8 @@ cargo test -p flpdf-cli --test cli_json --quiet
 
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
 
+`flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
+
 `QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
 要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を
 warning として記録し、空の `id1` で暗号鍵導出を継続する。`flpdf-ez48` で
