@@ -47,7 +47,7 @@ where
     let mut pdf = Pdf::<Box<dyn crate::ReadSeek>>::open_with_options(
         Box::new(Cursor::new(JSON_PDF.to_vec())),
         options,
-    )?;
+    )?; // cov:ignore: the fixed qpdf JSON rootless seed is a valid in-memory PDF
     pdf.import_json(source, input_name, true)?;
     Ok(pdf)
 }

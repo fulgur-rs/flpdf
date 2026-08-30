@@ -726,4 +726,130 @@ mod tests {
 
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     }
+
+    #[test]
+    fn job_json_writer_emits_the_v1_object_and_objectinfo_sections() {
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+        let keys = [JsonKey::Objects, JsonKey::Objectinfo];
+        let mut output = PlString::new("job json v1", None, &mut bytes);
+
+        write_qpdf_json_selected_objects_with_options(
+            &mut pdf,
+            1,
+            false,
+            false,
+            DecodeLevel::None,
+            &StreamDataMode::None,
+            &keys,
+            &[],
+            &mut output,
+        )
+        .unwrap();
+
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"objects\""));
+        assert!(text.contains("\"objectinfo\""));
+        assert!(text.contains("\"stream\""));
+    }
+
+    #[test]
+    fn job_json_v1_selectors_skip_unselected_objects_but_keep_the_trailer() {
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        let mut bytes = Vec::new();
+        let keys = [JsonKey::Objects, JsonKey::Objectinfo];
+        let selectors = [
+            JsonObjectSelector::Object {
+                number: 1,
+                generation: 0,
+            },
+            JsonObjectSelector::Trailer,
+        ];
+        let mut output = PlString::new("job json v1 selected", None, &mut bytes);
+
+        write_qpdf_json_selected_objects_with_options(
+            &mut pdf,
+            1,
+            false,
+            false,
+            DecodeLevel::None,
+            &StreamDataMode::None,
+            &keys,
+            &selectors,
+            &mut output,
+        )
+        .unwrap();
+
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\"1 0 R\""));
+        assert!(text.contains("\"trailer\""));
+    }
+
+    #[test]
+    fn job_json_schema_validation_covers_stdout_and_file_boundaries() {
+        let keys = [JsonKey::Qpdf];
+        let stream_mode = StreamDataMode::None;
+        let mut stdout = Vec::new();
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        write_qpdf_json_selected_objects_to_output_with_options(
+            &mut pdf,
+            2,
+            false,
+            false,
+            true,
+            DecodeLevel::None,
+            &stream_mode,
+            &keys,
+            &[],
+            JsonOutput::Stdout(&mut stdout),
+        )
+        .unwrap();
+        assert!(!stdout.is_empty());
+
+        let mut file_output = Vec::new();
+        let mut pdf = Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap();
+        write_qpdf_json_selected_objects_to_output_with_options(
+            &mut pdf,
+            2,
+            true,
+            false,
+            true,
+            DecodeLevel::None,
+            &stream_mode,
+            &keys,
+            &[],
+            JsonOutput::File(&mut file_output),
+        )
+        .unwrap();
+        assert!(!file_output.is_empty());
+    }
+
+    #[test]
+    fn job_json_schema_reports_parse_and_shape_failures() {
+        assert!(matches!(
+            validate_json_schema(b"{", 2, false, &[]),
+            Err(JsonOutputError::Convert(_))
+        ));
+        assert!(matches!(
+            validate_json_schema(b"{}", 2, false, &[JsonKey::Qpdf]),
+            Err(JsonOutputError::Convert(_))
+        ));
+
+        output_schema(
+            1,
+            false,
+            &[
+                JsonKey::Pages,
+                JsonKey::Pagelabels,
+                JsonKey::Outlines,
+                JsonKey::Acroform,
+                JsonKey::Encrypt,
+                JsonKey::Attachments,
+                JsonKey::Objects,
+                JsonKey::Objectinfo,
+            ],
+        )
+        .unwrap();
+        output_schema(2, true, &[]).unwrap();
+    }
 }

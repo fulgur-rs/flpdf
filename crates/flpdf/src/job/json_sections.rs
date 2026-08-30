@@ -1328,3 +1328,108 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ObjectHandle, ObjectRef, Pdf};
+    use std::io::Cursor;
+    use std::rc::Rc;
+
+    fn one_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        Pdf::open_mem_owned(std::fs::read(path).expect("one-page fixture"))
+            .expect("open one-page fixture")
+    }
+
+    fn image_handle(filter: ObjectHandle, decode_parms: ObjectHandle) -> ObjectHandle {
+        ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
+                (
+                    b"ColorSpace".to_vec(),
+                    ObjectHandle::name(b"DeviceGray".to_vec()),
+                ),
+                (b"DecodeParms".to_vec(), decode_parms),
+                (b"Filter".to_vec(), filter),
+                (b"Height".to_vec(), ObjectHandle::integer(1)),
+                (b"Subtype".to_vec(), ObjectHandle::name(b"Image".to_vec())),
+                (b"Width".to_vec(), ObjectHandle::integer(1)),
+            ]),
+            Rc::new(Vec::new()),
+        )
+    }
+
+    #[test]
+    fn image_projection_covers_filter_and_decode_parameter_arrays() {
+        let mut pdf = one_page_pdf();
+        let image_ref = ObjectRef::new(99, 0);
+        let filter = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        ]);
+        let image = image_handle(filter, ObjectHandle::null());
+        pdf.replace_object(image_ref, image).expect("install image");
+        let handle = pdf.get_object_handle(image_ref);
+        let result = image_to_json(&mut pdf, b"/Im0", &handle, 2, DecodeLevel::None)
+            .expect("image descriptor");
+        assert!(result.is_dictionary());
+
+        let filter = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        ]);
+        let decode_parms = ObjectHandle::array(vec![ObjectHandle::null(), ObjectHandle::null()]);
+        let image_ref = ObjectRef::new(100, 0);
+        pdf.replace_object(image_ref, image_handle(filter, decode_parms))
+            .expect("install second image");
+        let handle = pdf.get_object_handle(image_ref);
+        image_to_json(&mut pdf, b"/Im1", &handle, 1, DecodeLevel::All)
+            .expect("image descriptor with array decode parameters");
+    }
+
+    #[test]
+    fn image_projection_maps_every_json_decode_level() {
+        assert_eq!(
+            stream_decode_level(DecodeLevel::None),
+            crate::writer::DecodeLevel::None
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::Generalized),
+            crate::writer::DecodeLevel::Generalized
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::Specialized),
+            crate::writer::DecodeLevel::Specialized
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::All),
+            crate::writer::DecodeLevel::All
+        );
+    }
+
+    #[test]
+    fn encryption_capabilities_and_v1_key_spelling_are_both_built() {
+        let v1 = capabilities_from_p(-4, 1);
+        let v2 = capabilities_from_p(-4, 2);
+        assert!(v1.iter().any(|(key, _)| key == "moddifyannotations"));
+        assert!(v2.iter().any(|(key, _)| key == "modifyannotations"));
+    }
+
+    #[test]
+    fn encrypted_projection_can_include_the_authenticated_file_key() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(std::fs::read(path).expect("encrypted fixture")),
+            crate::PdfOpenOptions {
+                password: b"user-v4-aes".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open encrypted fixture");
+        build_encrypt_section_with_options(&mut pdf, 2, true)
+            .expect("encrypted section with file key");
+    }
+}

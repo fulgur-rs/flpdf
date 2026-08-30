@@ -1782,6 +1782,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_data_error_preserves_errors_for_direct_handles() {
+        let error = crate::Error::System("direct stream failure".to_owned());
+        assert!(matches!(
+            stream_data_error(&ObjectHandle::integer(1), error),
+            crate::Error::System(message) if message == "direct stream failure"
+        ));
+    }
+
     // A tree built through the public `ObjectHandle::array`/`dictionary`
     // factories carries no depth bound the way parsed input does (see
     // `object_handle.rs`'s own `UNPARSE_STACK_RED_ZONE` doc), so

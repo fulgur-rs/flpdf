@@ -980,6 +980,8 @@ mod lifecycle_tests {
         configuration.set_static_aes_iv(true);
         configuration.set_suppress_original_object_ids(true);
         configuration.set_preserve_encryption(false);
+        configuration.set_linearization(true);
+        configuration.set_linearization_pass1_filename("pass1.pdf");
         configuration.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
         configuration.copy_encryption_parameters(CopyEncryptionSource {
             encrypt_dict: crate::Dictionary::new(),
@@ -998,6 +1000,12 @@ mod lifecycle_tests {
         );
         assert!(!writer.settings.compress_streams);
         assert_eq!(writer.settings.decode_level, DecodeLevel::All);
+        assert_eq!(configuration.decode_level(), DecodeLevel::All);
+        assert!(configuration.preserves_unreferenced_objects());
+        assert_eq!(
+            writer.settings.linearization_pass1_filename,
+            Some(std::path::PathBuf::from("pass1.pdf"))
+        );
         assert!(writer.settings.recompress_flate);
         assert!(writer.settings.content_normalization);
         assert!(writer.settings.qdf_mode);

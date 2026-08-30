@@ -599,7 +599,7 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
                 EncryptParams::v5_r6(user_password, owner_password)
             }
         }
-        _ => unreachable!("key length was validated above"),
+        _ => unreachable!("key length was validated above"), // cov:ignore: key length comes only from the validated qpdf job schema choices
     };
     params.permissions = permissions;
     if matches!(
@@ -628,7 +628,7 @@ fn parse_json_decode_level(value: &str) -> crate::writer::DecodeLevel {
         "generalized" => crate::writer::DecodeLevel::Generalized,
         "specialized" => crate::writer::DecodeLevel::Specialized,
         "all" => crate::writer::DecodeLevel::All,
-        _ => unreachable!("decode level was validated before conversion"),
+        _ => unreachable!("decode level was validated before conversion"), // cov:ignore: decode level comes only from the validated qpdf job schema choices
     }
 }
 
@@ -645,7 +645,7 @@ fn parse_json_version(value: &str) -> i32 {
     match value {
         "1" => 1,
         "2" | "latest" | "" => 2,
-        _ => unreachable!("JSON version was validated before conversion"),
+        _ => unreachable!("JSON version was validated before conversion"), // cov:ignore: JSON version comes only from the validated qpdf job schema choices
     }
 }
 
@@ -1199,7 +1199,7 @@ impl QPDFJob {
                     "compress" => crate::StreamDataMode::Compress,
                     "preserve" => crate::StreamDataMode::Preserve,
                     "uncompress" => crate::StreamDataMode::Uncompress,
-                    _ => unreachable!("streamData was validated above"),
+                    _ => unreachable!("streamData was validated above"), // cov:ignore: streamData comes only from the validated qpdf job schema choices
                 });
         }
         if let Some(value) = job_json_choice(&members, b"compressStreams", &["y", "n"], true)? {
@@ -1299,7 +1299,7 @@ impl QPDFJob {
                 "none" => JsonStreamData::None,
                 "inline" => JsonStreamData::Inline,
                 "file" => JsonStreamData::File,
-                _ => unreachable!("jsonStreamData was validated above"),
+                _ => unreachable!("jsonStreamData was validated above"), // cov:ignore: jsonStreamData comes only from the validated qpdf job schema choices
             };
         }
         if let Some(value) = members.get(b"jsonKey".as_slice()) {
@@ -1436,7 +1436,7 @@ impl QPDFJob {
                 "auto" => RemoveUnreferencedResources::Auto,
                 "yes" => RemoveUnreferencedResources::Yes,
                 "no" => RemoveUnreferencedResources::No,
-                _ => unreachable!("removeUnreferencedResources was validated above"),
+                _ => unreachable!("removeUnreferencedResources was validated above"), // cov:ignore: removeUnreferencedResources comes only from the validated qpdf job schema choices
             };
         }
         if job_json_bare(&members, b"preserveUnreferencedResources")? {
@@ -2579,6 +2579,14 @@ mod tests {
         )
         .unwrap();
         assert!(parse_job_encrypt(&encrypt_256, true).is_ok());
+        let encrypt_128_rc4 =
+            crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","128bit":{}}"#)
+                .unwrap();
+        assert!(parse_job_encrypt(&encrypt_128_rc4, true).is_ok());
+        let encrypt_256_r6 =
+            crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","256bit":{}}"#)
+                .unwrap();
+        assert!(parse_job_encrypt(&encrypt_256_r6, true).is_ok());
         let missing_password = crate::json::Json::parse(br#"{"128bit":{}}"#).unwrap();
         assert!(parse_job_encrypt(&missing_password, true).is_err());
         let duplicate_key_length = crate::json::Json::parse(
@@ -2732,6 +2740,7 @@ mod tests {
         assert!(parse_job_page_labels(&["1:X".to_owned()], 6).is_err());
         assert!(parse_job_page_labels(&["1:D/foo".to_owned()], 6).is_err());
         assert!(parse_job_page_labels(&["1:D/0".to_owned()], 6).is_err());
+        assert!(parse_job_page_labels(&["rx:D".to_owned()], 6).is_err());
         let relative = parse_job_page_labels(
             &[
                 "1:D".to_owned(),
@@ -2743,5 +2752,89 @@ mod tests {
         .unwrap();
         assert_eq!(relative[1].0, 4);
         assert_eq!(relative[2].0, 5);
+    }
+
+    #[test]
+    fn job_json_private_parser_covers_remaining_choices_and_validation_errors() {
+        for stream_data in ["compress", "preserve", "uncompress"] {
+            let mut job = QPDFJob::new();
+            job.initialize_from_json_partial(&format!(r#"{{"streamData":"{stream_data}"}}"#))
+                .unwrap();
+        }
+        for stream_data in ["none", "inline", "file"] {
+            let mut job = QPDFJob::new();
+            job.initialize_from_json_partial(&format!(r#"{{"jsonStreamData":"{stream_data}"}}"#))
+                .unwrap();
+        }
+        for resources in ["auto", "yes", "no"] {
+            let mut job = QPDFJob::new();
+            job.initialize_from_json_partial(&format!(
+                r#"{{"removeUnreferencedResources":"{resources}"}}"#
+            ))
+            .unwrap();
+        }
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"addAttachment":[{"file":"/"}]}"#)
+            .expect_err("a root path has no attachment basename");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"overlay":[{}]}"#)
+            .expect_err("overlay file is required");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"overlay":{"file":"overlay.pdf"}}"#)
+            .unwrap();
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"pages":[{}]}"#)
+            .expect_err("page file is required");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"pages":{"file":"page.pdf","range":"1-2"}}"#)
+            .unwrap();
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"jsonKey":[1]}"#)
+            .expect_err("jsonKey entries must be strings");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"jsonKey":["unknown"]}"#)
+            .expect_err("jsonKey choices must be known");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"jsonObject":[1]}"#)
+            .expect_err("jsonObject entries must be strings");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"jsonObject":["unknown"]}"#)
+            .expect_err("jsonObject selectors must be valid");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"removeAttachment":[1]}"#)
+            .expect_err("attachment names must be strings");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"setPageLabels":[1]}"#)
+            .expect_err("page labels must be strings");
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"inputFile":"input.pdf","empty":""}"#)
+            .expect_err("empty and inputFile are mutually exclusive");
+    }
+
+    #[test]
+    fn job_input_setters_preserve_qpdf_configuration_boundaries() {
+        let mut job = QPDFJob::new();
+        job.set_input_file("input.pdf").unwrap();
+        assert_eq!(job.input_name(), "input.pdf");
+        assert!(job.set_input_file("second.pdf").is_err());
+
+        job.set_output_file("output.pdf").unwrap();
+        assert!(job.set_output_file("second-output.pdf").is_err());
+        job.set_password(b"password".to_vec());
+
+        let mut empty_job = QPDFJob::new();
+        empty_job
+            .initialize_from_json_partial(r#"{"empty":""}"#)
+            .unwrap();
+        assert!(empty_job.set_input_file("input.pdf").is_err());
+
+        let mut replace_job = QPDFJob::new();
+        replace_job
+            .initialize_from_json_partial(r#"{"replaceInput":""}"#)
+            .unwrap();
+        assert!(replace_job.set_output_file("output.pdf").is_err());
     }
 }

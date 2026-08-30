@@ -4507,6 +4507,14 @@ mod tests {
         crate::Pdf::open_mem_owned(bytes).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
     }
 
+    fn load_json_diff_fixture_pdf(name: &str) -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../../tests/fixtures/json-diff").join(name);
+        let bytes = std::fs::read(&fixture)
+            .unwrap_or_else(|e| panic!("{name} not found at {}: {e}", fixture.display()));
+        crate::Pdf::open_mem_owned(bytes).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
+    }
+
     // Helper: get page entry at index from build_pages_section result.
     fn get_page_entry(pages: &serde_json::Value, idx: usize) -> Vec<(String, serde_json::Value)> {
         let serde_json::Value::Array(arr) = pages else {
@@ -4793,6 +4801,31 @@ mod tests {
                 "page {i} pageposfrom1 mismatch"
             );
         }
+    }
+
+    #[test]
+    fn build_pages_section_projects_images_and_page_outlines() {
+        let mut image_pdf = load_fixture_pdf("shared-stream-objstm.pdf");
+        let image_pages = build_pages_section(&mut image_pdf).expect("image pages");
+        let image_entry = get_page_entry(&image_pages, 0);
+        let serde_json::Value::Array(images) = &image_entry[1].1 else {
+            panic!("images must be an array");
+        };
+        assert!(!images.is_empty(), "fixture must contain an image XObject");
+
+        let mut outline_pdf = load_json_diff_fixture_pdf("direct-outlines.pdf");
+        let pages = build_pages_section(&mut outline_pdf).expect("outline pages");
+        let outline_count = match &pages {
+            serde_json::Value::Array(entries) => entries
+                .iter()
+                .map(|entry| entry["outlines"].as_array().map_or(0, Vec::len))
+                .sum::<usize>(),
+            _ => 0,
+        };
+        assert!(
+            outline_count > 0,
+            "fixture must contain page-targeted outlines"
+        );
     }
 
     // ── 31. collect_content_refs: single Reference to a Stream ────────────────
