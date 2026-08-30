@@ -1097,6 +1097,7 @@ impl<R: Read + Seek> Pdf<R> {
                 stream_data: Some(Rc::new(stream.data.clone())),
                 stream_length: 0,
                 stream_provider: None,
+                filter_on_write: true,
             });
         }
         self.lift_bounded_with_content_tokens(object, 0, PROGRAMMATIC_LIFT_MAX_DEPTH)
@@ -1122,6 +1123,7 @@ impl<R: Read + Seek> Pdf<R> {
             stream_data: Some(Rc::new(stream.data.clone())),
             stream_length: 0,
             stream_provider: None,
+            filter_on_write: true,
         })
     }
 
@@ -2030,6 +2032,7 @@ impl<R: Read + Seek> Pdf<R> {
                             stream_data: Some(Rc::new(stream.data)),
                             stream_length: 0,
                             stream_provider: None,
+                            filter_on_write: true,
                         }
                     }
                     other => self.lift_bounded(&other, 0, crate::parser::MAX_PARSE_DEPTH)?,
@@ -2446,6 +2449,7 @@ impl<R: Read + Seek> Pdf<R> {
                         stream_data: Some(Rc::new(stream.data.clone())),
                         stream_length: 0,
                         stream_provider: None,
+                        filter_on_write: true,
                     }
                 }
                 // A bare top-level reference never comes from a file/ObjStm
@@ -3312,6 +3316,7 @@ mod tests {
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_length: 3,
             stream_provider: None,
+            filter_on_write: true,
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let promoted = pdf

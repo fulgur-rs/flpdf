@@ -816,11 +816,8 @@ fn canonical_stream_output_with_rewrite_policy(
             (data, filtering_attempted, normalized_content)
         } else {
             (
-                source_for_pipe
-                    .get_raw_stream_data()
-                    .map_err(|error| stream_data_error(&source_for_pipe, error))?
-                    .as_ref()
-                    .clone(),
+                canonical_stream_source_data(&source_for_pipe)
+                    .map_err(|error| stream_data_error(&source_for_pipe, error))?,
                 false,
                 false,
             )
@@ -857,6 +854,30 @@ fn canonical_stream_output_with_rewrite_policy(
     Ok((dict, data, refiltered, filtering_attempted))
 }
 
+/// Read a stream through qpdf's writer-owned unfiltered pipe.
+///
+/// `QPDFWriter::willFilterStream` still calls `pipeStreamData` once when
+/// `filter_on_write` is false, passing `will_retry=true` for that first
+/// attempt (`libqpdf/QPDFWriter.cc:1254-1314`). This is observably different
+/// from `getRawStreamData`, whose public accessor passes `will_retry=false`
+/// (`libqpdf/QPDF_Stream.cc:362-376`). In particular, a retry-aware provider
+/// may return `false` after writing its bytes; qpdf's writer keeps that buffer
+/// because filtering is already disabled and does not enter the retry branch.
+/// Keep the source success bit out of this writer result for the same reason.
+fn canonical_stream_source_data(handle: &ObjectHandle) -> crate::Result<Vec<u8>> {
+    let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
+    let mut filtering_attempted = false;
+    let _source_success = handle.pipe_stream_data(
+        &mut buffer,
+        &mut filtering_attempted,
+        0,
+        crate::writer::DecodeLevel::None,
+        false,
+        true,
+    )?; // cov:ignore: LLVM attributes this covered qpdf-shaped multiline call terminator without an executable counter
+    Ok(buffer.take_buffer()?.to_vec())
+}
+
 fn stream_data_error(handle: &ObjectHandle, error: crate::Error) -> crate::Error {
     if let Some(object_ref) = handle.object_ref() {
         crate::Error::System(format!(
@@ -877,6 +898,14 @@ fn canonical_stream_filter_plan(
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
+    // QPDFWriter::willFilterStream first derives a filter request from the
+    // stream and writer state, then lets QPDF_Stream::filter_on_write veto
+    // every filtering branch (`QPDFWriter.cc:1254-1285`). Keep that veto
+    // ahead of metadata, normalization, and compression policy construction:
+    // false means raw source dispatch regardless of any of those settings.
+    if !handle.get_filter_on_write()? {
+        return Ok(None);
+    }
     // The CLI may have already normalized and replaced this stream's bytes.
     // Keep that state as an effective normalization request so qpdf's
     // normalization branch still suppresses compression, while avoiding a
@@ -1267,6 +1296,123 @@ mod tests {
     }
 
     #[test]
+    fn canonical_stream_output_honors_a_disabled_filter_on_write_flag() {
+        let raw = vec![0x81, b'w', 0xb9, b'w', 0x80];
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"RunLengthDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(raw.len() as i64)),
+            ]),
+            Rc::new(raw.clone()),
+        );
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            decode_level: crate::writer::DecodeLevel::Specialized,
+            ..WriterOptions::default()
+        };
+        let (dict, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
+
+        assert_eq!(data, raw);
+        assert!(!refiltered);
+        assert!(dict
+            .get_key(b"/Filter")
+            .try_is_name_and_equals(b"RunLengthDecode")
+            .unwrap());
+        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(5));
+    }
+
+    #[test]
+    fn disabled_filter_on_write_overrides_the_metadata_filter_policy() {
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let raw =
+            crate::filters::test_dictionary_api::encode_stream_data(&filter_dict, b"metadata")
+                .expect("metadata payload must encode");
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Metadata".to_vec())),
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(raw.len() as i64)),
+            ]),
+            Rc::new(raw.clone()),
+        );
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+
+        let (dict, data, refiltered) = canonical_stream_output(&stream, &WriterOptions::default())
+            .expect("disabled stream should still be emitted");
+
+        assert_eq!(data, raw);
+        assert!(!refiltered);
+        assert!(dict
+            .get_key(b"/Filter")
+            .try_is_name_and_equals(b"FlateDecode")
+            .unwrap());
+        assert_eq!(
+            dict.get_key(b"/Length").as_integer(),
+            Some(raw.len() as i64)
+        );
+    }
+
+    #[test]
+    fn filter_on_write_mutation_invalidates_the_stream_cache_fingerprint() {
+        let stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+        let before = crate::writer::plain::plan::stream_cache_fingerprint(&stream).unwrap();
+
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+        let after = crate::writer::plain::plan::stream_cache_fingerprint(&stream).unwrap();
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn disabled_filter_on_write_applies_to_rewrite_and_linearization_wrappers() {
+        let raw = vec![0x81, b'w', 0xb9, b'w', 0x80];
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"RunLengthDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(raw.len() as i64)),
+            ]),
+            Rc::new(raw.clone()),
+        );
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            decode_level: crate::writer::DecodeLevel::Specialized,
+            ..WriterOptions::default()
+        };
+
+        let (_, rewrite_data, rewrite_refiltered) =
+            canonical_stream_output_for_rewrite(&stream, &options, false).unwrap();
+        let (_, linearization_data, linearization_refiltered) =
+            canonical_stream_output_for_linearization(&stream, &options, false).unwrap();
+
+        assert_eq!(rewrite_data, raw);
+        assert_eq!(linearization_data, raw);
+        assert!(!rewrite_refiltered);
+        assert!(!linearization_refiltered);
+    }
+
+    #[test]
     fn canonical_emission_turns_a_reference_to_a_removed_object_into_null() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
@@ -1459,6 +1605,45 @@ mod tests {
 
         assert_eq!(*attempts.borrow(), vec![(false, true), (false, false)]);
         assert_eq!(data, b"raw provider bytes");
+        assert!(!refiltered);
+    }
+
+    #[test]
+    fn disabled_filter_on_write_uses_qpdf_retry_flag_and_keeps_provider_bytes() {
+        let pdf = Pdf::empty().unwrap();
+        let stream = pdf.new_stream().unwrap();
+        let attempts = Rc::new(RefCell::new(Vec::new()));
+        let attempts_in_callback = Rc::clone(&attempts);
+
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    attempts_in_callback
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline
+                        .write(b"provider raw bytes")
+                        .map_err(crate::Error::from)?;
+                    pipeline.finish().map_err(crate::Error::from)?;
+                    Ok(false)
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        stream
+            .set_filter_on_write(false)
+            .expect("stream setter should succeed");
+
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            decode_level: crate::writer::DecodeLevel::Specialized,
+            ..WriterOptions::default()
+        };
+        let (_, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
+
+        assert_eq!(*attempts.borrow(), vec![(false, true)]);
+        assert_eq!(data, b"provider raw bytes");
         assert!(!refiltered);
     }
 

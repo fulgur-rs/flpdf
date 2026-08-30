@@ -302,20 +302,10 @@ pub(crate) fn run_test_69<R: Read + Seek>(
 
 /// qpdf source: `qpdf/test_driver.cc:2404-2414` (`test_70`).
 ///
-/// GAP(`QPDFObjectHandle::setFilterOnWrite`): qpdf's per-stream "always
-/// write this stream's original bytes verbatim, ignoring the writer's decode
-/// level / recompression settings" flag (consulted by
-/// `QPDFWriter::unparseObject`'s stream-filtering decision) has no flpdf
-/// equivalent -- confirmed: no `pub fn` on `ObjectHandle` or `Stream`
-/// matching `*filter_on_write*` anywhere in `crates/flpdf/src`. The two
-/// `getKey` lookups that would receive the (missing) call are real,
-/// side-effect-free translations and are kept for line-for-line
-/// correspondence with the source; without the mutation they would feed,
-/// `PdfWriter::write()` below would filter `/S1` and `/S2` at the requested
-/// decode level exactly like every other stream instead of forcing them raw,
-/// producing an `a.pdf` that differs from qpdf's real one for those two
-/// objects. Matching `run_test_20`'s precedent for a write whose
-/// faithfulness depends on a missing mutation, the writer is not invoked.
+/// `setFilterOnWrite(false)` forces `/S1` and `/S2` to retain their original
+/// bytes while the writer still applies its requested specialized decode
+/// policy to the other streams. This is the canonical ObjectHandle stream
+/// state, not a test-driver-only output shortcut.
 pub(crate) fn run_test_70<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -325,12 +315,14 @@ pub(crate) fn run_test_70<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
-    let _s1 = trailer.get_key(b"/S1");
-    let _s2 = trailer.get_key(b"/S2");
+    trailer.get_key(b"/S1").set_filter_on_write(false)?;
+    trailer.get_key(b"/S2").set_filter_on_write(false)?;
 
-    // GAP(QPDFObjectHandle::setFilterOnWrite): see this function's own doc
-    // above.
-    Ok(())
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_decode_level(DecodeLevel::Specialized);
+    writer.write()
 }
 
 /// qpdf source: `qpdf/test_driver.cc:2416-2457` (`test_71`).

@@ -3165,6 +3165,7 @@ mod tests {
             ]),
             stream_data: Some(std::rc::Rc::new(Vec::new())),
             stream_provider: None,
+            filter_on_write: true,
             stream_length: 0,
         });
         let skipped = BTreeSet::from([stream_ref]);

@@ -617,6 +617,7 @@ where
             stream_data: None,
             stream_length: 0,
             stream_provider: None,
+            filter_on_write: true,
         })
     }
 
