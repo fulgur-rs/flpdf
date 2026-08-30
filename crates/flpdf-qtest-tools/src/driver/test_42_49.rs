@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::{
-    Error, NameTree, NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper,
+    Error, Matrix, NameTree, NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper,
     PageDocumentHelper, PageLabelDocumentHelper, Pdf, PdfWriter, Rectangle,
 };
 
@@ -69,17 +69,19 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     {
         let items = array.try_array_items()?;
         let mut cursor = items.begin();
-        assert_eq!(cursor.current().try_get_name()?, b"/Item0");
+        let i_value = cursor.current();
+        assert_eq!(i_value.try_get_name()?, b"/Item0");
         cursor.previous();
-        assert_eq!(cursor.current().try_get_name()?, b"/Item0");
+        assert_eq!(i_value.try_get_name()?, b"/Item0");
         cursor.next();
         cursor.next();
         cursor.next();
         assert!(cursor.is_end());
         cursor.next();
         assert!(cursor.is_end());
-        assert!(!cursor.current().is_initialized());
+        assert!(!i_value.is_initialized());
         cursor.previous();
+        assert_eq!(i_value.try_get_name()?, b"/Item2");
         assert_eq!(cursor.current().try_get_name()?, b"/Item2");
     }
 
@@ -93,7 +95,7 @@ pub(crate) fn run_test_42<R: Read + Seek>(
         cursor.next();
         cursor.next();
         assert!(cursor.is_end());
-        assert!(!cursor.current().value.is_initialized());
+        assert!(!entry.value.is_initialized());
     }
 
     qtest.try_get_string_value()?;
@@ -246,6 +248,15 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     assert!(matrix_value.d > 7.79 && matrix_value.d < 7.81);
     assert!(matrix_value.e > 9.09 && matrix_value.e < 9.11);
     assert!(matrix_value.f > 2.29 && matrix_value.f < 2.31);
+    let qpdf_matrix = ObjectHandle::new_from_qpdf_matrix(Matrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3));
+    let qpdf_matrix_value = qpdf_matrix.try_get_array_as_matrix()?;
+    assert!(qpdf_matrix.try_is_matrix()?);
+    assert!(qpdf_matrix_value.a > 1.19 && qpdf_matrix_value.a < 1.21);
+    assert!(qpdf_matrix_value.b > 3.39 && qpdf_matrix_value.b < 3.41);
+    assert!(qpdf_matrix_value.c > 5.59 && qpdf_matrix_value.c < 5.61);
+    assert!(qpdf_matrix_value.d > 7.79 && qpdf_matrix_value.d < 7.81);
+    assert!(qpdf_matrix_value.e > 9.09 && qpdf_matrix_value.e < 9.11);
+    assert!(qpdf_matrix_value.f > 2.29 && qpdf_matrix_value.f < 2.31);
     for input in [
         b"[1 2 3 4 5]".as_slice(),
         b"[1 2 3 4 5 6 7]",
@@ -1078,9 +1089,54 @@ mod tests {
         .expect("run test 42");
         assert!(stdout.is_empty());
         let warning_text = String::from_utf8(stderr).expect("warnings are UTF-8");
-        assert!(warning_text.contains("operation for string attempted on object of type"));
-        assert!(warning_text.contains("returning null for out of bounds array access"));
-        assert!(warning_text.contains("ignoring attempt to append item"));
+        assert_eq!(
+            warning_text,
+            concat!(
+                "WARNING: operation for string attempted on object of type dictionary: returning empty string\n",
+                "WARNING: returning null for out of bounds array access\n",
+                "WARNING: returning null for out of bounds array access\n",
+                "WARNING: operation for array attempted on object of type integer: returning null\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to append item\n",
+                "WARNING: ignoring attempt to erase out of bounds array item\n",
+                "WARNING: ignoring attempt to erase out of bounds array item\n",
+                "WARNING: ignoring attempt to insert out of bounds array item\n",
+                "WARNING: ignoring attempt to set out of bounds array item\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to erase item\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to insert item\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to replace items\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to set item\n",
+                "WARNING: operation for array attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for array attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for boolean attempted on object of type integer: returning false\n",
+                "WARNING: operation for dictionary attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for dictionary attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for dictionary attempted on object of type integer: returning false for a key containment request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: ignoring key removal request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: ignoring key replacement request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: ignoring key replacement request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n",
+                "WARNING: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n",
+                "WARNING: operation for inlineimage attempted on object of type integer: returning empty data\n",
+                "WARNING: operation for integer attempted on object of type dictionary: returning 0\n",
+                "WARNING: operation for name attempted on object of type integer: returning dummy name\n",
+                "WARNING: operation for operator attempted on object of type integer: returning fake value\n",
+                "WARNING: operation for real attempted on object of type dictionary: returning 0.0\n",
+                "WARNING: operation for string attempted on object of type integer: returning empty string\n",
+                "WARNING: operation for string attempted on object of type integer: returning empty string\n",
+                "WARNING: operation for number attempted on object of type dictionary: returning 0\n",
+                "One error\n",
+                "WARNING: operation for string attempted on object of type name: returning empty string\n",
+                "One error\n",
+                "WARNING:  -> dictionary key /Quack: operation for string attempted on object of type null: returning empty string\n",
+                "WARNING:  -> dictionary key /Quack: operation for string attempted on object of type null: returning empty string\n",
+                "Two errors\n",
+                "WARNING: returning null for out of bounds array access\n",
+                "WARNING:  -> null returned from invalid array access: operation for string attempted on object of type null: returning empty string\n",
+                "One error\n",
+                "WARNING: operation for string attempted on object of type name: returning empty string\n",
+                "WARNING: , object 4 0 at offset 212 -> dictionary key /Potato: operation for name attempted on object of type null: returning dummy name\n",
+            )
+        );
         assert!(!warning_text.contains("test 42 done"));
 
         let mut pdf = minimal_pdf();
