@@ -455,6 +455,7 @@ struct Cli {
             "encrypt",
             "copy_encryption",
             "encryption_file_password",
+            "flatten_annotations",
             "output",
         ]
     )]
@@ -527,6 +528,7 @@ struct Cli {
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf", "coalesce_contents",
+              "flatten_annotations",
               "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
@@ -796,6 +798,25 @@ struct Cli {
               "linearize", "pages", "rotate", "split_pages", "empty",
           ])]
     coalesce_contents: bool,
+
+    /// Flatten annotations into page content (top-level alias of
+    /// `rewrite --flatten-annotations`; qpdf `--flatten-annotations`
+    /// equivalent). Values are `all`, `screen`, or `print`.
+    #[arg(
+        long = "flatten-annotations",
+        value_enum,
+        value_name = "MODE",
+        conflicts_with_all = [
+            "check", "show_object",
+            "show_npages", "show_pages", "show_xref", "show_linearization",
+            "show_encryption",
+            "list_attachments", "show_attachment", "remove_attachment",
+            "add_attachment", "copy_attachments_from",
+            "pages", "rotate", "split_pages", "empty",
+        ],
+        help = "Flatten annotations into page content; MODE is all, screen, or print"
+    )]
+    flatten_annotations: Option<CliFlattenMode>,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -2266,8 +2287,8 @@ fn main() {
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             false,                              // generate_appearances (not on top-level surface)
-            None,                               // flatten_annotations (not on top-level surface)
-            false,                              // flatten_rotation (not on top-level surface)
+            args.flatten_annotations,
+            false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
             args.verbose,
             options,
@@ -2428,8 +2449,8 @@ fn main() {
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             false,                              // generate_appearances (not on top-level surface)
-            None,                               // flatten_annotations (not on top-level surface)
-            false,                              // flatten_rotation (not on top-level surface)
+            args.flatten_annotations,
+            false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
             args.verbose,
             options,
@@ -2983,20 +3004,14 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
 
-            // --flatten-annotations / --generate-appearances / --flatten-rotation
-            // are applied only on run_rewrite's NON-linearize branch (the
-            // content-mutation passes do not exist on the linearize path). Pairing
-            // them with --linearize would silently drop the requested
-            // transformation, so reject the combination loudly instead — the same
-            // shape as the --linearize + page-ops guard below.
-            if cmd.linearize
-                && (cmd.generate_appearances
-                    || cmd.flatten_annotations.is_some()
-                    || cmd.flatten_rotation)
-            {
+            // --generate-appearances / --flatten-rotation remain unsupported
+            // on the linearize path, but flattenAnnotations is applied by
+            // qpdf before its linearized writer and is handled by the shared
+            // run_rewrite route below.
+            if cmd.linearize && (cmd.generate_appearances || cmd.flatten_rotation) {
                 eprintln!(
                     "flpdf: --linearize cannot be combined with \
-                     --flatten-annotations/--generate-appearances/--flatten-rotation"
+                     --generate-appearances/--flatten-rotation"
                 );
                 std::process::exit(1);
             }
@@ -3741,6 +3756,11 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let mut options = options;
         if decrypt || remove_restrictions {
             options.preserve_encryption = false;
+        }
+        if let Some(mode) = flatten_annotations_mode {
+            let (required_flags, forbidden_flags) = mode.flags();
+            PageDocumentHelper::new(&mut pdf)
+                .flatten_annotations(required_flags, forbidden_flags)?;
         }
         // Apply content normalization before the writer plans and emits the
         // linearized document.

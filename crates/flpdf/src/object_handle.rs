@@ -6231,8 +6231,12 @@ impl ObjectHandle {
         for filter in plan.filters.iter_mut().rev() {
             let warning_handle = self.clone();
             let warning_delivery_error = Rc::clone(&warning_delivery_error);
+            let suppress_filter_warnings = suppress_warnings;
             filter.set_warning_callback(Box::new(move |message, _code| {
-                match warning_handle.object_warning(message) {
+                if suppress_filter_warnings {
+                    return Ok(());
+                }
+                match warning_handle.stream_data_warning(message) {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         let error_message = error.to_string();
@@ -14095,7 +14099,7 @@ mod mutation_tests {
     }
 
     #[test]
-    fn pipe_stream_data_reports_flate_warnings_through_the_object_sink() {
+    fn pipe_stream_data_reports_flate_warnings_through_stream_data_sink() {
         let raw = vec![0x78];
         let resolver = Rc::new(SourcePipeResolver {
             value: ObjectValue::Stream {
@@ -14138,7 +14142,7 @@ mod mutation_tests {
         assert!(sink.take_buffer().unwrap().is_empty());
         assert_eq!(
             resolver.warnings.borrow().as_slice(),
-            &["object 20 0: input stream is complete but output may still be valid"]
+            &["offset 9: input stream is complete but output may still be valid"]
         );
     }
 

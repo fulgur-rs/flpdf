@@ -502,6 +502,16 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
     forbidden_flags: i64,
 ) -> Result<()> {
     let need_appearances = acroform_need_appearances(pdf)?;
+    if need_appearances {
+        // qpdf warns on the catalog's /AcroForm handle before skipping its
+        // Widget annotations (`QPDFPageDocumentHelper.cc:55-64`). Keep the
+        // object description on the warning so the job records the same
+        // recoverable condition and returns qpdf's warning status.
+        let root = pdf.root_handle()?;
+        root.try_get_key(b"/AcroForm")?.warn_if_possible(
+            "document does not have updated appearance streams, so form fields will not be flattened",
+        )?;
+    }
     let default_resources = acroform_default_resources(pdf)?;
     // qpdf resolves the Widget's field helper from one cached
     // AcroFormDocumentHelper analysis before asking it for `/DR`. Build the
