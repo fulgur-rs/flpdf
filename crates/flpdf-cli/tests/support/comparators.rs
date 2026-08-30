@@ -456,7 +456,7 @@ impl Comparator for QpdfJsonComparator {
             }
         };
 
-        let qpdf_json = match run_qpdf_json(qpdf_bytes, "qpdf-side.pdf", &tmp) {
+        let qpdf_json = match run_qpdf_json(qpdf_bytes, "qpdf-side.pdf", &tmp, None) {
             Ok(j) => j,
             Err(e) => {
                 return ComparatorResult::Skipped {
@@ -465,7 +465,7 @@ impl Comparator for QpdfJsonComparator {
             }
         };
 
-        let flpdf_json = match run_qpdf_json(flpdf_bytes, "flpdf-side.pdf", &tmp) {
+        let flpdf_json = match run_qpdf_json(flpdf_bytes, "flpdf-side.pdf", &tmp, None) {
             Ok(j) => j,
             Err(e) => {
                 return ComparatorResult::Skipped {
@@ -482,13 +482,25 @@ impl Comparator for QpdfJsonComparator {
 }
 
 /// Run `qpdf --json=2 <file>` on the given byte slice (written to `tmp/<name>`).
-/// Returns parsed `JsonValue` on success, or an error string.
-fn run_qpdf_json(bytes: &[u8], file_name: &str, tmp: &TempDir) -> Result<JsonValue, String> {
+/// `stream_data_mode`, when given, is passed as `--json-stream-data=<mode>`
+/// (e.g. `"inline"` to embed base64-encoded stream payloads in the
+/// projection instead of qpdf's default `none`). Returns parsed `JsonValue`
+/// on success, or an error string.
+fn run_qpdf_json(
+    bytes: &[u8],
+    file_name: &str,
+    tmp: &TempDir,
+    stream_data_mode: Option<&str>,
+) -> Result<JsonValue, String> {
     let pdf_path = tmp.path().join(file_name);
     std::fs::write(&pdf_path, bytes).map_err(|e| format!("write failed: {e}"))?;
 
-    let result = ShellCommand::new("qpdf")
-        .arg("--json=2")
+    let mut command = ShellCommand::new("qpdf");
+    command.arg("--json=2");
+    if let Some(mode) = stream_data_mode {
+        command.arg(format!("--json-stream-data={mode}"));
+    }
+    let result = command
         .arg(&pdf_path)
         .output()
         .map_err(|e| format!("spawn qpdf: {e}"))?;
@@ -509,12 +521,15 @@ fn run_qpdf_json(bytes: &[u8], file_name: &str, tmp: &TempDir) -> Result<JsonVal
 // StructuralComparator
 // ---------------------------------------------------------------------------
 
-/// Compares the two outputs through qpdf's canonical JSON object projection.
+/// Compares the two outputs through qpdf's canonical JSON object projection,
+/// with inline stream payloads so content corruption is not masked by
+/// [`QpdfJsonComparator`]'s default `--json-stream-data=none` projection.
 ///
 /// The former implementation reconstructed a second raw `Object` tree inside
 /// the test harness. That duplicated the library's removed object model and
 /// could disagree with qpdf about lazy references; qpdf JSON already supplies
-/// the semantic projection needed by this comparator.
+/// the semantic projection needed by this comparator, and requesting inline
+/// stream data folds the old decoded-payload check into the same JSON diff.
 pub struct StructuralComparator;
 
 impl Comparator for StructuralComparator {
@@ -523,7 +538,62 @@ impl Comparator for StructuralComparator {
     }
 
     fn compare(&self, outputs: &RunOutputs) -> ComparatorResult {
-        QpdfJsonComparator.compare(outputs)
+        let (Some(qpdf_bytes), Some(flpdf_bytes)) = (
+            outputs.qpdf.output_bytes.as_ref(),
+            outputs.flpdf.output_bytes.as_ref(),
+        ) else {
+            let reason =
+                if outputs.qpdf.output_bytes.is_none() && outputs.flpdf.output_bytes.is_none() {
+                    "both tools produced no output".to_string()
+                } else if outputs.qpdf.output_bytes.is_none() {
+                    "qpdf produced no output".to_string()
+                } else {
+                    "flpdf produced no output".to_string()
+                };
+            return ComparatorResult::Skipped { reason };
+        };
+
+        if !is_qpdf_available() {
+            return ComparatorResult::Skipped {
+                reason: "qpdf not available".to_string(),
+            };
+        }
+
+        let tmp = match tempfile::tempdir() {
+            Ok(t) => t,
+            Err(e) => {
+                return ComparatorResult::Skipped {
+                    reason: format!("failed to create tempdir: {e}"),
+                }
+            }
+        };
+
+        let qpdf_json = match run_qpdf_json(qpdf_bytes, "qpdf-side.pdf", &tmp, Some("inline")) {
+            Ok(j) => j,
+            Err(e) => {
+                return ComparatorResult::Skipped {
+                    reason: format!(
+                        "qpdf --json=2 --json-stream-data=inline failed on qpdf side: {e}"
+                    ),
+                }
+            }
+        };
+
+        let flpdf_json = match run_qpdf_json(flpdf_bytes, "flpdf-side.pdf", &tmp, Some("inline")) {
+            Ok(j) => j,
+            Err(e) => {
+                return ComparatorResult::Skipped {
+                    reason: format!(
+                        "qpdf --json=2 --json-stream-data=inline failed on flpdf side: {e}"
+                    ),
+                }
+            }
+        };
+
+        match compare_json("", &qpdf_json, &flpdf_json) {
+            Ok(()) => ComparatorResult::Match,
+            Err(reason) => ComparatorResult::Diverge { reason },
+        }
     }
 }
 
@@ -672,6 +742,81 @@ mod tests {
                 );
             }
             other => panic!("expected Diverge, got {other:?}"),
+        }
+    }
+
+    /// A minimal, xref-valid one-page PDF with a single uncompressed
+    /// content-stream object, otherwise structurally identical regardless
+    /// of `content`. A correct xref table (rather than relying on qpdf's
+    /// reconstruction fallback) keeps `run_qpdf_json` seeing a clean qpdf
+    /// exit code instead of the "warnings" status a repaired file produces.
+    fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(4);
+
+        offsets.push(out.len());
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offsets.push(out.len());
+        out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>\nendobj\n");
+
+        offsets.push(out.len());
+        out.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 100 100 ] /Contents 4 0 R >>\nendobj\n",
+        );
+
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        out.extend_from_slice(content);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = out.len();
+        out.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    #[test]
+    fn structural_detects_stream_payload_corruption_that_json_structure_hides() {
+        // Both PDFs have byte-identical structure (same dictionaries, same
+        // keys, same /Length) and differ only in the content-stream bytes.
+        // qpdf's default `--json-stream-data=none` omits stream payloads
+        // entirely, so QpdfJsonComparator alone would report Match here;
+        // StructuralComparator must request inline stream data to catch it.
+        let qpdf_bytes = one_page_pdf_with_content(b"1 0 0 RG 0 0 50 50 re S");
+        let flpdf_bytes = one_page_pdf_with_content(b"0 1 0 RG 0 0 50 50 re S");
+        let outputs = make_outputs(Some(qpdf_bytes), Some(flpdf_bytes));
+
+        if !is_qpdf_available() {
+            return;
+        }
+
+        let json_result = QpdfJsonComparator.compare(&outputs);
+        assert_eq!(
+            json_result,
+            ComparatorResult::Match,
+            "qpdf-json (stream data omitted) is expected to miss this corruption"
+        );
+
+        let structural_result = StructuralComparator.compare(&outputs);
+        match &structural_result {
+            ComparatorResult::Diverge { reason } => {
+                assert!(
+                    reason.contains("stream"),
+                    "expected a stream-payload divergence, got: {reason}"
+                );
+            }
+            other => {
+                panic!("structural comparator must catch stream content corruption, got {other:?}")
+            }
         }
     }
 
