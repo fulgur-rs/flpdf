@@ -459,20 +459,39 @@ impl BootstrapHandleDocument {
             description,
         };
         let pending = parse_file_object_handle_syntax(input, &mut parser)?;
-        let resolved_length =
-            pending
-                .indirect_length_ref()
-                .map(|object_ref| match self.resolve_length(object_ref) {
-                    Some(value) => ResolvedStreamLength::Integer(value),
-                    None => ResolvedStreamLength::Missing,
-                });
+        let resolved_length = pending
+            .indirect_length_ref()
+            .map(|object_ref| self.resolve_length(object_ref));
         let _ = (absolute_offset, description);
         finish_file_object_handle(input, pending, resolved_length, policy)
     }
 
-    fn resolve_length(&self, object_ref: ObjectRef) -> Option<i64> {
+    // Mirrors qpdf's own three-way `/Length` classification (an integer, a
+    // resolved null, or anything else) rather than collapsing "resolved but
+    // not an integer" into the same Missing case as "genuinely absent" --
+    // the raw parser's own `resolve_stream_length` (this file, further down)
+    // keeps the same three-way split and must report the same
+    // "/Length key in stream dictionary is not an integer" diagnostic for a
+    // hybrid xref stream whose /Length resolves through the active classic
+    // table to a non-integer object.
+    fn resolve_length(&self, object_ref: ObjectRef) -> ResolvedStreamLength {
         let handle = self.handle_for_reference(object_ref);
-        handle.try_as_integer().ok().flatten()
+        match handle.try_as_integer() {
+            Ok(Some(value)) => ResolvedStreamLength::Integer(value),
+            Ok(None) => {
+                if handle.try_is_null().unwrap_or(true) {
+                    ResolvedStreamLength::Missing
+                } else {
+                    ResolvedStreamLength::Invalid
+                }
+            }
+            // `resolve_indirect` above catches every resolution failure and
+            // falls back to a warned Null rather than propagating Err, so
+            // try_as_integer never actually returns Err for a handle from
+            // this resolver; kept only for symmetry with the general
+            // ObjectHandle contract, matching the prior `.ok()` fallback.
+            Err(_) => ResolvedStreamLength::Missing, // cov:ignore: this resolver's resolve_indirect never propagates Err
+        }
     }
 
     fn read_uncompressed_object(
@@ -3124,8 +3143,19 @@ fn parse_xref_stream(
         let object = handle_object
             .materialize()
             .map_err(|error| error.rebase_offset(xref_pos))?;
+        // Push through `context.diagnostics` -- not directly into
+        // `repair_diagnostics` -- so these framing diagnostics land AFTER
+        // whatever `read_file_object_handle`'s own `sync_handle_diagnostics`
+        // call already synced there (for example a warning raised while
+        // resolving this stream's indirect `/Length` target, which runs
+        // before `finish_file_object_handle` produces these diagnostics).
+        // `context.append_diagnostics_to` below drains `context.diagnostics`
+        // into `repair_diagnostics` in that same, qpdf-matching temporal
+        // order; pushing straight into `repair_diagnostics` here would
+        // report the recovery notice before the resolution warning that
+        // caused it.
         for diagnostic in &handle_completed.diagnostics {
-            repair_diagnostics.push(xref_file_object_diagnostic(
+            context.diagnostics.push(xref_file_object_diagnostic(
                 XrefObjectDescription::XrefStream,
                 object_ref,
                 xref_pos as u64,

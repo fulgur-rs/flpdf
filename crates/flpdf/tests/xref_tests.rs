@@ -285,6 +285,158 @@ fn hybrid_xref_stream_resolves_indirect_length_from_active_classic_table() {
 }
 
 #[test]
+fn hybrid_xref_stream_reports_invalid_not_missing_for_a_non_integer_indirect_length() {
+    // Same fixture shape as `hybrid_xref_stream_resolves_indirect_length_from_active_classic_table`,
+    // but the /Length target resolves to a name instead of an integer. qpdf's
+    // resolved-Length classification distinguishes a resolved-but-wrong-type
+    // value ("/Length key in stream dictionary is not an integer") from a
+    // genuinely missing/null target ("stream dictionary lacks /Length key");
+    // both routes must report the former here, not collapse into the latter.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_header =
+        "2 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 2] /Index [0 6] /Length 5 0 R >>\nstream\n"
+            .to_string();
+    let xref_stream_suffix = b"\nendstream\nendobj\n";
+    let length_target_offset = xref_stream_offset
+        + xref_stream_header.len() as u64
+        + (6 * 7) as u64
+        + xref_stream_suffix.len() as u64;
+    let xref_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (1, length_target_offset, 0),
+    ]);
+    bytes.extend_from_slice(xref_stream_header.as_bytes());
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(xref_stream_suffix);
+    assert_eq!(bytes.len() as u64, length_target_offset);
+    bytes.extend_from_slice(b"5 0 obj\n/NotAnInteger\nendobj\n");
+
+    let classic_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 6\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(format!("{length_target_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{classic_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("hybrid xref stream should recover from an invalid /Length");
+    assert!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("/Length key in stream dictionary is not an integer")),
+        "expected an Invalid-Length diagnostic, got: {:?}",
+        loaded.repair_diagnostics.entries()
+    );
+    assert!(
+        !loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("stream dictionary lacks /Length key")),
+        "a resolved non-integer /Length must not be reported as missing: {:?}",
+        loaded.repair_diagnostics.entries()
+    );
+}
+
+#[test]
+fn hybrid_xref_stream_reports_length_target_recovery_before_its_own_missing_length_notice() {
+    // Same fixture shape as `hybrid_xref_stream_resolves_indirect_length_from_active_classic_table`,
+    // but the /Length target (object 5) is itself an empty object -- qpdf
+    // recovers an empty indirect object as null (`empty object treated as
+    // null`) while resolving it, which happens strictly before the xref
+    // stream's own framing decides the resolved value is unusable and
+    // records its own recovery diagnostics. The resolution warning (the
+    // cause) must be reported before the xref stream's own recovery notices
+    // (the effect), not after.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_header =
+        "2 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 2] /Index [0 6] /Length 5 0 R >>\nstream\n"
+            .to_string();
+    let xref_stream_suffix = b"\nendstream\nendobj\n";
+    let length_target_offset = xref_stream_offset
+        + xref_stream_header.len() as u64
+        + (6 * 7) as u64
+        + xref_stream_suffix.len() as u64;
+    let xref_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (1, length_target_offset, 0),
+    ]);
+    bytes.extend_from_slice(xref_stream_header.as_bytes());
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(xref_stream_suffix);
+    assert_eq!(bytes.len() as u64, length_target_offset);
+    bytes.extend_from_slice(b"5 0 obj\nendobj\n");
+
+    let classic_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 6\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(format!("{length_target_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{classic_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("hybrid xref stream should recover from an empty /Length target");
+    let messages: Vec<&str> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    let empty_object_index = messages
+        .iter()
+        .position(|message| message.contains("empty object treated as null"))
+        .expect("length target recovery diagnostic must be present");
+    let missing_length_index = messages
+        .iter()
+        .position(|message| message.contains("stream dictionary lacks /Length key"))
+        .expect("xref stream's own missing-length diagnostic must be present");
+    assert!(
+        empty_object_index < missing_length_index,
+        "the /Length target's own resolution warning (the cause) must be \
+         reported before the xref stream's missing-length notice (the \
+         effect), got: {messages:?}"
+    );
+}
+
+#[test]
 fn xref_stream_direct_length_accepts_payload_adjacent_endstream_without_diagnostics() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let xref_offset = bytes.len();
