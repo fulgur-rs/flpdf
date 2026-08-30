@@ -11741,6 +11741,43 @@ mod unparse_tests {
 
         assert_eq!(dictionary.unparse_resolved(), b"<< #A 1 >>");
     }
+
+    #[test]
+    fn unparse_resolved_falls_back_but_try_unparse_resolved_reports_unresolved_values() {
+        let handle = ObjectHandle::from_value(ObjectValue::Unresolved);
+
+        assert_eq!(handle.unparse_resolved(), b"null");
+        assert_eq!(
+            handle
+                .try_unparse_resolved()
+                .expect_err("strict qpdf unparse must reject unresolved values")
+                .to_string(),
+            "attempted to unparse an unresolved QPDFObjectHandle"
+        );
+    }
+
+    #[test]
+    fn unparse_resolved_uses_the_canonical_form_for_an_unsafe_real_literal() {
+        let handle = ObjectHandle::real_literal(0.4, b"not-a-real".to_vec());
+
+        assert_eq!(handle.unparse_resolved(), b"0.4");
+    }
+
+    #[test]
+    fn try_unparse_resolved_reports_missing_original_data_for_a_direct_stream() {
+        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_provider: None,
+            stream_length: 0,
+        });
+
+        assert!(handle
+            .try_unparse_resolved()
+            .expect_err("a direct original stream has no source")
+            .to_string()
+            .contains("pipeStreamData called for original direct stream"));
+    }
 }
 
 #[cfg(test)]

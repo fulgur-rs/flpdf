@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn indirect_array_children_remain_opaque_during_compare() {
+    fn indirect_array_children_resolve_but_remain_reference_opaque_during_compare() {
         let mut actual_pdf = dummy_pdf();
         let mut expected_pdf = dummy_pdf();
         let actual_missing = actual_pdf.get_object_handle(ObjectRef::new(99, 0));
@@ -389,7 +389,9 @@ mod tests {
             .unwrap(),
             "array: object contents differ"
         );
-        assert!(!actual_missing.is_resolved() && !expected_missing.is_resolved());
+        assert!(actual_missing.is_resolved() && expected_missing.is_resolved());
+        assert_eq!(actual_missing.unparse(), b"99 0 R");
+        assert_eq!(expected_missing.unparse(), b"100 0 R");
     }
 
     #[test]
