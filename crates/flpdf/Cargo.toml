@@ -33,7 +33,7 @@ same-file.workspace = true
 # update -p ar_archive_writer --precise 0.5.2` succeeds without this line).
 ar_archive_writer.workspace = true
 libjpeg-turbo-rs.workspace = true
-flpdf-libjpeg-compat = { path = "../flpdf-libjpeg-compat", version = "0.4.0", optional = true }
+flpdf-libjpeg-compat = { path = "../flpdf-libjpeg-compat", version = "0.5.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_SystemInformation", "Win32_System_Time"] }
