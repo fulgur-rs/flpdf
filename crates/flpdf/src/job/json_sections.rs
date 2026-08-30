@@ -7,9 +7,11 @@
 
 use crate::json::Json;
 use crate::json_inspect::{
-    json_array, json_dictionary, pdf_dest_to_json, pdf_object_to_json, ConvertError,
+    json_array, json_dictionary, pdf_dest_to_json_with_version, pdf_object_to_json_with_version,
+    ConvertError, DecodeLevel,
 };
 use crate::object_handle::ObjectHandle;
+use crate::pipeline::Discard;
 use crate::{EmbeddedFileStream, FileSpec, ObjectRef, PageObjectHelper, Pdf};
 use std::io::{Read, Seek};
 
@@ -84,6 +86,7 @@ pub(crate) fn collect_content_refs<R: Read + Seek>(
 /// `"N M R"` (the *original* reference string) to the result. Entries that
 /// are direct inline Streams (no ref number) are skipped. The output is
 /// sorted by XObject name (alphabetical byte-lex order).
+#[cfg(test)]
 pub(crate) fn collect_image_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: crate::ObjectRef,
@@ -123,6 +126,99 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
     Ok(image_refs)
 }
 
+fn image_to_json<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    name: &[u8],
+    image: &ObjectHandle,
+    version: i32,
+    decode_level: DecodeLevel,
+) -> Result<Json, ConvertError> {
+    let image = image.clone();
+    pdf.resolve(&image)?;
+    let stream_dict = image
+        .as_stream_dict()
+        .and_then(|dict| dict.as_dictionary())
+        .ok_or_else(|| ConvertError::PdfError("image XObject is not a stream".to_owned()))?;
+
+    let value_for = |key: &[u8]| {
+        stream_dict
+            .get(key)
+            .cloned()
+            .unwrap_or_else(ObjectHandle::null)
+    };
+    let filter = value_for(b"/Filter");
+    pdf.resolve(&filter)?;
+    let filter_count = filter.as_array().map_or(1, |items| items.len());
+    let filter = if filter.as_array().is_some() {
+        pdf_object_to_json_with_version(&filter, version)?
+    } else {
+        json_array([pdf_object_to_json_with_version(&filter, version)?])?
+    };
+
+    let decode_parms = value_for(b"/DecodeParms");
+    pdf.resolve(&decode_parms)?;
+    let decode_parms = if decode_parms.as_array().is_some() {
+        pdf_object_to_json_with_version(&decode_parms, version)?
+    } else {
+        json_array(
+            (0..filter_count)
+                .map(|_| pdf_object_to_json_with_version(&decode_parms, version))
+                .collect::<Result<Vec<_>, _>>()?,
+        )? // cov:ignore: llvm-cov attributes this successful decode-parameter conversion to its mapping expressions
+    };
+
+    // `QPDFJob::doJSONPages` asks the image stream whether the selected decode
+    // level can filter it without emitting payload bytes. Discard preserves
+    // that check's side-effect boundary while avoiding a second JSON stream
+    // serializer (`QPDFJob.cc:1056-1071`).
+    let mut discard = Discard;
+    let mut filtering_attempted = false;
+    let filterable = image.pipe_stream_data(
+        &mut discard,
+        &mut filtering_attempted,
+        0,
+        stream_decode_level(decode_level),
+        true,
+        false,
+    )?; // cov:ignore: llvm-cov attributes the successful stream probe to its opening call lines
+
+    json_dictionary([
+        (
+            "bitspercomponent",
+            pdf_object_to_json_with_version(&value_for(b"/BitsPerComponent"), version)?,
+        ),
+        (
+            "colorspace",
+            pdf_object_to_json_with_version(&value_for(b"/ColorSpace"), version)?,
+        ),
+        ("decodeparms", decode_parms),
+        ("filter", filter),
+        (
+            "filterable",
+            Json::make_bool(filterable && filtering_attempted),
+        ),
+        (
+            "height",
+            pdf_object_to_json_with_version(&value_for(b"/Height"), version)?,
+        ),
+        ("name", Json::make_string(name)),
+        ("object", pdf_object_to_json_with_version(&image, version)?),
+        (
+            "width",
+            pdf_object_to_json_with_version(&value_for(b"/Width"), version)?,
+        ),
+    ])
+}
+
+fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {
+    match level {
+        DecodeLevel::None => crate::writer::DecodeLevel::None,
+        DecodeLevel::Generalized => crate::writer::DecodeLevel::Generalized,
+        DecodeLevel::Specialized => crate::writer::DecodeLevel::Specialized,
+        DecodeLevel::All => crate::writer::DecodeLevel::All,
+    }
+}
+
 /// Build the qpdf JSON v2 `"pages"` section.
 ///
 /// Returns a [`Json`] array where each element is a JSON object with
@@ -136,10 +232,83 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
 ///
 /// Returns a [`ConvertError`] if the page tree cannot be traversed or any
 /// object resolution fails.
+#[cfg(test)]
 pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    build_pages_section_with_version(pdf, 2)
+}
+
+#[cfg(test)]
+pub(crate) fn build_pages_section_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+) -> Result<Json, ConvertError> {
+    build_pages_section_with_options(pdf, version, DecodeLevel::Generalized)
+}
+
+pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+    decode_level: DecodeLevel,
+) -> Result<Json, ConvertError> {
     let page_refs = {
         let mut page_document = crate::PageDocumentHelper::new(pdf);
         page_document.get_all_pages()?
+    };
+
+    // qpdf constructs the page-label and outline helpers once for the whole
+    // page walk (`QPDFJob.cc:1035-1087`). Materialize those per-page values
+    // before the output loop so the mutable Pdf borrow is sequenced rather
+    // than replaced with independent, potentially divergent helper walks.
+    let labels = {
+        let mut helper = pdf.page_labels();
+        page_refs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                helper
+                    .get_label_for_page(index as i64)
+                    .map_err(ConvertError::from)
+                    .and_then(|label| {
+                        label
+                            .as_ref()
+                            .map(|label| pdf_object_to_json_with_version(label, version))
+                            .transpose()
+                            .map(|label| label.unwrap_or_else(Json::make_null))
+                    })
+            })
+            .collect::<Result<Vec<_>, ConvertError>>()?
+    };
+    let outlines = {
+        let mut helper = pdf.outline();
+        let tree = helper.get_tree().map_err(ConvertError::from)?;
+        let mut by_page = std::collections::BTreeMap::new();
+        for &page_ref in &page_refs {
+            let ids = tree
+                .get_outlines_for_page(&mut helper, Some(page_ref))
+                .map_err(ConvertError::from)?
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            let mut page_entries = Vec::with_capacity(ids.len());
+            for id in ids {
+                let item = &tree[id];
+                let object = match item.source_ref {
+                    Some(reference) => Json::make_string(reference.to_string()),
+                    None => pdf_object_to_json_with_version(&item.object, version)?,
+                };
+                let title = item.get_title(&mut helper).map_err(ConvertError::from)?;
+                let dest = pdf_dest_to_json_with_version(
+                    &item.get_dest(&mut helper).map_err(ConvertError::from)?,
+                    version,
+                )?; // cov:ignore: llvm-cov attributes this successful destination conversion to its opening call lines
+                page_entries.push(json_dictionary([
+                    ("dest".to_string(), dest),
+                    ("object".to_string(), object),
+                    ("title".to_string(), Json::make_string(title)),
+                ])?);
+            }
+            by_page.insert(page_ref, json_array(page_entries)?);
+        }
+        by_page
     };
 
     let mut entries: Vec<Json> = Vec::with_capacity(page_refs.len());
@@ -161,22 +330,36 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
             None => vec![],
         };
 
-        // Collect image XObject refs from (inherited) Resources.
-        let images: Vec<Json> = collect_image_refs(pdf, page_ref)?
+        // qpdf emits a complete image descriptor for every direct image
+        // XObject (`QPDFJob.cc:1043-1071`), not just its object reference.
+        // Keep the page helper's resource-name order and build each descriptor
+        // from the live stream dictionary.
+        let image_handles = {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            page.get_images()?
+        };
+        let images: Vec<Json> = image_handles
             .into_iter()
-            .map(Json::make_string)
-            .collect();
+            .map(|(name, image)| image_to_json(pdf, &name, &image, version, decode_level))
+            .collect::<Result<Vec<_>, ConvertError>>()?;
 
         // Build page entry with keys in strict alphabetical order:
         // contents < images < label < object < outlines < pageposfrom1
         let entry = json_dictionary([
             ("contents".to_string(), json_array(contents)?),
             ("images".to_string(), json_array(images)?),
-            // placeholder until flpdf-9hc.11.5 (page labels)
-            ("label".to_string(), Json::make_null()),
+            (
+                "label".to_string(),
+                labels[pageposfrom1 as usize - 1].clone(),
+            ),
             ("object".to_string(), Json::make_string(object_str)),
-            // placeholder until flpdf-9hc.11.6 (outline back-references)
-            ("outlines".to_string(), Json::make_array()),
+            (
+                "outlines".to_string(),
+                outlines
+                    .get(&page_ref)
+                    .cloned()
+                    .unwrap_or_else(Json::make_array),
+            ),
             ("pageposfrom1".to_string(), Json::make_int(pageposfrom1)),
         ]);
         entries.push(entry?);
@@ -201,7 +384,15 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
 /// `getFieldForAnnotation` (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-232`),
 /// `QPDFFormFieldObjectHelper` (`libqpdf/QPDFFormFieldObjectHelper.cc:29-285`),
 /// and `QPDFAnnotationObjectHelper` (`libqpdf/QPDFAnnotationObjectHelper.cc:13-47`).
+#[cfg(test)]
 pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    build_acroform_section_with_version(pdf, 2)
+}
+
+pub(crate) fn build_acroform_section_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+) -> Result<Json, ConvertError> {
     // qpdf's page helper repairs and snapshots the page list before the
     // AcroForm helper starts its cached annotation-to-field analysis. Rust's
     // mutable borrow rules require the same sequencing explicitly.
@@ -231,7 +422,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
 
     let fields = Json::make_array();
     for (pageposfrom1, field, annotation) in widgets {
-        let parent = pdf_object_to_json(&field.try_get_key(b"/Parent")?)?;
+        let parent = pdf_object_to_json_with_version(&field.try_get_key(b"/Parent")?, version)?;
 
         let (
             fieldtype,
@@ -286,12 +477,12 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
 
         let value = value
             .as_ref()
-            .map(pdf_object_to_json)
+            .map(|value| pdf_object_to_json_with_version(value, version))
             .transpose()?
             .unwrap_or_else(Json::make_null);
         let defaultvalue = defaultvalue
             .as_ref()
-            .map(pdf_object_to_json)
+            .map(|value| pdf_object_to_json_with_version(value, version))
             .transpose()?
             .unwrap_or_else(Json::make_null);
 
@@ -310,13 +501,16 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
             appearancestate.insert(0, b'/');
         }
         let annotation = json_dictionary([
-            ("object", pdf_object_to_json(&annotation)?),
+            (
+                "object",
+                pdf_object_to_json_with_version(&annotation, version)?,
+            ),
             ("appearancestate", Json::make_string(&appearancestate)),
             ("annotationflags", Json::make_int(annotationflags)),
         ])?; // cov:ignore: fixed annotation schema keys cannot trigger JsonError
 
         let field = json_dictionary([
-            ("object", pdf_object_to_json(&field)?),
+            ("object", pdf_object_to_json_with_version(&field, version)?),
             ("parent", parent),
             ("pageposfrom1", Json::make_int(pageposfrom1)),
             ("fieldtype", Json::make_string(fieldtype)),
@@ -362,7 +556,15 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails during tree walk.
+#[cfg(test)]
 pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    build_pagelabels_section_with_version(pdf, 2)
+}
+
+pub(crate) fn build_pagelabels_section_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+) -> Result<Json, ConvertError> {
     // qpdf's doJSONPageLabels obtains the full page list before checking
     // whether /PageLabels exists. Preserve both that validation side effect
     // and the observable everCalledGetAllPages metadata state.
@@ -397,7 +599,7 @@ pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json
     let result: Result<Vec<Json>, ConvertError> = entries
         .into_iter()
         .map(|(idx, label)| {
-            let label_json = pdf_object_to_json(&label)?;
+            let label_json = pdf_object_to_json_with_version(&label, version)?;
             json_dictionary([
                 ("index".to_string(), Json::make_int(idx)),
                 ("label".to_string(), label_json),
@@ -416,6 +618,7 @@ fn outline_item_to_json<R: Read + Seek>(
     id: crate::OutlineId,
     page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
     helper: &mut crate::OutlineDocumentHelper<'_, R>,
+    version: i32,
 ) -> Result<Json, ConvertError> {
     let item = &tree[id];
     // qpdf's QPDFJob::addOutlinesToJson computes the object first, then these
@@ -424,10 +627,10 @@ fn outline_item_to_json<R: Read + Seek>(
     // JSON dictionary serializer later sorts the keys.
     let object = match item.source_ref {
         Some(reference) => Json::make_string(reference.to_string()),
-        None => pdf_object_to_json(&item.object)?,
+        None => pdf_object_to_json_with_version(&item.object, version)?,
     };
     let title = item.get_title(helper)?;
-    let dest = pdf_dest_to_json(&item.get_dest(helper)?)?;
+    let dest = pdf_dest_to_json_with_version(&item.get_dest(helper)?, version)?;
     let count = item.get_count(helper)?;
     let destpageposfrom1 = item
         .get_dest_page(helper)?
@@ -437,7 +640,13 @@ fn outline_item_to_json<R: Read + Seek>(
         .unwrap_or_else(Json::make_null);
     let mut kids = Vec::with_capacity(item.kids.len());
     for kid in item.kids.iter().copied() {
-        kids.push(outline_item_to_json(tree, kid, page_numbers, helper)?);
+        kids.push(outline_item_to_json(
+            tree,
+            kid,
+            page_numbers,
+            helper,
+            version,
+        )?); // cov:ignore: llvm-cov attributes this successful recursive conversion to its opening call lines
     }
 
     json_dictionary([
@@ -463,7 +672,15 @@ fn outline_item_to_json<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
+#[cfg(test)]
 pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    build_outlines_section_with_version(pdf, 2)
+}
+
+pub(crate) fn build_outlines_section_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+) -> Result<Json, ConvertError> {
     let page_numbers = {
         let mut page_document = crate::PageDocumentHelper::new(pdf);
         page_document
@@ -477,7 +694,13 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     let tree = helper.get_tree()?;
     let mut entries = Vec::with_capacity(tree.roots().len());
     for id in tree.roots().to_vec() {
-        entries.push(outline_item_to_json(&tree, id, &page_numbers, &mut helper)?);
+        entries.push(outline_item_to_json(
+            &tree,
+            id,
+            &page_numbers,
+            &mut helper,
+            version,
+        )?);
     }
     json_array(entries)
 }
@@ -733,7 +956,15 @@ fn filespec_handle_to_json<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
+#[cfg(test)]
 pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    build_attachments_section_with_version(pdf, 2)
+}
+
+pub(crate) fn build_attachments_section_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    _version: i32,
+) -> Result<Json, ConvertError> {
     // qpdf's doJSONAttachments delegates name-tree traversal to
     // QPDFEmbeddedFileDocumentHelper::getEmbeddedFiles
     // (`QPDFJob.cc:1281-1330`). The helper returns live Filespec handles for
@@ -870,7 +1101,7 @@ fn dict_name_str<R: Read + Seek>(
 /// `p_raw` is the signed /P value. Per ISO 32000-1 §7.6.3.2 the bits are
 /// tested after casting to u32 so that negative values (like -4) behave as
 /// the expected all-bits-set value.
-fn capabilities_from_p(p_raw: i32) -> Vec<(String, Json)> {
+fn capabilities_from_p(p_raw: i32, version: i32) -> Vec<(String, Json)> {
     let p = p_raw as u32;
     // All nine capabilities in alphabetical order (qpdf schema).
     let accessibility = (p & 0x0200) != 0;
@@ -884,12 +1115,17 @@ fn capabilities_from_p(p_raw: i32) -> Vec<(String, Json)> {
     let printhigh = (p & 0x0800) != 0;
     let printlow = (p & 0x0004) != 0;
 
+    let modify_annotations_key = if version == 1 {
+        "moddifyannotations"
+    } else {
+        "modifyannotations"
+    };
     vec![
         ("accessibility".into(), Json::make_bool(accessibility)),
         ("extract".into(), Json::make_bool(extract)),
         ("modify".into(), Json::make_bool(modify)),
         (
-            "modifyannotations".into(),
+            modify_annotations_key.into(),
             Json::make_bool(modifyannotations),
         ),
         ("modifyassembly".into(), Json::make_bool(modifyassembly)),
@@ -901,12 +1137,17 @@ fn capabilities_from_p(p_raw: i32) -> Vec<(String, Json)> {
 }
 
 /// All-true capabilities object used for plaintext (no /Encrypt) documents.
-fn all_true_capabilities() -> Result<Json, ConvertError> {
+fn all_true_capabilities(version: i32) -> Result<Json, ConvertError> {
+    let modify_annotations_key = if version == 1 {
+        "moddifyannotations"
+    } else {
+        "modifyannotations"
+    };
     json_dictionary([
         ("accessibility", Json::make_bool(true)),
         ("extract", Json::make_bool(true)),
         ("modify", Json::make_bool(true)),
-        ("modifyannotations", Json::make_bool(true)),
+        (modify_annotations_key, Json::make_bool(true)),
         ("modifyassembly", Json::make_bool(true)),
         ("modifyforms", Json::make_bool(true)),
         ("modifyother", Json::make_bool(true)),
@@ -933,7 +1174,24 @@ fn all_true_capabilities() -> Result<Json, ConvertError> {
 /// nested entries (`/V`, `/R`, `/P`, `/Length`, `/StmF`, `/StrF`, `/EFF`,
 /// `/CF`, `/CFM`) that happen to be stored as indirect references, cannot be
 /// resolved (i.e. an underlying I/O or parse error).
+#[cfg(test)]
 pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    build_encrypt_section_with_version(pdf, 2)
+}
+
+#[cfg(test)]
+pub(crate) fn build_encrypt_section_with_version<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+) -> Result<Json, ConvertError> {
+    build_encrypt_section_with_options(pdf, version, false)
+}
+
+pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: i32,
+    show_encryption_key: bool,
+) -> Result<Json, ConvertError> {
     // Resolve /Encrypt via `trailer_key_handle`, not `trailer_handle`: the
     // latter lifts the *whole* trailer in one pass and degrades to a null
     // handle if any unrelated sibling entry's literal nesting exceeds the
@@ -954,7 +1212,7 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
     match encrypt_dict {
         None => {
             // Plaintext document: all defaults.
-            let capabilities = all_true_capabilities()?;
+            let capabilities = all_true_capabilities(version)?;
             let parameters = json_dictionary([
                 ("P", Json::make_int(0)),
                 ("R", Json::make_int(0)),
@@ -1029,14 +1287,21 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             // top-level `method` mirrors streammethod (qpdf behaviour)
             let method = streammethod;
 
-            let capabilities = json_dictionary(capabilities_from_p(p_raw))?;
+            let capabilities = json_dictionary(capabilities_from_p(p_raw, version))?;
+            let key = if show_encryption_key {
+                pdf.encryption_file_key()
+                    .map(|value| Json::make_string(hex::encode(value)))
+                    .unwrap_or_else(Json::make_null)
+            } else {
+                Json::make_null()
+            };
             let parameters = json_dictionary([
                 ("P", Json::make_int(p_raw as i64)),
                 ("R", Json::make_int(r)),
                 ("V", Json::make_int(v)),
                 ("bits", Json::make_int(bits)),
                 ("filemethod", Json::make_string(filemethod)),
-                ("key", Json::make_null()),
+                ("key", key),
                 ("method", Json::make_string(method)),
                 ("streammethod", Json::make_string(streammethod)),
                 ("stringmethod", Json::make_string(stringmethod)),
@@ -1060,5 +1325,141 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
                 ),
             ])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf};
+    use std::io::Cursor;
+    use std::rc::Rc;
+
+    fn one_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/one-page.pdf");
+        Pdf::open_mem_owned(std::fs::read(path).expect("one-page fixture"))
+            .expect("open one-page fixture")
+    }
+
+    fn image_handle(filter: ObjectHandle, decode_parms: ObjectHandle) -> ObjectHandle {
+        ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
+                (
+                    b"ColorSpace".to_vec(),
+                    ObjectHandle::name(b"DeviceGray".to_vec()),
+                ),
+                (b"DecodeParms".to_vec(), decode_parms),
+                (b"Filter".to_vec(), filter),
+                (b"Height".to_vec(), ObjectHandle::integer(1)),
+                (b"Subtype".to_vec(), ObjectHandle::name(b"Image".to_vec())),
+                (b"Width".to_vec(), ObjectHandle::integer(1)),
+            ]),
+            Rc::new(Vec::new()),
+        )
+    }
+
+    #[test]
+    fn image_projection_covers_filter_and_decode_parameter_arrays() {
+        let mut pdf = one_page_pdf();
+        let image_ref = ObjectRef::new(99, 0);
+        let filter = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        ]);
+        let image = image_handle(filter, ObjectHandle::null());
+        pdf.replace_object(image_ref, image).expect("install image");
+        let handle = pdf.get_object_handle(image_ref);
+        let result = image_to_json(&mut pdf, b"/Im0", &handle, 2, DecodeLevel::None)
+            .expect("image descriptor");
+        assert!(result.is_dictionary());
+
+        let filter = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        ]);
+        let decode_parms = ObjectHandle::array(vec![ObjectHandle::null(), ObjectHandle::null()]);
+        let image_ref = ObjectRef::new(100, 0);
+        pdf.replace_object(image_ref, image_handle(filter, decode_parms))
+            .expect("install second image");
+        let handle = pdf.get_object_handle(image_ref);
+        image_to_json(&mut pdf, b"/Im1", &handle, 1, DecodeLevel::All)
+            .expect("image descriptor with array decode parameters");
+    }
+
+    #[test]
+    fn image_projection_maps_every_json_decode_level() {
+        assert_eq!(
+            stream_decode_level(DecodeLevel::None),
+            crate::writer::DecodeLevel::None
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::Generalized),
+            crate::writer::DecodeLevel::Generalized
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::Specialized),
+            crate::writer::DecodeLevel::Specialized
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::All),
+            crate::writer::DecodeLevel::All
+        );
+    }
+
+    #[test]
+    fn encryption_capabilities_and_v1_key_spelling_are_both_built() {
+        let v1 = capabilities_from_p(-4, 1);
+        let v2 = capabilities_from_p(-4, 2);
+        assert!(v1.iter().any(|(key, _)| key == "moddifyannotations"));
+        assert!(v2.iter().any(|(key, _)| key == "modifyannotations"));
+    }
+
+    #[test]
+    fn encrypted_projection_can_include_the_authenticated_file_key() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(std::fs::read(path).expect("encrypted fixture")),
+            crate::PdfOpenOptions {
+                password: b"user-v4-aes".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open encrypted fixture");
+        build_encrypt_section_with_options(&mut pdf, 2, true)
+            .expect("encrypted section with file key");
+    }
+
+    #[test]
+    fn pages_projection_handles_a_direct_page_outline_item() {
+        let mut pdf = one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut item = Dictionary::new();
+        item.insert(
+            "Dest",
+            Object::Array(vec![
+                Object::Reference(page_ref),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+        item.insert("Title", Object::String(b"Direct outline".to_vec()));
+        let mut outlines = Dictionary::new();
+        outlines.insert("First", Object::Dictionary(item));
+        let outlines = pdf
+            .lift_object_to_handle(&Object::Dictionary(outlines))
+            .expect("lift direct outline root");
+        let catalog_ref = pdf.root_ref().expect("catalog");
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        catalog
+            .replace_key(b"/Outlines", outlines)
+            .expect("install outlines");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
+
+        let pages = build_pages_section_with_version(&mut pdf, 2).expect("pages with outline");
+        assert!(pages.is_array());
     }
 }

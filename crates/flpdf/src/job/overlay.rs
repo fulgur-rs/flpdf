@@ -3889,8 +3889,8 @@ mod tests {
 
         let err = write_qpdf_to_memory(&mut dest, |_| {});
         assert!(
-            matches!(&err, Err(Error::Internal(message))
-                if message == "pipeStreamData called for non-stream"),
+            matches!(&err, Err(Error::System(message))
+                if message == "error while getting stream data for 6 0 R: pipeStreamData called for non-stream"),
             "dropping the source before write must fail, not silently omit the stream: {err:?}"
         );
     }

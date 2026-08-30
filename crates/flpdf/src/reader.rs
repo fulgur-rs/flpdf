@@ -31,6 +31,17 @@ use std::rc::Rc;
 
 use crate::pdf::{CompressedMemberProvenance, Pdf};
 
+/// A seekable, owned input source that can cross a qpdf job's document
+/// boundary without exposing the concrete reader kind to its consumers.
+///
+/// qpdf's `QPDF` stores an `InputSource` behind one document type regardless
+/// of whether the source came from a file, memory, or a generated JSON seed.
+/// This trait is the Rust equivalent for job-owned documents: callers retain
+/// lazy reads while `JobDocument` can use one `Pdf` type for every source.
+pub trait ReadSeek: Read + Seek {}
+
+impl<T: Read + Seek> ReadSeek for T {}
+
 #[cfg(test)]
 pub(crate) struct QpdfPreparedObjects {
     pub(crate) refs: Vec<ObjectRef>,

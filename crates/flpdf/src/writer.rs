@@ -313,11 +313,40 @@ impl WriterConfiguration {
         self.settings.encryption_parameters = None;
     }
 
+    /// Set qpdf's linearized output mode.
+    pub fn set_linearization(&mut self, value: bool) {
+        self.settings.linearization = value;
+        if value {
+            self.settings.pclm = false;
+        }
+    }
+
+    /// Set the optional qpdf linearization pass-one output path.
+    pub fn set_linearization_pass1_filename(&mut self, path: impl Into<PathBuf>) {
+        self.settings.linearization_pass1_filename = Some(path.into());
+    }
+
     /// Apply this configuration to one writer while preserving its output
     /// sink lifecycle. Progress reporting is intentionally configured by the
     /// owning job after this method returns.
     pub fn apply_to<R: Read + Seek + 'static>(&self, writer: &mut PdfWriter<'_, R>) {
         writer.settings = self.settings.clone();
+    }
+
+    /// Return the stream decode level used by qpdf JSON serialization.
+    ///
+    /// qpdf keeps the JSON decode level beside the writer settings and uses
+    /// the same value for `json` sections and writer-side stream policy.
+    #[must_use]
+    pub const fn decode_level(&self) -> DecodeLevel {
+        self.settings.decode_level
+    }
+
+    /// Return whether otherwise-unreferenced objects are preserved by this
+    /// writer configuration.
+    #[must_use]
+    pub const fn preserves_unreferenced_objects(&self) -> bool {
+        self.settings.preserve_unreferenced_objects
     }
 }
 
@@ -951,6 +980,8 @@ mod lifecycle_tests {
         configuration.set_static_aes_iv(true);
         configuration.set_suppress_original_object_ids(true);
         configuration.set_preserve_encryption(false);
+        configuration.set_linearization(true);
+        configuration.set_linearization_pass1_filename("pass1.pdf");
         configuration.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
         configuration.copy_encryption_parameters(CopyEncryptionSource {
             encrypt_dict: crate::Dictionary::new(),
@@ -969,6 +1000,12 @@ mod lifecycle_tests {
         );
         assert!(!writer.settings.compress_streams);
         assert_eq!(writer.settings.decode_level, DecodeLevel::All);
+        assert_eq!(configuration.decode_level(), DecodeLevel::All);
+        assert!(configuration.preserves_unreferenced_objects());
+        assert_eq!(
+            writer.settings.linearization_pass1_filename,
+            Some(std::path::PathBuf::from("pass1.pdf"))
+        );
         assert!(writer.settings.recompress_flate);
         assert!(writer.settings.content_normalization);
         assert!(writer.settings.qdf_mode);

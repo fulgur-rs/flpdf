@@ -528,7 +528,9 @@ fn merge_provider_stream_reports_the_existing_error_after_source_drop() {
     let error = write_merged_memory(&mut merged).expect_err("dropped source must be observable");
     assert!(matches!(
         error,
-        Error::Internal(message) if message == "pipeStreamData called for non-stream"
+        Error::System(message)
+            if message
+                == "error while getting stream data for 4 0 R: pipeStreamData called for non-stream"
     ));
 }
 

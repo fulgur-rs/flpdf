@@ -8,8 +8,9 @@
 //! surrounding JSON document, and this module holds the same boundary; the
 //! builders live in [`crate::json_inspect`].
 //!
-//! Only JSON version 2 is supported. Any other version is rejected with
-//! [`JsonOutputError::UnsupportedVersion`].
+//! JSON v2 stream data is written through the `qpdf` key. JSON v1 keeps the
+//! historical `objects` and `objectinfo` maps, which are implemented below
+//! with the same canonical ObjectHandle writer.
 //!
 //! Per-object value serialization is not part of this boundary — qpdf
 //! delegates it to `QPDFObjectHandle::writeJSON`, whose flpdf counterpart is
@@ -34,6 +35,103 @@ use std::io::{Read, Seek, Write};
 
 /// The only qpdf JSON version whose serialization is defined here.
 const SUPPORTED_JSON_VERSION: i32 = 2;
+
+/// Write qpdf JSON v1's top-level `objects` map into an already-open document.
+///
+/// qpdf writes object references in object-number order and appends the
+/// trailer after the indirect objects (`QPDFJob.cc:958-980`). Object values
+/// are delegated to `QPDFObjectHandle::writeJSON(1, ..., true)` so names,
+/// strings, and stream dictionaries retain the v1 encoding.
+pub(crate) fn write_json_v1_objects_key<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    out: &mut dyn Pipeline,
+    first: &mut bool,
+    wanted_objects: &[JsonObjectSelector],
+) -> Result<(), JsonOutputError> {
+    Json::write_dictionary_key(out, first, b"objects", 1)?;
+    let mut object_first = true;
+    Json::write_dictionary_open(out, &mut object_first, 1)?;
+    for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
+        let object_ref = handle
+            .object_ref()
+            .expect("qpdf object-map entries are indirect handles");
+        if !object_selected(wanted_objects, object_ref) {
+            continue;
+        }
+        let key = format!("{} {} R", object_ref.number, object_ref.generation);
+        Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
+        handle.write_json(1, out, true, 2)?;
+    }
+    if trailer_selected(wanted_objects) {
+        Json::write_dictionary_key(out, &mut object_first, b"trailer", 2)?;
+        pdf.trailer().write_json(1, out, true, 2)?; // cov:ignore: llvm-cov attributes this successful trailer serialization to its opening write expressions
+    } // cov:ignore: llvm-cov attributes the successful trailer branch continuation to its write expressions
+    Json::write_dictionary_close(out, object_first, 1)?;
+    Ok(())
+}
+
+/// Write qpdf JSON v1's top-level `objectinfo` map into an already-open
+/// document (`QPDFJob.cc:1001-1027`).
+pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    out: &mut dyn Pipeline,
+    first: &mut bool,
+    wanted_objects: &[JsonObjectSelector],
+) -> Result<(), JsonOutputError> {
+    Json::write_dictionary_key(out, first, b"objectinfo", 1)?;
+    let mut object_first = true;
+    Json::write_dictionary_open(out, &mut object_first, 1)?;
+    for handle in pdf.get_all_objects().map_err(ConvertError::from)? {
+        let object_ref = handle
+            .object_ref()
+            .expect("qpdf object-map entries are indirect handles");
+        if !object_selected(wanted_objects, object_ref) {
+            continue;
+        }
+
+        let resolved = handle.clone();
+        pdf.resolve(&resolved).map_err(ConvertError::from)?;
+        let (is_stream, filter, length) = if let Some(stream_dict) = resolved
+            .as_stream_dict()
+            .and_then(|dict| dict.as_dictionary())
+        {
+            let filter = stream_dict
+                .get(b"/Filter".as_slice())
+                .cloned()
+                .unwrap_or_else(ObjectHandle::null);
+            let length = stream_dict
+                .get(b"/Length".as_slice())
+                .cloned()
+                .unwrap_or_else(ObjectHandle::null);
+            (true, filter, length)
+        } else {
+            (false, ObjectHandle::null(), ObjectHandle::null())
+        };
+
+        let key = format!("{} {} R", object_ref.number, object_ref.generation);
+        Json::write_dictionary_key(out, &mut object_first, key.as_bytes(), 2)?;
+        let mut details_first = true;
+        Json::write_dictionary_open(out, &mut details_first, 2)?;
+        Json::write_dictionary_key(out, &mut details_first, b"stream", 3)?;
+        let mut stream_first = true;
+        Json::write_dictionary_open(out, &mut stream_first, 3)?;
+        Json::write_dictionary_key(out, &mut stream_first, b"filter", 4)?;
+        filter.write_json(1, out, true, 4)?;
+        Json::write_dictionary_item(
+            out,
+            &mut stream_first,
+            b"is",
+            &Json::make_bool(is_stream),
+            4,
+        )?; // cov:ignore: llvm-cov attributes this successful objectinfo field serialization to its opening write expressions
+        Json::write_dictionary_key(out, &mut stream_first, b"length", 4)?;
+        length.write_json(1, out, true, 4)?;
+        Json::write_dictionary_close(out, stream_first, 3)?;
+        Json::write_dictionary_close(out, details_first, 2)?;
+    }
+    Json::write_dictionary_close(out, object_first, 1)?;
+    Ok(())
+}
 
 /// Format the side-file path for a `File`-mode stream entry.
 ///

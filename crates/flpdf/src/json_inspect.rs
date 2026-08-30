@@ -676,8 +676,16 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
 /// at all), so this bounds recursion the same way
 /// [`ObjectHandle::materialize`] does rather than assuming acyclic input.
 pub fn pdf_object_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
+    pdf_object_to_json_with_version(handle, QPDF_JSON_VERSION)
+}
+
+/// Convert a PDF object handle using the requested qpdf JSON object encoding.
+pub(crate) fn pdf_object_to_json_with_version(
+    handle: &ObjectHandle,
+    version: i32,
+) -> Result<Json, ConvertError> {
     handle
-        .get_json(QPDF_JSON_VERSION, false)
+        .get_json(version, false)
         .map_err(convert_object_json_error)
 }
 
@@ -709,9 +717,17 @@ fn convert_object_json_error(error: ObjectJsonError) -> ConvertError {
 /// parent was serialized with). Confirmed against live qpdf 11.9.0: `/Dest 8
 /// 0 R` with object 8 holding `[3 0 R /Fit]` emits `"dest": ["3 0 R",
 /// "/Fit"]`.
+#[cfg(test)]
 pub(crate) fn pdf_dest_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
+    pdf_dest_to_json_with_version(handle, QPDF_JSON_VERSION)
+}
+
+pub(crate) fn pdf_dest_to_json_with_version(
+    handle: &ObjectHandle,
+    version: i32,
+) -> Result<Json, ConvertError> {
     handle
-        .get_json(QPDF_JSON_VERSION, true)
+        .get_json(version, true)
         .map_err(convert_object_json_error)
 }
 
@@ -876,10 +892,10 @@ pub(crate) fn stream_payload_with_decode_status(
 
 // ── JsonKey ────────────────────────────────────────────────
 
-/// A top-level qpdf JSON v2 key that the caller may request via --json-key.
+/// A top-level qpdf JSON key that the caller may request via `--json-key`.
 ///
-/// qpdf's v1-only `objects` and `objectinfo` selectors are intentionally not
-/// represented: qpdf rejects both when JSON version 2 is selected.
+/// `Objects` and `Objectinfo` are retained for JSON v1; qpdf replaces those
+/// two top-level sections with `Qpdf` in JSON v2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JsonKey {
     Acroform,
@@ -889,14 +905,18 @@ pub enum JsonKey {
     Pagelabels,
     Pages,
     Qpdf,
+    Objects,
+    Objectinfo,
 }
 
 impl JsonKey {
-    /// All qpdf JSON v2 key names in alphabetical order.
+    /// All qpdf JSON key names in alphabetical order.
     pub const ALL_NAMES: &'static [&'static str] = &[
         "acroform",
         "attachments",
         "encrypt",
+        "objectinfo",
+        "objects",
         "outlines",
         "pagelabels",
         "pages",
@@ -914,11 +934,13 @@ impl JsonKey {
             "pagelabels" => Some(JsonKey::Pagelabels),
             "pages" => Some(JsonKey::Pages),
             "qpdf" => Some(JsonKey::Qpdf),
+            "objects" => Some(JsonKey::Objects),
+            "objectinfo" => Some(JsonKey::Objectinfo),
             _ => None,
         }
     }
 
-    /// The v2 top-level key name represented by this selector.
+    /// The top-level key name represented by this selector.
     pub(crate) fn output_key_name(self) -> &'static str {
         match self {
             JsonKey::Acroform => "acroform",
@@ -928,6 +950,8 @@ impl JsonKey {
             JsonKey::Pagelabels => "pagelabels",
             JsonKey::Pages => "pages",
             JsonKey::Qpdf => "qpdf",
+            JsonKey::Objects => "objects",
+            JsonKey::Objectinfo => "objectinfo",
         }
     }
 }
@@ -954,6 +978,9 @@ impl JsonObjectSelector {
     /// - `"trailer"` → `Trailer` (exact lowercase match only)
     /// - `"N"` → `Object { number: N, generation: 0 }`
     /// - `"N,G"` → `Object { number: N, generation: G }`
+    /// - The qpdf object-reference spelling `"N G R"` is also accepted; qpdf
+    ///   uses this form when an argument is passed as one token from its test
+    ///   driver (`QPDFJob.cc:929-952`).
     /// - More than 2 comma-separated parts, empty string, non-numeric
     ///   parts, negative numbers, or integer overflow → `None`.
     #[allow(clippy::should_implement_trait)]
@@ -963,6 +990,12 @@ impl JsonObjectSelector {
         }
         if s.is_empty() {
             return None;
+        }
+        let reference_parts: Vec<&str> = s.split_whitespace().collect();
+        if reference_parts.len() == 3 && reference_parts[2] == "R" {
+            let number = reference_parts[0].parse::<u32>().ok()?;
+            let generation = reference_parts[1].parse::<u16>().ok()?;
+            return Some(JsonObjectSelector::Object { number, generation });
         }
         let parts: Vec<&str> = s.splitn(3, ',').collect();
         if parts.len() > 2 {
@@ -4474,6 +4507,14 @@ mod tests {
         crate::Pdf::open_mem_owned(bytes).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
     }
 
+    fn load_json_diff_fixture_pdf(name: &str) -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../../tests/fixtures/json-diff").join(name);
+        let bytes = std::fs::read(&fixture)
+            .unwrap_or_else(|e| panic!("{name} not found at {}: {e}", fixture.display()));
+        crate::Pdf::open_mem_owned(bytes).unwrap_or_else(|e| panic!("failed to open {name}: {e}"))
+    }
+
     // Helper: get page entry at index from build_pages_section result.
     fn get_page_entry(pages: &serde_json::Value, idx: usize) -> Vec<(String, serde_json::Value)> {
         let serde_json::Value::Array(arr) = pages else {
@@ -4760,6 +4801,31 @@ mod tests {
                 "page {i} pageposfrom1 mismatch"
             );
         }
+    }
+
+    #[test]
+    fn build_pages_section_projects_images_and_page_outlines() {
+        let mut image_pdf = load_fixture_pdf("shared-stream-objstm.pdf");
+        let image_pages = build_pages_section(&mut image_pdf).expect("image pages");
+        let image_entry = get_page_entry(&image_pages, 0);
+        let serde_json::Value::Array(images) = &image_entry[1].1 else {
+            panic!("images must be an array"); // cov:ignore: the committed fixture contract supplies an images array
+        };
+        assert!(!images.is_empty(), "fixture must contain an image XObject");
+
+        let mut outline_pdf = load_json_diff_fixture_pdf("direct-outlines.pdf");
+        let pages = build_pages_section(&mut outline_pdf).expect("outline pages");
+        let outline_count = match &pages {
+            serde_json::Value::Array(entries) => entries
+                .iter()
+                .map(|entry| entry["outlines"].as_array().map_or(0, Vec::len))
+                .sum::<usize>(),
+            _ => 0, // cov:ignore: the committed fixture contract supplies a pages array
+        };
+        assert!(
+            outline_count > 0,
+            "fixture must contain page-targeted outlines"
+        );
     }
 
     // ── 31. collect_content_refs: single Reference to a Stream ────────────────
@@ -9704,8 +9770,8 @@ mod tests {
         assert_eq!(JsonKey::from_str("Pages"), None); // case-sensitive
         assert_eq!(JsonKey::from_str("version"), None);
         assert_eq!(JsonKey::from_str("parameters"), None);
-        assert_eq!(JsonKey::from_str("objectinfo"), None);
-        assert_eq!(JsonKey::from_str("objects"), None);
+        assert_eq!(JsonKey::from_str("objectinfo"), Some(JsonKey::Objectinfo));
+        assert_eq!(JsonKey::from_str("objects"), Some(JsonKey::Objects));
         assert_eq!(JsonKey::from_str("bogus"), None);
     }
 
@@ -9716,11 +9782,13 @@ mod tests {
         assert_eq!(JsonKey::ALL_NAMES[0], "acroform");
         assert_eq!(JsonKey::ALL_NAMES[1], "attachments");
         assert_eq!(JsonKey::ALL_NAMES[2], "encrypt");
-        assert_eq!(JsonKey::ALL_NAMES[3], "outlines");
-        assert_eq!(JsonKey::ALL_NAMES[4], "pagelabels");
-        assert_eq!(JsonKey::ALL_NAMES[5], "pages");
-        assert_eq!(JsonKey::ALL_NAMES[6], "qpdf");
-        assert_eq!(JsonKey::ALL_NAMES.len(), 7);
+        assert_eq!(JsonKey::ALL_NAMES[3], "objectinfo");
+        assert_eq!(JsonKey::ALL_NAMES[4], "objects");
+        assert_eq!(JsonKey::ALL_NAMES[5], "outlines");
+        assert_eq!(JsonKey::ALL_NAMES[6], "pagelabels");
+        assert_eq!(JsonKey::ALL_NAMES[7], "pages");
+        assert_eq!(JsonKey::ALL_NAMES[8], "qpdf");
+        assert_eq!(JsonKey::ALL_NAMES.len(), 9);
     }
 
     // ── output_key_name maps every v2 selector directly ──────────────────────
@@ -9775,6 +9843,17 @@ mod tests {
             Some(JsonObjectSelector::Object {
                 number: 3,
                 generation: 5
+            })
+        );
+    }
+
+    #[test]
+    fn json_object_selector_from_str_qpdf_reference_form() {
+        assert_eq!(
+            JsonObjectSelector::from_str("2 0 R"),
+            Some(JsonObjectSelector::Object {
+                number: 2,
+                generation: 0
             })
         );
     }

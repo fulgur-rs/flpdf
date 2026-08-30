@@ -425,6 +425,11 @@ struct Cli {
     #[arg(long = "show-encryption", conflicts_with = "output")]
     show_encryption: bool,
 
+    /// Include the derived encryption key in JSON's `encrypt.parameters.key`
+    /// field (qpdf `--show-encryption-key`).
+    #[arg(long = "show-encryption-key")]
+    show_encryption_key: bool,
+
     /// Run a complete qpdf job JSON file through the production QPDFJob
     /// lifecycle (qpdf `--job-json-file`).
     #[arg(long = "job-json-file", value_name = "PATH", require_equals = true)]
@@ -433,10 +438,9 @@ struct Cli {
     // ── JSON inspection flags ─────────────────────────────────────────────
     // These mirror qpdf's --json / --json-output / --json-key / --json-object
     // / --json-stream-data / --json-stream-prefix flags.
-    /// Enable JSON v2 output mode.  Pass `--json` alone or `--json=2` (qpdf
-    /// compatible).  The value, when given, must be supplied as `--json=2`
-    /// (with the equals sign) to avoid ambiguity with the positional input
-    /// argument.
+    /// Enable qpdf JSON output mode. Pass `--json` alone or `--json=1|2`.
+    /// The value, when given, must be supplied with an equals sign to avoid
+    /// ambiguity with the positional input argument.
     // JSON mode is exclusive with the other top-level inspection / write
     // modes and with the OUTPUT positional. Without these conflicts, e.g.
     // `flpdf --json --check in` or `flpdf --json in out` would silently
@@ -445,12 +449,12 @@ struct Cli {
     // instead of doing one thing while the user asked for two.
     #[arg(long, num_args = 0..=1, default_missing_value = "2",
           require_equals = true,
-          value_name = "VERSION", value_parser = ["2"],
+          value_name = "VERSION", value_parser = ["1", "2", "latest"],
           conflicts_with_all = [
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
               "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
-              "show_encryption", "output",
+              "show_encryption",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption",
               "add_attachment", "remove_attachment", "list_attachments",
@@ -494,11 +498,19 @@ struct Cli {
     /// Write JSON output to PATH instead of stdout.
     #[arg(
         long = "json-output",
-        value_name = "PATH",
-        requires = "json",
-        help = "Write JSON to PATH instead of stdout"
+        num_args = 0..=1,
+        default_missing_value = "2",
+        require_equals = true,
+        value_name = "VERSION",
+        value_parser = ["1", "2", "latest"],
+        help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
     )]
-    json_output: Option<PathBuf>,
+    json_output: Option<String>,
+
+    /// Validate generated JSON against qpdf's own output schema. This is a
+    /// testing option used by qpdf's qtest suite.
+    #[arg(long = "test-json-schema")]
+    test_json_schema: bool,
 
     /// Limit JSON output to the specified top-level key (repeatable).
     /// Valid JSON v2 keys: acroform, attachments, encrypt, outlines,
@@ -506,7 +518,6 @@ struct Cli {
     #[arg(
         long = "json-key",
         value_name = "KEY",
-        requires = "json",
         help = "This option is repeatable. If given, only the specified \
                 top-level keys will be included in the JSON output. \
                 Otherwise, all keys will be included."
@@ -518,7 +529,6 @@ struct Cli {
     #[arg(
         long = "json-object",
         value_name = "SELECTOR",
-        requires = "json",
         help = "This option is repeatable. If given, only specified objects \
                 will be shown in the \"qpdf\" key of the JSON output. \
                 Otherwise, all objects will be shown. Format: trailer, N, \
@@ -532,7 +542,6 @@ struct Cli {
     #[arg(
         long = "json-stream-data",
         value_name = "MODE",
-        requires = "json",
         help = "When used with --json, this option controls whether streams \
                 in json output should be omitted, written inline \
                 (base64-encoded), or written to a file. If \"file\" is \
@@ -548,7 +557,6 @@ struct Cli {
     #[arg(
         long = "json-stream-prefix",
         value_name = "PREFIX",
-        requires = "json",
         help = "Prefix for side files with --json-stream-data=file. With --json-output, \
                 defaults to the JSON output path; with JSON on stdout, an explicit \
                 non-empty prefix is required. An empty prefix is treated as absent."
@@ -2033,10 +2041,15 @@ fn main() {
     // For ordinary JSON output, the separate --json branch remains first among
     // the non-inspection modes and retains its existing validation boundary.
     let result = if let Some(path) = args.job_json_file.as_deref() {
-        run_job_json_file(path)
+        run_job_json_file(
+            path,
+            args.input.as_deref(),
+            args.output.as_deref(),
+            &args.password,
+        )
     } else if json_input_inspection {
         run_json_input_inspection(&args)
-    } else if args.json.is_some() {
+    } else if args.json.is_some() || args.json_output.is_some() {
         run_json(&args)
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
@@ -2354,7 +2367,7 @@ fn main() {
             // were already printed in qpdf shape).
             if !exit_err.message.is_empty() {
                 // cov:ignore-start: no production CliExitError currently carries a non-empty message
-                emit_logger_error(format!("{}: {}\n", progname(), exit_err.message));
+                emit_logger_error(format!("\n{}: {}\n", progname(), exit_err.message));
                 // cov:ignore-end
             }
             std::process::exit(exit_err.code.as_i32());
@@ -2387,7 +2400,12 @@ fn usage_exit(error: &UsageError) -> ! {
     std::process::exit(2);
 }
 
-fn run_job_json_file(path: &Path) -> CliResult<()> {
+fn run_job_json_file(
+    path: &Path,
+    input: Option<&Path>,
+    output: Option<&Path>,
+    password: &PasswordArgs,
+) -> CliResult<()> {
     let json = std::fs::read_to_string(path)
         .map_err(|error| error_with_file(path, Box::new(error) as Box<dyn std::error::Error>))?;
     let mut job = QPDFJob::new();
@@ -2396,15 +2414,46 @@ fn run_job_json_file(path: &Path) -> CliResult<()> {
     job.initialize_from_json_partial(&json).map_err(|error| {
         Box::new(CliExitError {
             code: ExitCode::Errors,
-            message: format!("error with job-json file {}: {error}", path.display()),
+            message: format_job_json_error(path, error),
         }) as Box<dyn std::error::Error>
     })?;
+    if let Some(input) = input {
+        job.set_input_file(input.to_path_buf()).map_err(|error| {
+            Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: format_job_json_error(path, error),
+            }) as Box<dyn std::error::Error>
+        })?;
+    }
+    if let Some(output) = output {
+        job.set_output_file(output.to_path_buf()).map_err(|error| {
+            Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: format_job_json_error(path, error),
+            }) as Box<dyn std::error::Error>
+        })?;
+    }
+    if let Some(password) = password.password.as_deref() {
+        job.set_password(password.as_bytes().to_vec());
+    }
     // The library JSON entry point uses qpdfjob's C-helper prefix while the
     // CLI's QPDFJob caller uses the ordinary qpdf prefix. Set the CLI
     // boundary after initialization, before any input warning or completion
     // summary is emitted.
     job.set_message_prefix(progname());
     finish_job_exit_status(job.run()?)
+}
+
+fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
+    format!(
+        "error with job-json file {}: {error}\nRun {} --job-json-help for information on the file format.\n\nFor help:\n  {} --help=usage       usage information\n  {} --help=topic       help on a topic\n  {} --help=--option    help on an option\n  {} --help             general help and a topic list\n",
+        path.display(),
+        progname(),
+        progname(),
+        progname(),
+        progname(),
+        progname(),
+    )
 }
 
 fn run_json(cli: &Cli) -> CliResult<()> {
@@ -2420,13 +2469,29 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         "qpdf",
     ];
 
+    let json_output_mode = cli.json_output.is_some();
+    let json_version = cli
+        .json_output
+        .as_deref()
+        .or(cli.json.as_deref())
+        .unwrap_or("2");
+    let json_version = match json_version {
+        "1" => 1,
+        "2" | "latest" => 2,
+        other => return Err(format!("unsupported json version {other}").into()),
+    };
+
     // 1. Validate --json-key values before doing any I/O.
     let mut json_keys: Vec<JsonKey> = Vec::new();
     for raw in &cli.json_key {
-        if matches!(raw.as_str(), "objects" | "objectinfo") {
+        if json_version != 1 && matches!(raw.as_str(), "objects" | "objectinfo") {
             eprintln!(
                 "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1"
             );
+            std::process::exit(2);
+        }
+        if json_version == 1 && raw == "qpdf" {
+            eprintln!("flpdf: json key \"qpdf\" is only valid for json version > 1");
             std::process::exit(2);
         }
         match JsonKey::from_str(raw.as_str()) {
@@ -2436,6 +2501,17 @@ fn run_json(cli: &Cli) -> CliResult<()> {
                 eprintln!("flpdf: --json-key must be given as --json-key={{{names}}}");
                 std::process::exit(2);
             }
+        }
+    }
+    if json_output_mode {
+        if json_version == 1 {
+            eprintln!("flpdf: --json-output requires JSON version 2");
+            std::process::exit(2);
+        }
+        // qpdf's json-output mode always selects the qpdf key in addition to
+        // any explicitly requested keys (`QPDFJob_config.cc:312-324`).
+        if !json_keys.contains(&JsonKey::Qpdf) {
+            json_keys.push(JsonKey::Qpdf);
         }
     }
 
@@ -2455,11 +2531,14 @@ fn run_json(cli: &Cli) -> CliResult<()> {
 
     // 3. Resolve stream-data mode.
     //
-    // The help text documents the default as "none". Stream payloads are
-    // never embedded or written to disk unless the caller explicitly opts
-    // in via --json-stream-data, even when --json-output is used: leaking
-    // stream contents based on an unrelated flag would be surprising.
-    let stream_data = match cli.json_stream_data.as_deref().unwrap_or("none") {
+    // Ordinary `--json` follows the inspection default of no stream payloads;
+    // qpdf's `--json-output` mode selects inline stream data unless the caller
+    // overrides it with --json-stream-data.
+    let stream_data = match cli
+        .json_stream_data
+        .as_deref()
+        .unwrap_or(if json_output_mode { "inline" } else { "none" })
+    {
         "none" => JsonStreamData::None,
         "inline" => JsonStreamData::Inline,
         "file" => JsonStreamData::File,
@@ -2474,13 +2553,21 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // spelling alone is insufficient: relative aliases, symlinks, and hard
     // links can all name the same underlying file.
     let input = cli.input.as_ref().ok_or("missing input file")?;
-    if let Some(output) = cli.json_output.as_ref() {
+    if let Some(output) = cli
+        .output
+        .as_ref()
+        .filter(|path| path.as_path() != Path::new("-"))
+    {
         reject_same_json_output(input, output)?;
     }
 
     // qpdf reserves standard output for binary/structured save data before
     // opening the document, so warnings and later info cannot claim stdout.
-    let mut standard_output = if cli.json_output.is_none() {
+    let mut standard_output = if cli
+        .output
+        .as_ref()
+        .is_none_or(|path| path.as_path() == Path::new("-"))
+    {
         Some(standard_save_writer()?)
     } else {
         None
@@ -2505,7 +2592,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         .map_err(|error| error_with_file(input, error.into()))?;
 
     if cli.json_input {
-        let mut pdf = job.create_from_json(input_file, input.display().to_string())?;
+        let mut pdf = job.create_from_json_document(input_file, input.display().to_string())?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         let mut runtime = JsonJobRuntime {
             input_identity: &input_identity,
@@ -2516,6 +2603,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
             cli,
             &mut runtime,
             &mut pdf,
+            json_version,
+            cli.test_json_schema,
+            cli.show_encryption_key,
+            json_output_mode,
             stream_data,
             &json_keys,
             &json_objects,
@@ -2533,6 +2624,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
             cli,
             &mut runtime,
             &mut pdf,
+            json_version,
+            cli.test_json_schema,
+            cli.show_encryption_key,
+            json_output_mode,
             stream_data,
             &json_keys,
             &json_objects,
@@ -2556,7 +2651,7 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
     })?;
 
     if cli.json_input {
-        let mut pdf = job.create_from_json(file, input.display().to_string())?;
+        let mut pdf = job.create_from_json_document(file, input.display().to_string())?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
     }
@@ -2612,21 +2707,34 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
 /// Serialize an already-opened job document through the existing qpdf JSON
 /// output consumer. Keeping this generic preserves the same output path for
 /// file-backed PDF inputs and JSON-created documents.
+#[allow(clippy::too_many_arguments)]
 fn run_json_document<R: Read + Seek>(
     cli: &Cli,
     runtime: &mut JsonJobRuntime<'_>,
     pdf: &mut Pdf<R>,
+    json_version: i32,
+    test_json_schema: bool,
+    show_encryption_key: bool,
+    json_output_mode: bool,
     stream_data: JsonStreamData,
     json_keys: &[JsonKey],
     json_objects: &[JsonObjectSelector],
 ) -> CliResult<()> {
     // `decode_level` governs both inline `data` payloads and file-mode side
     // files emitted by the job-owned JSON output pipeline.
-    let json_decode_level = cli
-        .decode_level
-        .map(DecodeLevel::from)
-        .unwrap_or(DecodeLevel::Generalized);
-    let json_result = if let Some(ref path) = cli.json_output {
+    let json_decode_level =
+        cli.decode_level
+            .map(DecodeLevel::from)
+            .unwrap_or(if json_output_mode {
+                DecodeLevel::None
+            } else {
+                DecodeLevel::Generalized
+            });
+    let output_path = cli
+        .output
+        .as_ref()
+        .filter(|path| path.as_path() != Path::new("-"));
+    let json_result = if let Some(path) = output_path {
         let mut file = open_verified_json_output(runtime.input_identity, path)?;
         let options = JsonJobOptions {
             decode_level: json_decode_level,
@@ -2635,8 +2743,12 @@ fn run_json_document<R: Read + Seek>(
             keys: json_keys,
             objects: json_objects,
         };
-        runtime.job.write_json(
+        runtime.job.write_json_with_version(
             pdf,
+            json_version,
+            test_json_schema,
+            json_output_mode,
+            show_encryption_key,
             options,
             JsonJobOutput::File {
                 filename: path,
@@ -2651,8 +2763,12 @@ fn run_json_document<R: Read + Seek>(
             keys: json_keys,
             objects: json_objects,
         };
-        runtime.job.write_json(
+        runtime.job.write_json_with_version(
             pdf,
+            json_version,
+            test_json_schema,
+            json_output_mode,
+            show_encryption_key,
             options,
             JsonJobOutput::Stdout(
                 runtime

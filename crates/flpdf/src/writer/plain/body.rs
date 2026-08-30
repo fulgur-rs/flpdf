@@ -706,14 +706,16 @@ pub(crate) fn canonical_stream_will_be_refiltered_with_policy(
         } else {
             (0, crate::writer::DecodeLevel::None)
         };
-        let success = handle.pipe_stream_data(
-            &mut discard,
-            &mut filtering_attempted,
-            attempt_encode_flags,
-            attempt_decode_level,
-            true,
-            attempt == 1,
-        )?;
+        let success = handle
+            .pipe_stream_data(
+                &mut discard,
+                &mut filtering_attempted,
+                attempt_encode_flags,
+                attempt_decode_level,
+                true,
+                attempt == 1,
+            )
+            .map_err(|error| stream_data_error(handle, error))?;
         if success || attempt == 2 {
             return Ok(filtering_attempted && success);
         }
@@ -788,14 +790,16 @@ fn canonical_stream_output_with_rewrite_policy(
                 } else {
                     (0, crate::writer::DecodeLevel::None)
                 };
-                let success = source_for_pipe.pipe_stream_data(
-                    &mut buffer,
-                    &mut filtering_attempted,
-                    attempt_encode_flags,
-                    attempt_decode_level,
-                    false,
-                    attempt == 1,
-                )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
+                let success = source_for_pipe
+                    .pipe_stream_data(
+                        &mut buffer,
+                        &mut filtering_attempted,
+                        attempt_encode_flags,
+                        attempt_decode_level,
+                        false,
+                        attempt == 1,
+                    )
+                    .map_err(|error| stream_data_error(&source_for_pipe, error))?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
 
                 if success || attempt == 2 {
                     // QPDFWriter retries a failed filter pipeline against a
@@ -812,7 +816,11 @@ fn canonical_stream_output_with_rewrite_policy(
             (data, filtering_attempted, normalized_content)
         } else {
             (
-                source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
+                source_for_pipe
+                    .get_raw_stream_data()
+                    .map_err(|error| stream_data_error(&source_for_pipe, error))?
+                    .as_ref()
+                    .clone(),
                 false,
                 false,
             )
@@ -847,6 +855,17 @@ fn canonical_stream_output_with_rewrite_policy(
     let refiltered =
         filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content;
     Ok((dict, data, refiltered, filtering_attempted))
+}
+
+fn stream_data_error(handle: &ObjectHandle, error: crate::Error) -> crate::Error {
+    if let Some(object_ref) = handle.object_ref() {
+        crate::Error::System(format!(
+            "error while getting stream data for {object_ref}: {error}"
+        ))
+    } else {
+        // cov:ignore: qpdf writer stream errors are always attributed to indirect object handles
+        error
+    }
 }
 
 fn canonical_stream_filter_plan(
@@ -1762,6 +1781,15 @@ mod tests {
                 .unwrap(),
             Some("encryption dictionary")
         );
+    }
+
+    #[test]
+    fn stream_data_error_preserves_errors_for_direct_handles() {
+        let error = crate::Error::System("direct stream failure".to_owned());
+        assert!(matches!(
+            stream_data_error(&ObjectHandle::integer(1), error),
+            crate::Error::System(message) if message == "direct stream failure"
+        ));
     }
 
     // A tree built through the public `ObjectHandle::array`/`dictionary`
