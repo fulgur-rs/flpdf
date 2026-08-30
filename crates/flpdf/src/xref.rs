@@ -3094,23 +3094,6 @@ fn parse_xref_stream(
     // cumulative registration receives these entries.
     let (build_result, reconstruction_trigger, bootstrap_cache) = {
         let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-        let mut completed = match context.read_file_object(
-            tail,
-            xref_pos as u64,
-            policy,
-            XrefObjectDescription::XrefStream,
-        ) {
-            Ok(completed) => completed,
-            Err(error) => {
-                context.append_diagnostics_to(&mut repair_diagnostics);
-                if let Some(sink) = error_diagnostics_sink {
-                    for diagnostic in repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
-                }
-                return Err(error.rebase_offset(xref_pos));
-            }
-        };
         let mut handle_completed = match context.read_file_object_handle(
             tail,
             xref_pos as u64,
@@ -3131,11 +3114,24 @@ fn parse_xref_stream(
         };
         // Xref streams are not encrypted, but filter decoding still requires
         // the logical payload rather than qpdf's raw recovery EOL.
-        let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
         let _recovered_handle_eol = handle_completed.remove_included_recovery_eol_for_decryption();
-        let object_ref = completed.object_ref;
-        let object = completed.object;
         let handle_object = handle_completed.object;
+        let object_ref = handle_completed.object_ref;
+        // `LoadedXref` still exposes the pre-cutover raw trailer boundary to
+        // the reader/cache slice. Materialize only this already-parsed xref
+        // stream at that existing boundary; the parser itself has one
+        // handle-native pass and no detached raw parser duplicate.
+        let object = handle_object
+            .materialize()
+            .map_err(|error| error.rebase_offset(xref_pos))?;
+        for diagnostic in &handle_completed.diagnostics {
+            repair_diagnostics.push(xref_file_object_diagnostic(
+                XrefObjectDescription::XrefStream,
+                object_ref,
+                xref_pos as u64,
+                diagnostic.clone(),
+            ));
+        }
         // qpdf's own read of this object (`readObjectAtOffset`, `QPDF.cc:956`)
         // happens before `processXRefStream` validates `/Type`, `/W`, `/Index`,
         // `/Size`, or the entry data (`QPDF.cc:960-1128`); any repair warning

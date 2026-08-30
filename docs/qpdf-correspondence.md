@@ -277,6 +277,8 @@ mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObjec
 継承 `/Resources`、非対象 resource category、重複ページの差分回帰は
 `crates/flpdf-cli/tests/cli_tests.rs` が qpdf 11.9.0 と比較する。
 
+| `QPDF::resolve` / `QPDF::resolveObjectsInStream`（bootstrap cache completion） | `QPDF.cc:1700-1857` | `xref.rs::parse_xref_stream` は xref stream の file-object を `read_file_object_handle` で一度だけ parse し、`parser.rs` の ObjStm member と同じ canonical `ObjectHandle` graphへ installする。 | 🔀 `.2` で raw+handle の二重 parse と live parser の finished-tree conversion を除去。`LoadedXref` の既存 raw 公開境界は reader/cache slice (`.3`) で handle-native 化する |
+
 ## 3. 書き込み — 最大の smear
 
 | qpdf | 行 | flpdf | 状態 |

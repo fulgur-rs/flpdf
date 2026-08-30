@@ -19,8 +19,6 @@ use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
 use crate::parser::dictionary_value_source_offset;
-#[cfg(test)]
-use crate::parser::parse_qpdf_file_object;
 #[cfg(any(test, feature = "qtest-driver"))]
 use crate::tokenizer::Tokenizer;
 use crate::{
@@ -2652,13 +2650,31 @@ pub(crate) fn parse_object_stream_entry(
         return Err(Error::parse(0, "compressed object offset out of range"));
     }
 
-    let (object, _diagnostics) = parse_qpdf_file_object(&stream_data[start..])?;
-    Ok(ParsedObjectStreamEntry { object })
+    let mut resolver = DetachedObjectStreamResolver;
+    let parsed = crate::parser::parse_qpdf_file_object_handle_with_diagnostics(
+        &stream_data[start..],
+        0,
+        None,
+        &mut resolver,
+    )?;
+    Ok(ParsedObjectStreamEntry {
+        object: parsed.value,
+    })
 }
 
 #[cfg(test)]
 pub(crate) struct ParsedObjectStreamEntry {
-    pub(crate) object: Object,
+    pub(crate) object: ObjectHandle,
+}
+
+#[cfg(test)]
+struct DetachedObjectStreamResolver;
+
+#[cfg(test)]
+impl crate::parser::HandleResolver for DetachedObjectStreamResolver {
+    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        ObjectHandle::from_value(ObjectValue::Reference(object_ref))
+    }
 }
 
 #[cfg(test)]
@@ -4889,19 +4905,25 @@ mod tests {
         let stream = Stream::new(dict, b"7 0 8 6 9 14 6 0 R [6 0 R] << /V 6 0 R >>".to_vec());
 
         assert_eq!(
-            parse_object_stream_entry(&stream, 0).unwrap().object,
-            Object::Integer(6)
+            parse_object_stream_entry(&stream, 0)
+                .unwrap()
+                .object
+                .as_integer(),
+            Some(6)
         );
-        assert_eq!(
-            parse_object_stream_entry(&stream, 1).unwrap().object,
-            Object::Array(vec![Object::Reference(ObjectRef::new(6, 0))])
-        );
+        let array = parse_object_stream_entry(&stream, 1)
+            .unwrap()
+            .object
+            .as_array()
+            .expect("array member");
+        assert_eq!(array.len(), 1);
+        assert_eq!(array[0].as_reference(), Some(ObjectRef::new(6, 0)));
         let dictionary = parse_object_stream_entry(&stream, 2)
             .unwrap()
             .object
-            .into_dict()
+            .try_get_key(b"/V")
             .expect("dictionary member");
-        assert_eq!(dictionary.get_ref("V"), Some(ObjectRef::new(6, 0)));
+        assert_eq!(dictionary.as_reference(), Some(ObjectRef::new(6, 0)));
     }
 
     #[test]
