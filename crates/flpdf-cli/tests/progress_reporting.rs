@@ -342,6 +342,37 @@ fn remove_attachment_keeps_progress_off_stdout() {
 }
 
 #[test]
+fn progress_rotate_to_a_valid_destination_still_reports_progress() {
+    let input = fixture("one-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let output_path = tempdir.path().join("rotate-out.pdf");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id", "--rotate=90:1"])
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .expect("flpdf invocation");
+
+    assert!(
+        output.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("progress output is UTF-8"),
+        progress_lines(
+            &output_path.display().to_string(),
+            &[0, 29, 43, 58, 72, 86, 99, 100]
+        )
+    );
+    assert!(output.stderr.is_empty());
+    assert!(output_path.exists(), "the destination validation guard must leave a valid destination untouched and still let the rotate write succeed");
+}
+
+#[test]
 fn progress_rewrite_to_unusable_destination_fails_before_any_progress_output() {
     let input = fixture("one-page.pdf");
     let tempdir = tempfile::tempdir().expect("tempdir");
