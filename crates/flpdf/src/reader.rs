@@ -676,11 +676,13 @@ impl<R: Read + Seek> Pdf<R> {
     fn encrypt_dictionary(&mut self) -> Result<Option<Dictionary>> {
         self.encrypt_dictionary_handle()?
             .map(|encrypt| {
+                // cov:ignore-start: encrypt_dictionary_handle already validated the dictionary type
                 encrypt.materialize()?.into_dict().ok_or_else(|| {
                     Error::Internal(
                         "validated /Encrypt handle did not materialize as a dictionary".into(),
                     )
                 })
+                // cov:ignore-end
             })
             .transpose()
     }
