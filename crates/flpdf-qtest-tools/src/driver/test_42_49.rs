@@ -2,8 +2,8 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::{
-    Error, NameTree, NumberTree, ObjectHandle, OutlineDocumentHelper, PageDocumentHelper,
-    PageLabelDocumentHelper, Pdf, PdfWriter,
+    Error, Matrix, NameTree, NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper,
+    PageDocumentHelper, PageLabelDocumentHelper, Pdf, PdfWriter, Rectangle,
 };
 
 use super::{emit_new_diagnostics, format_nntree_exception};
@@ -43,18 +43,16 @@ fn chase_key<R: Read + Seek>(
 
 pub(crate) fn run_test_42<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // qpdf 11.9.0 qpdf/test_driver.cc:1407-1549. Crafted for
-    // object-types.pdf. The function is exclusively `assert()`-based (a
-    // whitebox test of `QPDFObjectHandle`'s own C++ API); it never writes to
-    // stdout, and its only stderr output ("One error"/"Two errors") are
-    // literal markers for WARNING lines produced by the very wrong-type
-    // accessors gapped below, so nothing observable is lost by stopping here.
+    // qpdf 11.9.0 qpdf/test_driver.cc:1407-1549. Keep this as a thin
+    // consumer of ObjectHandle's qpdf-shaped accessors: warning text is
+    // produced by the handle's document resolver and drained here at the
+    // same boundaries as qpdf's logger.
     let qtest = pdf.trailer_key_handle(b"QTest");
     pdf.resolve(&qtest)?;
     let qtest = qtest.clone();
@@ -66,27 +64,218 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     let array = key2.clone();
     let integer = qtest.get_key(b"/Integer");
     pdf.resolve(&integer)?;
-    assert!(
-        array.as_array().is_some(),
-        "qpdf test_42 requires /Dictionary/Key2 to be an array"
-    );
 
-    // GAP(QPDFObjectHandle::aitems/ditems iterator; QPDFObjectHandle::getKeyIfDict;
-    // QPDFObjectHandle::getStringValue/getName/getOperatorValue/getRealValue/
-    // getNumericValue/getInlineImageValue/getDictAsMap/getKeys wrong-type-warning
-    // scalar accessors; QPDFObjectHandle::isRectangle/getArrayAsRectangle/
-    // newFromRectangle and ::isMatrix/getArrayAsMatrix/newFromMatrix; and the
-    // uninitialized-`QPDFObjectHandle` state exercised by `isInitialized()`
-    // after decrementing an `aitems()`/`ditems()` end iterator, and by a
-    // default-constructed handle at the end of the test): qpdf's test_42
-    // spends the remainder of its body on these low-level `QPDFObjectHandle`
-    // primitives. None has a public flpdf equivalent -- `type_warning`
-    // (`object_handle.rs:2105`) and the scalar wrong-type accessors it backs
-    // are `pub(crate)`, `ObjectHandle` has no array/dict-iterator type, no
-    // Rectangle/Matrix array conversion exists on `ObjectHandle` (only the
-    // standalone `flpdf::Rectangle`/`flpdf::Matrix` value types exist), and
-    // `ObjectHandle` has no state distinct from a direct null handle to
-    // represent "uninitialized". The function has no output either way.
+    assert!(array.try_is_array()?);
+    {
+        let items = array.try_array_items()?;
+        let mut cursor = items.begin();
+        let i_value = cursor.current();
+        assert_eq!(i_value.try_get_name()?, b"/Item0");
+        cursor.previous();
+        assert_eq!(i_value.try_get_name()?, b"/Item0");
+        cursor.next();
+        cursor.next();
+        cursor.next();
+        assert!(cursor.is_end());
+        cursor.next();
+        assert!(cursor.is_end());
+        assert!(!i_value.is_initialized());
+        cursor.previous();
+        assert_eq!(i_value.try_get_name()?, b"/Item2");
+        assert_eq!(cursor.current().try_get_name()?, b"/Item2");
+    }
+
+    assert!(dictionary.try_is_dictionary()?);
+    {
+        let items = dictionary.try_dict_items()?;
+        let mut cursor = items.begin();
+        let entry = cursor.current();
+        assert_eq!(entry.key, b"/Key1");
+        assert_eq!(entry.value.try_get_name()?, b"/Value1");
+        cursor.next();
+        cursor.next();
+        assert!(cursor.is_end());
+        assert!(!entry.value.is_initialized());
+    }
+
+    qtest.try_get_string_value()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(array.try_get_array_item(-1)?.is_null());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(array.try_get_array_item(16_059)?.is_null());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_array_item(0)?.is_null());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.try_append_array_item(ObjectHandle::null())?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    array.try_erase_array_item_at(-1)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    array.try_erase_array_item_at(16_059)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    array.try_insert_array_item_at(42, ObjectHandle::name(b"Dontpanic".to_vec()))?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    array.try_set_array_item_at(42, ObjectHandle::name(b"Dontpanic".to_vec()))?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.try_erase_array_item_at(0)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.try_insert_array_item_at(0, ObjectHandle::null())?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.try_set_array_items(Vec::new())?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.try_set_array_item_at(0, ObjectHandle::null())?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(integer.try_get_array_n_items()?, 0);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_array_as_vector()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(!integer.try_get_bool_value()?);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_dict_as_map()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_keys()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(!integer.try_get_has_key(b"/Potato")?);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.remove_key_and_get_old(b"/Potato")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.replace_key(b"/Potato", ObjectHandle::null())?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer.replace_key(b"/Potato", ObjectHandle::integer(1))?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(ObjectHandle::null()
+        .try_get_key_if_dict(b"/Integer")?
+        .try_get_key_if_dict(b"/Potato")?
+        .is_null());
+
+    let integer_from_qtest = qtest.try_get_key(b"/Integer")?;
+    integer_from_qtest.try_get_key_if_dict(b"/Potato")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    integer_from_qtest.try_get_key(b"/Potato")?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_inline_image_value()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(dictionary.try_get_int_value()?, 0);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(integer.try_get_name()?, b"/QPDFFakeName");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(integer.try_get_operator_value()?, b"QPDFFAKE");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(dictionary.try_get_real_value()?, b"0.0");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_string_value()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert!(integer.try_get_utf8_value()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    assert_eq!(dictionary.try_get_numeric_value()?, 0.0);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    writeln!(stderr, "One error")?;
+    assert!(array
+        .try_get_array_item(0)?
+        .try_get_string_value()?
+        .is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    writeln!(stderr, "One error")?;
+    assert!(dictionary
+        .try_get_key(b"/Quack")?
+        .try_get_string_value()?
+        .is_empty());
+    assert!(dictionary
+        .try_get_key_if_dict(b"/Quack")?
+        .try_get_string_value()?
+        .is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let nested_dictionary = array.try_get_array_item(1)?;
+    assert!(nested_dictionary.try_is_dictionary()?);
+    let nested_array = nested_dictionary.try_get_key(b"/K")?;
+    assert!(nested_array.try_is_array()?);
+    let nested_name = nested_array.try_get_array_item(0)?;
+    assert!(nested_name.try_is_name()?);
+    assert_eq!(nested_name.try_get_name()?, b"/V");
+
+    writeln!(stderr, "Two errors")?;
+    let invalid_item = array.try_get_array_item(16_059)?;
+    assert!(invalid_item.try_get_string_value()?.is_empty());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    writeln!(stderr, "One error")?;
+    array
+        .try_get_array_item(1)?
+        .try_get_key(b"/K")?
+        .try_get_array_item(0)?
+        .try_get_string_value()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    let page_ref = PageDocumentHelper::new(pdf)
+        .get_all_pages()?
+        .into_iter()
+        .next()
+        .expect("qpdf test_42 requires one page");
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page)?;
+    let contents = page.try_get_key(b"/Contents")?;
+    pdf.resolve(&contents)?;
+    let stream_dictionary = contents
+        .as_stream_dict()
+        .expect("qpdf test_42 requires a stream contents object");
+    pdf.resolve(&stream_dictionary)?;
+    assert_eq!(
+        stream_dictionary.try_get_key(b"/Potato")?.try_get_name()?,
+        b"/QPDFFakeName"
+    );
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    assert_eq!(integer.try_get_array_as_rectangle()?, Rectangle::default());
+    let rectangle = ObjectHandle::new_from_rectangle(Rectangle::new(1.2, 3.4, 5.6, 7.8));
+    let rectangle_value = rectangle.try_get_array_as_rectangle()?;
+    assert!(rectangle.try_is_rectangle()?);
+    assert!(rectangle_value.llx > 1.19 && rectangle_value.llx < 1.21);
+    assert!(rectangle_value.lly > 3.39 && rectangle_value.lly < 3.41);
+    assert!(rectangle_value.urx > 5.59 && rectangle_value.urx < 5.61);
+    assert!(rectangle_value.ury > 7.79 && rectangle_value.ury < 7.81);
+    for input in [b"[1 2 3 4 5]".as_slice(), b"[1 2 3]", b"[1 2 false 4]"] {
+        let value = ObjectHandle::parse(input)?;
+        assert!(!value.try_is_rectangle()?);
+        assert_eq!(value.try_get_array_as_rectangle()?, Rectangle::default());
+    }
+
+    let matrix =
+        ObjectHandle::new_from_matrix(ObjectHandleMatrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3));
+    let matrix_value = matrix.try_get_array_as_matrix()?;
+    assert!(matrix.try_is_matrix()?);
+    assert!(matrix_value.a > 1.19 && matrix_value.a < 1.21);
+    assert!(matrix_value.b > 3.39 && matrix_value.b < 3.41);
+    assert!(matrix_value.c > 5.59 && matrix_value.c < 5.61);
+    assert!(matrix_value.d > 7.79 && matrix_value.d < 7.81);
+    assert!(matrix_value.e > 9.09 && matrix_value.e < 9.11);
+    assert!(matrix_value.f > 2.29 && matrix_value.f < 2.31);
+    let qpdf_matrix = ObjectHandle::new_from_qpdf_matrix(Matrix::new(1.2, 3.4, 5.6, 7.8, 9.1, 2.3));
+    let qpdf_matrix_value = qpdf_matrix.try_get_array_as_matrix()?;
+    assert!(qpdf_matrix.try_is_matrix()?);
+    assert!(qpdf_matrix_value.a > 1.19 && qpdf_matrix_value.a < 1.21);
+    assert!(qpdf_matrix_value.b > 3.39 && qpdf_matrix_value.b < 3.41);
+    assert!(qpdf_matrix_value.c > 5.59 && qpdf_matrix_value.c < 5.61);
+    assert!(qpdf_matrix_value.d > 7.79 && qpdf_matrix_value.d < 7.81);
+    assert!(qpdf_matrix_value.e > 9.09 && qpdf_matrix_value.e < 9.11);
+    assert!(qpdf_matrix_value.f > 2.29 && qpdf_matrix_value.f < 2.31);
+    for input in [
+        b"[1 2 3 4 5]".as_slice(),
+        b"[1 2 3 4 5 6 7]",
+        b"[1 2 3 false 5 6 7]",
+        b"42",
+    ] {
+        let value = ObjectHandle::parse(input)?;
+        assert!(!value.try_is_matrix()?);
+        assert_eq!(
+            value.try_get_array_as_matrix()?,
+            ObjectHandleMatrix::default()
+        );
+    }
+
+    let uninitialized = ObjectHandle::uninitialized();
+    assert!(!uninitialized.is_initialized());
+    assert!(!uninitialized.try_is_integer()?);
+    assert!(!uninitialized.try_is_dictionary()?);
+    assert!(!uninitialized.try_is_scalar()?);
     Ok(())
 }
 
@@ -762,10 +951,15 @@ mod tests {
     fn pdf_with_object_types_qtest() -> Vec<u8> {
         let objects: &[(u32, &[u8])] = &[
             (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 0 >>\nstream\n\nendstream"),
         ];
         let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut offsets = [0usize; 3];
+        let mut offsets = [0usize; 5];
         for &(number, body) in objects {
             offsets[number as usize] = bytes.len();
             bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
@@ -773,13 +967,13 @@ mod tests {
             bytes.extend_from_slice(b"\nendobj\n");
         }
         let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
         for offset in offsets.into_iter().skip(1) {
             bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
         bytes.extend_from_slice(
             format!(
-                "trailer\n<< /Size 3 /Root 1 0 R /QTest << /Dictionary << /Key2 [] >> /Integer 1 >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
+                "trailer\n<< /Size 5 /Root 1 0 R /QTest << /Dictionary << /Key1 /Value1 /Key2 [ /Item0 << /K [ /V ] >> /Item2 ] >> /Integer 1 >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
             )
             .as_bytes(),
         );
@@ -894,7 +1088,56 @@ mod tests {
         )
         .expect("run test 42");
         assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        let warning_text = String::from_utf8(stderr).expect("warnings are UTF-8");
+        assert_eq!(
+            warning_text,
+            concat!(
+                "WARNING: operation for string attempted on object of type dictionary: returning empty string\n",
+                "WARNING: returning null for out of bounds array access\n",
+                "WARNING: returning null for out of bounds array access\n",
+                "WARNING: operation for array attempted on object of type integer: returning null\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to append item\n",
+                "WARNING: ignoring attempt to erase out of bounds array item\n",
+                "WARNING: ignoring attempt to erase out of bounds array item\n",
+                "WARNING: ignoring attempt to insert out of bounds array item\n",
+                "WARNING: ignoring attempt to set out of bounds array item\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to erase item\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to insert item\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to replace items\n",
+                "WARNING: operation for array attempted on object of type integer: ignoring attempt to set item\n",
+                "WARNING: operation for array attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for array attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for boolean attempted on object of type integer: returning false\n",
+                "WARNING: operation for dictionary attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for dictionary attempted on object of type integer: treating as empty\n",
+                "WARNING: operation for dictionary attempted on object of type integer: returning false for a key containment request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: ignoring key removal request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: ignoring key replacement request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: ignoring key replacement request\n",
+                "WARNING: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n",
+                "WARNING: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n",
+                "WARNING: operation for inlineimage attempted on object of type integer: returning empty data\n",
+                "WARNING: operation for integer attempted on object of type dictionary: returning 0\n",
+                "WARNING: operation for name attempted on object of type integer: returning dummy name\n",
+                "WARNING: operation for operator attempted on object of type integer: returning fake value\n",
+                "WARNING: operation for real attempted on object of type dictionary: returning 0.0\n",
+                "WARNING: operation for string attempted on object of type integer: returning empty string\n",
+                "WARNING: operation for string attempted on object of type integer: returning empty string\n",
+                "WARNING: operation for number attempted on object of type dictionary: returning 0\n",
+                "One error\n",
+                "WARNING: operation for string attempted on object of type name: returning empty string\n",
+                "One error\n",
+                "WARNING:  -> dictionary key /Quack: operation for string attempted on object of type null: returning empty string\n",
+                "WARNING:  -> dictionary key /Quack: operation for string attempted on object of type null: returning empty string\n",
+                "Two errors\n",
+                "WARNING: returning null for out of bounds array access\n",
+                "WARNING:  -> null returned from invalid array access: operation for string attempted on object of type null: returning empty string\n",
+                "One error\n",
+                "WARNING: operation for string attempted on object of type name: returning empty string\n",
+                "WARNING: , object 4 0 at offset 212 -> dictionary key /Potato: operation for name attempted on object of type null: returning dummy name\n",
+            )
+        );
+        assert!(!warning_text.contains("test 42 done"));
 
         let mut pdf = minimal_pdf();
         let mut stdout = Vec::new();

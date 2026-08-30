@@ -1290,10 +1290,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// Register the existing handle allocation under qpdf's fresh object
     /// identity, preserving the handle's shared storage instead of cloning its
-    /// value. This is the Rust equivalent of
-    /// `QPDF::makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`): the
-    /// handle aliases held by the caller and the canonical cache see the same
-    /// object after promotion.
+    /// value. This is the Rust equivalent of qpdf's higher-level
+    /// `QPDF::makeIndirectObject(QPDFObjectHandle)`, which rejects an
+    /// uninitialized handle before delegating to the raw-`shared_ptr`
+    /// primitive `QPDF::makeIndirectFromQPDFObject`
+    /// (`libqpdf/QPDF.cc:1882-1895`): the handle aliases held by the caller
+    /// and the canonical cache see the same object after promotion.
     #[allow(dead_code)]
     pub(crate) fn make_indirect_from_object_handle(
         &self,
@@ -1302,6 +1304,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if !handle.is_direct() {
             return Err(Error::Unsupported(
                 "cannot make an already-indirect ObjectHandle indirect".to_string(),
+            ));
+        }
+        if !handle.is_initialized() {
+            return Err(Error::Unsupported(
+                "attempted to make an uninitialized QPDFObjectHandle indirect".to_string(),
             ));
         }
         let object_ref = self.next_obj_gen()?;
