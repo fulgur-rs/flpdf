@@ -14144,6 +14144,22 @@ mod mutation_tests {
             resolver.warnings.borrow().as_slice(),
             &["offset 9: input stream is complete but output may still be valid"]
         );
+
+        resolver.warnings.borrow_mut().clear();
+        let mut suppressed_sink = crate::pipeline::buffer::Buffer::new("suppressed", None);
+        assert!(stream
+            .pipe_stream_data(
+                &mut suppressed_sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                true,
+                false,
+            )
+            .unwrap());
+        assert!(filtering_attempted);
+        assert!(suppressed_sink.take_buffer().unwrap().is_empty());
+        assert!(resolver.warnings.borrow().is_empty());
     }
 
     #[test]
