@@ -17456,6 +17456,7 @@ mod stream_provider_contract_tests {
 #[cfg(test)]
 pub(crate) mod warning_emission_tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// A document that records every warning an object emits through it.
     pub(crate) struct WarningRecorder {
@@ -17568,6 +17569,51 @@ pub(crate) mod warning_emission_tests {
                     == "operation for dictionary attempted on object of type integer: \
                         treating as empty"
         ));
+    }
+
+    #[test]
+    fn qpdf_type_check_accessors_return_fallbacks_and_warn() {
+        let (integer, recorder) = handle_resolving(ObjectValue::Integer(7));
+        let (dictionary, dictionary_recorder) =
+            handle_resolving(ObjectValue::Dictionary(BTreeMap::new()));
+
+        assert!(!integer.try_get_bool_value().unwrap());
+        assert_eq!(integer.try_get_real_value().unwrap(), b"0.0");
+        assert_eq!(integer.try_get_name().unwrap(), b"/QPDFFakeName");
+        assert!(integer.try_get_string_value().unwrap().is_empty());
+        assert!(integer.try_get_utf8_value().unwrap().is_empty());
+        assert_eq!(integer.try_get_operator_value().unwrap(), b"QPDFFAKE");
+        assert!(integer.try_get_inline_image_value().unwrap().is_empty());
+        assert_eq!(dictionary.try_get_int_value().unwrap(), 0);
+        assert_eq!(dictionary.try_get_numeric_value().unwrap(), 0.0);
+
+        assert_eq!(warnings(&recorder).len(), 7);
+        assert_eq!(warnings(&dictionary_recorder).len(), 2);
+        assert!(warnings(&recorder)
+            .iter()
+            .all(|message| message.contains("object 3 0: operation for")));
+        assert!(warnings(&dictionary_recorder)
+            .iter()
+            .all(|message| message.contains("object 3 0: operation for")));
+    }
+
+    #[test]
+    fn qpdf_type_check_container_accessors_keep_qpdf_fallbacks() {
+        let (integer, recorder) = handle_resolving(ObjectValue::Integer(7));
+        let null = ObjectHandle::null();
+
+        assert_eq!(integer.try_get_array_n_items().unwrap(), 0);
+        assert!(integer.try_get_array_as_vector().unwrap().is_empty());
+        assert!(integer.try_get_array_item(-1).unwrap().is_null());
+        assert!(!integer.try_get_has_key(b"/Potato").unwrap());
+        assert!(integer.try_get_dict_as_map().unwrap().is_empty());
+        assert!(integer.try_get_key_if_dict(b"/Potato").unwrap().is_null());
+        assert!(null.try_get_key_if_dict(b"/Integer").unwrap().is_null());
+
+        assert_eq!(warnings(&recorder).len(), 6);
+        assert!(warnings(&recorder)
+            .iter()
+            .any(|message| message.contains("returning null")));
     }
 
     #[test]

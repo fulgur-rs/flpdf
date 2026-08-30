@@ -762,10 +762,15 @@ mod tests {
     fn pdf_with_object_types_qtest() -> Vec<u8> {
         let objects: &[(u32, &[u8])] = &[
             (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, b"<< /Type /Pages /Count 0 /Kids [] >>"),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 0 >>\nstream\n\nendstream"),
         ];
         let mut bytes = b"%PDF-1.7\n".to_vec();
-        let mut offsets = [0usize; 3];
+        let mut offsets = [0usize; 5];
         for &(number, body) in objects {
             offsets[number as usize] = bytes.len();
             bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
@@ -773,13 +778,13 @@ mod tests {
             bytes.extend_from_slice(b"\nendobj\n");
         }
         let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
         for offset in offsets.into_iter().skip(1) {
             bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
         bytes.extend_from_slice(
             format!(
-                "trailer\n<< /Size 3 /Root 1 0 R /QTest << /Dictionary << /Key2 [] >> /Integer 1 >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
+                "trailer\n<< /Size 5 /Root 1 0 R /QTest << /Dictionary << /Key1 /Value1 /Key2 [ /Item0 << /K [ /V ] >> /Item2 ] >> /Integer 1 >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
             )
             .as_bytes(),
         );
@@ -894,7 +899,11 @@ mod tests {
         )
         .expect("run test 42");
         assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        let warning_text = String::from_utf8(stderr).expect("warnings are UTF-8");
+        assert!(warning_text.contains("operation for string attempted on object of type"));
+        assert!(warning_text.contains("returning null for out of bounds array access"));
+        assert!(warning_text.contains("ignoring attempt to append item"));
+        assert!(warning_text.contains("test 42 done"));
 
         let mut pdf = minimal_pdf();
         let mut stdout = Vec::new();

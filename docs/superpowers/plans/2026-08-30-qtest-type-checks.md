@@ -64,13 +64,13 @@ Add a parsed-document test that invokes the warning-producing family and checks 
 
 ```rust
 assert_eq!(integer.try_get_bool_value().unwrap(), false);
-assert_eq!(integer.try_get_int_value().unwrap(), 0);
 assert_eq!(integer.try_get_real_value().unwrap(), b"0.0");
 assert_eq!(integer.try_get_name().unwrap(), b"/QPDFFakeName");
 assert_eq!(integer.try_get_string_value().unwrap(), b"");
 assert_eq!(integer.try_get_utf8_value().unwrap(), b"");
 assert_eq!(integer.try_get_operator_value().unwrap(), b"QPDFFAKE");
 assert_eq!(integer.try_get_inline_image_value().unwrap(), b"");
+assert_eq!(dictionary.try_get_int_value().unwrap(), 0);
 assert_eq!(dictionary.try_get_numeric_value().unwrap(), 0.0);
 ```
 
