@@ -370,6 +370,33 @@ fn progress_rewrite_to_unusable_destination_fails_before_any_progress_output() {
     assert!(stderr.contains("Is a directory"), "stderr: {stderr}");
 }
 
+#[test]
+fn progress_pages_extraction_to_unusable_destination_fails_before_any_progress_output() {
+    let input = fixture("two-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let bad_destination = tempdir.path().join("not-a-file");
+    std::fs::create_dir(&bad_destination).expect("directory destination");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id"])
+        .arg(&input)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&bad_destination)
+        .output()
+        .expect("flpdf invocation");
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "no progress output must be printed before the destination is validated: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
+    assert!(stderr.contains("Is a directory"), "stderr: {stderr}");
+}
+
 fn fixture_from_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
