@@ -16,6 +16,7 @@ use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::apply_rotate_to_pages;
 use super::rotate_spec::RotateSpec;
 use crate::encryption::{EncryptMethod, EncryptParams};
+use crate::json::input::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
@@ -684,12 +685,29 @@ fn parse_job_split_pages(value: &[u8]) -> Result<usize> {
     if value.is_empty() {
         return Ok(1);
     }
-    let value = String::from_utf8_lossy(value);
-    value.parse::<usize>().map_err(|_| {
-        Error::Usage(UsageError::new(format!(
-            ".splitPages: invalid page count {value}"
-        )))
-    })
+    let text = String::from_utf8_lossy(value);
+    // qpdf converts a non-empty parameter with `QUtil::string_to_int`
+    // (`libqpdf/QPDFJob_config.cc:604-609`), whose `strtoll` stage performs
+    // no conversion and returns 0 for a string with no leading digit run --
+    // and 0 is falsy in qpdf's own `if (m->split_pages)` checks, so a
+    // malformed value behaves exactly like an explicit "0": both fall
+    // through to an ordinary, unsplit write rather than being rejected.
+    // Confirmed live: `splitPages: "not-a-number"` succeeds and writes one
+    // ordinary output file.
+    match qpdf_string_to_int_checked(&text) {
+        QpdfIntParse::NoDigits => Ok(0),
+        // A negative value is truthy in qpdf's `if (m->split_pages)` check
+        // and only fails later, inside the actual split loop, when qpdf
+        // narrows it to an unsigned chunk size (`QIntC::to_size`,
+        // `libqpdf/QPDFJob.cc:2970`). Rejecting it here instead is a known,
+        // tracked residual divergence (flpdf-sp4g) -- it needs
+        // `configuration.split_pages` to hold a signed value so "truthy but
+        // not a usable chunk size" can be represented at all.
+        QpdfIntParse::Value(count) if count >= 0 => Ok(count as usize),
+        QpdfIntParse::Value(_) | QpdfIntParse::Overflow(_) => Err(Error::Usage(UsageError::new(
+            format!(".splitPages: invalid page count {text}"),
+        ))),
+    }
 }
 
 fn parse_job_attachment(value: &crate::json::Json, path: &str) -> Result<AttachmentAddOptions> {
@@ -1672,14 +1690,14 @@ impl QPDFJob {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
         }
         let progress_requested = self.configuration.progress;
-        let write_result =
+        let write_result: Result<Vec<PathBuf>> =
             if let Some(chunk_size) = self.configuration.split_pages.filter(|size| *size > 0) {
                 let mut split_options = SplitPageOptions::new(chunk_size, output.clone())
                     .with_writer_configuration(writer_configuration.clone());
                 if let Some(input) = self.configuration.input_file.clone() {
                     split_options = split_options.with_input_path(input);
                 }
-                self.split_pages(pdf, split_options).map(|_| ())
+                self.split_pages(pdf, split_options)
             } else {
                 (|| {
                     let mut writer = PdfWriter::new(pdf);
@@ -1687,24 +1705,35 @@ impl QPDFJob {
                     if progress_requested {
                         self.configure_writer_progress(&mut writer);
                     }
-                    if output == Path::new("-") {
+                    let written = if output == Path::new("-") {
                         self.logger.save_to_standard_output(true)?;
                         writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
+                        Vec::new()
                     } else {
                         writer.set_output_file(&output)?;
-                    }
-                    writer.write()
+                        vec![output.clone()]
+                    };
+                    writer.write()?;
+                    Ok(written)
                 })()
             };
         match write_result {
-            Ok(()) => {
+            Ok(written) => {
                 self.record_document_warnings(pdf);
-                if self.configuration.verbose && output != Path::new("-") {
-                    self.logger.info(format!(
-                        "{}: wrote file {}\n",
-                        self.message_prefix,
-                        output.display()
-                    ))?; // cov:ignore: llvm-cov attributes this successful logger write to its opening expressions
+                if self.configuration.verbose {
+                    // qpdf reports one "wrote file" line per real output file
+                    // (`libqpdf/QPDFJob.cc:3019-3021` inside the per-chunk
+                    // split loop); a split write's real chunk filenames
+                    // never equal the requested output template, so `written`
+                    // must be the writer's actual output paths, not the
+                    // template `output` path.
+                    for path in &written {
+                        self.logger.info(format!(
+                            "{}: wrote file {}\n",
+                            self.message_prefix,
+                            path.display()
+                        ))?;
+                    }
                 }
                 self.complete(true)
             }
@@ -2157,7 +2186,14 @@ impl QPDFJob {
             self.configuration.input_file.as_deref(),
             self.configuration.output_file.as_deref(),
         ) {
-            if !self.configuration.replace_input && crate::qutil::same_file(input, output) {
+            // qpdf only runs this check when `!m->split_pages`
+            // (`libqpdf/QPDFJob.cc:627`): a splitting write never truncates
+            // the original input in place, so aliasing input and output is
+            // not destructive when splitting.
+            if !self.configuration.replace_input
+                && !self.configuration.split_pages.is_some_and(|size| size > 0)
+                && crate::qutil::same_file(input, output)
+            {
                 return Err(UsageError::new(
                     "input file and output file are the same; use --replace-input to intentionally overwrite the input",
                 )

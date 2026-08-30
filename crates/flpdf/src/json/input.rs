@@ -1181,17 +1181,26 @@ fn validate_pdf_version(value: &[u8]) -> Option<String> {
 /// on overflow in qpdf (`include/qpdf/QIntC.hh:87-109`); callers must
 /// surface [`Overflow`](QpdfIntParse::Overflow) as a fatal error rather than
 /// silently treating the value as absent or mismatched.
+///
+/// [`NoDigits`](QpdfIntParse::NoDigits) has no qpdf-side counterpart for the
+/// indirect-reference and JSON-version callers in this module, which only
+/// reach `string_to_int` once their own shape check has already guaranteed a
+/// digit is present. A caller that instead calls `string_to_int` directly on
+/// unchecked input, the way `QPDFJob::Config::splitPages`
+/// (`libqpdf/QPDFJob_config.cc:604-609`) does, DOES have a real qpdf-side
+/// counterpart for it: `strtoll` performs no conversion and returns `0`,
+/// which is falsy in qpdf's own `if (m->split_pages)` checks
+/// (`libqpdf/QPDFJob.cc:488,576,616`).
 #[derive(Debug, PartialEq, Eq)]
-enum QpdfIntParse {
-    /// No leading digit was found. qpdf's own call sites only reach
-    /// `string_to_int` once their own shape check has already guaranteed a
-    /// digit is present, so this variant has no qpdf-side counterpart.
+pub(crate) enum QpdfIntParse {
+    /// No leading digit was found. See the enum doc for whether this has a
+    /// qpdf-side counterpart in a given caller's context.
     NoDigits,
     Overflow(String),
     Value(i32),
 }
 
-fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
+pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
     let stripped = text.strip_prefix('+').unwrap_or(text);
     let (negative, digits) = stripped
         .strip_prefix('-')

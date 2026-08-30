@@ -219,6 +219,78 @@ fn job_json_file_split_pages_writes_qpdf_named_chunks() {
 }
 
 #[test]
+fn job_json_file_split_pages_reports_each_chunk_filename_when_verbose() {
+    // qpdf reports one "wrote file" line per real chunk from inside the
+    // per-chunk split loop (`libqpdf/QPDFJob.cc:3019-3021`), never the
+    // requested output template. Confirmed live against qpdf 11.9.0.
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-verbose.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"split.pdf","splitPages":"1","verbose":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-verbose.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for page in 1..=3 {
+        assert!(
+            stdout.contains(&format!("wrote file split-{page}.pdf")),
+            "stdout missing chunk report for split-{page}.pdf: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("wrote file split.pdf\n"),
+        "verbose report must not name the unsplit output template: {stdout}"
+    );
+}
+
+#[test]
+fn job_json_file_split_pages_allows_the_same_input_and_output_path() {
+    // qpdf only runs the same-file rejection when `!m->split_pages`
+    // (`libqpdf/QPDFJob.cc:627`): a splitting write never truncates the
+    // original input in place, so aliasing input and output is not
+    // destructive when splitting. Confirmed live against qpdf 11.9.0.
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    let input = directory.path().join("input.pdf");
+    fs::copy(fixture, &input).unwrap();
+    let before = fs::read(&input).unwrap();
+    fs::write(
+        directory.path().join("split-same.json"),
+        serde_json::json!({
+            "inputFile": &input,
+            "outputFile": &input,
+            "splitPages": "1",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-same.json")
+        .assert()
+        .code(0);
+
+    assert_eq!(fs::read(&input).unwrap(), before, "input must be untouched");
+    for page in 1..=3 {
+        assert!(directory.path().join(format!("input-{page}.pdf")).is_file());
+    }
+}
+
+#[test]
 fn job_json_file_split_pages_empty_value_defaults_to_one() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -345,14 +417,20 @@ fn job_json_file_rotate_trailing_colon_means_all_pages_like_qpdf() {
 }
 
 #[test]
-fn job_json_file_split_pages_rejects_a_non_numeric_value() {
+fn job_json_file_split_pages_non_numeric_value_falls_through_to_one_unsplit_output() {
+    // qpdf converts the parameter with `QUtil::string_to_int`, whose
+    // `strtoll` stage performs no conversion and returns 0 for a string with
+    // no leading digit run; 0 is falsy in qpdf's `if (m->split_pages)`
+    // checks, so a malformed value behaves exactly like an explicit "0" and
+    // silently falls through to an ordinary, unsplit write rather than being
+    // rejected. Confirmed live against qpdf 11.9.0.
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/three-page.pdf");
     fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
     fs::write(
         directory.path().join("split-invalid.json"),
-        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","splitPages":"not-a-number"}"#,
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","splitPages":"not-a-number","staticId":""}"#,
     )
     .unwrap();
 
@@ -361,10 +439,10 @@ fn job_json_file_split_pages_rejects_a_non_numeric_value() {
         .current_dir(directory.path())
         .arg("--job-json-file=split-invalid.json")
         .assert()
-        .code(2)
-        .stderr(predicates::str::contains(
-            ".splitPages: invalid page count not-a-number",
-        ));
+        .code(0);
+
+    assert!(directory.path().join("out.pdf").is_file());
+    assert!(!directory.path().join("out-1.pdf").exists());
 }
 
 #[test]
