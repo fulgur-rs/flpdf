@@ -36,6 +36,45 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
 }
 
 #[test]
+fn job_json_file_coalesce_contents_replaces_a_page_contents_array() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/multi-contents-one-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("coalesce.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"coalesced.pdf","coalesceContents":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=coalesce.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    let mut pdf = Pdf::open(Cursor::new(
+        fs::read(directory.path().join("coalesced.pdf")).unwrap(),
+    ))
+    .unwrap();
+    let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    let contents = page.try_get_key(b"/Contents").unwrap();
+    pdf.resolve(&contents).unwrap();
+    assert!(
+        contents.as_stream_dict().is_some(),
+        "coalesceContents must replace an array with one stream"
+    );
+    assert_eq!(
+        flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap(),
+        b"BT /F1 12 Tf 100 700 Td (Hello) Tj ET\nBT /F1 12 Tf 100 680 Td (World) Tj ET\n"
+    );
+}
+
+#[test]
 fn job_json_file_usage_errors_use_the_qpdf_job_file_boundary() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
