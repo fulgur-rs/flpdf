@@ -706,7 +706,7 @@ impl DocumentResolver for BootstrapHandleDocument {
                 // resolving the same indirect value against the repaired
                 // entries.
                 if self.state.borrow().reconstruction_trigger.is_some() {
-                    return Err(error);
+                    return Err(error); // cov:ignore: LLVM maps the tested reconstruction handoff return to the condition edge
                 }
                 let offset = match &error {
                     Error::Parse { offset, .. } => Some(*offset as u64),
@@ -981,11 +981,14 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     let xref_pos = match usize::try_from(startxref) {
         Ok(xref_pos) => xref_pos,
+        // cov:ignore-start: converting the u64 startxref offset can overflow
+        // only on a 32-bit target; the supported CI target is 64-bit.
         Err(_) if allow_repair => {
             parse_errors.push(Error::parse(0, "startxref does not fit usize"));
             0
         }
-        Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
+        // cov:ignore-end
+        Err(_) => return Err(Error::parse(0, "startxref does not fit usize")), // cov:ignore: the same u64-to-usize overflow is unrepresentable on the supported target
     };
 
     let mut registration = XrefRegistration::default();
@@ -1426,7 +1429,7 @@ fn merge_xref_stream_from_classic_trailer(
         return Err(error);
     }
     context.cache.commit();
-    let Some(xref_stream_offset) =
+    let Some(xref_stream_offset) = // cov:ignore: LLVM maps the covered hybrid-offset let-else binding to its continuation edge
         xref_stream_value.and_then(|value| value.try_as_integer().ok().flatten())
     else {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
