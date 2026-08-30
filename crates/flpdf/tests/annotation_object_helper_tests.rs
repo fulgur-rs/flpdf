@@ -5,9 +5,10 @@
 //! The PDF byte sequences are hand-crafted to exercise each typed accessor and,
 //! for form fields, the `/Parent` chain inheritance behaviour.
 
-use flpdf::{AnnotationObjectHelper, FormFieldObjectHelper, ObjectRef, Pdf};
+use flpdf::{AnnotationObjectHelper, FormFieldObjectHelper, ObjectHandle, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::rc::Rc;
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
 
@@ -455,27 +456,26 @@ fn annotation_handle_builds_no_rotate_page_content_for_appearance() {
         "/Subtype /Widget /F 16 /Rect [10 20 110 40] \
          /AP << /N 5 0 R >>",
     );
-    let bytes = {
+    let mut pdf = {
         let mut pdf = open(bytes);
-        let mut stream = flpdf::Dictionary::new();
-        stream.insert(
-            "BBox",
-            flpdf::Object::Array(vec![
-                flpdf::Object::Integer(0),
-                flpdf::Object::Integer(0),
-                flpdf::Object::Integer(100),
-                flpdf::Object::Integer(20),
-            ]),
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(100),
+                    ObjectHandle::integer(20),
+                ]),
+            )]),
+            Rc::new(Vec::new()),
         );
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            flpdf::Object::Stream(flpdf::Stream::new(stream, Vec::new())),
-        );
+        pdf.replace_object(ObjectRef::new(5, 0), stream)
+            .expect("replace appearance stream");
         pdf
     };
 
     // The helper owns the same qpdf NoRotate transform used by page flattening.
-    let mut pdf = bytes;
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     let content = annot
         .get_page_content_for_appearance("/Fxo1", 90, 0, 0x3)

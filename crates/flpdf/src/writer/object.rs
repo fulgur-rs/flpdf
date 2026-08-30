@@ -139,7 +139,7 @@ pub(crate) trait ObjectWriterEmission {
         &self,
         out: &mut Vec<u8>,
         xref_stream: bool,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     ) -> Result<()>;
     #[allow(clippy::too_many_arguments)]
     fn write_trailer_with_ref_map(
@@ -147,7 +147,7 @@ pub(crate) trait ObjectWriterEmission {
         out: &mut Vec<u8>,
         xref_stream: bool,
         qdf: bool,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         suppress_null_values: bool,
@@ -155,7 +155,7 @@ pub(crate) trait ObjectWriterEmission {
     fn write_dictionary_with_ref_map_and_id_writer(
         &self,
         out: &mut Vec<u8>,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         suppress_null_values: bool,
@@ -186,13 +186,13 @@ fn destroyed_unparse_error() -> Error {
 fn write_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
     if key.starts_with(b"/") {
         out.push(b'/');
-        crate::object::write_name_escaped(out, legacy_dictionary_key(key));
+        crate::pdf_syntax::write_name_escaped(out, legacy_dictionary_key(key));
     } else {
         // QPDF_Name::normalizeName preserves the first byte of a raw qpdf
         // dictionary key (`libqpdf/QPDF_Name.cc:27-50`). In particular,
         // `replaceKey("Array1", ...)` is intentionally emitted as the
         // slashless token `Array1`; do not silently canonicalize it here.
-        crate::object::write_name_escaped(out, key);
+        crate::pdf_syntax::write_name_escaped(out, key);
     }
 }
 
@@ -258,17 +258,13 @@ impl ObjectWriterEmission for ObjectHandle {
     /// own `m->qdf_mode` member set to `true` rather than `false` — a mode
     /// flag `unparseObject` checks internally, not an alternate set of call
     /// arguments. Carries forward this port's existing split between compact
-    /// and QDF container framing (`Object::write_pdf` / `Object::write_pdf_qdf`, this crate's
-    /// `object.rs`; see `docs/qpdf-correspondence.md`'s `QPDFWriter.cc` row,
-    /// classified 🔀, for that split) rather than re-deriving the indent
+    /// and QDF container framing rather than re-deriving the indent
     /// arithmetic from scratch: `indent` is the column (number of leading
     /// spaces) at which *this* value's own opening delimiter sits, an array
     /// or dictionary's children are written at `indent + 2`, and its closing
     /// delimiter (`]` / `>>`) returns to column `indent` on its own line —
-    /// exactly the legacy `Object::write_pdf_qdf` contract. Every
-    /// scalar (including a resolved-indirect [`ObjectValue::Reference`], no
-    /// qpdf counterpart, same as [`Self::write_object`]'s own choice for
-    /// it) writes byte-identically to the non-QDF form; only array,
+    /// exactly the established qpdf-shaped contract. Every scalar (including
+    /// a resolved indirect handle) writes byte-identically to the non-QDF form; only array,
     /// dictionary, and stream-dictionary-inlining framing differ.
     ///
     /// Applies the exact same null-suppression rule as [`Self::write_object`]
@@ -918,7 +914,7 @@ impl ObjectWriterEmission for ObjectHandle {
         &self,
         out: &mut Vec<u8>,
         xref_stream: bool,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     ) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -954,7 +950,7 @@ impl ObjectWriterEmission for ObjectHandle {
         out: &mut Vec<u8>,
         xref_stream: bool,
         qdf: bool,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         suppress_null_values: bool,
@@ -993,7 +989,7 @@ impl ObjectWriterEmission for ObjectHandle {
     fn write_dictionary_with_ref_map_and_id_writer(
         &self,
         out: &mut Vec<u8>,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         suppress_null_values: bool,
@@ -1490,14 +1486,14 @@ where
 // Writes one child handle's bytes for the plain-unparse family serviced by
 // `unparse_object_walk` below: an indirect child always writes as its own
 // `"N G R"` reference form, never recursed into — the same reference-vs-
-// recurse split `materialize_child`/`unparse_materialize_child` above already
+// recurse split used by the child-unparse helpers above already
 // apply, mirroring `QPDFWriter::unparseChild`'s own `child.isIndirect()`
 // check (`libqpdf/QPDFWriter.cc:1144-1156`, the check itself at `:1149`),
 // which `unparseObject`'s array-element and dictionary-value loops call into
 // for exactly this decision (`:1342`, `:1503`) instead of inlining it. A
 // direct child recurses through `unparse_object_walk`.
 //
-// No separate reserved check here, for the same reason `materialize_child`
+// No separate reserved check here, for the same reason the child-unparse helper
 // has none in its own reference-vs-recurse decision (see its own doc): the
 // decision below is `isIndirect()`-only, matching `unparseChild` exactly,
 // and never inspects the referenced object's resolved type. An *indirect*
@@ -1547,13 +1543,10 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
     handle
         .object_ref()
         .is_some_and(|object_ref| removed_refs.contains(&object_ref))
-        || handle
-            .as_reference()
-            .is_some_and(|object_ref| removed_refs.contains(&object_ref))
 }
 
 // The sole recursion hub for the plain unparse family (`ObjectHandle::
-// write_object` and its callees below), mirroring `unparse_materialize`'s
+// write_object` and its callees below), mirroring the unparse walk's
 // own single-hub pattern above for the same stack-growth reason: an
 // `ObjectHandle` tree built through public factories carries no depth bound
 // the parser enforces on parsed input. Also forces resolution of `handle`
@@ -1658,7 +1651,7 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Re
         ObjectValue::Integer(v) => out.extend_from_slice(v.to_string().as_bytes()),
         ObjectValue::Real(v) => out.extend_from_slice(v.to_string().as_bytes()),
         ObjectValue::RealLiteral { value, literal } => {
-            if crate::object::real_literal_is_safe(literal, *value) {
+            if crate::pdf_syntax::real_literal_is_safe(literal, *value) {
                 out.extend_from_slice(literal);
             } else {
                 out.extend_from_slice(value.to_string().as_bytes());
@@ -1666,9 +1659,9 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Re
         }
         ObjectValue::Name(name) => {
             out.push(b'/');
-            crate::object::write_name_escaped(out, name);
+            crate::pdf_syntax::write_name_escaped(out, name);
         }
-        ObjectValue::String(value) => crate::object::write_string_value(out, value),
+        ObjectValue::String(value) => crate::pdf_syntax::write_string_value(out, value),
         ObjectValue::Operator(value) | ObjectValue::InlineImage(value) => {
             out.extend_from_slice(value);
         }
@@ -1713,22 +1706,6 @@ pub(crate) fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Re
             // generic dispatch does not implement qpdf's real
             // stream-writing path for the indirect case either.
             unparse_object_walk(stream_dict, out)?;
-        }
-        ObjectValue::Reference(object_ref) => {
-            // qpdf-cutover-delete(flpdf-25kg.3.3) variant: an indirect
-            // handle's own resolved value can genuinely be a bare reference
-            // (e.g. a `Pdf::set_object` redirect -- see `ObjectValue::
-            // Reference`'s own doc; exercised by `unparse_tests::
-            // resolved_to_a_reference_indirect_handle_unparse_and_unparse_resolved_diverge`).
-            // No qpdf counterpart exists (a real `QPDFObjectHandle`'s
-            // resolved value is never itself a bare reference), so there is
-            // no oracle to match byte-for-byte; this mirrors
-            // `unparse_resolved`'s own choice for the identical shape
-            // (`unparse_materialize_value`'s fallthrough to
-            // `materialize_value`'s `Reference` arm, then
-            // `Object::write_pdf`, `object.rs:544-546`) rather than
-            // silently writing nothing.
-            out.extend_from_slice(object_ref.to_string().as_bytes());
         }
     }
     Ok(())
@@ -1781,23 +1758,6 @@ fn unparse_object_walk_with_ref_map(
             return Err(reserved_unparse_error());
         }
         handle.try_dereference()?;
-        // A resolved indirect redirect stores its reference as a scalar, but
-        // the mapping callback may re-enter mutation of this same handle.
-        // Copy the small reference token out before invoking the callback so
-        // `with_value`'s RefCell borrow cannot cross that call.
-        let reference = handle.with_value(|value| match value {
-            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
-            _ => None,
-        });
-        if let Some(object_ref) = reference {
-            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-                out.extend_from_slice(b"null");
-            } else {
-                let mapped = map(object_ref)?;
-                out.extend_from_slice(mapped.to_string().as_bytes());
-            }
-            return Ok(());
-        }
         let container = handle.with_value(|value| match value {
             Some(value) => {
                 if let Some(container) = snapshot_unparse_container(value) {
@@ -1872,14 +1832,6 @@ fn unparse_object_value_with_ref_map(
         }
         ObjectValue::Stream { stream_dict, .. } => {
             unparse_object_walk_with_ref_map(stream_dict, out, map, removed_refs)?;
-        }
-        ObjectValue::Reference(object_ref) => {
-            if object_ref.number == 0 || removed_refs.contains(object_ref) {
-                out.extend_from_slice(b"null");
-            } else {
-                let mapped = map(*object_ref)?;
-                out.extend_from_slice(mapped.to_string().as_bytes());
-            }
         }
         _ => unparse_object_value(value, out)?,
     }
@@ -2038,7 +1990,7 @@ fn try_write_sig_contents_hex_string(
     handle.try_dereference()?;
     Ok(handle.with_value(|value| {
         if let Some(ObjectValue::String(bytes)) = value {
-            crate::object::write_hex_string(out, bytes);
+            crate::pdf_syntax::write_hex_string(out, bytes);
             true
         } else {
             false
@@ -2085,7 +2037,7 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 // QDF-mode sibling of `write_child` above: an indirect child always writes
 // as its own `"N G R"` reference form regardless of QDF mode — qpdf never
 // inlines an indirect object at a child position in either mode, the same
-// unconditional split `unparse_materialize_child` already applies. A direct
+// unconditional child/reference split already applies. A direct
 // child recurses through `unparse_object_walk_qdf` at `indent`, the same
 // column its own container already committed to for this child (an array
 // element or dict value sits at its container's `indent + 2`; see
@@ -2153,7 +2105,7 @@ fn unparse_container_qdf(
 ) -> Result<()> {
     match container {
         UnparseContainer::Array(children) => {
-            // Object::write_pdf_qdf's Array arm: `[`, a newline, then each
+            // qpdf's QDF array arm: `[`, a newline, then each
             // child at `indent + 2`, followed by the closing bracket at
             // `indent`.
             out.push(b'[');
@@ -2179,7 +2131,7 @@ fn unparse_container_qdf(
 // QDF-mode sibling of `unparse_object_value` above. Only the container arms
 // (`Array`, `Dictionary`, the `Stream` dictionary-inlining arm) differ from
 // the plain form -- every scalar/name/string/reference arm is byte-identical
-// between the two modes (`Object::write_pdf_qdf`'s own fallthrough to
+// between the two modes (the qpdf QDF writer's own fallthrough to
 // `self.write_pdf(out)` for everything but its three container arms is the
 // same split), so this delegates that whole fallthrough set to
 // `unparse_object_value` itself rather than duplicating its match arms.
@@ -2187,7 +2139,7 @@ fn unparse_container_qdf(
 fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8>) -> Result<()> {
     match value {
         ObjectValue::Array(children) => {
-            // Object::write_pdf_qdf's Array arm (object.rs): `[`, a newline,
+            // qpdf's QDF array arm: `[`, a newline,
             // then per element `indent + 2` leading spaces + the child's own
             // QDF form + a trailing newline, then `indent` leading spaces and
             // `]`.
@@ -2220,14 +2172,13 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
             // dictionary handle at the *same* `indent`, not `indent + 2` --
             // a stream dictionary is not a child sitting inside a container
             // the way an array element or dict value is; it occupies this
-            // same value's own position, exactly as `Object::write_pdf_qdf`'s
+            // same value's own position, exactly as qpdf's QDF writer's
             // `Stream` arm calls `stream.dict.write_pdf_qdf(out, indent)` at
             // the unincremented indent before appending its
             // `stream`/`endstream` framing.
             unparse_object_walk_qdf(stream_dict, indent, out)?;
         }
-        // Every remaining variant (Null, Boolean, Integer, Real, RealLiteral,
-        // Name, String, Operator, InlineImage, Reference) has no QDF-specific
+        // Every remaining scalar variant has no QDF-specific
         // framing -- reuse `unparse_object_value`'s own arms for them
         // verbatim rather than duplicating scalar-formatting logic. Spelled
         // out explicitly (rather than an `other =>` catch-all) so this match
@@ -2247,8 +2198,7 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
         | ObjectValue::Name(_)
         | ObjectValue::String(_)
         | ObjectValue::Operator(_)
-        | ObjectValue::InlineImage(_)
-        | ObjectValue::Reference(_) => unparse_object_value(value, out)?,
+        | ObjectValue::InlineImage(_) => unparse_object_value(value, out)?,
     }
     Ok(())
 }
@@ -2317,18 +2267,6 @@ fn unparse_object_walk_qdf_with_ref_map(
             return Err(reserved_unparse_error());
         }
         handle.try_dereference()?;
-        let reference = handle.with_value(|value| match value {
-            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
-            _ => None,
-        });
-        if let Some(object_ref) = reference {
-            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-                out.extend_from_slice(b"null");
-            } else {
-                out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
-            }
-            return Ok(());
-        }
         let container = handle.with_value(|value| match value {
             Some(value) => {
                 if let Some(container) = snapshot_unparse_container(value) {
@@ -2461,18 +2399,6 @@ where
             return Err(reserved_unparse_error());
         }
         handle.try_dereference()?;
-        let reference = handle.with_value(|value| match value {
-            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
-            _ => None,
-        });
-        if let Some(object_ref) = reference {
-            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-                out.extend_from_slice(b"null");
-            } else {
-                out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
-            }
-            return Ok(());
-        }
         let container = handle.with_value(|value| match value {
             Some(value) => {
                 if let Some(container) = snapshot_unparse_container(value) {
@@ -2646,18 +2572,6 @@ where
             return Err(reserved_unparse_error());
         }
         handle.try_dereference()?;
-        let reference = handle.with_value(|value| match value {
-            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
-            _ => None,
-        });
-        if let Some(object_ref) = reference {
-            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
-                out.extend_from_slice(b"null");
-            } else {
-                out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
-            }
-            return Ok(());
-        }
         let container = handle.with_value(|value| match value {
             Some(value) => {
                 if let Some(container) = snapshot_unparse_container(value) {
@@ -2918,7 +2832,7 @@ fn try_write_sig_contents_with_string_writer(
     // signature contents. The ordinary string callback is therefore bypassed
     // here: qpdf keeps this value cleartext and only changes its spelling to
     // hexadecimal, even while the surrounding object is encrypted.
-    crate::object::write_hex_string(out, &bytes);
+    crate::pdf_syntax::write_hex_string(out, &bytes);
     Ok(true)
 }
 
@@ -3093,7 +3007,7 @@ where
 fn unparse_trailer_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     xref_stream: bool,
-    mut id_writer: Option<crate::object::TrailerIdWriter>,
+    mut id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     if !xref_stream {
@@ -3138,7 +3052,7 @@ fn unparse_trailer_entries_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     xref_stream: bool,
     qdf: bool,
-    mut id_writer: Option<crate::object::TrailerIdWriter>,
+    mut id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
@@ -3183,7 +3097,7 @@ fn unparse_trailer_entries_with_ref_map(
         }
         write_dictionary_key(out, key);
         out.push(b' ');
-        if key.as_slice() == b"/Root" && value.as_reference().is_none() {
+        if key.as_slice() == b"/Root" && value.object_ref().is_none() {
             // An inline Catalog is writer-owned, but its indirect descendants
             // remain in source space until this final child walk. qpdf's
             // `unparseChild` recurses into that direct dictionary, so preserve
@@ -3241,7 +3155,7 @@ fn unparse_trailer_entries_with_ref_map(
 #[allow(dead_code)] // retained with its public primitive until a future xref consumer needs it
 fn unparse_dictionary_entries_with_ref_map_and_id_writer(
     entries: &[(Vec<u8>, ObjectHandle)],
-    mut id_writer: Option<crate::object::TrailerIdWriter>,
+    mut id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
@@ -3276,9 +3190,8 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
 // Writes a trailer's `/ID` value in qpdf's `writeTrailer` compact shape:
 // `[<hex1><hex2>]`, no spaces (`QPDFWriter.cc:1194-1222`, `/ID [` then the
 // two identifier strings via `QPDF_String::unparse(true)`, then `]`).
-// Mirrors `write_id_style_value` (`object.rs`) byte-for-byte, but walks
-// `value`'s own `ObjectHandle` shape directly rather than bridging through
-// the legacy `Object` type: an indirect `value` (an `/ID` array stored as
+// Mirrors qpdf's identifier writer byte-for-byte, but walks `value`'s own
+// `ObjectHandle` shape directly: an indirect `value` (an `/ID` array stored as
 // a reference -- not a shape real qpdf itself ever produces, but nothing
 // at the type level rules it out) writes as its own `"N G R"` form via
 // `write_child`, checked before any shape inspection, matching
@@ -3311,8 +3224,8 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Resul
     match compact {
         Some((b0, b1)) => {
             out.push(b'[');
-            crate::object::write_hex_string(out, &b0);
-            crate::object::write_hex_string(out, &b1);
+            crate::pdf_syntax::write_hex_string(out, &b0);
+            crate::pdf_syntax::write_hex_string(out, &b1);
             out.push(b']');
             Ok(())
         }
@@ -3347,8 +3260,8 @@ fn write_id_style_value_handle_with_ref_map(
     match compact {
         Some((b0, b1)) => {
             out.push(b'[');
-            crate::object::write_hex_string(out, &b0);
-            crate::object::write_hex_string(out, &b1);
+            crate::pdf_syntax::write_hex_string(out, &b0);
+            crate::pdf_syntax::write_hex_string(out, &b1);
             out.push(b']');
             Ok(())
         }
@@ -3368,62 +3281,6 @@ mod tests {
         out.push(b' ');
         write_dictionary_key(&mut out, b"Raw");
         assert_eq!(out, b"/Canonical Raw");
-    }
-
-    #[test]
-    fn direct_object_value_container_fallbacks_cover_plain_qdf_and_mapped_walkers() -> Result<()> {
-        let array = ObjectValue::Array(vec![ObjectHandle::integer(1)]);
-        let dictionary = ObjectValue::Dictionary(
-            [(b"/Value".to_vec(), ObjectHandle::integer(2))]
-                .into_iter()
-                .collect(),
-        );
-        let stream = ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![(
-                b"/Length".to_vec(),
-                ObjectHandle::integer(0),
-            )]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_length: 0,
-        };
-        let reference = ObjectValue::Reference(ObjectRef::new(9, 0));
-        let null_reference = ObjectValue::Reference(ObjectRef::new(0, 0));
-        let values = [&array, &dictionary, &stream, &reference, &null_reference];
-        let map = |object_ref: ObjectRef| {
-            Ok(ObjectRef::new(object_ref.number + 1, object_ref.generation))
-        };
-        let removed_refs = BTreeSet::new();
-
-        for value in values {
-            unparse_object_value(value, &mut Vec::new())?;
-            unparse_object_value_with_ref_map(value, &mut Vec::new(), &map, &removed_refs)?;
-            unparse_object_value_qdf(value, 0, &mut Vec::new())?;
-        }
-
-        let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
-            crate::object::write_string_value(out, value);
-            Ok(())
-        };
-        unparse_object_value_with_ref_map_and_string_writer(
-            &ObjectValue::String(b"hook".to_vec()),
-            &mut Vec::new(),
-            &map,
-            &removed_refs,
-            &mut write_string,
-        )
-        .expect("string fallback callback succeeds");
-        let reserved = ObjectHandle::new_reserved_direct();
-        assert!(unparse_object_walk_with_ref_map_and_string_writer(
-            &reserved,
-            &mut Vec::new(),
-            &map,
-            &removed_refs,
-            &mut write_string,
-        )
-        .is_err());
-        Ok(())
     }
 
     #[test]

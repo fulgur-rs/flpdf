@@ -33,14 +33,14 @@ fn object_shape_filter_reader_is_test_only() {
             .replace("\r\n", "\n");
 
     for declaration in [
-        "#[cfg(test)]\npub(crate) fn decode_filter_specs_from_object",
-        "#[cfg(test)]\nfn decode_params_from_object",
-        "#[cfg(test)]\nfn param_value_from_object",
-        "#[cfg(test)]\nfn clamped_int_param",
+        "pub(crate) fn decode_filter_specs_from_object",
+        "fn decode_params_from_object(",
+        "fn param_value_from_object(",
+        "fn clamped_int_param(",
     ] {
         assert!(
-            source.contains(declaration),
-            "stream_filter.rs object-shaped helper is not test-only: {declaration}"
+            !source.contains(declaration),
+            "stream_filter.rs still contains the removed object-shaped helper: {declaration}"
         );
     }
 }

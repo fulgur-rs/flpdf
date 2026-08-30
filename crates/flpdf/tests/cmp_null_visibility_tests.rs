@@ -7,7 +7,7 @@ use common::PdfCanonicalTestExt;
 
 use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
 use flpdf::{
-    CompressStreams, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf,
+    CompressStreams, NewlineBeforeEndstream, ObjectHandle, ObjectRef, ObjectStreamMode, Pdf,
     PdfOpenOptions, StreamDataMode,
 };
 use std::fs::File;
@@ -262,16 +262,19 @@ fn generate_direct_trailer_array_rewrites_removed_generation_to_null() {
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &settings)
         .expect("generate rewrite must remap direct trailer values");
-    let rewritten = Pdf::open(Cursor::new(output)).expect("generated output must reopen");
+    let mut rewritten = Pdf::open(Cursor::new(output)).expect("generated output must reopen");
 
-    assert!(matches!(
-        rewritten.trailer_dictionary().get("Extra"),
-        Some(Object::Array(values))
-            if matches!(
-                values.as_slice(),
-                [Object::Null, Object::Reference(_)]
-            )
-    ));
+    let extra = rewritten
+        .trailer()
+        .try_get_key(b"/Extra")
+        .expect("rewritten trailer must expose /Extra");
+    let values = extra.as_array().expect("/Extra must remain an array");
+    assert_eq!(values.len(), 2);
+    assert!(values[0].is_null(), "removed generation must become null");
+    assert!(
+        values[1].object_ref().is_some(),
+        "current generation must remain an indirect reference"
+    );
 }
 
 #[test]
@@ -525,7 +528,8 @@ fn linearize_generate_stale_generation_inlines_null_without_body() {
 fn linearize_generate_handles_replaced_objstm_source() {
     let source = include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation.pdf");
     let mut pdf = Pdf::open(Cursor::new(source.as_slice())).expect("fixture must open");
-    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(Default::default()));
+    pdf.replace_object(ObjectRef::new(4, 0), ObjectHandle::dictionary(Vec::new()))
+        .expect("replacement object must be accepted");
 
     let settings = WriterTestSettings {
         object_streams: ObjectStreamMode::Generate,
@@ -811,31 +815,29 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
 
     assert!(
-        reopened
-            .object_refs()
-            .into_iter()
-            .all(|object_ref| !matches!(
-                reopened.resolve_canonical_object(object_ref).unwrap(),
-                Object::Stream(ref stream)
-                    if matches!(
-                        stream.dict.get("Type"),
-                        Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
-                    )
-            )),
+        reopened.object_refs().into_iter().all(|object_ref| {
+            let object = reopened.resolve_canonical_object(object_ref).unwrap();
+            !object.as_stream_dict().is_some_and(|stream_dict| {
+                stream_dict
+                    .try_get_key(b"/Type")
+                    .ok()
+                    .and_then(|type_name| type_name.as_name())
+                    .as_deref()
+                    == Some(b"ObjStm".as_slice())
+            })
+        }),
         "an empty qpdf Preserve plan is authoritative; the writer must not repack /Sig"
     );
     assert!(
-        reopened
-            .object_refs()
-            .into_iter()
-            .any(|object_ref| matches!(
-                reopened.resolve_canonical_object(object_ref).unwrap(),
-                Object::Dictionary(ref dict)
-                    if matches!(
-                        dict.get("Type"),
-                        Some(Object::Name(name)) if name.as_slice() == b"Sig"
-                    )
-            )),
+        reopened.object_refs().into_iter().any(|object_ref| {
+            let object = reopened.resolve_canonical_object(object_ref).unwrap();
+            object
+                .try_get_key(b"/Type")
+                .ok()
+                .and_then(|type_name| type_name.as_name())
+                .as_deref()
+                == Some(b"Sig".as_slice())
+        }),
         "the reachable signature dictionary must be emitted as a plain object"
     );
 }
@@ -884,38 +886,37 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
     let output = preserve_fixture(&fixture, |_| {}).unwrap();
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
 
-    let held = match reopened.trailer_dictionary().get("Foo") {
-        Some(Object::Dictionary(dict)) => match dict.get("Held") {
-            Some(Object::Reference(reference)) => *reference,
-            other => panic!("direct /Foo /Held must remain an indirect reference, got {other:?}"),
-        },
-        other => panic!("the direct /Foo trailer dictionary must survive, got {other:?}"),
-    };
+    let trailer = reopened.trailer();
+    let foo = trailer
+        .try_get_key(b"/Foo")
+        .expect("the direct /Foo trailer dictionary must survive");
+    let held = foo
+        .try_get_key(b"/Held")
+        .expect("direct /Foo must retain /Held")
+        .object_ref()
+        .expect("direct /Foo /Held must remain an indirect reference");
     assert_ne!(
         held,
         ObjectRef::new(5, 0),
         "nested trailer refs must be rewritten from their source number"
     );
     assert!(
-        matches!(
-            reopened.resolve_canonical_object(held).unwrap(),
-            Object::Dictionary(ref dict)
-                if matches!(
-                    dict.get("Kind"),
-                    Some(Object::Name(name)) if name.as_slice() == b"Ordinary"
-                )
-        ),
+        {
+            let object = reopened.resolve_canonical_object(held).unwrap();
+            object.try_get_key(b"/Kind").unwrap().as_name().as_deref()
+                == Some(b"Ordinary".as_slice())
+        },
         "the remapped /Foo /Held reference must resolve to the original member object"
     );
     assert!(
-        matches!(
-            reopened.trailer_dictionary().get("Info"),
-            Some(Object::Dictionary(dict))
-                if matches!(
-                    dict.get("Producer"),
-                    Some(Object::String(value)) if value == b"direct-info"
-                )
-        ),
+        trailer
+            .try_get_key(b"/Info")
+            .unwrap()
+            .try_get_key(b"/Producer")
+            .unwrap()
+            .as_string()
+            .as_deref()
+            == Some(b"direct-info".as_slice()),
         "a direct /Info trailer dictionary must survive"
     );
 
@@ -961,15 +962,21 @@ fn preserve_explicit_structural_deletion_keeps_source_container_over_100_members
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let mut member_counts = Vec::new();
     for object_ref in reopened.object_refs() {
-        if let Object::Stream(stream) = reopened.resolve_canonical_object(object_ref).unwrap() {
-            if matches!(
-                stream.dict.get("Type"),
-                Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
-            ) {
-                let Some(Object::Integer(count)) = stream.dict.get("N") else {
-                    panic!("ObjStm must carry an integer /N");
-                };
-                member_counts.push(*count);
+        let object = reopened.resolve_canonical_object(object_ref).unwrap();
+        if let Some(stream_dict) = object.as_stream_dict() {
+            if stream_dict
+                .try_get_key(b"/Type")
+                .unwrap()
+                .as_name()
+                .as_deref()
+                == Some(b"ObjStm".as_slice())
+            {
+                let count = stream_dict
+                    .try_get_key(b"/N")
+                    .unwrap()
+                    .as_integer()
+                    .expect("ObjStm must carry an integer /N");
+                member_counts.push(count);
             }
         }
     }

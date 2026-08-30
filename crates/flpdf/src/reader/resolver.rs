@@ -1197,22 +1197,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().object_cache.values().cloned().collect()
     }
 
-    /// The refs whose canonical handle has already left `NotYetResolved`.
-    ///
-    /// Collected under one short borrow, and deliberately *not* a
-    /// predicate-taking variant: [`ObjectHandle::is_resolved`] cannot
-    /// re-enter resolution, whereas a caller-supplied predicate could.
-    #[cfg(test)]
-    pub(crate) fn resolved_object_refs(&self) -> Vec<ObjectRef> {
-        self.core
-            .borrow()
-            .object_cache
-            .iter()
-            .filter(|(_, handle)| handle.is_resolved())
-            .map(|(object_ref, _)| *object_ref)
-            .collect()
-    }
-
     /// The largest object *number* any canonical handle occupies.
     pub(crate) fn max_object_number(&self) -> Option<u32> {
         self.core
@@ -1883,11 +1867,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     #[cfg(test)]
     pub(crate) fn header_offset(&self) -> usize {
         self.core.borrow().header_offset
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_reconstructed_xref_for_test(&self) {
-        self.core.borrow_mut().reconstructed_xref = true;
     }
 
     /// This document's encryption parameters, in their shared, mutable-in-
@@ -4168,8 +4147,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// therefore reject documents qpdf accepts.
     ///
     /// What is taken instead is this crate's own established answer, the one
-    /// `parser.rs`'s recursive-descent hub (`Parser::object`) and
-    /// [`crate::Pdf::lift_bounded`] already use: grow the stack rather than
+    /// `parser.rs`'s recursive-descent hub already uses: grow the stack rather than
     /// bound the recursion, so the depth a caller survives follows available
     /// memory instead of the thread's initial stack. The rationale beside
     /// `lift_bounded`'s own call applies verbatim — a production caller on a
@@ -7028,8 +7006,10 @@ mod tests {
         )
         .expect("re-open of V=4 output with user-pw");
         let info_ref = rt
-            .trailer_dictionary()
-            .get_ref("Info")
+            .trailer()
+            .try_get_key(b"/Info")
+            .expect("read trailer /Info")
+            .object_ref()
             .expect("trailer /Info must be a reference");
 
         let info: ObjectHandle = rt.get_object_handle(info_ref);
@@ -7247,8 +7227,10 @@ mod tests {
         )
         .expect("open encrypted fixture");
         let info_ref = pdf
-            .trailer_dictionary()
-            .get_ref("Info")
+            .trailer()
+            .try_get_key(b"/Info")
+            .expect("read trailer /Info")
+            .object_ref()
             .expect("trailer /Info must be a reference");
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
         pdf.resolve(&info)
@@ -7435,8 +7417,10 @@ mod tests {
             .cf_string = crate::encryption::state::EncryptionMode::Unknown;
 
         let info_ref = pdf
-            .trailer_dictionary()
-            .get_ref("Info")
+            .trailer()
+            .try_get_key(b"/Info")
+            .expect("read trailer /Info")
+            .object_ref()
             .expect("trailer /Info must be a reference");
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
         pdf.resolve(&info)
@@ -7485,7 +7469,12 @@ mod tests {
             crate::pipeline::test_support::NthWriteFailure::new(1),
         )));
         pdf.set_logger(logger);
-        let info_ref = pdf.trailer_dictionary().get_ref("Info").unwrap();
+        let info_ref = pdf
+            .trailer()
+            .try_get_key(b"/Info")
+            .unwrap()
+            .object_ref()
+            .unwrap();
 
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
         assert!(matches!(
@@ -12051,13 +12040,6 @@ mod tests {
     }
 
     #[test]
-    fn set_object_generation_replacement_matches_qpdf_tombstone_lifetime() {
-        assert_generation_replacement_matches_qpdf_tombstone_lifetime(|pdf, object_ref, value| {
-            pdf.set_object(object_ref, crate::Object::Integer(value));
-        });
-    }
-
-    #[test]
     fn replace_object_generation_replacement_matches_qpdf_tombstone_lifetime() {
         assert_generation_replacement_matches_qpdf_tombstone_lifetime(|pdf, object_ref, value| {
             pdf.replace_object(object_ref, ObjectHandle::integer(value))
@@ -12477,24 +12459,6 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_synchronizes_before_recording_set_object_provenance() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let object_ref = ObjectRef::new(1, 0);
-        pdf.cache.set_compressed(object_ref, 9, 2);
-        pdf.resolver
-            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
-        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
-
-        pdf.set_object(object_ref, crate::Object::Integer(42));
-
-        assert_eq!(
-            pdf.compressed_parent(object_ref),
-            None,
-            "set_object must not preserve object-stream provenance from a stale pre-recovery cache entry"
-        );
-    }
-
-    #[test]
     fn full_rewrite_synchronizes_recovered_compressed_parent_provenance() {
         let object_ref = ObjectRef::new(7, 0);
         let stream_ref = ObjectRef::new(5, 0);
@@ -12661,7 +12625,11 @@ mod tests {
         let mut pdf = Pdf::open(CountingReader::new(minimal_pdf_bytes())).expect("open");
         let reads_before = pdf.resolver.with_reader_mut(|reader| reader.reads);
 
-        assert_eq!(pdf.resolver.max_object_number(), None);
+        assert_eq!(
+            pdf.resolver.max_object_number(),
+            Some(1),
+            "the canonical trailer rebind registers /Root during open"
+        );
 
         let first = pdf.get_object_count().expect("prepare object cache");
         assert_eq!(first, 3);

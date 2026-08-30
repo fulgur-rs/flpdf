@@ -14,8 +14,8 @@
 //! attachment mutations need the same reachability boundary before a later
 //! writer invocation, so this module provides the explicit equivalent.
 
-use crate::object::MAX_INLINE_DEPTH;
 use crate::object_handle::ObjectHandle;
+use crate::object_handle::MAX_INLINE_DEPTH;
 use crate::{ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};

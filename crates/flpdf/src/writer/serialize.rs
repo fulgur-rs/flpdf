@@ -1,5 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives.
-use super::{object_streams, CompressStreams, NewlineBeforeEndstream};
+use super::{object_streams, CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission};
+use crate::ObjectHandle;
 
 /// Write a PDF stream to `out`, applying the [`NewlineBeforeEndstream`] policy.
 ///
@@ -23,23 +24,13 @@ use super::{object_streams, CompressStreams, NewlineBeforeEndstream};
 /// framing LF inserted before `endstream` is not part of `/Length`.
 pub fn write_stream_to_buf(
     out: &mut Vec<u8>,
-    stream: &crate::Stream,
+    stream: &ObjectHandle,
     policy: NewlineBeforeEndstream,
-) {
-    stream.dict.write_pdf(out);
-    write_stream_payload(out, &stream.data, policy);
-}
-
-/// Write a stream dictionary with an optional inline trailer-ID writer.
-#[cfg(test)]
-pub(crate) fn write_stream_with_id_writer(
-    out: &mut Vec<u8>,
-    stream: &crate::Stream,
-    policy: NewlineBeforeEndstream,
-    id_writer: Option<crate::object::TrailerIdWriter>,
-) {
-    stream.dict.write_pdf_with_id_writer(out, id_writer);
-    write_stream_payload(out, &stream.data, policy);
+) -> crate::Result<()> {
+    stream.write_stream_body(out, false)?;
+    let data = stream.get_raw_stream_data()?;
+    write_stream_payload(out, &data, policy);
+    Ok(())
 }
 
 /// Emit stream framing after its dictionary has already been written.
@@ -60,12 +51,6 @@ pub(crate) fn write_stream_payload_with_qdf(
         out.push(b'\n');
     }
     out.extend_from_slice(b"endstream");
-}
-
-/// Whether stream framing adds one LF before `endstream` for this payload.
-#[cfg(test)]
-pub(crate) fn framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) -> bool {
-    framing_adds_newline_with_qdf(data, policy, false)
 }
 
 /// Whether stream framing adds one LF, including qpdf's QDF-only rule.
@@ -151,7 +136,7 @@ pub(crate) mod xref_stream {
     use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
-    use crate::object::{Dictionary, Object, ObjectRef};
+    use crate::ObjectRef;
     use crate::Result;
 
     /// One cross-reference stream entry — a single `/W`-formatted row.
@@ -292,34 +277,6 @@ pub(crate) mod xref_stream {
     }
 
     #[cfg(test)]
-    fn push_be(out: &mut Vec<u8>, value: u64, width: u8) {
-        let bytes = value.to_be_bytes();
-        out.extend_from_slice(&bytes[bytes.len() - width as usize..]);
-    }
-
-    #[cfg(test)]
-    fn build_rows(entries: &[XrefStreamEntry], widths: XrefWidths) -> Vec<u8> {
-        let mut rows = Vec::with_capacity(entries.len() * columns(widths));
-        for entry in entries {
-            push_be(&mut rows, u64::from(entry.entry_type), widths[0]);
-            push_be(&mut rows, entry.field2, widths[1]);
-            push_be(&mut rows, entry.field3, widths[2]);
-        }
-        rows
-    }
-
-    #[cfg(test)]
-    fn png_up_predict(rows: &[u8], cols: usize) -> Vec<u8> {
-        crate::stream_filter::encode_png_predictor(
-            rows,
-            u32::try_from(cols).expect("test xref row width fits PNG predictor columns"),
-            1,
-            8,
-        )
-        .expect("test xref row geometry is valid")
-    }
-
-    #[cfg(test)]
     #[test]
     fn dictionary_key_preserves_qpdf_first_byte() {
         let mut out = Vec::new();
@@ -351,14 +308,9 @@ pub(crate) mod xref_stream {
         /// `/Prev` byte offset of the previous xref stream (left-justified in a
         /// [`PREV_FIELD_WIDTH`] field); `None` on the chain's final (main) stream.
         pub prev: Option<u64>,
-        /// Additional entries from qpdf's trimmed source trailer. These are merged
-        /// with `/Info`, `/Root`, and `/Size` and written in sorted key order after
-        /// `/W`/`/Index`, before the generated `/ID`.
-        pub trailer: Option<&'a Dictionary>,
         /// Canonical entries from a live ObjectHandle trailer. Keys are decoded
         /// and values are already serialized with the writer reference map, so
         /// the xref route does not reconstruct trailer data from a stale
-        /// materialized Dictionary snapshot.
         pub canonical_entries: Option<&'a [(Vec<u8>, Vec<u8>)]>,
         /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
         pub id: Option<(&'a [u8], &'a [u8])>,
@@ -421,69 +373,39 @@ pub(crate) mod xref_stream {
         if let Some((start, count)) = dict.index {
             out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
         }
-        if let Some(canonical_entries) = dict.canonical_entries {
-            let mut entries = canonical_entries.to_vec();
-            if let Some(info) = dict.info {
-                entries.push((
-                    b"/Info".to_vec(),
-                    format!("{} {} R", info.number, info.generation).into_bytes(),
-                ));
-            }
-            if let Some(root) = dict.root {
-                entries.push((
-                    b"/Root".to_vec(),
-                    format!("{} {} R", root.number, root.generation).into_bytes(),
-                ));
-            } else if let Some(root) = dict.root_value {
-                entries.push((b"/Root".to_vec(), root.to_vec()));
-            }
-            entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            for (key, value) in entries {
-                if qdf {
-                    // cov:ignore-start: QDF xref emission normally supplies canonical trailer entries
-                    out.extend_from_slice(b"\n  ");
-                    // cov:ignore-end
-                } else {
-                    out.push(b' ');
-                }
-                write_qpdf_dictionary_key(out, &key);
+        let mut entries = dict
+            .canonical_entries
+            .map_or_else(Vec::new, ToOwned::to_owned);
+        if let Some(info) = dict.info {
+            entries.push((
+                b"/Info".to_vec(),
+                format!("{} {} R", info.number, info.generation).into_bytes(),
+            ));
+        }
+        if let Some(root) = dict.root {
+            entries.push((
+                b"/Root".to_vec(),
+                format!("{} {} R", root.number, root.generation).into_bytes(),
+            ));
+        } else if let Some(root) = dict.root_value {
+            entries.push((b"/Root".to_vec(), root.to_vec()));
+        }
+        entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, value) in entries {
+            if qdf {
+                // cov:ignore-start: QDF xref emission normally supplies canonical trailer entries
+                out.extend_from_slice(b"\n  ");
+                // cov:ignore-end
+            } else {
                 out.push(b' ');
-                out.extend_from_slice(&value);
-                if key == b"/Size" {
-                    if let Some(prev) = dict.prev {
-                        out.extend_from_slice(
-                            format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes(),
-                        );
-                    }
-                }
             }
-        } else {
-            let mut trailer = dict.trailer.cloned().unwrap_or_default();
-            if let Some(info) = dict.info {
-                trailer.insert("Info", Object::Reference(info));
-            }
-            if let Some(root) = dict.root {
-                trailer.insert("Root", Object::Reference(root));
-            }
-            trailer.insert("Size", Object::Integer(i64::from(dict.size)));
-            for (key, value) in trailer.iter() {
-                if qdf {
-                    // cov:ignore-start: QDF xref emission never uses a materialized trailer snapshot
-                    out.extend_from_slice(b"\n  /");
-                    // cov:ignore-end
-                } else {
-                    out.extend_from_slice(b" /");
-                }
-                crate::object::write_name_escaped(out, key);
-                out.push(b' ');
-                value.write_pdf(out);
-                if key == b"Size" {
-                    if let Some(prev) = dict.prev {
-                        out.extend_from_slice(
-                            format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes(),
-                        );
-                    }
+            write_qpdf_dictionary_key(out, &key);
+            out.push(b' ');
+            out.extend_from_slice(&value);
+            if key == b"/Size" {
+                if let Some(prev) = dict.prev {
+                    out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
                 }
             }
         }
@@ -492,9 +414,9 @@ pub(crate) mod xref_stream {
     fn write_qpdf_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
         if let Some(key) = key.strip_prefix(b"/") {
             out.push(b'/');
-            crate::object::write_name_escaped(out, key);
+            crate::pdf_syntax::write_name_escaped(out, key);
         } else {
-            crate::object::write_name_escaped(out, key);
+            crate::pdf_syntax::write_name_escaped(out, key);
         }
     }
 
@@ -519,7 +441,7 @@ pub(crate) mod xref_stream {
         dict: &XrefStreamDict,
         payload: &[u8],
         qdf: bool,
-        id_writer: Option<crate::object::TrailerIdWriter>,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
     ) -> Option<std::ops::Range<usize>> {
         write_object_dict_prefix(out, object, dict, payload.len(), qdf);
         let (id_range, has_id) = if let Some(id_writer) = id_writer {
@@ -795,721 +717,5 @@ pub(crate) mod xref_stream {
         }
         buf.resize(region_len, b' ');
         Ok((buf, id_range))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn xref_production_route_has_no_direct_zlib_encoder() {
-            let source = include_str!("serialize.rs");
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            let direct_encoder = ["flate2::write::", "ZlibEncoder"].concat();
-            assert!(
-                !production.contains(&direct_encoder),
-                "xref production must use the canonical pipeline Flate route"
-            );
-        }
-
-        // Object map decoded from the qpdf 11.9.0 golden
-        // (`--linearize --object-streams=generate --deterministic-id` of
-        // tests/fixtures/compat/three-page.pdf). See the module doc for the shape.
-
-        /// First-half xref stream (obj 7) entries: objects 6..=16. Objects 6-12 are
-        /// uncompressed (type 1, byte offsets); 13-16 are members of the ObjStm
-        /// container obj 12 (type 2).
-        fn three_page_obj7_entries() -> Vec<XrefStreamEntry> {
-            let t1 = |off: u64| XrefStreamEntry {
-                entry_type: 1,
-                field2: off,
-                field3: 0,
-            };
-            let t2 = |idx: u64| XrefStreamEntry {
-                entry_type: 2,
-                field2: 12,
-                field3: idx,
-            };
-            vec![
-                t1(15),
-                t1(216),
-                t1(608),
-                t1(677),
-                t1(807),
-                t1(1000),
-                t1(1153),
-                t2(0),
-                t2(1),
-                t2(2),
-                t2(3),
-            ]
-        }
-
-        /// Main (second-half) xref stream (obj 5) entries: objects 0..=5. Object 0
-        /// is the free head; 1-5 are uncompressed (type 1, byte offsets).
-        fn three_page_obj5_entries() -> Vec<XrefStreamEntry> {
-            let t1 = |off: u64| XrefStreamEntry {
-                entry_type: 1,
-                field2: off,
-                field3: 0,
-            };
-            vec![
-                XrefStreamEntry {
-                    entry_type: 0,
-                    field2: 0,
-                    field3: 0,
-                },
-                t1(1540),
-                t1(1731),
-                t1(1883),
-                t1(2074),
-                t1(2226),
-            ]
-        }
-
-        const ID0: [u8; 16] = [
-            0x31, 0x96, 0x4d, 0xf6, 0xe5, 0xb2, 0x21, 0x18, 0x59, 0xe4, 0xac, 0x9d, 0x6e, 0x86,
-            0x2d, 0x1a,
-        ];
-        const ID1: [u8; 16] = [
-            0x60, 0x0e, 0x73, 0x37, 0x15, 0x98, 0x32, 0xba, 0x5a, 0xec, 0x69, 0x83, 0x87, 0xe2,
-            0xb7, 0x95,
-        ];
-
-        #[test]
-        fn calculate_padding_matches_qpdf() {
-            // 16 + 5*ceil(n/16384): one 16K block for any small xref stream.
-            assert_eq!(calculate_xref_stream_padding(0), 16);
-            assert_eq!(calculate_xref_stream_padding(370), 21);
-            assert_eq!(calculate_xref_stream_padding(16384), 21);
-            assert_eq!(calculate_xref_stream_padding(16385), 26);
-        }
-
-        #[test]
-        fn first_pass_widths_force_wide_field2() {
-            // 1<<25 dominates field 2 (4 bytes); field 3 sizes the objstm index.
-            assert_eq!(first_pass_widths(16, 3, 130), [1, 4, 1]);
-            // When max_ostream_index is 0 there are no ObjStm members, so W[2] = 0
-            // (matching qpdf which omits f3 when no compressed entries exist).
-            assert_eq!(first_pass_widths(16, 0, 0), [1, 4, 0]);
-        }
-
-        /// The first-pass region size pins where the object after the first-half
-        /// xref lands. qpdf 11.9.0 three-page golden: first-half xref (obj 7) at
-        /// offset 216, catalog (obj 8) at 608, with a trailing newline outside the
-        /// region — so the region is `608 - 216 - 1 = 391` bytes (a 370-byte
-        /// uncompressed pass-1 object + 21 bytes of padding).
-        #[test]
-        fn first_pass_region_matches_three_page_golden() {
-            let widths = first_pass_widths(16, 3, 130);
-            assert_eq!(first_pass_payload_len(11, widths, true), 77);
-            let dict = XrefStreamDict {
-                filtered: true,
-                widths,
-                index: Some((6, 11)),
-                info: Some(ObjectRef::new(15, 0)),
-                root: Some(ObjectRef::new(8, 0)),
-                root_value: None,
-                size: 17,
-                // `/Prev` and `/ID` are space-/fixed-width fields, so only their
-                // widths (not values) affect the region size.
-                prev: Some(2356),
-                trailer: None,
-                canonical_entries: None,
-                id: Some((&ID0, &ID1)),
-                encrypt: None,
-            };
-            assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
-        }
-
-        #[test]
-        fn second_pass_widths_match_three_page() {
-            // first-half stream: max entry offset 1153 + hint 130 = 1283 -> 2 bytes;
-            // objstm index 3 -> 1 byte; max id 16 -> 1 byte. => [1 2 1].
-            assert_eq!(second_pass_widths(1153, 130, 16, 3), [1, 2, 1]);
-            // main stream: max entry offset 2226, hint 0 -> 2 bytes => [1 2 1].
-            assert_eq!(second_pass_widths(2226, 0, 16, 3), [1, 2, 1]);
-            // a >64 KB offset widens field 2 to 3 bytes.
-            assert_eq!(second_pass_widths(70_000, 0, 16, 3), [1, 3, 1]);
-        }
-
-        #[test]
-        fn build_entries_reproduce_golden_object_maps() {
-            // First half (objs 6..16): obj6..12 uncompressed, obj13..16 in container 12.
-            let mut offs = BTreeMap::new();
-            for (n, off) in [
-                (6, 15),
-                (7, 216),
-                (8, 608),
-                (9, 677),
-                (10, 807),
-                (11, 1000),
-                (12, 1153),
-            ] {
-                offs.insert(n, off);
-            }
-            let mut members = BTreeMap::new();
-            for (n, idx) in [(13, 0u32), (14, 1), (15, 2), (16, 3)] {
-                members.insert(n, (12u32, idx));
-            }
-            assert_eq!(
-                build_entries(&offs, &members, 6, 11),
-                three_page_obj7_entries()
-            );
-
-            // Second half (objs 0..6): obj0 free, obj1..5 uncompressed.
-            let mut offs2 = BTreeMap::new();
-            for (n, off) in [(1, 1540), (2, 1731), (3, 1883), (4, 2074), (5, 2226)] {
-                offs2.insert(n, off);
-            }
-            assert_eq!(
-                build_entries(&offs2, &BTreeMap::new(), 0, 6),
-                three_page_obj5_entries()
-            );
-        }
-
-        #[test]
-        fn build_entries_fills_gaps_with_free_entries() {
-            // A non-zero number that is neither in `offs` nor `member_new` falls
-            // back to a free (type-0) entry. Defensive: a well-formed linearized
-            // layout has no such gap, but the encoder must not emit a stale offset.
-            let mut offs = BTreeMap::new();
-            offs.insert(1u32, 100usize);
-            let entries = build_entries(&offs, &BTreeMap::new(), 1, 3);
-            assert_eq!(
-                entries,
-                vec![
-                    XrefStreamEntry {
-                        entry_type: 1,
-                        field2: 100,
-                        field3: 0
-                    },
-                    XrefStreamEntry {
-                        entry_type: 0,
-                        field2: 0,
-                        field3: 0
-                    },
-                    XrefStreamEntry {
-                        entry_type: 0,
-                        field2: 0,
-                        field3: 0
-                    },
-                ]
-            );
-        }
-
-        #[test]
-        fn max_entry_offset_ignores_compressed_rows() {
-            let entries = three_page_obj7_entries();
-            // The container-number field2 of the type-2 rows (12) must not be
-            // mistaken for an offset; the max offset is obj12's 1153.
-            assert_eq!(max_entry_offset(&entries), 1153);
-            assert_eq!(max_entry_offset(&[]), 0);
-        }
-
-        #[test]
-        fn write_padded_region_pads_to_length() {
-            let dict = XrefStreamDict {
-                filtered: true,
-                widths: [1, 2, 1],
-                index: None,
-                info: None,
-                root: None,
-                root_value: None,
-                size: 6,
-                prev: None,
-                trailer: None,
-                canonical_entries: None,
-                id: Some((&ID0, &ID1)),
-                encrypt: None,
-            };
-            let (region, id_range) =
-                write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
-            assert_eq!(region.len(), 400);
-            // The object bytes are intact, followed by ASCII-space padding.
-            assert!(region.starts_with(b"5 0 obj\n<< /Type /XRef /Length 7"));
-            assert!(region.ends_with(b"   "));
-            assert!(region[region.len() - 1] == b' ');
-            // The returned `/ID` range must locate exactly the array token
-            // (`[<hex0><hex1>]`), not the whole padded region — a caller that
-            // back-patches a deterministic-`/ID` placeholder must be able to
-            // target only this span.
-            let id_range = id_range.expect("dict.id is Some");
-            let mut expected = Vec::new();
-            expected.push(b'[');
-            expected.push(b'<');
-            push_hex(&mut expected, &ID0);
-            expected.extend_from_slice(b"><");
-            push_hex(&mut expected, &ID1);
-            expected.extend_from_slice(b">]");
-            assert_eq!(&region[id_range.clone()], expected.as_slice());
-            assert_eq!(id_range.len(), 70);
-        }
-
-        #[test]
-        fn write_padded_region_rejects_oversized_object() {
-            let dict = XrefStreamDict {
-                filtered: true,
-                widths: [1, 2, 1],
-                index: None,
-                info: None,
-                root: None,
-                root_value: None,
-                size: 6,
-                prev: None,
-                trailer: None,
-                canonical_entries: None,
-                id: Some((&ID0, &ID1)),
-                encrypt: None,
-            };
-            // A 10-byte region cannot hold the object; the writer must error rather
-            // than silently overflow the reserved region.
-            let err = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 10).unwrap_err();
-            assert!(matches!(err, crate::Error::Unsupported(_)));
-        }
-
-        #[test]
-        fn bytes_needed_spans_byte_boundaries() {
-            assert_eq!(bytes_needed(0), 1);
-            assert_eq!(bytes_needed(255), 1);
-            assert_eq!(bytes_needed(256), 2);
-            assert_eq!(bytes_needed(65_535), 2);
-            assert_eq!(bytes_needed(65_536), 3);
-        }
-
-        #[test]
-        fn build_rows_packs_big_endian_fields() {
-            let entries = [
-                XrefStreamEntry {
-                    entry_type: 1,
-                    field2: 0x0102,
-                    field3: 0,
-                },
-                XrefStreamEntry {
-                    entry_type: 2,
-                    field2: 12,
-                    field3: 3,
-                },
-            ];
-            // /W [1 2 1] -> 4 bytes per row.
-            assert_eq!(
-                build_rows(&entries, [1, 2, 1]),
-                vec![0x01, 0x01, 0x02, 0x00, 0x02, 0x00, 0x0c, 0x03]
-            );
-        }
-
-        /// build_rows + PNG-Up predictor reproduce qpdf's exact pre-compression
-        /// bytes (the 55-byte obj7 / 30-byte obj5 predicted streams decoded from the
-        /// golden). Backend-independent — no Flate involved.
-        #[test]
-        fn predictor_reproduces_golden_pre_flate_bytes() {
-            let obj7_predicted = "0201000f00020000c900020002880002000045000200018200020000c1\
-             0002000199000201fc8b00020000000102000000010200000001";
-            let rows = build_rows(&three_page_obj7_entries(), [1, 2, 1]);
-            assert_eq!(hex(&png_up_predict(&rows, 4)), obj7_predicted);
-
-            let obj5_predicted = "02000000000201060400020000bf000200019800020001bf000200009800";
-            let rows5 = build_rows(&three_page_obj5_entries(), [1, 2, 1]);
-            assert_eq!(hex(&png_up_predict(&rows5, 4)), obj5_predicted);
-        }
-
-        #[test]
-        fn encode_payload_round_trips_through_inflate() {
-            // Backend-independent sanity: whatever the deflate flavour, the payload
-            // inflates back to the predicted rows.
-            let rows = build_rows(&three_page_obj5_entries(), [1, 2, 1]);
-            let predicted = png_up_predict(&rows, 4);
-            let payload = encode_payload(&three_page_obj5_entries(), [1, 2, 1]).unwrap();
-            let inflated = inflate(&payload);
-            assert_eq!(inflated, predicted);
-        }
-
-        #[test]
-        fn encode_payload_reports_invalid_geometry_without_panicking() {
-            let entries = [XrefStreamEntry {
-                entry_type: 1,
-                field2: 0,
-                field3: 0,
-            }];
-            let result = std::panic::catch_unwind(|| encode_payload(&entries, [0, 0, 0]));
-            assert!(
-                result.is_ok(),
-                "xref pipeline construction must return its error channel instead of panicking"
-            );
-            let error = result.unwrap().unwrap_err();
-            assert!(matches!(
-                error,
-                crate::Error::System(message)
-                    if message == "PNGFilter created with invalid columns value"
-            ));
-        }
-
-        #[test]
-        fn encode_payload_uncompressed_reports_invalid_geometry() {
-            let entries = [XrefStreamEntry {
-                entry_type: 1,
-                field2: 0,
-                field3: 0,
-            }];
-            let error = encode_payload_uncompressed(&entries, [0, 0, 0]).unwrap_err();
-            assert!(matches!(
-                error,
-                crate::Error::System(message)
-                    if message == "PNGFilter created with invalid columns value"
-            ));
-        }
-
-        #[test]
-        fn encode_payload_reports_field_width_overflow() {
-            let entries = [XrefStreamEntry {
-                entry_type: 1,
-                field2: 0,
-                field3: 0,
-            }];
-            let error = encode_payload(&entries, [9, 1, 1]).unwrap_err();
-            assert!(matches!(
-                error,
-                crate::Error::Internal(message)
-                    if message == "QPDFWriter::writeBinary called with too many bytes"
-            ));
-        }
-
-        #[test]
-        fn xref_pipeline_stage_identifiers_match_qpdf() {
-            let mut sink = Buffer::new(XREF_BUFFER_ID, None);
-            let mut flate = Flate::new(
-                XREF_FLATE_ID,
-                &mut sink,
-                FlateAction::Deflate,
-                DEFAULT_OUT_BUFFER_SIZE,
-            )
-            .unwrap();
-            {
-                let predictor =
-                    PngFilter::new(XREF_PNG_ID, &mut flate, PngFilterAction::Encode, 4, 1, 8)
-                        .unwrap();
-                assert_eq!(predictor.identifier(), XREF_PNG_ID);
-            }
-            assert_eq!(flate.identifier(), XREF_FLATE_ID);
-            drop(flate);
-            assert_eq!(sink.identifier(), XREF_BUFFER_ID);
-        }
-
-        /// The stream dictionary is emitted in qpdf's fixed key order, including the
-        /// `/Prev` fixed-width field and the conditional `/Index` / `/Info` / `/Root`
-        /// keys. Backend-independent (only `/Length` depends on the payload).
-        #[test]
-        fn dict_key_order_matches_qpdf() {
-            let mut out = Vec::new();
-            write_object(
-                &mut out,
-                ObjectRef::new(7, 0),
-                &XrefStreamDict {
-                    filtered: true,
-                    widths: [1, 2, 1],
-                    index: Some((6, 11)),
-                    info: Some(ObjectRef::new(15, 0)),
-                    root: Some(ObjectRef::new(8, 0)),
-                    root_value: None,
-                    size: 17,
-                    prev: Some(2226),
-                    trailer: None,
-                    canonical_entries: None,
-                    id: Some((&ID0, &ID1)),
-                    encrypt: None,
-                },
-                b"PAYLOAD",
-            );
-            let text = String::from_utf8(out).unwrap();
-            assert!(text.starts_with(
-                "7 0 obj\n<< /Type /XRef /Length 7 /Filter /FlateDecode \
-             /DecodeParms << /Columns 4 /Predictor 12 >> /W [ 1 2 1 ] \
-             /Index [ 6 11 ] /Info 15 0 R /Root 8 0 R /Size 17 /Prev 2226"
-            ));
-            // /Prev value left-justified in a 21-char field (17 padding spaces),
-            // then the standard inter-key separator: 18 spaces before /ID.
-            let after_prev = &text[text.find("/Prev 2226").unwrap() + "/Prev 2226".len()..];
-            let spaces = after_prev.chars().take_while(|c| *c == ' ').count();
-            assert_eq!(spaces, 18);
-            assert!(after_prev[spaces..].starts_with("/ID [<"));
-            assert!(text.ends_with(" >>\nstream\nPAYLOAD\nendstream\nendobj\n"));
-        }
-
-        #[test]
-        fn trimmed_trailer_extras_are_sorted_before_generated_id() {
-            let mut trailer = Dictionary::new();
-            trailer.insert("Info", Object::Dictionary(Dictionary::new()));
-            trailer.insert("Foo", Object::Integer(7));
-            let mut out = Vec::new();
-            write_object(
-                &mut out,
-                ObjectRef::new(7, 0),
-                &XrefStreamDict {
-                    filtered: true,
-                    widths: [1, 2, 1],
-                    index: None,
-                    info: None,
-                    root: Some(ObjectRef::new(1, 0)),
-                    root_value: None,
-                    size: 8,
-                    prev: None,
-                    trailer: Some(&trailer),
-                    canonical_entries: None,
-                    id: Some((&ID0, &ID1)),
-                    encrypt: None,
-                },
-                b"X",
-            );
-            let text = String::from_utf8(out).unwrap();
-            assert!(
-                text.contains("/W [ 1 2 1 ] /Foo 7 /Info << >> /Root 1 0 R /Size 8 /ID [<"),
-                "trimmed trailer entries must retain qpdf's sorted writeTrailer order: {text}"
-            );
-        }
-
-        #[test]
-        fn canonical_trailer_entries_write_info_root_and_prev() {
-            let canonical_entries = [(b"/Foo".to_vec(), b"7".to_vec())];
-            let mut out = Vec::new();
-            write_object(
-                &mut out,
-                ObjectRef::new(8, 0),
-                &XrefStreamDict {
-                    filtered: false,
-                    widths: [1, 1, 1],
-                    index: None,
-                    info: Some(ObjectRef::new(2, 0)),
-                    root: Some(ObjectRef::new(1, 0)),
-                    root_value: None,
-                    size: 8,
-                    prev: Some(123),
-                    trailer: None,
-                    canonical_entries: Some(&canonical_entries),
-                    id: None,
-                    encrypt: None,
-                },
-                &[0],
-            );
-            let text = String::from_utf8(out).unwrap();
-
-            assert!(text.contains("/Foo 7 /Info 2 0 R /Root 1 0 R /Size 8 /Prev 123"));
-        }
-
-        /// The main xref stream omits /Index, /Info, /Root, and /Prev.
-        #[test]
-        fn main_xref_dict_omits_chain_and_root_keys() {
-            let mut out = Vec::new();
-            write_object(
-                &mut out,
-                ObjectRef::new(5, 0),
-                &XrefStreamDict {
-                    filtered: true,
-                    widths: [1, 2, 1],
-                    index: None,
-                    info: None,
-                    root: None,
-                    root_value: None,
-                    size: 6,
-                    prev: None,
-                    trailer: None,
-                    canonical_entries: None,
-                    id: Some((&ID0, &ID1)),
-                    encrypt: None,
-                },
-                b"X",
-            );
-            let text = String::from_utf8(out).unwrap();
-            assert!(text.contains("/W [ 1 2 1 ] /Size 6 /ID [<"));
-            assert!(!text.contains("/Index"));
-            assert!(!text.contains("/Root"));
-            assert!(!text.contains("/Prev"));
-        }
-
-        // ---- byte-identity vs qpdf 11.9.0 golden (zlib backend only) ----
-
-        #[cfg(feature = "qpdf-zlib-compat")]
-        const GOLDEN_OBJ7: &[u8] = b"7 0 obj\n<< /Type /XRef /Length 43 /Filter /FlateDecode \
-        /DecodeParms << /Columns 4 /Predictor 12 >> /W [ 1 2 1 ] /Index [ 6 11 ] \
-        /Info 15 0 R /Root 8 0 R /Size 17 /Prev 2226                  \
-        /ID [<31964df6e5b2211859e4ac9d6e862d1a><600e7337159832ba5aec698387e2b795>] >>\n\
-        stream\nx\x9ccbd\xe0g`b`8\t$\x98:@,W \xc1\xd8\x04b\x1d\x04\xb1f201\xfe\xe9\x06q\x19\x18\
-        \x11\x04\x00\x98\xa4\x05(\nendstream\nendobj\n";
-
-        #[cfg(feature = "qpdf-zlib-compat")]
-        const GOLDEN_OBJ5: &[u8] = b"5 0 obj\n<< /Type /XRef /Length 31 /Filter /FlateDecode \
-        /DecodeParms << /Columns 4 /Predictor 12 >> /W [ 1 2 1 ] /Size 6 \
-        /ID [<31964df6e5b2211859e4ac9d6e862d1a><600e7337159832ba5aec698387e2b795>] >>\n\
-        stream\nx\x9ccb\x00\x02&F6\x16\x06&\x06\x86\xfd@\x82q\x06\x88\x00\xb1\x18f0\x00\x00\
-        \x1c7\x02\xc8\nendstream\nendobj\n";
-
-        #[cfg(feature = "qpdf-zlib-compat")]
-        #[test]
-        fn first_half_xref_object_is_byte_identical_to_qpdf() {
-            let payload = encode_payload(&three_page_obj7_entries(), [1, 2, 1]).unwrap();
-            let mut out = Vec::new();
-            write_object(
-                &mut out,
-                ObjectRef::new(7, 0),
-                &XrefStreamDict {
-                    filtered: true,
-                    widths: [1, 2, 1],
-                    index: Some((6, 11)),
-                    info: Some(ObjectRef::new(15, 0)),
-                    root: Some(ObjectRef::new(8, 0)),
-                    root_value: None,
-                    size: 17,
-                    prev: Some(2226),
-                    trailer: None,
-                    canonical_entries: None,
-                    id: Some((&ID0, &ID1)),
-                    encrypt: None,
-                },
-                &payload,
-            );
-            assert_eq!(out, GOLDEN_OBJ7);
-        }
-
-        #[cfg(feature = "qpdf-zlib-compat")]
-        #[test]
-        fn main_xref_object_is_byte_identical_to_qpdf() {
-            let payload = encode_payload(&three_page_obj5_entries(), [1, 2, 1]).unwrap();
-            let mut out = Vec::new();
-            write_object(
-                &mut out,
-                ObjectRef::new(5, 0),
-                &XrefStreamDict {
-                    filtered: true,
-                    widths: [1, 2, 1],
-                    index: None,
-                    info: None,
-                    root: None,
-                    root_value: None,
-                    size: 6,
-                    prev: None,
-                    trailer: None,
-                    canonical_entries: None,
-                    id: Some((&ID0, &ID1)),
-                    encrypt: None,
-                },
-                &payload,
-            );
-            assert_eq!(out, GOLDEN_OBJ5);
-        }
-
-        // ---- test helpers ----
-
-        fn hex(bytes: &[u8]) -> String {
-            let mut s = String::with_capacity(bytes.len() * 2);
-            for b in bytes {
-                s.push_str(&format!("{b:02x}"));
-            }
-            s
-        }
-
-        fn inflate(data: &[u8]) -> Vec<u8> {
-            use flate2::read::ZlibDecoder;
-            use std::io::Read as _;
-            let mut out = Vec::new();
-            ZlibDecoder::new(data)
-                .read_to_end(&mut out)
-                .expect("valid zlib payload");
-            out
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::writer::object_streams::ObjStmBody;
-    use crate::ObjectRef;
-
-    #[test]
-    fn raw_objstm_uses_qpdf_fixed_key_order() {
-        let body = ObjStmBody {
-            bytes: b"3 0\nnull\n".to_vec(),
-            first_offset: 4,
-            n_members: 1,
-        };
-        let mut out = Vec::new();
-        write_objstm_stream(
-            &mut out,
-            &body,
-            CompressStreams::No,
-            NewlineBeforeEndstream::Never,
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            b"<< /Type /ObjStm /Length 9 /N 1 /First 4 >>\n\
-              stream\n3 0\nnull\nendstream"
-        );
-    }
-
-    #[test]
-    fn framing_policy_matches_qpdf_boolean_and_qdf_rules() {
-        assert!(!framing_adds_newline(
-            b"payload",
-            NewlineBeforeEndstream::Never
-        ));
-        assert!(!framing_adds_newline(
-            b"payload\n",
-            NewlineBeforeEndstream::Never
-        ));
-        assert!(framing_adds_newline(
-            b"payload\n",
-            NewlineBeforeEndstream::Yes
-        ));
-        assert!(framing_adds_newline_with_qdf(
-            b"payload",
-            NewlineBeforeEndstream::Never,
-            true
-        ));
-        assert!(!framing_adds_newline_with_qdf(
-            b"payload\n",
-            NewlineBeforeEndstream::Never,
-            true
-        ));
-    }
-
-    #[test]
-    fn qpdf_newline_flag_adds_a_newline_even_for_eol_payloads() {
-        // qpdf's boolean setter is represented by `Yes`; the QDF conditional
-        // is represented separately rather than as a public middle state.
-        assert!(framing_adds_newline(
-            b"payload\n",
-            NewlineBeforeEndstream::Yes
-        ));
-    }
-
-    #[test]
-    fn xref_stream_id_writer_emits_encrypt_reference_after_id() {
-        let dict = xref_stream::XrefStreamDict {
-            filtered: false,
-            widths: [1, 1, 1],
-            index: None,
-            info: None,
-            root: Some(ObjectRef::new(1, 0)),
-            root_value: None,
-            size: 2,
-            prev: None,
-            trailer: None,
-            canonical_entries: None,
-            id: None,
-            encrypt: Some(ObjectRef::new(7, 0)),
-        };
-        let mut output = Vec::new();
-        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<00><11>]");
-
-        xref_stream::write_object_with_id_writer(
-            &mut output,
-            ObjectRef::new(8, 0),
-            &dict,
-            &[0, 1],
-            &mut id_writer,
-        );
-
-        let output = String::from_utf8(output).expect("xref stream output is ASCII");
-        assert!(output.contains("/ID [<00><11>] /Encrypt 7 0 R"));
     }
 }

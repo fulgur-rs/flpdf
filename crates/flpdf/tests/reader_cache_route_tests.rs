@@ -57,7 +57,7 @@ fn encryption_dictionary_reader_route_uses_handle_accessors() {
     let route = source
         .split("fn encrypt_dictionary_handle")
         .nth(1)
-        .and_then(|tail| tail.split("/// Snapshot `/Encrypt`").next())
+        .and_then(|tail| tail.split("pub(crate) fn last_xref_form").next())
         .expect("encryption dictionary route exists");
 
     assert!(route.contains("try_as_dictionary"));

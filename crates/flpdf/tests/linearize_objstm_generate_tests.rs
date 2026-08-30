@@ -9,11 +9,8 @@
 //! are parsed directly), so they run on every build and cover the
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
-#[path = "support/filter_handles.rs"]
-mod filter_handles;
-
 use flpdf::linearization::{LinearizationPlan, RenumberMap};
-use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter};
+use flpdf::{CompressStreams, DecodeLevel, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter};
 use std::cell::RefCell;
 use std::io::Cursor;
 use std::path::Path;
@@ -146,9 +143,9 @@ fn three_page_generate_keeps_catalog_standalone() {
     let obj = pdf
         .resolve_canonical_object(root)
         .expect("catalog resolves");
-    let dict = obj.as_dict().expect("catalog is a dictionary");
+    let dict = obj.as_dictionary().expect("catalog is a dictionary");
     let is_catalog = dict
-        .get("Type")
+        .get(b"/Type".as_slice())
         .and_then(|t| t.as_name())
         .map(|n| n == b"Catalog")
         .unwrap_or(false);
@@ -391,12 +388,12 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
     let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
     let mut js_number = None;
     for r in rt.object_refs() {
-        if let Ok(Object::Stream(s)) = rt.resolve_canonical_object(r) {
-            if let Ok(decoded) =
-                filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
-            {
-                if decoded == b"app.alert('shared');" {
-                    js_number = Some(r.number);
+        if let Ok(stream) = rt.resolve_canonical_object(r) {
+            if stream.as_stream_dict().is_some() {
+                if let Ok(decoded) = stream.get_stream_data(DecodeLevel::Generalized) {
+                    if decoded.as_slice() == b"app.alert('shared');" {
+                        js_number = Some(r.number);
+                    }
                 }
             }
         }
@@ -468,12 +465,12 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
     let mut js_number = None;
     for r in rt.object_refs() {
-        if let Ok(Object::Stream(s)) = rt.resolve_canonical_object(r) {
-            if let Ok(decoded) =
-                filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
-            {
-                if decoded == b"app.alert('shared');" {
-                    js_number = Some(r.number);
+        if let Ok(stream) = rt.resolve_canonical_object(r) {
+            if stream.as_stream_dict().is_some() {
+                if let Ok(decoded) = stream.get_stream_data(DecodeLevel::Generalized) {
+                    if decoded.as_slice() == b"app.alert('shared');" {
+                        js_number = Some(r.number);
+                    }
                 }
             }
         }

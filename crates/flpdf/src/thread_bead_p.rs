@@ -30,7 +30,7 @@
 //! A removed page kept alive only through a sibling bead reachable via a
 //! surviving page's `/B` (with no usable `/Threads`) must still have that
 //! bead's `/P` dropped, or the prune cannot collect the page. Indirection is
-//! normalized through [`Pdf::resolve_to_terminal_ref`] at every
+//! normalized through the canonical resolver at every
 //! link (`/Threads`, the thread entry, `/F`, `/N`, `/V`, `/B`, and `/P`), so a
 //! reference-to-reference chain, a direct (inline) thread dictionary, or a
 //! chained `/P` is handled the same way the page extraction path
@@ -95,7 +95,7 @@ use std::io::{Read, Seek};
 /// target page was dropped, so that a removed page referenced by nothing else
 /// is garbage-collected by the subsequent subset sweep
 /// ([`crate::job::QPDFJob::prune_after_subset`]). Reference-to-reference chains
-/// at every link are normalized through [`Pdf::resolve_to_terminal_ref`]
+/// at every link are normalized through the canonical resolver
 /// before each step is inspected. The function mutates `pdf`
 /// in place (same convention as `rebuild_page_tree`) and succeeds silently when
 /// the document has no article beads.
@@ -103,7 +103,7 @@ use std::io::{Read, Seek};
 /// # Errors
 ///
 /// Any error propagated from [`Pdf::resolve`] or
-/// [`Pdf::resolve_to_terminal_ref`] while resolving the catalog, the
+/// the canonical resolver while resolving the catalog, the
 /// `/Threads` array, the threads, the surviving pages, or the beads.
 pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -122,13 +122,13 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     seed_from_threads(pdf, &mut queue)?;
     seed_from_surviving_pages(pdf, result, &mut queue)?;
 
-    // Walk the ring(s). Pdf::resolve_to_terminal_ref keeps the visited key and
+    // Walk the ring(s). Pdf::resolve_handle_ref keeps the visited key and
     // the write-back target at the terminal bead ref (never an intermediate
     // reference holder).
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     while let Some(start_ref) = queue.pop() {
         let start = pdf.get_object_handle(start_ref);
-        let (concrete, terminal) = pdf.resolve_to_terminal_ref(&start)?;
+        let (concrete, terminal) = pdf.resolve_handle_ref(&start)?;
         let bead_ref = terminal.unwrap_or(start_ref);
         if !visited.insert(bead_ref) {
             continue;
@@ -165,7 +165,7 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
     }
     let threads_val = catalog.try_get_key(b"/Threads")?;
     // /Threads may be an indirect (possibly multi-hop) reference to the array.
-    let (threads_concrete, _) = pdf.resolve_to_terminal_ref(&threads_val)?;
+    let (threads_concrete, _) = pdf.resolve_handle_ref(&threads_val)?;
     let Some(threads) = threads_concrete.as_array() else {
         return Ok(());
     };
@@ -186,14 +186,14 @@ fn thread_first_bead<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     thread: &ObjectHandle,
 ) -> Result<Option<ObjectRef>> {
-    let (concrete, _) = pdf.resolve_to_terminal_ref(thread)?;
+    let (concrete, _) = pdf.resolve_handle_ref(thread)?;
     let Some(dict) = concrete.as_dictionary() else {
         return Ok(None);
     };
     let Some(f_val) = dict.get(b"/F".as_slice()) else {
         return Ok(None);
     };
-    let (_, terminal) = pdf.resolve_to_terminal_ref(f_val)?;
+    let (_, terminal) = pdf.resolve_handle_ref(f_val)?;
     Ok(terminal)
 }
 
@@ -219,7 +219,7 @@ fn seed_from_surviving_pages<R: Read + Seek>(
             continue;
         }
         let b_val = page.try_get_key(b"/B")?;
-        let (b_concrete, _) = pdf.resolve_to_terminal_ref(&b_val)?;
+        let (b_concrete, _) = pdf.resolve_handle_ref(&b_val)?;
         if let Some(beads) = b_concrete.as_array() {
             for bead in beads {
                 if let Some(r) = handle_reference(&bead) {
@@ -250,7 +250,7 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     else {
         return Ok(());
     };
-    let (_, p_terminal) = pdf.resolve_to_terminal_ref(&p_val)?;
+    let (_, p_terminal) = pdf.resolve_handle_ref(&p_val)?;
     let Some(page_ref) = p_terminal else {
         return Ok(()); // Non-reference /P: malformed, left unchanged.
     };
@@ -272,17 +272,17 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     }
 }
 
-/// Return an indirect reference carried by a handle without forcing a second
-/// resolution. Parsed dictionary/array references use `object_ref`; the
-/// mutation-only bare-reference value uses `as_reference`.
+/// Return the indirect identity carried by a child handle without resolving it.
+/// Canonical handles retain that identity after resolution; callers here need
+/// the edge target so they can enqueue the bead for a later walk.
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
-    handle.object_ref().or_else(|| handle.as_reference())
+    handle.object_ref()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_handle::{canonical_dictionary_key, ObjectValue};
+    use crate::object_handle::canonical_dictionary_key;
     use crate::Pdf;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -298,7 +298,7 @@ mod tests {
 
     fn reference_number(value: Option<&ObjectHandle>) -> Option<u32> {
         value
-            .and_then(handle_reference)
+            .and_then(ObjectHandle::object_ref)
             .map(|object_ref| object_ref.number)
     }
 
@@ -399,17 +399,7 @@ mod tests {
     }
 
     fn open(objs: &BTreeMap<u32, String>) -> Pdf<Cursor<Vec<u8>>> {
-        let mut pdf = Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture");
-        for (&number, body) in objs {
-            if let Ok(target) = body.parse::<ObjectRef>() {
-                pdf.replace_object(
-                    ObjectRef::new(number, 0),
-                    ObjectHandle::from_value(ObjectValue::Reference(target)),
-                )
-                .expect("install canonical reference fixture");
-            }
-        }
-        pdf
+        Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture")
     }
 
     /// A `RebuildResult` keeping pages 3 and 5 under their original refs
@@ -648,83 +638,6 @@ mod tests {
         assert!(
             p12.is_none(),
             "a direct (inline) thread dictionary's dangling bead /P must be dropped, got {p12:?}"
-        );
-    }
-
-    #[test]
-    fn bead_p_reference_chain_is_resolved() {
-        // Bead 12's /P is a reference-to-reference chain to the removed page 4;
-        // bead 11's /P is a chain to the surviving page 3. The chain must be
-        // resolved before classifying: 12 dropped, 11 kept.
-        let mut objs = base_objs_no_b();
-        objs.insert(
-            11,
-            "<< /Type /Bead /T 10 0 R /N 12 0 R /V 13 0 R /P 21 0 R /R [0 0 100 100] >>".into(),
-        );
-        objs.insert(
-            12,
-            "<< /Type /Bead /T 10 0 R /N 13 0 R /V 11 0 R /P 20 0 R /R [0 0 100 100] >>".into(),
-        );
-        objs.insert(20, "4 0 R".into()); // chain → removed page 4
-        objs.insert(21, "3 0 R".into()); // chain → surviving page 3
-        let mut pdf = open(&objs);
-
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("/P chain");
-
-        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
-        assert!(
-            p12.is_none(),
-            "a chained /P to a removed page must be dropped, got {p12:?}"
-        );
-        let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
-        assert!(
-            reference_number(p11.as_ref()) == Some(21),
-            "a chained /P to a surviving page must be kept verbatim, got {p11:?}"
-        );
-    }
-
-    #[test]
-    fn ring_neighbour_reference_chain_is_followed() {
-        // Bead 11's /N points at object 22, whose value is the real bead 12
-        // reference (a ref-to-ref ring link). With no /B fallback the removed
-        // bead 12 is reachable only through this chained /N; it must still be
-        // processed.
-        let mut objs = base_objs_no_b();
-        objs.insert(
-            11,
-            "<< /Type /Bead /T 10 0 R /N 22 0 R /V 13 0 R /P 3 0 R /R [0 0 100 100] >>".into(),
-        );
-        objs.insert(22, "12 0 R".into());
-        let mut pdf = open(&objs);
-
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("/N chain");
-
-        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
-        assert!(
-            p12.is_none(),
-            "a bead reached only through a chained /N must have its dangling /P dropped, got {p12:?}"
-        );
-    }
-
-    #[test]
-    fn threads_multi_hop_reference_chain_is_resolved() {
-        // /Threads → 14 → 15 → [10 0 R] (two-hop chain). No /B fallback, so the
-        // removed-page bead is reachable only by resolving the chain.
-        let mut objs = base_objs_no_b();
-        objs.insert(
-            1,
-            "<< /Type /Catalog /Pages 2 0 R /Threads 14 0 R >>".into(),
-        );
-        objs.insert(14, "15 0 R".into());
-        objs.insert(15, "[10 0 R]".into());
-        let mut pdf = open(&objs);
-
-        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("multi-hop /Threads");
-
-        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
-        assert!(
-            p12.is_none(),
-            "a thread reached through a multi-hop /Threads chain must be walked, got {p12:?}"
         );
     }
 

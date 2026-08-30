@@ -128,7 +128,7 @@ fn replace_merged_fields(
         return Ok(());
     };
     let root = merged.get_object_handle(root_ref);
-    let acroform = merged.resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+    let acroform = merged.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
     let Some(_) = acroform.as_dictionary() else {
         return Ok(());
     };

@@ -16,7 +16,7 @@
 mod common;
 use common::PdfCanonicalTestExt;
 
-use flpdf::{Object, ObjectRef, Pdf, Severity};
+use flpdf::{ObjectHandle, ObjectRef, Pdf, Severity};
 use std::io::Cursor;
 
 /// Build a PDF-1.4 (xref table) with one content stream (obj 3) carrying
@@ -85,15 +85,13 @@ fn build_pdf_indirect_len_adjacent(payload: &[u8], holder_value: i64) -> Vec<u8>
 /// Resolve the content stream referenced by the Catalog's `/Metadata`.
 fn metadata_stream_result<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
-) -> flpdf::Result<Object> {
+) -> flpdf::Result<ObjectHandle> {
     let root = pdf.root_ref().expect("output must have a /Root");
-    let metadata_ref = match pdf.resolve_canonical_object(root).expect("resolve /Root") {
-        Object::Dictionary(d) => match d.get("Metadata") {
-            Some(Object::Reference(r)) => *r,
-            other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
-        },
-        other => panic!("/Root must be a dictionary, got {other:?}"),
-    };
+    let root = pdf.resolve_canonical_object(root).expect("resolve /Root");
+    let metadata_ref = root
+        .try_get_key(b"/Metadata")?
+        .object_ref()
+        .expect("Catalog /Metadata must be a reference");
     pdf.resolve_canonical_object(metadata_ref)
 }
 
@@ -102,12 +100,9 @@ fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
     expected_data: &[u8],
     expected_messages: &[&str],
 ) {
+    let stream = metadata_stream_result(pdf).expect("qpdf-style stream recovery");
     assert_eq!(
-        metadata_stream_result(pdf)
-            .expect("qpdf-style stream recovery")
-            .as_stream()
-            .unwrap()
-            .data,
+        stream.get_raw_stream_data().unwrap().as_slice(),
         expected_data
     );
     let snapshot = pdf.repair_diagnostics();
@@ -123,12 +118,9 @@ fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
         .iter()
         .all(|entry| entry.severity == Severity::Warning));
 
+    let stream = metadata_stream_result(pdf).expect("cached stream recovery");
     assert_eq!(
-        metadata_stream_result(pdf)
-            .expect("cached stream recovery")
-            .as_stream()
-            .unwrap()
-            .data,
+        stream.get_raw_stream_data().unwrap().as_slice(),
         expected_data
     );
     assert_eq!(
@@ -147,14 +139,12 @@ fn correct_holder_reslices_payload_containing_endstream_bytes() {
     let bytes = build_pdf_indirect_len_adjacent(payload, payload.len() as i64);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
-        Object::Stream(stream) => assert_eq!(
-            stream.data.as_slice(),
-            payload,
-            "authoritative holder must re-slice the full payload, not stop at the interior endstream"
-        ),
-        other => panic!("expected a stream, got {other:?}"),
-    }
+    let stream = metadata_stream_result(&mut pdf).expect("stream must resolve");
+    assert_eq!(
+        stream.get_raw_stream_data().unwrap().as_slice(),
+        payload,
+        "authoritative holder must re-slice the full payload, not stop at the interior endstream"
+    );
 }
 
 /// (2) qpdf 11.9.0 accepts the `endstream` token at the stale holder boundary,
@@ -201,10 +191,8 @@ fn correct_holder_reslices_payload_containing_endstreamendobj_bytes() {
     let bytes = build_pdf_indirect_len_adjacent(payload, payload.len() as i64);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
-        Object::Stream(stream) => assert_eq!(stream.data.as_slice(), payload),
-        other => panic!("expected a stream, got {other:?}"),
-    }
+    let stream = metadata_stream_result(&mut pdf).expect("stream must resolve");
+    assert_eq!(stream.get_raw_stream_data().unwrap().as_slice(), payload);
 }
 
 /// (2d) qpdf 11.9.0 detects a self-referential holder loop, treats the length as
@@ -261,14 +249,12 @@ fn crlf_framed_indirect_length_round_trips() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
-        Object::Stream(stream) => assert_eq!(
-            stream.data.as_slice(),
-            payload,
-            "CRLF-framed stream data must be the payload without the framing EOL"
-        ),
-        other => panic!("expected a stream, got {other:?}"),
-    }
+    let stream = metadata_stream_result(&mut pdf).expect("stream must resolve");
+    assert_eq!(
+        stream.get_raw_stream_data().unwrap().as_slice(),
+        payload,
+        "CRLF-framed stream data must be the payload without the framing EOL"
+    );
 }
 
 /// A bare-CR-framed `endstream` (line-anchored) with an indirect `/Length` is
@@ -285,14 +271,12 @@ fn cr_framed_indirect_length_round_trips() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    match metadata_stream_result(&mut pdf).expect("stream must resolve") {
-        Object::Stream(stream) => assert_eq!(
-            stream.data.as_slice(),
-            payload,
-            "bare-CR-framed stream data must be the payload without the framing \\r"
-        ),
-        other => panic!("expected a stream, got {other:?}"),
-    }
+    let stream = metadata_stream_result(&mut pdf).expect("stream must resolve");
+    assert_eq!(
+        stream.get_raw_stream_data().unwrap().as_slice(),
+        payload,
+        "bare-CR-framed stream data must be the payload without the framing \\r"
+    );
 }
 
 /// Build a PDF-1.5 with an uncompressed ObjStm (obj 3) holding one member
@@ -371,14 +355,11 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
     let pages_obj = pdf
         .resolve_canonical_object(ObjectRef::new(2, 0))
         .expect("compressed member must resolve through the indirect-length ObjStm");
-    match pages_obj {
-        Object::Dictionary(d) => assert_eq!(
-            d.get("Type"),
-            Some(&Object::Name(b"Pages".to_vec())),
-            "compressed member must decode to the Pages dictionary"
-        ),
-        other => panic!("expected the Pages dictionary, got {other:?}"),
-    }
+    let type_value = pages_obj
+        .as_dictionary()
+        .and_then(|dict| dict.get(b"/Type".as_slice()).cloned())
+        .expect("compressed member type");
+    assert_eq!(type_value.as_name(), Some(b"Pages".to_vec()));
 }
 
 /// (3b) An unusable indirect `/Length` on an ObjStm container takes the same
@@ -392,10 +373,11 @@ fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
     let pages_obj = pdf
         .resolve_canonical_object(ObjectRef::new(2, 0))
         .expect("bounded recovery must preserve the compressed member");
-    assert_eq!(
-        pages_obj.as_dict().and_then(|dict| dict.get("Type")),
-        Some(&Object::Name(b"Pages".to_vec()))
-    );
+    let type_value = pages_obj
+        .as_dictionary()
+        .and_then(|dict| dict.get(b"/Type".as_slice()).cloned())
+        .expect("compressed member type");
+    assert_eq!(type_value.as_name(), Some(b"Pages".to_vec()));
 
     assert_eq!(
         pdf.repair_diagnostics()

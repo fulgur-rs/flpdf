@@ -6,19 +6,19 @@
 
 #![allow(dead_code)]
 
-use flpdf::{Object, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
+use flpdf::{ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
 
 /// Canonical object access for integration assertions after the library's
 /// owned raw-object resolver was removed.
 pub trait PdfCanonicalTestExt {
-    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object>;
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<ObjectHandle>;
 }
 
 impl<R: std::io::Read + std::io::Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
-    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<ObjectHandle> {
         let handle = self.get_object_handle(object_ref);
         self.resolve(&handle)?;
-        handle.materialize()
+        Ok(handle)
     }
 }
 

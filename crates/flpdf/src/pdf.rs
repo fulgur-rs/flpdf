@@ -5,7 +5,7 @@ use crate::cache::ObjectCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::pages::repair::PreparedPages;
 use crate::reader::resolver::ResolverHandle;
-use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefForm};
+use crate::{Error, ObjectHandle, ObjectRef, Result, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -79,7 +79,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// alive.
     pub(crate) resolver: Rc<ResolverHandle<R>>,
     pub(crate) version: String,
-    pub(crate) trailer: Dictionary,
+    pub(crate) trailer: ObjectHandle,
     pub(crate) last_xref_form: XrefForm,
     /// qpdf's xref-parser-owned `first_xref_item_offset` used by the
     /// linearization `/T` check; zero preserves qpdf's initialized default
@@ -119,15 +119,10 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// self-referential borrow of this Pdf. Transient page-selection helpers
     /// use their own cache instead.
     pub(crate) acroform_cache: Rc<RefCell<Option<AcroFormCache>>>,
-    /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
-    /// repeated [`Pdf::trailer`] calls return the same shared handle
-    /// rather than re-deriving a fresh one from `self.trailer` each time.
-    /// Populated lazily on first request.
+    /// Optional replacement used by the JSON importer while it is building a
+    /// new document trailer. Ordinary parsed documents use `trailer` directly.
     pub(crate) trailer_handle_memo: Option<ObjectHandle>,
-    /// Canonical direct or indirect `/Root` handle when the trailer itself has
-    /// not yet been lifted. This is separate from `trailer_handle_memo` so a
-    /// shallow root lookup does not inherit the whole-trailer depth fallback,
-    /// while repeated direct-root accesses still share qpdf's object identity.
+    /// Canonical `/Root` handle after the first root lookup.
     pub(crate) root_handle_memo: Option<ObjectHandle>,
     pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
@@ -318,120 +313,25 @@ impl<R: Read + Seek> Pdf<R> {
         level.try_as_integer().ok().flatten()
     }
 
-    /// The trailer dictionary (or the dictionary attached to the trailing xref stream
-    /// for cross-reference-stream documents). This is where you'd reach for `/Root`,
-    /// `/Info`, `/Size`, `/ID`, etc.
-    ///
-    /// This is a construction-time snapshot: it does not reflect trailer
-    /// changes made through [`Pdf::create_from_json`] or
-    /// [`Pdf::update_from_json`]. Use [`Pdf::root_ref`] or
-    /// [`Pdf::trailer_key_handle`] for `/Root`- and key-level reads that stay
-    /// current after those calls.
-    pub fn trailer_dictionary(&self) -> &Dictionary {
-        &self.trailer
-    }
-
-    // Degrade to a null handle rather than propagating the legacy materializer's
-    // depth error or panicking: the trailer is always fully parsed already, so
-    // the handle bridge accepts the same `parser::MAX_PARSE_DEPTH` bound as the
-    // parser itself. A value beyond that accepted bound is structurally
-    // unusable here, just as the canonical handle path presents an unusable
-    // reference as `Object::Null` rather than erroring.
-    //
-    // Memoized in `self.trailer_handle_memo`, the same way `handle_registry`
-    // memoizes indirect handles: `self.trailer` is set once at construction
-    // and never reassigned afterward, so a lazily-cached handle here has no
-    // invalidation to worry about, and repeated calls return the same shared
-    // identity (`QPDF::getTrailer`) instead of a fresh `Rc` (and fresh direct
-    // children, e.g. `/ID`) on every call.
-    /// The trailer dictionary as an [`ObjectHandle`].
-    ///
-    /// The trailer is always a direct, in-memory dictionary — it is never
-    /// itself an indirect object per the PDF spec — so the returned handle is
-    /// always direct. A trailer whose literal (non-indirect) nesting exceeds
-    /// the parser's accepted bound yields a null handle instead — note this
-    /// degrades the *entire* trailer, so a caller that only cares about one
-    /// key and cannot tolerate an unrelated sibling entry's nesting erasing it
-    /// should use [`Pdf::trailer_key_handle`] instead. Repeated calls return
-    /// the same shared handle.
+    /// The live trailer dictionary as an [`ObjectHandle`].
     pub fn trailer(&mut self) -> ObjectHandle {
         if let Some(handle) = &self.trailer_handle_memo {
             return handle.clone();
         }
-        let trailer = Object::Dictionary(self.trailer.clone());
-        let handle = self
-            .lift_to_handle_bounded(&trailer, 0, crate::parser::MAX_PARSE_DEPTH)
-            .unwrap_or_else(|_| ObjectHandle::null());
-        // A direct `/Root` is not represented in the legacy trailer by an
-        // indirect ObjectRef. If root_handle() was called first, reconnect the
-        // canonical trailer's root slot to that same live handle so later
-        // trailer consumers observe mutations made through the root boundary.
-        if !handle.is_null() {
-            if let Some(root) = self.root_handle_memo.clone() {
-                let _ = handle.replace_key(b"/Root", root);
-            }
-        }
+        let handle = self.trailer.clone();
         self.trailer_handle_memo = Some(handle.clone());
         handle
     }
 
-    /// `key`'s value in the trailer dictionary, as an [`ObjectHandle`] —
-    /// unlike `Pdf::trailer().get_key(key)`, this lifts only `key`'s
-    /// own value, so an unrelated sibling trailer entry whose literal nesting
-    /// exceeds the crate's inline-object-nesting bound cannot degrade this
-    /// result to null the way it degrades [`Pdf::trailer`]'s whole-
-    /// trailer walk. A bare reference (`/Key 1 0 R`) becomes a genuine
-    /// indirect handle sharing the canonical `handle_registry` identity
-    /// (matching how a dictionary *child* reference lifts, not `lift`'s own
-    /// top-level `ObjectValue::Reference` shape — a trailer value is read,
-    /// never `Pdf::set_object`-redirected in place). Returns a direct null
-    /// handle for a missing key or a lift failure on `key`'s own value
-    /// (matching [`ObjectHandle::get_key`]'s own "missing key" contract).
-    /// Single-key handles are not memoized, except for direct or indirect
-    /// `/Root`: the Catalog is a live mutation boundary and must retain one
-    /// canonical identity even before the whole trailer is lifted.
+    /// Return the live value for a trailer key, or a contextless null handle
+    /// when the key is absent.
     pub fn trailer_key_handle(&mut self, key: &[u8]) -> ObjectHandle {
-        // The JSON importer and canonical writer mutate the live trailer
-        // handle after construction (see `Pdf::root_ref`'s identical
-        // reasoning): once that handle exists *and is a genuine dictionary*
-        // it is qpdf's authoritative trailer, so a key lookup must go
-        // through it rather than the construction-time legacy snapshot. A
-        // `trailer_handle_memo` populated by `Pdf::trailer_handle`'s own
-        // whole-tree-degraded-to-null fallback carries no key information at
-        // all, so it must not be treated as authoritative here -- that would
-        // reintroduce the exact whole-tree coupling this method exists to
-        // avoid. `try_get_key` (not the panicking `get_key`) is used because
-        // the degrade-to-null fallback in `trailer_handle` produces a bare
-        // handle with no `Pdf` context to route a type-mismatch warning
-        // through.
-        if let Some(trailer) = &self.trailer_handle_memo {
-            if !trailer.is_null() {
-                let mut name = Vec::with_capacity(key.len() + 1);
-                name.push(b'/');
-                name.extend_from_slice(key);
-                return trailer
-                    .try_get_key(&name)
-                    .unwrap_or_else(|_| ObjectHandle::null());
-            }
-        }
-        if key == b"Root" {
-            if let Some(root) = &self.root_handle_memo {
-                return root.clone();
-            }
-        }
-        let Some(value) = self.trailer.get(key).cloned() else {
-            return ObjectHandle::null();
-        };
-        // `parser::MAX_PARSE_DEPTH`, not `lift`'s default `MAX_INLINE_DEPTH`:
-        // the trailer was already parsed successfully at the looser
-        // `MAX_PARSE_DEPTH` bound, so a value nested between the two would
-        // otherwise degrade to null *here* while the legacy `resolve_chain`/
-        // bounded source parsing still returns
-        // it — the same divergence `resolve`'s own call to
-        // `lift_bounded` documents and avoids for the analogous
-        // compressed-member case.
-        let handle = self
-            .lift_to_handle_bounded(&value, 0, crate::parser::MAX_PARSE_DEPTH)
+        let trailer = self.trailer();
+        let mut name = Vec::with_capacity(key.len() + 1);
+        name.push(b'/');
+        name.extend_from_slice(key);
+        let handle = trailer
+            .try_get_key(&name)
             .unwrap_or_else(|_| ObjectHandle::null());
         if key == b"Root" && !handle.is_null() {
             self.root_handle_memo = Some(handle.clone());
@@ -441,26 +341,12 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// `/Root` as listed in the trailer, when present.
     pub fn root_ref(&self) -> Option<ObjectRef> {
-        // The JSON importer and canonical writer mutate the live trailer
-        // handle after construction. Once that handle exists *and is a
-        // genuine dictionary* it is qpdf's authoritative trailer; the legacy
-        // dictionary is only the construction-time snapshot and cannot
-        // observe those mutations. A `trailer_handle_memo` populated by
-        // `Pdf::trailer_handle`'s own whole-tree-degraded-to-null fallback
-        // carries no key information, so it falls through to the legacy
-        // snapshot instead (matching `Pdf::trailer_key_handle`'s identical
-        // reasoning). `try_get_key`, not the panicking `get_key`, because
-        // that degrade-to-null fallback is a bare handle with no `Pdf`
-        // context to route a type-mismatch warning through.
-        if let Some(trailer) = &self.trailer_handle_memo {
-            if !trailer.is_null() {
-                return trailer
-                    .try_get_key(b"/Root")
-                    .ok()
-                    .and_then(|handle| handle.object_ref());
-            }
-        }
-        self.trailer.get_ref("Root")
+        self.trailer_handle_memo
+            .as_ref()
+            .unwrap_or(&self.trailer)
+            .try_get_key(b"/Root")
+            .ok()
+            .and_then(|handle| handle.object_ref())
     }
 
     /// Return the live catalog handle after applying qpdf's `QPDF::getRoot`
@@ -469,29 +355,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// graph before checking its type. A missing, dangling, or non-dictionary
     /// `/Root` is a document-level error rather than a missing-key fallback.
     pub fn root_handle(&mut self) -> Result<ObjectHandle> {
-        let trailer_is_live =
-            matches!(&self.trailer_handle_memo, Some(trailer) if !trailer.is_null());
-        let candidate = if trailer_is_live {
-            self.trailer_handle_memo
-                .as_ref()
-                .expect("trailer_is_live confirmed a populated, non-null memo")
-                .try_get_key(b"/Root")
-                .unwrap_or_else(|_| ObjectHandle::null())
-        } else if let Some(root) = &self.root_handle_memo {
+        let candidate = if let Some(root) = &self.root_handle_memo {
             root.clone()
         } else {
-            // The trailer memo is either absent or was itself degraded to
-            // null by an unrelated sibling entry's nesting depth (see
-            // `Pdf::trailer`'s own doc). Either way, fall back to the
-            // shallow, depth-safe single-key lift so a valid /Root is not
-            // hidden behind that unrelated trailer damage.
             let root = self.trailer_key_handle(b"Root");
             if !root.is_null() {
                 self.root_handle_memo = Some(root.clone());
             }
             root
         };
-        let root = self.resolve_to_terminal(&candidate)?;
+        self.resolve(&candidate)?;
+        let root = candidate;
         if root.as_dictionary().is_none() {
             return Err(Error::System("unable to find /Root dictionary".into()));
         }

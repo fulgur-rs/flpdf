@@ -1442,7 +1442,7 @@ mod tests {
             .expect("pages key should resolve");
         let pages_ref = pages_value
             .object_ref()
-            .or_else(|| pages_value.as_reference())
+            .or_else(|| pages_value.object_ref())
             .expect("pages should be indirect");
         let pages = pdf.get_object_handle(pages_ref);
         pages.try_dereference().expect("pages should resolve");

@@ -136,9 +136,9 @@ fn rewrite_output_is_valid_pdf() {
         .success();
 
     // Trailer must not have /Prev.
-    let pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     assert!(
-        pdf.trailer_dictionary().get("Prev").is_none(),
+        !pdf.trailer().try_has_key(b"/Prev").unwrap(),
         "full-rewrite output must not have /Prev"
     );
 }

@@ -9,8 +9,8 @@ use super::eligibility::{
     collect_indirect_objstm_length_refs, compressible_objgens_qpdf_plan, eligibility_context,
     even_split_into_streams_with_cap, is_eligible_for_objstm_handle, EligibilityContext,
 };
-use crate::object::ObjectRef;
 use crate::writer::WriterOptions;
+use crate::ObjectRef;
 use crate::XrefEntry;
 // ── Packing planner types ────────────────────────────────────────────────────
 
@@ -128,22 +128,13 @@ pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerCon
 /// - `Generate` → follows qpdf's compressible-object traversal and evenly
 ///   splits the result across the minimum number of streams allowed by the
 ///   member cap.
-#[cfg(test)]
-pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    config: &PlannerConfig,
-) -> crate::Result<PackingPlan> {
-    plan_object_streams_with_reachability(pdf, config, None)
-}
-
+///
 /// Plan object streams with an optional qpdf-reachable candidate set.
 ///
 /// The specialized writer uses this only for Generate combined with
 /// `preserveUnreferencedObjects`: qpdf's `generateObjectStreams` always takes
 /// its members from `getCompressibleObjGens` and never lets the preserve flag
-/// expand that set (`QPDFWriter.cc:1970-2006`). The ordinary planner keeps its
-/// historical unconstrained unit-test entry point through
-/// `plan_object_streams`.
+/// expand that set (`QPDFWriter.cc:1970-2006`).
 pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     config: &PlannerConfig,
@@ -201,14 +192,6 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
 /// are retained, and Preserve never applies Generate's 100-member cap. The
 /// traversal's operation-specific stale-generation removals are returned with
 /// the batches for the dedicated serializer.
-/// Build qpdf Preserve groups without discarding each source ObjStm identity.
-#[cfg(test)]
-pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-) -> crate::Result<ObjectStreamPlan> {
-    plan_qpdf_preserve_object_streams_with_unreferenced(pdf, false)
-}
-
 /// Reconstruct source ObjStm grouping with qpdf's
 /// `preserveUnreferencedObjects` policy. qpdf keeps every source ObjStm
 /// member in the source container map in this mode; reachability filtering is
@@ -334,16 +317,6 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         batches,
         removed_refs: BTreeSet::new(),
     })
-}
-
-#[cfg(test)]
-pub(crate) fn plan_preserve_for_test<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    ctx: &EligibilityContext,
-    length_exclusions: &BTreeSet<ObjectRef>,
-    _batch_size_cap: NonZeroUsize,
-) -> crate::Result<PackingPlan> {
-    plan_preserve(pdf, ctx, length_exclusions)
 }
 
 /// Generate mode: follow qpdf's live compressible-object traversal and evenly

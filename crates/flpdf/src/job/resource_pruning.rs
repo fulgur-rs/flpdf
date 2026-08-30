@@ -54,7 +54,7 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
         return Ok(false);
     };
     let catalog = pdf.get_object_handle(root_ref);
-    let pages = pdf.resolve_to_terminal(&catalog.try_get_key(b"/Pages")?)?;
+    let pages = pdf.resolve_handle(&catalog.try_get_key(b"/Pages")?)?;
     if pages.is_null() {
         return Ok(false);
     }
@@ -68,13 +68,13 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
     let mut indirect_resources_seen: BTreeSet<ObjectRef> = BTreeSet::new();
 
     while let Some(node) = queue.pop_front() {
-        let node = pdf.resolve_to_terminal(&node)?;
+        let node = pdf.resolve_handle(&node)?;
         if !nodes_seen.insert(node.identity_key()) {
             continue;
         }
 
         let dict = node.as_stream_dict().unwrap_or_else(|| node.clone());
-        let kids = pdf.resolve_to_terminal(&dict.try_get_key(b"/Kids")?)?;
+        let kids = pdf.resolve_handle(&dict.try_get_key(b"/Kids")?)?;
         if let Some(kids) = kids.try_as_array()? {
             // qpdf returns true for any non-leaf page node that owns a
             // /Resources key, even if only one descendant page is selected.
@@ -92,7 +92,7 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
             }
         }
 
-        let resources = pdf.resolve_to_terminal(&resources)?;
+        let resources = pdf.resolve_handle(&resources)?;
         let Some(resources_dict) = resources.as_dictionary() else {
             continue;
         };
@@ -106,12 +106,12 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
             }
         }
 
-        let xobject = pdf.resolve_to_terminal(&xobject)?;
+        let xobject = pdf.resolve_handle(&xobject)?;
         let Some(entries) = xobject.as_dictionary() else {
             continue;
         };
         for object in entries.into_values() {
-            let object = pdf.resolve_to_terminal(&object)?;
+            let object = pdf.resolve_handle(&object)?;
             if object.is_form_xobject()? {
                 queue.push_back(object);
             }

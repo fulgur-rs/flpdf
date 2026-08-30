@@ -113,11 +113,14 @@ use crate::{
     },
     writer::DecodeLevel,
 };
-use crate::{json::Json, Dictionary, Error, Object, ObjectRef, Result, Stream};
+use crate::{json::Json, Error, ObjectRef, Result};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
+
+/// Maximum inline structural nesting depth used by canonical graph walkers.
+pub(crate) const MAX_INLINE_DEPTH: usize = 256;
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
 type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
@@ -919,8 +922,7 @@ impl ObjectSlot {
 }
 
 /// The value payload of a direct `ObjectHandle`, mirroring qpdf's
-/// `QPDFValue` type family (`libqpdf/qpdf/QPDFValue.hh`) and this crate's
-/// existing [`crate::Object`] enum.
+/// `QPDFValue` type family (`libqpdf/qpdf/QPDFValue.hh`).
 ///
 /// Array and dictionary children are [`ObjectHandle`]s rather than raw
 /// nested `ObjectValue`s, so cloning a container clones only `Rc` handles
@@ -939,21 +941,19 @@ pub(crate) enum ObjectValue {
     Integer(i64),
     Real(f64),
     /// Preserves a non-canonical source spelling (e.g. `.4`) alongside its
-    /// parsed value, mirroring [`crate::Object::RealLiteral`], so that a
-    /// real number written in the source PDF unparses byte-identically.
+    /// parsed value, so that a real number written in the source PDF unparses
+    /// byte-identically.
     RealLiteral {
         value: f64,
         literal: Vec<u8>,
     },
     Name(Vec<u8>),
     String(Vec<u8>),
-    /// A content-stream operator token (e.g. `q`, `Do`), mirroring
-    /// [`crate::Object::Operator`]. Only meaningful inside a content stream
+    /// A content-stream operator token (e.g. `q`, `Do`). Only meaningful inside a content stream
     /// (`include/qpdf/QPDFObjectHandle.hh:318-319`: "Operator and
     /// InlineImage are only allowed in content streams").
     Operator(Vec<u8>),
-    /// Raw inline-image (`BI`...`ID`...`EI`) bytes, mirroring
-    /// [`crate::Object::InlineImage`]. Same content-stream-only constraint
+    /// Raw inline-image (`BI`...`ID`...`EI`) bytes. Same content-stream-only constraint
     /// as `Operator` above.
     InlineImage(Vec<u8>),
     Array(Vec<ObjectHandle>),
@@ -1011,25 +1011,6 @@ pub(crate) enum ObjectValue {
         /// (`libqpdf/QPDF_Stream.cc:668-685`).
         stream_length: usize,
     },
-    // qpdf-cutover-delete(flpdf-25kg.3.3): qpdf cannot store an indirect
-    // handle as another indirect object's replacement value. Delete this
-    // legacy redirect variant after `set_object` and ref-chain consumers move
-    // to canonical in-place slot replacement.
-    // An indirect object whose own resolved value is *itself* a bare
-    // reference to another object (e.g. `4 0 obj\n5 0 R\nendobj`, or a
-    // reference redirected in place via `Pdf::set_object`) -- never seen
-    // from a file/ObjStm parse (`Pdf::resolve`'s native path
-    // integerizes a top-level bare reference to `Integer` instead, matching
-    // qpdf), but a real value `Pdf::set_object` callers pass directly (used
-    // throughout this crate to redirect/collapse holder chains). A child
-    // array/dictionary entry that is a reference is represented as a
-    // separate indirect `ObjectHandle`, never this variant -- see
-    // `Pdf::lift_to_handle` and `materialize`'s own doc.
-    // qpdf-deviation: only Pdf::set_object builds an indirect object whose
-    // own resolved value is a bare reference; QPDF::replaceObject
-    // (QPDF.cc:1986-1991) throws on an indirect replacement and a top-level
-    // bare reference parses as Integer, so qpdf can never hold this shape.
-    Reference(ObjectRef),
 }
 
 impl ObjectValue {
@@ -1055,7 +1036,6 @@ impl ObjectValue {
             Self::Stream { .. } => 10,
             Self::Operator(_) => 11,
             Self::InlineImage(_) => 12,
-            Self::Reference(_) => 13,
         }
     }
 
@@ -1080,7 +1060,6 @@ impl ObjectValue {
             Self::Stream { .. } => "stream",
             Self::Operator(_) => "operator",
             Self::InlineImage(_) => "inline-image",
-            Self::Reference(_) => "unresolved",
         }
     }
 }
@@ -1098,16 +1077,6 @@ pub(crate) fn canonical_dictionary_key(key: &[u8]) -> Vec<u8> {
         canonical.extend_from_slice(key);
         canonical
     }
-}
-
-/// Convert a legacy `Dictionary` key body to qpdf's canonical dictionary key.
-/// Legacy keys omit the PDF name delimiter, but their decoded body may itself
-/// begin with `/` (for example, the body of `/#2Ffoo`).
-pub(crate) fn canonical_dictionary_key_from_legacy(key: &[u8]) -> Vec<u8> {
-    let mut canonical = Vec::with_capacity(key.len() + 1);
-    canonical.push(b'/');
-    canonical.extend_from_slice(key);
-    canonical
 }
 
 /// Convert a canonical ObjectHandle dictionary key back to the legacy
@@ -1576,14 +1545,8 @@ impl ObjectHandle {
         self.is_same_object_as(other)
     }
 
-    // An indirect slot with neither a document identity nor a resolver.
-    // Test-only, and necessarily so: every caller is inside a `#[cfg(test)]`
-    // module (this file's own tests, plus `parser.rs`'s
-    // `handle_path_parity_tests` and `reader.rs`'s tests).
-    // `Pdf::get_object_handle` does *not* use this — it needs both the
-    // document identity and the resolver, so it calls
-    // `new_indirect_for_pdf_with_resolver`.
-    #[cfg(test)]
+    /// An indirect slot without an owning document resolver. This is the
+    /// detached handle shape used by syntax-only parser boundaries.
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
         Self::new_indirect_unresolved_with_identity(object_ref, offset, None, None)
     }
@@ -2076,10 +2039,9 @@ impl ObjectHandle {
     }
 
     /// Construct a direct handle wrapping an already-built [`ObjectValue`], at
-    /// the no-offset sentinel. Used at the explicit raw-object materialization
-    /// boundary (`Pdf::lift`/`Pdf::lift_to_handle`) to wrap a value lifted from
-    /// a legacy [`crate::Object`] without going through one of the typed public
-    /// factories above.
+    /// the no-offset sentinel. Used by parser and bootstrap boundaries to wrap
+    /// an already-decoded internal value without going through one of the
+    /// typed public factories above.
     pub(crate) fn from_value(value: ObjectValue) -> Self {
         Self::new_direct(value, NO_PARSED_OFFSET)
     }
@@ -2467,6 +2429,7 @@ impl ObjectHandle {
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
+            eprintln!("TRACE DROPPED object={object_ref:?} handle={self:?}");
             return Err(Error::Internal(format!(
                 "object {} {} belongs to a dropped PDF",
                 object_ref.number, object_ref.generation
@@ -3612,8 +3575,8 @@ impl ObjectHandle {
     }
 
     /// Construct a direct dictionary value from `entries`. Iteration order
-    /// is the lexicographic order of the keys, not insertion order (matching
-    /// [`crate::Dictionary`]); a repeated key keeps its last value. Values
+    /// is the lexicographic order of the keys, not insertion order; a repeated
+    /// key keeps its last value. Values
     /// are handles, so cloning or re-reading this dictionary's entries never
     /// deep-copies their subtrees. Each input key is normalized to qpdf's
     /// decoded canonical name string, including the leading `/`.
@@ -3654,10 +3617,9 @@ impl ObjectHandle {
 
     /// Construct a direct real value that preserves a non-canonical source
     /// literal (e.g. `.4`) alongside its parsed value, mirroring
-    /// [`crate::Object::RealLiteral`], so that a real number written in the
-    /// source PDF unparses byte-identically. `literal` is expected to parse
-    /// back to `value` and to differ from `value`'s canonical string form —
-    /// see [`crate::Object::RealLiteral`]'s own documented invariant.
+    /// the parser's preserved-literal value, so that a real number written in
+    /// the source PDF unparses byte-identically. `literal` is expected to parse
+    /// back to `value` and to differ from `value`'s canonical string form.
     pub fn real_literal(value: f64, literal: Vec<u8>) -> Self {
         Self::new_direct(
             ObjectValue::RealLiteral { value, literal },
@@ -3691,8 +3653,8 @@ impl ObjectHandle {
     /// The value as `f64` if this handle's value — its own if direct, or
     /// its already-resolved value if indirect — is a real number (including
     /// one with a preserved non-canonical source literal), or `None`
-    /// otherwise. Mirrors [`crate::Object::as_real`]'s own real-or-real-literal
-    /// arm. Never performs resolution itself.
+    /// otherwise. The real-or-real-literal distinction is collapsed by this
+    /// accessor. It never performs resolution itself.
     pub fn as_real(&self) -> Option<f64> {
         self.with_value(|value| match value {
             Some(ObjectValue::Real(v) | ObjectValue::RealLiteral { value: v, .. }) => Some(*v),
@@ -3716,21 +3678,6 @@ impl ObjectHandle {
     pub fn as_string(&self) -> Option<Vec<u8>> {
         self.with_value(|value| match value {
             Some(ObjectValue::String(bytes)) => Some(bytes.clone()),
-            _ => None,
-        })
-    }
-
-    /// The target as an indirect-object reference if this handle's value —
-    /// its own if direct, or its already-resolved value if indirect — is
-    /// itself a bare reference (e.g. one redirected in place to another
-    /// object via `Pdf::set_object`), mirroring [`crate::Object::Reference`],
-    /// or `None` otherwise. This is distinct from an indirect *child*
-    /// handle, which is exposed via [`Self::is_indirect`]/[`Self::object_ref`]
-    /// on the child handle itself rather than through this accessor. Never
-    /// performs resolution itself.
-    pub fn as_reference(&self) -> Option<ObjectRef> {
-        self.with_value(|value| match value {
-            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
             _ => None,
         })
     }
@@ -4029,8 +3976,8 @@ impl ObjectHandle {
     /// reject loops with a visited set (`libqpdf/QPDFObjectHandle.cc:2091-2133`).
     /// This remains public because qpdf exposes the same live mutation on
     /// `QPDFObjectHandle`; external canonical consumers must not replace an
-    /// indirect array through its parent dictionary or materialize it into
-    /// the legacy [`crate::Object`] model.
+    /// indirect array through its parent dictionary or copy it into a separate
+    /// value model.
     ///
     /// As with [`Self::replace_key`], this mutates the live handle graph but
     /// cannot notify the owning [`crate::Pdf`]. After mutating, call
@@ -4859,8 +4806,7 @@ impl ObjectHandle {
             ObjectValue::Unresolved
             | ObjectValue::Destroyed
             | ObjectValue::Operator(_)
-            | ObjectValue::InlineImage(_)
-            | ObjectValue::Reference(_) => Err(Error::System(
+            | ObjectValue::InlineImage(_) => Err(Error::System(
                 "QPDFObjectHandle::makeDirectInternal: unknown object type".to_owned(),
             )),
         }
@@ -6040,7 +5986,7 @@ impl ObjectHandle {
     ///
     /// This is `QPDF_Stream::writeStreamJSON`
     /// (`libqpdf/QPDF_Stream.cc:207-295`), kept on the canonical stream handle
-    /// rather than split between a legacy `Object::Stream` payload reader and
+    /// rather than split between a separate stream payload reader and
     /// a document-level dictionary writer. `json_data` matches qpdf's three
     /// `qpdf_json_stream_data_e` values. The optional pipeline is the side-file
     /// sink required by `File`; it is deliberately not the JSON output sink.
@@ -6694,17 +6640,6 @@ impl ObjectHandle {
     /// without entering the resolver, matching `getTypeCode`'s null-handle
     /// fallback (`libqpdf/QPDFObjectHandle.cc:240-244`).
     ///
-    /// A resolved indirect handle whose own value is itself a bare
-    /// reference (mirroring [`crate::Object::Reference`]; see
-    /// [`Self::as_reference`]'s own doc), a `Pdf::set_object`-driven
-    /// redirect, also reports `13`. This looks like a
-    /// contradiction with [`Self::is_resolved`] returning `true` for the
-    /// same handle, but it is not: the *value* is known (it is a reference),
-    /// while the *referenced object's own type* is not known without following
-    /// the chain further. `type_code`/`type_name` inspect only the handle's
-    /// own canonical slot; they do not follow a bare-reference value to the
-    /// object it points at.
-    ///
     /// # Errors
     ///
     /// Returns the resolver error when an unresolved indirect handle cannot be
@@ -6822,65 +6757,6 @@ impl ObjectHandle {
         (Rc::as_ptr(&generation) as usize, generation.get())
     }
 
-    /// Convert this handle's value into a legacy [`crate::Object`] tree —
-    /// `Pdf::resolve` followed by an explicit materialization boundary,
-    /// also public for a caller outside this crate that still needs a
-    /// legacy `Object`/[`Dictionary`] for one value reached through an
-    /// otherwise `ObjectHandle`-native walk (e.g. `flpdf-qtest-tools`' qtest
-    /// driver, which ports a `&Dictionary`-shaped qpdf filter/`DecodeParms`
-    /// resolution routine).
-    ///
-    /// An indirect array/dictionary child is *not* recursively resolved: it
-    /// becomes `Object::Reference(child_ref)`, matching the parser's
-    /// pre-existing `Object::Reference` semantics so every consumer match on
-    /// that variant keeps working unchanged. A stream's own dictionary
-    /// handle (a separately parsed handle with its own `<<`-start parsed
-    /// offset) is flattened into a plain [`Dictionary`] for
-    /// `Object::Stream`.
-    ///
-    /// Parsed original streams make this bridge fallible: materializing one
-    /// reads its bytes through [`Self::get_raw_stream_data`] at this call
-    /// site. New qpdf-native stream consumers must keep the handle and pipe
-    /// it instead; this legacy bridge exists only for callers that still
-    /// require an owned [`Object`].
-    ///
-    /// An indirect handle that has not yet been resolved (see
-    /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
-    /// performing hidden resolution; callers that need the real value must
-    /// resolve first (e.g. via `Pdf::resolve`).
-    ///
-    /// A tree built through the public [`Self::array`]/[`Self::dictionary`]
-    /// factories carries no depth bound the way parsed input does, so this
-    /// walk is wrapped with the same stack-growth protection
-    /// [`Self::unparse_resolved`]/[`Self::shallow_copy`] already rely on
-    /// during construction, *and* capped at `parser::MAX_PARSE_DEPTH`,
-    /// substituting `Object::Null` for anything nested past that — no
-    /// document this crate accepts could parse a value nested deeper, so
-    /// the cap only ever bites a tree built directly through those
-    /// factories. Growing the construction stack alone would not be
-    /// enough on its own: the *returned* `Object` tree's own ordinary
-    /// recursive `Drop` runs later, unprotected, once this method has
-    /// already returned and the grown stack is gone — the depth cap keeps
-    /// that later drop within a size every other `MAX_PARSE_DEPTH`-bounded
-    /// `Object` tree in this crate already handles routinely, rather than
-    /// trying to protect `Drop` itself (`Object`'s recursive `Drop` glue
-    /// lives in `object.rs`, outside this file's scope to change).
-    ///
-    /// This does not protect `self` — the handle passed in — the same way:
-    /// an `ObjectHandle` tree that deep, built through the same public
-    /// factories, is a separate, pre-existing gap in `ObjectHandle`'s own
-    /// `Drop`, reachable without ever calling `materialize` at all (it
-    /// existed as long as those factories have been public), not something
-    /// introduced or fixable here.
-    pub fn materialize(&self) -> Result<Object> {
-        if self.is_reserved() {
-            return Err(Error::System(
-                "QPDFObjectHandle: attempting to unparse a reserved object".to_owned(),
-            ));
-        }
-        materialize_bounded(self, 0)
-    }
-
     /// This handle's qpdf-syntax unparse form
     /// (`include/qpdf/QPDFObjectHandle.hh:1159`,
     /// `libqpdf/QPDFObjectHandle.cc:1574-1584`): an indirect handle always
@@ -6896,7 +6772,7 @@ impl ObjectHandle {
     /// This handle's resolved qpdf-syntax form
     /// (`libqpdf/QPDFObjectHandle.cc:1586-1593`). The direct serializer walks
     /// `ObjectValue` and child [`ObjectHandle`] values without constructing
-    /// a detached [`crate::Object`] tree. It resolves the receiver before
+    /// a detached value tree. It resolves the receiver before
     /// dispatch, resolves array/dictionary children in qpdf's order, omits
     /// dictionary entries whose values resolve to null, and keeps indirect
     /// children in reference form (`libqpdf/QPDF_Array.cc:122-149`,
@@ -6948,10 +6824,11 @@ impl ObjectHandle {
     /// see [`Self::reset_parsed_offset`] to clear it). A no-op for an
     /// indirect handle; see [`Self::set_resolved`] for that case.
     ///
-    /// Used by `Pdf::set_object` to update a stream's own dictionary handle
+    /// Used by canonical replacement code to update a stream's own dictionary handle
     /// in place when the replacement value is also a stream, so the
     /// dictionary handle's already-recorded `<<`-start parsed offset
     /// survives instead of being lost to a freshly minted handle.
+    #[cfg(test)]
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
             self.0.borrow().stream_token_filters.borrow_mut().clear();
@@ -6963,140 +6840,12 @@ impl ObjectHandle {
     /// overriding the set-once contract [`Self::set_parsed_offset_if_unset`]
     /// normally enforces.
     ///
-    /// Used by `Pdf::set_object`: once it replaces an indirect handle's
+    /// Used by canonical replacement code: once it replaces an indirect handle's
     /// value with a caller-supplied one, any previously recorded source
     /// position no longer describes that value.
     pub(crate) fn reset_parsed_offset(&self) {
         self.0.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
     }
-}
-
-// The sole recursion hub for `ObjectHandle::materialize` — every nested
-// descent (array items, dictionary values, a stream's own dictionary handle)
-// goes through this function via `materialize_child`, so the depth cap and
-// `stacker::maybe_grow` wrap apply uniformly regardless of which container
-// shape carries the nesting. `depth` past `parser::MAX_PARSE_DEPTH`
-// substitutes `Object::Null`: no document this crate accepts could parse a
-// value nested deeper than that, so only a tree built directly through the
-// public `ObjectHandle::array`/`dictionary` factories (which impose no depth
-// bound themselves) can reach the cap at all.
-//
-// Checks `is_reserved()` on `handle` before ever walking its children,
-// mirroring the writer entrypoints' qpdf error boundary. The value-layer
-// Unresolved/Reserved/Destroyed arms below also return their qpdf logic
-// errors when a direct value reaches this materializer; an indirect child is
-// still emitted as a reference by `materialize_child` without dereferencing.
-fn materialize_bounded(handle: &ObjectHandle, depth: usize) -> Result<Object> {
-    if depth > crate::parser::MAX_PARSE_DEPTH {
-        return Ok(Object::Null);
-    }
-    if handle.is_reserved() {
-        return Err(reserved_unparse_error());
-    }
-    let stream = handle.with_value(|value| match value {
-        Some(ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-            ..
-        }) => Some((stream_dict.clone(), stream_data.clone())),
-        _ => None,
-    });
-    if let Some((stream_dict, stream_data)) = stream {
-        let dict = match materialize_bounded(&stream_dict, depth + 1)? {
-            Object::Dictionary(dict) => dict,
-            _ => Dictionary::new(),
-        };
-        let data = match stream_data {
-            Some(data) => data.as_ref().clone(),
-            None => handle.get_raw_stream_data()?.as_ref().clone(),
-        };
-        return Ok(Object::Stream(Stream::new(dict, data)));
-    }
-    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
-        handle.with_value(|value| match value {
-            Some(value) => materialize_value(value, depth),
-            None => Ok(Object::Null),
-        })
-    })
-}
-
-fn materialize_value(value: &ObjectValue, depth: usize) -> Result<Object> {
-    Ok(match value {
-        ObjectValue::Null => Object::Null,
-        ObjectValue::Unresolved => return Err(unresolved_unparse_error()),
-        ObjectValue::Reserved => return Err(reserved_unparse_error()),
-        ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
-        ObjectValue::Boolean(b) => Object::Boolean(*b),
-        ObjectValue::Integer(n) => Object::Integer(*n),
-        ObjectValue::Real(r) => Object::Real(*r),
-        ObjectValue::RealLiteral { value, literal } => Object::RealLiteral {
-            value: *value,
-            literal: literal.clone(),
-        },
-        ObjectValue::Name(name) => Object::Name(name.clone()),
-        ObjectValue::String(s) => Object::String(s.clone()),
-        ObjectValue::Operator(bytes) => Object::Operator(bytes.clone()),
-        ObjectValue::InlineImage(bytes) => Object::InlineImage(bytes.clone()),
-        ObjectValue::Array(children) => Object::Array(
-            children
-                .iter()
-                .map(|child| materialize_child(child, depth + 1))
-                .collect::<Result<Vec<_>>>()?,
-        ),
-        ObjectValue::Dictionary(entries) => {
-            let mut dict = Dictionary::new();
-            for (key, value) in entries {
-                dict.insert(
-                    legacy_dictionary_key(key),
-                    materialize_child(value, depth + 1)?,
-                );
-            }
-            Object::Dictionary(dict)
-        }
-        ObjectValue::Stream { .. } => {
-            return Err(Error::Internal(
-                "stream materialization must retain its ObjectHandle source".to_owned(),
-            ));
-        }
-        ObjectValue::Reference(object_ref) => Object::Reference(*object_ref),
-    })
-}
-
-// An array/dictionary child handle materializes to `Object::Reference`
-// without recursing into it when indirect (identity-preserving, matching
-// the parser's pre-existing `Object::Reference` semantics); a direct child
-// is materialized in place. Mirrors `QPDFWriter::unparseChild`
-// (`libqpdf/QPDFWriter.cc:1144-1156`), whose `child.isIndirect()` check
-// (`:1149`) is the only thing that decides reference-vs-recurse: it never
-// inspects what the referenced object resolves to, so an indirect object
-// that happens to be qpdf's reserved sentinel (`QPDF_Reserved`) is written
-// as an ordinary `"N G R"` reference like any other, never dereferenced,
-// here. This has no separate reserved check for the same reason
-// `unparseChild` has none: the decision is `isIndirect()`-only, full stop,
-// never inspecting the child's resolved type. Most reserved handles are
-// indirect by construction (`ObjectHandle::new_reserved_for_pdf`, always
-// paired with a freshly allocated `object_ref`), but `ObjectHandle::
-// shallow_copy` can also produce a *direct* one
-// (`ObjectHandle::new_reserved_direct`), the same way
-// `QPDFObjectHandle::shallowCopy` can hand back a direct `QPDF_Reserved`
-// (`libqpdf/QPDF_Reserved.cc:14-19`). qpdf's own equivalent throw for that
-// direct case does not live in `unparseChild`: it falls to
-// `unparseObject`'s scalar fallback (`QPDFWriter.cc:283-284`) and reaches
-// `QPDF_Reserved::unparse()` (`libqpdf/QPDF_Reserved.cc:22-26`) one level
-// down, in the dereferenced value itself, not at this reference-vs-recurse
-// decision point. This port surfaces that throw one level down too, in
-// `materialize_bounded`'s own `is_reserved` check (see that function's own
-// doc), which the `None` (direct) branch below calls into -- not here, to
-// keep this function's own decision `isIndirect()`-only, matching
-// `unparseChild` exactly. A reserved handle reached only as an *indirect*
-// child -- the case this function actually decides via the `Some` branch
-// below -- is unaffected: it is never dereferenced here, so its
-// unparseable body never matters at this position.
-fn materialize_child(handle: &ObjectHandle, depth: usize) -> Result<Object> {
-    Ok(match handle.object_ref() {
-        Some(object_ref) => Object::Reference(object_ref),
-        None => materialize_bounded(handle, depth)?,
-    })
 }
 
 // Direct `QPDFObjectHandle::unparseResolved` serialization. The value and
@@ -7171,7 +6920,7 @@ fn unparse_resolved_value(
         ObjectValue::Integer(value) => out.extend_from_slice(value.to_string().as_bytes()),
         ObjectValue::Real(value) => out.extend_from_slice(value.to_string().as_bytes()),
         ObjectValue::RealLiteral { value, literal } => {
-            if crate::object::real_literal_is_safe(&literal, value) {
+            if crate::pdf_syntax::real_literal_is_safe(&literal, value) {
                 out.extend_from_slice(&literal);
             } else {
                 out.extend_from_slice(value.to_string().as_bytes());
@@ -7179,9 +6928,9 @@ fn unparse_resolved_value(
         }
         ObjectValue::Name(value) => {
             out.push(b'/');
-            crate::object::write_name_escaped(out, &value);
+            crate::pdf_syntax::write_name_escaped(out, &value);
         }
-        ObjectValue::String(value) => crate::object::write_string_value(out, &value),
+        ObjectValue::String(value) => crate::pdf_syntax::write_string_value(out, &value),
         ObjectValue::Operator(value) | ObjectValue::InlineImage(value) => {
             out.extend_from_slice(&value);
         }
@@ -7223,7 +6972,6 @@ fn unparse_resolved_value(
             out.extend_from_slice(&data);
             out.extend_from_slice(b"\nendstream");
         }
-        ObjectValue::Reference(object_ref) => write_unparse_reference(object_ref, out),
     }
     Ok(())
 }
@@ -7237,7 +6985,7 @@ fn write_unparse_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
         // QPDF_Name::normalizeName preserves the first byte and escapes only
         // the remainder (`libqpdf/QPDF_Name.cc:27-49`).
         out.push(first);
-        crate::object::write_name_escaped(out, tail);
+        crate::pdf_syntax::write_name_escaped(out, tail);
     }
 }
 
@@ -7395,14 +7143,6 @@ impl<'a> ObjectJsonWriter<'a> {
         if handle.is_reserved() {
             return Err(ObjectJsonError::Reserved);
         }
-        if let Some(object_ref) = handle.as_reference() {
-            // A direct reference is the flpdf representation of the legacy
-            // Object::Reference redirect. qpdf's ordinary child writer emits
-            // the same reference scalar for an indirect child before it
-            // reaches any type-specific writer.
-            return self.write_reference(object_ref);
-        }
-
         match handle
             .type_code()
             .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?
@@ -7493,7 +7233,7 @@ impl<'a> ObjectJsonWriter<'a> {
                 // unchanged so the bound counts JSON containers only.
                 self.write_handle(&dictionary, json_version, false, depth)
             }
-            13 => Err(ObjectJsonError::Unresolved), // cov:ignore: as_reference dispatches bare references before type_code
+            13 => Err(ObjectJsonError::Unresolved),
             14 => Err(ObjectJsonError::Destroyed),
             1 => Err(ObjectJsonError::Reserved), // cov:ignore: reserved values are rejected before type dispatch
             // cov:ignore-start: type_code is exhaustive and every reachable code has a dedicated arm above
@@ -7512,8 +7252,11 @@ impl<'a> ObjectJsonWriter<'a> {
             return Err(ObjectJsonError::NonFiniteFloat);
         }
         if let Some((value, literal)) = handle.as_real_literal() {
-            let mut encoded = Vec::new();
-            Object::RealLiteral { value, literal }.write_pdf(&mut encoded);
+            let encoded = if crate::pdf_syntax::real_literal_is_safe(&literal, value) {
+                literal
+            } else {
+                value.to_string().into_bytes()
+            };
             if encoded.starts_with(b"-.") {
                 self.write(b"-0.")?;
                 self.write(&encoded[2..])
@@ -10267,77 +10010,8 @@ mod object_value_tests {
     }
 
     #[test]
-    fn materialize_is_now_a_public_bridge_usable_outside_this_crate() {
-        // `materialize` was widened from `pub(crate)` to `pub` so
-        // `flpdf-qtest-tools`' qtest driver can bridge one `ObjectHandle`
-        // value (a stream's own dictionary handle) back to a legacy
-        // `Object`/`Dictionary` for its still-`&Dictionary`-shaped
-        // filter/`DecodeParms` resolution routine — see this method's own
-        // doc. `object_value_tests` above already exercises its per-variant
-        // behavior exhaustively; this only pins the visibility contract.
-        let handle = ObjectHandle::integer(1);
-        let _: Object = ObjectHandle::materialize(&handle).expect("scalar materializes");
-    }
-
-    #[test]
-    fn materialize_caps_a_direct_tree_deeper_than_any_parseable_document() {
-        // Codex Review on PR #610 reproduced a process-aborting stack
-        // overflow by building a 100,000-level-deep direct array through
-        // the public `ObjectHandle::array` factory (which imposes no depth
-        // bound the way parsed input does), calling the newly-public
-        // `materialize` on it, then letting both the input handle and the
-        // materialized result drop normally. `materialize` now caps its own
-        // recursion at `parser::MAX_PARSE_DEPTH`, substituting `Object::Null`
-        // past that point -- verified below to actually take effect, not
-        // merely fail to crash by luck.
-        //
-        // `std::mem::forget(handle)` isolates what this fix is actually
-        // responsible for: dropping the *input* `handle` here, built the
-        // same way, independently overflows the stack even with no call to
-        // `materialize` at all (confirmed while narrowing this down) --
-        // `ObjectHandle`'s own recursive `Drop` is unprotected the same way
-        // `Object`'s is, and was already reachable this way before this PR
-        // (`array`/`dictionary` were already public). That is a real,
-        // separate, pre-existing gap this fix does not and cannot close
-        // from inside `materialize` -- forgetting `handle` here keeps this
-        // test scoped to materialize's own contribution rather than
-        // silently also depending on a fix for the unrelated one.
-        let mut handle = ObjectHandle::integer(1);
-        for _ in 0..100_000 {
-            handle = ObjectHandle::array(vec![handle]);
-        }
-
-        let materialized = handle.materialize().expect("direct tree materializes");
-        std::mem::forget(handle);
-
-        let mut cursor = &materialized;
-        let mut depth = 0;
-        loop {
-            match cursor {
-                Object::Array(items) if items.len() == 1 => {
-                    cursor = &items[0];
-                    depth += 1;
-                }
-                other => {
-                    assert_eq!(
-                        *other,
-                        Object::Null,
-                        "the cap must substitute null once nesting exceeds MAX_PARSE_DEPTH"
-                    );
-                    break;
-                }
-            }
-        }
-        assert_eq!(
-            depth,
-            crate::parser::MAX_PARSE_DEPTH + 1,
-            "materialize should recurse exactly through the depth cap before substituting null"
-        );
-    }
-
-    #[test]
     fn real_literal_handle_preserves_the_non_canonical_source_literal() {
-        // Object::RealLiteral exists so a non-canonical source spelling
+        // The preserved-literal value exists so a non-canonical source spelling
         // (e.g. ".4") survives unparse byte-identically. The handle payload
         // must carry the same two fields, or byte-identical output breaks
         // the moment a real-literal round-trips through this layer.
@@ -10983,13 +10657,6 @@ mod internal_state_value_tests {
                 "attempted to unparse a QPDFObjectHandle from a destroyed QPDF",
             ),
         ] {
-            let materialize_error = materialize_value(&value, 0)
-                .expect_err("internal qpdf values cannot materialize as PDF values");
-            assert!(
-                materialize_error.to_string().contains(expected),
-                "unexpected materialize error: {materialize_error:?}"
-            );
-
             let mut out = Vec::new();
             let unparse_error = unparse_object_value(&value, &mut out)
                 .expect_err("internal qpdf values cannot unparse as PDF values");
@@ -11026,222 +10693,6 @@ mod internal_state_value_tests {
 }
 
 #[cfg(test)]
-mod materialize_tests {
-    use super::*;
-
-    #[test]
-    fn scalar_values_materialize_to_the_matching_object_variant() {
-        assert_eq!(
-            ObjectHandle::null()
-                .materialize()
-                .expect("null materializes"),
-            Object::Null
-        );
-        assert_eq!(
-            ObjectHandle::boolean(true)
-                .materialize()
-                .expect("boolean materializes"),
-            Object::Boolean(true)
-        );
-        assert_eq!(
-            ObjectHandle::integer(7)
-                .materialize()
-                .expect("integer materializes"),
-            Object::Integer(7)
-        );
-        assert_eq!(
-            ObjectHandle::real(1.5)
-                .materialize()
-                .expect("real materializes"),
-            Object::Real(1.5)
-        );
-        assert_eq!(
-            ObjectHandle::name(b"Foo".to_vec())
-                .materialize()
-                .expect("name materializes"),
-            Object::Name(b"Foo".to_vec())
-        );
-        assert_eq!(
-            ObjectHandle::string(b"bar".to_vec())
-                .materialize()
-                .expect("string materializes"),
-            Object::String(b"bar".to_vec())
-        );
-    }
-
-    #[test]
-    fn real_literal_materializes_with_its_source_literal_preserved() {
-        let handle = ObjectHandle::real_literal(0.4, b".4".to_vec());
-        assert_eq!(
-            handle.materialize().expect("real literal materializes"),
-            Object::RealLiteral {
-                value: 0.4,
-                literal: b".4".to_vec(),
-            }
-        );
-    }
-
-    #[test]
-    fn a_direct_array_materializes_recursively_but_an_indirect_child_becomes_a_reference() {
-        let indirect_child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        let array = ObjectHandle::array(vec![ObjectHandle::integer(1), indirect_child]);
-
-        let materialized = array.materialize().expect("array materializes");
-        assert_eq!(
-            materialized,
-            Object::Array(vec![
-                Object::Integer(1),
-                Object::Reference(ObjectRef::new(9, 0))
-            ])
-        );
-    }
-
-    #[test]
-    fn a_dictionary_materializes_its_entries_by_key() {
-        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        let Object::Dictionary(materialized) = dict.materialize().expect("dictionary materializes")
-        else {
-            panic!("expected a dictionary"); // cov:ignore: unreachable in a passing run
-        };
-        assert_eq!(materialized.get("A"), Some(&Object::Integer(1)));
-    }
-
-    #[test]
-    fn a_stream_value_flattens_its_dictionary_handle_into_a_plain_dictionary() {
-        let dict_handle =
-            ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(5))]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            stream_dict: dict_handle,
-            stream_data: Some(Rc::new(b"Hello".to_vec())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_length: 0,
-        });
-
-        let Object::Stream(materialized) = stream.materialize().expect("stream materializes")
-        else {
-            panic!("expected a stream"); // cov:ignore: unreachable in a passing run
-        };
-        assert_eq!(materialized.data, b"Hello");
-        assert_eq!(materialized.dict.get("Length"), Some(&Object::Integer(5)));
-    }
-
-    #[test]
-    fn stream_materialization_degrades_a_non_dictionary_stream_dictionary() {
-        let stream = ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(b"data".to_vec()));
-
-        let Object::Stream(materialized) = stream.materialize().expect("stream materializes")
-        else {
-            panic!("expected a stream"); // cov:ignore: established by construction above
-        };
-        assert!(materialized.dict.iter().next().is_none());
-        assert_eq!(materialized.data, b"data");
-    }
-
-    #[test]
-    fn materialize_value_rejects_a_stream_without_its_source_handle() {
-        let error = materialize_value(
-            &ObjectValue::Stream {
-                stream_dict: ObjectHandle::dictionary(vec![]),
-                stream_data: Some(Rc::new(Vec::new())),
-                stream_provider: None,
-                filter_on_write: true,
-                stream_length: 0,
-            },
-            0,
-        )
-        .expect_err("the helper has no stream handle to read an original source from");
-        assert!(matches!(error, Error::Internal(message)
-            if message == "stream materialization must retain its ObjectHandle source"));
-    }
-
-    #[test]
-    fn an_unresolved_indirect_handle_materialization_reports_qpdf_error() {
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        let error = handle
-            .materialize()
-            .expect_err("QPDF_Unresolved::unparse is a logic error");
-        assert!(matches!(
-            error,
-            Error::Internal(message)
-                if message == "attempted to unparse an unresolved QPDFObjectHandle"
-        ));
-    }
-
-    #[test]
-    fn replace_direct_value_updates_a_direct_handles_value_but_keeps_its_offset() {
-        let handle = ObjectHandle::integer(1);
-        handle.set_parsed_offset_if_unset(100);
-
-        handle.replace_direct_value(ObjectValue::Integer(2));
-
-        assert_eq!(handle.as_integer(), Some(2));
-        assert_eq!(handle.get_parsed_offset(), 100);
-    }
-
-    #[test]
-    fn replace_direct_value_moves_dictionary_storage_without_cloning_it() {
-        let handle = ObjectHandle::integer(1);
-        let mut key = vec![b'K'; 4_096];
-        key[0] = b'/';
-        let original_key_allocation = key.as_ptr();
-        let value =
-            ObjectValue::Dictionary([(key, ObjectHandle::integer(2))].into_iter().collect());
-
-        handle.replace_direct_value(value);
-
-        assert!(handle.is_direct());
-        let slot = handle.0.borrow();
-        let state = slot.state.clone();
-        drop(slot);
-        let state = state.borrow();
-        let ObjectValue::Dictionary(entries) = &*state else {
-            panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
-        };
-        let replaced_key_allocation = entries
-            .keys()
-            .next()
-            .expect("replacement dictionary retains its key")
-            .as_ptr();
-        assert_eq!(replaced_key_allocation, original_key_allocation);
-    }
-
-    #[test]
-    fn replace_direct_value_is_a_no_op_on_an_indirect_handle() {
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_resolved(ObjectValue::Integer(1));
-
-        handle.replace_direct_value(ObjectValue::Integer(2));
-
-        assert_eq!(handle.as_integer(), Some(1));
-    }
-
-    #[test]
-    fn reset_parsed_offset_clears_an_already_set_offset() {
-        let handle = ObjectHandle::integer(1);
-        handle.set_parsed_offset_if_unset(100);
-
-        handle.reset_parsed_offset();
-
-        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
-        // The set-once guard is not permanently defeated: a later value can
-        // set a fresh offset after a reset.
-        handle.set_parsed_offset_if_unset(200);
-        assert_eq!(handle.get_parsed_offset(), 200);
-    }
-
-    #[test]
-    fn reset_parsed_offset_works_on_an_indirect_handle_too() {
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_parsed_offset_if_unset(100);
-
-        handle.reset_parsed_offset();
-
-        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
-    }
-}
-
-#[cfg(test)]
 mod rounded_accessor_tests {
     use super::*;
 
@@ -11254,8 +10705,8 @@ mod rounded_accessor_tests {
 
     #[test]
     fn as_real_accepts_both_real_and_real_literal_like_object_does() {
-        // Mirrors Object::as_real's own `Real(v) | RealLiteral { value: v, .. }`
-        // arm (object.rs:348-353) — a real-literal value is still "a real"
+        // Mirrors the handle's own `Real(v) | RealLiteral { value: v, .. }`
+        // arm — a real-literal value is still "a real"
         // for callers that don't care about the source spelling.
         assert_eq!(ObjectHandle::real(1.5).as_real(), Some(1.5));
         assert_eq!(
@@ -11280,24 +10731,13 @@ mod rounded_accessor_tests {
     }
 
     #[test]
-    fn as_reference_reads_a_resolved_indirect_redirect_but_not_a_plain_value() {
-        // ObjectValue::Reference is what an indirect handle resolves to when
-        // its own body is itself a bare reference (Pdf::set_object-driven
-        // redirect/collapse chains — see ObjectValue::Reference's own doc).
-        let redirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        redirect.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
-        assert_eq!(redirect.as_reference(), Some(ObjectRef::new(9, 0)));
-        assert_eq!(ObjectHandle::integer(1).as_reference(), None);
-    }
-
-    #[test]
     fn rounded_accessors_return_none_for_an_indirect_handle_before_resolution() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         assert_eq!(handle.as_boolean(), None);
         assert_eq!(handle.as_real(), None);
         assert!(handle.as_name().is_none());
         assert!(handle.as_string().is_none());
-        assert_eq!(handle.as_reference(), None);
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(9, 0)));
     }
 }
 
@@ -11317,22 +10757,6 @@ mod token_value_tests {
         let handle = ObjectHandle::inline_image(b"\x00\x01raw".to_vec());
         assert_eq!(handle.as_inline_image(), Some(b"\x00\x01raw".to_vec()));
         assert!(handle.as_operator().is_none());
-    }
-
-    #[test]
-    fn operator_and_inline_image_materialize_to_the_matching_object_variant() {
-        assert_eq!(
-            ObjectHandle::operator(b"Do".to_vec())
-                .materialize()
-                .expect("operator materializes"),
-            Object::Operator(b"Do".to_vec())
-        );
-        assert_eq!(
-            ObjectHandle::inline_image(b"data".to_vec())
-                .materialize()
-                .expect("inline image materializes"),
-            Object::InlineImage(b"data".to_vec())
-        );
     }
 }
 
@@ -11364,55 +10788,6 @@ mod type_code_tests {
             (ObjectValue::Unresolved, 13, "unresolved"),
             (ObjectValue::Reserved, 1, "reserved"),
             (ObjectValue::Destroyed, 14, "destroyed"),
-        ];
-
-        for (value, code, name) in cases {
-            assert_eq!(value.type_code(), code, "{name}");
-            assert_eq!(value.type_name(), name);
-        }
-    }
-
-    #[test]
-    fn object_values_report_qpdf_type_codes_and_names() {
-        let cases = [
-            (ObjectValue::Null, 2, "null"),
-            (ObjectValue::Boolean(true), 3, "boolean"),
-            (ObjectValue::Integer(1), 4, "integer"),
-            (ObjectValue::Real(1.5), 5, "real"),
-            (
-                ObjectValue::RealLiteral {
-                    value: 0.4,
-                    literal: b".4".to_vec(),
-                },
-                5,
-                "real",
-            ),
-            (ObjectValue::String(b"s".to_vec()), 6, "string"),
-            (ObjectValue::Name(b"N".to_vec()), 7, "name"),
-            (ObjectValue::Array(Vec::new()), 8, "array"),
-            (
-                ObjectValue::Dictionary(std::collections::BTreeMap::new()),
-                9,
-                "dictionary",
-            ),
-            (
-                ObjectValue::Stream {
-                    stream_dict: ObjectHandle::dictionary(Vec::new()),
-                    stream_data: None,
-                    stream_provider: None,
-                    filter_on_write: true,
-                    stream_length: 0,
-                },
-                10,
-                "stream",
-            ),
-            (ObjectValue::Operator(b"q".to_vec()), 11, "operator"),
-            (ObjectValue::InlineImage(b"d".to_vec()), 12, "inline-image"),
-            (
-                ObjectValue::Reference(ObjectRef::new(7, 0)),
-                13,
-                "unresolved",
-            ),
         ];
 
         for (value, code, name) in cases {
@@ -11544,45 +10919,6 @@ mod type_code_tests {
         assert_eq!(handle.type_code().expect("type code"), 4, "ot_integer");
         assert_eq!(handle.type_name().expect("type name"), "integer");
     }
-
-    #[test]
-    fn resolved_to_a_reference_indirect_handle_reports_unresolved() {
-        // `ObjectValue::Reference` is a real, reachable resolution state,
-        // not a speculative one: `Pdf::set_object` (`reader.rs:1184-1239`)
-        // is public, `Object::Reference` is a public variant, and
-        // `set_object` writes exactly this state via
-        // `handle.set_resolved(value)` (`reader.rs:1207-1210`) whenever the
-        // lifted value is itself a bare reference
-        // (`reader.rs:1877`'s `Object::Reference(object_ref) =>
-        // ObjectValue::Reference(*object_ref)` arm) — e.g.
-        // `pdf.set_object(holder, Object::Reference(target))` to redirect a
-        // holder chain in place, exactly as `ref_chain.rs`'s own test
-        // fixture does. `resolve` itself can never produce
-        // this state (a top-level bare reference never comes from a
-        // file/ObjStm parse — `parser.rs`'s `top_level_no_reference`
-        // integerizes it instead, matching qpdf — and `set_object` always
-        // resolves the same canonical handle it writes into the legacy
-        // cache, so `resolve`'s own `is_resolved` early-return
-        // guards against ever re-deriving this value itself), but the state
-        // is still reachable from any public accessor call on the handle
-        // `Pdf::set_object` resolved directly. This test calls the same
-        // `set_resolved` method `set_object` itself calls, to exercise the
-        // state without pulling `Pdf` into this single-file slice.
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
-        assert_eq!(handle.type_code().expect("type code"), 13, "ot_unresolved");
-        assert_eq!(handle.type_name().expect("type name"), "unresolved");
-        // The contradiction this method's own doc calls out: the value
-        // itself is known (is_resolved() is true) even though its type
-        // code reports the same ordinal as a handle whose value is not
-        // known at all.
-        assert!(handle.is_resolved());
-    }
-}
-
-#[cfg(test)]
-mod unparse_tests {
-    use super::*;
 
     #[test]
     fn unparse_resolved_covers_every_direct_serializer_arm_for_a_nested_array_dict_and_stream() {
@@ -11731,37 +11067,6 @@ mod unparse_tests {
 
         assert_eq!(handle.unparse(), b"null");
         assert_eq!(handle.unparse_resolved(), b"null");
-    }
-
-    #[test]
-    fn resolved_to_a_reference_indirect_handle_unparse_and_unparse_resolved_diverge() {
-        // Mirrors `type_code_tests::resolved_to_a_reference_indirect_handle_reports_unresolved`'s
-        // own state: a handle `Pdf::set_object` redirected in place to
-        // another object (see `ObjectValue::Reference`'s own doc).
-        // `unparse()` never dereferences an indirect handle (see this
-        // module's `destroyed_...` test above), so it reports the
-        // redirecting handle's own "N G R" -- not the target's.
-        // `unparse_resolved()` does read the resolved value, which is
-        // itself a bare reference, so it reports the *target's* "N G R"
-        // instead of chasing to the target's own concrete value (e.g.
-        // `42`). This is a real gap, not a documented design choice: this
-        // crate's own `flpdf-qtest-tools::driver::Handle` already has an
-        // established, tested contract for exactly this redirect scenario
-        // (`reference_chain_resolves_but_unparse_retains_the_first_reference`,
-        // `driver/handle.rs:678-696`) where the equivalent accessor *does*
-        // chase to the target's terminal value while `unparse()` keeps
-        // reporting the first reference's own identity -- this method does
-        // not yet replicate that. Chasing needs `Pdf` (`ObjectValue::Reference`
-        // stores only a bare `ObjectRef`, not a handle link), so it cannot be
-        // implemented from this file alone; tracked as flpdf-l3kz, and wired
-        // as a hard dependency of flpdf-egzr.3.2.3 (the slice that migrates
-        // `driver::Handle` itself onto this API and must not regress that
-        // test).
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
-
-        assert_eq!(handle.unparse(), b"1 0 R");
-        assert_eq!(handle.unparse_resolved(), b"9 0 R");
     }
 
     #[test]
@@ -12393,21 +11698,6 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         indirect.write_object(&mut out).unwrap();
         assert_eq!(out, b"<< /Length 2 >>");
-    }
-
-    #[test]
-    fn unparse_object_writes_a_resolved_indirect_reference_value_as_the_targets_own_form() {
-        // ObjectValue::Reference is a real, reachable resolution state (a
-        // `Pdf::set_object` redirect -- see its own doc and
-        // `unparse_tests::resolved_to_a_reference_indirect_handle_unparse_and_unparse_resolved_diverge`,
-        // which builds the identical shape). No qpdf counterpart exists, so
-        // this mirrors `unparse_resolved`'s own choice for it rather than
-        // writing nothing.
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
-        let mut out = Vec::new();
-        handle.write_object(&mut out).unwrap();
-        assert_eq!(out, b"9 0 R");
     }
 
     #[test]
@@ -13072,28 +12362,6 @@ mod unparse_object_tests {
     }
 
     #[test]
-    fn mapped_unparse_releases_reference_value_borrow_before_mapping() {
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(2, 0)));
-        let reentrant_handle = handle.clone();
-        let map = move |object_ref: ObjectRef| {
-            reentrant_handle.set_resolved(ObjectValue::Integer(7));
-            Ok(ObjectRef::new(
-                object_ref.number + 10,
-                object_ref.generation,
-            ))
-        };
-
-        let mut out = Vec::new();
-        handle
-            .write_object_with_ref_map_and_removed(&mut out, &map, &BTreeSet::new())
-            .expect("reference mapping may re-enter the handle");
-
-        assert_eq!(out, b"12 0 R");
-        assert_eq!(handle.as_integer(), Some(7));
-    }
-
-    #[test]
     fn mapped_unparse_omits_removed_indirect_dictionary_entries() {
         let removed_ref = ObjectRef::new(20, 0);
         let (removed, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
@@ -13128,221 +12396,6 @@ mod unparse_object_tests {
             .write_stream_body_with_ref_map_and_removed(&mut body, false, &map, &removed_refs)
             .unwrap();
         assert_eq!(body, b"<< /Mapped 8 0 R /Length 2 >>");
-    }
-
-    #[test]
-    fn mapped_unparse_inlines_object_zero_as_null() {
-        let array = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
-            ObjectRef::new(0, 0),
-            0,
-        )]);
-        let map = |_object_ref| -> crate::Result<ObjectRef> {
-            panic!("object zero map call") // cov:ignore: intentional panic guard
-        };
-
-        let mut array_out = Vec::new();
-        array
-            .write_object_with_ref_map_and_removed(&mut array_out, &map, &BTreeSet::new())
-            .unwrap();
-        assert_eq!(array_out, b"[ null ]");
-
-        let reference = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        reference.set_resolved(ObjectValue::Reference(ObjectRef::new(0, 0)));
-        let mut reference_out = Vec::new();
-        reference
-            .write_object_with_ref_map_and_removed(&mut reference_out, &map, &BTreeSet::new())
-            .unwrap();
-        assert_eq!(reference_out, b"null");
-    }
-
-    #[test]
-    fn mapped_string_writers_walk_all_live_object_shapes() {
-        let kept = ObjectHandle::new_indirect_unresolved(ObjectRef::new(20, 0), 0);
-        kept.set_resolved(ObjectValue::Integer(7));
-        let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(21, 0), 0);
-        removed.set_resolved(ObjectValue::Integer(8));
-        let direct_reference =
-            ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(42, 0)));
-        let zero = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), 0);
-
-        let signature = ObjectHandle::dictionary(vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
-            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
-            (b"Contents".to_vec(), ObjectHandle::string(b"sig".to_vec())),
-        ]);
-        let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![
-                (b"Child".to_vec(), kept.clone()),
-                (
-                    b"Payload".to_vec(),
-                    ObjectHandle::string(b"stream".to_vec()),
-                ),
-            ]),
-            stream_data: Some(Rc::new(b"ab".to_vec())),
-            stream_provider: None,
-            filter_on_write: true,
-            stream_length: 2,
-        });
-        let value = ObjectHandle::dictionary(vec![
-            (
-                b"Array".to_vec(),
-                ObjectHandle::array(vec![
-                    kept.clone(),
-                    removed.clone(),
-                    zero,
-                    direct_reference,
-                    ObjectHandle::integer(1),
-                    ObjectHandle::string(b"array".to_vec()),
-                ]),
-            ),
-            (
-                b"Nested".to_vec(),
-                ObjectHandle::dictionary(vec![(b"Removed".to_vec(), removed.clone())]),
-            ),
-            (b"Signature".to_vec(), signature),
-            (b"Stream".to_vec(), stream),
-            (b"Text".to_vec(), ObjectHandle::string(b"plain".to_vec())),
-        ]);
-        let mut removed_refs = BTreeSet::new();
-        removed_refs.insert(ObjectRef::new(21, 0));
-        let map = |object_ref: ObjectRef| {
-            Ok(ObjectRef::new(
-                object_ref.number + 100,
-                object_ref.generation,
-            ))
-        };
-
-        let mut compact = Vec::new();
-        value
-            .write_object_with_ref_map_and_removed_with_string_writer(
-                &mut compact,
-                &map,
-                &removed_refs,
-                &mut compact_string_hook,
-            )
-            .unwrap();
-        let compact_text = String::from_utf8_lossy(&compact);
-        assert!(compact_text.contains("120 0 R"));
-        assert!(compact_text.contains("142 0 R"));
-        assert!(compact_text.contains("<hook:plain>"));
-        assert!(compact_text.contains("/Contents <736967>"));
-        assert!(!compact_text.contains("/Removed"));
-
-        let mut qdf = Vec::new();
-        value
-            .write_object_qdf_with_ref_map_and_removed_with_string_writer(
-                &mut qdf,
-                2,
-                &map,
-                &removed_refs,
-                &mut qdf_string_hook,
-            )
-            .unwrap();
-        let qdf_text = String::from_utf8_lossy(&qdf);
-        assert!(qdf_text.contains("{hook:plain}"));
-        assert!(qdf_text.contains("/Contents <736967>"));
-        assert!(qdf_text.contains("120 0 R"));
-
-        let retained_redirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(90, 0), 0);
-        retained_redirect.set_resolved(ObjectValue::Reference(ObjectRef::new(42, 0)));
-        let removed_redirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), 0);
-        removed_redirect.set_resolved(ObjectValue::Reference(ObjectRef::new(21, 0)));
-        let mut redirect_out = Vec::new();
-        retained_redirect
-            .write_object_qdf_with_ref_map_and_removed(&mut redirect_out, 0, &map, &removed_refs)
-            .unwrap();
-        assert_eq!(redirect_out, b"142 0 R");
-        redirect_out.clear();
-        removed_redirect
-            .write_object_qdf_with_ref_map_and_removed(&mut redirect_out, 0, &map, &removed_refs)
-            .unwrap();
-        assert_eq!(redirect_out, b"null");
-        redirect_out.clear();
-        retained_redirect
-            .write_object_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                &map,
-                &removed_refs,
-                &mut compact_string_hook,
-            )
-            .unwrap();
-        assert_eq!(redirect_out, b"142 0 R");
-        redirect_out.clear();
-        removed_redirect
-            .write_object_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                &map,
-                &removed_refs,
-                &mut compact_string_hook,
-            )
-            .unwrap();
-        assert_eq!(redirect_out, b"null");
-        redirect_out.clear();
-        retained_redirect
-            .write_object_qdf_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                0,
-                &map,
-                &removed_refs,
-                &mut qdf_string_hook,
-            )
-            .unwrap();
-        assert_eq!(redirect_out, b"142 0 R");
-        redirect_out.clear();
-        removed_redirect
-            .write_object_qdf_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                0,
-                &map,
-                &removed_refs,
-                &mut qdf_string_hook,
-            )
-            .unwrap();
-        assert_eq!(redirect_out, b"null");
-
-        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(92, 0), 0);
-        missing.set_resolved(ObjectValue::Null);
-        redirect_out.clear();
-        missing
-            .write_object_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                &map,
-                &removed_refs,
-                &mut compact_string_hook,
-            )
-            .unwrap();
-        assert_eq!(redirect_out, b"null");
-        redirect_out.clear();
-        missing
-            .write_object_qdf_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                0,
-                &map,
-                &removed_refs,
-                &mut qdf_string_hook,
-            )
-            .unwrap();
-        assert_eq!(redirect_out, b"null");
-
-        let reserved = ObjectHandle::new_reserved_direct();
-        assert!(reserved
-            .write_object_qdf_with_ref_map_and_removed(&mut redirect_out, 0, &map, &removed_refs,)
-            .is_err());
-        assert!(reserved
-            .write_object_qdf_with_ref_map_and_removed_with_string_writer(
-                &mut redirect_out,
-                0,
-                &map,
-                &removed_refs,
-                &mut qdf_string_hook,
-            )
-            .is_err());
-
-        let mut qdf_plain = Vec::new();
-        value
-            .write_object_qdf_with_ref_map_and_removed(&mut qdf_plain, 0, &map, &removed_refs)
-            .unwrap();
-        assert!(String::from_utf8_lossy(&qdf_plain).contains("/Contents <736967>"));
     }
 
     #[test]
@@ -13585,199 +12638,6 @@ mod unparse_object_tests {
             )
             .unwrap();
         assert_eq!(non_dictionary_dict_compact_string, b"<< >>");
-    }
-
-    #[test]
-    fn mapped_trailer_and_xref_dictionary_walk_live_handles() {
-        let removed_ref = ObjectRef::new(31, 0);
-        let info = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), 0);
-        info.set_resolved(ObjectValue::Integer(7));
-        let removed = ObjectHandle::new_indirect_unresolved(removed_ref, 0);
-        removed.set_resolved(ObjectValue::Integer(8));
-        let id = ObjectHandle::array(vec![
-            ObjectHandle::string(vec![0xabu8, 0xcdu8]),
-            ObjectHandle::string(vec![0x12u8, 0x34u8]),
-        ]);
-        let indirect_id = ObjectHandle::new_indirect_unresolved(ObjectRef::new(32, 0), 0);
-        indirect_id.set_resolved(ObjectValue::Array(vec![
-            ObjectHandle::string(vec![0x01u8]),
-            ObjectHandle::string(vec![0x02u8]),
-        ]));
-        let trailer = ObjectHandle::dictionary(vec![
-            (b"Size".to_vec(), ObjectHandle::integer(40)),
-            (
-                b"Root".to_vec(),
-                ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(10, 0))),
-            ),
-            (b"Info".to_vec(), info),
-            (b"ID".to_vec(), id.clone()),
-            (
-                b"Encrypt".to_vec(),
-                ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(11, 0))),
-            ),
-            (b"Null".to_vec(), ObjectHandle::null()),
-            (b"Removed".to_vec(), removed),
-        ]);
-        let mut removed_refs = BTreeSet::new();
-        removed_refs.insert(removed_ref);
-        let map = |object_ref: ObjectRef| {
-            Ok(ObjectRef::new(
-                object_ref.number + 100,
-                object_ref.generation,
-            ))
-        };
-
-        let mut qdf_trailer = Vec::new();
-        let mut qdf_id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"<computed>");
-        trailer
-            .write_trailer_with_ref_map(
-                &mut qdf_trailer,
-                false,
-                true,
-                Some(&mut qdf_id_writer),
-                &map,
-                &removed_refs,
-                true,
-            )
-            .unwrap();
-        let qdf_text = String::from_utf8_lossy(&qdf_trailer);
-        assert!(qdf_text.starts_with("trailer <<\n"));
-        assert!(qdf_text.contains("/Root 10 0 R"));
-        assert!(qdf_text.contains("/Encrypt 11 0 R"));
-        assert!(qdf_text.contains("/ID <computed>"));
-        assert!(!qdf_text.contains("/Null"));
-        assert!(!qdf_text.contains("/Removed"));
-
-        let mut classic_trailer = Vec::new();
-        trailer
-            .write_trailer_with_ref_map(
-                &mut classic_trailer,
-                false,
-                false,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .unwrap();
-        let classic_text = String::from_utf8_lossy(&classic_trailer);
-        assert!(classic_text.starts_with("trailer <<"));
-        assert!(classic_text.contains("/Info 130 0 R"));
-        assert!(classic_text.contains("/ID [<abcd><1234>]"));
-        assert!(classic_text.contains("/Null null"));
-
-        let mut xref_trailer = Vec::new();
-        trailer
-            .write_trailer_with_ref_map(
-                &mut xref_trailer,
-                true,
-                false,
-                None,
-                &map,
-                &removed_refs,
-                true,
-            )
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&xref_trailer).starts_with("trailer"));
-
-        let mut xref_dictionary = Vec::new();
-        let mut dictionary_id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"<dict-id>");
-        trailer
-            .write_dictionary_with_ref_map_and_id_writer(
-                &mut xref_dictionary,
-                Some(&mut dictionary_id_writer),
-                &map,
-                &removed_refs,
-                true,
-            )
-            .unwrap();
-        let xref_text = String::from_utf8_lossy(&xref_dictionary);
-        assert!(xref_text.contains("/ID <dict-id>"));
-        assert!(xref_text.contains("/Info 130 0 R"));
-        assert!(!xref_text.contains("/Null"));
-
-        let mut indirect_id_dictionary = Vec::new();
-        let indirect_id_dict = ObjectHandle::dictionary(vec![(b"ID".to_vec(), indirect_id)]);
-        indirect_id_dict
-            .write_dictionary_with_ref_map_and_id_writer(
-                &mut indirect_id_dictionary,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .unwrap();
-        assert!(String::from_utf8_lossy(&indirect_id_dictionary).contains("/ID 132 0 R"));
-
-        let fallback_shapes = [
-            ObjectHandle::array(vec![
-                ObjectHandle::string(vec![0x00u8]),
-                ObjectHandle::string(vec![0x11u8]),
-                ObjectHandle::string(vec![0x8fu8]),
-            ]),
-            ObjectHandle::array(vec![
-                ObjectHandle::integer(1),
-                ObjectHandle::string(vec![0x8fu8]),
-            ]),
-            ObjectHandle::integer(7),
-        ];
-        for value in fallback_shapes {
-            let dict = ObjectHandle::dictionary(vec![(b"ID".to_vec(), value)]);
-            let mut out = Vec::new();
-            dict.write_dictionary_with_ref_map_and_id_writer(
-                &mut out,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .unwrap();
-            assert!(String::from_utf8_lossy(&out).contains("/ID "));
-        }
-
-        let reserved = ObjectHandle::new_reserved_direct();
-        let mut reserved_out = Vec::new();
-        assert!(reserved
-            .write_trailer_with_ref_map(
-                &mut reserved_out,
-                false,
-                false,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .is_err());
-        assert!(reserved
-            .write_dictionary_with_ref_map_and_id_writer(
-                &mut reserved_out,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .is_err());
-        let scalar = ObjectHandle::integer(7);
-        scalar
-            .write_trailer_with_ref_map(
-                &mut reserved_out,
-                false,
-                false,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .unwrap();
-        scalar
-            .write_dictionary_with_ref_map_and_id_writer(
-                &mut reserved_out,
-                None,
-                &map,
-                &removed_refs,
-                false,
-            )
-            .unwrap();
     }
 
     #[test]
@@ -17307,29 +16167,6 @@ mod mutation_tests {
     }
 
     #[test]
-    fn replace_stream_data_mutates_a_document_owned_indirect_stream_dictionary() {
-        let mut pdf = crate::Pdf::empty().expect("empty PDF");
-        let stream_ref = ObjectRef::new(3, 0);
-        let mut dict = crate::Dictionary::new();
-        dict.insert("Length", crate::Object::Integer(3));
-        pdf.set_object(
-            stream_ref,
-            crate::Object::Stream(crate::Stream::new(dict, b"old".to_vec())),
-        );
-        let stream = pdf.get_object_handle(stream_ref);
-        stream.try_dereference().expect("document-owned stream");
-
-        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
-
-        assert!(stream.is_indirect());
-        assert_eq!(stream.object_ref(), Some(stream_ref));
-        assert!(!stream
-            .as_stream_dict()
-            .expect("stream dictionary")
-            .has_key(b"/Length"));
-    }
-
-    #[test]
     fn replace_stream_data_sets_filter_and_decode_parms_when_given() {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
@@ -17485,7 +16322,7 @@ mod mutation_tests {
     #[test]
     fn replacing_a_contained_direct_value_propagates_its_owner_to_new_children() {
         // A preserved direct stream dictionary is replaced in place by
-        // Pdf::set_object. New direct descendants must inherit the same
+        // Canonical replacement. New direct descendants must inherit the same
         // incremental-write owner rather than requiring a later graph scan.
         let owner_ref = ObjectRef::new(7, 0);
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
@@ -18036,44 +16873,6 @@ mod stream_provider_contract_tests {
                     bytes.len()
                 )
         ));
-    }
-
-    #[test]
-    fn provider_source_reuses_the_filter_pipeline() {
-        let decoded = b"decoded provider bytes";
-        let mut filter_dict = Dictionary::new();
-        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        let encoded = Rc::new(
-            crate::filters::test_dictionary_api::encode_stream_data(&filter_dict, decoded)
-                .expect("provider source encoding"),
-        );
-        let pdf = crate::Pdf::empty().expect("empty PDF");
-        let stream = pdf.new_stream().expect("owned empty stream");
-        stream
-            .replace_stream_data_provider(
-                Rc::new(PipeProvider::new(Rc::clone(&encoded))),
-                Some(ObjectHandle::name(b"FlateDecode".to_vec())),
-                None,
-            )
-            .expect("provider replacement");
-
-        let output = stream
-            .get_stream_data(crate::writer::DecodeLevel::Generalized)
-            .expect("provider filter pipeline");
-        assert_eq!(output.as_slice(), decoded);
-        assert_ne!(
-            encoded.len(),
-            decoded.len(),
-            "the fixture must distinguish encoded provider bytes from decoded output"
-        );
-        assert_eq!(
-            stream
-                .as_stream_dict()
-                .expect("stream dictionary")
-                .get_key(b"/Length")
-                .as_integer(),
-            Some(encoded.len() as i64)
-        );
     }
 
     #[test]

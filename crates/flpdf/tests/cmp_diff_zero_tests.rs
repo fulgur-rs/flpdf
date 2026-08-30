@@ -26,9 +26,7 @@ mod common;
 use common::PdfCanonicalTestExt;
 
 use common::{write_with_settings, WriterTestSettings};
-use flpdf::{
-    load_xref_and_trailer, Object, ObjectRef, ObjectStreamMode, Pdf, StreamDataMode, XrefEntry,
-};
+use flpdf::{load_xref_and_trailer, ObjectRef, ObjectStreamMode, Pdf, StreamDataMode, XrefEntry};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -297,11 +295,14 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
     let catalog = rewritten
         .resolve_canonical_object(rewritten.root_ref().unwrap())
         .unwrap();
-    assert!(matches!(catalog, Object::Dictionary(ref dictionary)
-            if dictionary.get("Pages")
-                == Some(&Object::Reference(ObjectRef::new(3, 0)))
-                && dictionary.get("Extra")
-                    == Some(&Object::Reference(ObjectRef::new(4, 0)))));
+    assert_eq!(
+        catalog.try_get_key(b"/Pages").unwrap().object_ref(),
+        Some(ObjectRef::new(3, 0))
+    );
+    assert_eq!(
+        catalog.try_get_key(b"/Extra").unwrap().object_ref(),
+        Some(ObjectRef::new(4, 0))
+    );
 }
 
 #[test]

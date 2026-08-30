@@ -26,7 +26,7 @@ use super::emit_new_diagnostics;
 /// `damagedPDF` when `/Root` does not resolve to a dictionary and, under
 /// `check_mode`, repairs a missing/invalid `/Type`. This port only reaches
 /// for the handle itself; a caller that needs the dictionary type checked
-/// resolves it through [`resolved_key`]/`Pdf::resolve_to_terminal`
+/// resolves it through [`resolved_key`]/`Pdf::resolve_handle`
 /// and inspects it directly -- the same substitute this crate's own
 /// `test_34_41.rs` uses via its own (non-shared, so not reused here) private
 /// `root_handle`.
@@ -431,9 +431,8 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // `Object::Reference` lifting always resolves through
-    // `Pdf::get_object_handle`'s own canonical registry entry
-    // (`reader.rs`'s `lift_to_handle_bounded_with_options`), so `root1`
+    // An indirect JSON/PDF value resolves through `Pdf::get_object_handle`'s
+    // own canonical registry entry, so `root1`
     // below and `root_handle`'s own reference share the same underlying
     // `Rc` -- `is_same_object_as` needs no resolution to observe that.
     let trailer = pdf.trailer();

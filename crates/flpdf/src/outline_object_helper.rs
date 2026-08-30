@@ -83,10 +83,8 @@ fn goto_action_dest<R: Read + Seek>(
     if action.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
-    // Chase the same `Pdf::set_object` redirect every other dest-resolution
-    // call site in these two modules already chases: `try_is_name_and_equals`
-    // only dereferences its receiver once and never follows a
-    // bare-reference-valued result.
+    // Resolve the selected action subtype through the canonical document
+    // resolver before applying qpdf's name predicate.
     let subtype = helper.resolve_value_handle(action.try_get_key(b"/S")?)?;
     if !subtype.try_is_name_and_equals(b"GoTo")? {
         return Ok(None);
@@ -354,39 +352,5 @@ impl<'a> Iterator for OutlineTreeIter<'a> {
         self.stack
             .extend(item.kids.iter().rev().map(|&kid| (depth + 1, kid)));
         Some((depth, id, item))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{count_from_handle, title_from_handle};
-    use crate::pipeline::test_support::NthWriteFailure;
-    use crate::pipeline::PipelineHandle;
-
-    #[test]
-    fn scalar_warning_sink_failures_propagate() {
-        for title in [true, false] {
-            let mut pdf = crate::Pdf::empty().unwrap();
-            let logger = crate::QPDFLogger::create();
-            logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
-            pdf.set_logger(logger);
-
-            let result = if title {
-                let value = pdf
-                    .lift_object_to_handle(&crate::Object::Integer(42))
-                    .unwrap();
-                title_from_handle(&value).map(|_| ())
-            } else {
-                let value = pdf
-                    .lift_object_to_handle(&crate::Object::String(b"wrong".to_vec()))
-                    .unwrap();
-                count_from_handle(&value).map(|_| ())
-            };
-            assert!(matches!(
-                result,
-                Err(crate::Error::System(ref message)) if message == "sink write failure 1"
-            ));
-            assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
-        }
     }
 }

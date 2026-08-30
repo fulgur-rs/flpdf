@@ -27,7 +27,7 @@
 //! See `docs/qpdf-compat-decisions.md` §AcroForm & annotation transforms.
 
 use assert_cmd::Command;
-use flpdf::{AnnotationObjectHelper, DecodeLevel, Object, Pdf};
+use flpdf::{AnnotationObjectHelper, DecodeLevel, Pdf};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -544,10 +544,15 @@ fn generate_appearances_routes_checkbox_without_ap_through_set_value() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
     let widget = pdf.resolve_canonical_object(widget_ref).unwrap();
-    let widget = widget.as_dict().unwrap();
-    assert!(matches!(widget.get("V"), Some(Object::Name(name)) if name == b"Yes"));
-    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
-    assert!(widget.get("AP").is_none());
+    assert_eq!(
+        widget.try_get_key(b"/V").unwrap().as_name(),
+        Some(b"Yes".to_vec())
+    );
+    assert_eq!(
+        widget.try_get_key(b"/AS").unwrap().as_name(),
+        Some(b"Off".to_vec())
+    );
+    assert!(!widget.try_has_key(b"/AP").unwrap());
 }
 
 /// qpdf does not synthesize radio appearances when none exists.
@@ -594,11 +599,13 @@ fn generate_appearances_checkbox_with_ap_synchronizes_as_to_value() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
     let widget = pdf.resolve_canonical_object(widget_ref).unwrap();
-    let widget = widget.as_dict().unwrap();
-    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Yes"));
-    let ap = widget.get("AP").and_then(Object::as_dict).unwrap();
-    let normal = ap.get("N").and_then(Object::as_dict).unwrap();
-    assert!(normal.get("Off").is_some() && normal.get("Yes").is_some());
+    assert_eq!(
+        widget.try_get_key(b"/AS").unwrap().as_name(),
+        Some(b"Yes".to_vec())
+    );
+    let ap = widget.try_get_key(b"/AP").unwrap();
+    let normal = ap.try_get_key(b"/N").unwrap();
+    assert!(normal.try_has_key(b"/Off").unwrap() && normal.try_has_key(b"/Yes").unwrap());
 }
 
 /// A direct radio widget retains `/AS`; qpdf requires a parent field `/Kids`
@@ -621,11 +628,13 @@ fn generate_appearances_direct_radio_with_ap_leaves_as_unchanged() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
     let widget = pdf.resolve_canonical_object(widget_ref).unwrap();
-    let widget = widget.as_dict().unwrap();
-    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
-    let ap = widget.get("AP").and_then(Object::as_dict).unwrap();
-    let normal = ap.get("N").and_then(Object::as_dict).unwrap();
-    assert!(normal.get("Off").is_some() && normal.get("Yes").is_some());
+    assert_eq!(
+        widget.try_get_key(b"/AS").unwrap().as_name(),
+        Some(b"Off".to_vec())
+    );
+    let ap = widget.try_get_key(b"/AP").unwrap();
+    let normal = ap.try_get_key(b"/N").unwrap();
+    assert!(normal.try_has_key(b"/Off").unwrap() && normal.try_has_key(b"/Yes").unwrap());
 }
 
 /// `--generate-appearances` on a combo-box widget adds `/AP/N`, and the
@@ -893,10 +902,7 @@ fn flatten_rotation_processes_all_pages() {
 
     for (i, &page_ref) in page_refs.iter().enumerate() {
         let page_obj = pdf.resolve_canonical_object(page_ref).unwrap();
-        let Object::Dictionary(dict) = page_obj else {
-            panic!("page {} is not a dictionary", i + 1);
-        };
-        let rotate = dict.get("Rotate").and_then(|o| o.as_integer());
+        let rotate = page_obj.try_get_key(b"/Rotate").unwrap().as_integer();
         assert!(
             rotate.is_none() || rotate == Some(0),
             "page {} /Rotate should be absent or 0 after --flatten-rotation, got {rotate:?}",

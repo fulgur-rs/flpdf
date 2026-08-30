@@ -9,25 +9,22 @@ use flpdf::job::{CheckError, QPDFJob};
 use flpdf::ObjectRef;
 use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
-    Object, ObjectStreamMode, Pdf, PdfWriter, Result, StreamDataMode,
+    ObjectHandle, ObjectStreamMode, Pdf, PdfWriter, Result, StreamDataMode,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
-/// Canonical object access used by integration assertions while the removed
-/// owned raw-object resolver has no compatibility API in the library.
-///
-/// The helper delegates to the live ObjectHandle resolver and materializes
-/// only at the assertion boundary.
+/// Resolve one canonical object for integration assertions without creating
+/// an owned second object model.
 pub trait PdfCanonicalTestExt {
-    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object>;
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<ObjectHandle>;
 }
 
 impl<R: Read + Seek + 'static> PdfCanonicalTestExt for Pdf<R> {
-    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+    fn resolve_canonical_object(&mut self, object_ref: ObjectRef) -> Result<ObjectHandle> {
         let handle = self.get_object_handle(object_ref);
         self.resolve(&handle)?;
-        handle.materialize()
+        Ok(handle)
     }
 }
 
@@ -250,43 +247,6 @@ pub fn write_qdf_output<R: Read + Seek + 'static, W: Write>(
         ..WriterTestSettings::default()
     };
     write_with_settings(pdf, out, &settings)
-}
-
-/// Rewrite indirect references in a test-side object according to a writer
-/// renumbering map. PdfWriter is a full-rewrite API, so byte-for-byte object
-/// identity comparisons must account for the new object numbers while still
-/// comparing the complete dictionary/array shape.
-pub fn remap_object_refs(value: &mut flpdf::Object, mapping: &BTreeMap<ObjectRef, ObjectRef>) {
-    match value {
-        flpdf::Object::Reference(reference) => {
-            if let Some(mapped) = mapping.get(reference) {
-                *reference = *mapped;
-            }
-        }
-        flpdf::Object::Array(values) => {
-            for value in values {
-                remap_object_refs(value, mapping);
-            }
-        }
-        flpdf::Object::Dictionary(dictionary) => {
-            let entries: Vec<(Vec<u8>, flpdf::Object)> = dictionary
-                .iter()
-                .map(|(key, value)| (key.to_vec(), value.clone()))
-                .collect();
-            for (key, mut value) in entries {
-                remap_object_refs(&mut value, mapping);
-                dictionary.insert(key, value);
-            }
-        }
-        flpdf::Object::Stream(stream) => {
-            let mut dictionary = flpdf::Object::Dictionary(stream.dict.clone());
-            remap_object_refs(&mut dictionary, mapping);
-            if let flpdf::Object::Dictionary(dictionary) = dictionary {
-                stream.dict = dictionary;
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Build a PDF from a set of already-serialised indirect objects.

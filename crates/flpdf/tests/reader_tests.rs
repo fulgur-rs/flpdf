@@ -95,12 +95,12 @@ where
 #[test]
 fn opens_pdf_without_resolving_all_objects() {
     let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
-    let pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
     assert_eq!(pdf.version(), "1.7");
     assert_eq!(pdf.resolved_count(), 0);
     assert_eq!(
-        pdf.trailer_dictionary().get_ref("Root"),
+        pdf.trailer().try_get_key(b"/Root").unwrap().object_ref(),
         Some(ObjectRef::new(1, 0))
     );
 }
@@ -639,8 +639,10 @@ fn resolve_decrypts_encrypted_strings_after_authentication() {
     .unwrap();
 
     let info_ref = pdf
-        .trailer_dictionary()
-        .get_ref("Info")
+        .trailer()
+        .try_get_key(b"/Info")
+        .expect("read writer fixture /Info")
+        .object_ref()
         .expect("writer fixture has /Info");
     let info = resolved_handle(&mut pdf, info_ref);
     assert_eq!(
@@ -656,7 +658,9 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
     let xref = load_xref_and_trailer(&mut xref_reader).expect("load generated xref stream");
     let info_ref = xref
         .trailer
-        .get_ref("Info")
+        .try_get_key(b"/Info")
+        .expect("read writer fixture /Info")
+        .object_ref()
         .expect("writer fixture has /Info");
     assert!(
         matches!(

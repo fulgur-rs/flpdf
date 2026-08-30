@@ -66,24 +66,24 @@ pub struct LabelRange {
 
 impl LabelRange {
     /// Decode a live qpdf-shaped label dictionary without materializing it as
-    /// a legacy [`crate::Object`]. Unknown `/S` names remain unknown to the raw
+    /// an independent value snapshot. Unknown `/S` names remain unknown to the
     /// handle, while this typed compatibility view retains the historical
     /// `LabelStyle::None` mapping.
     fn from_handle<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         handle: &ObjectHandle,
     ) -> Result<Option<Self>> {
-        let handle = pdf.resolve_to_terminal(handle)?;
+        let handle = pdf.resolve_handle(handle)?;
         if handle.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
         let style = pdf
-            .resolve_to_terminal(&handle.try_get_key(b"/S")?)?
+            .resolve_handle(&handle.try_get_key(b"/S")?)?
             .try_as_name()?
             .map(|name| LabelStyle::from_name(&name))
             .unwrap_or(LabelStyle::None);
         let prefix = pdf
-            .resolve_to_terminal(&handle.try_get_key(b"/P")?)?
+            .resolve_handle(&handle.try_get_key(b"/P")?)?
             .as_string()
             .map(|bytes| {
                 crate::json_inspect::decode_pdf_text_string(&bytes)
@@ -278,7 +278,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             return Ok(None);
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        let catalog = self.pdf.resolve_to_terminal(&catalog)?;
+        let catalog = self.pdf.resolve_handle(&catalog)?;
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -497,7 +497,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some((label, offset)) = tree.find_object_at_or_below(self.pdf, page_idx)? else {
             return Ok(None);
         };
-        let label = self.pdf.resolve_to_terminal(&label)?;
+        let label = self.pdf.resolve_handle(&label)?;
         if label.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -687,7 +687,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(label) = self.get_label_for_page_from_tree(&mut tree, page_idx)? else {
             return Ok(false);
         };
-        let label = self.pdf.resolve_to_terminal(&label)?;
+        let label = self.pdf.resolve_handle(&label)?;
         label.try_has_key(b"/P")
     }
 

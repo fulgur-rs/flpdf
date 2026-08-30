@@ -4,12 +4,8 @@
 
 use std::collections::HashSet;
 
-use crate::object::ObjectRef;
-#[cfg(test)]
-use crate::object::{Dictionary, Object};
-#[cfg(test)]
-use crate::writer::ObjectWriterEmission;
 use crate::ObjectHandle;
+use crate::ObjectRef;
 // ── ObjStm body emitter ───────────────────────────────────────────────────────
 
 /// The serialised body of an ObjStm (ISO 32000-1 §7.5.7).
@@ -32,37 +28,6 @@ pub(crate) struct ObjStmBody {
 ///
 /// This inner function does the real work without touching a `Pdf` reader; it
 /// exists primarily to make unit-testing Pdf-free.
-#[cfg(test)]
-pub(crate) fn emit_objstm_body_from_resolved(
-    members: &[(ObjectRef, Object)],
-) -> crate::Result<ObjStmBody> {
-    emit_objstm_body_from_resolved_with_writer(
-        members,
-        &mut |out, _member_index, _object_ref, object| {
-            object.write_pdf(out);
-            Ok(())
-        },
-    )
-}
-
-/// Serialize pre-resolved ObjStm members while delegating each complete member
-/// body to `write_member`.
-///
-/// `member_index` is the member's zero-based index in the object stream. The
-/// encrypted full-rewrite writer passes it to `EncryptedStringEmitter` so the
-/// callback serializer runs without installing an individual object data key;
-/// the enclosing ObjStm stream remains the sole encryption boundary.
-#[cfg(test)]
-pub(crate) fn emit_objstm_body_from_resolved_with_writer<F>(
-    members: &[(ObjectRef, Object)],
-    write_member: &mut F,
-) -> crate::Result<ObjStmBody>
-where
-    F: FnMut(&mut Vec<u8>, u32, ObjectRef, &Object) -> crate::Result<()>,
-{
-    emit_objstm_body_from_members(members, write_member, false)
-}
-
 /// Serialise ObjStm members directly from the canonical ObjectHandle graph.
 ///
 /// The member pair table is still supplied in output-number order by the
@@ -70,16 +35,6 @@ where
 /// writer boundary: arrays and dictionaries retain indirect child identity,
 /// dictionary nulls are suppressed by the handle unparser, and no temporary
 /// [`ObjectHandle`] tree is materialised merely to calculate the body offsets.
-#[cfg(test)]
-pub(crate) fn emit_objstm_body_from_handles(
-    members: &[(ObjectRef, ObjectHandle)],
-) -> crate::Result<ObjStmBody> {
-    emit_objstm_body_from_handles_with_writer(
-        members,
-        &mut |out, _member_index, _object_ref, handle| handle.write_object(out),
-    )
-}
-
 /// Handle-backed ObjStm body emission with a caller-owned member serializer.
 ///
 /// The callback is used for the encrypted full-rewrite route, where qpdf's
@@ -187,7 +142,7 @@ where
 /// Wrap an [`ObjStmBody`] and build the complete `/Type /ObjStm` stream
 /// dictionary (ISO 32000-1 §7.5.7).
 ///
-/// The returned [`crate::Stream`] is ready to be written as an indirect object.
+/// The returned stream handle is ready to be written as an indirect object.
 /// Key order follows qpdf parity: `Type → N → First → Length → Filter`.
 ///
 /// The `compress` parameter controls whether the body bytes are compressed with
@@ -195,51 +150,6 @@ where
 /// (`CompressStreams::No`).  Passing the same [`crate::writer::CompressStreams`]
 /// value that drives the surrounding full-rewrite loop ensures the ObjStm
 /// container uses the same policy as every other stream in the document.
-#[cfg(test)]
-pub(crate) fn wrap_objstm_body(
-    body: &ObjStmBody,
-    compress: crate::writer::CompressStreams,
-) -> crate::Result<crate::Stream> {
-    match compress {
-        crate::writer::CompressStreams::Yes => {
-            // Build a temporary encode dict with /Filter /FlateDecode.
-            let mut encode_dict = Dictionary::new();
-            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-
-            // Compress the body bytes via the existing helper.
-            let encoded =
-                crate::filters::test_dictionary_api::encode_stream_data(&encode_dict, &body.bytes)?;
-
-            // Build the final stream dictionary in qpdf-compatible key order.
-            let mut dict = Dictionary::new();
-            dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
-            dict.insert("N", Object::Integer(body.n_members as i64));
-            dict.insert("First", Object::Integer(body.first_offset as i64));
-            dict.insert("Length", Object::Integer(encoded.len() as i64));
-            dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-
-            Ok(crate::Stream {
-                dict,
-                data: encoded,
-            })
-        }
-        crate::writer::CompressStreams::No => {
-            // Emit raw (uncompressed) body bytes without any /Filter.
-            let mut dict = Dictionary::new();
-            dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
-            dict.insert("N", Object::Integer(body.n_members as i64));
-            dict.insert("First", Object::Integer(body.first_offset as i64));
-            dict.insert("Length", Object::Integer(body.bytes.len() as i64));
-            // No /Filter key — body is raw plaintext.
-
-            Ok(crate::Stream {
-                dict,
-                data: body.bytes.clone(),
-            })
-        }
-    }
-}
-
 /// Build the synthetic ObjStm container as an ObjectHandle while retaining
 /// the raw payload separately for the stream pipeline. The container has no
 /// source object identity, but its dictionary is still emitted through the
@@ -289,7 +199,7 @@ pub(crate) fn wrap_objstm_body_as_handle(
     if let Some(extends) = extends {
         entries.push((
             b"Extends".to_vec(),
-            ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(extends)),
+            ObjectHandle::new_indirect_unresolved(extends, -1),
         ));
     }
     let handle = ObjectHandle::stream(

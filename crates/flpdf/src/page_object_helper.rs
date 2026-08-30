@@ -125,8 +125,8 @@ use std::rc::Rc;
 /// An axis-aligned rectangle expressed as `[llx, lly, urx, ury]` in user-space
 /// units, corresponding to a PDF rectangle array `[x1 y1 x2 y2]`.
 ///
-/// PDF allows any combination of [`crate::Object::Integer`] and [`crate::Object::Real`]
-/// elements; both are coerced to `f64`.
+/// PDF allows any combination of integer and real elements; both are coerced
+/// to `f64`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageBox {
     /// Left x coordinate (lower-left x).
@@ -830,7 +830,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Aggregates the page's `/Contents` entry (single stream or array), decodes
     /// each stream through its filter pipeline (same as
     /// [`crate::pages::page_content_bytes`]), then parses the concatenated bytes
-    /// through [`crate::content_stream::parse_content_stream_data`].
+    /// through [`crate::content_stream::parse_content_operations`].
     ///
     /// Returns an empty `Vec` when the page has no `/Contents`.
     ///
@@ -839,7 +839,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
     ///   `/Type /Page` dictionary, or when a `/Contents` element is not a stream.
     /// - Any error from [`crate::pages::page_content_bytes`] or
-    ///   [`crate::content_stream::parse_content_stream_data`].
+    ///   [`crate::content_stream::parse_content_operations`].
     ///
     /// # Examples
     ///
@@ -1537,7 +1537,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
     ///   dictionary, when `/Annots` is not an array, or when an array element
-    ///   is not a [`crate::Object::Reference`].
+    ///   is not an indirect object handle.
     /// - Any error from [`Pdf::resolve`].
     ///
     /// # Examples
@@ -1561,9 +1561,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
         let page = self.resolved_page_handle()?;
         let page_ref = self.require_page_ref()?;
-        let annots = self
-            .pdf
-            .resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
+        let annots = self.pdf.resolve_handle(&page.try_get_key(b"/Annots")?)?;
         if annots.is_null() {
             return Ok(Vec::new());
         }
@@ -1598,9 +1596,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         only_subtype: Option<&[u8]>,
     ) -> Result<Vec<ObjectHandle>> {
         let page = self.resolved_page_handle()?;
-        let annots = self
-            .pdf
-            .resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
+        let annots = self.pdf.resolve_handle(&page.try_get_key(b"/Annots")?)?;
         let Some(annots_array) = annots.as_array() else {
             return Ok(Vec::new());
         };
@@ -1609,14 +1605,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             .filter(|value| !value.is_empty());
         let mut result = Vec::with_capacity(annots_array.len());
         for item in annots_array {
-            let annotation = self.pdf.resolve_to_terminal(&item)?;
+            let annotation = self.pdf.resolve_handle(&item)?;
             if annotation.as_dictionary().is_none() {
                 continue;
             }
             if let Some(expected) = only_subtype {
                 let subtype = self
                     .pdf
-                    .resolve_to_terminal(&annotation.try_get_key(b"/Subtype")?)?;
+                    .resolve_handle(&annotation.try_get_key(b"/Subtype")?)?;
                 if subtype.as_name().as_deref() != Some(expected) {
                     continue;
                 }
@@ -1878,12 +1874,12 @@ fn collect_resource_names<R: Read + Seek>(
     resources: &ObjectHandle,
 ) -> Result<std::collections::BTreeSet<Vec<u8>>> {
     let mut result = std::collections::BTreeSet::new();
-    let resources = pdf.resolve_to_terminal(resources)?;
+    let resources = pdf.resolve_handle(resources)?;
     let Some(entries) = resources.as_dictionary() else {
         return Ok(result);
     };
     for value in entries.into_values() {
-        let value = pdf.resolve_to_terminal(&value)?;
+        let value = pdf.resolve_handle(&value)?;
         if let Some(entries) = value.as_dictionary() {
             result.extend(entries.into_keys());
         }
@@ -1900,7 +1896,7 @@ fn resolve_resource_dictionary<R: Read + Seek>(
     if value.is_null() {
         return Ok(None);
     }
-    let value = pdf.resolve_to_terminal(&value)?;
+    let value = pdf.resolve_handle(&value)?;
     Ok(value.as_dictionary().map(|_| value))
 }
 
@@ -2102,7 +2098,7 @@ fn append_annotation_handles<R: Read + Seek>(
     page: &ObjectHandle,
     annotations: Vec<ObjectHandle>,
 ) -> Result<()> {
-    let existing = pdf.resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
+    let existing = pdf.resolve_handle(&page.try_get_key(b"/Annots")?)?;
     let annots = if existing.as_array().is_some() {
         existing
     } else {
@@ -2240,7 +2236,7 @@ fn get_attribute_for_target<R: Read + Seek>(
         object.clone()
     };
     let inheritable = !is_form && is_inheritable_page_attribute(key);
-    let mut result = pdf.resolve_to_terminal(&dict.try_get_key(key)?)?;
+    let mut result = pdf.resolve_handle(&dict.try_get_key(key)?)?;
     let mut inherited = false;
 
     if result.is_null() && inheritable {
@@ -2264,7 +2260,7 @@ fn get_attribute_for_target<R: Read + Seek>(
                 key,
                 DEFAULT_MAX_PAGE_TREE_DEPTH,
             )? {
-                result = pdf.resolve_to_terminal(&value)?;
+                result = pdf.resolve_handle(&value)?;
                 inherited = true;
             }
         }
@@ -2497,14 +2493,14 @@ mod tests {
         let root = target.get_object_handle(root_ref);
         target.resolve(&root).expect("resolve target catalog");
         let acroform = target
-            .resolve_to_terminal(&root.try_get_key(b"/AcroForm").expect("read /AcroForm key"))
+            .resolve_handle(&root.try_get_key(b"/AcroForm").expect("read /AcroForm key"))
             .expect("resolve /AcroForm");
         assert!(
             acroform.as_dictionary().is_some(),
             "the copied orphan widget must produce a destination /AcroForm"
         );
         let fields = target
-            .resolve_to_terminal(&acroform.try_get_key(b"/Fields").expect("read /Fields key"))
+            .resolve_handle(&acroform.try_get_key(b"/Fields").expect("read /Fields key"))
             .expect("resolve /Fields");
         assert_eq!(
             fields

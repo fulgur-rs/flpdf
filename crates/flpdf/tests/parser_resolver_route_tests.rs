@@ -22,18 +22,10 @@ fn xref_stream_production_parses_through_the_handle_route_once() {
 }
 
 #[test]
-fn object_stream_test_entrypoint_keeps_the_parsed_value_as_a_handle() {
+fn object_stream_legacy_test_entrypoint_is_removed() {
     let source = include_str!("../src/reader.rs");
-    let entrypoint = source
-        .split("pub(crate) fn parse_object_stream_entry(")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("pub(crate) struct ParsedObjectStreamEntry")
-                .next()
-        })
-        .expect("object-stream test entrypoint exists");
-
-    assert!(entrypoint.contains("parse_qpdf_file_object_handle_with_diagnostics"));
-    assert!(!entrypoint.contains("parse_qpdf_file_object("));
-    assert!(!entrypoint.contains(".materialize("));
+    assert!(!source.contains("pub(crate) fn parse_object_stream_entry("));
+    assert!(source.contains("parse_qpdf_file_object_handle_with_diagnostics"));
+    assert!(!source.contains("parse_qpdf_file_object("));
+    assert!(!source.contains(".materialize("));
 }

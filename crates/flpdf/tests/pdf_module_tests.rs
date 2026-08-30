@@ -8,7 +8,11 @@ fn pdf_module_exposes_the_canonical_document_type() {
     assert_eq!(from_module.version(), "1.7");
     assert_eq!(from_module.root_ref(), Some(flpdf::ObjectRef::new(1, 0)));
     assert_eq!(
-        from_module.trailer_dictionary().get_ref("Root"),
+        from_module
+            .trailer()
+            .try_get_key(b"/Root")
+            .unwrap()
+            .object_ref(),
         from_module.root_ref()
     );
 
