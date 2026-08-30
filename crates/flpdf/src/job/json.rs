@@ -5,7 +5,7 @@
 //! | qpdf responsibility | flpdf owner |
 //! | --- | --- |
 //! | `doJSONPages`, `doJSONPageLabels`, `doJSONOutlines`, `doJSONAttachments`, `doJSONEncrypt` | `crate::job::build_*_section` |
-//! | `doJSONAcroform` | [`crate::job::build_acroform_section`] |
+//! | `doJSONAcroform` | [`crate::job::json_sections::build_acroform_section_with_version`] |
 //! | `doJSON` fixed order and key selection | this module |
 //! | `writeJSON` output destination and side-file prefix | [`write_json`] |
 
