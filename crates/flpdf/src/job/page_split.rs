@@ -54,6 +54,8 @@ pub struct SplitPageOptions {
     pub deterministic_id: bool,
     /// Reapply the effective qpdf writer settings to every chunk.
     pub writer_configuration: WriterConfiguration,
+    /// Report each chunk's real output path as it is written.
+    pub verbose: bool,
 }
 
 impl SplitPageOptions {
@@ -66,6 +68,7 @@ impl SplitPageOptions {
             input_path: None,
             deterministic_id: false,
             writer_configuration: WriterConfiguration::default(),
+            verbose: false,
         }
     }
 
@@ -87,6 +90,13 @@ impl SplitPageOptions {
     #[must_use]
     pub fn with_writer_configuration(mut self, configuration: WriterConfiguration) -> Self {
         self.writer_configuration = configuration;
+        self
+    }
+
+    /// Report each chunk's real output path as it is written.
+    #[must_use]
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
         self
     }
 }
@@ -240,6 +250,22 @@ impl QPDFJob {
             self.configure_writer_progress(&mut writer);
             writer.set_output_file(&output_path)?;
             writer.write()?;
+            // qpdf reports each chunk from inside this per-chunk loop
+            // (`libqpdf/QPDFJob.cc:3019-3021`), immediately after that
+            // chunk's write succeeds, so a later chunk's failure still
+            // leaves the reports for every chunk written before it. Confirmed
+            // live: `qpdf --verbose --split-pages=1` with a later chunk's
+            // destination pre-occupied by a directory still prints "wrote
+            // file" for the earlier, successfully written chunks before
+            // failing.
+            if options.verbose {
+                let message = format!(
+                    "{}: wrote file {}\n",
+                    self.message_prefix(),
+                    output_path.display()
+                );
+                self.logger().info(message)?;
+            }
             written.push(output_path);
         }
 

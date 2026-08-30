@@ -1690,14 +1690,22 @@ impl QPDFJob {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
         }
         let progress_requested = self.configuration.progress;
-        let write_result: Result<Vec<PathBuf>> =
+        let splitting = self.configuration.split_pages.is_some_and(|size| size > 0);
+        let write_result: Result<()> =
             if let Some(chunk_size) = self.configuration.split_pages.filter(|size| *size > 0) {
                 let mut split_options = SplitPageOptions::new(chunk_size, output.clone())
-                    .with_writer_configuration(writer_configuration.clone());
+                    .with_writer_configuration(writer_configuration.clone())
+                    .with_verbose(self.configuration.verbose);
                 if let Some(input) = self.configuration.input_file.clone() {
                     split_options = split_options.with_input_path(input);
                 }
-                self.split_pages(pdf, split_options)
+                // qpdf reports each chunk from inside the split loop itself
+                // (`libqpdf/QPDFJob.cc:3019-3021`), so this call's own verbose
+                // option -- not the shared report below -- is what a split write
+                // relies on; the shared report is for the non-split branch only,
+                // and stays correct even if a later chunk fails after earlier
+                // chunks already reported success.
+                self.split_pages(pdf, split_options).map(|_| ())
             } else {
                 (|| {
                     let mut writer = PdfWriter::new(pdf);
@@ -1705,33 +1713,22 @@ impl QPDFJob {
                     if progress_requested {
                         self.configure_writer_progress(&mut writer);
                     }
-                    let written = if output == Path::new("-") {
+                    if output == Path::new("-") {
                         self.logger.save_to_standard_output(true)?;
                         writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
-                        Vec::new()
                     } else {
                         writer.set_output_file(&output)?;
-                        vec![output.clone()]
-                    };
-                    writer.write()?;
-                    Ok(written)
+                    }
+                    writer.write()
                 })()
             };
         match write_result {
-            Ok(written) => {
+            Ok(()) => {
                 self.record_document_warnings(pdf);
-                if self.configuration.verbose {
-                    // qpdf reports one "wrote file" line per real output file
-                    // (`libqpdf/QPDFJob.cc:3019-3021` inside the per-chunk
-                    // split loop); a split write's real chunk filenames
-                    // never equal the requested output template, so `written`
-                    // must be the writer's actual output paths, not the
-                    // template `output` path.
-                    for path in &written {
-                        let message =
-                            format!("{}: wrote file {}\n", self.message_prefix, path.display());
-                        self.logger.info(message)?;
-                    }
+                if self.configuration.verbose && output != Path::new("-") && !splitting {
+                    let message =
+                        format!("{}: wrote file {}\n", self.message_prefix, output.display());
+                    self.logger.info(message)?;
                 }
                 self.complete(true)
             }

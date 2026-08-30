@@ -255,6 +255,41 @@ fn job_json_file_split_pages_reports_each_chunk_filename_when_verbose() {
 }
 
 #[test]
+fn job_json_file_split_pages_reports_earlier_chunks_after_a_later_chunk_fails() {
+    // qpdf reports each chunk from inside the per-chunk split loop
+    // (`libqpdf/QPDFJob.cc:3019-3021`), immediately after that chunk's write
+    // succeeds, so a later chunk's failure still leaves the reports for
+    // every chunk written before it. Confirmed live: `qpdf --verbose
+    // --split-pages=1` with out-2.pdf pre-occupied by a directory still
+    // prints "wrote file out-1.pdf" before failing.
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::create_dir(directory.path().join("out-2.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-partial.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"out.pdf","splitPages":"1","verbose":""}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-partial.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("wrote file out-1.pdf"),
+        "stdout missing the earlier, successfully written chunk's report: {stdout}"
+    );
+    assert!(directory.path().join("out-1.pdf").is_file());
+}
+
+#[test]
 fn job_json_file_split_pages_allows_the_same_input_and_output_path() {
     // qpdf only runs the same-file rejection when `!m->split_pages`
     // (`libqpdf/QPDFJob.cc:627`): a splitting write never truncates the
