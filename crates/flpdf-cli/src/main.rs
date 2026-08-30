@@ -5048,6 +5048,13 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         None
     };
 
+    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    if split_progress {
+        // qpdf creates a fresh writer for each split output. The memory
+        // rewrite is flpdf's internal preparation step and is not an
+        // observable qpdf writer, so it must not consume the progress stream.
+        options.progress = false;
+    }
     let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
@@ -5057,6 +5064,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             output,
             input_path,
             options.deterministic_id,
+            split_progress,
             writer_configuration(&options, false),
         )?;
         if verbose {
@@ -5180,6 +5188,7 @@ fn split_rewritten_pdf(
     output: &Path,
     input_path: &Path,
     deterministic_id: bool,
+    progress: bool,
     writer_configuration: WriterConfiguration,
 ) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
@@ -5187,6 +5196,10 @@ fn split_rewritten_pdf(
     job.set_message_prefix(progname());
     let input_name = input_path.to_string_lossy().into_owned();
     let mut pdf = job.open(Cursor::new(bytes), input_name, PdfOpenOptions::default())?;
+    if progress {
+        job.set_progress(true);
+        job.set_output_file(output.to_path_buf())?;
+    }
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
@@ -5254,6 +5267,13 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     // the memory intermediate decryptable before split_pages re-opens it.
     let mut options = options;
     options.preserve_encryption = page_ops.split_pages.is_none() && pdf.is_encrypted();
+    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    if split_progress {
+        // qpdf creates a fresh writer for each split output. The memory
+        // rewrite is flpdf's internal preparation step and is not an
+        // observable qpdf writer, so it must not consume the progress stream.
+        options.progress = false;
+    }
     let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
@@ -5264,6 +5284,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             output,
             input,
             options.deterministic_id,
+            split_progress,
             writer_configuration(&options, false),
         )?;
         if verbose {

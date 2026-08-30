@@ -157,6 +157,45 @@ fn progress_error_keeps_exit_two_without_progress_or_output() {
     assert!(!output_path.exists(), "fatal input must not create output");
 }
 
+#[test]
+fn progress_reports_each_split_writer_once() {
+    let input = fixture("two-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let output_path = tempdir.path().join("split.pdf");
+
+    let output = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id", "--split-pages=1"])
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .expect("flpdf invocation");
+
+    assert!(
+        output.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
+    assert_eq!(
+        stdout.matches("write progress: 0%\n").count(),
+        2,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("write progress: 100%\n").count(),
+        2,
+        "{stdout}"
+    );
+    assert!(stdout
+        .lines()
+        .all(|line| line.contains(&output_path.display().to_string())));
+    assert!(tempdir.path().join("split-1.pdf").exists());
+    assert!(tempdir.path().join("split-2.pdf").exists());
+    assert!(output.stderr.is_empty());
+}
+
 fn fixture_from_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
