@@ -74,8 +74,8 @@ cargo build --release --bin flpdf --bin flpdf-test-compare --bin flpdf-test-driv
 - [ ] Add the three exact suite names to allowlist.txt in sorted order. Do not promote merge-and-split rows, which remain owned by the Phase 4/5 page-operation work.
 - [ ] Run the validators against the same artifacts:
 ~~~text
-python3 scripts/verify-allowlist.py survey/latest/harness.log survey/latest/qtest-results.xml survey/latest/qtest-summary.md
-python3 scripts/verify-parity-manifest.py survey/latest/harness.log survey/latest/qtest-results.xml parity/qtest-11.9.0.jsonl
+python3 scripts/verify-allowlist.py survey/latest/harness.log survey/latest/qtest-results.xml allowlist.txt --summary survey/latest/qtest-summary.md
+python3 scripts/verify-parity-manifest.py survey/latest/harness.log survey/latest/qtest-results.xml parity/qtest-11.9.0.jsonl --summary survey/latest/qtest-parity-summary.md
 ~~~
 - [ ] Require zero validation errors and three target passes before committing the qtest checkout with git -C /tmp/flpdf-qtest-25kg-7-10-progress add allowlist.txt parity/qtest-11.9.0.jsonl and git -C /tmp/flpdf-qtest-25kg-7-10-progress commit -m "data: promote progress-reporting qtest parity".
 
