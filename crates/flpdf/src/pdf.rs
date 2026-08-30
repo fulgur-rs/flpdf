@@ -354,16 +354,23 @@ impl<R: Read + Seek> Pdf<R> {
     /// be an indirect reference, so resolve it through the canonical handle
     /// graph before checking its type. A missing, dangling, or non-dictionary
     /// `/Root` is a document-level error rather than a missing-key fallback.
+    ///
+    /// Reads `/Root` fresh from the live trailer on every call, matching
+    /// [`Self::root_ref`]'s identical reasoning: a caller may replace `/Root`
+    /// through the live handle returned by [`Self::trailer`], or install a
+    /// new trailer via `update_from_json()`, after an earlier call already
+    /// populated `root_handle_memo` — trusting that memo unconditionally
+    /// would keep returning the old catalog after such a replacement.
     pub fn root_handle(&mut self) -> Result<ObjectHandle> {
-        let candidate = if let Some(root) = &self.root_handle_memo {
-            root.clone()
-        } else {
-            let root = self.trailer_key_handle(b"Root");
-            if !root.is_null() {
-                self.root_handle_memo = Some(root.clone());
-            }
-            root
-        };
+        let candidate = self
+            .trailer_handle_memo
+            .as_ref()
+            .unwrap_or(&self.trailer)
+            .try_get_key(b"/Root")
+            .unwrap_or_else(|_| ObjectHandle::null());
+        if !candidate.is_null() {
+            self.root_handle_memo = Some(candidate.clone());
+        }
         self.resolve(&candidate)?;
         let root = candidate;
         if root.as_dictionary().is_none() {
