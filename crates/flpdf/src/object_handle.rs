@@ -18367,6 +18367,16 @@ pub(crate) mod warning_emission_tests {
             Err(crate::Error::Internal(message))
                 if message == "attempted to dereference an uninitialized QPDFObjectHandle"
         ));
+
+        let mut bytes = Vec::new();
+        let mut output = crate::pipeline::PlString::new("uninitialized", None, &mut bytes);
+        let error = handle
+            .write_json(2, &mut output, true, 0)
+            .expect_err("JSON dereference must reject an uninitialized handle");
+        assert_eq!(
+            error.to_string(),
+            "attempted to dereference an uninitialized QPDFObjectHandle"
+        );
     }
 
     #[test]
@@ -18446,6 +18456,82 @@ pub(crate) mod warning_emission_tests {
         cursor.next();
         assert!(cursor.is_end());
         assert!(!cursor.current().value.is_initialized());
+        cursor.previous();
+        assert_eq!(cursor.current().key, b"/Key2");
+
+        let empty_array_items = ObjectHandle::integer(7).try_array_items().unwrap();
+        assert!(empty_array_items.end().is_end());
+        let empty_dict_items = ObjectHandle::integer(7).try_dict_items().unwrap();
+        assert!(empty_dict_items.end().is_end());
+    }
+
+    #[test]
+    fn qpdf_type_check_accessors_cover_successful_values_and_live_containers() {
+        assert!(ObjectHandle::boolean(true).try_get_bool_value().unwrap());
+        assert_eq!(
+            ObjectHandle::real(1.25).try_get_real_value().unwrap(),
+            b"1.25"
+        );
+        assert_eq!(
+            ObjectHandle::real_literal(0.4, b".4".to_vec())
+                .try_get_real_value()
+                .unwrap(),
+            b".4"
+        );
+        assert_eq!(
+            ObjectHandle::integer(7).try_get_numeric_value().unwrap(),
+            7.0
+        );
+        assert_eq!(
+            ObjectHandle::real_literal(0.4, b".4".to_vec())
+                .try_get_numeric_value()
+                .unwrap(),
+            0.4
+        );
+        assert_eq!(
+            ObjectHandle::name(b"Name".to_vec()).try_get_name().unwrap(),
+            b"/Name"
+        );
+        assert_eq!(
+            ObjectHandle::string(vec![0xfe, 0xff, 0x00, b'A'])
+                .try_get_string_value()
+                .unwrap(),
+            vec![0xfe, 0xff, 0x00, b'A']
+        );
+        assert_eq!(
+            ObjectHandle::string(vec![0xfe, 0xff, 0x00, b'A'])
+                .try_get_utf8_value()
+                .unwrap(),
+            b"A"
+        );
+        assert_eq!(
+            ObjectHandle::operator(b"q".to_vec())
+                .try_get_operator_value()
+                .unwrap(),
+            b"q"
+        );
+        assert_eq!(
+            ObjectHandle::inline_image(b"raw".to_vec())
+                .try_get_inline_image_value()
+                .unwrap(),
+            b"raw"
+        );
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        assert!(array.try_is_array().unwrap());
+        assert!(!array.try_is_integer().unwrap());
+        assert_eq!(array.try_get_array_n_items().unwrap(), 1);
+        assert_eq!(array.try_get_array_as_vector().unwrap().len(), 1);
+        assert_eq!(array.try_get_array_item(0).unwrap().as_integer(), Some(1));
+
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::integer(1)),
+            (b"B".to_vec(), ObjectHandle::null()),
+        ]);
+        assert!(dictionary.try_is_dictionary().unwrap());
+        assert_eq!(dictionary.try_get_dict_as_map().unwrap().len(), 2);
+        assert!(dictionary.try_get_has_key(b"/A").unwrap());
+        assert!(!dictionary.try_get_has_key(b"/B").unwrap());
     }
 
     #[test]
@@ -18492,6 +18578,60 @@ pub(crate) mod warning_emission_tests {
             "object 3 0: operation for array attempted on object of type integer: ignoring attempt to append item",
             "object 3 0: operation for array attempted on object of type integer: ignoring attempt to erase item",
         ]);
+    }
+
+    #[test]
+    fn signed_array_mutators_cover_qpdf_bounds_and_success_paths() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        array
+            .try_set_array_item_at(0, ObjectHandle::integer(2))
+            .unwrap();
+        array
+            .try_append_array_item(ObjectHandle::integer(3))
+            .unwrap();
+        array
+            .try_set_array_items(vec![ObjectHandle::integer(4)])
+            .unwrap();
+        array
+            .try_insert_array_item_at(1, ObjectHandle::integer(5))
+            .unwrap();
+        array.try_erase_array_item_at(0).unwrap();
+        assert_eq!(array.as_array().unwrap().len(), 1);
+
+        let (array, recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::integer(1)]));
+        array
+            .try_set_array_item_at(-1, ObjectHandle::integer(2))
+            .unwrap();
+        array
+            .try_set_array_item_at(42, ObjectHandle::integer(2))
+            .unwrap();
+        array
+            .try_insert_array_item_at(-1, ObjectHandle::integer(2))
+            .unwrap();
+        array
+            .try_insert_array_item_at(42, ObjectHandle::integer(2))
+            .unwrap();
+        array.try_erase_array_item_at(-1).unwrap();
+        array.try_erase_array_item_at(42).unwrap();
+        assert_eq!(warnings(&recorder).len(), 6);
+
+        let (integer, recorder) = handle_resolving(ObjectValue::Integer(7));
+        integer
+            .try_set_array_item_at(-1, ObjectHandle::null())
+            .unwrap();
+        integer
+            .try_set_array_item_at(0, ObjectHandle::null())
+            .unwrap();
+        integer
+            .try_insert_array_item_at(-1, ObjectHandle::null())
+            .unwrap();
+        integer
+            .try_insert_array_item_at(0, ObjectHandle::null())
+            .unwrap();
+        integer.try_erase_array_item_at(-1).unwrap();
+        integer.try_erase_array_item_at(0).unwrap();
+        assert_eq!(warnings(&recorder).len(), 6);
     }
 
     /// A sink that appends every write to a shared buffer.
