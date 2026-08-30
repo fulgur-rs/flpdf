@@ -91,6 +91,7 @@ struct JobConfiguration {
     remove_restrictions: bool,
     coalesce_contents: bool,
     flatten_rotation: bool,
+    generate_appearances: bool,
     writer: WriterConfiguration,
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
@@ -1148,7 +1149,7 @@ impl QPDFJob {
     /// This implements the qpdf job-JSON fields currently owned by this
     /// lifecycle, including input/output setup, writer settings, page
     /// transformations (`splitPages`, `rotate`, `removeRestrictions`,
-    /// `coalesceContents`, and `flattenRotation`),
+    /// `generateAppearances`, `coalesceContents`, and `flattenRotation`),
     /// attachments, page selection, and JSON output.
     ///
     /// # Errors
@@ -1318,6 +1319,7 @@ impl QPDFJob {
         configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
         configuration.coalesce_contents = job_json_bare(&members, b"coalesceContents")?;
         configuration.flatten_rotation = job_json_bare(&members, b"flattenRotation")?;
+        configuration.generate_appearances = job_json_bare(&members, b"generateAppearances")?;
         if let Some(value) = job_json_choice(
             &members,
             b"objectStreams",
@@ -1891,6 +1893,15 @@ impl QPDFJob {
         if configuration.remove_restrictions {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
             let _ = acroform.disable_digital_signatures()?;
+        }
+
+        // qpdf's `handleTransformations` generates form appearances after
+        // removing restrictions and before content coalescing or rotation
+        // flattening (`QPDFJob.cc:2177-2180`). The AcroForm helper owns the
+        // `/NeedAppearances` gate, widget traversal, and marker clearing.
+        if configuration.generate_appearances {
+            let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+            acroform.generate_appearances_if_needed()?;
         }
 
         // qpdf's `handleTransformations` coalesces every page after the
