@@ -707,6 +707,11 @@ mod tests {
                 .as_ref(),
             b"raw"
         );
+        assert!(
+            !stream_payload_for_decode_level(&specialized, DecodeLevel::Specialized)
+                .expect("specialized filter is selected at specialized level")
+                .is_empty()
+        );
 
         let corrupt = stream(b"not-flate".to_vec(), Some(b"FlateDecode"));
         assert_eq!(
@@ -719,6 +724,10 @@ mod tests {
 
     #[test]
     fn selectors_and_object_error_conversion_cover_all_public_boundaries() {
+        assert_eq!(DecodeLevel::None.as_qpdf_str(), "none");
+        assert_eq!(DecodeLevel::Generalized.as_qpdf_str(), "generalized");
+        assert_eq!(DecodeLevel::Specialized.as_qpdf_str(), "specialized");
+        assert_eq!(DecodeLevel::All.as_qpdf_str(), "all");
         assert_eq!(
             JsonObjectSelector::from_str("trailer"),
             Some(JsonObjectSelector::Trailer)

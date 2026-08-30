@@ -2100,3 +2100,51 @@ mod final_handle_tests {
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(17, 0)));
     }
 }
+
+#[cfg(test)]
+mod source_window_tests {
+    use super::Pdf;
+    use crate::ObjectRef;
+
+    #[test]
+    fn source_stream_offset_retries_when_the_next_xref_offset_truncates_the_header() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (number, body) in [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".as_slice(),
+            ),
+        ] {
+            offsets.push((number, bytes.len()));
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let stream_offset = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n");
+        let truncated_header_offset = stream_offset + 4;
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for (_, offset) in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{truncated_header_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("synthetic source-window PDF opens");
+        let data_offset = pdf
+            .source_stream_data_offset(ObjectRef::new(4, 0))
+            .expect("source stream offset")
+            .expect("stream object has source data");
+        assert_eq!(
+            data_offset,
+            (stream_offset + b"4 0 obj\n<< /Length 5 >>\nstream\n".len()) as u64
+        );
+    }
+}

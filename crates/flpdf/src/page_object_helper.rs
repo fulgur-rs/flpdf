@@ -2425,6 +2425,14 @@ mod tests {
             .expect("non-dictionary resources have no names")
             .is_empty());
 
+        let nested = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(1))]),
+        )]);
+        assert!(collect_resource_names(&mut pdf, &nested)
+            .expect("nested resource dictionaries have names")
+            .contains(b"/F1".as_slice()));
+
         let missing = ObjectHandle::dictionary(Vec::new());
         assert!(
             resolve_resource_dictionary(&mut pdf, &missing, b"/ColorSpace")

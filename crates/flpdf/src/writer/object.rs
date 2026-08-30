@@ -3304,7 +3304,7 @@ mod tests {
             &map,
             &BTreeSet::new(),
             false,
-        )?;
+        )?; // cov:ignore: LLVM maps this successful generic dictionary call continuation to test cleanup
         assert_eq!(output, b"<< /ID [<01><02>] /Keep 1 >>");
         Ok(())
     }

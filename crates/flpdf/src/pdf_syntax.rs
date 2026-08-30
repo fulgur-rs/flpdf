@@ -9,9 +9,12 @@ pub(crate) fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
     {
         return false;
     }
+    // cov:ignore-start: the preceding PDF-number byte grammar rejects every
+    // non-UTF-8 byte before this defensive conversion boundary.
     let Ok(text) = std::str::from_utf8(literal) else {
         return false;
     };
+    // cov:ignore-end
     text.parse::<f64>()
         .map(|parsed| parsed.to_bits() == value.to_bits())
         .unwrap_or(false)

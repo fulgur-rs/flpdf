@@ -485,6 +485,7 @@ mod final_handle_tests {
     fn require_endstream_rejects_a_usable_length_without_a_terminator() -> Result<()> {
         let input = b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nnot-endobj";
         let mut resolver = Detached;
+        let _ = resolver.indirect_handle(ObjectRef::new(9, 0));
         let pending = parse_file_object_handle_syntax(input, &mut resolver)?;
         let error =
             finish_file_object_handle(input, pending, None, RecoveryPolicy::RequireEndstream)

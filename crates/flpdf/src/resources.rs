@@ -525,18 +525,22 @@ mod final_handle_tests {
         let form = pdf
             .new_stream_with_data(Rc::new(b"q Q".to_vec()))
             .expect("form stream");
-        form.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+        let form_dict = form.as_stream_dict().expect("form dictionary");
+        form_dict
+            .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
             .expect("form type");
-        form.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+        form_dict
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
             .expect("form subtype");
-        form.replace_key(
-            b"/Resources",
-            ObjectHandle::dictionary(vec![(
-                b"/Font".to_vec(),
-                ObjectHandle::dictionary(vec![(b"/Unused".to_vec(), ObjectHandle::integer(1))]),
-            )]),
-        )
-        .expect("form resources");
+        form_dict
+            .replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(
+                    b"/Font".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/Unused".to_vec(), ObjectHandle::integer(1))]),
+                )]),
+            )
+            .expect("form resources");
         let resources = ObjectHandle::dictionary(vec![(
             b"/XObject".to_vec(),
             ObjectHandle::dictionary(vec![(b"/Fm0".to_vec(), form)]),

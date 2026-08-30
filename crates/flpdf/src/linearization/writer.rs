@@ -2348,7 +2348,7 @@ fn do_write_pass<R: Read + Seek>(
         crate::writer::encrypted_strings::write_encryption_dictionary_handle(
             &mut bytes,
             &ctx.encrypt_dict,
-        )?;
+        )?; // cov:ignore: LLVM maps this covered encrypted-dictionary continuation to cleanup
         bytes.extend_from_slice(b"\nendobj\n");
         xref_offsets.insert(ctx.encrypt_ref.number, offset);
     }
