@@ -228,7 +228,21 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
 /// later persistence step fails. Opens without truncating so an
 /// already-existing, otherwise-valid destination is left untouched until
 /// the real write.
+///
+/// Skips the check for an existing destination that is neither a regular
+/// file nor a directory (a named pipe, for example): qpdf itself opens its
+/// real destination exactly once, and a FIFO's reader observes EOF and can
+/// exit as soon as this validation open closes, so the later real write
+/// would reopen a FIFO with no reader left and hang. Directories are still
+/// probed here (opening one for writing fails immediately with no
+/// reader-synchronization side effect), and a nonexistent path is still
+/// probed since `create(true)` there has no such side effect either.
 fn validate_progress_output_destination(output: &Path) -> CliResult<()> {
+    if let Ok(metadata) = std::fs::metadata(output) {
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Ok(());
+        }
+    }
     OpenOptions::new()
         .write(true)
         .create(true)

@@ -405,6 +405,72 @@ fn progress_rewrite_to_unusable_destination_fails_before_any_progress_output() {
     assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
 }
 
+// qpdf opens its real output destination exactly once. A destination
+// validation probe that opens-then-closes a FIFO would let a blocking
+// reader observe EOF and exit before the later real write reopens the
+// pipe, so the real write would hang with no reader left (Unix-only:
+// named pipes are not exercised on Windows).
+#[cfg(unix)]
+#[test]
+fn progress_rotate_to_a_fifo_destination_does_not_hang() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let input = fixture("one-page.pdf");
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let fifo_path = tempdir.path().join("out.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo invocation")
+            .success(),
+        "mkfifo must succeed"
+    );
+
+    let reader_fifo = fifo_path.clone();
+    let reader = std::thread::spawn(move || {
+        let mut file = std::fs::File::open(&reader_fifo).expect("open fifo for reading");
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).expect("read fifo");
+        buf
+    });
+
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("flpdf"))
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--progress", "--deterministic-id", "--rotate=90:1"])
+        .arg(&input)
+        .arg(&fifo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn flpdf");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    let output = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("flpdf must not hang writing to a FIFO destination")
+        .expect("flpdf invocation");
+
+    assert!(
+        output.status.success(),
+        "flpdf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bytes = reader.join().expect("fifo reader thread");
+    assert!(
+        bytes.starts_with(b"%PDF-1.3\n"),
+        "fifo reader did not receive the rewritten PDF"
+    );
+}
+
 #[test]
 fn progress_pages_extraction_to_unusable_destination_fails_before_any_progress_output() {
     let input = fixture("two-page.pdf");
