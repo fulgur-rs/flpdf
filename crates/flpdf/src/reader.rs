@@ -589,6 +589,19 @@ impl<R: Read + Seek> Pdf<R> {
     /// Parse qpdf's encryption parameters before authentication so the
     /// read-only `--show-encryption` path can report them after BadPassword.
     pub(crate) fn initialize_encryption_inspection(&mut self) -> Result<()> {
+        let encrypt_handle = self.trailer_key_handle(b"Encrypt");
+        if encrypt_handle.is_null() {
+            return Ok(());
+        }
+        let id_handle = self.trailer_key_handle(b"ID");
+        if !crate::encryption::state::first_file_id_handle_with_status(&id_handle)?.valid {
+            // qpdf's initializeEncryption warns before validating /Encrypt and
+            // then continues with an empty id1
+            // (`QPDF_encryption.cc:718-751`). The warning is emitted here once,
+            // while authentication consumes the same fallback value without
+            // re-emitting it.
+            self.push_warning("(trailer): invalid /ID in trailer dictionary")?;
+        }
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(());
         };
