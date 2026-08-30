@@ -77,7 +77,8 @@ use crate::writer::{
     inject_adbe_extension, report_progress_event, serialize::xref_stream, strip_adbe_extension,
     CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
 };
-use crate::{Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::Object;
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 
 const EBADF_ERRNO: i32 = 9;
 
@@ -1185,7 +1186,7 @@ fn finalize_linearized_id(
     source_id0: Option<&[u8]>,
     det_id_source_id0: Option<&[u8]>,
     copy_encryption: Option<&crate::encryption::CopyEncryptionSource>,
-) -> Object {
+) -> ObjectHandle {
     if options.deterministic_id {
         // Size the all-zero permanent-identifier placeholder to the source
         // `/ID[0]` length so the serialized `/ID` array reaches its FINAL width
@@ -1197,24 +1198,22 @@ fn finalize_linearized_id(
         // already-captured source `/ID[0]` (`None` -> 16, the fallback changing
         // identifier's width), which matches what the writer emits.
         let len0 = det_id_source_id0.map(<[u8]>::len).unwrap_or(16);
-        Object::Array(vec![
-            Object::String(vec![0u8; len0]),
-            Object::String(vec![0u8; 16]),
+        ObjectHandle::array(vec![
+            ObjectHandle::string(vec![0u8; len0]),
+            ObjectHandle::string(vec![0u8; 16]),
         ])
     } else if let Some(source) = copy_encryption {
-        let generated = crate::writer::generate_id_array_from_source_id0(None, options.static_id);
+        let generated = crate::writer::generate_id_handle(None, options.static_id);
         let id1 = generated
             .as_array()
-            .and_then(|values| values.get(1))
-            .and_then(Object::as_string)
-            .map(<[u8]>::to_vec)
+            .and_then(|values| values.get(1).and_then(ObjectHandle::as_string))
             .unwrap_or_else(|| source.id0.clone());
-        Object::Array(vec![
-            Object::String(source.id0.clone()),
-            Object::String(id1),
+        ObjectHandle::array(vec![
+            ObjectHandle::string(source.id0.clone()),
+            ObjectHandle::string(id1),
         ])
     } else {
-        crate::writer::generate_id_array_from_source_id0(source_id0, options.static_id)
+        crate::writer::generate_id_handle(source_id0, options.static_id)
     }
 }
 
@@ -1225,44 +1224,12 @@ fn finalize_linearized_id(
 /// first string with the same byte width as the original `/ID[0]` (falling
 /// back to 16 bytes when there is no non-empty original identifier), followed
 /// by a 16-byte all-zero changing identifier.
-fn linearization_pass1_id(source_id0: Option<&[u8]>) -> Object {
+fn linearization_pass1_id(source_id0: Option<&[u8]>) -> ObjectHandle {
     let first_len = source_id0.map(|id| id.len()).unwrap_or(16);
-    Object::Array(vec![
-        Object::String(vec![0u8; first_len]),
-        Object::String(vec![0u8; 16]),
+    ObjectHandle::array(vec![
+        ObjectHandle::string(vec![0u8; first_len]),
+        ObjectHandle::string(vec![0u8; 16]),
     ])
-}
-
-/// `/ID` array for the split xref stream dicts.  Reads the file-scoped
-/// identifier that `write_linearized` already finalized onto `source_trailer`
-/// (see [`finalize_linearized_id`]) so it stays consistent with the Part-1
-/// trailer.
-/// Lift the writer-owned two-string `/ID` value into the canonical handle
-/// graph. Linearization still keeps the legacy `Object` only for the existing
-/// two-pass ID computation; all xref/trailer emission consumes this handle.
-fn id_object_to_handle(object: &Object) -> Result<ObjectHandle> {
-    let values = object.as_array().ok_or_else(|| {
-        crate::Error::Unsupported("linearization writer: /ID is not an array".to_string())
-    })?;
-    if values.len() != 2 {
-        return Err(crate::Error::Unsupported(
-            "linearization writer: /ID must contain two strings".to_string(),
-        ));
-    }
-    let ids = values
-        .iter()
-        .map(|value| {
-            value
-                .as_string()
-                .map(|bytes| ObjectHandle::string(bytes.to_vec()))
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(
-                        "linearization writer: /ID entries must be strings".to_string(),
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(ObjectHandle::array(ids))
 }
 
 /// Overwrite every all-zero deterministic `/ID` placeholder in the finished
@@ -3372,9 +3339,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // invariant at the point it actually matters.
     let id0: Vec<u8> = finalized_id
         .as_array()
-        .and_then(|values| values.first())
-        .and_then(Object::as_string)
-        .map(<[u8]>::to_vec)
+        .and_then(|values| values.first().and_then(ObjectHandle::as_string))
         .ok_or_else(|| {
             // cov:ignore-start: unreachable — every branch of finalize_linearized_id
             // constructs a well-formed 2-element string array (see its own body)
@@ -3384,11 +3349,9 @@ fn write_linearized_impl<R: Read + Seek>(
                     .to_string(),
             )
         })?; // cov:ignore-end
-    let finalized_id_handle = id_object_to_handle(&finalized_id)?;
-    let pass1_id_handle = id_object_to_handle(&pass1_id)?;
-    source_trailer_handle.replace_key(b"/ID", finalized_id_handle)?;
+    source_trailer_handle.replace_key(b"/ID", finalized_id)?;
     let pass1_source_trailer = source_trailer_handle.shallow_copy()?;
-    pass1_source_trailer.replace_key(b"/ID", pass1_id_handle)?;
+    pass1_source_trailer.replace_key(b"/ID", pass1_id)?;
 
     // QPDFWriter::setEncryptionParameters and
     // QPDFWriter::copyEncryptionParameters call generateID() before the
@@ -4559,7 +4522,7 @@ mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
     use crate::writer::{WriterOptions, DETERMINISTIC_ID_ARRAY_LEN};
-    use crate::{Dictionary, ObjectRef, Pdf};
+    use crate::{Dictionary, Object, ObjectRef, Pdf};
     use std::io::{Cursor, Read, Seek};
 
     fn resolved_object<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<Object> {
@@ -9513,14 +9476,19 @@ mod tests {
     }
 
     #[test]
-    fn id_helpers_reject_noncanonical_shapes() {
-        assert!(id_object_to_handle(&Object::Null).is_err());
-        assert!(id_object_to_handle(&Object::Array(vec![Object::Null])).is_err());
-        assert!(id_object_to_handle(&Object::Array(vec![
-            Object::String(b"id".to_vec()),
-            Object::Integer(7),
-        ]))
-        .is_err());
+    fn id_helpers_build_canonical_handle_shapes() {
+        let pass1 = linearization_pass1_id(Some(b"id"));
+        assert_eq!(pass1.as_array().expect("pass-1 ID array").len(), 2);
+        assert_eq!(
+            pass1.as_array().expect("pass-1 ID array")[0].as_string(),
+            Some(vec![0; 2])
+        );
+
+        let finalized = finalize_linearized_id(&WriterOptions::default(), Some(b"id"), None, None);
+        assert_eq!(
+            finalized.as_array().expect("final ID array")[0].as_string(),
+            Some(b"id".to_vec())
+        );
 
         let missing = ObjectHandle::dictionary(Vec::new());
         assert!(xref_id_bytes(&missing)

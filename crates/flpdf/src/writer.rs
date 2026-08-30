@@ -2939,6 +2939,7 @@ pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> 
 
 /// Generate qpdf's ordinary/static `/ID` array from a previously resolved
 /// source `/ID[0]`, without reconstructing a legacy [`Object`] trailer value.
+#[cfg(test)]
 pub(crate) fn generate_id_array_from_source_id0(
     source_id0: Option<&[u8]>,
     static_id: bool,
@@ -3699,22 +3700,26 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
-    // Snapshot the source Catalog AND its dirty-flag state BEFORE any ADBE
-    // injection / strip mutates them, so those output-only mutations do not
-    // leak into the caller's Pdf handle. Restored below regardless of whether
-    // the write succeeds — the Pdf handle is safe to reuse for subsequent
-    // writes (or for read APIs like page enumeration) after this call
-    // returns. The dirty flag is captured too because `Pdf::set_object` used
-    // for the restore unconditionally marks its target dirty; without the
-    // dirty-flag restore a subsequent `write_pdf` incremental append would
-    // spuriously emit a Catalog delta.
-    let catalog_snapshot = pdf.root_ref().and_then(|r| {
+    // Snapshot the source Catalog's output-only `/Extensions` entry and its
+    // dirty-flag state BEFORE any ADBE injection / strip mutates them, so those
+    // output-only mutations do not leak into the caller's Pdf handle. Restored
+    // below regardless of whether the write succeeds — the Pdf handle is safe
+    // to reuse for subsequent writes (or for read APIs like page enumeration)
+    // after this call returns. The dirty flag is captured too because the
+    // canonical Catalog restore marks its target dirty; without the dirty-flag
+    // restore a subsequent `write_pdf` incremental append would spuriously
+    // emit a Catalog delta.
+    let catalog_snapshot: Option<CatalogExtensionsSnapshot> = pdf.root_ref().and_then(|r| {
         let was_dirty = pdf.is_dirty(r);
-        let handle = pdf.get_object_handle(r);
-        pdf.resolve(&handle)
-            .ok()
-            .and_then(|()| handle.materialize().ok())
-            .map(|catalog| (r, catalog, was_dirty))
+        let handle: ObjectHandle = pdf.get_object_handle(r);
+        pdf.resolve(&handle).ok().and_then(|()| {
+            let entries = handle.try_as_dictionary().ok()??;
+            Some(CatalogExtensionsSnapshot {
+                root_ref: r,
+                extensions: entries.get(b"/Extensions".as_slice()).cloned(),
+                was_dirty,
+            })
+        })
     });
     // A direct Catalog has no ObjectRef whose whole-dictionary snapshot can
     // be restored after the output-only `/Extensions` mutation. Keep the
@@ -3758,38 +3763,16 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     // is not scoped to one write -- so it must survive this restore; only the
     // output-only `/Extensions` injection/strip must not leak into the
     // caller's Pdf handle. Runs on success and on error alike so partial
-    // injection state cannot leak either. `set_object` marks the ref dirty;
-    // if the ref was clean before this call, clear the dirty flag to leave
-    // the caller's Pdf byte-for-byte equivalent to its pre-call state absent
-    // any repair.
-    // cov:ignore-start: outer if-let and inner-if closing braces are
-    // llvm-cov region artifacts; the interior is exercised by
+    // injection state cannot leak either. `restore_catalog_extensions` marks
+    // the ref dirty; if the ref was clean before this call, clear the dirty
+    // flag to leave the caller's Pdf byte-for-byte equivalent to its pre-call
+    // state absent any repair.
+    // cov:ignore-start: outer if-let and helper-call terminators are llvm-cov
+    // region artifacts; the interior is exercised by
     // emit_canonical_pdf_does_not_leave_root_dirty_flag_set and
     // emit_canonical_pdf_preserves_pre_existing_root_dirty_flag.
-    if let Some((root_ref, original, was_dirty)) = catalog_snapshot {
-        let original_extensions = match &original {
-            Object::Dictionary(dict) => dict.get("Extensions").cloned(),
-            _ => None,
-        };
-        let current_handle = pdf.get_object_handle(root_ref);
-        match pdf
-            .resolve(&current_handle)
-            .and_then(|()| current_handle.materialize())
-        {
-            Ok(Object::Dictionary(mut current)) => {
-                match original_extensions {
-                    Some(extensions) => current.insert("Extensions", extensions),
-                    None => {
-                        current.remove("Extensions");
-                    }
-                }
-                pdf.set_object(root_ref, Object::Dictionary(current));
-            }
-            _ => pdf.set_object(root_ref, original),
-        }
-        if !was_dirty {
-            pdf.clear_dirty(root_ref);
-        }
+    if let Some(snapshot) = catalog_snapshot {
+        restore_catalog_extensions(pdf, Some(snapshot))?;
     }
     if let Some((root, original_extensions)) = direct_catalog_snapshot {
         let current_extensions = root
