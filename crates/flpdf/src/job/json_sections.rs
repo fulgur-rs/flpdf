@@ -11,7 +11,6 @@ use crate::json_inspect::{
     ConvertError, DecodeLevel,
 };
 use crate::object_handle::ObjectHandle;
-use crate::pdf_string::decode_pdf_text_string;
 use crate::pipeline::Discard;
 use crate::{EmbeddedFileStream, FileSpec, ObjectRef, PageObjectHelper, Pdf};
 use std::io::{Read, Seek};
