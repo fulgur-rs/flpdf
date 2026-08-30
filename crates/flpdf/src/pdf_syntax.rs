@@ -97,23 +97,6 @@ pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{real_literal_is_safe, write_name_escaped};
-
-    #[test]
-    fn real_literal_rejects_non_utf8_source_bytes() {
-        assert!(!real_literal_is_safe(&[0xff], 0.0));
-    }
-
-    #[test]
-    fn name_escaping_covers_nul_delimiters_and_non_ascii_bytes() {
-        let mut output = Vec::new();
-        write_name_escaped(&mut output, b"a\0#/ \x80z");
-        assert_eq!(output, b"a#00#23#2f#20#80z");
-    }
-}
-
 /// Write bytes as a lowercase hexadecimal PDF string.
 pub(crate) fn write_hex_string(out: &mut Vec<u8>, value: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -130,3 +113,20 @@ pub(crate) type TrailerIdWriter<'a> = &'a mut dyn FnMut(&mut Vec<u8>);
 
 /// Reborrowable two-lifetime form of TrailerIdWriter.
 pub(crate) type ReborrowableIdWriter<'r, 'd> = &'r mut (dyn FnMut(&mut Vec<u8>) + 'd);
+
+#[cfg(test)]
+mod tests {
+    use super::{real_literal_is_safe, write_name_escaped};
+
+    #[test]
+    fn real_literal_rejects_non_utf8_source_bytes() {
+        assert!(!real_literal_is_safe(&[0xff], 0.0));
+    }
+
+    #[test]
+    fn name_escaping_covers_nul_delimiters_and_non_ascii_bytes() {
+        let mut output = Vec::new();
+        write_name_escaped(&mut output, b"a\0#/ \x80z");
+        assert_eq!(output, b"a#00#23#2f#20#80z");
+    }
+}

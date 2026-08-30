@@ -5568,16 +5568,18 @@ mod final_handle_writer_tests {
 
     #[test]
     fn encryption_shape_reads_copy_encryption_handles() {
-        let mut options = WriterOptions::default();
-        options.copy_encryption = Some(CopyEncryptionSource {
-            encrypt_dict: ObjectHandle::dictionary(vec![
-                (b"/V".to_vec(), ObjectHandle::integer(4)),
-                (b"/R".to_vec(), ObjectHandle::integer(4)),
-            ]),
-            file_key: vec![0; 16],
-            id0: vec![0; 16],
-            object_key_alg: ObjectKeyAlg::Rc4,
-        });
+        let options = WriterOptions {
+            copy_encryption: Some(CopyEncryptionSource {
+                encrypt_dict: ObjectHandle::dictionary(vec![
+                    (b"/V".to_vec(), ObjectHandle::integer(4)),
+                    (b"/R".to_vec(), ObjectHandle::integer(4)),
+                ]),
+                file_key: vec![0; 16],
+                id0: vec![0; 16],
+                object_key_alg: ObjectKeyAlg::Rc4,
+            }),
+            ..WriterOptions::default()
+        };
 
         assert_eq!(encryption_shape(&options), Some((4, 4, true)));
     }

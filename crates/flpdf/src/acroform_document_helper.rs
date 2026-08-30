@@ -2286,6 +2286,7 @@ fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+#[allow(clippy::mutable_key_type)]
 mod final_handle_tests {
     use super::{AcroFormDocumentHelper, InheritedFieldOverrides};
     use crate::{ObjectHandle, ObjectRef, Pdf};
