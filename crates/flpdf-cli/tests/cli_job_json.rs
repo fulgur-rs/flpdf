@@ -245,6 +245,32 @@ fn job_json_file_rotate_applies_to_the_selected_page() {
 }
 
 #[test]
+fn job_json_file_rotate_trailing_colon_means_all_pages_like_qpdf() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("rotate-all.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"rotated-all.pdf","rotate":"90:","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=rotate-all.json")
+        .assert()
+        .code(0);
+
+    assert_eq!(
+        page_rotations(&fs::read(directory.path().join("rotated-all.pdf")).unwrap()),
+        vec![Some(90), Some(90), Some(90)],
+        "qpdf treats an empty range after rotate's colon as all pages"
+    );
+}
+
+#[test]
 fn job_json_file_remove_restrictions_disables_signature_fields() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
