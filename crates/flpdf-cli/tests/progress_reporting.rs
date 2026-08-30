@@ -12,6 +12,11 @@ fn fixture(name: &str) -> PathBuf {
 fn progress_lines(output_name: &str) -> String {
     format!(
         "flpdf: {output_name}: write progress: 0%\n\
+         flpdf: {output_name}: write progress: 29%\n\
+         flpdf: {output_name}: write progress: 43%\n\
+         flpdf: {output_name}: write progress: 58%\n\
+         flpdf: {output_name}: write progress: 72%\n\
+         flpdf: {output_name}: write progress: 86%\n\
          flpdf: {output_name}: write progress: 99%\n\
          flpdf: {output_name}: write progress: 100%\n"
     )
@@ -63,7 +68,7 @@ fn progress_keeps_pdf_on_stdout_and_reports_on_stderr() {
         "flpdf failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.starts_with(b"%PDF-1.7\n"));
+    assert!(output.stdout.starts_with(b"%PDF-1.3\n"));
     assert_eq!(
         String::from_utf8(output.stderr).expect("progress output is UTF-8"),
         progress_lines("standard output")
