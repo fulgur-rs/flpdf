@@ -3503,4 +3503,44 @@ mod final_handle_tests {
         assert!(!first.is_indirect());
         assert!(!second.is_indirect());
     }
+
+    #[test]
+    fn bootstrap_cache_cleans_owned_states_and_detaches_stream_values() {
+        let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        let entries = BTreeMap::new();
+        let document = BootstrapHandleDocument::new_with_state(
+            b"",
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::clone(&state),
+        );
+        let cache = BootstrapCache {
+            handle_state: state.clone(),
+            handle_document: None,
+            handle_document_owners: vec![document],
+        };
+        drop(state);
+        drop(cache);
+
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"/Length".to_vec(),
+                ObjectHandle::integer(0),
+            )]),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
+            filter_on_write: true,
+            stream_length: 0,
+        });
+        let detached = detach_bootstrap_handle(&stream).expect("stream detaches");
+        assert_eq!(detached.get_filter_on_write().expect("stream flag"), true);
+        assert_eq!(
+            detached
+                .as_stream_dict()
+                .expect("detached stream dictionary")
+                .get_key(b"/Length")
+                .as_integer(),
+            Some(0)
+        );
+    }
 }
