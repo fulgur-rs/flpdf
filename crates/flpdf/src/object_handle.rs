@@ -1214,7 +1214,7 @@ impl ArrayItems {
     }
 
     fn len(&self) -> usize {
-        self.array.as_array().map_or(0, |items| items.len())
+        ArrayItemCursor::array_len(&self.array)
     }
 }
 
@@ -1229,15 +1229,27 @@ impl ArrayItemCursor {
         cursor
     }
 
+    /// Read the array length without cloning every child handle, unlike
+    /// [`ObjectHandle::as_array`]. Every cursor step calls this, so an O(n)
+    /// clone here would make a full traversal O(n²).
+    fn array_len(array: &ObjectHandle) -> usize {
+        array.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => children.len(),
+            _ => 0,
+        })
+    }
+
     fn len(&self) -> usize {
-        self.array.as_array().map_or(0, |items| items.len())
+        Self::array_len(&self.array)
     }
 
     fn update_current(&mut self) {
         let target = self
             .array
-            .as_array()
-            .and_then(|items| items.get(self.index).cloned())
+            .with_value(|value| match value {
+                Some(ObjectValue::Array(children)) => children.get(self.index).cloned(),
+                _ => None,
+            })
             .filter(|item| item.is_initialized());
         self.current.rebind_cursor_value(target);
     }
@@ -1299,11 +1311,15 @@ impl DictItemCursor {
         cursor
     }
 
+    /// Look up the current key without cloning the whole entry map, unlike
+    /// [`ObjectHandle::as_dictionary`]. Every cursor step calls this, so an
+    /// O(n) clone here would make a full traversal O(n²).
     fn update_current(&mut self) {
         let target = self.keys.get(self.index).and_then(|key| {
-            self.dictionary
-                .as_dictionary()
-                .and_then(|entries| entries.get(key).cloned())
+            self.dictionary.with_value(|value| match value {
+                Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+                _ => None,
+            })
         });
         self.current.rebind_cursor_value(target);
     }
@@ -1406,6 +1422,7 @@ impl ObjectHandle {
                 slot.stream_token_filters.clone(),
                 slot.content_normalization_applied.clone(),
                 slot.mutation_generation.clone(),
+                slot.containment_parents.clone(),
             )
         });
 
@@ -1428,6 +1445,7 @@ impl ObjectHandle {
                     stream_token_filters,
                     content_normalization_applied,
                     mutation_generation,
+                    containment_parents,
                 )) => {
                     slot.initialized = initialized;
                     slot.state = state;
@@ -1444,7 +1462,12 @@ impl ObjectHandle {
                     slot.stream_token_filters = stream_token_filters;
                     slot.content_normalization_applied = content_normalization_applied;
                     slot.mutation_generation = mutation_generation;
-                    slot.containment_parents.clear();
+                    // Preserve the target's own containment provenance so a
+                    // cursor-derived direct child stays dirty-markable via
+                    // Pdf::mark_object_handle_dirty (Codex Review finding on
+                    // PR #1353; clearing it here silently dropped edits made
+                    // through a cursor's current() handle).
+                    slot.containment_parents = containment_parents;
                 }
                 None => {
                     slot.initialized = false;
@@ -1912,11 +1935,20 @@ impl ObjectHandle {
     ///
     /// flpdf currently accepts only a direct handle with a resolved value at
     /// this boundary. Keeping this check separate lets the resolver run it
-    /// before minting an absent target cache entry.
+    /// before minting an absent target cache entry. qpdf's
+    /// `QPDF::replaceObject` rejects both an indirect and an uninitialized
+    /// handle with the same message
+    /// (`libqpdf/QPDF.cc:1986-1989`: `if (oh.isIndirect() ||
+    /// !oh.isInitialized())`).
     pub(crate) fn validate_replacement_source(&self) -> Result<()> {
         if !self.is_direct() {
             return Err(crate::Error::Unsupported(
                 "replacement ObjectHandle must be direct".to_string(),
+            ));
+        }
+        if !self.is_initialized() {
+            return Err(crate::Error::Unsupported(
+                "QPDF::replaceObject called with indirect object handle".to_string(),
             ));
         }
         Ok(())
@@ -4354,7 +4386,12 @@ impl ObjectHandle {
             let destroyed = matches!(&*state, ObjectValue::Destroyed);
             destroyed
         };
-        if item_is_destroyed {
+        // qpdf's QPDF_Array::checkOwnership rejects an item whose
+        // getObjectPtr() is null -- the default-constructed
+        // QPDFObjectHandle() shape, distinct from an initialized handle
+        // whatever its current value type -- with this same message
+        // (`libqpdf/QPDF_Array.cc:9-24`).
+        if item_is_destroyed || !item.is_initialized() {
             return Err(Error::Internal(
                 "Attempting to add an uninitialized object to a QPDF_Array.".to_owned(),
             ));
@@ -16257,6 +16294,45 @@ mod mutation_tests {
     }
 
     #[test]
+    fn array_mutators_reject_uninitialized_items() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(0)]);
+        let uninitialized = ObjectHandle::uninitialized();
+
+        let append_error = array
+            .append_array_item(uninitialized.clone())
+            .expect_err("an uninitialized handle must not be appended");
+        assert!(matches!(
+            append_error,
+            Error::Internal(message)
+                if message == "Attempting to add an uninitialized object to a QPDF_Array."
+        ));
+
+        let insert_error = array
+            .insert_array_item(0, uninitialized.clone())
+            .expect_err("an uninitialized handle must not be inserted");
+        assert!(matches!(
+            insert_error,
+            Error::Internal(message)
+                if message == "Attempting to add an uninitialized object to a QPDF_Array."
+        ));
+
+        let set_error = array
+            .set_array_item(0, uninitialized)
+            .expect_err("an uninitialized handle must not be set into an array slot");
+        assert!(matches!(
+            set_error,
+            Error::Internal(message)
+                if message == "Attempting to add an uninitialized object to a QPDF_Array."
+        ));
+
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert_eq!(
+            array.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let self_clone = dict.clone();
@@ -18747,6 +18823,24 @@ pub(crate) mod warning_emission_tests {
         assert_eq!(items.current().key, b"/A");
         items.next();
         assert!(items.is_end());
+    }
+
+    #[test]
+    fn dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary() {
+        let dictionary = ObjectHandle::dictionary(vec![(b"/A".to_vec(), ObjectHandle::integer(1))]);
+        let mut cursor = dictionary.try_dict_items().unwrap().begin();
+
+        // The cursor keeps the same live dictionary handle rather than a
+        // frozen snapshot; if it stops being a dictionary mid-iteration
+        // (its Rc-shared slot is reassigned a scalar payload here), the
+        // cursor must fall back rather than panic on a stale key lookup.
+        dictionary
+            .share_value_state_with(&ObjectHandle::integer(2))
+            .expect("reassign the shared slot's payload to a non-dictionary value");
+
+        let entry = cursor.current();
+        assert_eq!(entry.key, b"/A");
+        assert!(!entry.value.is_initialized());
     }
 
     #[test]

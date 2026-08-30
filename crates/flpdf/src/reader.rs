@@ -4643,6 +4643,34 @@ mod tests {
     }
 
     #[test]
+    fn mark_object_handle_dirty_finds_the_owner_through_an_array_cursor() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes =
+            classic_pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"], object_ref);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let owner = pdf.get_object_handle(object_ref);
+        pdf.resolve(&owner).unwrap();
+        let item = ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(1))]);
+        let container = ObjectHandle::array(vec![item]);
+        owner.replace_key(b"/Kids", container).unwrap();
+        pdf.clear_dirty(object_ref);
+
+        let kids = owner.get_key(b"/Kids");
+        let items = kids.try_array_items().expect("array cursor");
+        let mut cursor = items.begin();
+        let via_cursor = cursor.current();
+        via_cursor
+            .replace_key(b"/Value", ObjectHandle::integer(2))
+            .unwrap();
+
+        pdf.mark_object_handle_dirty(&via_cursor).unwrap();
+        assert!(
+            pdf.is_dirty(object_ref),
+            "a cursor-derived direct child must retain its containment provenance"
+        );
+    }
+
+    #[test]
     fn detached_direct_child_does_not_dirty_owner_but_live_removal_is_written() {
         let owner_ref = ObjectRef::new(1, 0);
         let bytes = classic_pdf_with_bodies(
@@ -6016,6 +6044,55 @@ mod tests {
             pdf.next_obj_gen()
                 .expect("failed promotion is non-mutating"),
             ObjectRef::new(5, 0)
+        );
+    }
+
+    #[test]
+    fn make_indirect_from_object_handle_rejects_an_uninitialized_handle() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let before = pdf
+            .next_obj_gen()
+            .expect("baseline allocation counter reads cleanly");
+
+        let error = pdf
+            .make_indirect_from_object_handle(ObjectHandle::uninitialized())
+            .expect_err("an uninitialized handle must not be promoted");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: attempted to make an uninitialized QPDFObjectHandle indirect"
+        );
+        assert_eq!(
+            pdf.next_obj_gen()
+                .expect("rejected promotion is non-mutating"),
+            before
+        );
+    }
+
+    #[test]
+    fn replace_object_rejects_an_uninitialized_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(1))
+            .expect("initial allocation")
+            .object_ref()
+            .expect("fresh indirect ref");
+
+        let error = pdf
+            .resolver
+            .replace_object(object_ref, ObjectHandle::uninitialized())
+            .expect_err("an uninitialized handle must not replace an existing object");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: QPDF::replaceObject called with indirect object handle"
+        );
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve(&handle).unwrap();
+        assert_eq!(
+            handle.as_integer(),
+            Some(1),
+            "a rejected replacement must leave the original object untouched"
         );
     }
 
