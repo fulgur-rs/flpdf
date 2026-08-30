@@ -38,7 +38,7 @@ where
     resolve_compare_children(&act, actual_pdf, &mut actual_seen, 0)?;
     let mut expected_seen = Vec::new();
     resolve_compare_children(&exp, expected_pdf, &mut expected_seen, 0)?;
-    if act.unparse_resolved() != exp.unparse_resolved() {
+    if act.try_unparse_resolved()? != exp.try_unparse_resolved()? {
         return Ok(format!("{label}: object contents differ"));
     }
     Ok(String::new())
@@ -72,7 +72,7 @@ where
     resolve_compare_children(&act_dict, actual_pdf, &mut actual_seen, 0)?;
     let mut expected_seen = Vec::new();
     resolve_compare_children(&exp_dict, expected_pdf, &mut expected_seen, 0)?;
-    if act_dict.unparse_resolved() != exp_dict.unparse_resolved() {
+    if act_dict.try_unparse_resolved()? != exp_dict.try_unparse_resolved()? {
         return Ok(format!("{label}: stream dictionaries differ"));
     }
 
@@ -343,6 +343,29 @@ mod tests {
             .unwrap(),
             "different: different types"
         );
+    }
+
+    #[test]
+    fn compare_propagates_qpdf_unparse_errors() {
+        let mut actual_pdf = dummy_pdf();
+        let mut expected_pdf = dummy_pdf();
+        let actual = actual_pdf.new_reserved().expect("actual reserved object");
+        let expected = expected_pdf
+            .new_reserved()
+            .expect("expected reserved object");
+
+        let error = compare_objects(
+            "reserved",
+            &actual,
+            &expected,
+            &mut actual_pdf,
+            &mut expected_pdf,
+        )
+        .expect_err("qpdf unparse errors must cross the comparator Result boundary");
+
+        assert!(error
+            .to_string()
+            .contains("attempting to unparse a reserved object"));
     }
 
     #[test]
