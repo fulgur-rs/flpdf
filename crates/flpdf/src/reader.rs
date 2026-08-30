@@ -590,7 +590,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// read-only `--show-encryption` path can report them after BadPassword.
     pub(crate) fn initialize_encryption_inspection(&mut self) -> Result<()> {
         let encrypt_handle = self.trailer_key_handle(b"Encrypt");
-        if encrypt_handle.is_null() {
+        if encrypt_handle.try_is_null()? {
             return Ok(());
         }
         let id_handle = self.trailer_key_handle(b"ID");
@@ -600,7 +600,9 @@ impl<R: Read + Seek> Pdf<R> {
             // (`QPDF_encryption.cc:718-751`). The warning is emitted here once,
             // while authentication consumes the same fallback value without
             // re-emitting it.
-            self.push_warning("(trailer): invalid /ID in trailer dictionary")?;
+            let offset = self.resolver.last_offset();
+            self.resolver
+                .push_trailer_warning_at(offset, "invalid /ID in trailer dictionary")?;
         }
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(());
