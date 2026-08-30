@@ -1,6 +1,9 @@
 //! qpdf correspondence: `QPDF.hh:899-923` and `QPDF_encryption.cc:700-1205` encryption state, crypt-filter dispatch, object-key cache, and inspection projection.
 
-use super::crypt_filters::{crypt_filter_method, crypt_filter_modes, interpret_cf};
+use super::crypt_filters::{
+    crypt_filter_method_from_handle, crypt_filter_modes_from_handle,
+    interpret_cf_selector_from_handle,
+};
 use super::password::{password_bytes_for_read, PasswordMode};
 use super::permissions::Permissions;
 use super::standard::{
@@ -10,7 +13,9 @@ use super::standard::{
 };
 use crate::encryption::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::error::{EncryptedError, Result};
-use crate::{Dictionary, Object, ObjectHandle, ObjectRef};
+#[cfg(test)]
+use crate::{Dictionary, Object};
+use crate::{ObjectHandle, ObjectRef};
 use std::collections::BTreeMap;
 
 /// qpdf's `QPDF::EncryptionParameters` state for an authenticated document.
@@ -242,27 +247,76 @@ pub(crate) struct EncryptionInspectionState {
     pub(crate) weak_crypto: bool,
 }
 
+struct StandardHandlerInputsOwned {
+    v: i64,
+    r: i64,
+    length_bits: i64,
+    p: i32,
+    id0: Vec<u8>,
+    u: [u8; 32],
+    o: [u8; 32],
+    encrypt_metadata: bool,
+}
+
+impl StandardHandlerInputsOwned {
+    fn borrowed(&self) -> StandardHandlerInputs<'_> {
+        StandardHandlerInputs {
+            v: self.v,
+            r: self.r,
+            length_bits: self.length_bits,
+            p: self.p,
+            id0: &self.id0,
+            u: &self.u,
+            o: &self.o,
+            encrypt_metadata: self.encrypt_metadata,
+        }
+    }
+}
+
+struct StandardHandlerR5InputsOwned {
+    u: [u8; 48],
+    o: [u8; 48],
+    ue: [u8; 32],
+    oe: [u8; 32],
+}
+
+impl StandardHandlerR5InputsOwned {
+    fn borrowed(&self) -> StandardHandlerR5Inputs<'_> {
+        StandardHandlerR5Inputs {
+            u: &self.u,
+            o: &self.o,
+            ue: &self.ue,
+            oe: &self.oe,
+        }
+    }
+}
+
 /// Parse the qpdf-owned `/Encrypt` parameters before authentication.
-pub(crate) fn parse_inspection_state(encrypt: &Dictionary) -> Result<EncryptionInspectionState> {
-    let v = required_version(encrypt)?;
-    let r = required_revision(encrypt)?;
-    let permissions = Permissions::new(required_permissions(encrypt)?);
-    let filter = required_name(encrypt, "Filter")?.to_string();
-    let length_bits = match encrypt.get("Length") {
-        Some(Object::Integer(value)) => *value,
+pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<EncryptionInspectionState> {
+    let v = required_version_from_handle(encrypt)?;
+    let r = required_revision_from_handle(encrypt)?;
+    let permissions = Permissions::new(required_permissions_from_handle(encrypt)?);
+    let filter = required_name_from_handle(encrypt, "Filter")?;
+    let length = encrypt.try_get_key(b"/Length")?;
+    let length_bits = match length.try_as_integer()? {
+        Some(value) => value,
         _ if v <= 1 => 40,
         _ if v == 4 => 128,
         _ if v >= 5 => 256,
         _ => 40,
     };
-    let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
-    let crypt_filters = crypt_filter_modes(encrypt, v);
+    let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
+    let crypt_filters = crypt_filter_modes_from_handle(encrypt, v)?;
     let (cf_stream, cf_string, cf_file) = if matches!(v, 4 | 5) {
-        let stream = interpret_cf(&crypt_filters, encrypt.get("StmF"));
-        let string = interpret_cf(&crypt_filters, encrypt.get("StrF"));
-        let file = match encrypt.get("EFF") {
-            Some(eff) if eff.as_name().is_some() => interpret_cf(&crypt_filters, Some(eff)),
-            _ => stream,
+        let stream =
+            interpret_cf_selector_from_handle(&crypt_filters, &encrypt.try_get_key(b"/StmF")?)?;
+        let string =
+            interpret_cf_selector_from_handle(&crypt_filters, &encrypt.try_get_key(b"/StrF")?)?;
+        let eff = encrypt.try_get_key(b"/EFF")?;
+        let file = if eff.try_as_name()?.is_some() {
+            interpret_cf_selector_from_handle(&crypt_filters, &eff)?
+        } else {
+            stream
         };
         (stream, string, file)
     } else {
@@ -371,7 +425,7 @@ pub(crate) struct AuthenticationResult {
 /// canonical `/ID` handle selected from the trailer; all Standard-handler
 /// parsing and key derivation stays in this module.
 pub(crate) fn authenticate(
-    encrypt: &Dictionary,
+    encrypt: &ObjectHandle,
     id: &ObjectHandle,
     encrypt_ref: Option<ObjectRef>,
     password: &[u8],
@@ -432,13 +486,14 @@ pub(crate) fn authenticate(
         // split layer-2 uses.
         let file_key = decode_hex_file_key(raw_password)?;
         let (encrypt_metadata, weak_crypto, id0) = if matches!(revision, 5 | 6) {
-            let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
+            let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
             // Same weak-crypto classification as layer-2's R5/R6 branch.
             (encrypt_metadata, revision == 5 || rc4_in_use(), None)
         } else {
             let id0 = first_file_id_handle(id)?;
-            let inputs = standard_handler_inputs_with_id0(encrypt, &id0)?;
-            (inputs.encrypt_metadata, rc4_in_use(), Some(id0))
+            let inputs = standard_handler_inputs_from_handle(encrypt, &id0)?;
+            let borrowed = inputs.borrowed();
+            (borrowed.encrypt_metadata, rc4_in_use(), Some(id0))
         };
         // A raw key bypasses authentication, so neither the user nor the
         // owner password was matched. qpdf likewise reports no password
@@ -468,8 +523,10 @@ pub(crate) fn authenticate(
         //
         // Keep this authentication ordering identical in the `else`
         // (V<5 / V=4) branch below.
-        let inputs = standard_handler_r5_inputs(encrypt).map_err(map_uo_length_to_bad_password)?;
-        let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
+        let inputs = standard_handler_r5_inputs_from_handle(encrypt)
+            .map_err(map_uo_length_to_bad_password)?;
+        let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
+        let inputs = inputs.borrowed();
         let weak_crypto = revision == 5 || rc4_in_use();
         let user_attempt = if revision == 5 {
             check_user_password_r5(&password, &inputs)
@@ -504,21 +561,22 @@ pub(crate) fn authenticate(
         )
     } else {
         let id0 = first_file_id_handle(id)?;
-        let inputs = standard_handler_inputs_with_id0(encrypt, &id0)?;
-        let encrypt_metadata = inputs.encrypt_metadata;
+        let inputs = standard_handler_inputs_from_handle(encrypt, &id0)?;
+        let borrowed = inputs.borrowed();
+        let encrypt_metadata = borrowed.encrypt_metadata;
         let weak_crypto = rc4_in_use();
         // Password authentication runs before any state is committed, so
         // both failing attempts return `BadPassword`.
         let v4_path = inputs.v == 4 && inputs.r == 4;
         let user_attempt = if v4_path {
-            check_user_password_v4(&password, &inputs)
+            check_user_password_v4(&password, &borrowed)
         } else {
-            check_user_password(&password, &inputs)
+            check_user_password(&password, &borrowed)
         };
         let owner_attempt = if v4_path {
-            check_owner_password_v4_with_user_password(&password, &inputs)
+            check_owner_password_v4_with_user_password(&password, &borrowed)
         } else {
-            check_owner_password_with_user_password(&password, &inputs)
+            check_owner_password_with_user_password(&password, &borrowed)
         };
         let user_password_matched = user_attempt.is_ok();
         let owner_password_matched = owner_attempt.is_ok();
@@ -542,7 +600,7 @@ pub(crate) fn authenticate(
     // the R=6 /Perms validation that belongs to the password-authenticated
     // path (QPDF_encryption.cc:907-950).
     let perms_warning = if revision == 6 && !password_is_hex_key {
-        r6_perms_warning(encrypt, &file_key, permissions, encrypt_metadata)?
+        r6_perms_warning_from_handle(encrypt, &file_key, permissions, encrypt_metadata)?
     } else {
         None
     };
@@ -570,75 +628,69 @@ pub(crate) fn authenticate(
     })
 }
 
-#[cfg(test)]
-fn standard_handler_inputs<'a>(
-    encrypt: &'a Dictionary,
-    trailer: &'a Dictionary,
-) -> Result<StandardHandlerInputs<'a>> {
-    let id0 = first_file_id(trailer)?;
-    standard_handler_inputs_with_id0(encrypt, id0)
-}
-
-fn standard_handler_inputs_with_id0<'a>(
-    encrypt: &'a Dictionary,
-    id0: &'a [u8],
-) -> Result<StandardHandlerInputs<'a>> {
-    let filter = required_name(encrypt, "Filter")?;
-    let v = required_integer(encrypt, "V")?;
-    let r = required_integer(encrypt, "R")?;
+fn standard_handler_inputs_from_handle(
+    encrypt: &ObjectHandle,
+    id0: &[u8],
+) -> Result<StandardHandlerInputsOwned> {
+    let filter = required_name_from_handle(encrypt, "Filter")?;
+    let v = required_integer_from_handle(encrypt, "V")?;
+    let r = required_integer_from_handle(encrypt, "R")?;
     if filter != "Standard" || !matches!((v, r), (1 | 2, 2 | 3) | (4, 4)) {
         return Err(crate::error::EncryptedError::UnsupportedHandler {
-            filter: filter.to_string(),
+            filter,
             v,
             r,
-            cfm: crypt_filter_method(encrypt),
+            cfm: crypt_filter_method_from_handle(encrypt)?,
         }
         .into());
     }
-    let length_bits = match encrypt.get("Length") {
-        Some(Object::Integer(value)) => *value,
-        Some(_) => {
+    let length = encrypt.try_get_key(b"/Length")?;
+    let length_bits = match length.try_as_integer()? {
+        Some(value) => value,
+        None if length.is_null() => 40,
+        None => {
             return Err(crate::error::EncryptedError::Malformed {
                 reason: "/Length entry is not an integer".into(),
             }
             .into())
         }
-        None => 40,
     };
-    let p = required_permissions(encrypt)?;
-    let u = required_32_byte_string(encrypt, "U")?;
-    let o = required_32_byte_string(encrypt, "O")?;
-    let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
-    Ok(StandardHandlerInputs {
+    let p = required_permissions_from_handle(encrypt)?;
+    let u = required_32_byte_string_from_handle(encrypt, "U")?;
+    let o = required_32_byte_string_from_handle(encrypt, "O")?;
+    let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
+    Ok(StandardHandlerInputsOwned {
         v,
         r,
         length_bits,
         p,
-        id0,
+        id0: id0.to_vec(),
         u,
         o,
         encrypt_metadata,
     })
 }
 
-fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5Inputs<'_>> {
-    let filter = required_name(encrypt, "Filter")?;
-    let v = required_integer(encrypt, "V")?;
-    let r = required_integer(encrypt, "R")?;
+fn standard_handler_r5_inputs_from_handle(
+    encrypt: &ObjectHandle,
+) -> Result<StandardHandlerR5InputsOwned> {
+    let filter = required_name_from_handle(encrypt, "Filter")?;
+    let v = required_integer_from_handle(encrypt, "V")?;
+    let r = required_integer_from_handle(encrypt, "R")?;
     if filter != "Standard" || v != 5 || !matches!(r, 5 | 6) {
         return Err(crate::error::EncryptedError::UnsupportedHandler {
-            filter: filter.to_string(),
+            filter,
             v,
             r,
-            cfm: crypt_filter_method(encrypt),
+            cfm: crypt_filter_method_from_handle(encrypt)?,
         }
         .into());
     }
-    Ok(StandardHandlerR5Inputs {
-        u: required_48_byte_string(encrypt, "U")?,
-        o: required_48_byte_string(encrypt, "O")?,
-        ue: required_32_byte_string(encrypt, "UE")?,
-        oe: required_32_byte_string(encrypt, "OE")?,
+    Ok(StandardHandlerR5InputsOwned {
+        u: required_48_byte_string_from_handle(encrypt, "U")?,
+        o: required_48_byte_string_from_handle(encrypt, "O")?,
+        ue: required_32_byte_string_from_handle(encrypt, "UE")?,
+        oe: required_32_byte_string_from_handle(encrypt, "OE")?,
     })
 }
 
@@ -684,19 +736,120 @@ fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(key)
 }
 
-fn encrypt_metadata_flag(encrypt: &Dictionary) -> Result<bool> {
-    match encrypt.get("EncryptMetadata") {
-        Some(Object::Boolean(value)) => Ok(*value),
-        Some(_) => Err(crate::error::EncryptedError::Malformed {
-            reason: "/EncryptMetadata entry is not a boolean".into(),
+fn required_integer_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<i64> {
+    let key_name = format!("/{key}");
+    let value = dict.try_get_key(key_name.as_bytes())?;
+    match value.try_as_integer()? {
+        Some(value) => Ok(value),
+        None if value.is_null() => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
         }
         .into()),
-        None => Ok(true),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not an integer"),
+        }
+        .into()),
     }
 }
 
-fn required_permissions(encrypt: &Dictionary) -> Result<i32> {
-    i32::try_from(required_integer(encrypt, "P")?).map_err(|_| {
+fn required_revision_from_handle(encrypt: &ObjectHandle) -> Result<i64> {
+    required_integer_from_handle(encrypt, "R")
+}
+
+fn required_version_from_handle(encrypt: &ObjectHandle) -> Result<i64> {
+    required_integer_from_handle(encrypt, "V")
+}
+
+fn required_name_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<String> {
+    let key_name = format!("/{key}");
+    let value = dict.try_get_key(key_name.as_bytes())?;
+    match value.try_as_name()? {
+        Some(name) => String::from_utf8(name).map_err(|_| {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not valid UTF-8"),
+            }
+            .into()
+        }),
+        None if value.is_null() => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a name"),
+        }
+        .into()),
+    }
+}
+
+fn required_32_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 32]> {
+    let key_name = format!("/{key}");
+    let value = dict.try_get_key(key_name.as_bytes())?;
+    value.try_dereference()?;
+    let Some(bytes) = value.as_string() else {
+        return Err(if value.is_null() {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("missing /{key} entry"),
+            }
+        } else {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not a string"),
+            }
+        }
+        .into());
+    };
+    bytes.as_slice().try_into().map_err(|_| {
+        crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not 32 bytes"),
+        }
+        .into()
+    })
+}
+
+fn required_48_byte_string_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<[u8; 48]> {
+    let key_name = format!("/{key}");
+    let value = dict.try_get_key(key_name.as_bytes())?;
+    value.try_dereference()?;
+    let Some(bytes) = value.as_string() else {
+        return Err(if value.is_null() {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("missing /{key} entry"),
+            }
+        } else {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not a string"),
+            }
+        }
+        .into());
+    };
+    if bytes.len() < 48 {
+        return Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not 48 bytes"),
+        }
+        .into());
+    }
+    bytes[..48].try_into().map_err(|_| {
+        crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not 48 bytes"),
+        }
+        .into()
+    })
+}
+
+fn encrypt_metadata_flag_from_handle(encrypt: &ObjectHandle) -> Result<bool> {
+    let value = encrypt.try_get_key(b"/EncryptMetadata")?;
+    value.try_dereference()?;
+    match value.as_boolean() {
+        Some(value) => Ok(value),
+        None if value.is_null() => Ok(true),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: "/EncryptMetadata entry is not a boolean".into(),
+        }
+        .into()),
+    }
+}
+
+fn required_permissions_from_handle(encrypt: &ObjectHandle) -> Result<i32> {
+    i32::try_from(required_integer_from_handle(encrypt, "P")?).map_err(|_| {
         crate::error::EncryptedError::Malformed {
             reason: "/P entry is out of i32 range".into(),
         }
@@ -704,16 +857,20 @@ fn required_permissions(encrypt: &Dictionary) -> Result<i32> {
     })
 }
 
-fn r6_perms_warning(
-    encrypt: &Dictionary,
+fn r6_perms_warning_from_handle(
+    encrypt: &ObjectHandle,
     file_key: &[u8],
     permissions: Permissions,
     encrypt_metadata: bool,
 ) -> Result<Option<String>> {
-    let Some(perms) = encrypt.get("Perms") else {
+    let Some(entries) = encrypt.try_as_dictionary()? else {
         return Ok(None);
     };
-    let Object::String(bytes) = perms else {
+    let Some(perms) = entries.get(b"/Perms".as_slice()).cloned() else {
+        return Ok(None);
+    };
+    perms.try_dereference()?;
+    let Some(bytes) = perms.as_string() else {
         return Ok(Some("R=6 /Perms entry is not a string".into()));
     };
     let Ok(mut block) = <[u8; 16]>::try_from(bytes.as_slice()) else {
@@ -753,94 +910,6 @@ fn r6_perms_warning(
         return Ok(Some("R=6 /Perms magic bytes are not 'adb'".into()));
     }
     Ok(None)
-}
-
-fn required_revision(encrypt: &Dictionary) -> Result<i64> {
-    required_integer(encrypt, "R")
-}
-
-fn required_version(encrypt: &Dictionary) -> Result<i64> {
-    required_integer(encrypt, "V")
-}
-
-fn required_integer(dict: &Dictionary, key: &'static str) -> Result<i64> {
-    match dict.get(key) {
-        Some(Object::Integer(value)) => Ok(*value),
-        Some(_) => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not an integer"),
-        }
-        .into()),
-        None => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("missing /{key} entry"),
-        }
-        .into()),
-    }
-}
-
-pub(crate) fn required_name<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a str> {
-    match dict.get(key) {
-        Some(Object::Name(name)) => std::str::from_utf8(name).map_err(|_| {
-            crate::error::EncryptedError::Malformed {
-                reason: format!("/{key} entry is not valid UTF-8"),
-            }
-            .into()
-        }),
-        Some(_) => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not a name"),
-        }
-        .into()),
-        None => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("missing /{key} entry"),
-        }
-        .into()),
-    }
-}
-
-fn required_32_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a [u8; 32]> {
-    match dict.get(key) {
-        Some(Object::String(bytes)) => bytes.as_slice().try_into().map_err(|_| {
-            crate::error::EncryptedError::Malformed {
-                reason: format!("/{key} entry is not 32 bytes"),
-            }
-            .into()
-        }),
-        Some(_) => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not a string"),
-        }
-        .into()),
-        None => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("missing /{key} entry"),
-        }
-        .into()),
-    }
-}
-
-fn required_48_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a [u8; 48]> {
-    match dict.get(key) {
-        // qpdf's V=5 algorithms use the required prefix; longer
-        // producer-specific entries (for example the qtest nontrivial
-        // crypt-filter fixture) must not be rejected merely for trailing
-        // bytes. Preserve the existing short-entry error classification,
-        // which the authentication boundary maps to BadPassword.
-        Some(Object::String(bytes)) if bytes.len() >= 48 => bytes[..48].try_into().map_err(|_| {
-            crate::error::EncryptedError::Malformed {
-                reason: format!("/{key} entry is not 48 bytes"),
-            }
-            .into()
-        }),
-        Some(Object::String(_)) => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not 48 bytes"),
-        }
-        .into()),
-        Some(_) => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("/{key} entry is not a string"),
-        }
-        .into()),
-        None => Err(crate::error::EncryptedError::Malformed {
-            reason: format!("missing /{key} entry"),
-        }
-        .into()),
-    }
 }
 
 /// qpdf's `/ID[0]` value and whether the trailer satisfied its two-element
@@ -921,6 +990,12 @@ pub(crate) fn first_file_id(trailer: &Dictionary) -> Result<&[u8]> {
 mod tests {
     use super::*;
 
+    fn handle_dictionary(encrypt: &Dictionary) -> ObjectHandle {
+        let mut pdf = crate::Pdf::empty().expect("empty test PDF");
+        pdf.lift_object_to_handle(&Object::Dictionary(encrypt.clone()))
+            .expect("legacy test dictionary lifts to a handle")
+    }
+
     fn legacy_dictionary() -> Dictionary {
         let mut encrypt = Dictionary::new();
         encrypt.insert("Filter", Object::Name(b"Standard".to_vec()));
@@ -930,12 +1005,6 @@ mod tests {
         encrypt.insert("U", Object::String(vec![0; 32]));
         encrypt.insert("O", Object::String(vec![0; 32]));
         encrypt
-    }
-
-    fn legacy_trailer() -> Dictionary {
-        let mut trailer = Dictionary::new();
-        trailer.insert("ID", Object::Array(vec![Object::String(vec![1, 2, 3])]));
-        trailer
     }
 
     #[test]
@@ -1058,14 +1127,16 @@ mod tests {
         let mut v1 = legacy_dictionary();
         v1.insert("V", Object::Integer(1));
         assert_eq!(
-            parse_inspection_state(&v1).expect("V=1 parses").length_bits,
+            super::parse_inspection_state(&handle_dictionary(&v1))
+                .expect("V=1 parses")
+                .length_bits,
             40
         );
 
         // V=2/R=3 with no /Length: falls through to the catch-all default,
         // matching the PDF spec's 40-bit default for the legacy RC4 handler.
         assert_eq!(
-            parse_inspection_state(&legacy_dictionary())
+            super::parse_inspection_state(&handle_dictionary(&legacy_dictionary()))
                 .expect("V=2 parses")
                 .length_bits,
             40
@@ -1076,7 +1147,9 @@ mod tests {
         v4.insert("V", Object::Integer(4));
         v4.insert("R", Object::Integer(4));
         assert_eq!(
-            parse_inspection_state(&v4).expect("V=4 parses").length_bits,
+            super::parse_inspection_state(&handle_dictionary(&v4))
+                .expect("V=4 parses")
+                .length_bits,
             128
         );
 
@@ -1085,7 +1158,9 @@ mod tests {
         v5.insert("V", Object::Integer(5));
         v5.insert("R", Object::Integer(5));
         assert_eq!(
-            parse_inspection_state(&v5).expect("V=5 parses").length_bits,
+            super::parse_inspection_state(&handle_dictionary(&v5))
+                .expect("V=5 parses")
+                .length_bits,
             256
         );
     }
@@ -1094,48 +1169,64 @@ mod tests {
     fn dictionary_validation_reports_qpdf_error_shapes() {
         let mut unsupported = legacy_dictionary();
         unsupported.insert("Filter", Object::Name(b"Other".to_vec()));
-        assert!(standard_handler_inputs(&unsupported, &legacy_trailer()).is_err());
+        assert!(
+            standard_handler_inputs_from_handle(&handle_dictionary(&unsupported), b"id").is_err()
+        );
 
         let mut wrong_length = legacy_dictionary();
         wrong_length.insert("Length", Object::Name(b"bad".to_vec()));
-        assert!(standard_handler_inputs(&wrong_length, &legacy_trailer()).is_err());
+        assert!(
+            standard_handler_inputs_from_handle(&handle_dictionary(&wrong_length), b"id").is_err()
+        );
 
         let mut unsupported_v5 = legacy_dictionary();
         unsupported_v5.insert("V", Object::Integer(4));
         unsupported_v5.insert("R", Object::Integer(4));
-        assert!(standard_handler_r5_inputs(&unsupported_v5).is_err());
+        assert!(
+            standard_handler_r5_inputs_from_handle(&handle_dictionary(&unsupported_v5)).is_err()
+        );
 
         let mut bad_permissions = legacy_dictionary();
         bad_permissions.insert("P", Object::Integer(i64::MAX));
-        assert!(standard_handler_inputs(&bad_permissions, &legacy_trailer()).is_err());
+        assert!(
+            standard_handler_inputs_from_handle(&handle_dictionary(&bad_permissions), b"id")
+                .is_err()
+        );
 
         let mut missing = Dictionary::new();
-        assert!(required_integer(&missing, "V").is_err());
+        assert!(required_integer_from_handle(&handle_dictionary(&missing), "V").is_err());
         missing.insert("V", Object::Name(b"not-an-integer".to_vec()));
-        assert!(required_integer(&missing, "V").is_err());
+        assert!(required_integer_from_handle(&handle_dictionary(&missing), "V").is_err());
 
-        assert!(required_name(&Dictionary::new(), "Filter").is_err());
+        assert!(
+            required_name_from_handle(&handle_dictionary(&Dictionary::new()), "Filter").is_err()
+        );
         let mut wrong_name = Dictionary::new();
         wrong_name.insert("Filter", Object::Integer(1));
-        assert!(required_name(&wrong_name, "Filter").is_err());
+        assert!(required_name_from_handle(&handle_dictionary(&wrong_name), "Filter").is_err());
         wrong_name.insert("Filter", Object::Name(vec![0xff]));
-        assert!(required_name(&wrong_name, "Filter").is_err());
+        assert!(required_name_from_handle(&handle_dictionary(&wrong_name), "Filter").is_err());
 
         let mut wrong_32 = Dictionary::new();
-        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        assert!(required_32_byte_string_from_handle(&handle_dictionary(&wrong_32), "U").is_err());
         wrong_32.insert("U", Object::Integer(1));
-        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        assert!(required_32_byte_string_from_handle(&handle_dictionary(&wrong_32), "U").is_err());
         wrong_32.insert("U", Object::String(vec![0; 31]));
-        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        assert!(required_32_byte_string_from_handle(&handle_dictionary(&wrong_32), "U").is_err());
 
         let mut wrong_48 = Dictionary::new();
-        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        assert!(required_48_byte_string_from_handle(&handle_dictionary(&wrong_48), "U").is_err());
         wrong_48.insert("U", Object::Integer(1));
-        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        assert!(required_48_byte_string_from_handle(&handle_dictionary(&wrong_48), "U").is_err());
         wrong_48.insert("U", Object::String(vec![0; 47]));
-        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        assert!(required_48_byte_string_from_handle(&handle_dictionary(&wrong_48), "U").is_err());
         wrong_48.insert("U", Object::String(vec![0; 64]));
-        assert_eq!(required_48_byte_string(&wrong_48, "U").unwrap().len(), 48);
+        assert_eq!(
+            required_48_byte_string_from_handle(&handle_dictionary(&wrong_48), "U")
+                .unwrap()
+                .len(),
+            48
+        );
 
         assert!(first_file_id(&Dictionary::new()).is_err());
         let mut id = Dictionary::new();
@@ -1146,12 +1237,12 @@ mod tests {
         id.insert("ID", Object::Array(vec![Object::Integer(1)]));
         assert!(first_file_id(&id).is_err());
 
-        assert!(encrypt_metadata_flag(&Dictionary::new()).unwrap());
+        assert!(encrypt_metadata_flag_from_handle(&handle_dictionary(&Dictionary::new())).unwrap());
         let mut metadata = Dictionary::new();
         metadata.insert("EncryptMetadata", Object::Integer(1));
-        assert!(encrypt_metadata_flag(&metadata).is_err());
+        assert!(encrypt_metadata_flag_from_handle(&handle_dictionary(&metadata)).is_err());
         metadata.insert("EncryptMetadata", Object::Boolean(false));
-        assert!(!encrypt_metadata_flag(&metadata).unwrap());
+        assert!(!encrypt_metadata_flag_from_handle(&handle_dictionary(&metadata)).unwrap());
     }
 
     fn encrypted_perms(p: i32, encrypt_metadata: bool, edit: impl FnOnce(&mut [u8; 16])) -> Object {
@@ -1176,14 +1267,26 @@ mod tests {
     ) -> Option<String> {
         let mut encrypt = Dictionary::new();
         encrypt.insert("Perms", perms);
-        r6_perms_warning(&encrypt, file_key, Permissions::new(expected), metadata).unwrap()
+        r6_perms_warning_from_handle(
+            &handle_dictionary(&encrypt),
+            file_key,
+            Permissions::new(expected),
+            metadata,
+        )
+        .unwrap()
     }
 
     #[test]
     fn perms_validation_covers_qpdf_warning_order() {
         let key = [0x42; 32];
         assert_eq!(
-            r6_perms_warning(&Dictionary::new(), &key, Permissions::new(-4), true).unwrap(),
+            r6_perms_warning_from_handle(
+                &handle_dictionary(&Dictionary::new()),
+                &key,
+                Permissions::new(-4),
+                true,
+            )
+            .unwrap(),
             None
         );
         assert_eq!(

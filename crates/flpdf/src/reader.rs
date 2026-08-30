@@ -412,7 +412,7 @@ impl<R: Read + Seek> Pdf<R> {
         if self.encryption.borrow().is_none() {
             return Ok(None);
         }
-        let Some(encrypt) = self.encrypt_dictionary()? else {
+        let Some(encrypt) = self.encrypt_dictionary_handle()? else {
             return Ok(None);
         };
         // qpdf: "After we initialize encryption parameters, we must use stored
@@ -425,11 +425,27 @@ impl<R: Read + Seek> Pdf<R> {
                 .expect("checked is_some above; authenticate_if_encrypted set it");
             (encryption.encryption_v, encryption.encryption_r)
         };
-        let filter = crate::encryption::state::required_name(&encrypt, "Filter")?.to_string();
+        let filter_handle = encrypt.try_get_key(b"/Filter")?;
+        let filter = match filter_handle.try_as_name()? {
+            Some(name) => String::from_utf8(name).map_err(|_| EncryptedError::Malformed {
+                reason: "/Filter entry is not valid UTF-8".into(),
+            })?,
+            None => {
+                return Err(EncryptedError::Malformed {
+                    reason: if filter_handle.is_null() {
+                        "missing /Filter entry".into()
+                    } else {
+                        "/Filter entry is not a name".into()
+                    },
+                }
+                .into())
+            }
+        };
         // /Length is in bits and absent for V<5 (defaulting to 40 per the
         // Standard handler); V=5 always uses a 256-bit key.
-        let length_bits = match encrypt.get("Length") {
-            Some(Object::Integer(value)) => *value,
+        let length_handle = encrypt.try_get_key(b"/Length")?;
+        let length_bits = match length_handle.try_as_integer()? {
+            Some(value) => value,
             _ if v >= 5 => 256,
             _ => 40,
         };
@@ -548,7 +564,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn authenticate_if_encrypted(&mut self, options: &PdfOpenOptions) -> Result<()> {
-        if self.encrypt_dictionary()?.is_none() {
+        if self.encrypt_dictionary_handle()?.is_none() {
             return Ok(());
         }
         if options.password_is_hex_key || options.suppress_password_recovery {
@@ -602,7 +618,7 @@ impl<R: Read + Seek> Pdf<R> {
             self.resolver
                 .push_trailer_warning_at(offset, "invalid /ID in trailer dictionary")?;
         }
-        let Some(encrypt) = self.encrypt_dictionary()? else {
+        let Some(encrypt) = self.encrypt_dictionary_handle()? else {
             return Ok(());
         };
         let inspection = crate::encryption::state::parse_inspection_state(&encrypt)?;
@@ -614,7 +630,7 @@ impl<R: Read + Seek> Pdf<R> {
         let encrypt_handle = self.trailer_key_handle(b"Encrypt");
         let encrypt_ref = encrypt_handle.object_ref();
         let id_handle = self.trailer_key_handle(b"ID");
-        let Some(encrypt) = self.encrypt_dictionary()? else {
+        let Some(encrypt) = self.encrypt_dictionary_handle()? else {
             return Ok(());
         };
         let authenticated = crate::encryption::state::authenticate(
@@ -638,7 +654,7 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    fn encrypt_dictionary(&mut self) -> Result<Option<Dictionary>> {
+    fn encrypt_dictionary_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let encrypt = self.trailer_key_handle(b"Encrypt");
         if encrypt.is_null() {
             return Ok(None);
@@ -650,11 +666,23 @@ impl<R: Read + Seek> Pdf<R> {
             }
             .into());
         }
-        let dict = encrypt
-            .materialize()?
-            .into_dict()
-            .expect("try_as_dictionary confirmed that /Encrypt is a dictionary");
-        Ok(Some(dict))
+        Ok(Some(encrypt))
+    }
+
+    /// Snapshot `/Encrypt` into the legacy dictionary shape for the writer's
+    /// donor-copy boundary. Reader inspection and authentication must use
+    /// [`Self::encrypt_dictionary_handle`] directly; the writer slice owns the
+    /// eventual removal of this raw snapshot.
+    fn encrypt_dictionary(&mut self) -> Result<Option<Dictionary>> {
+        self.encrypt_dictionary_handle()?
+            .map(|encrypt| {
+                encrypt.materialize()?.into_dict().ok_or_else(|| {
+                    Error::Internal(
+                        "validated /Encrypt handle did not materialize as a dictionary".into(),
+                    )
+                })
+            })
+            .transpose()
     }
 
     /// Lift an already-materialized legacy [`Object`] value into a canonical
@@ -681,6 +709,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `ObjectValue` representation) or for nesting beyond the depth bound —
     /// see [`Self::lift_bounded`]. Neither case arises for a value that
     /// already came from ordinary indirect-object resolution.
+    #[cfg(test)]
     pub(crate) fn lift_object_to_handle(&mut self, object: &Object) -> Result<ObjectHandle> {
         self.lift_to_handle_bounded(object, 0, crate::parser::MAX_PARSE_DEPTH)
     }
@@ -972,8 +1001,8 @@ impl<R: Read + Seek> Pdf<R> {
         // candidate re-read (`:516-575`, especially `:575`; `:576-607`). This
         // method must neither clear nor extend either registration. Canonical
         // xref/cache removal is separately `removeObject` (`:1996-2005`).
-        // Refresh the legacy cache before replacing the canonical value, or
-        // an old object-stream entry can incorrectly retain provenance.
+        // Refresh compatibility-cache metadata before replacing the canonical
+        // value, or an old object-stream entry can incorrectly retain provenance.
         self.synchronize_cache_with_resolver_xref();
         // qpdf's replaceObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
@@ -1005,7 +1034,7 @@ impl<R: Read + Seek> Pdf<R> {
         handle.reset_parsed_offset();
         handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
 
-        self.cache.set_resolved(object_ref, object);
+        self.cache.set_resolved(object_ref, handle.clone());
         self.handle_mutated_object_refs.remove(&object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
@@ -1102,10 +1131,10 @@ impl<R: Read + Seek> Pdf<R> {
         }
         if !matches!(
             self.cache.entry(object_stream_ref),
-            Some(CacheEntry::Resolved(Object::Stream(_)))
+            Some(CacheEntry::Resolved(stream)) if stream.as_stream_dict().is_some()
         ) {
-            // A compressed member can only have been materialized after its
-            // source stream was loaded into the legacy cache. Avoid scanning
+            // A compressed member can only have been resolved after its source
+            // stream was loaded into the compatibility cache. Avoid scanning
             // the complete xref/cache for ordinary object mutations.
             return Ok(());
         }
@@ -1123,44 +1152,34 @@ impl<R: Read + Seek> Pdf<R> {
                 Some(CacheEntry::Compressed { stream, index }) => {
                     Some((Some((*stream, *index)), None))
                 }
-                Some(CacheEntry::Resolved(object)) => Some((None, Some(object.clone()))),
+                Some(CacheEntry::Resolved(handle)) => Some((None, Some(handle.clone()))),
                 Some(CacheEntry::Missing | CacheEntry::Deleted)
                 | Some(CacheEntry::Unresolved { .. } | CacheEntry::Reserved)
                 | None => None,
             };
-            let Some((compressed_entry, legacy_object)) = cache_state else {
+            let Some((compressed_entry, cached_handle)) = cache_state else {
                 continue;
             };
 
             // Prefer the canonical value when the planner has already
-            // materialized the member. This preserves direct ObjectHandle
-            // mutations even if the legacy cache still contains an older
-            // snapshot from before the handle route was introduced.
-            let canonical_object = self
+            // resolved the member. This preserves direct ObjectHandle
+            // mutations while the compatibility cache is being reconciled.
+            let canonical_handle = self
                 .resolver
                 .registered_handle(member_ref)
                 .filter(ObjectHandle::is_resolved)
-                .map(|handle| handle.materialize())
-                .transpose()?;
-            let Some(object) = canonical_object.or(legacy_object) else {
+                .or(cached_handle);
+            let Some(handle) = canonical_handle else {
                 continue;
             };
-            members.push((member_ref, compressed_entry, object));
+            members.push((member_ref, compressed_entry, handle));
         }
 
-        for (member_ref, compressed_entry, object) in members {
-            let handle = self
-                .resolver
-                .registered_handle(member_ref)
-                .unwrap_or_else(|| self.get_object_handle(member_ref));
-            if !handle.is_resolved() {
-                let value = self.lift_for_set_object(&object, &handle)?;
-                handle.set_resolved(value);
-            }
+        for (member_ref, compressed_entry, handle) in members {
             if let Some((stream, index)) = compressed_entry {
                 self.record_compressed_member_provenance(member_ref, stream, index);
             }
-            self.cache.set_resolved(member_ref, object);
+            self.cache.set_resolved(member_ref, handle);
         }
         Ok(())
     }
@@ -1430,7 +1449,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `makeIndirectObject`. During the ObjectHandle cutover, the latter live
     /// solely in the canonical handle registry: including resolved cache-miss
     /// handles here preserves that visibility without cloning their stream
-    /// payloads into the legacy `Object` cache.
+    /// payloads into a raw compatibility cache.
     #[cfg(test)]
     fn qpdf_json_live_object_refs(&self) -> Vec<ObjectRef> {
         let mut refs = self.live_object_refs();
@@ -1674,15 +1693,10 @@ impl<R: Read + Seek> Pdf<R> {
         // Never clear or add either registration here. Exact xref/cache removal
         // remains `removeObject` (`QPDF.cc:1996-2005`).
         //
-        // Refresh the legacy cache before replacing the canonical value, or
-        // an old object-stream entry can incorrectly retain provenance
-        // (mirrors `set_object`'s identical precondition above).
+        // Refresh the compatibility-cache metadata before replacing the
+        // canonical value. This keeps recovery-derived xref metadata aligned
+        // without changing any other object-cache cell.
         self.synchronize_cache_with_resolver_xref();
-        // qpdf's replaceObject changes only the requested cache slot; already
-        // resolved members of an ObjStm remain live in their own cache slots.
-        // Promote those compatibility-cache values before the replacement
-        // overwrites the source container.
-        self.promote_resolved_object_stream_members(object_ref)?;
         let target = self.resolver.replace_object(object_ref, replacement)?;
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
@@ -2531,19 +2545,32 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    /// Resolve `object_ref` to its concrete value for the JSON projection,
-    /// parsing on demand through the canonical handle resolver.
+    /// Resolve `object_ref` for the qpdf JSON projection through the canonical
+    /// handle resolver. The returned handle is the persistent qpdf object-cache
+    /// cell, so callers can inspect its value or stream without creating a raw
+    /// `Object` snapshot.
     ///
-    /// Resolution caches the result so subsequent calls are constant-time. Unknown,
-    /// freed, or compressed-but-broken entries return [`Object::Null`] rather than an
-    /// error, matching the behavior the PDF spec mandates for missing objects (§7.3.10).
+    /// Unknown, freed, or compressed-but-broken entries resolve to a canonical
+    /// null handle rather than an error, matching the behavior the PDF spec
+    /// mandates for missing objects (§7.3.10).
     ///
     /// # Errors
     ///
-    pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+    pub(crate) fn resolve_qpdf_json_handle(
+        &mut self,
+        object_ref: ObjectRef,
+    ) -> Result<ObjectHandle> {
         let handle = self.get_object_handle(object_ref);
         self.resolve(&handle)?;
-        handle.materialize()
+        Ok(handle)
+    }
+
+    /// Borrow the qpdf JSON projection as a raw value for migration-only
+    /// tests. Production JSON consumers use [`Self::resolve_qpdf_json_handle`]
+    /// and remain on the canonical handle graph.
+    #[cfg(test)]
+    pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        self.resolve_qpdf_json_handle(object_ref)?.materialize()
     }
 
     /// Offset of the first recorded object that starts strictly after `offset`,
@@ -3680,7 +3707,7 @@ mod tests {
         // materializing the value, rather than trusting the stale raw snapshot.
         let first_ref = ObjectRef::new(1, 0);
         pdf.handle_mutated_object_refs.insert(first_ref);
-        pdf.cache.set_resolved(first_ref, Object::Null);
+        pdf.cache.set_resolved(first_ref, ObjectHandle::null());
         let mut expected_catalog = Dictionary::new();
         expected_catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
         assert_eq!(

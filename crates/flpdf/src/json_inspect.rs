@@ -23,7 +23,9 @@ use crate::job::{
 use crate::json::Json;
 #[cfg(test)]
 use crate::object::Dictionary;
-use crate::object::{Object, ObjectRef};
+#[cfg(test)]
+use crate::object::Object;
+use crate::object::ObjectRef;
 use crate::object_handle::{ObjectHandle, ObjectJsonError};
 #[cfg(test)]
 use crate::pipeline::Pipeline;
@@ -599,16 +601,17 @@ pub(crate) fn ordered_qpdf_object<R: Read + Seek>(
 pub(crate) fn qpdf_resolve_top_level_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
-) -> Result<Object, ConvertError> {
+) -> Result<ObjectHandle, ConvertError> {
     let mut current = start;
     let mut visited = std::collections::BTreeSet::new();
     loop {
         if !visited.insert(current) {
-            return Ok(Object::Null);
+            return Ok(ObjectHandle::null());
         }
-        match pdf.resolve_qpdf_json_object(current)? {
-            Object::Reference(next) => current = next,
-            terminal => return Ok(terminal),
+        let handle = pdf.resolve_qpdf_json_handle(current)?;
+        match handle.as_reference() {
+            Some(next) => current = next,
+            None => return Ok(handle),
         }
     }
 }
@@ -625,12 +628,12 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
     object_ref: ObjectRef,
     decode_level: DecodeLevel,
 ) -> Result<Option<Vec<u8>>, ConvertError> {
-    let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
+    let stream = qpdf_resolve_top_level_object(pdf, object_ref)?;
+    if stream.as_stream_dict().is_none() {
         return Ok(None);
-    };
-    let stream_handle = pdf.lift_object_to_handle(&Object::Stream(stream))?;
+    }
     Ok(Some(
-        stream_payload_with_decode_status(&stream_handle, decode_level)?
+        stream_payload_with_decode_status(&stream, decode_level)?
             .bytes
             .into_owned(),
     ))
@@ -1015,6 +1018,15 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
+    }
+
+    fn qpdf_resolve_top_level_object<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        start: ObjectRef,
+    ) -> Result<Object, ConvertError> {
+        super::qpdf_resolve_top_level_object(pdf, start)?
+            .materialize()
+            .map_err(ConvertError::from)
     }
 
     fn stream_handle<R: Read + Seek>(pdf: &mut Pdf<R>, stream: Stream) -> ObjectHandle {
@@ -6117,6 +6129,23 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn qpdf_top_level_resolution_returns_the_canonical_handle_without_raw_cache() {
+        let mut pdf = empty_pdf();
+        let object_ref = crate::ObjectRef::new(1, 0);
+        let expected = pdf.get_object_handle(object_ref);
+
+        let resolved = super::qpdf_resolve_top_level_object(&mut pdf, object_ref)
+            .expect("resolve qpdf JSON object");
+
+        assert!(resolved.is_same_object_as(&expected));
+        assert!(!matches!(
+            pdf.cache.entry(object_ref),
+            Some(crate::cache::CacheEntry::Resolved(_))
+        ));
+        assert!(resolved.as_dictionary().is_some());
     }
 
     #[test]
