@@ -2,7 +2,9 @@
 
 #[test]
 fn object_handle_unparse_production_has_no_raw_materialization_helper() {
-    let source = include_str!("../src/object_handle.rs");
+    // Git's default autocrlf=true checkout converts this source to CRLF on
+    // Windows; keep the structural guard independent of checkout line endings.
+    let source = include_str!("../src/object_handle.rs").replace("\r\n", "\n");
     let unparse_resolved = source
         .split("pub fn unparse_resolved")
         .nth(1)
