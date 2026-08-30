@@ -4939,6 +4939,21 @@ mod tests {
     }
 
     #[test]
+    fn object_stream_file_object_mode_propagates_member_parse_errors() {
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        dict.insert("N", Object::Integer(1));
+        dict.insert("First", Object::Integer(4));
+        let stream = Stream::new(dict, b"7 0 999999999999999999999999".to_vec());
+
+        let error = match parse_object_stream_entry(&stream, 0) {
+            Ok(_) => panic!("an invalid member integer must propagate the parser error"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid integer"));
+    }
+
+    #[test]
     fn object_stream_file_object_helpers_reject_invalid_metadata() {
         let mut missing_first = Dictionary::new();
         missing_first.insert("N", Object::Integer(1));

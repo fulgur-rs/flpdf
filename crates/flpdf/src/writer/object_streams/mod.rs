@@ -1419,13 +1419,9 @@ mod tests {
 
         for (index, (_, expected_obj)) in members.iter().enumerate() {
             let parsed = crate::reader::parse_object_stream_entry(&stream, index as u32).unwrap();
-            let expected_value = match expected_obj {
-                Object::Integer(value) => *value,
-                _ => unreachable!("the round-trip fixture contains only integers"),
-            };
             assert_eq!(
                 parsed.object.as_integer(),
-                Some(expected_value),
+                expected_obj.as_integer(),
                 "round-trip mismatch at index {index}"
             );
         }
