@@ -1331,7 +1331,7 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::io::Cursor;
     use std::rc::Rc;
 
@@ -1436,20 +1436,22 @@ mod tests {
     fn pages_projection_handles_a_direct_page_outline_item() {
         let mut pdf = one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
-        let mut item = Dictionary::new();
-        item.insert(
-            "Dest",
-            Object::Array(vec![
-                Object::Reference(page_ref),
-                Object::Name(b"Fit".to_vec()),
+        let outlines = ObjectHandle::dictionary(vec![(
+            b"/First".to_vec(),
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Dest".to_vec(),
+                    ObjectHandle::array(vec![
+                        pdf.get_object_handle(page_ref),
+                        ObjectHandle::name(b"Fit".to_vec()),
+                    ]),
+                ),
+                (
+                    b"/Title".to_vec(),
+                    ObjectHandle::string(b"Direct outline".to_vec()),
+                ),
             ]),
-        );
-        item.insert("Title", Object::String(b"Direct outline".to_vec()));
-        let mut outlines = Dictionary::new();
-        outlines.insert("First", Object::Dictionary(item));
-        let outlines = pdf
-            .lift_object_to_handle(&Object::Dictionary(outlines))
-            .expect("lift direct outline root");
+        )]);
         let catalog_ref = pdf.root_ref().expect("catalog");
         let catalog = pdf.get_object_handle(catalog_ref);
         pdf.resolve(&catalog).expect("resolve catalog");
