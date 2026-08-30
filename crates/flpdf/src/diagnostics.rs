@@ -13,6 +13,18 @@ pub enum Severity {
     Error,
 }
 
+/// Identifies whether a warning already carries the qpdf exception location
+/// assembled by its owning object/document boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticOrigin {
+    /// A parser, xref, or validation warning whose filename/offset belongs to
+    /// the caller that renders the diagnostic.
+    Input,
+    /// A `QPDFObjectHandle` warning whose qpdf object description is already
+    /// part of [`Diagnostic::message`].
+    Object,
+}
+
 /// A single message produced while parsing or validating a document.
 ///
 /// `offset` is the byte offset in the source file when known.
@@ -21,6 +33,7 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub offset: Option<u64>,
+    pub origin: DiagnosticOrigin,
 }
 
 impl Diagnostic {
@@ -30,6 +43,7 @@ impl Diagnostic {
             severity: Severity::Warning,
             message: message.into(),
             offset,
+            origin: DiagnosticOrigin::Input,
         }
     }
 
@@ -39,7 +53,26 @@ impl Diagnostic {
             severity: Severity::Error,
             message: message.into(),
             offset,
+            origin: DiagnosticOrigin::Input,
         }
+    }
+
+    /// Construct a warning whose message already contains qpdf's object
+    /// description and therefore must not receive a second input filename at
+    /// the output boundary.
+    pub fn object_warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            message: message.into(),
+            offset: None,
+            origin: DiagnosticOrigin::Object,
+        }
+    }
+
+    /// Whether this diagnostic carries a qpdf object-level exception
+    /// location in its message.
+    pub fn is_object_warning(&self) -> bool {
+        self.origin == DiagnosticOrigin::Object
     }
 }
 
@@ -113,5 +146,14 @@ mod tests {
             entries[0].message,
             "[encrypted.malformed] malformed /Encrypt dictionary: missing /O entry"
         );
+    }
+
+    #[test]
+    fn object_warning_retains_qpdf_exception_location_kind() {
+        let diagnostic = Diagnostic::object_warning("test array: warning");
+
+        assert!(diagnostic.is_object_warning());
+        assert_eq!(diagnostic.message, "test array: warning");
+        assert_eq!(diagnostic.offset, None);
     }
 }

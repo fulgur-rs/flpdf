@@ -69,44 +69,6 @@ fn is_destroyed(handle: &ObjectHandle) -> flpdf::Result<bool> {
     Ok(handle.type_code()? == 14)
 }
 
-/// `QPDFObjectHandle::replaceKeyAndGetNew`
-/// (`libqpdf/QPDFObjectHandle.cc:1213-1217`): `replaceKey(key, value);
-/// return value;`.
-fn replace_key_and_get_new(
-    dict: &ObjectHandle,
-    key: &[u8],
-    value: ObjectHandle,
-) -> flpdf::Result<ObjectHandle> {
-    dict.replace_key(key, value.clone())?;
-    Ok(value)
-}
-
-/// `QPDFObjectHandle::removeKeyAndGetOld`
-/// (`libqpdf/QPDFObjectHandle.cc:1240-1248`): read `key`'s current value
-/// from `asDictionary()`, defaulting to a fresh null when `dict` is not a
-/// dictionary or `key` is absent, then `removeKey(key)`.
-fn remove_key_and_get_old(dict: &ObjectHandle, key: &[u8]) -> ObjectHandle {
-    let old = dict
-        .as_dictionary()
-        .and_then(|entries| entries.get(key).cloned())
-        .unwrap_or_else(ObjectHandle::null);
-    dict.remove_key(key);
-    old
-}
-
-/// `QPDFObjectHandle::replaceKeyAndGetOld`
-/// (`libqpdf/QPDFObjectHandle.cc:1219-1225`): `old =
-/// removeKeyAndGetOld(key); replaceKey(key, value); return old;`.
-fn replace_key_and_get_old(
-    dict: &ObjectHandle,
-    key: &[u8],
-    value: ObjectHandle,
-) -> flpdf::Result<ObjectHandle> {
-    let old = remove_key_and_get_old(dict, key);
-    dict.replace_key(key, value)?;
-    Ok(old)
-}
-
 // ---------------------------------------------------------------------------
 // test_88 (test_driver.cc:3106-3160)
 // ---------------------------------------------------------------------------
@@ -127,16 +89,16 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     let dict = ObjectHandle::dictionary(vec![]);
     dict.replace_key(b"/One", ObjectHandle::integer(1))?;
     dict.replace_key(b"/Two", ObjectHandle::integer(2))?;
-    let three = replace_key_and_get_new(&dict, b"/Three", ObjectHandle::array(vec![]))?;
+    let three = dict.replace_key_and_get_new(b"/Three", ObjectHandle::array(vec![]))?;
     three.append_array_item(ObjectHandle::parse(b"(a)")?)?;
     three.append_array_item(ObjectHandle::parse(b"(b)")?)?;
     let newdict = three.append_array_item_and_get_new(ObjectHandle::dictionary(vec![]))?;
     newdict.replace_key(b"/Z", ObjectHandle::parse(b"/Y")?)?;
     newdict.replace_key(b"/X", ObjectHandle::parse(b"/W")?)?;
     dict.replace_key(b"/Quack", ObjectHandle::parse(b"[1 2 3]")?)?;
-    let quack = replace_key_and_get_old(&dict, b"/Quack", ObjectHandle::parse(b"/Moo")?)?;
+    let quack = dict.replace_key_and_get_old(b"/Quack", ObjectHandle::parse(b"/Moo")?)?;
     assert_eq!(quack.unparse(), b"[ 1 2 3 ]");
-    let nothing = replace_key_and_get_old(&dict, b"/NotThere", ObjectHandle::null())?;
+    let nothing = dict.replace_key_and_get_old(b"/NotThere", ObjectHandle::null())?;
     assert!(nothing.is_null());
     assert_eq!(
         dict.unparse(),
@@ -178,8 +140,8 @@ pub(crate) fn run_test_88<R: Read + Seek>(
         ObjectHandle::parse(b"[ << /P /Q /T /U >> (b) << /Z /Y /X /W >> ]")?.unparse()
     );
 
-    assert!(remove_key_and_get_old(&new_dict, b"/M").is_null());
-    assert_eq!(remove_key_and_get_old(&new_dict, b"/P").unparse(), b"/Q");
+    assert!(new_dict.remove_key_and_get_old(b"/M")?.is_null());
+    assert_eq!(new_dict.remove_key_and_get_old(b"/P")?.unparse(), b"/Q");
     assert_eq!(
         new_dict.unparse(),
         ObjectHandle::parse(b"<< /T /U >>")?.unparse()
@@ -190,19 +152,12 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     pdf.resolve(&root)?;
     let root = root.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    let arr2 = replace_key_and_get_new(&root, b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
-    // GAP(QPDFObjectHandle::setObjectDescription): no public equivalent
-    // attaches explicit `pdf` + description warning context to a handle
-    // (test_driver.cc:3157, `arr2.setObjectDescription(&pdf, "test
-    // array")`), so `arr2` below carries only whatever context
-    // `replace_key`'s own child-attachment already gives a value installed
-    // into the live object graph, not the description qpdf's test
-    // installs. If that is insufficient for `erase_array_item_and_get_old`
-    // to route its warning instead of erroring (see that method's own
-    // doc), the call below surfaces that honestly as a propagated
-    // `flpdf::Error::System` via `?` rather than a silently wrong null.
+    let arr2 = root.replace_key_and_get_new(b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
+    arr2.set_object_description(pdf, "test array")?;
     assert!(arr2.erase_array_item_and_get_old(50)?.is_null());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert!(root.erase_array_item_and_get_old(0)?.is_null());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 
@@ -496,16 +451,10 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     assert_eq!(oh2.unparse(), b"<< /One /Three >>");
     assert!(!oh1.is_indirect());
 
-    // GAP(QPDF::makeIndirectObject): `Pdf::make_indirect_object_handle`
-    // clones `oh1`'s direct value onto a *new*, separately-registered
-    // indirect slot rather than promoting the existing shared allocation
-    // in place (`Pdf::make_indirect_object_handle`'s own doc: "materializing
-    // here would duplicate a direct stream's payload into the legacy
-    // Object cache"), so the returned handle does not share identity with
-    // `oh1` the way qpdf's in-place promotion does. `assert(oh1.isSameObjectAs(oh4))`,
-    // `assert(oh1.isIndirect())`, and `assert(oh4.isIndirect())`
-    // (test_driver.cc:3263-3266) are not ported; the `/Potato` assertions
-    // below do not depend on `oh4` and are.
+    let oh4 = pdf.make_indirect_from_object_handle(oh1.clone())?;
+    assert!(oh1.is_same_object_as(&oh4));
+    assert!(oh1.is_indirect());
+    assert!(oh4.is_indirect());
     trailer.replace_key(b"/Potato", oh1.clone())?;
     let potato = trailer.get_key(b"/Potato");
     assert!(potato.is_same_object_as(&oh2));
@@ -782,12 +731,17 @@ mod test_92_tests {
 #[cfg(test)]
 mod tests {
     use super::{run_test_88, run_test_89};
-    use flpdf::{Pdf, PdfOpenOptions};
+    use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let options = PdfOpenOptions {
+            description: "minimal.pdf".to_owned(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
         Pdf::open_mem_owned_with_options(
             include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
-            PdfOpenOptions::default(),
+            options,
         )
         .expect("open minimal fixture")
     }
@@ -810,12 +764,21 @@ mod tests {
         .expect("run test 88");
 
         assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: test array: ignoring attempt to erase out of bounds array item\n\
+              WARNING: minimal.pdf, object 1 0 at offset 19: operation for array attempted on object of type dictionary: ignoring attempt to erase item\n"
+        );
     }
 
     #[test]
     fn test_89_resolves_root_and_unknown_object_handles_once() {
         let mut pdf = minimal_pdf();
+        pdf.replace_object(
+            ObjectRef::new(5, 0),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
+        )
+        .expect("install a contextful object-5 array for the test fixture");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;

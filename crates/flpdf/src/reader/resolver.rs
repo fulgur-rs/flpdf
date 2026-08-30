@@ -1779,7 +1779,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let (logger, suppress_warnings) = {
             let mut core = self.core.borrow_mut();
             core.repair_diagnostics
-                .push(Diagnostic::warning(message.clone(), None));
+                .push(Diagnostic::object_warning(message.clone()));
             (core.logger.clone(), core.suppress_warnings)
         };
         route_warning(&logger, suppress_warnings, "", None, &message)
