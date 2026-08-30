@@ -18,7 +18,7 @@ use std::process::Command;
 use flpdf::{
     load_xref_and_trailer, CopyEncryptionSource, DecodeLevel, EncryptMethod, EncryptParams,
     ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, Pdf,
-    PdfOpenOptions, StreamDataMode, XrefEntry,
+    PdfOpenOptions, R2PermissionsConfig, StreamDataMode, XrefEntry,
 };
 
 const INFO_PLAINTEXT: &[u8] = b"Task4NestedPrintable";
@@ -842,6 +842,29 @@ fn v4_aes128_preserve_drops_orphan_length_holder() {
         js_stream_length(&mut pdf).as_integer().is_some(),
         "preserve + encrypt must direct-ize the JS stream's /Length"
     );
+}
+
+#[test]
+fn v1_r2_writer_uses_the_separate_r2_permission_bits() {
+    let mut params =
+        EncryptParams::rc4(EncryptMethod::V1Rc440, b"user".to_vec(), b"owner".to_vec());
+    params.r2_permissions = R2PermissionsConfig {
+        print: false,
+        modify: true,
+        extract: true,
+        annotate: true,
+    };
+
+    let bytes = encrypt_to_bytes(&fixture("tests/fixtures/compat/one-page.pdf"), params);
+    let mut pdf = open_encrypted(&bytes, b"user");
+    let info = pdf
+        .encryption_info()
+        .expect("read R=2 encryption info")
+        .expect("R=2 output is encrypted");
+
+    assert_eq!(info.v, 1);
+    assert_eq!(info.r, 2);
+    assert_eq!(info.permissions.raw(), -8);
 }
 
 mod common;

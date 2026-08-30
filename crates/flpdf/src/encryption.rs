@@ -41,7 +41,7 @@ pub(crate) mod state;
 
 pub use keys::ObjectKeyAlg;
 pub use password::PasswordMode;
-pub use permissions::{Permissions, PermissionsConfig, PrintPermission};
+pub use permissions::{Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig};
 pub use state::EncryptionInfo;
 
 /// Encryption method to apply at write time.
@@ -93,6 +93,11 @@ pub struct EncryptParams {
     /// Capability flags encoded into `/P` via
     /// [`PermissionsConfig::to_p_bits`].
     pub permissions: PermissionsConfig,
+    /// R=2 capability flags encoded into `/P` via
+    /// [`R2PermissionsConfig::to_p_bits`]. This is kept separate from
+    /// [`Self::permissions`] because qpdf exposes distinct R=2 and R>=3
+    /// writer setter contracts.
+    pub r2_permissions: R2PermissionsConfig,
     /// Whether the `/Metadata` stream is encrypted alongside the rest of
     /// the document. When `false`, the writer:
     ///
@@ -117,6 +122,7 @@ impl EncryptParams {
             user_password: user_password.into(),
             owner_password: owner_password.into(),
             permissions: PermissionsConfig::default(),
+            r2_permissions: R2PermissionsConfig::default(),
             encrypt_metadata: true,
         }
     }
@@ -132,6 +138,7 @@ impl EncryptParams {
             user_password: user_password.into(),
             owner_password: owner_password.into(),
             permissions: PermissionsConfig::default(),
+            r2_permissions: R2PermissionsConfig::default(),
             encrypt_metadata: true,
         }
     }
@@ -145,6 +152,7 @@ impl EncryptParams {
             user_password: user_password.into(),
             owner_password: owner_password.into(),
             permissions: PermissionsConfig::default(),
+            r2_permissions: R2PermissionsConfig::default(),
             encrypt_metadata: true,
         }
     }
@@ -170,6 +178,7 @@ impl EncryptParams {
             user_password: user_password.into(),
             owner_password: owner_password.into(),
             permissions: PermissionsConfig::default(),
+            r2_permissions: R2PermissionsConfig::default(),
             encrypt_metadata: true,
         }
     }

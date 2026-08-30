@@ -2364,7 +2364,7 @@ pub(crate) fn build_encryption_context(
                 length_bits: 40,
                 user_password: &params.user_password,
                 owner_password: &params.owner_password,
-                p: params.permissions.to_p_bits(),
+                p: params.r2_permissions.to_p_bits(),
                 id0: &id0,
             };
             let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;

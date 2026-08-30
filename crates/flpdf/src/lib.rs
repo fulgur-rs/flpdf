@@ -161,7 +161,9 @@ pub use embedded_files::{
     list_embedded_files_with_max_depth, remove_attachment, EmbeddedFileDocumentHelper,
     DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
 };
-pub use encryption::permissions::{Permissions, PermissionsConfig, PrintPermission};
+pub use encryption::permissions::{
+    Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig,
+};
 pub use encryption::EncryptionInfo;
 pub use encryption::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, ObjectKeyAlg, PasswordMode,
