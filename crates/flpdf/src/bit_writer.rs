@@ -55,11 +55,6 @@ impl<'a> BitWriter<'a> {
         self.write_bits(value, bits)
     }
 
-    #[cfg(test)]
-    pub(crate) fn write_bits_i32(&mut self, value: i32, bits: usize) -> PipelineResult<()> {
-        self.write_bits(value as u64, bits)
-    }
-
     pub(crate) fn flush(&mut self) -> PipelineResult<()> {
         if self.bit_offset < 7 {
             self.write_bits(0, self.bit_offset + 1)?;
@@ -147,7 +142,6 @@ mod tests {
             let mut writer = BitWriter::new(&mut sink);
             writer.write_bits(0xffff_ffff, 0).unwrap();
             writer.write_bits_signed(-1, 0).unwrap();
-            writer.write_bits_i32(-1, 0).unwrap();
             writer.flush().unwrap();
         }
         assert!(sink.bytes.is_empty());
@@ -159,11 +153,7 @@ mod tests {
         let mut sink = TestSink::default();
         {
             let mut writer = BitWriter::new(&mut sink);
-            for result in [
-                writer.write_bits(0, 33),
-                writer.write_bits_signed(-1, 33),
-                writer.write_bits_i32(-1, 33),
-            ] {
+            for result in [writer.write_bits(0, 33), writer.write_bits_signed(-1, 33)] {
                 assert!(matches!(result.unwrap_err(), PipelineError::Logic(_)));
             }
             writer.flush().unwrap();
@@ -194,11 +184,11 @@ mod tests {
     }
 
     #[test]
-    fn i32_writes_use_the_low_requested_bits() {
+    fn writes_use_the_low_requested_bits() {
         let mut sink = TestSink::default();
         {
             let mut writer = BitWriter::new(&mut sink);
-            writer.write_bits_i32(-1, 4).unwrap();
+            writer.write_bits(u64::MAX, 4).unwrap();
             writer.flush().unwrap();
         }
         assert_eq!(sink.bytes, [0xf0]);
