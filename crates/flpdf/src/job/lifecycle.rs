@@ -2115,6 +2115,11 @@ impl QPDFJob {
             if self.configuration.empty_input {
                 return Err(UsageError::new("--replace-input may not be used with --empty").into());
             }
+            if self.configuration.split_pages.is_some_and(|size| size > 0) {
+                return Err(
+                    UsageError::new("--split-pages may not be used with --replace-input").into(),
+                );
+            }
             if self.configuration.json_version.is_some() {
                 return Err(UsageError::new("--json may not be used with --replace-input").into());
             }
