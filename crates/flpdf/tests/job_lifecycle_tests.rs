@@ -874,14 +874,15 @@ fn job_json_password_file_reads_raw_bytes_and_keeps_only_the_first_line() {
     // whole file before authentication even gets a chance to run, while the
     // byte-preserving first-line split (`QUtil::read_lines_from_file` +
     // `lines.front()`, `QUtil.cc:1231-1286`) only ever looks at the first
-    // line's bytes, so the password authenticates successfully.
+    // line's bytes, so the password authenticates successfully. The first
+    // line itself ends in `\r\n` to also exercise the trailing-`\r` strip.
     let encrypted_pdf = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
     let tempdir = tempfile::tempdir().unwrap();
     let password_file = tempdir.path().join("password.txt");
     std::fs::write(
         &password_file,
-        b"user-v4-aes\nignored line with \xffinvalid utf-8\n",
+        b"user-v4-aes\r\nignored line with \xffinvalid utf-8\n",
     )
     .unwrap();
     let output = tempdir.path().join("out.pdf");
