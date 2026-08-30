@@ -154,6 +154,60 @@ fn job_json_file_flatten_rotation_preserves_orphan_widget_warning_status() {
 }
 
 #[test]
+fn job_json_file_generate_appearances_clears_need_marker_and_adds_ap() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("input.pdf"),
+        job_json_appearance_fixture(),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("appearances.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"generated.pdf","generateAppearances":"","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=appearances.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    let mut pdf = Pdf::open(Cursor::new(
+        fs::read(directory.path().join("generated.pdf")).unwrap(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    let acroform = root.try_get_key(b"/AcroForm").unwrap();
+    pdf.resolve(&acroform).unwrap();
+    let need_appearances = acroform.try_get_key(b"/NeedAppearances").unwrap();
+    pdf.resolve(&need_appearances).unwrap();
+    assert_ne!(
+        need_appearances.as_boolean(),
+        Some(true),
+        "generateAppearances must clear qpdf's NeedAppearances marker"
+    );
+
+    let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    let annots = page.try_get_key(b"/Annots").unwrap();
+    pdf.resolve(&annots).unwrap();
+    let widget = annots.as_array().unwrap()[0].clone();
+    pdf.resolve(&widget).unwrap();
+    let appearance = widget.try_get_key(b"/AP").unwrap();
+    pdf.resolve(&appearance).unwrap();
+    let normal = appearance.try_get_key(b"/N").unwrap();
+    pdf.resolve(&normal).unwrap();
+    assert!(
+        normal.as_stream_dict().is_some(),
+        "generateAppearances must install a normal widget appearance"
+    );
+}
+
+#[test]
 fn job_json_file_usage_errors_use_the_qpdf_job_file_boundary() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
@@ -681,4 +735,40 @@ fn page_rotations(bytes: &[u8]) -> Vec<Option<i64>> {
             rotate.as_integer()
         })
         .collect()
+}
+
+fn job_json_appearance_fixture() -> Vec<u8> {
+    assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\n",
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [4 0 R] >>\n",
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) /V (Hello) /DA (/Helv 12 Tf 0 g) /Rect [100 700 300 720] /P 3 0 R >>\n",
+        b"<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\n",
+    ])
+}
+
+fn assemble_pdf(objects: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0u64; objects.len() + 1];
+    for (index, body) in objects.iter().enumerate() {
+        let object_number = index + 1;
+        offsets[object_number] = bytes.len() as u64;
+        bytes.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"endobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
 }
