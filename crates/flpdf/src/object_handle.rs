@@ -18360,8 +18360,11 @@ pub(crate) mod warning_emission_tests {
         assert!(!handle.is_null());
         assert!(!handle.is_resolved());
         assert!(!handle.try_is_integer().unwrap());
+        assert!(!handle.try_is_array().unwrap());
         assert!(!handle.try_is_dictionary().unwrap());
+        assert!(!handle.try_is_name().unwrap());
         assert!(!handle.try_is_scalar().unwrap());
+        assert!(!handle.try_is_number().unwrap());
         assert!(matches!(
             handle.try_dereference(),
             Err(crate::Error::Internal(message))
@@ -18397,6 +18400,40 @@ pub(crate) mod warning_emission_tests {
         assert!(!invalid_rectangle.try_is_rectangle().unwrap());
         assert_eq!(
             invalid_rectangle.try_get_array_as_rectangle().unwrap(),
+            Rectangle::default()
+        );
+        let integer_rectangle = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::integer(2),
+            ObjectHandle::integer(3),
+            ObjectHandle::integer(4),
+        ]);
+        assert!(integer_rectangle.try_is_rectangle().unwrap());
+        assert_eq!(
+            integer_rectangle.try_get_array_as_rectangle().unwrap(),
+            Rectangle::new(1.0, 2.0, 3.0, 4.0)
+        );
+        let literal_rectangle = ObjectHandle::array(vec![
+            ObjectHandle::real_literal(1.2, b"1.2".to_vec()),
+            ObjectHandle::real_literal(3.4, b"3.4".to_vec()),
+            ObjectHandle::real_literal(5.6, b"5.6".to_vec()),
+            ObjectHandle::real_literal(7.8, b"7.8".to_vec()),
+        ]);
+        assert_eq!(
+            literal_rectangle.try_get_array_as_rectangle().unwrap(),
+            Rectangle::new(1.2, 3.4, 5.6, 7.8)
+        );
+        assert!(!ObjectHandle::integer(1).try_is_rectangle().unwrap());
+        let uninitialized_rectangle = ObjectHandle::array(vec![
+            ObjectHandle::uninitialized(),
+            ObjectHandle::integer(2),
+            ObjectHandle::integer(3),
+            ObjectHandle::integer(4),
+        ]);
+        assert_eq!(
+            uninitialized_rectangle
+                .try_get_array_as_rectangle()
+                .unwrap(),
             Rectangle::default()
         );
 
@@ -18468,6 +18505,7 @@ pub(crate) mod warning_emission_tests {
     #[test]
     fn qpdf_type_check_accessors_cover_successful_values_and_live_containers() {
         assert!(ObjectHandle::boolean(true).try_get_bool_value().unwrap());
+        assert!(ObjectHandle::integer(7).try_is_scalar().unwrap());
         assert_eq!(
             ObjectHandle::real(1.25).try_get_real_value().unwrap(),
             b"1.25"
@@ -18481,6 +18519,10 @@ pub(crate) mod warning_emission_tests {
         assert_eq!(
             ObjectHandle::integer(7).try_get_numeric_value().unwrap(),
             7.0
+        );
+        assert_eq!(
+            ObjectHandle::real(1.25).try_get_numeric_value().unwrap(),
+            1.25
         );
         assert_eq!(
             ObjectHandle::real_literal(0.4, b".4".to_vec())
@@ -18557,30 +18599,6 @@ pub(crate) mod warning_emission_tests {
     }
 
     #[test]
-    fn array_mutators_emit_type_warning_text_for_non_arrays() {
-        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
-
-        handle.set_array_item(0, ObjectHandle::integer(1)).unwrap();
-        handle
-            .set_array_items(vec![ObjectHandle::integer(2)])
-            .unwrap();
-        handle
-            .insert_array_item(0, ObjectHandle::integer(3))
-            .unwrap();
-        handle.append_array_item(ObjectHandle::integer(4)).unwrap();
-        let erased = handle.erase_array_item_and_get_old(0).unwrap();
-
-        assert!(erased.is_null());
-        assert_eq!(warnings(&recorder), [
-            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to set item",
-            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to replace items",
-            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to insert item",
-            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to append item",
-            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to erase item",
-        ]);
-    }
-
-    #[test]
     fn signed_array_mutators_cover_qpdf_bounds_and_success_paths() {
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
         array
@@ -18632,6 +18650,30 @@ pub(crate) mod warning_emission_tests {
         integer.try_erase_array_item_at(-1).unwrap();
         integer.try_erase_array_item_at(0).unwrap();
         assert_eq!(warnings(&recorder).len(), 6);
+    }
+
+    #[test]
+    fn array_mutators_emit_type_warning_text_for_non_arrays() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle.set_array_item(0, ObjectHandle::integer(1)).unwrap();
+        handle
+            .set_array_items(vec![ObjectHandle::integer(2)])
+            .unwrap();
+        handle
+            .insert_array_item(0, ObjectHandle::integer(3))
+            .unwrap();
+        handle.append_array_item(ObjectHandle::integer(4)).unwrap();
+        let erased = handle.erase_array_item_and_get_old(0).unwrap();
+
+        assert!(erased.is_null());
+        assert_eq!(warnings(&recorder), [
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to set item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to replace items",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to insert item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to append item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to erase item",
+        ]);
     }
 
     /// A sink that appends every write to a shared buffer.
