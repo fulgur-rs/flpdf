@@ -2531,10 +2531,9 @@ fn run_json(cli: &Cli) -> CliResult<()> {
 
     // 3. Resolve stream-data mode.
     //
-    // The help text documents the default as "none". Stream payloads are
-    // never embedded or written to disk unless the caller explicitly opts
-    // in via --json-stream-data, even when --json-output is used: leaking
-    // stream contents based on an unrelated flag would be surprising.
+    // Ordinary `--json` follows the inspection default of no stream payloads;
+    // qpdf's `--json-output` mode selects inline stream data unless the caller
+    // overrides it with --json-stream-data.
     let stream_data = match cli
         .json_stream_data
         .as_deref()
