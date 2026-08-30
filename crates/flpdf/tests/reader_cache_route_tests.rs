@@ -9,7 +9,7 @@ fn resolved_cache_entries_are_handle_native() {
 
 #[test]
 fn canonical_replacement_does_not_round_trip_through_raw_materialization() {
-    let source = include_str!("../src/reader.rs");
+    let source = include_str!("../src/reader.rs").replace("\r\n", "\n");
     let replace_object = source
         .split("pub fn replace_object(")
         .nth(1)
@@ -23,7 +23,7 @@ fn canonical_replacement_does_not_round_trip_through_raw_materialization() {
 
 #[test]
 fn json_inspection_keeps_top_level_resolution_handle_native() {
-    let source = include_str!("../src/json_inspect.rs");
+    let source = include_str!("../src/json_inspect.rs").replace("\r\n", "\n");
     let resolver = source
         .split("pub(crate) fn qpdf_resolve_top_level_object")
         .nth(1)
@@ -39,7 +39,7 @@ fn json_inspection_keeps_top_level_resolution_handle_native() {
 
 #[test]
 fn json_stream_payload_uses_the_resolved_handle_directly() {
-    let source = include_str!("../src/json_inspect.rs");
+    let source = include_str!("../src/json_inspect.rs").replace("\r\n", "\n");
     let route = source
         .split("pub fn qpdf_raw_stream_payload")
         .nth(1)
@@ -53,7 +53,7 @@ fn json_stream_payload_uses_the_resolved_handle_directly() {
 
 #[test]
 fn encryption_dictionary_reader_route_uses_handle_accessors() {
-    let source = include_str!("../src/reader.rs");
+    let source = include_str!("../src/reader.rs").replace("\r\n", "\n");
     let route = source
         .split("fn encrypt_dictionary_handle")
         .nth(1)
@@ -66,7 +66,7 @@ fn encryption_dictionary_reader_route_uses_handle_accessors() {
 
 #[test]
 fn encryption_state_production_route_uses_handle_values() {
-    let source = include_str!("../src/encryption/state.rs");
+    let source = include_str!("../src/encryption/state.rs").replace("\r\n", "\n");
     let route = source
         .split("pub(crate) fn parse_inspection_state")
         .nth(1)
