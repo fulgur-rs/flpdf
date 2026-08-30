@@ -398,7 +398,11 @@ fn progress_rewrite_to_unusable_destination_fails_before_any_progress_output() {
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
-    assert!(stderr.contains("Is a directory"), "stderr: {stderr}");
+    // The OS error text for opening a directory for writing is
+    // platform-specific ("Is a directory" on Linux/macOS, "Access is denied"
+    // on Windows); only the fail-fast-before-progress behavior above is the
+    // qpdf-parity contract under test.
+    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
 }
 
 #[test]
@@ -425,7 +429,11 @@ fn progress_pages_extraction_to_unusable_destination_fails_before_any_progress_o
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
-    assert!(stderr.contains("Is a directory"), "stderr: {stderr}");
+    // The OS error text for opening a directory for writing is
+    // platform-specific ("Is a directory" on Linux/macOS, "Access is denied"
+    // on Windows); only the fail-fast-before-progress behavior above is the
+    // qpdf-parity contract under test.
+    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
 }
 
 fn fixture_from_path(path: &str) -> PathBuf {
