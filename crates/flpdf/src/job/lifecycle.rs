@@ -971,6 +971,15 @@ impl QPDFJob {
         self.configuration.password = password.into();
     }
 
+    /// Request qpdf writer progress reporting for writers configured by this job.
+    ///
+    /// Corresponds to `QPDFJob::Config::progress` (`libqpdf/QPDFJob_config.cc:478-481`).
+    /// The existing [`Self::configure_writer_progress`] method remains the sole
+    /// owner of the default logger-backed reporter construction.
+    pub fn set_progress(&mut self, value: bool) {
+        self.configuration.progress = value;
+    }
+
     /// Return the current diagnostic prefix.
     #[must_use]
     pub fn message_prefix(&self) -> &str {

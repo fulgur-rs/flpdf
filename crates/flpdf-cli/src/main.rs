@@ -70,6 +70,7 @@ struct WriterOptions {
     decode_level: StreamDecodeLevel,
     decode_level_set: bool,
     recompress_flate: bool,
+    progress: bool,
     static_id: bool,
     deterministic_id: bool,
     static_aes_iv: bool,
@@ -97,6 +98,7 @@ impl Default for WriterOptions {
             decode_level: StreamDecodeLevel::None,
             decode_level_set: false,
             recompress_flate: false,
+            progress: false,
             static_id: false,
             deterministic_id: false,
             static_aes_iv: false,
@@ -212,6 +214,68 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
     Ok(())
 }
 
+/// Fail fast on an unusable output destination before a progress-reporting
+/// page-operation rewrite begins.
+///
+/// qpdf opens (and therefore validates) its real output destination before
+/// any writing -- including progress notifications -- starts. Confirmed
+/// against live qpdf 11.9.0: `qpdf --progress --rotate=90:1 in.pdf
+/// a-directory` fails immediately with no progress line printed at all.
+/// flpdf's page-operation rewrite instead computes the complete output into
+/// an internal memory buffer first (`write_qpdf_to_memory`) and persists it
+/// to `output` only afterward, so without this guard an unusable
+/// destination would let the full 0..100 progress sequence print before the
+/// later persistence step fails. Opens without truncating so an
+/// already-existing, otherwise-valid destination is left untouched until
+/// the real write.
+///
+/// Skips the check for an existing named pipe (Unix only): qpdf itself opens
+/// its real destination exactly once, and a FIFO's reader observes EOF and
+/// can exit as soon as this validation open closes, so the later real write
+/// would reopen a FIFO with no reader left and hang. Every other destination
+/// kind (regular files, directories, sockets, device files, and nonexistent
+/// paths) has no such open/close synchronization hazard and is still probed
+/// here, so this remains a fail-fast guard for those.
+fn validate_progress_output_destination(output: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(metadata) = std::fs::metadata(output) {
+            if metadata.file_type().is_fifo() {
+                return Ok(());
+            }
+        }
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(output)?;
+    Ok(())
+}
+
+/// Attach qpdf's logger-backed progress reporter to a direct CLI writer.
+///
+/// The event accounting remains owned by `PdfWriter`; `QPDFJob` owns the
+/// message prefix, output identity, and info/save routing just as qpdf's
+/// `setWriterOptions` does (`libqpdf/QPDFJob.cc:2926-2935`).
+fn configure_cli_progress<R: Read + Seek + 'static>(
+    writer: &mut PdfWriter<'_, R>,
+    output: &Path,
+    enabled: bool,
+) -> CliResult<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_output_file(output.to_path_buf())?;
+    job.set_progress(true);
+    job.configure_writer_progress(writer);
+    Ok(())
+}
+
 fn write_with_pdf_writer<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     output: &Path,
@@ -222,6 +286,7 @@ fn write_with_pdf_writer<R: Read + Seek + 'static>(
 ) -> CliResult<()> {
     let mut writer = PdfWriter::new(pdf);
     configure_pdf_writer(&mut writer, options, linearize, linearize_pass1)?;
+    configure_cli_progress(&mut writer, output, options.progress)?;
     if let Some(sink) = standard_output.take() {
         writer.set_output_writer(sink)?;
     } else {
@@ -233,10 +298,12 @@ fn write_with_pdf_writer<R: Read + Seek + 'static>(
 
 fn write_qpdf_to_memory<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
+    output: &Path,
     options: &WriterOptions,
 ) -> CliResult<Vec<u8>> {
     let mut writer = PdfWriter::new(pdf);
     configure_pdf_writer(&mut writer, options, false, None)?;
+    configure_cli_progress(&mut writer, output, options.progress)?;
     writer.set_output_memory()?;
     writer.write()?;
     Ok(writer.get_buffer()?)
@@ -823,6 +890,10 @@ struct Cli {
                 (mirrors qpdf --verbose)"
     )]
     verbose: bool,
+
+    /// Report approximate write progress (qpdf --progress).
+    #[arg(long = "progress")]
+    progress: bool,
 
     /// Extract an attachment by key (qpdf --show-attachment compatible).
     ///
@@ -1558,6 +1629,10 @@ struct RewriteCommand {
                 (mirrors qpdf --verbose)"
     )]
     verbose: bool,
+
+    /// Report approximate write progress (qpdf --progress).
+    #[arg(long = "progress")]
+    progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -2093,6 +2168,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             &top_level_version_options,
         )
     } else if !args.add_attachment.is_empty() {
@@ -2105,6 +2181,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             args.verbose,
             &top_level_version_options,
         )
@@ -2118,6 +2195,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             args.verbose,
             &top_level_version_options,
         )
@@ -2138,6 +2216,7 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            progress: args.progress,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2229,6 +2308,7 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            progress: args.progress,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2296,6 +2376,7 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            progress: args.progress,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2860,6 +2941,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 static_aes_iv: cmd.static_aes_iv,
                 no_original_object_ids: cmd.no_original_object_ids,
                 preserve_unreferenced_objects: cmd.preserve_unreferenced,
+                progress: cmd.progress,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
@@ -5009,7 +5091,16 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         None
     };
 
-    let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
+    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    if split_progress {
+        // qpdf creates a fresh writer for each split output. The memory
+        // rewrite is flpdf's internal preparation step and is not an
+        // observable qpdf writer, so it must not consume the progress stream.
+        options.progress = false;
+    } else if options.progress && standard_output.is_none() {
+        validate_progress_output_destination(output)?;
+    }
+    let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
         let (written, mut split_job) = split_rewritten_pdf(
@@ -5018,6 +5109,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             output,
             input_path,
             options.deterministic_id,
+            split_progress,
             writer_configuration(&options, false),
         )?;
         if verbose {
@@ -5141,6 +5233,7 @@ fn split_rewritten_pdf(
     output: &Path,
     input_path: &Path,
     deterministic_id: bool,
+    progress: bool,
     writer_configuration: WriterConfiguration,
 ) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
@@ -5148,6 +5241,10 @@ fn split_rewritten_pdf(
     job.set_message_prefix(progname());
     let input_name = input_path.to_string_lossy().into_owned();
     let mut pdf = job.open(Cursor::new(bytes), input_name, PdfOpenOptions::default())?;
+    if progress {
+        job.set_progress(true);
+        job.set_output_file(output.to_path_buf())?;
+    }
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
@@ -5215,7 +5312,16 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     // the memory intermediate decryptable before split_pages re-opens it.
     let mut options = options;
     options.preserve_encryption = page_ops.split_pages.is_none() && pdf.is_encrypted();
-    let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
+    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    if split_progress {
+        // qpdf creates a fresh writer for each split output. The memory
+        // rewrite is flpdf's internal preparation step and is not an
+        // observable qpdf writer, so it must not consume the progress stream.
+        options.progress = false;
+    } else if options.progress && creates_output {
+        validate_progress_output_destination(output)?;
+    }
+    let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
@@ -5225,6 +5331,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             output,
             input,
             options.deterministic_id,
+            split_progress,
             writer_configuration(&options, false),
         )?;
         if verbose {
@@ -6549,6 +6656,7 @@ fn run_add_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6592,6 +6700,7 @@ fn run_add_attachment(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
@@ -6622,6 +6731,7 @@ fn run_remove_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
@@ -6638,10 +6748,12 @@ fn run_remove_attachment(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
-    let mut standard_output = None;
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let creates_output = standard_output.is_none();
     write_with_pdf_writer(
         &mut pdf,
         &output,
@@ -6650,7 +6762,7 @@ fn run_remove_attachment(
         false,
         None,
     )?;
-    finish_operation_warnings(&pdf, true)
+    finish_operation_warnings(&pdf, creates_output)
 }
 
 /// `--list-attachments [--verbose] input`
@@ -6705,6 +6817,7 @@ fn run_copy_attachments_from(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6753,6 +6866,7 @@ fn run_copy_attachments_from(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut writer_options, version_options);

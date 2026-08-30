@@ -319,6 +319,18 @@ ObjStm・linearizationの全イベントで `Result` をその場で伝播する
 検査する迂回や、callback failureを成功扱いにするlegacy routeは維持しない
 （`flpdf-egzr.8.8`）。
 
+`--progress` のCLI consumerは、qpdf 11.9.0の `QPDFJob::Config::progress`
+（`QPDFJob_config.cc:478-481`）から `setWriterOptions` 内のfallback reporter登録
+（`QPDFJob.cc:2926-2935`）を経て、writerの `indicateProgress`
+（`QPDFWriter.cc:2187-2193,2957-2987`）へ到達する。flpdfは
+`flpdf-cli/src/main.rs` のCLI writer境界で既存の
+`job/lifecycle.rs::QPDFJob::configure_writer_progress` を呼び出し、
+`QPDFJob::set_progress` により設定だけを渡す。callbackの文言・info/save channel・
+0..100のイベント計算はそれぞれJob/Loggerとcanonical `PdfWriter`が所有し、CLIに
+別のlegacy bridgeを置かない。qpdf 11.9.0の実測では通常の `OUTPUT` へはinfo/stdout、
+`OUTPUT=-` へはstderrに `0%` から `100%` のprogressを出し、PDF bytesはstdoutに残る。
+qtest `progress-reporting` の3行はこの同一責務境界を検証する。
+
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
 経路にしか入らない構造的リスクがここに集中している。`emit_canonical_pdf_inner`
