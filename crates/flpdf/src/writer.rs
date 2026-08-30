@@ -3874,19 +3874,34 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     // Drive emission from the qpdf enqueue order: `(new_ref, old_ref)` pairs in
-    // ascending reservation order. QDF must include the extra reservation made
-    // for each ObjStm container and its sorted members before ordinary page
-    // descendants are assigned. Non-QDF specialized routes retain the existing
-    // Catalog-first map; the plain route already owns its container-aware plan.
-    let renumbered: Vec<(ObjectRef, ObjectRef)> = if options.qdf && !plan.batches.is_empty() {
+    // ascending reservation order. qpdf assigns the container and all of its
+    // sorted members when the first member is enqueued in every non-linearized
+    // writer mode—not only QDF (`QPDFWriter.cc:1057-1118`).
+    let (renumbered, object_stream_container_numbers): (
+        Vec<(ObjectRef, ObjectRef)>,
+        Vec<Option<u32>>,
+    ) = if !plan.batches.is_empty() {
         use crate::writer::object_streams::ObjectStreamGroup;
         use crate::writer::rewrite_renumber::ObjectStreamRenumber;
 
+        let source_xref_entries = pdf.source_xref_entries();
         let groups = plan
             .batches
             .iter()
-            .cloned()
-            .map(|members| ObjectStreamGroup::Synthetic { members })
+            .map(|members| {
+                let members = members.clone();
+                if options.object_streams == ObjectStreamMode::Preserve {
+                    if let Some(source) =
+                        source_objstm_container_for_batch(&members, &source_xref_entries)
+                    {
+                        ObjectStreamGroup::SourceBacked { source, members }
+                    } else {
+                        ObjectStreamGroup::Synthetic { members }
+                    }
+                } else {
+                    ObjectStreamGroup::Synthetic { members }
+                }
+            })
             .collect::<Vec<_>>();
         let object_stream_renumber = ObjectStreamRenumber::build_with_stream_policy(
             pdf,
@@ -3898,39 +3913,48 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         )?; // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
         let mut pairs = object_stream_renumber.pairs().collect::<Vec<_>>();
         pairs.sort_unstable_by_key(|(new_ref, _)| (new_ref.number, new_ref.generation));
-        pairs
+        let containers = (0..plan.batches.len())
+            .map(|batch_idx| object_stream_renumber.container_number(batch_idx))
+            .collect();
+        (pairs, containers)
     } else {
-        renumber.pairs().collect()
+        (renumber.pairs().collect(), vec![None; plan.batches.len()])
     };
 
-    let existing_max: u32 = u32::try_from(renumber.len()).map_err(|_| {
-        crate::Error::Unsupported("full-rewrite: renumbered object count overflows u32".to_string())
-    })?;
+    let existing_max = renumbered
+        .iter()
+        .map(|(new_ref, _)| new_ref.number)
+        .max()
+        .unwrap_or(0);
+    let output_renumber_map: HashMap<ObjectRef, ObjectRef> = renumbered
+        .iter()
+        .map(|(new_ref, old_ref)| (*old_ref, *new_ref))
+        .collect();
 
     // A QDF container receives its number when the standard enqueue walk first
     // reaches any member of its group. This applies to both generated and
-    // source-preserved groups; compact output retains its contiguous allocation
-    // above the Catalog-first object range.
+    // source-preserved groups; compact output uses these numbers directly.
     let mut container_refs: Vec<ObjectRef> = if options.qdf {
         if plan.batches.is_empty() {
             Vec::new()
         } else {
             vec![ObjectRef::new(0, 0); plan.batches.len()]
         }
-    } else {
-        (1..=plan.batches.len())
-            .map(|i| {
-                let number = existing_max.checked_add(i as u32)?;
-                Some(ObjectRef::new(number, 0))
+    } else if !plan.batches.is_empty() {
+        object_stream_container_numbers
+            .into_iter()
+            .map(|number| {
+                number
+                    .map(|number| ObjectRef::new(number, 0))
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(
+                            "ObjStm container absent from qpdf renumber map".to_string(),
+                        )
+                    })
             })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                // cov:ignore-start: a supported PDF cannot allocate more than u32::MAX ObjStm batches
-                crate::Error::Unsupported(
-                    "full-rewrite: ObjStm container number overflows u32".to_string(),
-                )
-                // cov:ignore-end
-            })? // cov:ignore: batch-count overflow is impossible for a supported PDF
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
     };
 
     // Member-to-batch lookup by original reference. The QDF pre-scan needs the
@@ -4111,8 +4135,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // cov:ignore-end
                 .number
         } else {
-            renumber
-                .new_for_original(member_ref)
+            output_renumber_map
+                .get(&member_ref)
+                .copied()
                 // cov:ignore-start: member_to_batch is built from this complete map
                 .ok_or_else(|| {
                     crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
@@ -4149,18 +4174,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
         } else {
-            // cov:ignore-start: contiguous object and batch counts cannot approach u32::MAX in a supported process.
-            let containers_len = u32::try_from(plan.batches.len()).map_err(|_| {
-                crate::Error::Unsupported(
-                    "full-rewrite encrypt: ObjStm batch count overflows u32".to_string(),
-                )
-            })?;
-            existing_max.checked_add(containers_len).ok_or_else(|| {
-                crate::Error::Unsupported(
-                    "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
-                )
-            })?
-            // cov:ignore-end
+            // Object-stream containers already occupy their qpdf enqueue
+            // numbers in `existing_max`; `/Encrypt` follows the highest
+            // assigned ordinary/member number (`QPDFWriter.cc:3006-3030`).
+            existing_max
         };
         let id0 = generated_id
             .as_ref()
@@ -4415,13 +4432,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         // cov:ignore-end
                     }) // cov:ignore: catalog-first planning makes every QDF reference resolvable
             } else {
-                renumber.new_for_original(object_ref).ok_or_else(|| {
-                    // cov:ignore-start: catalog-first planning inserts every live reference
-                    crate::Error::Unsupported(format!(
-                        "full-rewrite: reference {object_ref} absent from renumber map"
-                    ))
-                    // cov:ignore-end
-                }) // cov:ignore: catalog-first planning makes every reference resolvable
+                output_renumber_map
+                    .get(&object_ref)
+                    .copied()
+                    .ok_or_else(|| {
+                        // cov:ignore-start: catalog-first planning inserts every live reference
+                        crate::Error::Unsupported(format!(
+                            "full-rewrite: reference {object_ref} absent from renumber map"
+                        ))
+                        // cov:ignore-end
+                    }) // cov:ignore: catalog-first planning makes every reference resolvable
             }
         };
         let removed_refs: BTreeSet<ObjectRef> = skip_refs.iter().copied().collect();
@@ -4643,8 +4663,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     })?
                 // cov:ignore-end
             } else {
-                renumber
-                    .new_for_original(old)
+                output_renumber_map
+                    .get(&old)
+                    .copied()
                     // cov:ignore-start: handles are selected from this complete renumber map
                     .ok_or_else(|| {
                         crate::Error::Unsupported(
@@ -4670,13 +4691,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     })
                 // cov:ignore-end
             } else {
-                renumber.new_for_original(object_ref).ok_or_else(|| {
-                    // cov:ignore-start: ObjStm members are selected from the same complete renumber map
-                    crate::Error::Unsupported(format!(
-                        "full-rewrite: ObjStm reference {object_ref} absent from renumber map"
-                    ))
-                    // cov:ignore-end
-                }) // cov:ignore: ObjStm members are selected from the same complete renumber map
+                output_renumber_map
+                    .get(&object_ref)
+                    .copied()
+                    .ok_or_else(|| {
+                        // cov:ignore-start: ObjStm members are selected from the same complete renumber map
+                        crate::Error::Unsupported(format!(
+                            "full-rewrite: ObjStm reference {object_ref} absent from renumber map"
+                        ))
+                        // cov:ignore-end
+                    }) // cov:ignore: ObjStm members are selected from the same complete renumber map
             }
         };
         let mut qdf_first_member_body_offset = None;
@@ -4790,7 +4814,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &container_refs,
                     options.qdf,
                     &qdf_emission_renumber,
-                    &renumber,
+                    &output_renumber_map,
                 )
             })
         } else {
@@ -5060,13 +5084,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                             // cov:ignore-end
                         }) // cov:ignore: catalog-first planning makes every QDF trailer reference resolvable
                 } else {
-                    renumber.new_for_original(object_ref).ok_or_else(|| {
-                        // cov:ignore-start: catalog-first planning inserts every live trailer reference
-                        crate::Error::Unsupported(format!(
+                    output_renumber_map
+                        .get(&object_ref)
+                        .copied()
+                        .ok_or_else(|| {
+                            // cov:ignore-start: catalog-first planning inserts every live trailer reference
+                            crate::Error::Unsupported(format!(
                             "full-rewrite: trailer reference {object_ref} absent from renumber map"
                         ))
-                        // cov:ignore-end
-                    }) // cov:ignore: catalog-first planning makes every trailer reference resolvable
+                            // cov:ignore-end
+                        }) // cov:ignore: catalog-first planning makes every trailer reference resolvable
                 }
             };
 

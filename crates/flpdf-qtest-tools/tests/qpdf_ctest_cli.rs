@@ -9,6 +9,99 @@ fn minimal_pdf() -> std::path::PathBuf {
         .join("tests/fixtures/minimal.pdf")
 }
 
+fn encrypted_fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/encrypted")
+        .join(name)
+}
+
+#[test]
+fn qpdf_ctest_2_reports_invalid_password_through_the_c_api_error_surface() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = encrypted_fixture("v1-rc4-40-r2.pdf");
+    let output = directory.path().join("unused.pdf");
+    let input_name = input.to_str().expect("input path is UTF-8");
+    let expected = format!(
+        "error: {input_name}: invalid password\n  code: 4\n  file: {input_name}\n  pos: 0\n  text: invalid password\nC test 2 done\n"
+    );
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input_name, "wrong", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(expected)
+        .stderr("");
+    assert!(
+        !output.exists(),
+        "test02 must not initialize a writer after auth failure"
+    );
+}
+
+#[test]
+fn qpdf_ctest_encryption_writer_cases_cover_r2_through_r6() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = minimal_pdf();
+    let cases = [
+        ("11", "user1"),
+        ("12", "user2"),
+        ("15", "user2"),
+        ("17", "user3"),
+        ("18", "user4"),
+    ];
+
+    for (test_number, user_password) in cases {
+        let output = directory.path().join(format!("test-{test_number}.pdf"));
+        Command::cargo_bin("qpdf-ctest")
+            .expect("qpdf-ctest binary")
+            .args([
+                test_number,
+                input.to_str().unwrap(),
+                "",
+                output.to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .stdout(format!("C test {test_number} done\n"))
+            .stderr("");
+
+        let pdf = Pdf::open_with_options(
+            std::fs::File::open(&output).expect("open ctest output"),
+            flpdf::PdfOpenOptions {
+                password: user_password.as_bytes().to_vec(),
+                ..flpdf::PdfOpenOptions::default()
+            },
+        )
+        .expect("ctest encryption output must authenticate");
+        assert!(pdf.is_encrypted());
+    }
+}
+
+#[test]
+fn qpdf_ctest_13_recovers_the_user_password_and_decrypts() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = encrypted_fixture("v2-rc4-128-r3.pdf");
+    let output = directory.path().join("decrypted.pdf");
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "13",
+            input.to_str().unwrap(),
+            "user-v2",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout("user password: user-v2\nC test 13 done\n")
+        .stderr("");
+
+    let pdf = Pdf::open(std::io::Cursor::new(std::fs::read(output).unwrap()))
+        .expect("test13 output must be plaintext");
+    assert!(!pdf.is_encrypted());
+}
+
 #[test]
 fn qpdf_ctest_19_writes_the_same_deterministic_pdf_twice() {
     let directory = tempfile::tempdir().expect("temporary directory");
