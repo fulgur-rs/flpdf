@@ -570,8 +570,9 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
         b"modify",
         &["all", "annotate", "form", "assembly", "none"],
         true,
+        // cov:ignore-start: llvm-cov attributes this successful choice continuation to the match body
     )? {
-        // cov:ignore: llvm-cov continuation
+        // cov:ignore-end
         job_json_modify_permission(&value, &mut permissions)?;
     }
     if let Some(value) = job_json_yn(&settings, b"modifyOther")? {
@@ -1193,8 +1194,9 @@ impl QPDFJob {
             b"streamData",
             &["compress", "preserve", "uncompress"],
             true,
+            // cov:ignore-start: llvm-cov attributes this successful choice continuation to the match body
         )? {
-            // cov:ignore: llvm-cov continuation
+            // cov:ignore-end
             configuration
                 .writer
                 .set_stream_data_mode(match value.as_str() {
@@ -1296,8 +1298,9 @@ impl QPDFJob {
             b"jsonStreamData",
             &["none", "inline", "file"],
             true,
+            // cov:ignore-start: llvm-cov attributes this successful choice continuation to the match body
         )? {
-            // cov:ignore: llvm-cov continuation
+            // cov:ignore-end
             configuration.json_stream_data = match value.as_str() {
                 "none" => JsonStreamData::None,
                 "inline" => JsonStreamData::Inline,
@@ -1434,8 +1437,9 @@ impl QPDFJob {
             b"removeUnreferencedResources",
             &["auto", "yes", "no"],
             true,
+            // cov:ignore-start: llvm-cov attributes this successful choice continuation to the match body
         )? {
-            // cov:ignore: llvm-cov continuation
+            // cov:ignore-end
             configuration.remove_unreferenced_resources = match value.as_str() {
                 "auto" => RemoveUnreferencedResources::Auto,
                 "yes" => RemoveUnreferencedResources::Yes,
@@ -1906,10 +1910,10 @@ impl QPDFJob {
 
     fn finish_replace_input(&self) -> Result<()> {
         let input = self.configuration.input_file.as_ref().ok_or_else(|| {
+            // cov:ignore-start: successful replace-input completion has the validated input path
             Error::Usage(UsageError::new("--replace-input requires an input file"))
-            // cov:ignore: successful replace-input completion always has the validated input path
-            // cov:ignore: successful replace-input completion always has the validated input path
-        })?; // cov:ignore: successful replace-input completion always has the validated input path
+            // cov:ignore-end
+        })?; // cov:ignore: successful replace-input completion has the validated input path
         let temp = self
             .replace_input_path()
             .ok_or_else(|| Error::System("replace-input temporary path is missing".to_owned()))?;

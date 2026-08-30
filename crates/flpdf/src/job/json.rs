@@ -126,12 +126,10 @@ pub fn write_qpdf_json_selected_objects_with_options<R: Read + Seek>(
     if version == 1 {
         if json_section_selected(keys, JsonKey::Objects) {
             crate::document_json::write_json_v1_objects_key(pdf, out, &mut first, objects)?;
-            // cov:ignore: llvm-cov attributes this successful delegated write to the opening call lines
-        }
+        } // cov:ignore: llvm-cov continuation
         if json_section_selected(keys, JsonKey::Objectinfo) {
             crate::document_json::write_json_v1_objectinfo_key(pdf, out, &mut first, objects)?;
-            // cov:ignore: llvm-cov attributes this successful delegated write to the opening call lines
-        }
+        } // cov:ignore: llvm-cov continuation
     } else if json_section_selected(keys, JsonKey::Qpdf) {
         // qpdf's doJSONObjects delegates the whole "qpdf" key to
         // QPDF::writeJSON with complete=false, letting it continue the
