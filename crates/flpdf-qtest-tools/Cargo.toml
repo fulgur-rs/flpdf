@@ -49,6 +49,10 @@ path = "src/bin/test_xref.rs"
 name = "test_parsedoffset"
 path = "src/bin/test_parsedoffset.rs"
 
+[[bin]]
+name = "flpdf-test-large-file"
+path = "src/bin/test_large_file.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"

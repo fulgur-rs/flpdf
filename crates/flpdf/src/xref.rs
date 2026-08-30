@@ -3692,7 +3692,19 @@ fn parse_startxref(bytes: &[u8]) -> Result<u64> {
     let pos = search_start + relative_pos;
 
     let mut cursor = ByteCursor::new(bytes, pos + marker.len());
-    cursor.read_u64()
+    let token = cursor.read_token()?;
+    if !token.is_integer() {
+        // qpdf's findStartxref only accepts the marker when its following
+        // token is an integer. A malformed value therefore falls through to
+        // the same damagedPDF("can't find startxref") path as an absent
+        // marker (`libqpdf/QPDF.cc:413-453`), rather than exposing the
+        // tokenizer's integer-type diagnostic.
+        return Err(Error::parse(0, "can't find startxref"));
+    }
+    let text = std::str::from_utf8(&token.value)
+        .map_err(|_| Error::parse(token.start, "number is not utf-8"))?;
+    text.parse::<u64>()
+        .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))
 }
 
 struct ByteCursor<'a> {
@@ -3734,17 +3746,6 @@ impl<'a> ByteCursor<'a> {
     fn read_u32(&mut self) -> Result<u32> {
         let token = self.read_token()?;
         parse_xref_subsection_u32(&token)
-    }
-
-    fn read_u64(&mut self) -> Result<u64> {
-        let token = self.read_token()?;
-        if !token.is_integer() {
-            return Err(Error::parse(token.start, "expected unsigned integer"));
-        }
-        let text = std::str::from_utf8(&token.value)
-            .map_err(|_| Error::parse(token.start, "number is not utf-8"))?;
-        text.parse::<u64>()
-            .map_err(|_| Error::parse(token.start, "invalid unsigned integer"))
     }
 
     fn read_token(&mut self) -> Result<Token> {
@@ -3859,6 +3860,17 @@ mod tests {
         let error = super::parse_startxref(&bytes).expect_err(
             "qpdf only searches for startxref in the final 1054 bytes; an old marker must not win",
         );
+        assert!(matches!(
+            error,
+            Error::Parse { offset: 0, message } if message == "can't find startxref"
+        ));
+    }
+
+    #[test]
+    fn parse_startxref_treats_a_non_integer_marker_value_as_missing() {
+        let bytes = b"%PDF-1.5\nstartxref\noops\n%%EOF\n";
+        let error = super::parse_startxref(bytes)
+            .expect_err("qpdf ignores a startxref marker whose following token is not integer");
         assert!(matches!(
             error,
             Error::Parse { offset: 0, message } if message == "can't find startxref"

@@ -67,7 +67,7 @@ fn rejects_non_integer_startxref_token_at_token_start() {
     let error = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "parse error at byte 19: expected unsigned integer"
+        "parse error at byte 0: can't find startxref"
     );
 }
 

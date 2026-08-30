@@ -15,6 +15,7 @@ pub mod clean;
 pub mod common;
 pub mod compare;
 pub mod driver;
+pub mod large_file;
 pub mod metadata;
 pub mod orchestrator;
 pub mod output;
