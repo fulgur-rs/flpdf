@@ -26,14 +26,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
 use super::page_range::PageRange;
 use crate::page_document_helper::PageDocumentHelper;
 use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
-use crate::{
-    Dictionary, Error, Matrix, Object, ObjectHandle, ObjectRef, Pdf, Rectangle, Result, Stream,
-};
+#[cfg(test)]
+use crate::{Dictionary, Object, Stream};
+use crate::{Error, Matrix, ObjectHandle, ObjectRef, Pdf, Rectangle, Result};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
 /// destination page's own content.
@@ -329,9 +330,7 @@ fn apply_overlays_to_page_with_sources<R: Read + Seek, RS: Read + Seek>(
 
     // 4. Allocate the new /Contents stream (uncompressed, no /Filter; the writer
     //    compresses on output).
-    let contents_ref = next_object_ref(dest)?;
-    let contents_stream = Stream::new(Dictionary::new(), content.into_bytes());
-    dest.set_object(contents_ref, Object::Stream(contents_stream));
+    let contents_stream = dest.new_stream_with_data(Rc::new(content.into_bytes()))?;
 
     // 5. Rewrite only /Resources and /Contents on the live page handle. qpdf's
     // copyAnnotations has already appended to this same page's /Annots value;
@@ -343,7 +342,7 @@ fn apply_overlays_to_page_with_sources<R: Read + Seek, RS: Read + Seek>(
         ObjectHandle::dictionary(xobject_entries),
     )]);
     overlay_page.replace_key(b"/Resources", resources)?;
-    overlay_page.replace_key(b"/Contents", dest.get_object_handle(contents_ref))?;
+    overlay_page.replace_key(b"/Contents", contents_stream)?;
     dest.mark_object_handle_dirty(&overlay_page)?;
 
     Ok(())
@@ -1051,6 +1050,7 @@ fn overlay_page_handle<R: Read + Seek>(
 
 /// Allocate the next available object reference (`max(numbers) + 1`, generation
 /// 0), matching the allocation pattern used elsewhere in the crate.
+#[cfg(test)]
 fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     let n = pdf
         .object_refs()

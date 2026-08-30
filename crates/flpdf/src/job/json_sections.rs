@@ -10,8 +10,7 @@ use crate::json_inspect::{
     json_array, json_dictionary, pdf_dest_to_json, pdf_object_to_json, ConvertError,
 };
 use crate::object_handle::ObjectHandle;
-use crate::pdf_string::decode_pdf_text_string;
-use crate::{ObjectRef, PageObjectHelper, Pdf};
+use crate::{EmbeddedFileStream, FileSpec, ObjectRef, PageObjectHelper, Pdf};
 use std::io::{Read, Seek};
 
 // ── build_pages_section ───────────────────────────────────────────────────────
@@ -618,239 +617,108 @@ pub(crate) fn checksum_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Build a JSON entry for one filespec dictionary.
+/// Build a JSON entry for one live Filespec handle.
 ///
-/// Returns an object with keys in alphabetical order:
-/// `description`, `filespec`, `names`, `preferredcontents`, `preferredname`, `streams`.
-fn filespec_to_json<R: Read + Seek>(
+/// qpdf's `doJSONAttachments` keeps the Filespec and embedded-file helpers at
+/// the boundary (`QPDFJob.cc:1281-1330`). Keep the same shape here: direct and
+/// indirect name-tree leaves both go through [`FileSpec`], and every `/EF`
+/// dictionary item goes through [`EmbeddedFileStream`].
+fn filespec_handle_to_json<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    filespec_ref: crate::ObjectRef,
+    filespec: ObjectHandle,
 ) -> Result<Json, ConvertError> {
-    let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
-
-    let filespec_handle = pdf.get_object_handle(filespec_ref);
-    pdf.resolve(&filespec_handle)?;
-    let Some(filespec_dict) = filespec_handle.as_dictionary() else {
-        // Malformed filespec — return a minimal entry
-        return json_dictionary([
-            ("description".to_string(), Json::make_null()),
-            ("filespec".to_string(), Json::make_string(filespec_str)),
-            ("names".to_string(), Json::make_dictionary()),
-            ("preferredcontents".to_string(), Json::make_null()),
-            ("preferredname".to_string(), Json::make_null()),
-            ("streams".to_string(), Json::make_dictionary()),
-        ]);
+    let filespec_value = Json::make_string(filespec.unparse());
+    let (description, filenames, preferred_name, preferred_contents, streams) = {
+        let mut file_spec = FileSpec::new(filespec, pdf)?;
+        let description = file_spec.get_description()?;
+        let filenames = file_spec.get_filenames()?;
+        let preferred_name = file_spec.get_filename()?;
+        let preferred_contents = file_spec.get_embedded_file_stream("")?.unparse();
+        let stream_entries = file_spec.get_embedded_file_stream_entries()?;
+        (
+            description,
+            filenames,
+            preferred_name,
+            preferred_contents,
+            stream_entries,
+        )
     };
 
-    filespec_dict_to_json(pdf, &filespec_dict, Some(filespec_str))
-}
-
-/// Same as [`filespec_to_json`] but takes the filespec dictionary directly,
-/// for the case where the name tree leaf value is a direct dictionary rather
-/// than an indirect reference. When `filespec_str` is `Some`, it is used for
-/// the `filespec` key; when `None`, that key emits JSON null because
-/// no reference number exists.
-fn filespec_dict_to_json<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    filespec_dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
-    filespec_str: Option<String>,
-) -> Result<Json, ConvertError> {
-    let filespec_value = match filespec_str {
-        Some(s) => Json::make_string(s),
-        None => Json::make_null(),
+    let description = if description.is_empty() {
+        Json::make_null()
+    } else {
+        Json::make_string(description)
     };
+    // qpdf writes getFilename() directly rather than through its
+    // null_or_string helper, so a missing/wrong-type preferred name is the
+    // empty JSON string, not null (`QPDFJob.cc:1308`).
+    let preferred_name = Json::make_string(preferred_name);
+    let names = json_dictionary(
+        filenames
+            .into_iter()
+            .map(|(key, value)| (key, Json::make_string(value))),
+    )?; // cov:ignore: fixed Filespec name keys cannot trigger JsonError
 
-    // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let description = match filespec_dict.get(b"/Desc".as_slice()) {
-        Some(handle) => {
-            pdf.resolve(handle)?;
-            handle
-                .as_string()
-                .map(|bytes| {
-                    let s = decode_pdf_text_string(&bytes)
-                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-                    Json::make_string(s)
-                })
-                .unwrap_or_else(Json::make_null)
-        }
-        None => Json::make_null(),
-    };
+    let mut stream_pairs = Vec::with_capacity(streams.len());
+    for (key, stream) in streams {
+        let stream_info = {
+            let embedded_file = EmbeddedFileStream::new(stream, pdf)?;
+            let creation_date = parse_pdf_date(&embedded_file.get_creation_date()?);
+            let checksum = embedded_file.get_checksum()?;
+            let mimetype = embedded_file.get_subtype()?;
 
-    // names: collect /F, /UF, /DOS, /Mac, /Unix — each decoded as PDF text string
-    // Keys are in alphabetical order (they already are in BTreeMap).
-    let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
-    let mut names_pairs: Vec<(String, Json)> = Vec::new();
-    for key in &name_keys {
-        let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
-        let Some(handle) = filespec_dict.get(&key) else {
-            continue;
-        };
-        pdf.resolve(handle)?;
-        if let Some(bytes) = handle.as_string() {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            names_pairs.push((
-                String::from_utf8_lossy(&key).into_owned(),
-                Json::make_string(s),
-            ));
-        }
-    }
-
-    // preferredname: /UF > /F > /Unix > /DOS > /Mac — matches qpdf's
-    // `QPDFFileSpecObjectHelper::name_keys` priority order
-    // (QPDFFileSpecObjectHelper.cc), which is *not* alphabetical (/DOS comes
-    // before /Mac).
-    let preferred_name_key_order = ["UF", "F", "Unix", "DOS", "Mac"];
-    let mut preferredname = Json::make_null();
-    for key in &preferred_name_key_order {
-        let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
-        let Some(handle) = filespec_dict.get(&key) else {
-            continue;
-        };
-        pdf.resolve(handle)?;
-        if let Some(bytes) = handle.as_string() {
-            let s = decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            preferredname = Json::make_string(s);
-            break;
-        }
-    }
-
-    // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
-    let ef_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
-        match filespec_dict.get(b"/EF".as_slice()) {
-            Some(handle) => {
-                pdf.resolve(handle)?;
-                handle.as_dictionary()
-            }
-            None => None,
-        };
-
-    // preferredcontents: /EF/UF > /EF/F > /EF/Unix > /EF/DOS > /EF/Mac, same
-    // priority order as preferredname, taking the first entry that resolves
-    // to an actual stream (qpdf's `getEmbeddedFileStream()` checks
-    // `isStream()`, not merely that the key is present).
-    let preferred_ef_key_order = ["UF", "F", "Unix", "DOS", "Mac"];
-    let mut preferredcontents = Json::make_null();
-    if let Some(ref ef) = ef_dict {
-        for key in &preferred_ef_key_order {
-            let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
-            let Some(handle) = ef.get(&key) else {
-                continue;
-            };
-            let Some(r) = handle.object_ref() else {
-                continue;
-            };
-            pdf.resolve(handle)?;
-            if handle.as_stream_dict().is_some() {
-                preferredcontents = Json::make_string(format!("{} {} R", r.number, r.generation));
-                break;
-            }
-        }
-    }
-
-    // streams: for each key in /EF, build a stream-info object
-    // Keys alphabetical: /DOS, /F, /Mac, /UF, /Unix
-    let ef_key_order = ["DOS", "F", "Mac", "UF", "Unix"];
-    let mut streams_pairs: Vec<(String, Json)> = Vec::new();
-
-    if let Some(ref ef) = ef_dict {
-        for key in &ef_key_order {
-            let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
-            let Some(stream_ref) = ef.get(&key).and_then(ObjectHandle::object_ref) else {
-                continue;
-            };
-
-            let stream_handle = pdf.get_object_handle(stream_ref);
-            pdf.resolve(&stream_handle)?;
-            let Some(stream_dict) = stream_handle
-                .as_stream_dict()
-                .and_then(|d| d.as_dictionary())
-            else {
-                continue;
-            };
-
-            // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream_dict.get(b"/Subtype".as_slice()) {
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle
-                        .as_name()
-                        .map(|bytes| {
-                            Json::make_string(String::from_utf8_lossy(&bytes).into_owned())
-                        })
-                        .unwrap_or_else(Json::make_null)
-                }
-                None => Json::make_null(),
-            };
-
-            // /Params sub-dict
-            let params_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
-                match stream_dict.get(b"/Params".as_slice()) {
-                    Some(handle) => {
-                        pdf.resolve(handle)?;
-                        handle.as_dictionary()
-                    }
-                    None => None,
-                };
-
-            // checksum: /Params /CheckSum bytes → lowercase hex, or null
-            let checksum = match params_dict
-                .as_ref()
-                .and_then(|p| p.get(b"/CheckSum".as_slice()))
-            {
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle
-                        .as_string()
-                        .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
-                        .unwrap_or_else(Json::make_null)
-                }
-                None => Json::make_null(),
-            };
-
-            // creationdate: /Params /CreationDate → ISO 8601, or null
-            let creationdate = match params_dict
-                .as_ref()
-                .and_then(|p| p.get(b"/CreationDate".as_slice()))
-            {
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle
-                        .as_string()
-                        .and_then(|bytes| parse_pdf_date(&bytes))
+            // qpdf 11.9.0 reads CreationDate for both JSON date fields
+            // (`QPDFJob.cc:1319-1322`), even though the helper also exposes
+            // ModDate. Preserve that observable quirk at this boundary.
+            json_dictionary([
+                (
+                    "checksum".to_string(),
+                    if checksum.is_empty() {
+                        Json::make_null()
+                    } else {
+                        Json::make_string(checksum_to_hex(&checksum))
+                    },
+                ),
+                (
+                    "creationdate".to_string(),
+                    creation_date
+                        .clone()
                         .map(Json::make_string)
-                        .unwrap_or_else(Json::make_null)
-                }
-                None => Json::make_null(),
-            };
-
-            // modificationdate: qpdf's `QPDFJob::doJSONAttachments` reads
-            // `/Params /CreationDate` for *both* `creationdate` and
-            // `modificationdate` — a copy-paste bug (QPDFJob.cc:1319-1322 in
-            // qpdf 11.9.0, still present on qpdf `main`). Per the
-            // byte-identical mandate qpdf's behavior is replicated even where
-            // it is buggy, so `/ModDate` is deliberately never read here.
-            let modificationdate = creationdate.clone();
-
-            // Stream entry keys: checksum, creationdate, mimetype, modificationdate
-            let stream_entry = json_dictionary([
-                ("checksum".to_string(), checksum),
-                ("creationdate".to_string(), creationdate),
-                ("mimetype".to_string(), mimetype),
-                ("modificationdate".to_string(), modificationdate),
-            ])?;
-            streams_pairs.push((String::from_utf8_lossy(&key).into_owned(), stream_entry));
-        }
+                        .unwrap_or_else(Json::make_null),
+                ),
+                (
+                    "mimetype".to_string(),
+                    if mimetype.is_empty() {
+                        Json::make_null()
+                    } else {
+                        Json::make_string(mimetype)
+                    },
+                ),
+                (
+                    "modificationdate".to_string(),
+                    creation_date
+                        .map(Json::make_string)
+                        .unwrap_or_else(Json::make_null),
+                ),
+            ])? // cov:ignore: fixed embedded-file schema keys cannot trigger JsonError
+        };
+        // Keep the raw `/EF` key bytes rather than lossy-decoding to `String`:
+        // two distinct byte-valued keys (e.g. `/#FE` and `/#FF`) can both
+        // decode to U+FFFD under `from_utf8_lossy`, which would collide in
+        // `json_dictionary` and silently drop one stream entry.
+        stream_pairs.push((key, stream_info));
     }
 
     json_dictionary([
         ("description".to_string(), description),
         ("filespec".to_string(), filespec_value),
-        ("names".to_string(), json_dictionary(names_pairs)?),
-        ("preferredcontents".to_string(), preferredcontents),
-        ("preferredname".to_string(), preferredname),
-        ("streams".to_string(), json_dictionary(streams_pairs)?),
+        ("names".to_string(), names),
+        (
+            "preferredcontents".to_string(),
+            Json::make_string(preferred_contents),
+        ),
+        ("preferredname".to_string(), preferred_name),
+        ("streams".to_string(), json_dictionary(stream_pairs)?),
     ])
 }
 
@@ -883,19 +751,11 @@ pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Jso
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Build the output object. Both indirect and direct Filespec handles yield
-    // an attachments entry.
+    // Build the output object. Both indirect and direct Filespec handles use
+    // the same qpdf-shaped helper boundary.
     let mut pairs: Vec<(String, Json)> = Vec::new();
     for (name, filespec) in raw_entries {
-        let entry = if let Some(filespec_ref) = filespec.object_ref() {
-            filespec_to_json(pdf, filespec_ref)?
-        } else {
-            pdf.resolve(&filespec)?;
-            let Some(dict) = filespec.as_dictionary() else {
-                continue;
-            };
-            filespec_dict_to_json(pdf, &dict, None)?
-        };
+        let entry = filespec_handle_to_json(pdf, filespec)?;
         pairs.push((name, entry));
     }
 
