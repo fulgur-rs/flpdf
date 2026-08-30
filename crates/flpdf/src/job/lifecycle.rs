@@ -20,8 +20,9 @@ use crate::json::input::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectStreamMode, PageDocumentHelper, Pdf, PdfOpenOptions,
-    PdfWriter, QPDFLogger, ReadSeek, Result, Severity, UsageError, WriterConfiguration,
+    AcroFormDocumentHelper, Error, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, Pdf,
+    PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, Severity, UsageError,
+    WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::fs::File;
@@ -88,6 +89,7 @@ struct JobConfiguration {
     split_pages: Option<usize>,
     rotations: Vec<RotateSpec>,
     remove_restrictions: bool,
+    coalesce_contents: bool,
     writer: WriterConfiguration,
     linearize: bool,
     linearize_pass1: Option<PathBuf>,
@@ -1144,7 +1146,8 @@ impl QPDFJob {
     ///
     /// This implements the qpdf job-JSON fields currently owned by this
     /// lifecycle, including input/output setup, writer settings, page
-    /// transformations (`splitPages`, `rotate`, and `removeRestrictions`),
+    /// transformations (`splitPages`, `rotate`, `removeRestrictions`, and
+    /// `coalesceContents`),
     /// attachments, page selection, and JSON output.
     ///
     /// # Errors
@@ -1312,6 +1315,7 @@ impl QPDFJob {
             configuration.rotations.push(rotation);
         }
         configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
+        configuration.coalesce_contents = job_json_bare(&members, b"coalesceContents")?;
         if let Some(value) = job_json_choice(
             &members,
             b"objectStreams",
@@ -1885,6 +1889,18 @@ impl QPDFJob {
         if configuration.remove_restrictions {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
             let _ = acroform.disable_digital_signatures()?;
+        }
+
+        // qpdf's `handleTransformations` coalesces every page after the
+        // earlier document transformations and before later page-label/output
+        // completion (`QPDFJob.cc:2185-2188`). Keep the existing lazy,
+        // provider-backed PageObjectHelper route; do not decode page contents
+        // into a new eager buffer here.
+        if configuration.coalesce_contents {
+            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+            for page_ref in page_refs {
+                PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
+            }
         }
 
         self.apply_page_label_transformations(pdf, configuration)?;
