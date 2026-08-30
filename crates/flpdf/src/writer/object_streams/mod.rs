@@ -1420,7 +1420,8 @@ mod tests {
         for (index, (_, expected_obj)) in members.iter().enumerate() {
             let parsed = crate::reader::parse_object_stream_entry(&stream, index as u32).unwrap();
             assert_eq!(
-                &parsed.object, expected_obj,
+                parsed.object.as_integer(),
+                expected_obj.as_integer(),
                 "round-trip mismatch at index {index}"
             );
         }
@@ -1560,8 +1561,16 @@ mod tests {
         let parsed0 = crate::reader::parse_object_stream_entry(&stream, 0).unwrap();
         let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
 
-        assert_eq!(parsed0.object, obj1, "index 0 must parse to Integer(42)");
-        assert_eq!(parsed1.object, obj2, "index 1 must parse to Integer(99)");
+        assert_eq!(
+            parsed0.object.as_integer(),
+            Some(42),
+            "index 0 must parse to Integer(42)"
+        );
+        assert_eq!(
+            parsed1.object.as_integer(),
+            Some(99),
+            "index 1 must parse to Integer(99)"
+        );
     }
 
     #[test]
@@ -1585,8 +1594,16 @@ mod tests {
 
         let parsed0 = crate::reader::parse_object_stream_entry(&stream, 0).unwrap();
         let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
-        assert_eq!(parsed0.object, obj1, "index 0 must parse to Integer(42)");
-        assert_eq!(parsed1.object, obj2, "index 1 must parse to Integer(99)");
+        assert_eq!(
+            parsed0.object.as_integer(),
+            Some(42),
+            "index 0 must parse to Integer(42)"
+        );
+        assert_eq!(
+            parsed1.object.as_integer(),
+            Some(99),
+            "index 1 must parse to Integer(99)"
+        );
     }
 
     #[test]

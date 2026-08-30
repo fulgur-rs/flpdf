@@ -152,56 +152,6 @@ impl HandleResolver for DetachedHandles {
     }
 }
 
-#[cfg(test)]
-fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
-    if let Some(object_ref) = handle.as_reference() {
-        return Ok(Object::Reference(object_ref));
-    }
-    if handle.is_null() {
-        return Ok(Object::Null);
-    }
-    if let Some(value) = handle.as_boolean() {
-        return Ok(Object::Boolean(value));
-    }
-    if let Some(value) = handle.as_integer() {
-        return Ok(Object::Integer(value));
-    }
-    if let Some((value, literal)) = handle.as_real_literal() {
-        return Ok(Object::RealLiteral { value, literal });
-    }
-    if let Some(value) = handle.as_real() {
-        return Ok(Object::Real(value));
-    }
-    if let Some(value) = handle.as_name() {
-        return Ok(Object::Name(value));
-    }
-    if let Some(value) = handle.as_string() {
-        return Ok(Object::String(value));
-    }
-    if let Some(values) = handle.as_array() {
-        return values
-            .iter()
-            .map(materialize_live_handle)
-            .collect::<Result<Vec<_>>>()
-            .map(Object::Array);
-    }
-    if let Some(values) = handle.as_dictionary() {
-        let mut dictionary = Dictionary::new();
-        for (key, value) in values {
-            dictionary.insert(
-                crate::object_handle::legacy_dictionary_key(&key),
-                materialize_live_handle(&value)?,
-            );
-        }
-        return Ok(Object::Dictionary(dictionary));
-    } // cov:ignore: LLVM attributes the exercised dictionary return to its closing delimiter.
-      // cov:ignore-start: LiveFileParser's file-object grammar only produces the arms above.
-    Err(Error::Internal(
-        "live parser produced an unmaterializable direct object handle".into(),
-    ))
-    // cov:ignore-end
-}
-
 /// Pulls exactly one token at a time from a live [`LiveInput`] through the
 /// existing qpdf-shaped push tokenizer.
 ///
@@ -843,9 +793,9 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 #[cfg(test)]
 mod live_input_tests {
     use super::{
-        parse_live_file_object, parse_live_file_object_with_decrypter, parse_qpdf_file_object,
-        HandleResolver, LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource,
-        SliceLiveInput, StringDecrypter, MAX_PARSE_DEPTH,
+        parse_live_file_object, parse_live_file_object_with_decrypter, HandleResolver,
+        LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource, SliceLiveInput,
+        StringDecrypter, MAX_PARSE_DEPTH,
     };
     use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
@@ -1298,19 +1248,22 @@ mod live_input_tests {
 
     #[test]
     fn objstm_member_uses_the_live_file_recovery_and_decoded_stream_offsets() {
-        // `parse_qpdf_file_object` is consumed by `parse_object_stream_entry`.
         // This is deliberately malformed: qpdf keeps the scalar under a fake
         // key and warns at qpdf's dictionary-frame offset (just after `<<`),
         // rather than taking the legacy strict-parser error branch.
-        let (object, diagnostics) =
-            parse_qpdf_file_object(b"<< 12 >> next-member").expect("recovered ObjStm member");
+        let mut input = CountingInput::new(b"<< 12 >> next-member");
+        let mut resolver = NullResolver;
+        let parsed =
+            parse_live_file_object(&mut input, &mut resolver).expect("recovered ObjStm member");
+        let object = parsed.value;
+        let diagnostics = parsed.diagnostics;
 
         assert_eq!(
             object
-                .as_dict()
-                .and_then(|dict| dict.get("QPDFFake1"))
-                .cloned(),
-            Some(crate::Object::Integer(12))
+                .try_get_key(b"/QPDFFake1")
+                .expect("fake key")
+                .as_integer(),
+            Some(12)
         );
         assert_eq!(
             diagnostics
@@ -1322,6 +1275,20 @@ mod live_input_tests {
                 "expected dictionary key but found non-name object; inserting key /QPDFFake1"
             )]
         );
+    }
+
+    #[test]
+    fn live_parser_returns_handle_children() {
+        let mut input = CountingInput::new(b"<< /Child 4 >>");
+        let mut resolver = NullResolver;
+        let parsed = parse_live_file_object(&mut input, &mut resolver)
+            .expect("live object parser returns a handle");
+
+        let child = parsed
+            .value
+            .try_get_key(b"/Child")
+            .expect("dictionary child");
+        assert_eq!(child.as_integer(), Some(4));
     }
 
     #[test]
@@ -1558,8 +1525,18 @@ mod live_input_tests {
         assert_eq!(empty.empty, Some(0));
         assert_eq!(live_input.position, 0, "endobj remains unread");
 
-        let (object, diagnostics) = parse_qpdf_file_object(b"endobj").expect("ObjStm empty");
-        assert_eq!(object, crate::Object::Null);
+        let mut empty_input = CountingInput::new(b"endobj");
+        let mut empty_resolver = NullResolver;
+        let parsed =
+            parse_live_file_object(&mut empty_input, &mut empty_resolver).expect("ObjStm empty");
+        assert!(parsed.value.is_null());
+        let mut diagnostics = parsed.diagnostics;
+        if let Some(empty_offset) = parsed.empty {
+            diagnostics.push(super::ParserDiagnostic {
+                relative_offset: usize::try_from(empty_offset).unwrap_or(usize::MAX),
+                message: "empty object treated as null".to_string(),
+            });
+        }
         assert_eq!(
             diagnostics
                 .iter()
@@ -1666,27 +1643,6 @@ pub(crate) fn parse_indirect_object_with_diagnostics(
         completed.object,
         completed.diagnostics,
     ))
-}
-
-/// Parse one object using qpdf's file-object rules. A bare `N G R` at the
-/// outermost level is recovered as integer `N`; references nested inside
-/// arrays, dictionaries, and stream dictionaries retain their usual meaning.
-/// Object-stream members use this mode without any `endobj` check because an
-/// ObjStm body contains only adjacent direct-object representations.
-#[cfg(test)]
-pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
-    let mut input = SliceLiveInput::new(input);
-    let mut handles = DetachedHandles::default();
-    let parsed = parse_live_file_object(&mut input, &mut handles)?;
-    let object = materialize_live_handle(&parsed.value)?;
-    let mut diagnostics = parsed.diagnostics;
-    if let Some(empty_offset) = parsed.empty {
-        diagnostics.push(ParserDiagnostic {
-            relative_offset: usize::try_from(empty_offset).unwrap_or(usize::MAX),
-            message: "empty object treated as null".to_string(),
-        });
-    }
-    Ok((object, diagnostics))
 }
 
 #[derive(Debug, PartialEq)]

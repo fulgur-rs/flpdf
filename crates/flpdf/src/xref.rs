@@ -459,20 +459,39 @@ impl BootstrapHandleDocument {
             description,
         };
         let pending = parse_file_object_handle_syntax(input, &mut parser)?;
-        let resolved_length =
-            pending
-                .indirect_length_ref()
-                .map(|object_ref| match self.resolve_length(object_ref) {
-                    Some(value) => ResolvedStreamLength::Integer(value),
-                    None => ResolvedStreamLength::Missing,
-                });
+        let resolved_length = pending
+            .indirect_length_ref()
+            .map(|object_ref| self.resolve_length(object_ref));
         let _ = (absolute_offset, description);
         finish_file_object_handle(input, pending, resolved_length, policy)
     }
 
-    fn resolve_length(&self, object_ref: ObjectRef) -> Option<i64> {
+    // Mirrors qpdf's own three-way `/Length` classification (an integer, a
+    // resolved null, or anything else) rather than collapsing "resolved but
+    // not an integer" into the same Missing case as "genuinely absent" --
+    // the raw parser's own `resolve_stream_length` (this file, further down)
+    // keeps the same three-way split and must report the same
+    // "/Length key in stream dictionary is not an integer" diagnostic for a
+    // hybrid xref stream whose /Length resolves through the active classic
+    // table to a non-integer object.
+    fn resolve_length(&self, object_ref: ObjectRef) -> ResolvedStreamLength {
         let handle = self.handle_for_reference(object_ref);
-        handle.try_as_integer().ok().flatten()
+        match handle.try_as_integer() {
+            Ok(Some(value)) => ResolvedStreamLength::Integer(value),
+            Ok(None) => {
+                if handle.try_is_null().unwrap_or(true) {
+                    ResolvedStreamLength::Missing
+                } else {
+                    ResolvedStreamLength::Invalid
+                }
+            }
+            // `resolve_indirect` above catches every resolution failure and
+            // falls back to a warned Null rather than propagating Err, so
+            // try_as_integer never actually returns Err for a handle from
+            // this resolver; kept only for symmetry with the general
+            // ObjectHandle contract, matching the prior `.ok()` fallback.
+            Err(_) => ResolvedStreamLength::Missing, // cov:ignore: this resolver's resolve_indirect never propagates Err
+        }
     }
 
     fn read_uncompressed_object(
@@ -609,18 +628,48 @@ impl BootstrapHandleDocument {
                 document: self,
                 description: XrefObjectDescription::Ordinary,
             };
-            let parsed = parse_qpdf_file_object_handle_with_diagnostics(
+            let parsed = match parse_qpdf_file_object_handle_with_diagnostics(
                 &decoded[member_start..],
                 i64::try_from(member_start).unwrap_or(i64::MAX),
                 Some(i64::try_from(member_start).unwrap_or(i64::MAX)),
                 &mut parser,
-            )?;
-            for diagnostic in parsed.diagnostics {
+            ) {
+                Ok(parsed) => parsed,
+                // Mirror `XrefReadContext::resolve_objects_in_stream`'s own
+                // member-context wrapping: a raw parse error must carry the
+                // same "object stream N (object M 0, offset ...)" identity
+                // and rebased offset a successfully-parsed member's
+                // diagnostics already get below, not the raw member-relative
+                // offset/message.
+                Err(error) => {
+                    return Err(match error.rebase_offset(member_start) {
+                        Error::Parse { offset, message } => Error::parse(
+                            offset,
+                            format!(
+                                "object stream {stream_number} (object {} 0, offset {offset}): {message}",
+                                object_ref.number
+                            ),
+                        ),
+                        other => other, // cov:ignore: byte-backed direct parser errors are parse errors
+                    });
+                }
+            };
+            for diagnostic in &parsed.diagnostics {
                 let offset = member_start.saturating_add(diagnostic.relative_offset);
                 self.push_warning(
                     format!(
                         "object stream {stream_number} (object {} 0, offset {offset}): {}",
                         object_ref.number, diagnostic.message
+                    ),
+                    Some(offset as u64),
+                );
+            }
+            if let Some(empty_offset) = parsed.empty_offset {
+                let offset = member_start.saturating_add(empty_offset);
+                self.push_warning(
+                    format!(
+                        "object stream {stream_number} (object {} 0, offset {offset}): empty object treated as null",
+                        object_ref.number
                     ),
                     Some(offset as u64),
                 );
@@ -3094,23 +3143,6 @@ fn parse_xref_stream(
     // cumulative registration receives these entries.
     let (build_result, reconstruction_trigger, bootstrap_cache) = {
         let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-        let mut completed = match context.read_file_object(
-            tail,
-            xref_pos as u64,
-            policy,
-            XrefObjectDescription::XrefStream,
-        ) {
-            Ok(completed) => completed,
-            Err(error) => {
-                context.append_diagnostics_to(&mut repair_diagnostics);
-                if let Some(sink) = error_diagnostics_sink {
-                    for diagnostic in repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
-                }
-                return Err(error.rebase_offset(xref_pos));
-            }
-        };
         let mut handle_completed = match context.read_file_object_handle(
             tail,
             xref_pos as u64,
@@ -3131,11 +3163,35 @@ fn parse_xref_stream(
         };
         // Xref streams are not encrypted, but filter decoding still requires
         // the logical payload rather than qpdf's raw recovery EOL.
-        let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
         let _recovered_handle_eol = handle_completed.remove_included_recovery_eol_for_decryption();
-        let object_ref = completed.object_ref;
-        let object = completed.object;
         let handle_object = handle_completed.object;
+        let object_ref = handle_completed.object_ref;
+        // `LoadedXref` still exposes the pre-cutover raw trailer boundary to
+        // the reader/cache slice. Materialize only this already-parsed xref
+        // stream at that existing boundary; the parser itself has one
+        // handle-native pass and no detached raw parser duplicate.
+        let object = handle_object
+            .materialize()
+            .map_err(|error| error.rebase_offset(xref_pos))?;
+        // Push through `context.diagnostics` -- not directly into
+        // `repair_diagnostics` -- so these framing diagnostics land AFTER
+        // whatever `read_file_object_handle`'s own `sync_handle_diagnostics`
+        // call already synced there (for example a warning raised while
+        // resolving this stream's indirect `/Length` target, which runs
+        // before `finish_file_object_handle` produces these diagnostics).
+        // `context.append_diagnostics_to` below drains `context.diagnostics`
+        // into `repair_diagnostics` in that same, qpdf-matching temporal
+        // order; pushing straight into `repair_diagnostics` here would
+        // report the recovery notice before the resolution warning that
+        // caused it.
+        for diagnostic in &handle_completed.diagnostics {
+            context.diagnostics.push(xref_file_object_diagnostic(
+                XrefObjectDescription::XrefStream,
+                object_ref,
+                xref_pos as u64,
+                diagnostic.clone(),
+            ));
+        }
         // qpdf's own read of this object (`readObjectAtOffset`, `QPDF.cc:956`)
         // happens before `processXRefStream` validates `/Type`, `/W`, `/Index`,
         // `/Size`, or the entry data (`QPDF.cc:960-1128`); any repair warning
@@ -4435,6 +4491,117 @@ mod tests {
                 .try_as_integer()
                 .unwrap(),
             Some(42)
+        );
+    }
+
+    #[test]
+    fn bootstrap_document_resolve_objects_in_stream_wraps_a_malformed_member_error() {
+        // Same malformed-member payload
+        // (`bootstrap_document_reports_object_stream_decode_and_member_failures`)
+        // that `resolve_indirect`'s outer try/catch degrades to a warning,
+        // but called directly so the raw error `resolve_objects_in_stream`
+        // itself produces is observable. `XrefReadContext::resolve_objects_in_stream`
+        // wraps a member parse error with the same
+        // "object stream N (object M 0, offset ...)" identity its own
+        // per-diagnostic loop uses; `BootstrapHandleDocument`'s copy must
+        // match rather than propagate the raw, unwrapped parser error.
+        let malformed_member_payload = b"2 0 [ 2147483648 0 R ]";
+        let malformed_member_first = b"2 0 ".len();
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First {malformed_member_first} /Length {} >>\nstream\n",
+                malformed_member_payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(malformed_member_payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let document = BootstrapHandleDocument::new(
+            &bytes,
+            XrefEntryLookup::Registration(&registration.entries),
+            XrefLoadOptions::default(),
+        );
+        let error = document
+            .resolve_objects_in_stream(8)
+            .expect_err("a malformed member must propagate a parse error");
+        assert!(
+            error
+                .to_string()
+                .contains("object stream 8 (object 2 0, offset"),
+            "expected the member-context wrapper, got: {error}"
+        );
+        assert!(error.to_string().contains("integer out of range"));
+    }
+
+    #[test]
+    fn bootstrap_document_resolve_objects_in_stream_reports_an_empty_member_as_null() {
+        // qpdf's tokenizer-level "empty object" detection triggers on seeing
+        // the literal word "endobj" as the very next token
+        // (`parse_live_file_object`'s own first-token check, this crate's
+        // parser.rs) -- the same check runs for an object-stream member
+        // parsed through this mode, so a member whose content happens to be
+        // exactly "endobj" hits it too. `XrefReadContext::resolve_objects_in_stream`
+        // forwards `parsed.empty_offset` as an "empty object treated as
+        // null" diagnostic; `BootstrapHandleDocument`'s copy must do the
+        // same instead of silently resolving to null with no diagnostic at
+        // all.
+        let members: [(u32, &[u8]); 1] = [(2, b"endobj".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let document = BootstrapHandleDocument::new(
+            &bytes,
+            XrefEntryLookup::Registration(&registration.entries),
+            XrefLoadOptions::default(),
+        );
+        document
+            .resolve_objects_in_stream(8)
+            .expect("an empty member resolves to null, not an error");
+        let member = document.handle_for_reference(ObjectRef::new(2, 0));
+        assert!(member.is_null());
+        assert!(
+            document
+                .state
+                .borrow()
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("object stream 8 (object 2 0, offset")
+                    && diagnostic.message.contains("empty object treated as null")),
+            "expected an empty-object diagnostic, got: {:?}",
+            document.state.borrow().diagnostics.entries() // cov:ignore: LLVM attributes this trailing assert! format argument to a line that only runs on failure
         );
     }
 

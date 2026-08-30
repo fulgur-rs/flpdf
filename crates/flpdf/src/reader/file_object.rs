@@ -217,7 +217,8 @@ pub(crate) fn parse_file_object_handle_syntax(
         i64::try_from(body_start).unwrap_or(i64::MAX),
         Some(i64::try_from(body_start).unwrap_or(i64::MAX)),
         resolver,
-    )?;
+    )
+    .map_err(|error| error.rebase_offset(body_start))?;
     let next_offset = body_start.saturating_add(parsed.next_offset);
     let mut diagnostics = parsed
         .diagnostics
