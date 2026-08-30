@@ -2429,7 +2429,6 @@ impl ObjectHandle {
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
-            eprintln!("TRACE DROPPED object={object_ref:?} handle={self:?}");
             return Err(Error::Internal(format!(
                 "object {} {} belongs to a dropped PDF",
                 object_ref.number, object_ref.generation

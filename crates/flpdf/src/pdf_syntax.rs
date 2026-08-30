@@ -21,11 +21,19 @@ pub(crate) fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
 }
 
 /// Escape decoded PDF name bytes into a single PDF name token.
+///
+/// `QPDFTokenizer` uses a raw NUL byte as a sentinel for a recoverable stray
+/// `#` (`libqpdf/QPDFTokenizer.cc:441-465`, "Use null to encode a bad #");
+/// `QPDF_Name::normalizeName` restores that sentinel to a bare `#` when
+/// serializing (`libqpdf/QPDF_Name.cc:35-37`). A genuine `#00` escape is
+/// never decoded to a raw NUL by the tokenizer in the first place -- it is
+/// kept as the literal three-byte text `#00` (`QPDFTokenizer.cc:471-475`) --
+/// so a raw NUL byte reaching this function can only be that sentinel.
 pub(crate) fn write_name_escaped(out: &mut Vec<u8>, raw: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in raw {
         if byte == 0 {
-            out.extend_from_slice(b"#00");
+            out.push(b'#');
             continue;
         }
         let needs_escape = !(0x21..=0x7e).contains(&byte)
@@ -127,6 +135,18 @@ mod tests {
     fn name_escaping_covers_nul_delimiters_and_non_ascii_bytes() {
         let mut output = Vec::new();
         write_name_escaped(&mut output, b"a\0#/ \x80z");
-        assert_eq!(output, b"a#00#23#2f#20#80z");
+        assert_eq!(output, b"a##23#2f#20#80z");
+    }
+
+    #[test]
+    fn name_escaping_restores_the_stray_hash_sentinel_as_a_bare_hash() {
+        // The tokenizer's recoverable-stray-# sentinel (a raw NUL byte) must
+        // round-trip back to a bare `#`, matching qpdf's
+        // `QPDF_Name::normalizeName` (`libqpdf/QPDF_Name.cc:35-37`) -- not
+        // `#00`, which is a distinct, valid escape for an actual NUL that the
+        // tokenizer never decodes to a raw byte in the first place.
+        let mut output = Vec::new();
+        write_name_escaped(&mut output, b"a\0\x31x");
+        assert_eq!(output, b"a#1x");
     }
 }
