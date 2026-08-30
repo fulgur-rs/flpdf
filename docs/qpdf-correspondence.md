@@ -557,6 +557,13 @@ warning として記録し、空の `id1` で暗号鍵導出を継続する。`f
 一度だけ同じ非致命経路へ送る。正確に2要素で第1要素が文字列なら、空文字列も有効値として
 警告しない。
 
+`flpdf-5lsj` では、`QPDF::readTrailer` が `InputSource::getLastOffset()` を保持したまま
+`initializeEncryption` の `damagedPDF("trailer", message)` に渡す責務
+（`QPDF.cc:1313-1327,2625-2628`）も移植した。初期xref/trailer読込をbyte snapshotで
+行うflpdfでは、その論理`startxref`をresolverの共有入力sourceへseedし、
+`push_trailer_warning_at` が `(trailer, offset N): ...` を診断とloggerへ一度だけ渡す。
+pinned qpdf 11.9.0 と `/usr/bin/qpdf` の malformed `/ID` probe（offset 416）で一致する。
+
 暗号の責務境界は `QPDFJob.cc:2753-2761` の `setEncryptionOptions` が新規RC4書き込みだけを
 `allow_weak_crypto` で拒否する形であり、既存のRC4/R=5入力を読む経路にはこの拒否がない。
 flpdfも `PdfOpenOptions` のread-side opt-in/error gateを撤去し、`--allow-weak-crypto` は

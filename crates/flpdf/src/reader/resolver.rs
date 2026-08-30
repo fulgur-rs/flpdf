@@ -442,7 +442,7 @@ fn route_warning(
     if suppress_warnings {
         return Ok(());
     }
-    if message.starts_with("(object ") {
+    if message.starts_with("(object ") || message.starts_with("(trailer") {
         let separator = if description.is_empty() { "" } else { " " };
         return logger.warn(format!("WARNING: {description}{separator}{message}\n"));
     }
@@ -1592,6 +1592,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.push_warning_with_offset(Some(offset), None, message)
     }
 
+    /// Append qpdf's `damagedPDF("trailer", message)` warning shape.
+    ///
+    /// `QPDF::readTrailer` leaves the parser's input-source offset in
+    /// `getLastOffset()` before `initializeEncryption` reports malformed
+    /// `/ID` (`libqpdf/QPDF.cc:1313-1327`;
+    /// `libqpdf/QPDF_encryption.cc:718-751`). The trailer location is already
+    /// part of the exception text, so the generic input warning formatter must
+    /// not add a second `(offset ...)` wrapper when this warning is replayed.
+    pub(crate) fn push_trailer_warning_at(
+        &self,
+        offset: u64,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let (diagnostic_offset, location) = if offset > 0 {
+            (Some(offset), format!("(trailer, offset {offset})"))
+        } else {
+            (None, "(trailer)".to_owned())
+        };
+        self.push_warning_with_offset(
+            diagnostic_offset,
+            None,
+            format!("{location}: {}", message.into()),
+        )
+    }
+
     /// Emit a warning from qpdf's JSON input reactor.
     ///
     /// `QPDF::warn(qpdf_e_json, object, offset, message)` formats the PDF
@@ -2498,6 +2523,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// physical read offset when wrapping a damaged parameter error.
     pub(crate) fn last_offset(&self) -> u64 {
         self.core.borrow().input.last_offset()
+    }
+
+    /// Seed the shared input source's qpdf-style last-read position after the
+    /// initial xref/trailer snapshot has been loaded outside the resolver.
+    pub(crate) fn set_last_offset(&self, offset: u64) {
+        self.core.borrow().input.last_offset.set(offset);
     }
 
     /// Return the logical source bytes while restoring the resolver's current
@@ -4770,6 +4801,61 @@ mod tests {
         assert_eq!(
             output.lock().unwrap().as_slice(),
             b"WARNING: input.pdf (object 5 0, offset 123): expected endobj\n"
+        );
+    }
+
+    #[test]
+    fn warning_location_does_not_repeat_offset_for_trailer_prefixed_message() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+
+        super::route_warning(
+            &logger,
+            false,
+            "input.pdf",
+            Some(416),
+            "(trailer, offset 416): invalid /ID in trailer dictionary",
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: input.pdf (trailer, offset 416): invalid /ID in trailer dictionary\n"
+        );
+    }
+
+    #[test]
+    fn trailer_warning_without_positive_offset_omits_offset_like_qpdf() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, String::new()),
+            0,
+        );
+
+        resolver
+            .push_trailer_warning_at(0, "invalid /ID in trailer dictionary")
+            .expect("warning delivery");
+
+        assert_eq!(
+            resolver.repair_diagnostics().entries()[0].message,
+            "(trailer): invalid /ID in trailer dictionary"
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: (trailer): invalid /ID in trailer dictionary\n"
         );
     }
 

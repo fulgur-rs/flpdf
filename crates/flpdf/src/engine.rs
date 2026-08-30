@@ -168,6 +168,12 @@ impl<R: Read + Seek> Pdf<R> {
             warning_options,
             unique_id,
         );
+        // qpdf's readTrailer resets InputSource::last_offset to the xref
+        // read position before initializeEncryption runs
+        // (QPDF.cc:1313-1327). Xref loading happens in a byte snapshot before
+        // the canonical resolver is constructed, so seed its shared input
+        // source with the same logical startxref position.
+        resolver.set_last_offset(loaded.startxref);
         resolver.replay_warnings(&initial_diagnostics)?;
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
         // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
@@ -583,6 +589,24 @@ mod tests {
                 .count(),
             1
         );
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("invalid /ID in trailer dictionary")
+            })
+            .expect("the malformed /ID warning must be recorded");
+        assert_eq!(
+            warning.offset,
+            Some(416),
+            "qpdf's damagedPDF(trailer, message) uses the input last offset"
+        );
+        assert_eq!(
+            warning.message,
+            "(trailer, offset 416): invalid /ID in trailer dictionary"
+        );
     }
 
     #[test]
@@ -621,6 +645,59 @@ mod tests {
                     .contains("invalid /ID in trailer dictionary"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn malformed_id_warning_keeps_qpdf_offset_after_xref_recovery() {
+        let mut bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"),
+        )
+        .expect("encrypted fixture must exist");
+        let id_offset = bytes
+            .windows(b"/ID".len())
+            .rposition(|window| window == b"/ID")
+            .expect("encrypted fixture must contain a trailer /ID");
+        bytes[id_offset..id_offset + b"/ID".len()].copy_from_slice(b"/XX");
+
+        let old_startxref = b"startxref\n416\n";
+        let startxref_offset = bytes
+            .windows(old_startxref.len())
+            .rposition(|window| window == old_startxref)
+            .expect("encrypted fixture must contain its startxref value");
+        bytes.splice(
+            startxref_offset..startxref_offset + old_startxref.len(),
+            b"startxref\n999999\n".iter().copied(),
+        );
+
+        let pdf = Pdf::open_for_encryption_inspection(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                password: b"5042ec4efa389ea32a149ab2a34e84fc".to_vec(),
+                password_is_hex_key: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf continues after recovering a malformed startxref");
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("invalid /ID in trailer dictionary")
+            })
+            .expect("the malformed /ID warning must be recorded");
+        assert_eq!(
+            warning.offset,
+            Some(416),
+            "qpdf retains the recovered encryption object's input offset"
+        );
+        assert_eq!(
+            warning.message,
+            "(trailer, offset 416): invalid /ID in trailer dictionary"
         );
     }
 
