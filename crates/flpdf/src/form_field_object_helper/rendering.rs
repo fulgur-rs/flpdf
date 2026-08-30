@@ -648,17 +648,25 @@ fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) 
             offset: usize,
             length: usize,
         ) -> Result<ParseControl> {
-            if object.as_operator().as_deref() == Some(b"Tf") {
-                if let [.., name, size] = self.operands.as_slice() {
-                    if let (Some(_), Some(value)) = (
-                        name.0.as_name(),
-                        size.0
-                            .as_real()
-                            .or_else(|| size.0.as_integer().map(|n| n as f64)),
-                    ) {
-                        self.tf_size_span = Some((size.1, size.2, value));
+            if let Some(operator) = object.as_operator() {
+                if operator.as_slice() == b"Tf" {
+                    if let [.., name, size] = self.operands.as_slice() {
+                        if let (Some(_), Some(value)) = (
+                            name.0.as_name(),
+                            size.0
+                                .as_real()
+                                .or_else(|| size.0.as_integer().map(|n| n as f64)),
+                        ) {
+                            self.tf_size_span = Some((size.1, size.2, value));
+                        }
                     }
                 }
+                // Every operator is an operand-stack boundary, matching
+                // `OperationCallbacks::handle_object` (`content_stream.rs`):
+                // clearing only on `Tf` would let any other operator (`g`,
+                // `cm`, ...) fall through and be retained as a bogus operand
+                // for the rest of the string, growing unboundedly on a
+                // malformed `/DA` with many non-`Tf` operators.
                 self.operands.clear();
             } else if object.as_inline_image().is_none() {
                 self.operands.push((object, offset, length));

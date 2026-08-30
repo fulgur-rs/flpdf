@@ -702,7 +702,11 @@ fn filespec_handle_to_json<R: Read + Seek>(
                 ),
             ])? // cov:ignore: fixed embedded-file schema keys cannot trigger JsonError
         };
-        stream_pairs.push((String::from_utf8_lossy(&key).into_owned(), stream_info));
+        // Keep the raw `/EF` key bytes rather than lossy-decoding to `String`:
+        // two distinct byte-valued keys (e.g. `/#FE` and `/#FF`) can both
+        // decode to U+FFFD under `from_utf8_lossy`, which would collide in
+        // `json_dictionary` and silently drop one stream entry.
+        stream_pairs.push((key, stream_info));
     }
 
     json_dictionary([
