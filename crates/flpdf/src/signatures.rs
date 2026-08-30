@@ -249,7 +249,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
 
     let signature_value_ref = entries
         .get(b"/V".as_slice())
-        .and_then(|value| value.object_ref().or_else(|| value.object_ref()));
+        .and_then(|value| value.object_ref());
     let has_signature_value = entries.contains_key(b"/V".as_slice());
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
@@ -384,7 +384,7 @@ fn signature_info_for_field<R: Read + Seek>(
     let Some(value) = FormFieldObjectHelper::new(field_ref, pdf).field_value_handle()? else {
         return Ok(None);
     };
-    let signature_ref = value.object_ref().or_else(|| value.object_ref());
+    let signature_ref = value.object_ref();
     let value = resolve_handle(pdf, &value)?;
     let Some(signature_dict) = value.as_dictionary() else {
         return Ok(None);

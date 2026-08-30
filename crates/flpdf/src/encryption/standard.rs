@@ -1553,6 +1553,38 @@ pub(crate) fn encrypt_cipher_bytes(
     }
 }
 
+#[cfg(test)]
+mod v5_dictionary_tests {
+    use super::{build_v5_r5_encrypt_dict, V5R5Secrets, V5R6EncryptParams};
+
+    #[test]
+    fn v5_r5_dictionary_emits_encrypt_metadata_false() {
+        let secrets = V5R5Secrets {
+            file_key: [1; 32],
+            user_validation_salt: [2; 8],
+            user_key_salt: [3; 8],
+            owner_validation_salt: [4; 8],
+            owner_key_salt: [5; 8],
+            perms_random_tail: [6; 4],
+        };
+        let params = V5R6EncryptParams {
+            user_password: b"user",
+            owner_password: b"owner",
+            p: -4,
+            encrypt_metadata: false,
+        };
+
+        let dictionary = build_v5_r5_encrypt_dict(&params, &secrets).expect("valid V=5 R=5 data");
+        assert_eq!(
+            dictionary
+                .try_get_key(b"/EncryptMetadata")
+                .expect("dictionary lookup")
+                .as_boolean(),
+            Some(false)
+        );
+    }
+}
+
 fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
     // `encrypt_padded::<Pkcs7>` always appends at least one byte of
     // padding (a full block of `0x10` when plaintext is block-aligned), so

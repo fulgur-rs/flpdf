@@ -601,9 +601,6 @@ pub(crate) fn canonical_trailer_entries_with_visibility(
         if value
             .object_ref()
             .is_some_and(|object_ref| object_ref.number == 0 || removed_refs.contains(&object_ref))
-            || value.object_ref().is_some_and(|object_ref| {
-                object_ref.number == 0 || removed_refs.contains(&object_ref)
-            })
             || (suppress_null_values && value.try_is_null()?)
         {
             continue;

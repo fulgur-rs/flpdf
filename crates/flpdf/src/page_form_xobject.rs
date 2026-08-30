@@ -290,7 +290,7 @@ fn inherited_box_array<R: Read + Seek>(
             }
         }
 
-        match parent_val.and_then(|value| value.object_ref().or_else(|| value.object_ref())) {
+        match parent_val.and_then(|value| value.object_ref()) {
             Some(r) => {
                 current = r;
                 depth += 1;
@@ -336,7 +336,7 @@ fn resolve_rect_array<R: Read + Seek>(
 /// the private redirect shape used by older mutation fixtures.
 #[cfg(test)]
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
-    handle.object_ref().or_else(|| handle.object_ref())
+    handle.object_ref()
 }
 
 /// Compute the normalized `(width, height)` of a rectangle array, coercing each
@@ -599,7 +599,7 @@ mod tests {
         }
 
         fn object_ref(&self) -> Option<ObjectRef> {
-            self.0.object_ref().or_else(|| self.0.object_ref())
+            self.0.object_ref()
         }
     }
 

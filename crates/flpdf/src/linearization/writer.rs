@@ -1883,7 +1883,7 @@ fn compute_outline_hint_info<R: Read + Seek>(
             None // cov:ignore: catalog is always a dict when outlines exist
         } else {
             let outlines = root.try_get_key(b"/Outlines")?;
-            outlines.object_ref().or_else(|| outlines.object_ref())
+            outlines.object_ref()
         }
     } else {
         None // cov:ignore: a non-empty retained outline set has a Catalog root

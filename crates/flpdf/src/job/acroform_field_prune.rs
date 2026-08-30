@@ -654,7 +654,7 @@ mod tests {
     }
 
     fn reference_target(value: &ObjectHandle) -> Option<ObjectRef> {
-        value.object_ref().or_else(|| value.object_ref())
+        value.object_ref()
     }
 
     fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<ObjectRef> {

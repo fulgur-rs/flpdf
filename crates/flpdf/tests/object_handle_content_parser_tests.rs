@@ -1,6 +1,7 @@
 use flpdf::{
-    pipeline::PlString, ContentToken, ContentTokenType, ObjectHandle, ObjectHandleParserCallbacks,
-    ObjectRef, ParseControl, Pdf, PipelineResult, TokenFilter, TokenFilterOutput,
+    parse_content_operations, pipeline::PlString, ContentToken, ContentTokenType, ObjectHandle,
+    ObjectHandleParserCallbacks, ObjectRef, ParseControl, Pdf, PipelineResult, TokenFilter,
+    TokenFilterOutput,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -141,6 +142,26 @@ fn parse_as_contents_delivers_inline_image_handles() {
         .objects
         .iter()
         .any(|(object, _, _)| object.as_inline_image().is_some()));
+}
+
+#[test]
+fn parse_content_operations_ignores_inline_image_events() {
+    let mut operators = Vec::new();
+    parse_content_operations(b"BI /W 1 ID \0EI q", |_, operator| {
+        operators.push(operator.to_vec());
+        Ok(ParseControl::Continue)
+    })
+    .unwrap();
+
+    assert_eq!(
+        operators,
+        vec![
+            b"BI".to_vec(),
+            b"ID".to_vec(),
+            b"EI".to_vec(),
+            b"q".to_vec()
+        ]
+    );
 }
 
 #[test]

@@ -7939,6 +7939,44 @@ mod object_json_writer_tests {
         ));
         assert_eq!(output.bytes, b"{\n  ");
     }
+
+    #[test]
+    fn object_json_writer_handles_internal_states_and_real_literals() {
+        for (value, expected) in [
+            (ObjectValue::Unresolved, ObjectJsonError::Unresolved),
+            (ObjectValue::Destroyed, ObjectJsonError::Destroyed),
+        ] {
+            let handle = ObjectHandle::from_value(value);
+            let mut bytes = Vec::new();
+            let mut output = PlString::new("object-handle-json", None, &mut bytes);
+            let error = handle
+                .write_json(2, &mut output, false, 0)
+                .expect_err("internal qpdf states are not JSON values");
+            assert!(matches!(
+                (error, expected),
+                (ObjectJsonError::Unresolved, ObjectJsonError::Unresolved)
+                    | (ObjectJsonError::Destroyed, ObjectJsonError::Destroyed)
+            ));
+        }
+
+        for (handle, expected) in [
+            (
+                ObjectHandle::real_literal(1.2, b"1.2".to_vec()),
+                b"1.2".as_slice(),
+            ),
+            (
+                ObjectHandle::real_literal(0.4, b"not-a-real".to_vec()),
+                b"0.4".as_slice(),
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            let mut output = PlString::new("object-handle-json", None, &mut bytes);
+            handle
+                .write_json(2, &mut output, false, 0)
+                .expect("finite real literals serialize as JSON numbers");
+            assert_eq!(bytes, expected);
+        }
+    }
 }
 
 // `ObjectHandle::shallow_copy`'s per-variant dispatch: an Array/Dictionary

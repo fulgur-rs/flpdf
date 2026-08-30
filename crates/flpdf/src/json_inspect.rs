@@ -17,8 +17,8 @@ pub(crate) fn qpdf_resolve_top_level_object<R: Read + Seek>(
 ) -> Result<ObjectHandle, ConvertError> {
     // JSON object keys already name the canonical indirect object. The final
     // raw-object route no longer has a separate `ObjectValue::Reference`
-    // carrier to chase, so resolving once is sufficient and preserves the
-    // document-owned cache identity.
+    // carrier to chase, so resolving once is both sufficient and preserves
+    // the document-owned cache identity.
     Ok(pdf.resolve_qpdf_json_handle(start)?)
 }
 
@@ -557,4 +557,49 @@ pub(crate) fn json_dictionary<K: AsRef<[u8]>>(
             .map_err(|error| ConvertError::JsonError(error.to_string()))?;
     }
     Ok(dictionary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConvertError, JsonOutputError};
+    use crate::object_handle::ObjectJsonError;
+    use crate::pipeline::PipelineError;
+
+    #[test]
+    fn conversion_errors_keep_their_public_text_and_categories() {
+        assert_eq!(
+            ConvertError::NonFiniteFloat.to_string(),
+            "non-finite float cannot be serialized as JSON"
+        );
+        assert_eq!(
+            ConvertError::PdfError("broken PDF".to_owned()).to_string(),
+            "PDF error: broken PDF"
+        );
+        assert_eq!(
+            ConvertError::JsonError("bad JSON".to_owned()).to_string(),
+            "JSON error: bad JSON"
+        );
+
+        assert!(matches!(
+            JsonOutputError::from(ObjectJsonError::Pipeline(PipelineError::logic("pipeline"))),
+            JsonOutputError::Pipeline(_)
+        ));
+        assert!(matches!(
+            JsonOutputError::from(ObjectJsonError::NonFiniteFloat),
+            JsonOutputError::Convert(ConvertError::NonFiniteFloat)
+        ));
+        assert!(matches!(
+            JsonOutputError::from(ObjectJsonError::Json("json".to_owned())),
+            JsonOutputError::Convert(ConvertError::JsonError(message)) if message == "json"
+        ));
+        assert!(matches!(
+            JsonOutputError::from(ObjectJsonError::Pdf("pdf".to_owned())),
+            JsonOutputError::Convert(ConvertError::PdfError(message)) if message == "pdf"
+        ));
+        assert!(matches!(
+            JsonOutputError::from(ObjectJsonError::UnsupportedVersion(3)),
+            JsonOutputError::Convert(ConvertError::PdfError(message))
+                if message.contains("only version 1 or 2")
+        ));
+    }
 }

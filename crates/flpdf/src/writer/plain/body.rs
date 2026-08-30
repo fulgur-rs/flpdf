@@ -604,9 +604,6 @@ fn is_removed_content_reference(value: &ObjectHandle, removed_refs: &BTreeSet<Ob
     value
         .object_ref()
         .is_some_and(|object_ref| removed_refs.contains(&object_ref))
-        || value
-            .object_ref()
-            .is_some_and(|object_ref| removed_refs.contains(&object_ref))
 }
 
 fn write_content_key(out: &mut Vec<u8>, key: &[u8]) {

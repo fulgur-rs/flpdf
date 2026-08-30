@@ -221,7 +221,7 @@ fn collect_direct_handle_refs_with_context(
             "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
     }
-    if let Some(object_ref) = handle.object_ref().or_else(|| handle.object_ref()) {
+    if let Some(object_ref) = handle.object_ref() {
         out.push((object_ref, in_array));
         return Ok(());
     }
@@ -247,7 +247,7 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
             "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
     }
-    if let Some(object_ref) = handle.object_ref().or_else(|| handle.object_ref()) {
+    if let Some(object_ref) = handle.object_ref() {
         out.push((object_ref, in_array));
         return Ok(());
     }
@@ -1662,7 +1662,7 @@ impl LinearizationPlan {
             let root_handle = pdf.get_object_handle(root_ref);
             pdf.resolve(&root_handle)?;
             let outlines = root_handle.try_get_key(b"/Outlines")?;
-            outlines.object_ref().or_else(|| outlines.object_ref())
+            outlines.object_ref()
         } else {
             None // cov:ignore: reachable_object_set rejects a rootless document before outline planning can succeed
         };

@@ -71,3 +71,14 @@ impl fmt::Display for ParseObjectRefError {
 }
 
 impl std::error::Error for ParseObjectRefError {}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectRef;
+
+    #[test]
+    fn malformed_reference_error_displays_its_qpdf_style_message() {
+        let error = ObjectRef::parse("7 nope").expect_err("generation must be numeric");
+        assert_eq!(error.to_string(), "invalid object generation in '7 nope'");
+    }
+}

@@ -311,7 +311,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for item in fields {
-            if let Some(field_ref) = item.object_ref().or_else(|| item.object_ref()) {
+            if let Some(field_ref) = item.object_ref() {
                 self.walk_field_tree(field_ref, &mut seen, &mut out)?;
             }
         }
@@ -352,7 +352,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for item in fields {
-            if let Some(field_ref) = item.object_ref().or_else(|| item.object_ref()) {
+            if let Some(field_ref) = item.object_ref() {
                 self.walk_field_info_tree(field_ref, inherited.clone(), &mut seen, &mut out, 0)?;
             }
         }
@@ -1762,7 +1762,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     fn acroform_ref(&mut self) -> Result<Option<ObjectRef>> {
         let catalog = self.pdf.root_handle()?;
         let acroform = catalog.try_get_key(b"/AcroForm")?;
-        Ok(acroform.object_ref().or_else(|| acroform.object_ref()))
+        Ok(acroform.object_ref())
     }
 
     fn acroform_dict(&mut self) -> Result<Option<ObjectHandle>> {
@@ -1853,7 +1853,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(());
         };
         for kid in kids {
-            if let Some(kid_ref) = kid.object_ref().or_else(|| kid.object_ref()) {
+            if let Some(kid_ref) = kid.object_ref() {
                 self.walk_field_tree_rec(kid_ref, seen, out, depth + 1)?;
             }
         }
@@ -1904,7 +1904,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(());
         };
         for kid in kids {
-            if let Some(kid_ref) = kid.object_ref().or_else(|| kid.object_ref()) {
+            if let Some(kid_ref) = kid.object_ref() {
                 self.walk_field_info_tree(kid_ref, current.clone(), seen, out, depth + 1)?;
             }
         }
@@ -2230,7 +2230,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         Ok(fields
             .into_iter()
-            .filter_map(|item| item.object_ref().or_else(|| item.object_ref()))
+            .filter_map(|item| item.object_ref())
             .collect())
     }
 

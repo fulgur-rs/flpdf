@@ -433,7 +433,7 @@ fn root_outlines_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<ObjectRe
     let root = pdf.get_object_handle(root_ref);
     root.try_dereference()?;
     let outlines = root.try_get_key(b"/Outlines")?;
-    Ok(outlines.object_ref().or_else(|| outlines.object_ref()))
+    Ok(outlines.object_ref())
 }
 
 fn outlines_in_first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {

@@ -5547,3 +5547,284 @@ pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     }
     Ok(refs)
 }
+
+#[cfg(test)]
+mod final_handle_writer_tests {
+    use super::*;
+    use crate::encryption::standard::ObjectKeyAlg;
+    use crate::encryption::CopyEncryptionSource;
+    use std::io::Cursor;
+
+    fn stream_with_filter(filter: Option<&[u8]>, data: Vec<u8>) -> ObjectHandle {
+        let mut entries = vec![(
+            b"/Length".to_vec(),
+            ObjectHandle::integer(data.len() as i64),
+        )];
+        if let Some(filter) = filter {
+            entries.push((b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec())));
+        }
+        ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::new(data))
+    }
+
+    #[test]
+    fn encryption_shape_reads_copy_encryption_handles() {
+        let mut options = WriterOptions::default();
+        options.copy_encryption = Some(CopyEncryptionSource {
+            encrypt_dict: ObjectHandle::dictionary(vec![
+                (b"/V".to_vec(), ObjectHandle::integer(4)),
+                (b"/R".to_vec(), ObjectHandle::integer(4)),
+            ]),
+            file_key: vec![0; 16],
+            id0: vec![0; 16],
+            object_key_alg: ObjectKeyAlg::Rc4,
+        });
+
+        assert_eq!(encryption_shape(&options), Some((4, 4, true)));
+    }
+
+    #[test]
+    fn stream_compression_policy_handles_public_and_private_routes() {
+        let plain = stream_with_filter(None, b"q 1 0 cm\n".to_vec());
+        let uncompressed = apply_stream_compress_policy(&plain, CompressStreams::No)
+            .expect("an unfiltered stream can be emitted without compression");
+        assert!(uncompressed
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .try_get_key(b"/Filter")
+            .expect("filter lookup")
+            .is_null());
+        assert_eq!(
+            uncompressed
+                .get_raw_stream_data()
+                .expect("stream data")
+                .as_ref(),
+            b"q 1 0 cm\n"
+        );
+
+        let compressed = apply_stream_compress_policy(&plain, CompressStreams::Yes)
+            .expect("an unfiltered stream can be compressed");
+        assert_eq!(
+            compressed
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .try_get_key(b"/Filter")
+                .expect("filter lookup")
+                .as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+        assert_eq!(
+            filters::decode_stream_data(
+                &compressed.as_stream_dict().expect("stream dictionary"),
+                &compressed.get_raw_stream_data().expect("stream data"),
+            )
+            .expect("compressed payload decodes"),
+            b"q 1 0 cm\n"
+        );
+
+        let flate_dictionary = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"/Length".to_vec(), ObjectHandle::integer(8)),
+        ]);
+        let encoded =
+            filters::encode_stream_data(&flate_dictionary, b"decoded").expect("flate encoder");
+        let flate = ObjectHandle::stream(flate_dictionary, Rc::new(encoded));
+        let preserved = apply_stream_compress_policy_with_decode_level(
+            &flate,
+            CompressStreams::No,
+            DecodeLevel::None,
+            false,
+        )
+        .expect("decode-level none preserves a gated filter chain");
+        assert_eq!(
+            preserved
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .try_get_key(b"/Filter")
+                .expect("filter lookup")
+                .as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+
+        let corrupt = stream_with_filter(Some(b"FlateDecode"), b"not-flate".to_vec());
+        let passthrough = apply_stream_compress_policy_with_decode_level(
+            &corrupt,
+            CompressStreams::No,
+            DecodeLevel::All,
+            false,
+        )
+        .expect("corrupt data follows qpdf's raw-preservation path");
+        assert_eq!(
+            passthrough
+                .get_raw_stream_data()
+                .expect("raw stream data")
+                .as_ref(),
+            b"not-flate"
+        );
+
+        let normalized = apply_stream_compress_policy_with_decode_level(
+            &plain,
+            CompressStreams::No,
+            DecodeLevel::None,
+            true,
+        )
+        .expect("content normalization remains available on an unfiltered stream");
+        assert!(!normalized
+            .get_raw_stream_data()
+            .expect("normalized stream data")
+            .is_empty());
+    }
+
+    #[test]
+    fn filter_chain_gate_covers_qpdf_filter_aliases_and_levels() {
+        for name in [
+            b"FlateDecode".as_slice(),
+            b"Fl".as_slice(),
+            b"LZWDecode".as_slice(),
+            b"LZW".as_slice(),
+            b"ASCII85Decode".as_slice(),
+            b"A85".as_slice(),
+            b"ASCIIHexDecode".as_slice(),
+            b"AHx".as_slice(),
+        ] {
+            let dictionary = ObjectHandle::dictionary(vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::name(name.to_vec()),
+            )]);
+            assert!(filter_chain_is_decodable(
+                &dictionary,
+                CompressStreams::No,
+                DecodeLevel::Generalized,
+                false,
+            )
+            .expect("generalized filter gate"));
+        }
+
+        let run_length = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"RL".to_vec()),
+        )]);
+        assert!(!filter_chain_is_decodable(
+            &run_length,
+            CompressStreams::No,
+            DecodeLevel::Generalized,
+            false,
+        )
+        .expect("run-length generalized gate"));
+        assert!(filter_chain_is_decodable(
+            &run_length,
+            CompressStreams::No,
+            DecodeLevel::Specialized,
+            false,
+        )
+        .expect("run-length specialized gate"));
+
+        let dct = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"DCT".to_vec()),
+        )]);
+        assert!(!filter_chain_is_decodable(
+            &dct,
+            CompressStreams::No,
+            DecodeLevel::Specialized,
+            false,
+        )
+        .expect("DCT specialized gate"));
+        assert!(
+            filter_chain_is_decodable(&dct, CompressStreams::No, DecodeLevel::All, false,)
+                .expect("DCT all gate")
+        );
+
+        let none = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"UnknownDecode".to_vec()),
+        )]);
+        assert!(
+            !filter_chain_is_decodable(&none, CompressStreams::No, DecodeLevel::All, false,)
+                .expect("unknown filter gate")
+        );
+
+        let malformed =
+            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
+        assert!(!filter_chain_is_decodable(
+            &malformed,
+            CompressStreams::No,
+            DecodeLevel::All,
+            false,
+        )
+        .expect("malformed filter gate"));
+
+        let array = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"Fl".to_vec())]),
+        )]);
+        assert!(filter_chain_is_decodable(
+            &array,
+            CompressStreams::No,
+            DecodeLevel::Generalized,
+            false,
+        )
+        .expect("array filter gate"));
+        let array_with_scalar = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        )]);
+        assert!(!filter_chain_is_decodable(
+            &array_with_scalar,
+            CompressStreams::No,
+            DecodeLevel::All,
+            false,
+        )
+        .expect("array scalar filter gate"));
+
+        let generalized = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        assert!(filter_chain_is_decodable(
+            &generalized,
+            CompressStreams::Yes,
+            DecodeLevel::None,
+            false,
+        )
+        .expect("compression enables generalized filtering at decode none"));
+        assert!(filter_chain_is_decodable(
+            &generalized,
+            CompressStreams::No,
+            DecodeLevel::None,
+            true,
+        )
+        .expect("normalization enables generalized filtering at decode none"));
+    }
+
+    #[test]
+    fn pclm_emits_a_synthetic_stream_for_a_page_xobject() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("fixture must open");
+        let page = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let page_handle = pdf.get_object_handle(page);
+        pdf.resolve(&page_handle).expect("page resolves");
+        let replacement = page_handle.shallow_copy().expect("page is copyable");
+        let image = pdf
+            .new_stream_with_data(Rc::new(b"image".to_vec()))
+            .expect("image stream");
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Im0".to_vec(), image)]),
+        )]);
+        replacement
+            .replace_key(b"/Resources", resources)
+            .expect("replace page resources");
+        pdf.replace_object(page, replacement).expect("replace page");
+
+        let mut output = Vec::new();
+        write_pclm(&mut pdf, &mut output, &WriterOptions::default()).expect("PCLm writer succeeds");
+        assert!(output
+            .windows(b"q /image Do Q\n".len())
+            .any(|window| { window == b"q /image Do Q\n" }));
+    }
+}
