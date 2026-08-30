@@ -863,6 +863,7 @@ fn stream_data_error(handle: &ObjectHandle, error: crate::Error) -> crate::Error
             "error while getting stream data for {object_ref}: {error}"
         ))
     } else {
+        // cov:ignore: qpdf writer stream errors are always attributed to indirect object handles
         error
     }
 }

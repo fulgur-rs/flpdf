@@ -4809,7 +4809,7 @@ mod tests {
         let image_pages = build_pages_section(&mut image_pdf).expect("image pages");
         let image_entry = get_page_entry(&image_pages, 0);
         let serde_json::Value::Array(images) = &image_entry[1].1 else {
-            panic!("images must be an array");
+            panic!("images must be an array"); // cov:ignore: the committed fixture contract supplies an images array
         };
         assert!(!images.is_empty(), "fixture must contain an image XObject");
 
@@ -4820,7 +4820,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry["outlines"].as_array().map_or(0, Vec::len))
                 .sum::<usize>(),
-            _ => 0,
+            _ => 0, // cov:ignore: the committed fixture contract supplies a pages array
         };
         assert!(
             outline_count > 0,

@@ -1178,6 +1178,7 @@ fn json_job_output_matches_qpdf_11_9_json_input_route() {
 #[test]
 fn json_job_parser_accepts_all_covered_qpdf_handler_shapes() {
     let valid_documents = [
+        r#"{"inputFile":""}"#,
         r#"{"streamData":"compress"}"#,
         r#"{"streamData":"preserve"}"#,
         r#"{"streamData":"uncompress"}"#,
@@ -1322,7 +1323,7 @@ fn json_job_output_covers_v1_sections_images_outlines_encryption_and_schema() {
     assert!(v1_text.contains("\"objects\""));
     assert!(v1_text.contains("\"objectinfo\""));
 
-    for (name, input) in [("images", image_pdf), ("outlines", outline_pdf)] {
+    for (name, input) in [("images", image_pdf), ("outlines", outline_pdf.clone())] {
         let output = tempdir.path().join(format!("{name}.json"));
         let json = serde_json::json!({
             "inputFile": input,
@@ -1336,6 +1337,19 @@ fn json_job_output_covers_v1_sections_images_outlines_encryption_and_schema() {
         assert_eq!(job.run().unwrap(), JobExitCode::Success);
         assert!(std::fs::metadata(output).unwrap().len() > 0);
     }
+
+    let outline_output = tempdir.path().join("outline-section.json");
+    let outline_json = serde_json::json!({
+        "inputFile": outline_pdf,
+        "outputFile": outline_output,
+        "json": "2",
+        "jsonKey": ["outlines"],
+    })
+    .to_string();
+    let mut outline_job = QPDFJob::new();
+    outline_job.initialize_from_json(&outline_json).unwrap();
+    assert_eq!(outline_job.run().unwrap(), JobExitCode::Success);
+    assert!(std::fs::metadata(outline_output).unwrap().len() > 0);
 
     let encrypted_output = tempdir.path().join("encrypted.json");
     let encrypted_json = serde_json::json!({
@@ -1481,4 +1495,59 @@ fn json_job_show_encryption_and_setter_boundaries_are_reachable() {
         .bytes
         .windows(b"R = 4".len())
         .any(|window| { window == b"R = 4" }));
+}
+
+#[test]
+fn json_job_rejects_conflicting_output_configuration_and_bad_page_labels() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+
+    let conflicting = [
+        serde_json::json!({
+            "inputFile": input,
+            "outputFile": tempdir.path().join("out.pdf"),
+            "replaceInput": ""
+        }),
+        serde_json::json!({"empty": "", "replaceInput": ""}),
+        serde_json::json!({"inputFile": input, "replaceInput": "", "json": "2"}),
+        serde_json::json!({
+            "inputFile": input,
+            "outputFile": tempdir.path().join("out.pdf"),
+            "check": ""
+        }),
+    ];
+    for value in conflicting {
+        let mut job = QPDFJob::new();
+        assert!(job.initialize_from_json(&value.to_string()).is_err());
+    }
+
+    let bad_labels = serde_json::json!({
+        "inputFile": input,
+        "outputFile": tempdir.path().join("bad-labels.pdf"),
+        "setPageLabels": ["1:D", "2:D"]
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&bad_labels).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+}
+
+#[test]
+fn json_job_replace_input_keeps_original_when_input_has_warnings() {
+    let repairable = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("warning-replace.pdf");
+    std::fs::copy(repairable, &input).unwrap();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "replaceInput": "",
+        "staticId": ""
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    assert!(input.exists());
+    assert!(Path::new(&format!("{}.~qpdf-orig", input.display())).exists());
 }
