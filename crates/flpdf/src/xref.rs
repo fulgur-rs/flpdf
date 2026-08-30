@@ -707,7 +707,7 @@ impl DocumentResolver for BootstrapHandleDocument {
                 // entries.
                 if self.state.borrow().reconstruction_trigger.is_some() {
                     return Err(error); // cov:ignore: LLVM maps the tested reconstruction handoff return to the condition edge
-                }
+                } // cov:ignore: LLVM maps the tested reconstruction handoff return to this closing branch edge
                 let offset = match &error {
                     Error::Parse { offset, .. } => Some(*offset as u64),
                     _ => None, // cov:ignore: byte-backed bootstrap object reads surface parse errors
