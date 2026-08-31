@@ -1236,6 +1236,102 @@ fn split_pages_leading_dot_template_matches_qpdf() {
 }
 
 #[test]
+fn top_level_split_pages_verbose_preserves_earlier_reports_after_later_failure() {
+    // qpdf reports each successfully written chunk before attempting the next
+    // one. A later destination failure must not erase the earlier report.
+    if !qpdf_available() {
+        return;
+    }
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+    std::fs::create_dir(qdir.path().join("q-2.pdf")).unwrap();
+    std::fs::create_dir(fdir.path().join("f-2.pdf")).unwrap();
+
+    let (q_ok, q_stdout) = run_qpdf(&[
+        "--verbose",
+        "--split-pages=1",
+        src.to_str().unwrap(),
+        qdir.path().join("q.pdf").to_str().unwrap(),
+    ]);
+    assert!(!q_ok, "qpdf should fail on the occupied second chunk");
+    assert!(
+        q_stdout.contains("wrote file ") && q_stdout.contains("q-1.pdf"),
+        "qpdf must report the first chunk before the later failure: {q_stdout}"
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--verbose",
+            "--split-pages=1",
+            src.to_str().unwrap(),
+            fdir.path().join("f.pdf").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), Some(2));
+    let flpdf_stdout = String::from_utf8_lossy(&flpdf.stdout);
+    assert!(
+        flpdf_stdout.contains("wrote file ") && flpdf_stdout.contains("f-1.pdf"),
+        "flpdf must preserve the first chunk report before the later failure: {flpdf_stdout}"
+    );
+    assert!(fdir.path().join("f-1.pdf").is_file());
+}
+
+#[test]
+fn pages_then_split_pages_verbose_preserves_earlier_reports_after_later_failure() {
+    // The --pages pipeline reaches the same canonical split job after its
+    // in-memory page selection. It must retain qpdf's per-chunk report timing.
+    if !qpdf_available() {
+        return;
+    }
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+    std::fs::create_dir(qdir.path().join("q-pages-2.pdf")).unwrap();
+    std::fs::create_dir(fdir.path().join("f-pages-2.pdf")).unwrap();
+
+    let (q_ok, q_stdout) = run_qpdf(&[
+        "--verbose",
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        "--",
+        "--split-pages=1",
+        qdir.path().join("q-pages.pdf").to_str().unwrap(),
+    ]);
+    assert!(!q_ok, "qpdf should fail on the occupied second chunk");
+    assert!(
+        q_stdout.contains("wrote file ") && q_stdout.contains("q-pages-1.pdf"),
+        "qpdf must report the first pages+split chunk before the later failure: {q_stdout}"
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--verbose",
+            src.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-3",
+            "--",
+            "--split-pages=1",
+            fdir.path().join("f-pages.pdf").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), Some(2));
+    let flpdf_stdout = String::from_utf8_lossy(&flpdf.stdout);
+    assert!(
+        flpdf_stdout.contains("wrote file ") && flpdf_stdout.contains("f-pages-1.pdf"),
+        "flpdf must preserve the first pages+split report before the later failure: {flpdf_stdout}"
+    );
+    assert!(fdir.path().join("f-pages-1.pdf").is_file());
+}
+
+#[test]
 fn split_pages_encrypted_primary_matches_qpdf_cleartext_chunks() {
     // qpdf 11.9.0 builds a fresh empty output document for every split chunk;
     // source-encryption preservation therefore does not carry into the
