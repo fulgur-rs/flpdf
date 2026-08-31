@@ -1,9 +1,9 @@
 use flpdf::job::{
-    JobDocument, JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob,
+    JobDocument, JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob,
 };
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
+use flpdf::{Error, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -142,6 +142,81 @@ fn new_job_matches_qpdf_defaults() {
     assert_eq!(JobExitCode::Error.as_i32(), 2);
     assert_eq!(JobExitCode::Success.as_i32(), 0);
     assert_eq!(JobExitCode::Warning.as_i32(), 3);
+}
+
+#[test]
+fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
+    let range = PageRange::parse("1").unwrap();
+    let one_source = [
+        PageSpecInput::new(1, range.clone()),
+        PageSpecInput::new(1, range.clone()),
+    ];
+    let two_sources = [
+        PageSpecInput::new(1, range.clone()),
+        PageSpecInput::new(2, range),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.set_keep_files_open_threshold(1);
+    assert!(job.keep_files_open_for_page_specs(&one_source));
+    assert!(!job.keep_files_open_for_page_specs(&two_sources));
+
+    job.set_keep_files_open(true);
+    assert!(job.keep_files_open_for_page_specs(&two_sources));
+    job.set_keep_files_open(false);
+    assert!(!job.keep_files_open_for_page_specs(&one_source));
+
+    assert_eq!(
+        QPDFJob::parse_keep_files_open_threshold("+50junk").unwrap(),
+        50
+    );
+}
+
+#[test]
+fn keep_files_open_policy_is_parsed_at_argv_and_json_job_boundaries() {
+    let range = PageRange::parse("1").unwrap();
+    let specs = [PageSpecInput::new(1, range.clone())];
+
+    let mut argv_job = QPDFJob::new();
+    argv_job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--keep-files-open=n".to_owned(),
+            "--keep-files-open-threshold=+50junk".to_owned(),
+        ])
+        .unwrap();
+    assert!(!argv_job.keep_files_open_for_page_specs(&specs));
+
+    let json = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "output.pdf",
+        "keepFilesOpen": "n",
+        "keepFilesOpenThreshold": "50junk"
+    })
+    .to_string();
+    let mut json_job = QPDFJob::new();
+    json_job.initialize_from_json(&json).unwrap();
+    assert!(!json_job.keep_files_open_for_page_specs(&specs));
+}
+
+#[test]
+fn argv_keep_files_open_rejects_an_unknown_choice() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--keep-files-open=maybe".to_owned(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "invalid value for --keep-files-open: maybe"
+    ));
 }
 
 #[test]

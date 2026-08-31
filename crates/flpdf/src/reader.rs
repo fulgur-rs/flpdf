@@ -20,8 +20,11 @@ use crate::reader::resolver::ResolverHandle;
 #[cfg(feature = "qtest-driver")]
 use crate::tokenizer::Tokenizer;
 use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::pdf::{CompressedMemberProvenance, Pdf};
@@ -36,6 +39,141 @@ use crate::pdf::{CompressedMemberProvenance, Pdf};
 pub trait ReadSeek: Read + Seek {}
 
 impl<T: Read + Seek> ReadSeek for T {}
+
+/// Controller for a file source that can be closed between qpdf page-job
+/// operations and reopened at its last logical position.
+///
+/// This is the Rust equivalent of qpdf's `ClosedFileInputSource::stayOpen`
+/// (`libqpdf/ClosedFileInputSource.cc:18-35,97-104`). It is intentionally
+/// crate-private: callers select the policy through `QPDFJob`, not by
+/// manipulating the underlying reader directly.
+#[derive(Clone)]
+pub(crate) struct InputSourceControl(Rc<RefCell<ReopenableFileState>>);
+
+impl InputSourceControl {
+    pub(crate) fn set_stay_open(&self, value: bool) {
+        let mut state = self.0.borrow_mut();
+        state.stay_open = value;
+        if !value {
+            // Every completed read/seek records `position`, so dropping the
+            // live reader here preserves the same offset qpdf stores in
+            // `ClosedFileInputSource::after` before clearing `fis`.
+            state.reader = None;
+        }
+    }
+}
+
+struct ReopenableFileState {
+    path: PathBuf,
+    reader: Option<BufReader<File>>,
+    position: u64,
+    stay_open: bool,
+}
+
+/// A file-backed `Read + Seek` source with qpdf's close-and-reopen behavior.
+///
+/// The source opens eagerly so opening a PDF reports the same initial I/O
+/// failure as a normal file reader. Once its controller selects `stay_open =
+/// false`, each completed I/O operation drops the `File`; the next operation
+/// reopens the path and seeks to the saved logical position. This mirrors
+/// qpdf's `ClosedFileInputSource::before`/`after` pair without changing the
+/// resolver's generic `ReadSeek` contract.
+pub(crate) struct ReopenableFile {
+    control: InputSourceControl,
+}
+
+impl ReopenableFile {
+    pub(crate) fn new(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        Ok(Self {
+            control: InputSourceControl(Rc::new(RefCell::new(ReopenableFileState {
+                path: path.to_path_buf(),
+                reader: Some(BufReader::new(file)),
+                position: 0,
+                stay_open: true,
+            }))),
+        })
+    }
+
+    pub(crate) fn controller(&self) -> InputSourceControl {
+        self.control.clone()
+    }
+
+    #[cfg(test)]
+    fn is_closed_for_test(&self) -> bool {
+        self.control.0.borrow().reader.is_none()
+    }
+}
+
+impl Read for ReopenableFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut state = self.control.0.borrow_mut();
+        if state.reader.is_none() {
+            let file = File::open(&state.path)?;
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(state.position))?;
+            state.reader = Some(reader);
+        }
+        let bytes_read = match state
+            .reader
+            .as_mut()
+            .expect("reopenable reader is installed")
+            .read(buffer)
+        {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                if !state.stay_open {
+                    state.reader = None;
+                }
+                return Err(error);
+            }
+        };
+        let position = match state
+            .reader
+            .as_mut()
+            .expect("reopenable reader is installed")
+            .stream_position()
+        {
+            Ok(position) => position,
+            // cov:ignore-start: `ReopenableFile` owns a regular seekable File; a successful read followed by an injected stream_position failure is not representable through this concrete source.
+            Err(error) => {
+                if !state.stay_open {
+                    state.reader = None;
+                }
+                return Err(error);
+            } // cov:ignore-end
+        };
+        state.position = position;
+        if !state.stay_open {
+            state.reader = None;
+        }
+        Ok(bytes_read)
+    }
+}
+
+impl Seek for ReopenableFile {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let mut state = self.control.0.borrow_mut();
+        if state.reader.is_none() {
+            let file = File::open(&state.path)?;
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(state.position))?;
+            state.reader = Some(reader);
+        }
+        let result = state
+            .reader
+            .as_mut()
+            .expect("reopenable reader is installed")
+            .seek(from);
+        if let Ok(position) = result {
+            state.position = position;
+        }
+        if !state.stay_open {
+            state.reader = None;
+        }
+        result
+    }
+}
 
 /// Options for opening a PDF document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2129,6 +2267,59 @@ mod source_window_tests {
         assert_eq!(
             data_offset,
             (stream_offset + b"4 0 obj\n<< /Length 5 >>\nstream\n".len()) as u64
+        );
+    }
+}
+
+#[cfg(test)]
+mod reopenable_source_tests {
+    use super::ReopenableFile;
+    use std::io::Read;
+
+    #[test]
+    fn closed_source_reopens_at_the_last_reader_position() {
+        let temp = tempfile::tempdir().expect("temporary source directory");
+        let path = temp.path().join("source.pdf");
+        std::fs::write(&path, b"abcdef").expect("write source");
+
+        let mut source = ReopenableFile::new(&path).expect("open source");
+        let controller = source.controller();
+        controller.set_stay_open(false);
+
+        let mut first = [0; 2];
+        source.read_exact(&mut first).expect("read first bytes");
+        assert_eq!(&first, b"ab");
+        assert!(
+            source.is_closed_for_test(),
+            "source must close after a read"
+        );
+
+        controller.set_stay_open(true);
+        let mut second = [0; 2];
+        source.read_exact(&mut second).expect("reopen and read");
+        assert_eq!(&second, b"cd");
+        assert!(
+            !source.is_closed_for_test(),
+            "explicit keep-open must retain source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_error_closes_a_nonpersistent_source() {
+        let temp = tempfile::tempdir().expect("temporary source directory");
+        let directory = temp.path().join("not-a-file");
+        std::fs::create_dir(&directory).expect("create directory source");
+
+        let mut source = ReopenableFile::new(&directory).expect("open directory source");
+        source.controller().set_stay_open(false);
+        let error = source
+            .read(&mut [0; 1])
+            .expect_err("directory read must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(
+            source.is_closed_for_test(),
+            "failed nonpersistent read must close source"
         );
     }
 }

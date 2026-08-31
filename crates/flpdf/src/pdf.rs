@@ -5,6 +5,7 @@ use crate::cache::ObjectCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::pages::repair::PreparedPages;
 use crate::reader::resolver::ResolverHandle;
+use crate::reader::InputSourceControl;
 use crate::{Error, ObjectHandle, ObjectRef, Result, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,6 +79,10 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// surviving handle can never keep a dropped document's input source
     /// alive.
     pub(crate) resolver: Rc<ResolverHandle<R>>,
+    /// Optional qpdf-style file-source lifetime controller. Generic readers
+    /// (memory buffers and caller-owned streams) leave this absent; the
+    /// file-open factory installs it for `QPDFJob::handle_page_specs`.
+    pub(crate) input_source_control: Option<InputSourceControl>,
     pub(crate) version: String,
     pub(crate) trailer: ObjectHandle,
     pub(crate) last_xref_form: XrefForm,
@@ -200,6 +205,15 @@ impl<R: Read + Seek> Drop for Pdf<R> {
 }
 
 impl<R: Read + Seek> Pdf<R> {
+    /// Set qpdf's `ClosedFileInputSource::stayOpen` policy when this document
+    /// was opened through the file-source factory. Non-file readers have no
+    /// close/reopen controller and therefore remain unchanged.
+    pub(crate) fn set_input_source_stay_open(&self, value: bool) {
+        if let Some(control) = &self.input_source_control {
+            control.set_stay_open(value);
+        }
+    }
+
     /// PDF version header as written in the first line of the file (e.g. `"1.7"`).
     pub fn version(&self) -> &str {
         &self.version

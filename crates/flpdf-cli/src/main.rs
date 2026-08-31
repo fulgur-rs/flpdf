@@ -1079,6 +1079,17 @@ struct Cli {
 /// `["--password=x", …]`.
 #[derive(Debug, Clone, Default, ClapArgs)]
 struct PageOpArgs {
+    /// Manage whether qpdf keeps secondary `--pages` input files open
+    /// (`--keep-files-open=y|n`). When omitted, qpdf selects the value from
+    /// the distinct page-spec source count and [`Self::keep_files_open_threshold`].
+    #[arg(long = "keep-files-open", value_enum)]
+    keep_files_open: Option<CliYesNo>,
+
+    /// Distinct page-spec source count at which qpdf automatically switches
+    /// `--keep-files-open` off (default 200).
+    #[arg(long = "keep-files-open-threshold", value_name = "COUNT")]
+    keep_files_open_threshold: Option<String>,
+
     /// Select pages from one or more input files (qpdf `--pages`).
     ///
     /// Syntax (qpdf 11.9.0 `--help=page-selection`):
@@ -1150,12 +1161,11 @@ struct PageOpArgs {
     )]
     collate: Vec<String>,
 
-    /// `qpdf --empty` — start from an empty document. Parsed for qpdf-script
-    /// compatibility but NOT implemented at this layer (would silently
-    /// produce wrong output if ignored), so it errors actionably.
+    /// `qpdf --empty` — start from an empty document for a `--pages` job.
+    /// A bare empty rewrite remains unsupported at this layer.
     #[arg(
         long = "empty",
-        help = "(qpdf --empty) start from an empty document — NOT yet implemented"
+        help = "(qpdf --empty) start from an empty document for --pages"
     )]
     empty: bool,
 }
@@ -2066,6 +2076,10 @@ fn main() {
     };
     let args = Cli::parse_from(residual_args);
     validate_collate_values(&args.page_ops.collate);
+    if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
+        eprintln!("flpdf: {error}");
+        std::process::exit(2);
+    }
     let top_level_version_options =
         match parse_cli_version_options(args.min_version.as_deref(), args.force_version.as_deref())
         {
@@ -2440,46 +2454,60 @@ fn main() {
                 }
             }
         }
-        let dispatch = |input: PathBuf, output: PathBuf| -> CliResult<()> {
-            if !args.page_ops.pages.is_empty() {
-                run_page_extraction(
-                    &input,
+        if args.page_ops.empty && !args.page_ops.pages.is_empty() && args.output.is_none() {
+            match args.input.clone() {
+                Some(output) => run_empty_page_extraction(
                     &output,
                     args.repair,
                     &args.password,
-                    args.json_input,
-                    args.update_from_json.as_deref(),
                     &args.page_ops,
-                    &overlay_specs,
-                    CliRemoveUnreferencedResources::Auto,
-                    options.clone(),
+                    options,
                     args.verbose,
-                )
-            } else {
-                if !overlay_specs.is_empty() {
-                    eprintln!(
-                        "flpdf: --overlay/--underlay is not applied with \
-                         --rotate/--split-pages alone (no --pages); \
-                         rerun with --pages or without the overlay"
-                    );
-                    std::process::exit(1);
-                }
-                run_rewrite_with_page_ops(
-                    &input,
-                    &output,
-                    args.repair,
-                    &args.password,
-                    args.json_input,
-                    args.update_from_json.as_deref(),
-                    &args.page_ops,
-                    options.clone(),
-                    args.verbose,
-                )
+                ),
+                None => Err("--empty page operations require an output file".into()),
             }
-        };
-        match (args.input.clone(), args.output.clone()) {
-            (Some(i), Some(o)) => dispatch(i, o),
-            _ => Err("page operations require both an input and an output file".into()),
+        } else {
+            let dispatch = |input: PathBuf, output: PathBuf| -> CliResult<()> {
+                if !args.page_ops.pages.is_empty() {
+                    run_page_extraction(
+                        &input,
+                        &output,
+                        args.repair,
+                        &args.password,
+                        args.json_input,
+                        args.update_from_json.as_deref(),
+                        &args.page_ops,
+                        &overlay_specs,
+                        CliRemoveUnreferencedResources::Auto,
+                        options.clone(),
+                        args.verbose,
+                    )
+                } else {
+                    if !overlay_specs.is_empty() {
+                        eprintln!(
+                            "flpdf: --overlay/--underlay is not applied with \
+                             --rotate/--split-pages alone (no --pages); \
+                             rerun with --pages or without the overlay"
+                        );
+                        std::process::exit(1);
+                    }
+                    run_rewrite_with_page_ops(
+                        &input,
+                        &output,
+                        args.repair,
+                        &args.password,
+                        args.json_input,
+                        args.update_from_json.as_deref(),
+                        &args.page_ops,
+                        options.clone(),
+                        args.verbose,
+                    )
+                }
+            };
+            match (args.input.clone(), args.output.clone()) {
+                (Some(i), Some(o)) => dispatch(i, o),
+                _ => Err("page operations require both an input and an output file".into()),
+            }
         }
     } else {
         let mut options = WriterOptions {
@@ -3044,6 +3072,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         }
         Commands::Rewrite(cmd) => {
             validate_collate_values(&cmd.page_ops.collate);
+            validate_keep_files_open_threshold(&cmd.page_ops)?;
             let version_options = match parse_cli_version_options(
                 cmd.min_version.as_deref(),
                 cmd.force_version.as_deref(),
@@ -4666,6 +4695,27 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// Apply the page-job-owned keep-open configuration from the CLI surface.
+fn configure_keep_files_open(job: &mut QPDFJob, page_ops: &PageOpArgs) -> CliResult<()> {
+    if let Some(value) = page_ops.keep_files_open {
+        job.set_keep_files_open(matches!(value, CliYesNo::Yes));
+    }
+    if let Some(threshold) = page_ops.keep_files_open_threshold.as_deref() {
+        job.set_keep_files_open_threshold(QPDFJob::parse_keep_files_open_threshold(threshold)?);
+    }
+    Ok(())
+}
+
+/// Validate the qpdf unsigned threshold even when no page operation is
+/// selected. qpdf parses all options before dispatch, so a malformed value
+/// must not be silently ignored by an ordinary rewrite route.
+fn validate_keep_files_open_threshold(page_ops: &PageOpArgs) -> CliResult<()> {
+    if let Some(value) = page_ops.keep_files_open_threshold.as_deref() {
+        QPDFJob::parse_keep_files_open_threshold(value)?;
+    }
+    Ok(())
+}
+
 /// Run the `--pages` extraction pipeline.
 ///
 /// Processing order is fixed as follows:
@@ -4854,6 +4904,170 @@ fn run_page_extraction(
     )
 }
 
+/// Run qpdf's `--empty --pages` route with an empty primary document.
+///
+/// qpdf's empty primary has no input filename and all page specifications are
+/// therefore secondary sources. Keep this as the same `QPDFJob::handle_page_specs`
+/// boundary used by ordinary multi-source extraction so source-count policy,
+/// collate order, copying, and final writing cannot drift between the two
+/// command shapes.
+fn run_empty_page_extraction(
+    output: &Path,
+    repair: bool,
+    password: &PasswordArgs,
+    page_ops: &PageOpArgs,
+    options: WriterOptions,
+    verbose: bool,
+) -> CliResult<()> {
+    let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
+    let creates_output = standard_output.is_none();
+    let raw_specs = parse_pages_segment(&page_ops.pages)?;
+    if raw_specs.iter().any(|spec| spec.file_token == ".") {
+        return Err("--pages: '.' cannot refer to a primary input with --empty".into());
+    }
+    let inputs = resolve_page_specs(&raw_specs, Path::new("<empty>"))?;
+
+    let mut source_paths = Vec::new();
+    let mut source_passwords = Vec::new();
+    let mut specs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let source_index =
+            if let Some(index) = source_paths.iter().position(|path| *path == input.path) {
+                index + 1
+            } else {
+                source_paths.push(input.path.clone());
+                source_passwords.push(input.password.clone());
+                source_paths.len()
+            };
+        specs.push(PageSpecInput::new(source_index, input.range));
+    }
+
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    configure_keep_files_open(&mut job, page_ops)?;
+    if verbose && page_ops.keep_files_open.is_none() {
+        logger_info(format!(
+            "flpdf: selecting --keep-open-files={}\n",
+            if job.keep_files_open_for_page_specs(&specs) {
+                "y"
+            } else {
+                "n"
+            }
+        ))?;
+    }
+
+    let mut sources = Vec::with_capacity(source_paths.len() + 1);
+    sources.push(job.create_empty_document()?);
+    for (source_index, path) in source_paths.iter().enumerate() {
+        if verbose {
+            logger_info(format!(
+                "flpdf: processing {}\n",
+                pages_progress_filename(path)
+            ))?;
+        }
+        let mut source_password = password.clone();
+        source_password.password = source_passwords[source_index].clone();
+        source_password.password_file = None;
+        sources.push(open_page_source(path, repair, &source_password)?);
+    }
+
+    if verbose {
+        let mut message = String::from(
+            "flpdf: empty PDF: checking for shared resources\nflpdf: no shared resources found\n",
+        );
+        for path in &source_paths {
+            let fname = pages_progress_filename(path);
+            message.push_str(&format!(
+                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+            ));
+        }
+        message.push_str("flpdf: removing unreferenced pages from primary input\n");
+        for path in &source_paths {
+            message.push_str(&format!(
+                "flpdf: adding pages from {}\n",
+                pages_progress_filename(path)
+            ));
+        }
+        logger_info(message)?;
+    }
+
+    // qpdf raises the output version floor from every source participating in
+    // a page job, including the empty primary's source heap
+    // (`QPDFJob.cc:1714-1715,2847-2918`).
+    let mut options = options;
+    let mut max_version = PdfVersion::new(1, 0, 0);
+    for source in &mut sources {
+        let source_version =
+            parse_pdf_version(source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
+        max_version.update_if_greater(PdfVersion::new(
+            source_version.major(),
+            source_version.minor(),
+            source.adobe_extension_level().unwrap_or(0),
+        ));
+    }
+    if let Some(ref current) = options.min_version {
+        let current_version = parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
+        max_version.update_if_greater(PdfVersion::new(
+            current_version.major(),
+            current_version.minor(),
+            options.min_extension_level.unwrap_or(0),
+        ));
+    }
+    let (version, max_ext) = max_version.get_version();
+    options.min_version = Some(version);
+    options.min_extension_level = (max_ext > 0).then_some(max_ext);
+
+    let collate = parse_collate_values(&page_ops.collate)?;
+    let source_warnings = job.has_warnings();
+    let page_output = job.handle_page_specs(
+        &mut sources,
+        &specs,
+        collate.as_deref(),
+        RemoveUnreferencedResources::Auto,
+        options.preserve_unreferenced_objects,
+    )?;
+    let source_warnings = source_warnings || job.has_warnings();
+    let PageSpecJobOutput::Merged(mut merged) = page_output else {
+        return Err("--empty --pages unexpectedly returned an in-place document".into());
+    };
+    let selected = pages::page_refs(&mut merged)?;
+    let combined_pages = selected
+        .iter()
+        .enumerate()
+        .map(|(index, &page_ref)| {
+            Ok(CombinedPage {
+                source_index: 0,
+                page: flpdf::SelectedPage {
+                    index_1based: u32::try_from(index + 1)
+                        .map_err(|_| "--pages: too many output pages")?,
+                    page_ref,
+                },
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    run_page_extraction_after_plan(
+        &mut merged,
+        output,
+        Path::new("<empty>"),
+        repair,
+        password,
+        page_ops,
+        &[],
+        CliRemoveUnreferencedResources::No,
+        options,
+        verbose,
+        standard_output,
+        creates_output,
+        false,
+        None,
+        source_warnings,
+        None,
+        combined_pages,
+    )
+}
+
 /// Run qpdf's ordinary multi-source page-spec path.
 ///
 /// The primary document is retained at source index zero even when no page
@@ -4881,7 +5095,7 @@ fn run_page_extraction_from_multiple_sources(
     // operations. Keep this probe separate from the mutable source vector so
     // source opening below can use the same top-level password policy.
     let primary_encrypted =
-        open_pdf(&primary_input.to_path_buf(), repair, password)?.is_encrypted();
+        open_page_source(&primary_input.to_path_buf(), repair, password)?.is_encrypted();
 
     // Build literal-path source identity and one qpdf page specification per
     // occurrence. `.` was already normalized to primary_input by
@@ -4904,8 +5118,43 @@ fn run_page_extraction_from_multiple_sources(
         specs.push(PageSpecInput::new(source_index, input.range));
     }
 
+    let mut sources = Vec::with_capacity(source_paths.len());
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    configure_keep_files_open(&mut job, page_ops)?;
+    if verbose && page_ops.keep_files_open.is_none() {
+        let keep_files_open = job.keep_files_open_for_page_specs(&specs);
+        logger_info(format!(
+            "flpdf: selecting --keep-open-files={}\n",
+            if keep_files_open { "y" } else { "n" }
+        ))?;
+    }
+    sources.push(open_page_source(
+        &primary_input.to_path_buf(),
+        repair,
+        password,
+    )?);
+    for (source_index, path) in source_paths.iter().enumerate().skip(1) {
+        let mut source_password = password.clone();
+        // qpdf opens each secondary with only the password attached to its
+        // page specification (QPDFJob.cc:2400-2412). The primary password is
+        // not a fallback for a secondary with no segment password; retain the
+        // global interpretation/policy flags, but replace both credential
+        // fields with the per-source value, including an explicit empty value.
+        source_password.password = source_passwords[source_index].clone();
+        source_password.password_file = None;
+        if verbose {
+            logger_info(format!(
+                "flpdf: processing {}\n",
+                pages_progress_filename(path)
+            ))?;
+        }
+        sources.push(open_page_source(path, repair, &source_password)?);
+    }
+
     if verbose {
-        let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
+        let mut message = String::new();
         for path in &source_paths {
             let fname = pages_progress_filename(path);
             message.push_str(&format!(
@@ -4920,20 +5169,6 @@ fn run_page_extraction_from_multiple_sources(
             ));
         }
         logger_info(message)?;
-    }
-
-    let mut sources = Vec::with_capacity(source_paths.len());
-    sources.push(open_pdf(&primary_input.to_path_buf(), repair, password)?);
-    for (source_index, path) in source_paths.iter().enumerate().skip(1) {
-        let mut source_password = password.clone();
-        // qpdf opens each secondary with only the password attached to its
-        // page specification (QPDFJob.cc:2400-2412). The primary password is
-        // not a fallback for a secondary with no segment password; retain the
-        // global interpretation/policy flags, but replace both credential
-        // fields with the per-source value, including an explicit empty value.
-        source_password.password = source_passwords[source_index].clone();
-        source_password.password_file = None;
-        sources.push(open_pdf(path, repair, &source_password)?);
     }
 
     // qpdf raises the writer floor from every input processed by the job
@@ -4972,9 +5207,6 @@ fn run_page_extraction_from_multiple_sources(
         .writer_copy_encryption_source()?;
 
     let collate = parse_collate_values(&page_ops.collate)?;
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
     let source_warnings = job.has_warnings();
     let page_output = job.handle_page_specs(
         &mut sources,
@@ -5058,8 +5290,23 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
 ) -> CliResult<()> {
     let primary_encrypted = pdf.is_encrypted();
     let primary_copy_encryption = pdf.writer_copy_encryption_source()?;
-    if verbose {
-        let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
+    let specs: Vec<PageSpecInput> = inputs
+        .iter()
+        .map(|input| PageSpecInput::new(0, input.range.clone()))
+        .collect();
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    configure_keep_files_open(&mut job, page_ops)?;
+    if verbose && page_ops.keep_files_open.is_none() {
+        let mut message = format!(
+            "flpdf: selecting --keep-open-files={}\n",
+            if job.keep_files_open_for_page_specs(&specs) {
+                "y"
+            } else {
+                "n"
+            }
+        );
         for path in distinct {
             let fname = pages_progress_filename(path);
             message.push_str(&format!(
@@ -5080,15 +5327,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
         logger_info(message)?;
     }
 
-    let specs: Vec<PageSpecInput> = inputs
-        .iter()
-        .map(|input| PageSpecInput::new(0, input.range.clone()))
-        .collect();
     let collate = parse_collate_values(&page_ops.collate)?;
     let mut sources = vec![pdf];
-    let mut job = QPDFJob::new();
-    job.set_logger(cli_logger());
-    job.set_message_prefix(progname());
     let before_warnings = job.has_warnings();
     let page_output = job.handle_page_specs(
         &mut sources,
@@ -6350,6 +6590,23 @@ fn open_pdf(
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
     open_pdf_impl(input, repair, password, false)
+}
+
+/// Open a secondary page-spec source through the same file-backed reader
+/// boundary as qpdf's `QPDFJob::handlePageSpecs`.
+fn open_page_source(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<Pdf<Box<dyn flpdf::ReadSeek>>> {
+    let mut options = pdf_open_options(repair, password)?;
+    options.logger = Some(cli_logger());
+    options.description = input.display().to_string();
+    let mut pdf = Pdf::<Box<dyn flpdf::ReadSeek>>::open_file_with_options(input, options)
+        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    pdf.root_handle()
+        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    Ok(pdf)
 }
 
 fn open_pdf_from_file(
