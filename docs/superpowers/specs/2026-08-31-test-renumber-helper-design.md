@@ -56,7 +56,7 @@ because `test_renumber` is not currently available on PATH.
 
 | qpdf responsibility | flpdf counterpart | Design decision |
 |---|---|---|
-| `getAllObjects()` and object traversal | `Pdf::object_refs()`, `Pdf::get_object_handle()`, and public `ObjectHandle` type/value accessors | Use the canonical live handle graph; do not materialize a parallel raw-object snapshot. |
+| `getAllObjects()` and object traversal | `Pdf::get_all_objects()` and public `ObjectHandle` type/value accessors | Use the canonical live handle graph and qpdf-shaped dangling-reference preparation; do not materialize a parallel raw-object snapshot. |
 | writer option setters | `PdfWriter::set_object_stream_mode`, `set_linearization`, and `set_preserve_unreferenced_objects` | Configure the existing writer directly. |
 | memory output | `PdfWriter::set_output_memory`, `write`, and `get_buffer` | Reload the exact bytes returned by the writer. |
 | `getRenumberedObjGen` | `PdfWriter::get_renumbered_obj_gen` | Print one mapping for every source object reference. |
@@ -117,4 +117,3 @@ panic is not an acceptable fallback.
 - The helper's stdout/stderr/status and generated output are differentially
   checked against the pinned qpdf 11.9.0 helper for both fixtures and every
   option combination.
-

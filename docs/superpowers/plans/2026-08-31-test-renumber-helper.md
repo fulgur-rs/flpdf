@@ -208,7 +208,7 @@ Implement the helper run against the existing public APIs:
 
 ```rust
 let mut pdf = flpdf::Pdf::open(std::fs::File::open(input)?)?;
-let source_refs = pdf.object_refs();
+let source_objects = pdf.get_all_objects()?;
 let mut writer = flpdf::PdfWriter::new(&mut pdf);
 writer.set_output_memory()?;
 writer.set_object_stream_mode(options.object_streams);
@@ -220,9 +220,10 @@ let written_xref = writer.get_written_xref_table()?;
 let mut reloaded = flpdf::Pdf::open_mem_owned(output_bytes)?;
 ```
 
-For each source reference, call `get_renumbered_obj_gen`, print the mapping,
-print `deleted` for an absent mapping, and compare the source handle with the
-reloaded emitted handle. Then compare `written_xref` to
+For each source object returned by `get_all_objects`, obtain its indirect
+`ObjectRef`, call `get_renumbered_obj_gen`, print the mapping, print `deleted`
+for an absent mapping, and compare the source handle with the reloaded emitted
+handle. Then compare `written_xref` to
 `reloaded.get_xref_table()` using `XrefEntry` variants and the same fields
 observed by qpdf, including qpdf's upstream self-comparison behavior at
 `test_renumber.cc:147,153-154`. Print both `complete` markers and
