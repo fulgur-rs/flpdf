@@ -1948,3 +1948,68 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
     }
     sink.take_buffer().map_err(map_pipeline_error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeParams, FlateLzwStreamFilter, ParamValue, StreamFilter};
+    use crate::pipeline::test_support::RecordingSink;
+    use crate::pipeline::PipelineRef;
+
+    fn wide_tiff_decode_params() -> DecodeParams {
+        DecodeParams::Present(vec![
+            (b"Predictor".to_vec(), ParamValue::Int(2)),
+            (b"Columns".to_vec(), ParamValue::Int(536_870_911)),
+            (b"Colors".to_vec(), ParamValue::Int(1)),
+            (b"BitsPerComponent".to_vec(), ParamValue::Int(8)),
+        ])
+    }
+
+    fn wide_tiff_filter() -> FlateLzwStreamFilter {
+        let mut filter = FlateLzwStreamFilter::new(false);
+        assert!(filter.set_decode_params(&wide_tiff_decode_params()));
+        filter.set_tiff_memory_limit(Some(1 << 20));
+        filter
+    }
+
+    #[test]
+    fn owned_decode_pipeline_applies_tiff_memory_limit_before_codec_construction() {
+        let mut filter = wide_tiff_filter();
+        let mut sink = RecordingSink::new(&[], &[]);
+        let error = match filter.decode_pipeline_owned(PipelineRef::from(&mut sink)) {
+            Err(error) => error,
+            Ok(_) => panic!("the wide TIFF row must exceed the configured budget"),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("TIFFPredictor memory limit exceeded"));
+    }
+
+    #[test]
+    fn recovering_decode_pipeline_applies_tiff_memory_limit_before_codec_writes() {
+        let mut filter = wide_tiff_filter();
+        let error = match filter.pipe_decode_recovering(&[], None, &mut |_, _, _, _| Ok(())) {
+            Err(error) => error,
+            Ok(_) => panic!("the wide TIFF row must exceed the configured budget"),
+        };
+
+        assert!(error
+            .to_string()
+            .contains("TIFFPredictor memory limit exceeded"));
+    }
+
+    #[test]
+    fn encode_predictor_uses_the_tiff_stream_filter_pipeline() {
+        let params = DecodeParams::Present(vec![
+            (b"Predictor".to_vec(), ParamValue::Int(2)),
+            (b"Columns".to_vec(), ParamValue::Int(2)),
+            (b"Colors".to_vec(), ParamValue::Int(1)),
+            (b"BitsPerComponent".to_vec(), ParamValue::Int(8)),
+        ]);
+
+        assert_eq!(
+            super::encode_predictor(&[10, 20], b"FlateDecode", &params).unwrap(),
+            [10, 10]
+        );
+    }
+}

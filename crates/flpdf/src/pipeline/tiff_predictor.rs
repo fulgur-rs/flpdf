@@ -379,6 +379,18 @@ mod tests {
             Some(0),
         )
         .is_ok());
+
+        let mut sink = RecordingSink::new(&[], &[]);
+        assert!(TiffPredictor::new_with_memory_limit(
+            "tiff",
+            &mut sink,
+            TiffPredictorAction::Decode,
+            4,
+            1,
+            8,
+            Some(1024),
+        )
+        .is_ok());
     }
 
     #[test]
