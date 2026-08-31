@@ -2859,6 +2859,25 @@ fn parse_xref_stream(
             let handle_stream_data = handle_object
                 .as_stream_data()
                 .ok_or_else(|| Error::parse(xref_pos, "xref stream has no data"))?;
+            // `decode_stream_data_from_handle` is a generic filter-decoding
+            // entry point shared with non-bootstrap callers, so it has no
+            // knowledge of this context's deferred source snapshot; it
+            // dereferences `/Filter`/`/DecodeParms` internally
+            // (`filters.rs:466-468`) without going through
+            // `ensure_source_for_resolution`. When either is itself an
+            // indirect reference (a legal but unusual hybrid-xref
+            // construction), that dereference would otherwise reach
+            // `resolve_indirect` before the snapshot is populated, which
+            // recovers by treating the value as null and silently ignoring
+            // the requested filter.
+            if let Some(dictionary) = handle_stream_dict.as_dictionary() {
+                if let Some(filter) = dictionary.get(b"/Filter".as_slice()) {
+                    context.ensure_source_for_resolution(filter);
+                }
+                if let Some(decode_parms) = dictionary.get(b"/DecodeParms".as_slice()) {
+                    context.ensure_source_for_resolution(decode_parms);
+                }
+            }
             let stream_data = filters::decode_stream_data_from_handle(
                 &handle_stream_dict,
                 &handle_stream_data,
@@ -3574,6 +3593,87 @@ mod final_handle_tests {
         assert!(
             document.bytes.get().is_none(),
             "unused trailer references must not force the source snapshot"
+        );
+    }
+
+    /// A hybrid-reference file: a classic `xref` table with an `/XRefStm`
+    /// pointing at a supplementary cross-reference stream whose own
+    /// `/Filter` is an indirect reference (`4 0 R`) to a name object,
+    /// rather than a direct `/Filter` name in the stream's own dictionary.
+    /// This is a legal but unusual construction (confirmed accepted by live
+    /// qpdf 11.9.0 `--check`, exit 0, no reconstruction) that exercises
+    /// `decode_stream_data_from_handle`'s internal `/Filter` dereference
+    /// (`filters.rs:466-468`) at a point where this context's deferred
+    /// source snapshot may not yet be populated.
+    fn hybrid_xref_with_indirect_filter() -> Vec<u8> {
+        fn entry(kind: u8, offset: u16, gen: u8) -> [u8; 4] {
+            let [hi, lo] = offset.to_be_bytes();
+            [kind, hi, lo, gen]
+        }
+
+        let mut bytes = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = [0usize; 6];
+
+        offsets[1] = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets[2] = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets[3] = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        offsets[4] = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\n/ASCIIHexDecode\nendobj\n");
+
+        offsets[5] = bytes.len();
+        let mut raw_entries = Vec::new();
+        raw_entries.extend_from_slice(&entry(0, 0, 0));
+        for &offset in &offsets[1..=5] {
+            raw_entries.extend_from_slice(&entry(1, offset as u16, 0));
+        }
+        let mut stream_data = raw_entries
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>()
+            .into_bytes();
+        stream_data.push(b'>');
+        bytes.extend_from_slice(b"5 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /Filter 4 0 R /W [1 2 1] /Size 6 /Root 1 0 R /Length {} >>",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"\nstream\n");
+        bytes.extend_from_slice(&stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_stream_offset = offsets[5];
+
+        let classic_xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for &offset in &offsets[1..=5] {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R /XRefStm {xref_stream_offset} >>\n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(format!("startxref\n{classic_xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn hybrid_xref_stream_with_indirect_filter_loads_without_reconstruction() {
+        let bytes = hybrid_xref_with_indirect_filter();
+        let mut reader = std::io::Cursor::new(bytes);
+        let state = load_xref_state_with_options(&mut reader, XrefLoadOptions::default())
+            .expect("hybrid xref with an indirect /Filter must load");
+
+        assert!(
+            !state.already_reconstructed,
+            "a valid indirect /Filter on the /XRefStm stream must not force \
+             cross-reference reconstruction"
         );
     }
 
