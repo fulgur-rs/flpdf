@@ -8,9 +8,10 @@
 
 use super::attachments::{AttachmentAddOptions, AttachmentCopyOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
+use super::outline_dest_remap::remap_outline_and_dests;
 use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
 use super::page_range::PageRange;
-use super::page_specs::PageSpecInput;
+use super::page_specs::{PageSpecInput, PageSpecJobOutput};
 use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::{apply_rotate_to_pages, flatten_rotation_on_pages};
@@ -1818,20 +1819,35 @@ impl QPDFJob {
                 };
                 specs.push(PageSpecInput::new(source_index, page.range.clone()));
             }
-            let mut merged = self.handle_page_specs(
+            let page_output = self.handle_page_specs(
                 &mut page_sources,
                 &specs,
                 configuration.collate,
                 configuration.remove_unreferenced_resources,
                 configuration.writer.preserves_unreferenced_objects(),
             )?; // cov:ignore: llvm-cov attributes this successful page merge continuation to its opening call lines
-            self.apply_configured_rotations(&mut merged, configuration)?;
-            let status = self.run_document_stages(&mut merged, configuration);
-            // `merged` may retain provider-backed objects from page_sources;
-            // both are deliberately alive until every output byte is written.
-            drop(merged);
-            drop(page_sources);
-            status
+            match page_output {
+                PageSpecJobOutput::InPlace {
+                    pdf,
+                    result,
+                    prune_mode,
+                } => {
+                    remap_outline_and_dests(pdf, &result)?;
+                    QPDFJob::prune_after_subset(pdf, prune_mode)?;
+                    QPDFJob::prune_acroform_after_subset(pdf, &result)?;
+                    self.apply_configured_rotations(pdf, configuration)?;
+                    self.run_document_stages(pdf, configuration)
+                }
+                PageSpecJobOutput::Merged(mut merged) => {
+                    self.apply_configured_rotations(&mut merged, configuration)?;
+                    let status = self.run_document_stages(&mut merged, configuration);
+                    // `merged` may retain provider-backed objects from
+                    // page_sources; both are deliberately alive until every
+                    // output byte is written.
+                    drop(merged);
+                    status
+                }
+            }
         }
     }
 

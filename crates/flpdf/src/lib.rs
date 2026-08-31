@@ -176,13 +176,13 @@ pub use filespec_helper::{
 pub use form_field_object_helper::FormFieldObjectHelper;
 pub use job::{
     add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback, collate,
-    extract_attachment, extract_attachment_to_path, format_attachment_list,
-    format_attachment_list_with_sink, list_attachment_info, merge_documents,
-    overlay_verbose_report, prune_acroform_after_subset,
+    copy_duplicate_page_annotations, extract_attachment, extract_attachment_to_path,
+    format_attachment_list, format_attachment_list_with_sink, list_attachment_info,
+    merge_documents, overlay_verbose_report, prune_acroform_after_subset,
     prune_acroform_after_subset_with_max_depth, write_attachment, AttachmentInfo, CombinedPage,
     CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage,
-    OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, Parity, RotateSpec, SelectedPage,
-    DEFAULT_MAX_ACROFORM_DEPTH,
+    OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, PageSpecJobOutput, Parity,
+    RotateSpec, SelectedPage, DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use matrix::{Matrix, Rectangle};

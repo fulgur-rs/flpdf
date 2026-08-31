@@ -73,7 +73,36 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
             "QPDF::copyForeign called with object from this QPDF".to_owned(),
         ));
     }
-    copy_foreign_with_source_id(target, source_id, foreign, true)
+    copy_foreign_with_source_id(target, source_id, foreign, true, true)
+}
+
+/// Copy one primary object for the fresh page-merge target's
+/// `--preserve-unreferenced` route.
+///
+/// qpdf's writer enqueues page-tree containers as ordinary objects when
+/// preserving unreferenced objects (`QPDFWriter.cc:2907-2913`), while the
+/// public `copyForeignObject` page-copy boundary intentionally stops at
+/// `/Pages` (`QPDF.cc:2101-2210`). Keep those responsibilities separate: page
+/// insertion retains the boundary, and this writer-preservation traversal
+/// carries the otherwise-unreferenced page-tree graph into the fresh target.
+pub(crate) fn copy_foreign_object_for_preserve<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    foreign: &ObjectHandle,
+) -> Result<ObjectHandle> {
+    if !foreign.is_indirect() {
+        return Err(Error::System(
+            "QPDF::copyForeign called with direct object handle".to_owned(),
+        ));
+    }
+    let source_id = foreign.owning_pdf_unique_id().ok_or_else(|| {
+        Error::System("QPDF::copyForeign called with object with no owning PDF".to_owned())
+    })?;
+    if source_id == target.unique_id() {
+        return Err(Error::System(
+            "QPDF::copyForeign called with object from this QPDF".to_owned(),
+        ));
+    }
+    copy_foreign_with_source_id(target, source_id, foreign, true, false)
 }
 
 /// Copy a direct or indirect value from a foreign document while retaining the
@@ -103,7 +132,7 @@ pub(crate) fn copy_foreign_value<R: Read + Seek>(
             ));
         }
     }
-    copy_foreign_with_source_id(target, source_id, foreign, false)
+    copy_foreign_with_source_id(target, source_id, foreign, false, true)
 }
 
 fn copy_foreign_with_source_id<R: Read + Seek>(
@@ -111,6 +140,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
     source_id: u64,
     foreign: &ObjectHandle,
     require_indirect: bool,
+    stop_at_page_tree: bool,
 ) -> Result<ObjectHandle> {
     let object_map = target.take_foreign_object_map(source_id);
     let visiting = target.take_foreign_object_visiting(source_id);
@@ -146,6 +176,7 @@ fn copy_foreign_with_source_id<R: Read + Seek>(
         object_map,
         visiting,
         direct_visiting: Vec::new(),
+        stop_at_page_tree,
         to_copy: Vec::new(),
     };
     let result = if require_indirect {
@@ -187,6 +218,10 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     object_map: BTreeMap<ObjectRef, ObjectRef>,
     visiting: BTreeSet<ObjectRef>,
     direct_visiting: Vec<ObjectHandle>,
+    /// Whether this invocation is the qpdf `copyForeignObject` page boundary.
+    /// The writer-preservation traversal disables the boundary so otherwise
+    /// unreferenced `/Pages` containers can be carried to a fresh merge target.
+    stop_at_page_tree: bool,
     to_copy: Vec<ObjectHandle>,
 }
 
@@ -304,7 +339,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 ));
             }
         }
-        if foreign.try_is_dictionary_of_type(b"Pages", b"")? {
+        if self.stop_at_page_tree && foreign.try_is_dictionary_of_type(b"Pages", b"")? {
             return Ok(());
         }
 
@@ -696,6 +731,51 @@ mod tests {
     }
 
     #[test]
+    fn preserve_copy_allows_page_tree_containers_without_pages_boundary_warning() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let direct_error = copy_foreign_object_for_preserve(&mut target, &ObjectHandle::integer(1))
+            .expect_err("preserve copy must reject a direct object");
+        assert!(matches!(direct_error, Error::System(message)
+            if message == "QPDF::copyForeign called with direct object handle"));
+
+        let unowned = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let unowned_error = copy_foreign_object_for_preserve(&mut target, &unowned)
+            .expect_err("preserve copy must reject an unowned indirect object");
+        assert!(matches!(unowned_error, Error::System(message)
+            if message == "QPDF::copyForeign called with object with no owning PDF"));
+
+        let owned = target.get_object_handle(ObjectRef::new(3, 0));
+        let same_document_error = copy_foreign_object_for_preserve(&mut target, &owned)
+            .expect_err("preserve copy must reject a target-owned object");
+        assert!(matches!(same_document_error, Error::System(message)
+            if message == "QPDF::copyForeign called with object from this QPDF"));
+
+        let page = source.get_object_handle(ObjectRef::new(3, 0));
+        let intermediate = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+                (b"Kids".to_vec(), ObjectHandle::array(vec![page])),
+                (b"Count".to_vec(), ObjectHandle::integer(1)),
+            ]))
+            .expect("intermediate page tree node");
+        source
+            .get_object_handle(ObjectRef::new(2, 0))
+            .replace_key(b"Kids", ObjectHandle::array(vec![intermediate.clone()]))
+            .expect("replace page-tree children");
+
+        let copied = copy_foreign_object_for_preserve(&mut target, &intermediate)
+            .expect("preserve traversal must copy a page-tree container");
+        assert!(copied.object_ref().is_some());
+        target
+            .resolve(&copied)
+            .expect("resolve preserved page tree");
+        assert!(target.repair_diagnostics().entries().is_empty());
+        assert_eq!(copied.get_key(b"/Kids").try_array_len().unwrap(), Some(1));
+    }
+
+    #[test]
     fn copy_foreign_object_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
@@ -790,6 +870,7 @@ mod tests {
                 ]),
                 visiting: BTreeSet::new(),
                 direct_visiting: Vec::new(),
+                stop_at_page_tree: true,
                 to_copy: Vec::new(),
             };
             copier
@@ -833,6 +914,7 @@ mod tests {
             object_map: BTreeMap::new(),
             visiting: BTreeSet::new(),
             direct_visiting: Vec::new(),
+            stop_at_page_tree: true,
             to_copy: Vec::new(),
         }
     }
@@ -969,6 +1051,7 @@ mod tests {
                 object_map: BTreeMap::from([(source_ref, wrong_ref)]),
                 visiting: BTreeSet::new(),
                 direct_visiting: Vec::new(),
+                stop_at_page_tree: true,
                 to_copy: Vec::new(),
             };
             copier

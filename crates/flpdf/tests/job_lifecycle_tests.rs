@@ -313,6 +313,113 @@ fn json_job_run_applies_pages_and_attachments() {
         .is_some());
 }
 
+/// 2-page document with an outline item pointing at page 2 (obj 4).
+fn build_outline_fixture() -> Vec<u8> {
+    use std::collections::BTreeMap;
+    let mut objs: BTreeMap<u32, String> = BTreeMap::new();
+    objs.insert(
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>".into(),
+    );
+    objs.insert(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into());
+    for n in 3..=4 {
+        objs.insert(
+            n,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+    }
+    objs.insert(
+        10,
+        "<< /Type /Outlines /First 20 0 R /Last 20 0 R /Count 1 >>".into(),
+    );
+    objs.insert(
+        20,
+        "<< /Title (P2) /Parent 10 0 R /Dest [4 0 R /Fit] >>".into(),
+    );
+
+    let mut raw: Vec<u8> = b"%PDF-1.5\n".to_vec();
+    let mut offs: BTreeMap<u32, usize> = BTreeMap::new();
+    for (n, body) in &objs {
+        offs.insert(*n, raw.len());
+        raw.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let max_num = *objs.keys().max().unwrap();
+    let xref_pos = raw.len();
+    raw.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_num + 1).as_bytes());
+    for i in 1..=max_num {
+        if let Some(&off) = offs.get(&i) {
+            raw.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        } else {
+            raw.extend_from_slice(b"0000000000 65535 f \n");
+        }
+    }
+    raw.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+            max_num + 1
+        )
+        .as_bytes(),
+    );
+    raw
+}
+
+/// A single-source `--pages . 1` job (qpdf's own-file page selection) takes
+/// the in-place `QPDFJob::handle_page_specs` route
+/// (`PageSpecJobOutput::InPlace`). Before this test, `QPDFJob::run`'s
+/// in-place branch pruned the subset without first calling
+/// `remap_outline_and_dests`, leaving the outline's `/Dest` pointing at the
+/// now-removed, ungutted page 2 object instead of the null-and-kept-live
+/// value qpdf produces (`libqpdf/QPDF_optimization.cc`'s outline/dest sweep,
+/// matched by the merged-source CLI route's own
+/// `remap_outline_and_dests` call in `flpdf-cli`).
+#[test]
+fn json_job_run_in_place_page_subset_remaps_outline_dests() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("outline-fixture.pdf");
+    std::fs::write(&input, build_outline_fixture()).unwrap();
+    let output = tempdir.path().join("in-place-subset.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "pages": [{"file": ".", "range": "1"}]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 1);
+
+    // Writing renumbers objects, so locate the removed page through the
+    // surviving outline item's `/Dest` rather than assuming the original
+    // fixture's object number 4 persists in the output.
+    let root = pdf.trailer_key_handle(b"Root");
+    pdf.resolve(&root).unwrap();
+    let outlines = root.as_dictionary().unwrap()[b"/Outlines".as_slice()].clone();
+    pdf.resolve(&outlines).unwrap();
+    let first_item = outlines.as_dictionary().unwrap()[b"/First".as_slice()].clone();
+    pdf.resolve(&first_item).unwrap();
+    let dest = first_item.as_dictionary().unwrap()[b"/Dest".as_slice()].clone();
+    pdf.resolve(&dest).unwrap();
+    let target = dest.as_array().unwrap()[0].clone();
+    let target_ref = target
+        .object_ref()
+        .expect("the outline dest target must still be an indirect reference");
+    pdf.resolve(&target).unwrap();
+
+    assert!(
+        target.is_null(),
+        "the removed page kept alive by the outline dest must be nulled, not left as a \
+         dangling /Type /Page dict"
+    );
+    assert!(
+        pdf.live_object_refs().contains(&target_ref),
+        "the nulled-but-referenced page must stay live"
+    );
+}
+
 #[test]
 fn json_job_run_applies_encryption_and_json_output_mode() {
     let fixture =

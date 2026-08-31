@@ -62,7 +62,7 @@ pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_merge::{merge_documents, MergeInput};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
-pub use page_specs::PageSpecInput;
+pub use page_specs::{copy_duplicate_page_annotations, PageSpecInput, PageSpecJobOutput};
 pub use page_split::SplitPageOptions;
 pub use resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use rotate::{apply_rotate_to_pages, flatten_rotation_on_pages, RotateMode, RotateOp};
