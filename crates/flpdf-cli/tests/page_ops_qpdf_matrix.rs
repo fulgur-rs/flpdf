@@ -1565,6 +1565,86 @@ fn collate_zero_matches_qpdf_empty_page_result() {
 }
 
 #[test]
+fn collate_zero_with_rotate_matches_qpdf_no_op() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source_file = distinct_pages_pdf(3);
+    let source = source_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+    let common = [
+        source.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        ".",
+        "1-3",
+        "--",
+        "--collate=0",
+        "--rotate=90",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.push(q.to_str().unwrap());
+    let mut f_args = common.to_vec();
+    f_args.push(f.to_str().unwrap());
+
+    let (q_ok, _) = run_qpdf(&q_args);
+    assert!(
+        q_ok,
+        "qpdf treats a zero-page --collate result as a rotate no-op"
+    );
+    flpdf_ok(&f_args);
+
+    assert_eq!(npages_of(&q), 0);
+    assert_eq!(npages_of(&f), 0);
+}
+
+#[test]
+fn collate_zero_with_split_pages_matches_qpdf_no_op() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source_file = distinct_pages_pdf(3);
+    let source = source_file.path();
+    let q = tmp.path().join("q-%d.pdf");
+    let f = tmp.path().join("f-%d.pdf");
+    let common = [
+        source.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        ".",
+        "1-3",
+        "--",
+        "--collate=0",
+        "--split-pages=1",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.push(q.to_str().unwrap());
+    let mut f_args = common.to_vec();
+    f_args.push(f.to_str().unwrap());
+
+    let (q_ok, _) = run_qpdf(&q_args);
+    assert!(
+        q_ok,
+        "qpdf treats a zero-page --collate result as a split-pages no-op"
+    );
+    flpdf_ok(&f_args);
+
+    assert!(
+        !tmp.path().join("q-1.pdf").exists(),
+        "qpdf writes no split chunks for an empty page selection"
+    );
+    assert!(
+        !tmp.path().join("f-1.pdf").exists(),
+        "flpdf must match qpdf and write no split chunks"
+    );
+}
+
+#[test]
 fn collate_invalid_parameter_without_pages_is_rejected_like_qpdf() {
     if !qpdf_available() {
         return;

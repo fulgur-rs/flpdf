@@ -1942,6 +1942,15 @@ impl QPDFJob {
             return Ok(());
         }
         let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+        if page_refs.is_empty() {
+            // qpdf's handleRotations resolves each range against the real page
+            // count and then filters `0 <= pageno < npages` before touching
+            // `pages`, so an empty document rotates nothing without erroring
+            // (confirmed live: `--collate=0 --rotate=90` exits 0). A resolved
+            // range's own out-of-bounds check requires page_count >= 1, so
+            // this document-empty case is handled up front instead.
+            return Ok(());
+        }
         let page_count = u32::try_from(page_refs.len())
             .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
         for rotation in &configuration.rotations {

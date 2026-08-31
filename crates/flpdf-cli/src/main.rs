@@ -5309,14 +5309,24 @@ fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
     for raw in rotate_args {
         let spec =
             RotateSpec::parse(raw).map_err(|e| format!("--rotate: invalid spec {raw:?}: {e}"))?;
-        let indices = spec
-            .range
-            .resolve(total)
-            .map_err(|e| format!("--rotate: page range out of bounds in {raw:?}: {e}"))?;
-        let pages: Vec<ObjectRef> = indices
-            .iter()
-            .filter_map(|&i| target_pages.get((i - 1) as usize).copied())
-            .collect();
+        // qpdf's handleRotations resolves each range against the real page
+        // count and then filters `0 <= pageno < npages` before touching
+        // `pages`, so an empty document rotates nothing without erroring
+        // (confirmed live: `--collate=0 --rotate=90` exits 0). A resolved
+        // range's own out-of-bounds check requires page_count >= 1, so this
+        // document-empty case is handled up front instead of via resolve().
+        let pages: Vec<ObjectRef> = if total == 0 {
+            Vec::new()
+        } else {
+            let indices = spec
+                .range
+                .resolve(total)
+                .map_err(|e| format!("--rotate: page range out of bounds in {raw:?}: {e}"))?;
+            indices
+                .iter()
+                .filter_map(|&i| target_pages.get((i - 1) as usize).copied())
+                .collect()
+        };
         apply_rotate_to_pages(pdf, &pages, &spec.op)?;
     }
     Ok(())
