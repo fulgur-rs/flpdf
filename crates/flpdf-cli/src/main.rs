@@ -70,6 +70,7 @@ struct WriterOptions {
     decode_level: StreamDecodeLevel,
     decode_level_set: bool,
     recompress_flate: bool,
+    compression_level: Option<i32>,
     progress: bool,
     static_id: bool,
     deterministic_id: bool,
@@ -98,6 +99,7 @@ impl Default for WriterOptions {
             decode_level: StreamDecodeLevel::None,
             decode_level_set: false,
             recompress_flate: false,
+            compression_level: None,
             progress: false,
             static_id: false,
             deterministic_id: false,
@@ -156,6 +158,10 @@ fn apply_cli_decode_level(options: &mut WriterOptions, decode_level: Option<CliD
     }
 }
 
+fn parse_compression_level(value: Option<&str>) -> CliResult<Option<i32>> {
+    value.map(qpdf_selector_integer).transpose()
+}
+
 /// Translate the CLI's effective writer options into the reusable library
 /// configuration that qpdf reapplies to every split-page output writer.
 fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfiguration {
@@ -171,6 +177,9 @@ fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfi
         configuration.set_decode_level(options.decode_level);
     }
     configuration.set_recompress_flate(options.recompress_flate);
+    if let Some(level) = options.compression_level {
+        configuration.set_compression_level(level);
+    }
     configuration.set_qdf_mode(options.qdf && !linearize);
     if options.content_normalization_set {
         configuration.set_content_normalization(options.content_normalization);
@@ -502,7 +511,8 @@ struct Cli {
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
               "is_encrypted", "requires_password",
-              "compress_streams", "linearize_pass1", "remove_restrictions",
+              "compress_streams", "recompress_flate", "compression_level",
+              "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
@@ -557,7 +567,8 @@ struct Cli {
             "show_npages", "show_pages", "show_xref", "show_linearization",
             "show_encryption",
             "is_encrypted", "requires_password",
-            "compress_streams", "linearize_pass1", "remove_restrictions",
+            "compress_streams", "recompress_flate", "compression_level",
+            "linearize_pass1", "remove_restrictions",
             "decrypt", "encrypt", "copy_encryption",
             "add_attachment", "remove_attachment", "list_attachments",
             "show_attachment", "copy_attachments_from",
@@ -714,6 +725,14 @@ struct Cli {
     /// rewrite.  Provided so qtest commands parse cleanly.
     #[arg(long = "compress-streams")]
     compress_streams: Option<String>,
+    /// Re-encode streams that are already a lone `/FlateDecode` (qpdf
+    /// `--recompress-flate`).
+    #[arg(long = "recompress-flate")]
+    recompress_flate: bool,
+    /// Set the zlib compression level used when emitting Flate streams
+    /// (qpdf `--compression-level=level`).
+    #[arg(long = "compression-level", value_name = "LEVEL")]
+    compression_level: Option<String>,
     /// Control which qpdf stream filters are decoded during rewrite.
     /// Values are ordered from least to most decoding: none, generalized,
     /// specialized, and all.
@@ -1547,6 +1566,11 @@ struct RewriteCommand {
     #[arg(long = "recompress-flate")]
     recompress_flate: bool,
 
+    /// Set the zlib compression level used when emitting Flate streams
+    /// (qpdf `--compression-level=level`).
+    #[arg(long = "compression-level", value_name = "LEVEL")]
+    compression_level: Option<String>,
+
     /// Flatten annotations into page content (qpdf `--flatten-annotations`).
     ///
     /// MODE is `all`, `screen`, or `print`:
@@ -2031,6 +2055,14 @@ fn main() {
                 std::process::exit(1);
             }
         };
+    let top_level_compression_level =
+        match parse_compression_level(args.compression_level.as_deref()) {
+            Ok(level) => level,
+            Err(error) => {
+                eprintln!("flpdf: {error}");
+                std::process::exit(2);
+            }
+        };
     let normalize_content = normalize_content_enabled(args.normalize_content, args.qdf);
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
@@ -2218,6 +2250,8 @@ fn main() {
             args.static_id,
             args.preserve_unreferenced,
             args.progress,
+            args.recompress_flate,
+            top_level_compression_level,
             &top_level_version_options,
         )
     } else if !args.add_attachment.is_empty() {
@@ -2231,6 +2265,8 @@ fn main() {
             args.static_id,
             args.preserve_unreferenced,
             args.progress,
+            args.recompress_flate,
+            top_level_compression_level,
             args.verbose,
             &top_level_version_options,
         )
@@ -2245,6 +2281,8 @@ fn main() {
             args.static_id,
             args.preserve_unreferenced,
             args.progress,
+            args.recompress_flate,
+            top_level_compression_level,
             args.verbose,
             &top_level_version_options,
         )
@@ -2266,6 +2304,8 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
             progress: args.progress,
+            recompress_flate: args.recompress_flate,
+            compression_level: top_level_compression_level,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2359,6 +2399,8 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
             progress: args.progress,
+            recompress_flate: args.recompress_flate,
+            compression_level: top_level_compression_level,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2427,6 +2469,8 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
             progress: args.progress,
+            recompress_flate: args.recompress_flate,
+            compression_level: top_level_compression_level,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -3027,6 +3071,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // Recompressing an existing lone /FlateDecode stream is a writer
                 // setting and is applied by the same canonical route.
                 recompress_flate: cmd.recompress_flate,
+                compression_level: parse_compression_level(cmd.compression_level.as_deref())?,
                 ..WriterOptions::default()
             };
             apply_cli_decode_level(&mut options, cmd.decode_level);
@@ -6829,6 +6874,8 @@ fn run_add_attachment(
     static_id: bool,
     preserve_unreferenced: bool,
     progress: bool,
+    recompress_flate: bool,
+    compression_level: Option<i32>,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6873,6 +6920,8 @@ fn run_add_attachment(
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         progress,
+        recompress_flate,
+        compression_level,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
@@ -6904,6 +6953,8 @@ fn run_remove_attachment(
     static_id: bool,
     preserve_unreferenced: bool,
     progress: bool,
+    recompress_flate: bool,
+    compression_level: Option<i32>,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
@@ -6921,6 +6972,8 @@ fn run_remove_attachment(
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         progress,
+        recompress_flate,
+        compression_level,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
@@ -6990,6 +7043,8 @@ fn run_copy_attachments_from(
     static_id: bool,
     preserve_unreferenced: bool,
     progress: bool,
+    recompress_flate: bool,
+    compression_level: Option<i32>,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -7039,6 +7094,8 @@ fn run_copy_attachments_from(
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         progress,
+        recompress_flate,
+        compression_level,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut writer_options, version_options);

@@ -43,7 +43,7 @@ where
 use crate::encryption::{CopyEncryptionSource, EncryptParams};
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
-use crate::pipeline::{Pipeline, PlString};
+use crate::pipeline::{flate::Flate, Pipeline, PlString};
 use crate::{filters, Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -259,6 +259,16 @@ impl WriterConfiguration {
     /// Set qpdf's `--recompress-flate` policy.
     pub fn set_recompress_flate(&mut self, value: bool) {
         self.settings.recompress_flate = value;
+    }
+
+    /// Set qpdf's Flate compression level for subsequently-created streams.
+    ///
+    /// The value is passed to the underlying qpdf-shaped Flate codec when it
+    /// is non-negative. `0..=9` are the zlib compression levels; values above
+    /// 9 are rejected when the writer is prepared for output. Negative values
+    /// retain the codec default, matching qpdf's `>= 0` setup guard.
+    pub fn set_compression_level(&mut self, level: i32) {
+        self.settings.compression_level = Some(level);
     }
 
     /// Set qpdf's content-normalization policy.
@@ -532,6 +542,16 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         self.settings.recompress_flate = value;
     }
 
+    /// Set qpdf's Flate compression level for subsequently-created streams.
+    ///
+    /// The value is passed to the underlying qpdf-shaped Flate codec when it
+    /// is non-negative. `0..=9` are the zlib compression levels; values above
+    /// 9 are rejected when the writer is prepared for output. Negative values
+    /// retain the codec default, matching qpdf's `>= 0` setup guard.
+    pub fn set_compression_level(&mut self, level: i32) {
+        self.settings.compression_level = Some(level);
+    }
+
     pub fn set_content_normalization(&mut self, value: bool) {
         self.settings.content_normalization = value;
         self.settings.content_normalization_set = true;
@@ -764,6 +784,13 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
     /// `get_final_version` and `write` observe the same plan.
     fn prepared_write_options(&mut self) -> Result<WriterOptions> {
         let mut options = self.settings.to_write_options();
+        if let Some(level) = options.compression_level {
+            if level >= 0 {
+                if let Err(error) = Flate::set_compression_level(level) {
+                    return Err(error.into());
+                }
+            }
+        }
         if self.settings.linearization {
             // qpdf's doWriteSetup clears QDF before selecting the
             // linearized two-pass writer (QPDFWriter.cc:2036-2038).
@@ -1457,6 +1484,11 @@ pub(crate) struct WriterOptions {
     /// always re-encoded regardless of this flag: its in-body bytes are not the
     /// canonical data, so they are never preserved verbatim.
     pub recompress_flate: bool,
+
+    /// Optional qpdf Flate compression level. Negative values leave the codec
+    /// default selected; non-negative values are passed to the Flate codec
+    /// before output streams are created.
+    pub compression_level: Option<i32>,
 
     /// Encrypt the canonical output with the supplied [`crate::EncryptParams`]
     /// (qpdf `--encrypt …` equivalent).
@@ -5846,6 +5878,53 @@ mod final_handle_writer_tests {
             .get_raw_stream_data()
             .expect("normalized stream data")
             .is_empty());
+    }
+
+    #[test]
+    fn pdf_writer_compression_level_changes_recompressed_output() {
+        let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
+            .lock()
+            .unwrap();
+
+        fn rewrite(level: i32) -> Vec<u8> {
+            let mut pdf = Pdf::open(Cursor::new(
+                include_bytes!("../../../tests/fixtures/compat/lone-flate-l9.pdf").to_vec(),
+            ))
+            .expect("fixture must open");
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_static_id(true);
+            writer.set_recompress_flate(true);
+            writer.set_compression_level(level);
+            writer.set_output_memory().expect("memory output");
+            writer.write().expect("writer succeeds");
+            writer.get_buffer().expect("memory buffer")
+        }
+
+        let level_one = rewrite(1);
+        let level_nine = rewrite(9);
+        let _default_level = rewrite(-1);
+        crate::pipeline::flate::Flate::set_compression_level(-1).expect("reset level");
+        assert_ne!(
+            level_one, level_nine,
+            "PdfWriter compression level must affect recompressed output"
+        );
+    }
+
+    #[test]
+    fn pdf_writer_rejects_an_invalid_compression_level() {
+        let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
+            .lock()
+            .unwrap();
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/lone-flate-l9.pdf").to_vec(),
+        ))
+        .expect("fixture must open");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_compression_level(10);
+        assert!(
+            writer.get_final_version().is_err(),
+            "an invalid zlib compression level must fail during writer preparation"
+        );
     }
 
     #[test]

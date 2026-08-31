@@ -330,6 +330,15 @@ deleted identities. The regression and qpdf 11.9.0 probe are tracked in
 test-only の legacy projection として残り、production の PCLm・QDF・暗号化 writer は
 live `ObjectHandle` から trailer と `/ID` を取得する。
 
+`QPDFJob::Config::compressionLevel` (`QPDFJob_config.cc:135-139`) は
+`QPDFJob::setWriterOptions` (`QPDFJob.cc:2847-2851`) で `Pl_Flate` の共有
+compression levelへ適用され、`recompressFlate` (`QPDFJob_config.cc:498-503`、
+`QPDFJob.cc:2870-2872`) は `QPDFWriter::willFilterStream`
+(`QPDFWriter.cc:1260-1270`) の lone-`/FlateDecode` preserve gateだけを解除する。
+flpdfは `WriterSettings`/`WriterOptions` の `compression_level` と
+`pipeline/flate.rs::Flate::set_compression_level` で同じ設定順を保持し、
+CLIのtop-levelとnative rewriteの両方をcanonical `PdfWriter`へ接続する。
+
 進捗計測の準備境界は `writer.rs:538-563` に固定する。QDF/content-normalization
 または non-none decode level の `PageDocumentHelper::get_all_pages()` による page-tree
 修復を先に実行してから `get_object_count()` を取得し、qpdf の
