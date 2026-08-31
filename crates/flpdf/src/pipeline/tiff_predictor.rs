@@ -54,9 +54,13 @@ impl<'a> TiffPredictor<'a> {
 
         // qpdf head widened this intermediate before checking it so a
         // wrapped u32 product cannot reach `previous.resize` with a bogus
-        // one-byte row. The maximum product is below u64::MAX after this
-        // first check, so the wide row calculation is safe to use for the
-        // hardening boundary.
+        // one-byte row. The wide bound must match the narrow check's own
+        // established upper bound (`u32::MAX - 1`, not `u32::MAX`): at
+        // columns=u32::MAX, colors=1, bits=8 the wide value lands exactly on
+        // `u32::MAX`, which a strict `>` bound against `u32::MAX` would
+        // accept, even though the narrow computation below wraps this exact
+        // geometry down to a plausible-looking 536,870,911-byte (~512 MiB)
+        // row instead of rejecting it during construction.
         let bits_per_pixel = u64::from(bits_per_sample) * u64::from(samples_per_pixel);
         if bits_per_pixel + 7 > u64::from(u32::MAX) {
             return Err(PipelineError::runtime(
@@ -64,7 +68,7 @@ impl<'a> TiffPredictor<'a> {
             ));
         }
         let bytes_per_row = (u64::from(columns) * bits_per_pixel).div_ceil(8);
-        if bytes_per_row == 0 || bytes_per_row > u64::from(u32::MAX) {
+        if bytes_per_row == 0 || bytes_per_row > u64::from(u32::MAX - 1) {
             return Err(PipelineError::runtime(
                 "TIFFPredictor created with invalid columns value",
             ));
@@ -285,6 +289,22 @@ mod tests {
         );
         assert_eq!(
             construction_error(u32::MAX, 5, 8).to_string(),
+            "TIFFPredictor created with invalid columns value"
+        );
+    }
+
+    /// `columns=u32::MAX, colors=1, bits=8` makes the raw bit count 8x
+    /// larger than `u32::MAX` (34,359,738,360 bits), but the u32-wrapped
+    /// byte count collapses to a plausible-looking 536,870,911 bytes
+    /// (~512 MiB) after wrapping and dividing by 8. A preflight bound
+    /// checked only on the *divided* byte count misses this case entirely
+    /// (536,870,911 is far under any reasonable byte-count bound), letting
+    /// a malformed one-byte stream trigger a ~512 MiB allocation. The
+    /// preflight must bound the undivided bit count instead.
+    #[test]
+    fn constructor_rejects_columns_that_overflow_before_dividing_by_eight() {
+        assert_eq!(
+            construction_error(u32::MAX, 1, 8).to_string(),
             "TIFFPredictor created with invalid columns value"
         );
     }
