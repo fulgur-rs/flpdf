@@ -248,6 +248,15 @@ bounded-read/retry し、`test_0_1` は DecodeParms warning を source ref ご�
 | `QPDFParser.cc` | 519 | `parser.rs` の `LiveInput` / `LiveTokenSource` / `LiveFileParser` は `InputSource` を一度だけ前進する file-object baseline（`QPDFParser.cc:27-518`）。canonical resolver の uncompressed type-1 consumer と、decoded-stream-relative `SliceLiveInput` 経由の ObjStm member consumer（`reader.rs::parse_object_stream_entry`）が使い、token 終端の one-character unread、diagnostic、top-level/nested/container/null の parsed offset、empty/dictionary/bad-token/depth recovery をここで共有する。uncompressed 側は canonical unresolved handle を同時に生成する。live canonical と context-none explicit の parser invocation は qpdf の parse-call description template を非 null handle に stamp し、container の render shift と null の無記述も維持する。`ObjectHandle::parse` は同じ live parser の context-none entry point で、warning を `Error`、nested `N G R` を `Error::Internal`、非 C whitespace の後続を parse error にする | 🔀 canonical uncompressed consumer は `StringDecrypter`（`flpdf-25kg.3.17`）を object-ref と shared `EncryptionState` に束縛し、`QPDF::readObject` / `QPDFParser` と同様に top-level・array・nested dictionary・stream dictionary の `tt_string` だけを token 時に復号する（`QPDF.cc:1331-1340`; `QPDFParser.cc:114-121,327-365`; `QPDF_encryption.cc:977-1039`）。完成した `/Type /Sig` + `/ByteRange` 辞書だけは raw `/Contents` bytes と parsed offset を復元する。ObjStm / context-none explicit parse / content mode は decrypter を渡さず、unknown word も callback 非呼出し。Content mode は既存 `Parser` を維持し、file-object live parser は content grammar を兼用しない |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除 |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替。所有者は `reader/resolver.rs` の `ResolverCore`（`m->file` 相当）。`ResolverCore` のメソッドは `InputSource` の 3 操作 `seek`/`tell`/`read`（`InputSource.hh:71-74`）に限定し、`OffsetInputSource`（`QPDF.cc:406`）が担う header shift は `seek`/`tell` が適用する。例外は `rewind_underlying_source` 1 つで、これは wrapper が持つ `proxied`（`libqpdf/qpdf/OffsetInputSource.hh:24`）に相当する — `OffsetInputSource::rewind` は logical 0 に行く（`OffsetInputSource.cc:55-59`）ため `m->file` では表現できない。owned-window 系の legacy helper（`read_window` / `read_physical_input`）は `ResolverHandle` 側の `qpdf-legacy-tenant` で、`ResolverCore` の面には置かない | ⚪ |
+
+pre-`Pdf` の xref bootstrap も qpdf の `QPDF::Members::file` / `InputSource`
+の遅延 read 境界（`QPDF.hh:67-97,1453-1457`、`QPDF.cc:245-275`）を保つ。
+`BootstrapHandleDocument` は handle state と diagnostics を先に共有するが、
+入力 snapshot は `OnceCell<Rc<[u8]>>` として未解決 indirect object または
+indirect `/Length` の実解決時だけ初期化する。direct-only の trailer/xref
+metadata path は入力全体を複製しない。これは qpdf の object/stream lazy read
+を generic `Read + Seek` の static resolver lifetime に合わせるための内部
+ownership 実装であり、PDF bytes、warning、xref/cache identity は変更しない。
 | `QPDF_pages.cc` | 319 | `pages/repair.rs`（`QPDF_pages.cc:39-75` の `getAllPages` root correction と `:77-150` の `getAllPagesInternal` repair/enumeration を canonical `ObjectHandle` graph 上で実装） + `optimization/inherited_attrs.rs`（canonical page promotion/clone と衝突しない `Pdf::next_obj_gen` allocation） + `pages.rs` / `pages/tree_rebuild.rs`（flatten/insert/remove と legacy consumer の残り） | 🔀 `flpdf-25kg.3.7` で repair/enumeration の canonical route を追加。`.3.2.6.15` では `QPDFPageObjectHelper::getAttribute` の bottom-up `/Parent` climb（`QPDFPageObjectHelper.cc:217-263`。`QPDF_optimization.cc:121-245`/`QPDF_pages.cc:154-180,205-248` は top-down push とツリー変異のオラクル）を、共有 `PageParentCursor` / `resolve_inherited_handle_with_max_depth` として live `ObjectHandle` で切り出した。直接親の identity、間接親の canonical `ObjectRef`、null/非辞書親、cycle/depth guard をこの境界で保持し、`/Rotate` の未指定を合成しない。`.3.2.6.16` では `tree_rebuild` の単一文書 consumer を canonical handle route に切り替え、選択ページの inherited `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を再親子付け前に push、直接 non-scalar は `make_indirect_object_handle` で一度だけ昇格、既存 indirect 値は identity を保持し、duplicate は `shallow_copy`、root `/Kids`・`/Count`・各 leaf `/Parent` は live handle を replace/remove する。qpdf の absent `/Rotate` は合成しない。`QPDFObjectHandle.cc:1199-1209,2072-2079` の live replace/remove・shallow-copy がこの consumerの mutation oracleである。`QPDFJob.cc:2360-2632` の page-selection orchestration はこの境界の外であり、`page_extract` uses canonical `copyForeignObject`/`ObjectHandle`; `page_merge` / `page_label` remain separate consumers |
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
 
@@ -319,6 +328,18 @@ ObjStm・linearizationの全イベントで `Result` をその場で伝播する
 検査する迂回や、callback failureを成功扱いにするlegacy routeは維持しない
 （`flpdf-egzr.8.8`）。
 
+`--progress` のCLI consumerは、qpdf 11.9.0の `QPDFJob::Config::progress`
+（`QPDFJob_config.cc:478-481`）から `setWriterOptions` 内のfallback reporter登録
+（`QPDFJob.cc:2926-2935`）を経て、writerの `indicateProgress`
+（`QPDFWriter.cc:2187-2193,2957-2987`）へ到達する。flpdfは
+`flpdf-cli/src/main.rs` のCLI writer境界で既存の
+`job/lifecycle.rs::QPDFJob::configure_writer_progress` を呼び出し、
+`QPDFJob::set_progress` により設定だけを渡す。callbackの文言・info/save channel・
+0..100のイベント計算はそれぞれJob/Loggerとcanonical `PdfWriter`が所有し、CLIに
+別のlegacy bridgeを置かない。qpdf 11.9.0の実測では通常の `OUTPUT` へはinfo/stdout、
+`OUTPUT=-` へはstderrに `0%` から `100%` のprogressを出し、PDF bytesはstdoutに残る。
+qtest `progress-reporting` の3行はこの同一責務境界を検証する。
+
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
 経路にしか入らない構造的リスクがここに集中している。`emit_canonical_pdf_inner`
@@ -370,6 +391,25 @@ Encrypt-map emission を handle tree で再現し、直接の `/O` `/U` `/OE` `/
 `/Perms` だけを hex 化する。`flpdf-egzr.3.2.5`（close 済み）writer cutover が
 この surface を production consumer として使用している。
 
+### Non-linearized encrypted Generate ObjStm numbering (`flpdf-cecz`, 2026-08-31)
+
+qpdf 11.9.0 の standard writer は、`QPDFWriter.cc:1072-1118` の enqueue 中に
+generated ObjStm の最初の member へ到達すると、`assignCompressedObjectNumbers`
+（`:1057-1066`）で container とその全 member の番号を直ちに予約する。
+`getCompressibleObjGens` は `QPDF.cc:2393-2440` で `/Encrypt` を候補から除外し、
+全 body の書き出し後に `writeEncryptionDictionary`（`:2244-2255`）が
+`openObject(0)` で `/Encrypt` を末尾へ割り当てる。実測では複数 ObjStm の
+container-first 番号、source object-number 順の member index、type-2 xref、
+`/Encrypt` の後置がこの順序になる。
+
+flpdf の非 linearized encrypted Generate route は `ObjectStreamRenumber` を
+同じ canonical walk として利用し、通常 object と container の chunks を番号順に
+interleave してから xref を確定する。ObjStm dictionary は qpdf の固定順
+`/Type /ObjStm /Length ... /Filter ... /N ... /First ...` で直接 emission し、
+copy-encryption の Generate でも同じ xref-stream/container route を使う。
+QDF、linearized encrypted Generate、非 Generate の copy-encryption はこの issue の
+scope 外であり、それぞれ既存の dedicated route と `flpdf-j4ph` が担当する。
+
 **renumber は重複していない**: `writer/rewrite_renumber.rs` は `linearization/plan.rs` からも
 使われる共有機構で、`linearization/renumber.rs` はその上に載る最終採番層。qpdf の
 `obj_renumber` 1 本に対して 2 層構造だが、二重実装ではない。
@@ -405,6 +445,25 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 `QPDF.cc:2393` にある別物。
 
 ## 5. 暗号
+
+### Encrypted writer matrix (`flpdf-25kg.6.1`, 2026-08-31)
+
+qpdf 11.9.0 の Standard handler は、`QPDFWriter.cc:777-840` の V/R/CFM ごとの
+version floor と `QPDF_encryption.cc:601-660,1180-1204` の V=5 random input 順を
+持つ。`flpdf-cli/tests/encrypt_cli_tests.rs` の
+`encrypted_writer_direct_handler_matrix_matches_qpdf_after_decrypt` は、固定された
+入力・password・permission と全 6 direct handler（V=1/R=2、V=2/R=3、V=4 RC4/R=4、
+V=4 AES/R=4、V=5/R=5、V=5/R=6）を qpdf で復号して QDF に再出力し、semantic/structural
+bytes を比較する。qpdf-zlib-compat の
+`encrypted_writer_deterministic_direct_handler_matrix_is_byte_identical_to_qpdf` は
+V5 以外の deterministic 4 handler を raw bytes で比較し、
+`encrypted_writer_copy_encryption_tuple_is_byte_identical_to_qpdf` は固定 V4 AES-128
+donor の copy-encryption tuple を direct encryption と独立に比較する。
+
+V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invocation
+でも毎回変化）を含むため raw qpdf CLI byte gate の対象外とし、既存の test-only
+`V5Randomness` seam（`.6.5`）で flpdf の deterministic repeat を検証し、qpdf とは
+復号後の QDF で比較する。production default は引き続き OS CSPRNG である。
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
@@ -558,6 +617,15 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob::Config::showEncryption` / `QPDFJob::showEncryption` | `QPDFJob_config.cc:551-555`; `QPDFJob.cc:442-445,700-742,1646-1658` | `job/lifecycle.rs::open_for_encryption_inspection` + `flpdf-cli/src/main.rs::run_show_encryption` + `job/check.rs::QPDFJob::show_encryption`（top-level `--show-encryption` と native subcommandが共有） + `encryption/state.rs::EncryptionInspectionState` | 🔀 qpdfの認証前parsed encryption stateを保持し、wrong-passwordでもR/P/password/match/permission/method reportを完了する。暗号化されたdocumentのdecryption state (`EncryptionState`) は認証成功時だけ有効にし、qpdfの `User password` recovery は V<5 の owner-password pathだけで行う。 |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | clap で代替 | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。 |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
+
+`--job-json-file` の page-transform fields `splitPages`、`rotate`、`removeRestrictions` は、qpdf の生成 JSON handler (`QPDFJob_json.cc:611-624`, `auto_job_json_init.hh`) と Config/Job call order (`QPDFJob_config.cc:535-540,597-609`; `QPDFJob.cc:369-411,428-520,2137-2150,2635-2651,2940-3025`) に対応して `job/lifecycle.rs` の canonical configuration から page split、rotation、security/signature mutation へ接続した。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。 |
+
+`coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
+
+`flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
+
+`generateAppearances` も生成 handler (`auto_job_json_init.hh:383-385`)、Config (`QPDFJob_config.cc:218-221`)、変換順序 (`QPDFJob.cc:2177-2180`) に対応し、既存の `AcroFormDocumentHelper::generate_appearances_if_needed` (`QPDFAcroFormDocumentHelper.cc:393-417`) を `job/lifecycle.rs` から `coalesceContents` の前に呼ぶ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
+top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 
 `QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
 要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を
@@ -870,7 +938,7 @@ byte golden の無い書き込み経路は安全に移動できない。🔀 行
 | null 可視性 | `cmp_null_visibility_tests` ✅ | — |
 | QDF | 🟡 **部分的にあり**（下記）。`job::overlay::byte_gate` の QDF 12 件を含む | 🟡 `cli_byte_identical_overlay.rs` の QDF 3 件 |
 | 暗号化出力 | ❌ gated byte gate 無し | 🟡 `encrypt_cli_tests` の `encrypted_document_is_byte_identical_to_qpdf` / `cli_linearize_encrypt_aes128_byte_identical_to_qpdf` 2件（`qpdf-zlib-compat` 関数レベル gate、CI 列挙済み） |
-| incremental update | ❌ gated byte gate 無し | ❌ |
+| PDF incremental append: not applicable | qpdf 11.9.0 has no incremental append writer; `/Prev` is reader-side xref history | flpdf `PdfWriter` always emits a fresh full rewrite; reader-side `/Prev` parsing remains |
 
 ### QDF の既存カバレッジ（部分的）
 
@@ -921,6 +989,15 @@ CI で走らない。ファイル全体が gated な 11 件は全て列挙済み
 | `std::shared_ptr<QPDFValue>` → `Rc<RefCell<..>>`（`object_handle.rs`） | 79 | 無し（`Rc` による共有 identity の内部所有権機構自体。live direct containment の weak reverse index は qpdf の現在の forward membership から派生する incremental dirty bookkeeping で、stale owner の誤った scheduling を現在の graph に一致させる。共有 identity と各 object の serialization rule は変えず、Pdf identity provenance は別フィールドで保持。byte-identical suite で確認済み） |
 | `std::shared_ptr<Buffer> QPDF_Stream::stream_data`（`libqpdf/qpdf/QPDF_Stream.hh:104`） → `Rc<Vec<u8>>`（`object_handle.rs` の `ObjectValue::Stream`） | 1 | 無し（共有の意味論は同一。`QPDFObjectHandle::newStream(QPDF*, shared_ptr<Buffer>)` / `replaceStreamData(shared_ptr<Buffer>, ..)` / `QPDF_Stream::getStreamDataBuffer` に対応する `ObjectHandle::stream` / `replace_stream_data` / `as_stream_data` が buffer を共有したまま受け渡す。`Rc<[u8]>` ではなく `Rc<Vec<u8>>` なのは、`Rc::<[u8]>::from(vec)` が refcount ヘッダを前置できず payload 全体を memcpy するため。二段の間接になるのは `shared_ptr<Buffer>` と偶然一致するだけで対応関係ではない — qpdf が `Buffer` 型を要するのは C++ が borrow/own を型で表せず実行時フラグに畳むからで（`include/qpdf/Buffer.hh:35-46` が所有・非所有の両コンストラクタを持つ）、その面は既存の `Buffer` → `Vec<u8>` 行が扱う。`Rc` なのは `Repr` が `Rc<RefCell<..>>` ベースで `ObjectValue` がそもそも `!Send` のため。`replace_stream_data` は `QPDF_Stream::replaceFilterData`（`QPDF_Stream.cc:668-684`）に対応する共有 helper を通り、zero length では `/Length` を削除、nonzero では正確な integer を設定する（`flpdf-25kg.4.5`）。byte-identical suite（`qpdf-zlib-compat`）で確認済み） |
 | `QPDF_Array` borrow / slash 付き canonical name string → `Vec<ObjectHandle>` の単一 child clone / slash 無し decoded `Vec<u8>`、および live array mutation（`object_handle.rs`） | 0 | 無し。`try_array_item` は `QPDF_Array::at` と同じ valid index の child identity を `Rc` clone で返し、name predicate は同じ decoded bytes を比較するだけで出力しない。`set_array_item` / `set_array_items` / `insert_array_item` / `append_array_item` / `erase_array_item` は `QPDFObjectHandle.cc:869-955` と `QPDF_Array.cc:10-26,220-313` の bounds→warning、ownership、live child containment、`setFromVector` の clear-before-check / partial-prefix 順序を保持する。`nntree.rs` の canonical NNTree engine はこの live mutation boundary を `set_array_items` から利用し、旧 `replace_array_item(s)` は qpdf の warning/ownership/insert/erase 契約を持たない compatibility bridge として残る。 |
+
+直接構築された深いコンテナの破棄は、qpdf 11.9.0 の `QPDFObject`/`QPDFValue` と
+`QPDF_Array`/`QPDF_Dictionary` の shared-pointer ownership（`QPDFObject_private.hh:19-24,176-179`、
+`QPDFValue.hh:18-27`、`QPDF_Array.hh:9-50`、`QPDF_Dictionary.hh:11-38`、
+`QPDFObjectHandle.cc:1944-2013`）では既定デストラクタが再帰的に辿る。固定版 qpdf の
+live probe は深さ 5,000 では exit 0、50,000 と 100,000 では構築完了後に exit 139
+となった。flpdf はこの一点を Rust safety hardening として、最終所有者の direct
+`Array`/`Dictionary`/`Stream` dictionary edge だけを heap worklist で解放する。
+共有 alias・indirect/resolver identity・PDF bytes は変更しない。
 
 現時点の証拠ではいずれも出力バイトに影響しない。
 

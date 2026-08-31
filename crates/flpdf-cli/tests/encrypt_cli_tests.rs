@@ -55,6 +55,64 @@ const TWO_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/two-page.pdf";
 #[cfg(feature = "qpdf-zlib-compat")]
 const THREE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
 
+/// All direct Standard-handler revisions exposed by the CLI. The boolean
+/// records qpdf's write-time weak-crypto opt-in; it is also passed to qpdf
+/// when reading the R=5 output in the semantic gate.
+const DIRECT_ENCRYPTION_MATRIX: &[(&str, &[&str], bool, &str)] = &[
+    (
+        "v1-r2",
+        &["--allow-weak-crypto", "--encrypt", "u", "o", "40", "--"],
+        true,
+        "R = 2",
+    ),
+    (
+        "v2-r3",
+        &["--allow-weak-crypto", "--encrypt", "u", "o", "128", "--"],
+        true,
+        "R = 3",
+    ),
+    (
+        "v4-rc4-r4",
+        &[
+            "--allow-weak-crypto",
+            "--encrypt",
+            "u",
+            "o",
+            "128",
+            "--force-V4",
+            "--",
+        ],
+        true,
+        "R = 4",
+    ),
+    (
+        "v4-aes-r4",
+        &["--encrypt", "u", "o", "128", "--use-aes=y", "--"],
+        false,
+        "R = 4",
+    ),
+    (
+        "v5-r5",
+        &[
+            "--allow-weak-crypto",
+            "--encrypt",
+            "u",
+            "o",
+            "256",
+            "--force-R5",
+            "--",
+        ],
+        true,
+        "R = 5",
+    ),
+    (
+        "v5-r6",
+        &["--encrypt", "u", "o", "256", "--"],
+        false,
+        "R = 6",
+    ),
+];
+
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
@@ -1117,6 +1175,17 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
             &["u", "", "128", "--allow-insecure"],
             "unrecognized argument",
         ),
+        // A sub-flag missing its leading `-` must not be silently reinterpreted
+        // as the corresponding named flag (qpdf rejects it as an unrecognized
+        // positional argument, not as `--force-R5`).
+        (&["u", "o", "256", "force-R5"], "unrecognized argument"),
+        // In the dashed `--user-password=`/`--bits=` form, qpdf stays in its
+        // password-argument table (no named options recognized) until `--bits`
+        // selects the key-length-specific table.
+        (
+            &["--user-password=u", "--allow-insecure", "--bits=256"],
+            "unrecognized argument",
+        ),
     ];
     for (enc_args, needle) in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -1139,6 +1208,32 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
             "no output for incompatible combo {enc_args:?}"
         );
     }
+}
+
+/// A zero-token `--encrypt --` segment must be rejected the same as an
+/// absent one is accepted — clap's `num_args = 0..` means both an omitted
+/// `--encrypt` and one given with no sub-arguments produce an empty list, so
+/// the two must stay distinguishable or `--encrypt --` would silently write
+/// an unencrypted (plaintext) output despite the user asking for encryption
+/// (qpdf itself rejects this with "encryption key length is required").
+#[test]
+fn encrypt_empty_segment_is_rejected_not_treated_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--encrypt requires USER-PW OWNER-PW KEY-LEN",
+        ));
+    assert!(
+        !output.exists(),
+        "no output must be written for an empty --encrypt segment"
+    );
 }
 
 /// flpdf-9hc.4.9.5: the R>=3 `--encrypt` permission sub-flags must produce the
@@ -1617,6 +1712,316 @@ fn encrypted_document_is_byte_identical_to_qpdf() {
     assert_eq!(
         mine, reference,
         "AES-128 (V=4/AESV2): flpdf output must be byte-identical to qpdf 11.9.0"
+    );
+}
+
+/// Decrypt both sides through qpdf's canonical QDF writer so the random V5
+/// security-handler entries are removed from the comparison. This is the
+/// semantic and structural gate for every direct Standard-handler revision.
+#[test]
+fn encrypted_writer_direct_handler_matrix_matches_qpdf_after_decrypt() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let input = fixture(ONE_PAGE_FIXTURE);
+
+    for (label, encrypt_args, allow_weak_crypto, expected_revision) in DIRECT_ENCRYPTION_MATRIX {
+        let qpdf_output = tmp.path().join(format!("{label}-qpdf.pdf"));
+        let flpdf_output = tmp.path().join(format!("{label}-flpdf.pdf"));
+        write_qpdf_direct_encryption(&input, &qpdf_output, encrypt_args);
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--static-id", "--static-aes-iv", "--object-streams=disable"])
+            .args(*encrypt_args)
+            .arg(&input)
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        let show = ShellCommand::new("qpdf")
+            .arg("--password=u")
+            .arg("--allow-weak-crypto")
+            .arg("--show-encryption")
+            .arg(&flpdf_output)
+            .output()
+            .unwrap();
+        assert!(
+            show.status.success(),
+            "{label}: qpdf could not inspect flpdf output: {}",
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&show.stdout).contains(expected_revision),
+            "{label}: expected {expected_revision}, got {}",
+            String::from_utf8_lossy(&show.stdout)
+        );
+
+        let qpdf_qdf = tmp.path().join(format!("{label}-qpdf.qdf"));
+        let flpdf_qdf = tmp.path().join(format!("{label}-flpdf.qdf"));
+        decrypt_to_qdf(&qpdf_output, &qpdf_qdf, *allow_weak_crypto);
+        decrypt_to_qdf(&flpdf_output, &flpdf_qdf, *allow_weak_crypto);
+        assert_eq!(
+            std::fs::read(&flpdf_qdf).unwrap(),
+            std::fs::read(&qpdf_qdf).unwrap(),
+            "{label}: decrypted semantic/structural QDF must match qpdf 11.9.0"
+        );
+    }
+}
+
+/// V1/V2/V4 direct encryption has no security-handler randomness once qpdf's
+/// static ID and AES-IV controls are enabled. Keep every deterministic
+/// revision in the qpdf-zlib byte gate; V5 is covered semantically above and
+/// has its test-only randomness seam in the core writer tests.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_writer_deterministic_direct_handler_matrix_is_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let input = fixture(ONE_PAGE_FIXTURE);
+
+    for (label, encrypt_args, _allow_weak_crypto, _expected_revision) in
+        DIRECT_ENCRYPTION_MATRIX.iter().take(4)
+    {
+        let qpdf_output = tmp.path().join(format!("{label}-qpdf.pdf"));
+        let flpdf_output = tmp.path().join(format!("{label}-flpdf.pdf"));
+        write_qpdf_direct_encryption(&input, &qpdf_output, encrypt_args);
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--static-id", "--static-aes-iv", "--object-streams=disable"])
+            .args(*encrypt_args)
+            .arg(&input)
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        assert_eq!(
+            std::fs::read(&flpdf_output).unwrap(),
+            std::fs::read(&qpdf_output).unwrap(),
+            "{label}: deterministic direct encryption must be byte-identical to qpdf 11.9.0"
+        );
+    }
+}
+
+/// The donor-based copy route is independently gated from direct encryption.
+/// The donor is qpdf-authored with fixed ID/IV controls, so qpdf's copied V4
+/// AES handler and flpdf's recovered donor tuple must produce identical bytes.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_writer_copy_encryption_tuple_is_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let input = fixture(ONE_PAGE_FIXTURE);
+    let donor = tmp.path().join("donor-qpdf.pdf");
+    let donor_result = ShellCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--encrypt",
+            "",
+            "",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&donor)
+        .output()
+        .unwrap();
+    assert!(
+        donor_result.status.success(),
+        "qpdf donor generation failed: {}",
+        String::from_utf8_lossy(&donor_result.stderr)
+    );
+
+    let qpdf_output = tmp.path().join("copy-qpdf.pdf");
+    let flpdf_output = tmp.path().join("copy-flpdf.pdf");
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--static-id", "--static-aes-iv", "--object-streams=disable"])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .args(["--encryption-file-password=", "--"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf copy-encryption reference failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--static-id", "--static-aes-iv", "--object-streams=disable"])
+        .args(["--copy-encryption"])
+        .arg(&donor)
+        .args(["--encryption-file-password", "", "--"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "fixed V4 AES-128 copy-encryption tuple must be byte-identical to qpdf 11.9.0"
+    );
+}
+
+fn write_qpdf_direct_encryption(input: &Path, output: &Path, encrypt_args: &[&str]) {
+    let result = ShellCommand::new("qpdf")
+        .args(["--static-id", "--static-aes-iv", "--object-streams=disable"])
+        .args(encrypt_args)
+        .arg(input)
+        .arg(output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "qpdf direct encryption failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn decrypt_to_qdf(input: &Path, output: &Path, allow_weak_crypto: bool) {
+    let mut command = ShellCommand::new("qpdf");
+    command
+        .arg("--password=u")
+        .arg("--decrypt")
+        .arg("--qdf")
+        .arg("--object-streams=disable")
+        .arg("--static-id");
+    if allow_weak_crypto {
+        command.arg("--allow-weak-crypto");
+    }
+    let result = command.arg(input).arg(output).output().unwrap();
+    assert!(
+        result.status.success(),
+        "qpdf decrypt-to-QDF failed for {}: {}",
+        input.display(),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+/// qpdf's non-linearized Generate writer assigns an ObjStm container and all
+/// of its members when the first member is reached. The encrypted coordinator
+/// must preserve that container-first numbering for both freshly derived
+/// encryption and copy-encryption from a fixed V4 AES-128 donor.
+///
+/// The fixture has more than one generated ObjStm, so a route that merely
+/// keeps the output valid or moves one container can not satisfy this gate.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_generate_objstm_direct_and_copy_are_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let input = fixture("../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf");
+
+    let direct_args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--object-streams=generate",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+    let direct_qpdf = tmp.path().join("direct-qpdf.pdf");
+    let direct_flpdf = tmp.path().join("direct-flpdf.pdf");
+    let qpdf = ShellCommand::new("qpdf")
+        .args(direct_args)
+        .arg(&input)
+        .arg(&direct_qpdf)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf direct Generate reference failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(direct_args)
+        .arg(&input)
+        .arg(&direct_flpdf)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&direct_flpdf).unwrap(),
+        std::fs::read(&direct_qpdf).unwrap(),
+        "direct encrypted Generate output must be byte-identical to qpdf 11.9.0"
+    );
+
+    let donor = tmp.path().join("donor.pdf");
+    let donor_args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+    let donor_result = ShellCommand::new("qpdf")
+        .args(donor_args)
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&donor)
+        .output()
+        .unwrap();
+    assert!(
+        donor_result.status.success(),
+        "qpdf donor generation failed: {}",
+        String::from_utf8_lossy(&donor_result.stderr)
+    );
+
+    let copy_qpdf = tmp.path().join("copy-qpdf.pdf");
+    let copy_flpdf = tmp.path().join("copy-flpdf.pdf");
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=generate",
+        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .args(["--encryption-file-password=", "--"])
+        .arg(&input)
+        .arg(&copy_qpdf)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf copy-encryption Generate reference failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=generate",
+            "--copy-encryption",
+        ])
+        .arg(&donor)
+        .args(["--encryption-file-password", "", "--"])
+        .arg(&input)
+        .arg(&copy_flpdf)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&copy_flpdf).unwrap(),
+        std::fs::read(&copy_qpdf).unwrap(),
+        "copy-encryption Generate output must be byte-identical to qpdf 11.9.0"
     );
 }
 

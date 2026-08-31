@@ -89,9 +89,8 @@ flpdf check input.pdf                       # validate structure / report diagno
 flpdf pages input.pdf                       # show page structure
 flpdf dump-object 7 0 input.pdf             # dump one indirect object
 flpdf qdf      input.pdf  out.qdf           # qdf-style flat dump
-flpdf rewrite  input.pdf  out.pdf           # incremental rewrite
+flpdf rewrite  input.pdf  out.pdf           # fresh full rewrite
 flpdf rewrite --linearize    in.pdf out.pdf # produce a linearized PDF
-flpdf rewrite --full-rewrite in.pdf out.pdf # decode + re-emit with FlateDecode
 ```
 
 Encrypted inputs are supported via `--password`, `--password-file`, and
@@ -132,7 +131,7 @@ The crate is organized as a few small layers:
 - `Object`, `Dictionary`, `Stream`, `ObjectRef` — the data model.
 - `pages`, `outline_object_helper` — read-only traversal helpers that mirror
   `qpdf --show-pages` and `--json-key=outlines`.
-- `write_pdf` / `write_qdf` — incremental rewrite and qdf-style flat dump.
+- `write_pdf` / `write_qdf` — fresh full rewrite and qdf-style flat dump.
 - `job::QPDFJob::check` — qpdf-compatible document validation and warning
   completion for CLI and library job consumers.
 

@@ -70,6 +70,7 @@ struct WriterOptions {
     decode_level: StreamDecodeLevel,
     decode_level_set: bool,
     recompress_flate: bool,
+    progress: bool,
     static_id: bool,
     deterministic_id: bool,
     static_aes_iv: bool,
@@ -97,6 +98,7 @@ impl Default for WriterOptions {
             decode_level: StreamDecodeLevel::None,
             decode_level_set: false,
             recompress_flate: false,
+            progress: false,
             static_id: false,
             deterministic_id: false,
             static_aes_iv: false,
@@ -212,6 +214,68 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
     Ok(())
 }
 
+/// Fail fast on an unusable output destination before a progress-reporting
+/// page-operation rewrite begins.
+///
+/// qpdf opens (and therefore validates) its real output destination before
+/// any writing -- including progress notifications -- starts. Confirmed
+/// against live qpdf 11.9.0: `qpdf --progress --rotate=90:1 in.pdf
+/// a-directory` fails immediately with no progress line printed at all.
+/// flpdf's page-operation rewrite instead computes the complete output into
+/// an internal memory buffer first (`write_qpdf_to_memory`) and persists it
+/// to `output` only afterward, so without this guard an unusable
+/// destination would let the full 0..100 progress sequence print before the
+/// later persistence step fails. Opens without truncating so an
+/// already-existing, otherwise-valid destination is left untouched until
+/// the real write.
+///
+/// Skips the check for an existing named pipe (Unix only): qpdf itself opens
+/// its real destination exactly once, and a FIFO's reader observes EOF and
+/// can exit as soon as this validation open closes, so the later real write
+/// would reopen a FIFO with no reader left and hang. Every other destination
+/// kind (regular files, directories, sockets, device files, and nonexistent
+/// paths) has no such open/close synchronization hazard and is still probed
+/// here, so this remains a fail-fast guard for those.
+fn validate_progress_output_destination(output: &Path) -> CliResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(metadata) = std::fs::metadata(output) {
+            if metadata.file_type().is_fifo() {
+                return Ok(());
+            }
+        }
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(output)?;
+    Ok(())
+}
+
+/// Attach qpdf's logger-backed progress reporter to a direct CLI writer.
+///
+/// The event accounting remains owned by `PdfWriter`; `QPDFJob` owns the
+/// message prefix, output identity, and info/save routing just as qpdf's
+/// `setWriterOptions` does (`libqpdf/QPDFJob.cc:2926-2935`).
+fn configure_cli_progress<R: Read + Seek + 'static>(
+    writer: &mut PdfWriter<'_, R>,
+    output: &Path,
+    enabled: bool,
+) -> CliResult<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_output_file(output.to_path_buf())?;
+    job.set_progress(true);
+    job.configure_writer_progress(writer);
+    Ok(())
+}
+
 fn write_with_pdf_writer<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     output: &Path,
@@ -222,6 +286,7 @@ fn write_with_pdf_writer<R: Read + Seek + 'static>(
 ) -> CliResult<()> {
     let mut writer = PdfWriter::new(pdf);
     configure_pdf_writer(&mut writer, options, linearize, linearize_pass1)?;
+    configure_cli_progress(&mut writer, output, options.progress)?;
     if let Some(sink) = standard_output.take() {
         writer.set_output_writer(sink)?;
     } else {
@@ -233,10 +298,12 @@ fn write_with_pdf_writer<R: Read + Seek + 'static>(
 
 fn write_qpdf_to_memory<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
+    output: &Path,
     options: &WriterOptions,
 ) -> CliResult<Vec<u8>> {
     let mut writer = PdfWriter::new(pdf);
     configure_pdf_writer(&mut writer, options, false, None)?;
+    configure_cli_progress(&mut writer, output, options.progress)?;
     writer.set_output_memory()?;
     writer.write()?;
     Ok(writer.get_buffer()?)
@@ -388,6 +455,7 @@ struct Cli {
             "encrypt",
             "copy_encryption",
             "encryption_file_password",
+            "flatten_annotations",
             "output",
         ]
     )]
@@ -460,6 +528,7 @@ struct Cli {
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf", "coalesce_contents",
+              "flatten_annotations",
               "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
@@ -730,6 +799,33 @@ struct Cli {
           ])]
     coalesce_contents: bool,
 
+    /// Flatten annotations into page content (top-level alias of
+    /// `rewrite --flatten-annotations`; qpdf `--flatten-annotations`
+    /// equivalent). Values are `all`, `screen`, or `print`.
+    // `json_output` has no dedicated dispatch check of its own (unlike
+    // `json`, which lists `flatten_annotations` on its own conflicts_with_all
+    // for the same reason): without it, `--flatten-annotations=all
+    // --json-output=2 in out` exits 0 and silently writes a JSON dump of the
+    // unmodified input while dropping the requested transformation, since
+    // main's dispatch chain routes to run_json before either rewrite path
+    // that consumes flatten_annotations. Confirmed live.
+    #[arg(
+        long = "flatten-annotations",
+        value_enum,
+        value_name = "MODE",
+        conflicts_with_all = [
+            "check", "show_object",
+            "show_npages", "show_pages", "show_xref", "show_linearization",
+            "show_encryption",
+            "list_attachments", "show_attachment", "remove_attachment",
+            "add_attachment", "copy_attachments_from",
+            "pages", "rotate", "split_pages", "empty",
+            "json_output",
+        ],
+        help = "Flatten annotations into page content; MODE is all, screen, or print"
+    )]
+    flatten_annotations: Option<CliFlattenMode>,
+
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
     // Observed against /usr/bin/qpdf 11.9.0:
@@ -824,6 +920,10 @@ struct Cli {
     )]
     verbose: bool,
 
+    /// Report approximate write progress (qpdf --progress).
+    #[arg(long = "progress")]
+    progress: bool,
+
     /// Extract an attachment by key (qpdf --show-attachment compatible).
     ///
     /// KEY is the name-tree key used when the attachment was added. The raw
@@ -889,7 +989,7 @@ struct Cli {
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
     )]
-    encrypt: Vec<String>,
+    encrypt: Option<Vec<String>>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
@@ -1272,7 +1372,7 @@ struct RewriteCommand {
             "copy_encryption",
         ]
     )]
-    encrypt: Vec<String>,
+    encrypt: Option<Vec<String>>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
@@ -1558,6 +1658,10 @@ struct RewriteCommand {
                 (mirrors qpdf --verbose)"
     )]
     verbose: bool,
+
+    /// Report approximate write progress (qpdf --progress).
+    #[arg(long = "progress")]
+    progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -2099,6 +2203,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             &top_level_version_options,
         )
     } else if !args.add_attachment.is_empty() {
@@ -2111,6 +2216,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             args.verbose,
             &top_level_version_options,
         )
@@ -2124,6 +2230,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            args.progress,
             args.verbose,
             &top_level_version_options,
         )
@@ -2144,6 +2251,7 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            progress: args.progress,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2173,7 +2281,7 @@ fn main() {
         // plaintext output even though the user asked for encryption.
         apply_encryption_options(
             &mut options,
-            &args.encrypt,
+            args.encrypt.as_deref(),
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             &args.password,
@@ -2193,10 +2301,11 @@ fn main() {
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             false,                              // generate_appearances (not on top-level surface)
-            None,                               // flatten_annotations (not on top-level surface)
-            false,                              // flatten_rotation (not on top-level surface)
+            args.flatten_annotations,
+            false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
             args.verbose,
+            args.no_warn,
             options,
         );
         result
@@ -2213,7 +2322,7 @@ fn main() {
         // (mirrors the existing `--decrypt` / `--remove-restrictions`
         // rejection in the subcommand surface). Wiring encryption
         // through the page-op pipeline is a flpdf-9hc.4.9 follow-up.
-        if !args.encrypt.is_empty() {
+        if args.encrypt.is_some() {
             eprintln!(
                 "flpdf: --encrypt is not applied in the \
                  --pages/--rotate/--split-pages/--collate pipeline; \
@@ -2235,6 +2344,7 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            progress: args.progress,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2302,6 +2412,7 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            progress: args.progress,
             object_streams: args.object_streams.into(),
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
@@ -2333,7 +2444,7 @@ fn main() {
         // the non-page-op branch, so no further page-op guard is needed here.
         apply_encryption_options(
             &mut options,
-            &args.encrypt,
+            args.encrypt.as_deref(),
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             &args.password,
@@ -2353,10 +2464,11 @@ fn main() {
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             false,                              // generate_appearances (not on top-level surface)
-            None,                               // flatten_annotations (not on top-level surface)
-            false,                              // flatten_rotation (not on top-level surface)
+            args.flatten_annotations,
+            false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
             args.verbose,
+            args.no_warn,
             options,
         )
     };
@@ -2867,6 +2979,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 static_aes_iv: cmd.static_aes_iv,
                 no_original_object_ids: cmd.no_original_object_ids,
                 preserve_unreferenced_objects: cmd.preserve_unreferenced,
+                progress: cmd.progress,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
@@ -2897,7 +3010,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // apply_encryption_options).
             apply_encryption_options(
                 &mut options,
-                &cmd.encrypt,
+                cmd.encrypt.as_deref(),
                 cmd.copy_encryption.as_deref(),
                 cmd.encryption_file_password.as_deref(),
                 &cmd.password,
@@ -2908,20 +3021,14 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
 
-            // --flatten-annotations / --generate-appearances / --flatten-rotation
-            // are applied only on run_rewrite's NON-linearize branch (the
-            // content-mutation passes do not exist on the linearize path). Pairing
-            // them with --linearize would silently drop the requested
-            // transformation, so reject the combination loudly instead — the same
-            // shape as the --linearize + page-ops guard below.
-            if cmd.linearize
-                && (cmd.generate_appearances
-                    || cmd.flatten_annotations.is_some()
-                    || cmd.flatten_rotation)
-            {
+            // --generate-appearances / --flatten-rotation remain unsupported
+            // on the linearize path, but flattenAnnotations is applied by
+            // qpdf before its linearized writer and is handled by the shared
+            // run_rewrite route below.
+            if cmd.linearize && (cmd.generate_appearances || cmd.flatten_rotation) {
                 eprintln!(
                     "flpdf: --linearize cannot be combined with \
-                     --flatten-annotations/--generate-appearances/--flatten-rotation"
+                     --generate-appearances/--flatten-rotation"
                 );
                 std::process::exit(1);
             }
@@ -2965,7 +3072,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 if coalesce_contents
                     || cmd.remove_restrictions
                     || cmd.decrypt
-                    || !cmd.encrypt.is_empty()
+                    || cmd.encrypt.is_some()
                     || cmd.copy_encryption.is_some()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
@@ -3043,6 +3150,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.flatten_rotation,
                 overlay_specs,
                 cmd.verbose,
+                false, // no_warn: the `rewrite` subcommand has no --no-warn flag
                 options,
             )
         }
@@ -3105,12 +3213,12 @@ fn run_check_linearization(
 /// fires.
 fn apply_encryption_options(
     options: &mut WriterOptions,
-    encrypt: &[String],
+    encrypt: Option<&[String]>,
     copy_encryption: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
     password_args: &PasswordArgs,
 ) {
-    if !encrypt.is_empty() {
+    if let Some(encrypt) = encrypt {
         match parse_encrypt_segment(encrypt, password_args.allow_weak_crypto) {
             Ok(parsed) => {
                 if parsed.accessibility_warning {
@@ -3319,6 +3427,15 @@ fn parse_encrypt_segment(
             if !token.starts_with('-') || token == "-" {
                 return Err("positional and dashed encryption arguments may not be mixed".into());
             }
+            // qpdf's password-argument table has no key-specific options;
+            // `--bits` must select the key-length-specific table before any
+            // other named option is recognized.
+            if !key_len_seen {
+                return Err(format!(
+                    "unrecognized argument {token} (encryption options must be terminated with --)"
+                )
+                .into());
+            }
             subflags.push(token.clone());
         } else if positional.len() < 3 {
             if token.starts_with('-') && token != "-" {
@@ -3330,6 +3447,12 @@ fn parse_encrypt_segment(
             positional_mode = true;
             positional.push(token.clone());
         } else {
+            if !token.starts_with('-') || token == "-" {
+                return Err(format!(
+                    "unrecognized argument {token} (encryption options must be terminated with --)"
+                )
+                .into());
+            }
             subflags.push(token.clone());
         }
         index += 1;
@@ -3665,6 +3788,7 @@ fn run_rewrite(
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
+    no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
@@ -3697,6 +3821,7 @@ fn run_rewrite(
             flatten_rotation,
             overlay_specs,
             verbose,
+            no_warn,
             options,
         ),
         JobPdf::Json(pdf) => run_rewrite_opened(
@@ -3717,6 +3842,7 @@ fn run_rewrite(
             flatten_rotation,
             overlay_specs,
             verbose,
+            no_warn,
             options,
         ),
     }
@@ -3741,8 +3867,15 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
+    no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
+    // qpdf's `--no-warn` suppresses warning delivery for the entire job,
+    // including warnings raised by transformations applied after the
+    // document opens (e.g. --flatten-annotations's /NeedAppearances
+    // warning), not only open-time diagnostics. Without this, a warning
+    // raised mid-rewrite would still print live despite --no-warn.
+    pdf.set_suppress_warnings(no_warn);
     let mut standard_output = prepare_pdf_standard_output(output)?;
 
     // Overlay/underlay stacking mutates page dictionaries and adds objects
@@ -3764,6 +3897,11 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let mut options = options;
         if decrypt || remove_restrictions {
             options.preserve_encryption = false;
+        }
+        if let Some(mode) = flatten_annotations_mode {
+            let (required_flags, forbidden_flags) = mode.flags();
+            PageDocumentHelper::new(&mut pdf)
+                .flatten_annotations(required_flags, forbidden_flags)?;
         }
         // Apply content normalization before the writer plans and emits the
         // linearized document.
@@ -3789,7 +3927,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         }
         // On an encrypted input, `--decrypt`/`--remove-restrictions` has
         // already disabled source-encryption preservation above.
-        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file)?;
+        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     } else {
         // Capture encryption state before the write for the qpdf-compatible
         // restriction diagnostic.
@@ -3990,7 +4128,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file)?;
+        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     }
     Ok(())
 }
@@ -5114,7 +5252,16 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         None
     };
 
-    let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
+    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    if split_progress {
+        // qpdf creates a fresh writer for each split output. The memory
+        // rewrite is flpdf's internal preparation step and is not an
+        // observable qpdf writer, so it must not consume the progress stream.
+        options.progress = false;
+    } else if options.progress && standard_output.is_none() {
+        validate_progress_output_destination(output)?;
+    }
+    let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
         let (written, mut split_job) = split_rewritten_pdf(
@@ -5123,6 +5270,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             output,
             input_path,
             options.deterministic_id,
+            split_progress,
             writer_configuration(&options, false),
         )?;
         if verbose {
@@ -5246,6 +5394,7 @@ fn split_rewritten_pdf(
     output: &Path,
     input_path: &Path,
     deterministic_id: bool,
+    progress: bool,
     writer_configuration: WriterConfiguration,
 ) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
@@ -5253,6 +5402,10 @@ fn split_rewritten_pdf(
     job.set_message_prefix(progname());
     let input_name = input_path.to_string_lossy().into_owned();
     let mut pdf = job.open(Cursor::new(bytes), input_name, PdfOpenOptions::default())?;
+    if progress {
+        job.set_progress(true);
+        job.set_output_file(output.to_path_buf())?;
+    }
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
@@ -5320,7 +5473,16 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     // the memory intermediate decryptable before split_pages re-opens it.
     let mut options = options;
     options.preserve_encryption = page_ops.split_pages.is_none() && pdf.is_encrypted();
-    let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
+    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    if split_progress {
+        // qpdf creates a fresh writer for each split output. The memory
+        // rewrite is flpdf's internal preparation step and is not an
+        // observable qpdf writer, so it must not consume the progress stream.
+        options.progress = false;
+    } else if options.progress && creates_output {
+        validate_progress_output_destination(output)?;
+    }
+    let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
@@ -5330,6 +5492,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             output,
             input,
             options.deterministic_id,
+            split_progress,
             writer_configuration(&options, false),
         )?;
         if verbose {
@@ -5813,7 +5976,7 @@ fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
             if result.warnings.is_empty() {
                 Ok(())
             } else {
-                finish_warning_state(true, false)
+                finish_warning_state(true, false, false)
             }
         }
         Err(ShowLinearizationError::Malformed { message }) => {
@@ -6365,6 +6528,7 @@ fn finish_operation_warnings_with_prior<R: Read + Seek>(
     finish_warning_state(
         prior_warnings || !pdf.repair_diagnostics().entries().is_empty(),
         creates_output,
+        false,
     )
 }
 
@@ -6396,10 +6560,11 @@ fn finish_check_job(result: std::result::Result<JobExitCode, CheckError>) -> Cli
     }
 }
 
-fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<()> {
+fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     if has_warnings {
         job.record_warnings();
     }
@@ -6445,6 +6610,7 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     pdf: &Pdf<R>,
     normalization_warnings: &[ContentNormalizationWarning],
     creates_output: bool,
+    no_warn: bool,
 ) -> CliResult<()> {
     // qpdf retains open-time warnings in the document warning collection and
     // emits the final summary after the output writer completes. Include the
@@ -6457,7 +6623,7 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     if normalization_warnings.is_empty() && !has_repair_warnings {
         return Ok(());
     }
-    finish_warning_state(true, creates_output)
+    finish_warning_state(true, creates_output, no_warn)
 }
 
 /// Prefix a fatal error with the input path so main() renders the observed
@@ -6653,6 +6819,7 @@ fn run_add_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6696,6 +6863,7 @@ fn run_add_attachment(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
@@ -6726,6 +6894,7 @@ fn run_remove_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
@@ -6742,10 +6911,12 @@ fn run_remove_attachment(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut options, version_options);
-    let mut standard_output = None;
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let creates_output = standard_output.is_none();
     write_with_pdf_writer(
         &mut pdf,
         &output,
@@ -6754,7 +6925,7 @@ fn run_remove_attachment(
         false,
         None,
     )?;
-    finish_operation_warnings(&pdf, true)
+    finish_operation_warnings(&pdf, creates_output)
 }
 
 /// `--list-attachments [--verbose] input`
@@ -6809,6 +6980,7 @@ fn run_copy_attachments_from(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    progress: bool,
     verbose: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
@@ -6857,6 +7029,7 @@ fn run_copy_attachments_from(
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
+        progress,
         ..WriterOptions::default()
     };
     apply_cli_version_options(&mut writer_options, version_options);

@@ -502,6 +502,16 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
     forbidden_flags: i64,
 ) -> Result<()> {
     let need_appearances = acroform_need_appearances(pdf)?;
+    if need_appearances {
+        // qpdf warns on the catalog's /AcroForm handle before skipping its
+        // Widget annotations (`QPDFPageDocumentHelper.cc:55-64`). Keep the
+        // object description on the warning so the job records the same
+        // recoverable condition and returns qpdf's warning status.
+        let root = pdf.root_handle()?;
+        root.try_get_key(b"/AcroForm")?.warn_if_possible(
+            "document does not have updated appearance streams, so form fields will not be flattened",
+        )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+    }
     let default_resources = acroform_default_resources(pdf)?;
     // qpdf resolves the Widget's field helper from one cached
     // AcroFormDocumentHelper analysis before asking it for `/DR`. Build the
@@ -984,6 +994,13 @@ mod tests {
         pdf.mark_object_handle_dirty(&root).unwrap();
 
         assert!(acroform_need_appearances(&mut pdf).unwrap());
+
+        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        let diagnostics = pdf.repair_diagnostics();
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.message
+                == "document does not have updated appearance streams, so form fields will not be flattened"
+        }));
     }
 
     #[test]
