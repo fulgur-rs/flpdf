@@ -33,27 +33,33 @@ Grouped by area for navigation.
 **Owner:** Mitsuru Hayasaka
 
 **Evidence:** qpdf's `Pl_Function` class (`include/qpdf/Pl_Function.hh:37-62`,
-`libqpdf/Pl_Function.cc:10-61`) adapts a byte callback to the C++ `Pipeline`
-chain. In qpdf 11.9.0 its production constructors are reached by
-`qpdf_write_json` (`libqpdf/qpdf-c.cc:1925-1950`) and custom logger destinations
-(`libqpdf/qpdflogger-c.cc:35-100`), both C API surfaces. The qpdf core PDF
-reader/writer paths do not consume `Pl_Function` directly.
+`libqpdf/Pl_Function.cc:10-61`) has three constructors: one taking a
+C++-native `std::function<void(unsigned char const*, size_t)>` callback
+(not C-ABI-specific on its own), and two taking C-style function pointers
+plus a `void*` udata for C callers. Only the C-style overloads are ever
+actually called in qpdf 11.9.0's own source — `qpdf_write_json`
+(`libqpdf/qpdf-c.cc:1936`) and custom logger destinations
+(`libqpdf/qpdflogger-c.cc:58`), both C API wrapper files — and the
+`std::function` overload has no caller anywhere in qpdf's codebase. The
+qpdf core PDF reader/writer paths do not consume `Pl_Function` at all.
 
-flpdf has no qpdf-compatible C ABI, so a C function-pointer/`void*` adapter
-would add an API surface outside this project scope. The Rust-native
-equivalent to `qpdf_write_json`'s output callback is the caller-supplied
-`Pipeline` passed to `Json::write` (`json/writer.rs:97`), which receives
+Because every actual `Pl_Function` construction in qpdf routes through the
+C-style overload from a C API wrapper, there is no non-C-API qpdf
+production consumer to port a Rust `PlFunction` stage for — flpdf lacking a
+C ABI is why the two consumers that do exist are out of scope, not a claim
+that the class itself is inherently C-specific. The Rust-native equivalent
+to `qpdf_write_json`'s output callback is the caller-supplied `Pipeline`
+passed to `Json::write` (`json/writer.rs:97`), which receives
 already-serialized JSON bytes the same way the C callback does —
 `Json::make_blob` is the opposite boundary, a producer closure that writes
-raw bytes for `Json::write` to base64-encode into an inline string value, not
-an output sink. Custom logger destinations correspond to `QPDFLogger`'s
+raw bytes for `Json::write` to base64-encode into an inline string value,
+not an output sink. Custom logger destinations correspond to `QPDFLogger`'s
 `PipelineHandle`-typed setters (`logger.rs`'s `set_info`/`set_warn`/
-`set_error`/`set_save`), and progress reporting corresponds to
-`PdfWriter::register_progress_reporter`/`QPDFJob::register_progress_reporter`,
-whose closures return the crate-wide `Result<()>`. These paths preserve
-callback bytes, error propagation, and finish ownership for their actual
-Rust consumers. Do not add a standalone `PlFunction` stage unless a future C
-ABI is explicitly adopted.
+`set_error`/`set_save`). These paths preserve callback bytes, error
+propagation, and finish ownership for their actual Rust consumers. Do not
+add a standalone `PlFunction` stage unless a future qpdf production
+consumer actually calls its `std::function` overload, or a C ABI is
+explicitly adopted.
 
 ### Stream encoding
 
