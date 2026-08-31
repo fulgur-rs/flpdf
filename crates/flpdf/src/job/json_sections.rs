@@ -5,6 +5,7 @@
 //! constructs them from `QPDFJob::doJSON`, while the generic JSON value and
 //! stream serializers remain in [`crate::json_inspect`].
 
+use crate::encryption::state::effective_length_bits;
 use crate::json::Json;
 use crate::json_inspect::{
     json_array, json_dictionary, pdf_dest_to_json_with_version, pdf_object_to_json_with_version,
@@ -1021,21 +1022,27 @@ fn dict_name_str<R: Read + Seek>(
 /// `p_raw` is the signed /P value. Per ISO 32000-1 §7.6.3.2 the bits are
 /// tested after casting to u32 so that negative values (like -4) behave as
 /// the expected all-bits-set value.
-fn capabilities_from_p(p_raw: i32, version: i32) -> Vec<(String, Json)> {
+fn capabilities_from_p(p_raw: i32, revision: i64, json_version: i32) -> Vec<(String, Json)> {
     let p = p_raw as u32;
-    // All nine capabilities in alphabetical order (qpdf schema).
-    let accessibility = (p & 0x0200) != 0;
+    // All nine capabilities in alphabetical order (qpdf schema). These
+    // projections follow QPDF_encryption.cc:1331-1420, where the meaning of
+    // bits 4, 6, 9, and 11 depends on the Standard-handler revision.
+    let bit = |number: u32| p & (1u32 << (number - 1)) != 0;
+    let accessibility = bit(if revision < 3 { 5 } else { 10 });
     let extract = (p & 0x0010) != 0;
-    let modify = (p & 0x0008) != 0;
-    let modifyannotations = (p & 0x0020) != 0;
-    let modifyassembly = (p & 0x0400) != 0;
-    let modifyforms = (p & 0x0100) != 0;
-    // modifyother mirrors modify (qpdf behaviour for standard handler)
-    let modifyother = modify;
-    let printhigh = (p & 0x0800) != 0;
-    let printlow = (p & 0x0004) != 0;
+    let modifyannotations = bit(6);
+    let modifyassembly = bit(if revision < 3 { 4 } else { 11 });
+    let modifyforms = bit(if revision < 3 { 6 } else { 9 });
+    let modifyother = bit(4);
+    let printlow = bit(3);
+    let printhigh = printlow && (revision < 3 || bit(12));
+    let modify = bit(4) && modifyannotations && (revision < 3 || (modifyforms && modifyassembly));
 
-    let modify_annotations_key = if version == 1 {
+    // The legacy misspelled key is a JSON output-schema quirk, not an
+    // encryption-revision one: qpdf selects it on `m->json_version == 1`
+    // (`QPDFJob.cc:1236`), the same schema version `all_true_capabilities`
+    // above already keys on for the plaintext projection.
+    let modify_annotations_key = if json_version == 1 {
         "moddifyannotations"
     } else {
         "modifyannotations"
@@ -1081,8 +1088,10 @@ fn all_true_capabilities(version: i32) -> Result<Json, ConvertError> {
 /// Schema follows qpdf 11.x `--json --json-key=encrypt`:
 /// - Plaintext / no `/Encrypt`: `encrypted: false`, all capabilities `true`,
 ///   all parameters 0 / "none".
-/// - Encrypted: parameters from the `/Encrypt` dictionary; key is always
-///   `null`; `recovereduserpassword` is always `null`.
+/// - Encrypted: parameters from the `/Encrypt` dictionary and authenticated
+///   state; `key` is populated only when requested, and
+///   `recovereduserpassword` is populated only for V<5 owner-password
+///   authentication.
 ///
 /// The function reads the trailer's `/Encrypt` entry directly and does **not**
 /// require any internal `EncryptionState` accessor, making it self-contained
@@ -1166,15 +1175,22 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
                 }
                 None => 0,
             };
-            let bits = match enc.get(b"/Length".as_slice()) {
-                // Default key length when /Length is absent: 40 bits (V=1/2).
-                None => 40,
-                // Present: an integer value, or 0 for anything malformed.
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle.as_integer().unwrap_or(0)
-                }
-            };
+            let length_handle = enc
+                .get(b"/Length".as_slice())
+                .cloned()
+                .unwrap_or_else(ObjectHandle::null);
+            pdf.resolve(&length_handle)?;
+            let dictionary_bits = effective_length_bits(v, &length_handle)?;
+            let encryption_info = pdf.encryption_info()?;
+            // qpdf reports the derived file-key length, not a raw `/Length`
+            // spelling. The initialized encryption snapshot is therefore the
+            // authority after authentication; the dictionary projection is a
+            // defensive fallback for an encrypted inspection object without
+            // an authenticated state.
+            let bits = encryption_info
+                .as_ref()
+                .map(|info| info.length_bits)
+                .unwrap_or(dictionary_bits);
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
             let stmf = dict_name_str(pdf, enc, "StmF")?;
@@ -1194,7 +1210,7 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
             // top-level `method` mirrors streammethod (qpdf behaviour)
             let method = streammethod;
 
-            let capabilities = json_dictionary(capabilities_from_p(p_raw, version))?;
+            let capabilities = json_dictionary(capabilities_from_p(p_raw, r, version))?;
             let key = if show_encryption_key {
                 pdf.encryption_file_key()
                     .map(|value| Json::make_string(hex::encode(value)))
@@ -1214,21 +1230,36 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
                 ("stringmethod", Json::make_string(stringmethod)),
             ])?;
 
-            // ownerpasswordmatched / userpasswordmatched come from the
-            // reader's authentication record so user-only-authenticated
-            // documents do not falsely report owner=true.
+            // qpdf only exposes a recovered user password when the owner
+            // password matched on a V<5 document and the user password did
+            // not also match (`QPDFJob.cc:1208-1217`).
+            let recovered_user_password = encryption_info
+                .as_ref()
+                .filter(|info| {
+                    info.v < 5 && info.owner_password_matched && !info.user_password_matched
+                })
+                .map(|info| Json::make_string(&info.user_password))
+                .unwrap_or_else(Json::make_null);
             json_dictionary([
                 ("capabilities", capabilities),
                 ("encrypted", Json::make_bool(is_encrypted)),
                 (
                     "ownerpasswordmatched",
-                    Json::make_bool(pdf.owner_password_matched()),
+                    Json::make_bool(
+                        encryption_info
+                            .as_ref()
+                            .is_some_and(|info| info.owner_password_matched),
+                    ),
                 ),
                 ("parameters", parameters),
-                ("recovereduserpassword", Json::make_null()),
+                ("recovereduserpassword", recovered_user_password),
                 (
                     "userpasswordmatched",
-                    Json::make_bool(pdf.user_password_matched()),
+                    Json::make_bool(
+                        encryption_info
+                            .as_ref()
+                            .is_some_and(|info| info.user_password_matched),
+                    ),
                 ),
             ])
         }
@@ -1316,11 +1347,17 @@ mod tests {
     }
 
     #[test]
-    fn encryption_capabilities_and_v1_key_spelling_are_both_built() {
-        let v1 = capabilities_from_p(-4, 1);
-        let v2 = capabilities_from_p(-4, 2);
-        assert!(v1.iter().any(|(key, _)| key == "moddifyannotations"));
-        assert!(v2.iter().any(|(key, _)| key == "modifyannotations"));
+    fn modify_annotations_key_spelling_follows_json_version_not_encryption_revision() {
+        // The legacy misspelled key is a JSON schema-version quirk
+        // (`QPDFJob.cc:1236`: `m->json_version == 1`), independent of the
+        // encryption revision `R` used for the bit-semantics projections
+        // below. A `--json=1` inspection of a modern R>=3 document must still
+        // emit the typo'd key, and a `--json=2` inspection of a legacy R=1
+        // document must not.
+        let json1_r2 = capabilities_from_p(-4, 2, 1);
+        let json2_r1 = capabilities_from_p(-4, 1, 2);
+        assert!(json1_r2.iter().any(|(key, _)| key == "moddifyannotations"));
+        assert!(json2_r1.iter().any(|(key, _)| key == "modifyannotations"));
     }
 
     #[test]

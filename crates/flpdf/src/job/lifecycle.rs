@@ -1023,6 +1023,19 @@ impl QPDFJob {
         self.configuration.progress = value;
     }
 
+    /// Include the derived encryption key in check/show-encryption output.
+    ///
+    /// This is the job-owned equivalent of qpdf's `--show-encryption-key`
+    /// switch; JSON output already carries the same setting through its
+    /// dedicated options.
+    pub fn set_show_encryption_key(&mut self, show: bool) {
+        self.configuration.show_encryption_key = show;
+    }
+
+    pub(crate) fn show_encryption_key(&self) -> bool {
+        self.configuration.show_encryption_key
+    }
+
     /// Return the current diagnostic prefix.
     #[must_use]
     pub fn message_prefix(&self) -> &str {

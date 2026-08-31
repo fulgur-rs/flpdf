@@ -6,7 +6,10 @@
 //! process boundary; the PDF read/write responsibilities stay in the canonical
 //! `flpdf::Pdf` and `flpdf::PdfWriter` APIs.
 
-use flpdf::{DecodeLevel, EncryptionInfo, Pdf, PdfOpenOptions, PdfWriter, Result};
+use flpdf::{
+    DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, EncryptionInfo, Error, Pdf,
+    PdfOpenOptions, PdfWriter, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
+};
 use std::env;
 use std::fs::File;
 use std::io::Write;
@@ -53,6 +56,13 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
 
     match args[1].to_str() {
         Some("1") => run_test1(&args[2], &args[3]),
+        Some("2") => run_test2(&args[2], &args[3], &args[4]),
+        Some("11") => run_test11(&args[2], &args[3], &args[4]),
+        Some("12") => run_test12(&args[2], &args[3], &args[4]),
+        Some("13") => run_test13(&args[2], &args[3], &args[4]),
+        Some("15") => run_test15(&args[2], &args[3], &args[4]),
+        Some("17") => run_test17(&args[2], &args[3], &args[4]),
+        Some("18") => run_test18(&args[2], &args[3], &args[4]),
         Some("19") => run_test19(&args[2], &args[3], &args[4]),
         Some("20") => run_test20(&args[2], &args[3], &args[4]),
         Some(test_number) => Err(flpdf::Error::Unsupported(format!(
@@ -60,6 +70,256 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         ))),
         None => Err(flpdf::Error::Unsupported("invalid test number".to_owned())),
     }
+}
+
+fn read_options(input: &std::path::Path, password: Vec<u8>) -> PdfOpenOptions {
+    PdfOpenOptions {
+        password,
+        // The qpdf C API authenticates with one password candidate. The
+        // alternate encoding retry loop belongs to QPDFJob, not qpdf-c.
+        suppress_password_recovery: true,
+        description: input.to_string_lossy().into_owned(),
+        ..PdfOpenOptions::default()
+    }
+}
+
+fn open_input(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Result<Pdf<File>> {
+    let input = PathBuf::from(input_arg);
+    let password = password_bytes(password_arg);
+    Pdf::open_with_options(File::open(&input)?, read_options(&input, password))
+}
+
+fn is_bad_password(error: &Error) -> bool {
+    match error {
+        Error::Encrypted(EncryptedError::BadPassword) => true,
+        Error::OpenFailure { source, .. } => is_bad_password(source),
+        _ => false,
+    }
+}
+
+/// Write `path`'s raw bytes to `output`, matching `qpdf_get_error_filename`'s
+/// verbatim `argv` filename (`qpdf-ctest.c:40`) rather than a lossy
+/// UTF-8 projection that would replace non-UTF-8 bytes with U+FFFD before
+/// the name ever reaches the terminal.
+#[cfg(unix)]
+fn write_native_path(output: &mut impl Write, path: &std::path::Path) -> Result<()> {
+    output.write_all(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_native_path(output: &mut impl Write, path: &std::path::Path) -> Result<()> {
+    write!(output, "{}", path.display())?;
+    Ok(())
+}
+
+fn report_invalid_password(input: &std::path::Path) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    write!(stdout, "error: ")?;
+    write_native_path(&mut stdout, input)?;
+    writeln!(stdout, ": invalid password")?;
+    writeln!(stdout, "  code: 4")?;
+    write!(stdout, "  file: ")?;
+    write_native_path(&mut stdout, input)?;
+    writeln!(stdout)?;
+    writeln!(stdout, "  pos: 0")?;
+    writeln!(stdout, "  text: invalid password")?;
+    Ok(())
+}
+
+/// Run qpdf's C API authentication/error case (`qpdf-ctest.c:test02`).
+///
+/// The C API reports a failed read through its error object and still returns
+/// process success after the helper prints that object. Preserve that
+/// distinction from the Rust process adapter's own fatal errors.
+fn run_test2(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let input = PathBuf::from(input_arg);
+    let password = password_bytes(password_arg);
+    let result = Pdf::open_with_options(
+        File::open(&input)?,
+        PdfOpenOptions {
+            password,
+            suppress_password_recovery: true,
+            suppress_warnings: true,
+            description: input.to_string_lossy().into_owned(),
+            ..PdfOpenOptions::default()
+        },
+    );
+    match result {
+        Ok(mut pdf) => {
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_output_file(PathBuf::from(output_arg))?;
+            writer.set_static_id(true);
+            writer.write()?;
+            println!("C test 2 done");
+            Ok(())
+        }
+        Err(error) if is_bad_password(&error) => {
+            report_invalid_password(&input)?;
+            println!("C test 2 done");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn low_print_permissions() -> PermissionsConfig {
+    PermissionsConfig {
+        print: PrintPermission::Low,
+        ..PermissionsConfig::default()
+    }
+}
+
+fn write_with_encryption(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+    params: EncryptParams,
+    static_aes_iv: bool,
+) -> Result<()> {
+    let output = PathBuf::from(output_arg);
+    let mut pdf = open_input(input_arg, password_arg)?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(output)?;
+    writer.set_static_id(true);
+    if static_aes_iv {
+        writer.set_static_aes_iv(true);
+    }
+    writer.set_encryption_parameters(params);
+    writer.write()
+}
+
+/// qpdf C API test11: V=1/R=2 RC4-40 with the four legacy permission bits.
+fn run_test11(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let params = EncryptParams {
+        method: EncryptMethod::V1Rc440,
+        user_password: b"user1".to_vec(),
+        owner_password: b"owner1".to_vec(),
+        permissions: PermissionsConfig::default(),
+        r2_permissions: R2PermissionsConfig {
+            print: false,
+            modify: true,
+            extract: true,
+            annotate: true,
+        },
+        encrypt_metadata: true,
+    };
+    write_with_encryption(input_arg, password_arg, output_arg, params, false)?;
+    println!("C test 11 done");
+    Ok(())
+}
+
+/// qpdf C API test12: V=2/R=3 RC4-128 with full permissions and low printing.
+fn run_test12(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let params = EncryptParams {
+        method: EncryptMethod::V2Rc4128,
+        user_password: b"user2".to_vec(),
+        owner_password: b"owner2".to_vec(),
+        permissions: low_print_permissions(),
+        r2_permissions: R2PermissionsConfig::default(),
+        encrypt_metadata: true,
+    };
+    write_with_encryption(input_arg, password_arg, output_arg, params, false)?;
+    println!("C test 12 done");
+    Ok(())
+}
+
+/// qpdf C API test13: report the recovered user password, then write a
+/// decrypted copy with encryption preservation disabled.
+fn run_test13(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let mut pdf = open_input(input_arg, password_arg)?;
+    let info = pdf
+        .encryption_info()?
+        .ok_or_else(|| Error::Internal("test13 input is not encrypted".to_owned()))?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(b"user password: ")?;
+    stdout.write_all(&info.user_password)?;
+    stdout.write_all(b"\n")?;
+    drop(stdout);
+
+    let output = PathBuf::from(output_arg);
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(output)?;
+    writer.set_static_id(true);
+    writer.set_preserve_encryption(false);
+    writer.write()?;
+    println!("C test 13 done");
+    Ok(())
+}
+
+/// qpdf C API test15: V=4/R=4 AES-128 with a static IV and low printing.
+fn run_test15(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let params = EncryptParams {
+        method: EncryptMethod::V4Aes128,
+        user_password: b"user2".to_vec(),
+        owner_password: b"owner2".to_vec(),
+        permissions: low_print_permissions(),
+        r2_permissions: R2PermissionsConfig::default(),
+        encrypt_metadata: true,
+    };
+    write_with_encryption(input_arg, password_arg, output_arg, params, true)?;
+    println!("C test 15 done");
+    Ok(())
+}
+
+/// qpdf C API test17: V=5/R=5 AES-256 with static AES IV.
+fn run_test17(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let params = EncryptParams {
+        method: EncryptMethod::V5R5Aes256,
+        user_password: b"user3".to_vec(),
+        owner_password: b"owner3".to_vec(),
+        permissions: low_print_permissions(),
+        r2_permissions: R2PermissionsConfig::default(),
+        encrypt_metadata: true,
+    };
+    write_with_encryption(input_arg, password_arg, output_arg, params, true)?;
+    println!("C test 17 done");
+    Ok(())
+}
+
+/// qpdf C API test18: V=5/R=6 AES-256 with static AES IV.
+fn run_test18(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let params = EncryptParams {
+        method: EncryptMethod::V5R6Aes256,
+        user_password: b"user4".to_vec(),
+        owner_password: b"owner4".to_vec(),
+        permissions: low_print_permissions(),
+        r2_permissions: R2PermissionsConfig::default(),
+        encrypt_metadata: true,
+    };
+    write_with_encryption(input_arg, password_arg, output_arg, params, true)?;
+    println!("C test 18 done");
+    Ok(())
 }
 
 /// Run qpdf's portable metadata observation case (`qpdf-ctest.c:test01`).

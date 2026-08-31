@@ -2178,11 +2178,23 @@ fn main() {
         run_show_linearization(args.input)
     } else if args.show_encryption {
         match args.input.as_ref() {
-            Some(input) => run_show_encryption(input, args.repair, &args.password, args.no_warn),
+            Some(input) => run_show_encryption(
+                input,
+                args.repair,
+                &args.password,
+                args.no_warn,
+                args.show_encryption_key,
+            ),
             None => Err("--show-encryption requires an input file".into()),
         }
     } else if args.check {
-        run_check(args.input, args.repair, &args.password, args.no_warn)
+        run_check(
+            args.input,
+            args.repair,
+            &args.password,
+            args.no_warn,
+            args.show_encryption_key,
+        )
     } else if args.list_attachments {
         run_list_attachments(args.input, args.repair, &args.password, args.verbose)
     } else if let Some(key) = args.show_attachment {
@@ -2799,6 +2811,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
     if cli.check {
+        job.set_show_encryption_key(cli.show_encryption_key);
         return finish_check_job(job.check(pdf));
     }
     if cli.show_npages {
@@ -2811,6 +2824,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
         return finish_job_exit_status(job.show_xref(pdf)?);
     }
     if cli.show_encryption {
+        job.set_show_encryption_key(cli.show_encryption_key);
         return finish_show_encryption(job, pdf, cli.password.password_is_hex_key);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
@@ -2913,7 +2927,7 @@ fn run_json_document<R: Read + Seek>(
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
     match command {
-        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password, false),
+        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password, false, false),
         Commands::CheckLinearization(cmd) => {
             run_check_linearization(Some(cmd.input), false, &PasswordArgs::default(), false)
         }
@@ -2937,7 +2951,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => {
-            run_show_encryption(&cmd.input, cmd.repair, &cmd.password, false)
+            // The native subcommand has no `--show-encryption-key` flag of its
+            // own (the dedicated `show-encryption-key` subcommand covers that
+            // need); only the qpdf-argv-compatible top-level `--show-encryption`
+            // flag combines with `--show-encryption-key`.
+            run_show_encryption(&cmd.input, cmd.repair, &cmd.password, false, false)
         }
         Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair, cmd.recovery),
         Commands::RequiresPassword(cmd) => {
@@ -3155,6 +3173,7 @@ fn run_check(
     repair: bool,
     password: &PasswordArgs,
     no_warn: bool,
+    show_encryption_key: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
@@ -3162,6 +3181,7 @@ fn run_check(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);
+    job.set_show_encryption_key(show_encryption_key);
     let mut options = pdf_open_options(repair, password)?;
     // The job emits the collected diagnostics once, after the qpdf check
     // banner, and owns the shared warning completion boundary.
@@ -6142,7 +6162,7 @@ fn run_show_encryption_key(
             logger_info(format!("{}\n", hex_lower(&key)))?;
             finish_operation_warnings(&pdf, false)
         }
-        None if pdf.is_encrypted() => Err("encrypted PDF: incorrect password".into()),
+        None if pdf.is_encrypted() => Err("invalid password".into()),
         None => Err("file is not encrypted; no encryption key to show".into()),
     }
 }
@@ -6162,12 +6182,14 @@ fn run_show_encryption(
     repair: bool,
     password: &PasswordArgs,
     no_warn: bool,
+    show_encryption_key: bool,
 ) -> CliResult<()> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);
+    job.set_show_encryption_key(show_encryption_key);
     let mut options = pdf_open_options(repair, password)?;
     // qpdf's `--no-warn` drops open-time repair diagnostics entirely for
     // `--show-encryption` (no deferred replay, unlike `--check`'s report
@@ -6627,8 +6649,7 @@ fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
     if is_bad_password_error(&error) {
-        return "encrypted PDF: incorrect password; retry with --password or --password-file"
-            .into();
+        return "invalid password".into();
     }
     error.into()
 }

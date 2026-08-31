@@ -142,6 +142,7 @@ impl QPDFJob {
             &message_prefix,
             &input_name,
             self.warnings_suppressed(),
+            self.show_encryption_key(),
         )?;
         self.record_document_warnings(pdf);
         if outcome.warnings {
@@ -164,7 +165,12 @@ impl QPDFJob {
         password_is_hex_key: bool,
     ) -> Result<()> {
         let logger = self.logger();
-        emit_encryption_report(pdf, &logger, password_is_hex_key)
+        emit_encryption_report(
+            pdf,
+            &logger,
+            password_is_hex_key,
+            self.show_encryption_key(),
+        )
     }
 }
 
@@ -195,7 +201,7 @@ fn check_document<R: Read + Seek + 'static>(
     message_prefix: &str,
     input_name: &str,
 ) -> std::result::Result<CheckOutcome, CheckError> {
-    check_document_with_suppression(pdf, logger, message_prefix, input_name, false)
+    check_document_with_suppression(pdf, logger, message_prefix, input_name, false, false)
 }
 
 fn check_document_with_suppression<R: Read + Seek + 'static>(
@@ -204,6 +210,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     message_prefix: &str,
     input_name: &str,
     suppress_warnings: bool,
+    show_encryption_key: bool,
 ) -> std::result::Result<CheckOutcome, CheckError> {
     let mut warnings = false;
     let mut diagnostics_seen = 0;
@@ -236,7 +243,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     // block for the standalone `--show-encryption` mode
     // (`QPDFJob.cc:428-448`), a path `--check` never reaches. Always
     // suppress it here.
-    emit_encryption_report(pdf, logger, true)?;
+    emit_encryption_report(pdf, logger, true, show_encryption_key)?;
 
     let linearized = match pdf.is_linearized() {
         Ok(value) => value,
@@ -338,8 +345,10 @@ fn emit_encryption_report<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
     suppress_password_mismatch_notice: bool,
+    show_encryption_key: bool,
 ) -> Result<()> {
-    let report = render_encryption_report(pdf, suppress_password_mismatch_notice)?;
+    let report =
+        render_encryption_report(pdf, suppress_password_mismatch_notice, show_encryption_key)?;
     logger.info(report)
 }
 
@@ -361,6 +370,7 @@ fn emit_encryption_report<R: Read + Seek>(
 fn render_encryption_report<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     suppress_password_mismatch_notice: bool,
+    show_encryption_key: bool,
 ) -> Result<Vec<u8>> {
     let Some(info) = pdf.encryption_info()? else {
         return Ok(b"File is not encrypted\n".to_vec());
@@ -379,6 +389,12 @@ fn render_encryption_report<R: Read + Seek>(
     output.extend_from_slice(b"User password = ");
     output.extend_from_slice(&info.user_password);
     output.push(b'\n');
+    if show_encryption_key {
+        let key = pdf.encryption_file_key().unwrap_or_default();
+        output.extend_from_slice(b"Encryption key = ");
+        output.extend_from_slice(hex::encode(key).as_bytes());
+        output.push(b'\n');
+    }
     if info.owner_password_matched {
         output.extend_from_slice(b"Supplied password is owner password\n");
     }

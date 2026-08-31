@@ -1279,7 +1279,7 @@ fn split_pages_encrypted_primary_matches_qpdf_cleartext_chunks() {
         .unwrap();
     assert!(!wrong.status.success(), "wrong password must fail");
     assert!(
-        String::from_utf8_lossy(&wrong.stderr).contains("incorrect password"),
+        String::from_utf8_lossy(&wrong.stderr).contains("invalid password"),
         "wrong password should report authentication failure: {}",
         String::from_utf8_lossy(&wrong.stderr)
     );

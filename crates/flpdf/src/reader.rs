@@ -9,7 +9,7 @@ use crate::cache::CacheEntry;
 use crate::encryption::password::{password_candidates_for_read, PasswordMode};
 use crate::encryption::permissions::Permissions;
 use crate::encryption::standard::ObjectKeyAlg;
-use crate::encryption::state::{EncryptionInfo, EncryptionInspectionState};
+use crate::encryption::state::{effective_length_bits, EncryptionInfo, EncryptionInspectionState};
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
@@ -441,14 +441,11 @@ impl<R: Read + Seek> Pdf<R> {
                 .into())
             }
         };
-        // /Length is in bits and absent for V<5 (defaulting to 40 per the
-        // Standard handler); V=5 always uses a 256-bit key.
+        // Keep the reported key length on qpdf's initialized encryption state,
+        // including its 128-bit guess for an invalid/missing V=2/V=3
+        // `/Length` (`QPDF_encryption.cc:835-853`).
         let length_handle = encrypt.try_get_key(b"/Length")?;
-        let length_bits = match length_handle.try_as_integer()? {
-            Some(value) => value,
-            _ if v >= 5 => 256,
-            _ => 40,
-        };
+        let length_bits = effective_length_bits(v, &length_handle)?; // cov:ignore: unreachable through any public path -- open_with_repair_mode calls initialize_encryption_inspection() unconditionally before authenticate_if_encrypted(), so encryption_inspection is already Some whenever self.encryption can become Some, and the cache check above always short-circuits first (pre-existing on origin/main, not introduced by this change; tracked in flpdf-z03g)
 
         let encryption_guard = self.encryption.borrow();
         let encryption = encryption_guard

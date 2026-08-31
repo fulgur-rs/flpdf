@@ -43,5 +43,5 @@ fn check_recovers_pdfdoc_password_and_suppression_disables_recovery() {
     run_check(&input, &password_file, true)
         .assert()
         .failure()
-        .stderr(predicates::str::contains("incorrect password"));
+        .stderr(predicates::str::contains("invalid password"));
 }
