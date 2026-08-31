@@ -8,6 +8,13 @@
 //! The short-lived `BootstrapHandleDocument` supplies the pre-`Pdf` owner
 //! that qpdf's `QPDFParser` already has at this point; it is not the canonical
 //! post-open resolver owned by `Pdf`.
+//!
+//! qpdf keeps its shared `QPDF::Members::file` input source and does not read
+//! PDF objects until they are needed (`include/qpdf/QPDF.hh:67-97,1453-1457`,
+//! `libqpdf/QPDF.cc:245-275`). The bootstrap owner follows that boundary:
+//! handle identity and diagnostics are available during xref parsing, while
+//! its `Rc<[u8]>` source snapshot is initialized only for an actual indirect
+//! object or stream-length resolution.
 use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
@@ -20,7 +27,7 @@ use crate::reader::file_object::{
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
@@ -323,7 +330,10 @@ impl XrefEntryLookup<'_> {
 /// shared through [`BootstrapCache`] for one xref-loading operation, matching
 /// qpdf's document-level cache rather than one context's local parse lifetime.
 struct BootstrapHandleDocument {
-    bytes: Rc<[u8]>,
+    /// The static resolver only retains a source snapshot after a bootstrap
+    /// operation actually needs to read an indirect object. Direct parser
+    /// values and shared diagnostics do not require the full input buffer.
+    bytes: OnceCell<Rc<[u8]>>,
     entry_lookup: RefCell<BTreeMap<ObjectRef, XrefEntry>>,
     options: XrefLoadOptions,
     state: Rc<RefCell<BootstrapHandleState>>,
@@ -341,13 +351,17 @@ impl std::fmt::Debug for BootstrapHandleDocument {
 
 impl BootstrapHandleDocument {
     fn new_with_state(
-        bytes: &[u8],
+        bytes: Option<&[u8]>,
         entry_lookup: XrefEntryLookup<'_>,
         options: XrefLoadOptions,
         state: Rc<RefCell<BootstrapHandleState>>,
     ) -> Rc<Self> {
+        let source_bytes = OnceCell::new();
+        if let Some(bytes) = bytes {
+            let _ = source_bytes.set(Rc::from(bytes));
+        }
         let document = Rc::new(Self {
-            bytes: Rc::from(bytes),
+            bytes: source_bytes,
             entry_lookup: RefCell::new(entry_lookup.owned_entries()),
             options,
             state,
@@ -356,6 +370,10 @@ impl BootstrapHandleDocument {
         let resolver: Rc<dyn DocumentResolver> = document.clone();
         *document.resolver.borrow_mut() = Some(Rc::downgrade(&resolver));
         document
+    }
+
+    fn ensure_source_bytes(&self, bytes: &[u8]) {
+        let _ = self.bytes.get_or_init(|| Rc::from(bytes));
     }
 
     fn refresh_entry_lookup(&self, entry_lookup: XrefEntryLookup<'_>) {
@@ -392,14 +410,6 @@ impl BootstrapHandleDocument {
         self.state.borrow_mut().diagnostics.push(diagnostic);
     }
 
-    fn take_reconstruction_trigger(&self) -> Option<Error> {
-        self.state
-            .borrow_mut()
-            .reconstruction_trigger
-            .take()
-            .map(|(offset, message)| Error::parse(offset as usize, message))
-    }
-
     fn object_policy(&self) -> RecoveryPolicy {
         if self.options.allow_repair {
             RecoveryPolicy::Bounded
@@ -414,15 +424,17 @@ impl BootstrapHandleDocument {
         absolute_offset: u64,
         policy: RecoveryPolicy,
         description: XrefObjectDescription,
+        source_bytes: &[u8],
     ) -> Result<HandleFileObjectRead> {
         let mut parser = BootstrapHandleParser {
             document: self,
             description,
         };
         let pending = parse_file_object_handle_syntax(input, &mut parser)?;
-        let resolved_length = pending
-            .indirect_length_ref()
-            .map(|object_ref| self.resolve_length(object_ref));
+        let resolved_length = pending.indirect_length_ref().map(|object_ref| {
+            self.ensure_source_bytes(source_bytes);
+            self.resolve_length(object_ref)
+        });
         let _ = (absolute_offset, description);
         finish_file_object_handle(input, pending, resolved_length, policy)
     }
@@ -463,8 +475,10 @@ impl BootstrapHandleDocument {
         let start = usize::try_from(offset)
             .ok()
             .ok_or_else(|| Error::parse(0, "object offset does not fit usize"))?;
-        let input = self
-            .bytes
+        let source_bytes = self.bytes.get().ok_or_else(|| {
+            Error::Internal("bootstrap resolver source bytes were not initialized".to_owned())
+        })?;
+        let input = source_bytes
             .get(start..)
             .ok_or_else(|| Error::parse(start, "object is beyond the end of the file"))?;
         let policy = self.object_policy();
@@ -500,7 +514,13 @@ impl BootstrapHandleDocument {
         // object") reports an offset relative to `input`, not the file,
         // unless rebased here.
         let mut completed = self
-            .read_file_object(input, offset, policy, XrefObjectDescription::Ordinary)
+            .read_file_object(
+                input,
+                offset,
+                policy,
+                XrefObjectDescription::Ordinary,
+                source_bytes,
+            )
             .map_err(|error| error.rebase_offset(start))?;
         for diagnostic in &completed.diagnostics {
             self.push_diagnostic(xref_file_object_diagnostic(
@@ -801,7 +821,8 @@ impl XrefHandleCache {
 }
 
 /// Handle-only bootstrap context for qpdf's pre-`Pdf` xref reads.
-struct XrefReadContext {
+struct XrefReadContext<'bytes> {
+    bytes: &'bytes [u8],
     document: Rc<BootstrapHandleDocument>,
     cache: XrefHandleCache,
     diagnostics: Diagnostics,
@@ -820,9 +841,9 @@ impl HandleResolver for XrefDetachedHandles {
     }
 }
 
-impl XrefReadContext {
+impl<'bytes> XrefReadContext<'bytes> {
     fn new(
-        bytes: &[u8],
+        bytes: &'bytes [u8],
         spec: XrefReadContextSpec<'_>,
         registration: &XrefRegistration,
         options: XrefLoadOptions,
@@ -861,7 +882,7 @@ impl XrefReadContext {
                 Rc::clone(document)
             } else {
                 let document = BootstrapHandleDocument::new_with_state(
-                    bytes,
+                    None,
                     entry_lookup,
                     options,
                     Rc::clone(&cache.handle_state),
@@ -878,6 +899,7 @@ impl XrefReadContext {
             .entries()
             .len();
         Self {
+            bytes,
             document,
             cache: XrefHandleCache { shared },
             diagnostics: Diagnostics::default(),
@@ -892,9 +914,9 @@ impl XrefReadContext {
         policy: RecoveryPolicy,
         description: XrefObjectDescription,
     ) -> Result<HandleFileObjectRead> {
-        let result = self
-            .document
-            .read_file_object(input, absolute_offset, policy, description);
+        let result =
+            self.document
+                .read_file_object(input, absolute_offset, policy, description, self.bytes);
         self.sync_handle_diagnostics();
         result
     }
@@ -907,14 +929,23 @@ impl XrefReadContext {
         let mut name = Vec::with_capacity(key.len() + 1);
         name.push(b'/');
         name.extend_from_slice(key.as_bytes());
+        self.ensure_source_for_resolution(dictionary);
         let value = dictionary.try_get_key(&name).ok()?;
+        self.ensure_source_for_resolution(&value);
         let _ = value.try_dereference();
         self.sync_handle_diagnostics();
         Some(value)
     }
 
+    fn ensure_source_for_resolution(&self, handle: &ObjectHandle) {
+        if handle.object_ref().is_some() && !handle.is_resolved() {
+            self.document.ensure_source_bytes(self.bytes);
+        }
+    }
+
     fn sync_handle_diagnostics(&mut self) {
-        let state = self.document.state.borrow();
+        let shared = self.cache.shared.borrow();
+        let state = shared.handle_state.borrow();
         for diagnostic in state
             .diagnostics
             .entries()
@@ -934,7 +965,14 @@ impl XrefReadContext {
     }
 
     fn take_reconstruction_trigger(&self) -> Option<Error> {
-        self.document.take_reconstruction_trigger()
+        let shared = self.cache.shared.borrow();
+        let trigger = shared
+            .handle_state
+            .borrow_mut()
+            .reconstruction_trigger
+            .take()
+            .map(|(offset, message)| Error::parse(offset as usize, message));
+        trigger
     }
 }
 
@@ -2792,7 +2830,7 @@ fn parse_xref_stream(
         // function's own `Err` propagates -- mirroring that same qpdf ordering
         // without changing what any `error_diagnostics_sink: None` caller
         // observes (the sink is write-only, and only on this closure's `Err`).
-        let build = || -> Result<XrefStreamBuild> {
+        let mut build = || -> Result<XrefStreamBuild> {
             let handle_stream_dict = handle_object
                 .as_stream_dict()
                 .ok_or_else(|| Error::parse(xref_pos, "xref not found"))?;
@@ -2800,7 +2838,7 @@ fn parse_xref_stream(
             // `isStreamOfType("/XRef")` succeeds. The shared parser owns this
             // check for both direct startxref streams and classic-trailer
             // `/XRefStm` targets.
-            if !is_xref_stream_handle(&handle_object)? {
+            if !is_xref_stream_handle(&mut context, &handle_object)? {
                 return Err(Error::parse(xref_pos, "xref not found"));
             }
 
@@ -2809,12 +2847,13 @@ fn parse_xref_stream(
                 .as_dictionary()
                 .and_then(|entries| entries.get(b"/Size".as_slice()).cloned())
                 .ok_or(Error::Missing("XRef stream /Size"))?;
+            context.ensure_source_for_resolution(&size_value);
             let size = parse_non_negative_u64_handle(&size_value, "/Size")?;
             let size =
                 u32::try_from(size).map_err(|_| Error::parse(0, "/Size does not fit u32"))?;
 
-            let widths = parse_xref_widths_handle(&handle_stream_dict)?;
-            let index = parse_xref_index_handle(&handle_stream_dict, size)?;
+            let widths = parse_xref_widths_handle(&mut context, &handle_stream_dict)?;
+            let index = parse_xref_index_handle(&mut context, &handle_stream_dict, size)?;
             let ranges = build_xref_ranges(index)?;
             let has_first_xref_item = ranges.iter().any(|&(start, count)| start == 0 && count > 0);
             let handle_stream_data = handle_object
@@ -2997,18 +3036,26 @@ type XrefStreamBuild = (
 // corresponding fixed-width Rust type rather than a platform-sized usize.
 const MAX_XREF_FIELD_WIDTH: usize = std::mem::size_of::<i64>();
 
-fn is_xref_stream_handle(stream: &ObjectHandle) -> Result<bool> {
+fn is_xref_stream_handle(context: &mut XrefReadContext<'_>, stream: &ObjectHandle) -> Result<bool> {
     let Some(stream_dict) = stream.as_stream_dict() else {
         return Ok(false);
     };
-    Ok(stream_dict.try_get_key(b"/Type")?.try_as_name()?.as_deref() == Some(b"XRef"))
+    context.ensure_source_for_resolution(&stream_dict);
+    let type_value = stream_dict.try_get_key(b"/Type")?;
+    context.ensure_source_for_resolution(&type_value);
+    Ok(type_value.try_as_name()?.as_deref() == Some(b"XRef"))
 }
 
-fn parse_xref_widths_handle(stream_dict: &ObjectHandle) -> Result<XrefWidths> {
+fn parse_xref_widths_handle(
+    context: &mut XrefReadContext<'_>,
+    stream_dict: &ObjectHandle,
+) -> Result<XrefWidths> {
+    context.ensure_source_for_resolution(stream_dict);
     let value = stream_dict
         .as_dictionary()
         .and_then(|entries| entries.get(b"/W".as_slice()).cloned())
         .ok_or(Error::Missing("XRef stream /W"))?;
+    context.ensure_source_for_resolution(&value);
     let values = value
         .try_as_array()?
         .ok_or_else(|| Error::parse(0, "/W must be array"))?;
@@ -3016,6 +3063,9 @@ fn parse_xref_widths_handle(stream_dict: &ObjectHandle) -> Result<XrefWidths> {
         return Err(Error::parse(0, "/W must contain three integers"));
     }
 
+    for value in &values {
+        context.ensure_source_for_resolution(value);
+    }
     let w0 = parse_usize(parse_non_negative_u64_handle(&values[0], "/W[0]")?, "/W[0]")?;
     let w1 = parse_usize(parse_non_negative_u64_handle(&values[1], "/W[1]")?, "/W[1]")?;
     let w2 = parse_usize(parse_non_negative_u64_handle(&values[2], "/W[2]")?, "/W[2]")?;
@@ -3028,8 +3078,14 @@ fn parse_xref_widths_handle(stream_dict: &ObjectHandle) -> Result<XrefWidths> {
     Ok((w0, w1, w2))
 }
 
-fn parse_xref_index_handle(stream_dict: &ObjectHandle, size: u32) -> Result<Vec<u32>> {
+fn parse_xref_index_handle(
+    context: &mut XrefReadContext<'_>,
+    stream_dict: &ObjectHandle,
+    size: u32,
+) -> Result<Vec<u32>> {
+    context.ensure_source_for_resolution(stream_dict);
     let value = stream_dict.try_get_key(b"/Index")?;
+    context.ensure_source_for_resolution(&value);
     if value.try_is_null()? {
         return Ok(vec![0, size]);
     }
@@ -3045,6 +3101,7 @@ fn parse_xref_index_handle(stream_dict: &ObjectHandle, size: u32) -> Result<Vec<
     values
         .iter()
         .map(|value| {
+            context.ensure_source_for_resolution(value);
             parse_non_negative_u64_handle(value, "/Index").and_then(|integer| {
                 integer
                     .try_into()
@@ -3348,6 +3405,149 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 mod final_handle_tests {
     use super::*;
 
+    #[test]
+    fn bootstrap_document_construction_defers_the_source_snapshot() {
+        let entries = BTreeMap::new();
+        let document = BootstrapHandleDocument::new_with_state(
+            None,
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+
+        assert!(
+            document.bytes.get().is_none(),
+            "constructing the bootstrap owner must not copy the complete input"
+        );
+    }
+
+    #[test]
+    fn direct_only_bootstrap_access_does_not_initialize_the_source_snapshot() {
+        let registration = XrefRegistration::default();
+        let mut context = XrefReadContext::new(
+            b"source bytes are not needed",
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        let dictionary =
+            ObjectHandle::dictionary(vec![(b"/Size".to_vec(), ObjectHandle::integer(7))]);
+
+        let value = context
+            .resolve_dictionary_value(&dictionary, "Size")
+            .expect("direct dictionary value");
+
+        assert_eq!(value.try_as_integer().unwrap(), Some(7));
+        assert!(context.document.bytes.get().is_none());
+        context.sync_handle_diagnostics();
+        assert!(context.diagnostics.entries().is_empty());
+
+        let input = b"1 0 obj\n<< /Root 2 0 R >>\nendobj\n";
+        let mut context = XrefReadContext::new(
+            input,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        let parsed = context
+            .read_file_object_handle(
+                input,
+                0,
+                RecoveryPolicy::RequireEndstream,
+                XrefObjectDescription::Ordinary,
+            )
+            .expect("a direct dictionary with an unused reference");
+        assert!(parsed.object.as_dictionary().is_some());
+        assert!(context.document.bytes.get().is_none());
+    }
+
+    #[test]
+    fn indirect_bootstrap_resolution_initializes_the_source_snapshot_once() {
+        let bytes = b"\n1 0 obj\n7\nendobj\n";
+        let object_ref = ObjectRef::new(1, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 1 });
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        let indirect = context.document.handle_for_reference(object_ref);
+        let dictionary = ObjectHandle::dictionary(vec![(b"/Size".to_vec(), indirect)]);
+
+        assert!(context.document.bytes.get().is_none());
+        let value = context
+            .resolve_dictionary_value(&dictionary, "Size")
+            .expect("indirect dictionary value");
+        assert_eq!(value.try_as_integer().unwrap(), Some(7));
+
+        let snapshot = context.document.bytes.get().expect("source snapshot");
+        let snapshot_ptr = Rc::as_ptr(snapshot);
+        context.document.ensure_source_bytes(b"different bytes");
+        assert_eq!(
+            Rc::as_ptr(context.document.bytes.get().unwrap()),
+            snapshot_ptr
+        );
+    }
+
+    #[test]
+    fn bootstrap_object_read_reports_an_uninitialized_source_snapshot() {
+        let entries = BTreeMap::new();
+        let document = BootstrapHandleDocument::new_with_state(
+            None,
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+
+        let error = document
+            .read_uncompressed_object(ObjectRef::new(1, 0), 1)
+            .expect_err("a direct resolver call without a source must fail internally");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "bootstrap resolver source bytes were not initialized"
+        ));
+    }
+
+    #[test]
+    fn indirect_stream_length_initializes_the_source_snapshot_before_resolution() {
+        let mut bytes = b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec();
+        let object_two_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n3\nendobj\n");
+        let object_one = ObjectRef::new(1, 0);
+        let object_two = ObjectRef::new(2, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            object_two,
+            XrefEntry::Uncompressed {
+                offset: object_two_offset as u64,
+            },
+        );
+        let document = BootstrapHandleDocument::new_with_state(
+            None,
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+
+        assert!(document.bytes.get().is_none());
+        let result = document
+            .read_file_object(
+                &bytes,
+                0,
+                RecoveryPolicy::RequireEndstream,
+                XrefObjectDescription::Ordinary,
+                &bytes,
+            )
+            .expect("indirect stream length should resolve");
+
+        assert_eq!(result.object_ref, object_one);
+        assert_eq!(result.object.as_stream_data().unwrap().as_slice(), b"abc");
+        assert!(document.bytes.get().is_some());
+    }
+
     fn classic_xref_with_trailer(trailer: &str) -> (Vec<u8>, usize) {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let xref = bytes.len();
@@ -3360,6 +3560,24 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn ordinary_classic_xref_loading_keeps_the_bootstrap_source_lazy() {
+        let (bytes, _) = classic_xref_with_trailer("<< /Size 1 /Root 1 0 R >>");
+        let mut reader = std::io::Cursor::new(bytes);
+        let state = load_xref_state_with_options(&mut reader, XrefLoadOptions::default())
+            .expect("ordinary classic xref should load");
+        let cache = state.bootstrap_cache.borrow();
+        let document = cache
+            .handle_document
+            .as_ref()
+            .expect("handle parser creates the shared bootstrap owner");
+
+        assert!(
+            document.bytes.get().is_none(),
+            "unused trailer references must not force the source snapshot"
+        );
+    }
+
+    #[test]
     fn bootstrap_trigger_and_diagnostic_append_stay_on_handle_state() {
         let object_ref = ObjectRef::new(1, 0);
         let mut entries = BTreeMap::new();
@@ -3369,7 +3587,7 @@ mod final_handle_tests {
             ..BootstrapHandleState::default()
         }));
         let document = BootstrapHandleDocument::new_with_state(
-            b"x",
+            Some(b"x"),
             XrefEntryLookup::Registration(&entries),
             XrefLoadOptions::default(),
             state,
@@ -3509,7 +3727,7 @@ mod final_handle_tests {
         let state = Rc::new(RefCell::new(BootstrapHandleState::default()));
         let entries = BTreeMap::new();
         let document = BootstrapHandleDocument::new_with_state(
-            b"",
+            Some(b""),
             XrefEntryLookup::Registration(&entries),
             XrefLoadOptions::default(),
             Rc::clone(&state),
