@@ -445,7 +445,7 @@ impl<R: Read + Seek> Pdf<R> {
         // including its 128-bit guess for an invalid/missing V=2/V=3
         // `/Length` (`QPDF_encryption.cc:835-853`).
         let length_handle = encrypt.try_get_key(b"/Length")?;
-        let length_bits = effective_length_bits(v, &length_handle)?;
+        let length_bits = effective_length_bits(v, &length_handle)?; // cov:ignore: unreachable through any public path -- open_with_repair_mode calls initialize_encryption_inspection() unconditionally before authenticate_if_encrypted(), so encryption_inspection is already Some whenever self.encryption can become Some, and the cache check above always short-circuits first (pre-existing on origin/main, not introduced by this change; tracked in flpdf-z03g)
 
         let encryption_guard = self.encryption.borrow();
         let encryption = encryption_guard
