@@ -2870,13 +2870,18 @@ fn parse_xref_stream(
             // `resolve_indirect` before the snapshot is populated, which
             // recovers by treating the value as null and silently ignoring
             // the requested filter.
-            if let Some(dictionary) = handle_stream_dict.as_dictionary() {
-                if let Some(filter) = dictionary.get(b"/Filter".as_slice()) {
-                    context.ensure_source_for_resolution(filter);
-                }
-                if let Some(decode_parms) = dictionary.get(b"/DecodeParms".as_slice()) {
-                    context.ensure_source_for_resolution(decode_parms);
-                }
+            let stream_dictionary = handle_stream_dict.as_dictionary();
+            if let Some(filter) = stream_dictionary
+                .as_ref()
+                .and_then(|dictionary| dictionary.get(b"/Filter".as_slice()))
+            {
+                context.ensure_source_for_resolution(filter);
+            }
+            if let Some(decode_parms) = stream_dictionary
+                .as_ref()
+                .and_then(|dictionary| dictionary.get(b"/DecodeParms".as_slice()))
+            {
+                context.ensure_source_for_resolution(decode_parms);
             }
             let stream_data = filters::decode_stream_data_from_handle(
                 &handle_stream_dict,
