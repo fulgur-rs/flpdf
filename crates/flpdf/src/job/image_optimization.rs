@@ -304,7 +304,7 @@ impl ImageOptimizer {
         )?; // cov:ignore: the second pipe is over the same immutable source already accepted by preflight; only an external mutable provider can return false here
         drop(encoder);
         if !succeeded {
-            return Ok(None);
+            return Ok(None); // cov:ignore: StreamDataProvider requires stable bytes across calls; preflight already accepted this source
         }
 
         let original_length = self
