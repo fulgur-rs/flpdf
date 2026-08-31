@@ -556,6 +556,7 @@ impl RenumberMap {
     pub(crate) fn place_objstm_members_per_half(
         &mut self,
         open_document_batches: &[Vec<ObjectRef>],
+        open_document_source_container_numbers: &[Option<u32>],
         first_half_batches: &[Vec<ObjectRef>],
         second_half_batches: &[Vec<ObjectRef>],
         second_half_anchors: &[SecondHalfContainerAnchor],
@@ -741,20 +742,40 @@ impl RenumberMap {
         // are emitted at the hint-insertion point below.
         let mut open_document_container_numbers: Vec<u32> =
             Vec::with_capacity(count_nonempty(open_document_batches));
-        // Helper: append the open-document (qpdf part4) ObjStm containers as
-        // type-1 slots, recording their numbers. Called once, immediately
-        // before the hint sentinel, so they are numbered right after the
-        // catalog (qpdf `part4_first_obj`, before the hint stream).
-        let emit_open_document_containers = |table: &mut Vec<ObjectRef>, nums: &mut Vec<u32>| {
-            for batch in open_document_batches {
-                if batch.is_empty() {
-                    continue;
+        // Helper: append open-document (qpdf part4) ObjStm containers as
+        // type-1 slots, recording their numbers. Generate-mode containers have
+        // no source identity and are appended at the hint boundary. Preserve
+        // containers retain their source object number in qpdf's
+        // `lc_open_document` set, so they are inserted before the next plain
+        // open-document object with a larger source number.
+        let mut next_open_document_batch = 0usize;
+        let mut emit_open_document_containers_before =
+            |plain_source_number: Option<u32>, table: &mut Vec<ObjectRef>, nums: &mut Vec<u32>| {
+                while next_open_document_batch < open_document_batches.len() {
+                    let batch_index = next_open_document_batch;
+                    if open_document_batches[batch_index].is_empty() {
+                        next_open_document_batch += 1;
+                        continue;
+                    }
+                    let source_number = open_document_source_container_numbers
+                        .get(batch_index)
+                        .copied()
+                        .flatten();
+                    let emit = match plain_source_number {
+                        Some(plain_source_number) => {
+                            source_number.is_some_and(|source| source < plain_source_number)
+                        }
+                        None => true,
+                    };
+                    if !emit {
+                        break;
+                    }
+                    let container_num = table.len() as u32;
+                    table.push(SENTINEL); // container: a plain indirect, no original
+                    nums.push(container_num);
+                    next_open_document_batch += 1;
                 }
-                let container_num = table.len() as u32;
-                table.push(SENTINEL); // container: a plain indirect, no original
-                nums.push(container_num);
-            }
-        };
+            };
 
         // (7) first-half non-members, with the hint sentinel re-inserted at its
         //     recorded relative position (all type-1). At that point the
@@ -769,15 +790,26 @@ impl RenumberMap {
         // `from_plan` always places these (part6 outline objects, step 9b) after
         // the hint slot, so collecting them here never shifts the hint position.
         let mut first_half_post_container_plain: Vec<ObjectRef> = Vec::new();
+        let source_ordered_open_document = open_document_source_container_numbers
+            .iter()
+            .any(Option::is_some);
         for (i, &original) in first_half_plain.iter().enumerate() {
             if i as u32 == hint_index_in_first_half {
-                emit_open_document_containers(
+                emit_open_document_containers_before(
+                    None,
                     &mut new_by_new_number,
                     &mut open_document_container_numbers,
                 );
                 open_document_emitted = true;
                 new_hint_slot = new_by_new_number.len() as u32;
                 new_by_new_number.push(SENTINEL);
+            }
+            if source_ordered_open_document && i > 0 && (i as u32) < hint_index_in_first_half {
+                emit_open_document_containers_before(
+                    Some(original.number),
+                    &mut new_by_new_number,
+                    &mut open_document_container_numbers,
+                );
             }
             if first_half_post_plain.contains(&original) {
                 first_half_post_container_plain.push(original);
@@ -795,7 +827,8 @@ impl RenumberMap {
         // case that the planner does not produce.
         if hint_index_in_first_half as usize >= first_half_plain.len() {
             if !open_document_emitted {
-                emit_open_document_containers(
+                emit_open_document_containers_before(
+                    None,
                     &mut new_by_new_number,
                     &mut open_document_container_numbers,
                 );
@@ -1391,6 +1424,7 @@ mod tests {
         let relocation = rn.place_objstm_members_per_half(
             &[],
             &[],
+            &[],
             &second_half_batches,
             &[],
             &BTreeSet::new(),
@@ -1475,6 +1509,7 @@ mod tests {
         let relocation = rn.place_objstm_members_per_half(
             &[],
             &[],
+            &[],
             &[vec![member]],
             &[SecondHalfContainerAnchor::BeforeFirst],
             &BTreeSet::new(),
@@ -1497,6 +1532,7 @@ mod tests {
         // One Part-3 (first-half) batch: 5 0 R + 8 0 R (both part3_objects).
         let first_half_batches = vec![vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)]];
         let relocation = rn.place_objstm_members_per_half(
+            &[],
             &[],
             &first_half_batches,
             &[],
@@ -1569,6 +1605,7 @@ mod tests {
         let second_half_batches = vec![vec![], vec![ObjectRef::new(4, 0)]];
         let relocation = rn.place_objstm_members_per_half(
             &open_document_batches,
+            &[],
             &first_half_batches,
             &second_half_batches,
             &[],
@@ -1736,5 +1773,48 @@ mod tests {
             rn.new_for_original(od_plain).unwrap().number,
             od_plain_number
         );
+    }
+
+    #[test]
+    fn preserve_open_document_containers_interleave_with_plain_objects() {
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(60, 0)],
+            part4_rest: vec![ObjectRef::new(50, 0)],
+            part4_open_document_plain: vec![
+                ObjectRef::new(6, 0),
+                ObjectRef::new(14, 0),
+                ObjectRef::new(18, 0),
+                ObjectRef::new(21, 0),
+                ObjectRef::new(23, 0),
+            ],
+            total_object_count: 60,
+            root_ref: Some(ObjectRef::new(50, 0)),
+            ..Default::default()
+        };
+        let mut rn = RenumberMap::from_plan(&plan);
+        let relocation = rn.place_objstm_members_per_half(
+            &[vec![ObjectRef::new(6, 0)], vec![ObjectRef::new(23, 0)]],
+            &[Some(1), Some(19)],
+            &[],
+            &[],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(relocation.container_numbers, vec![5, 8]);
+        assert_eq!(
+            rn.new_for_original(ObjectRef::new(14, 0)).unwrap().number,
+            6
+        );
+        assert_eq!(
+            rn.new_for_original(ObjectRef::new(18, 0)).unwrap().number,
+            7
+        );
+        assert_eq!(
+            rn.new_for_original(ObjectRef::new(21, 0)).unwrap().number,
+            9
+        );
+        assert_eq!(rn.hint_stream_slot(), 10);
     }
 }

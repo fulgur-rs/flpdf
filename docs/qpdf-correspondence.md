@@ -205,6 +205,24 @@ bounded-read/retry し、`test_0_1` は DecodeParms warning を source ref ご�
 `resolution_fallbacks_remaining` を filter index ごとに消費する再読は増やさず、
 既存の qtest-only offset boundary に閉じ込める。
 
+### qtest renumber consumer (2026-08-31)
+
+`qpdf/test_renumber.cc:14-22,24-117,119-166,168-259` is ported by
+`crates/flpdf-qtest-tools/src/renumber.rs` and
+`src/bin/test_renumber.rs`. It uses `Pdf::get_all_objects`, the public
+`ObjectHandle` value/type accessors, `PdfWriter`'s memory output and renumbered
+object/xref result APIs, then reloads through `Pdf::open_mem_owned`. The
+recursive comparison deliberately skips stream payloads and preserves qpdf's
+upstream xref self-comparisons at `test_renumber.cc:147,153-154`.
+
+The signed linearization differential also fixed the canonical writer boundary:
+`linearization/renumber.rs` interleaves Preserve source containers with plain
+open-document objects, while `linearization/writer.rs` suppresses a preserved
+member's duplicate plain emission and reports each source container's logical
+output identity. This mirrors `QPDFWriter::preserveObjectStreams` and
+`enqueueObject` (`QPDFWriter.cc:1072-1125,1939-1966`) and is covered by the
+eight-case qpdf 11.9.0 helper differential.
+
 ## 1. オブジェクトモデル
 
 | qpdf | 行 | flpdf | 状態 |

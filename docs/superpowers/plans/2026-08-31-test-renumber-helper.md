@@ -249,6 +249,26 @@ cargo test -p flpdf-qtest-tools
 Expected: all helper tests pass, including usage, bad option, missing input,
 success, comparison mismatch, cycle, stream, and xref cases.
 
+- [ ] **Step 8: Fix the canonical Preserve linearization boundary exposed by
+  the signed fixture**
+
+The first live differential must remain a RED test until the writer is fixed.
+qpdf's `preserveObjectStreams` keeps the source member-to-container assignment
+(`QPDFWriter.cc:1939-1966`), and `writeLinearized` emits each preserved
+container once while `enqueueObject` routes a compressed member through its
+container (`QPDFWriter.cc:1072-1125,1621-1757`). The current flpdf path can
+leave those same Preserve members in `part4_open_document_plain`, causing a
+plain duplicate, and the writer result omits the source-container mapping that
+qpdf exposes.
+
+Add a regression assertion using the qpdf qtest signed fixture when the pinned
+qpdf test tree is available, then correct the shared linearization writer data
+flow: suppress a member from every plain emission list when the resolved
+ObjStm layout owns it, and carry source-container identity through the
+canonical writer result for Preserve mode. Do not skip the fixture, weaken the
+xref comparison, or add a helper-only mapping shim. Re-run the focused helper
+test and the eight-case differential before wiring qtest.
+
 ## Task 3: Differentially verify all qpdf helper modes
 
 **Files:**
@@ -290,7 +310,8 @@ EOF
 
 Run each helper from the qpdf fixture directory so relative fixture lookup is
 identical. Record each status and the exact output diff. qpdf's helper must
-report status 0 and `succeeded`; flpdf must do the same for all eight.
+report status 0 and `succeeded`; flpdf must do the same for all eight. The
+signed linearize case is the regression gate for the Preserve writer fix above.
 
 - [ ] **Step 2: Add focused Rust assertions for both fixtures and modes**
 

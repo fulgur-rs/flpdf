@@ -23,7 +23,13 @@ The implementation owns:
   `flpdf-qtest` repository.
 
 It does not port C or C++ ABI symbols, vendor qpdf fixtures, or replace the
-canonical `PdfWriter` renumbering algorithm.
+canonical `PdfWriter` renumbering algorithm. The first live differential pass
+also exposed a writer-side parity defect: Preserve linearization had to keep
+source ObjStm membership out of the plain open-document emission and expose the
+source-container identities represented by the fresh output containers. That
+small core correction is in scope because it repairs the canonical writer
+responsibility exercised by `getRenumberedObjGen` and
+`getWrittenXRefTable`; it is not a helper-only compatibility shim.
 
 ## qpdf contract
 
@@ -96,11 +102,11 @@ Successful comparisons print the same section markers and end in
 not enter that set. Streams are not decoded or compared because qpdf's helper
 explicitly excludes their payloads.
 
-The implementation will first exercise the existing public writer APIs in
-tests. If a RED test demonstrates that a required value is not observable at
-that public boundary, the missing qpdf responsibility will be isolated and
-audited before any core change. A test-only raw-object bridge, sentinel, or
-panic is not an acceptable fallback.
+The implementation first exercises the existing public writer APIs in tests. A
+live RED differential on qpdf's signed linearization fixture identified the
+canonical writer defect described above; the fix must be covered at the writer
+boundary before the helper is accepted. A test-only raw-object bridge,
+sentinel, or panic is not an acceptable fallback.
 
 ## Verification and acceptance
 
@@ -117,3 +123,6 @@ panic is not an acceptable fallback.
 - The helper's stdout/stderr/status and generated output are differentially
   checked against the pinned qpdf 11.9.0 helper for both fixtures and every
   option combination.
+- Preserve linearization of the signed ObjStm fixture has no duplicate plain
+  emission, reports matching xref entry kinds, and returns the same source
+  container mappings as qpdf's `getRenumberedObjGen` contract.

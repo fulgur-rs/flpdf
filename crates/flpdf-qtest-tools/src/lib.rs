@@ -20,6 +20,7 @@ pub mod large_file;
 pub mod metadata;
 pub mod orchestrator;
 pub mod output;
+pub mod renumber;
 pub mod tokenizer_runner;
 
 pub use orchestrator::compare_files;
