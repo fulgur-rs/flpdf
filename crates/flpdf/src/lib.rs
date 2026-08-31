@@ -175,7 +175,7 @@ pub use filespec_helper::{
 };
 pub use form_field_object_helper::FormFieldObjectHelper;
 pub use job::{
-    add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback, collate,
+    add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback,
     copy_duplicate_page_annotations, extract_attachment, extract_attachment_to_path,
     format_attachment_list, format_attachment_list_with_sink, list_attachment_info,
     merge_documents, overlay_verbose_report, prune_acroform_after_subset,

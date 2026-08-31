@@ -165,45 +165,6 @@ impl CombinedPlan {
         Ok(Self { per_input, flat })
     }
 
-    /// Build repeated selections from one already-opened document.
-    ///
-    /// qpdf permits the same main input to occur more than once in a
-    /// `--pages` segment. The ordinary [`Self::build`] API intentionally takes
-    /// one mutable reference per input and therefore cannot express repeated
-    /// borrows of the same `Pdf`; this entry point builds each plan
-    /// sequentially while retaining only the selected page references. It is
-    /// used by the JSON-input CLI route so a created document is never
-    /// serialized to a temporary PDF and reopened merely for page planning.
-    pub fn build_repeated<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        ranges: Vec<PageRange>,
-    ) -> Result<Self> {
-        if ranges.is_empty() {
-            return Err(Error::Unsupported(
-                "at least one input document is required; got an empty input list".into(),
-            ));
-        }
-
-        let mut per_input = Vec::with_capacity(ranges.len());
-        let mut flat = Vec::new();
-
-        for (source_index, range) in ranges.into_iter().enumerate() {
-            let plan = PagePlan::build(pdf, &range)
-                .map_err(|e| Error::Unsupported(format!("input {source_index}: {e}")))?;
-
-            for page in plan.pages() {
-                flat.push(CombinedPage {
-                    source_index,
-                    page: page.clone(),
-                });
-            }
-
-            per_input.push(plan);
-        }
-
-        Ok(Self { per_input, flat })
-    }
-
     /// Build a combined plan from a list of [`InputSpec`]s.
     ///
     /// Each spec is opened with [`Pdf::open_with_options`] using the supplied
@@ -410,38 +371,6 @@ mod tests {
         assert_eq!(flat[0].page.index_1based, 1);
         assert_eq!(flat[1].page.index_1based, 2);
         assert_eq!(flat[2].page.index_1based, 3);
-    }
-
-    #[test]
-    fn repeated_ranges_from_one_document_keep_selection_order() {
-        let mut pdf = open(build_n_page_pdf(3));
-        let plan = CombinedPlan::build_repeated(
-            &mut pdf,
-            vec![
-                PageRange::parse("1,3").unwrap(),
-                PageRange::parse("2").unwrap(),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(plan.input_count(), 2);
-        assert_eq!(plan.total_page_count(), 3);
-        assert_eq!(
-            plan.flat_pages()
-                .iter()
-                .map(|page| page.page.index_1based)
-                .collect::<Vec<_>>(),
-            vec![1, 3, 2]
-        );
-        assert_eq!(plan.flat_pages()[0].source_index, 0);
-        assert_eq!(plan.flat_pages()[2].source_index, 1);
-    }
-
-    #[test]
-    fn repeated_ranges_reject_empty_input() {
-        let mut pdf = open(build_n_page_pdf(1));
-        let error = CombinedPlan::build_repeated(&mut pdf, Vec::new()).unwrap_err();
-        assert!(error.to_string().contains("at least one input document"));
     }
 
     #[test]

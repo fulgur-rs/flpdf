@@ -23,7 +23,6 @@ mod json_sections;
 mod lifecycle;
 mod outline_dest_remap;
 mod overlay;
-mod page_collate;
 mod page_combine;
 mod page_merge;
 mod page_plan;
@@ -57,7 +56,6 @@ pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,
 };
-pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_merge::{merge_documents, MergeInput};
 pub use page_plan::{PagePlan, SelectedPage};

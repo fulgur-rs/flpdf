@@ -313,6 +313,34 @@ fn json_job_run_applies_pages_and_attachments() {
         .is_some());
 }
 
+/// qpdf's `handleRotations` resolves each `--rotate` range against the real
+/// page count and then filters `0 <= pageno < npages` before touching
+/// `pages`, so a `--collate=0`-produced empty document rotates nothing
+/// without erroring (confirmed live: `--collate=0 --rotate=90` exits 0).
+#[test]
+fn json_job_run_applies_rotate_to_a_collate_zero_empty_page_selection() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("collate-zero-rotate.pdf");
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "staticId": "",
+        "pages": [{"file": fixture}, {"file": fixture}],
+        "collate": "0",
+        "rotate": "90"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 0);
+}
+
 /// 2-page document with an outline item pointing at page 2 (obj 4).
 fn build_outline_fixture() -> Vec<u8> {
     use std::collections::BTreeMap;

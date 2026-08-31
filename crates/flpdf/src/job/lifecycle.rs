@@ -98,7 +98,7 @@ struct JobConfiguration {
     linearize_pass1: Option<PathBuf>,
     allow_weak_crypto: bool,
     page_specs: Vec<JobPageConfig>,
-    collate: Option<usize>,
+    collate: Option<Vec<usize>>,
     overlays: Vec<JobOverlayConfig>,
     underlays: Vec<JobOverlayConfig>,
     attachments_to_add: Vec<AttachmentAddOptions>,
@@ -668,19 +668,87 @@ fn parse_job_version(value: &str, path: &str) -> Result<(String, i64)> {
         .ok_or_else(|| Error::Usage(UsageError::new(format!("{path}: invalid version {value}"))))
 }
 
-fn parse_positive_usize(value: &[u8], path: &str) -> Result<usize> {
-    let value = String::from_utf8_lossy(value);
-    let parsed = value.parse::<usize>().map_err(|_| {
-        Error::Usage(UsageError::new(format!(
-            "{path}: invalid positive integer {value}"
-        )))
-    })?;
-    if parsed == 0 {
-        return Err(Error::Usage(UsageError::new(format!(
-            "{path}: value must be greater than zero"
-        ))));
+fn qpdf_is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b'\x0c' | b'\x0b')
+}
+
+fn parse_qpdf_collate_uint(component: &[u8]) -> Result<usize> {
+    // QUtil::string_to_ull receives a NUL-terminated c_str(), so embedded NUL
+    // bytes terminate both its sign check and strtoull's digit scan.
+    let component = &component[..component
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(component.len())];
+    let mut index = 0;
+    while component
+        .get(index)
+        .is_some_and(|&byte| qpdf_is_space(byte))
+    {
+        index += 1;
     }
-    Ok(parsed)
+    if component.get(index) == Some(&b'-') {
+        return Err(Error::System(format!(
+            "underflow converting {} to 64-bit unsigned integer",
+            String::from_utf8_lossy(component)
+        )));
+    }
+    if component.get(index) == Some(&b'+') {
+        index += 1;
+    }
+
+    let digit_start = index;
+    let mut value = 0_u64;
+    while let Some(&byte @ b'0'..=b'9') = component.get(index) {
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(byte - b'0')))
+            .ok_or_else(|| {
+                Error::System(format!(
+                    "overflow converting {} to 64-bit unsigned integer",
+                    String::from_utf8_lossy(component)
+                ))
+            })?;
+        index += 1;
+    }
+    if index == digit_start {
+        return Ok(0);
+    }
+    if value > u64::from(u32::MAX) {
+        return Err(Error::System(format!(
+            "integer out of range converting {value} from a 8-byte unsigned type to a 4-byte unsigned type"
+        )));
+    }
+    Ok(value as usize)
+}
+
+fn parse_qpdf_collate_parameter(parameter: &[u8]) -> Result<Vec<usize>> {
+    if parameter.is_empty() {
+        return Ok(vec![1]);
+    }
+
+    let mut values = Vec::new();
+    let mut position = 0;
+    loop {
+        let end = parameter[position..]
+            .iter()
+            .position(|&byte| byte == b',')
+            .map(|offset| position + offset);
+        // qpdf passes the comma's absolute index as the *count* argument to
+        // std::string::substr rather than subtracting position. Preserve that
+        // source behavior for malformed middle components such as `2,,3`.
+        let count = end.unwrap_or(usize::MAX);
+        let component_end = position.saturating_add(count).min(parameter.len());
+        let component = &parameter[position..component_end];
+        if component.is_empty() {
+            return Err(Error::Usage(UsageError::new("--collate: trailing comma")));
+        }
+        values.push(parse_qpdf_collate_uint(component)?);
+        let Some(end) = end else {
+            break;
+        };
+        position = end + 1;
+    }
+    Ok(values)
 }
 
 fn parse_job_split_pages(value: &[u8]) -> Result<usize> {
@@ -928,6 +996,16 @@ impl Default for QPDFJob {
 }
 
 impl QPDFJob {
+    /// Parse one qpdf `--collate` parameter into its ordered group sizes.
+    ///
+    /// This is the shared job configuration entry point for the CLI and JSON
+    /// paths. It mirrors `QPDFJob::Config::collate(std::string const&)`
+    /// (`libqpdf/QPDFJob_config.cc:95-125`) and its unsigned conversion
+    /// through `QUtil::string_to_ull` (`libqpdf/QUtil.cc:396-425`).
+    pub fn parse_collate(value: &str) -> Result<Vec<usize>> {
+        parse_qpdf_collate_parameter(value.as_bytes())
+    }
+
     /// Construct a job with qpdf's default message prefix and logger.
     ///
     /// Corresponds to `QPDFJob::QPDFJob` (`libqpdf/QPDFJob.cc:290-293`), whose
@@ -1366,7 +1444,8 @@ impl QPDFJob {
                 Some(PathBuf::from(String::from_utf8_lossy(&value).into_owned()));
         }
         if let Some(value) = job_json_string(&members, b"collate")? {
-            configuration.collate = Some(parse_positive_usize(&value, ".collate")?);
+            let value = String::from_utf8_lossy(&value);
+            configuration.collate = Some(Self::parse_collate(&value)?);
         }
 
         if let Some(value) = job_json_choice(&members, b"json", &["1", "2", "latest"], false)? {
@@ -1822,7 +1901,7 @@ impl QPDFJob {
             let page_output = self.handle_page_specs(
                 &mut page_sources,
                 &specs,
-                configuration.collate,
+                configuration.collate.as_deref(),
                 configuration.remove_unreferenced_resources,
                 configuration.writer.preserves_unreferenced_objects(),
             )?; // cov:ignore: llvm-cov attributes this successful page merge continuation to its opening call lines
@@ -1863,6 +1942,15 @@ impl QPDFJob {
             return Ok(());
         }
         let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+        if page_refs.is_empty() {
+            // qpdf's handleRotations resolves each range against the real page
+            // count and then filters `0 <= pageno < npages` before touching
+            // `pages`, so an empty document rotates nothing without erroring
+            // (confirmed live: `--collate=0 --rotate=90` exits 0). A resolved
+            // range's own out-of-bounds check requires page_count >= 1, so
+            // this document-empty case is handled up front instead.
+            return Ok(());
+        }
         let page_count = u32::try_from(page_refs.len())
             .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
         for rotation in &configuration.rotations {
@@ -2820,9 +2908,9 @@ mod tests {
         assert_eq!(parse_json_version(""), 2);
         assert!(parse_job_version("1.7.3", ".version").is_ok());
         assert!(parse_job_version("invalid", ".version").is_err());
-        assert_eq!(parse_positive_usize(b"2", ".count").unwrap(), 2);
-        assert!(parse_positive_usize(b"0", ".count").is_err());
-        assert!(parse_positive_usize(b"not-number", ".count").is_err());
+        assert_eq!(QPDFJob::parse_collate("2").unwrap(), vec![2]);
+        assert_eq!(QPDFJob::parse_collate("0").unwrap(), vec![0]);
+        assert_eq!(QPDFJob::parse_collate("not-number").unwrap(), vec![0]);
 
         for value in ["all", "annotate", "form", "assembly", "none"] {
             let mut permissions = crate::PermissionsConfig::default();
@@ -2874,6 +2962,32 @@ mod tests {
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
         assert!(parse_job_encrypt(&no_key_length, true).is_err());
         assert!(parse_job_encrypt(&encrypt_40, false).is_err());
+    }
+
+    #[test]
+    fn job_collate_parser_matches_qpdf_parameter_semantics() {
+        assert_eq!(QPDFJob::parse_collate("").unwrap(), vec![1]);
+        assert_eq!(QPDFJob::parse_collate("2,3").unwrap(), vec![2, 3]);
+        assert_eq!(QPDFJob::parse_collate("2,,3").unwrap(), vec![2, 0, 3]);
+        assert_eq!(QPDFJob::parse_collate("0").unwrap(), vec![0]);
+        assert_eq!(QPDFJob::parse_collate("2abc").unwrap(), vec![2]);
+        assert_eq!(QPDFJob::parse_collate("abc").unwrap(), vec![0]);
+        assert_eq!(QPDFJob::parse_collate(" +2").unwrap(), vec![2]);
+
+        let leading_comma = QPDFJob::parse_collate(",2").unwrap_err();
+        assert!(leading_comma.to_string().contains("trailing comma"));
+        let trailing_comma = QPDFJob::parse_collate("2,").unwrap_err();
+        assert!(trailing_comma.to_string().contains("trailing comma"));
+        let underflow = QPDFJob::parse_collate("-1").unwrap_err();
+        assert!(underflow.to_string().contains("underflow converting -1"));
+        let overflow = QPDFJob::parse_collate("18446744073709551616").unwrap_err();
+        assert!(overflow
+            .to_string()
+            .contains("overflow converting 18446744073709551616"));
+        let narrowing = QPDFJob::parse_collate("4294967296").unwrap_err();
+        assert!(narrowing
+            .to_string()
+            .contains("integer out of range converting 4294967296"));
     }
 
     #[test]

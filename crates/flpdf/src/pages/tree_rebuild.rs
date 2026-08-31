@@ -383,8 +383,7 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` value is absent,
-///   or `selected` is empty.
+/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` value is absent.
 /// - [`Error::Unsupported`] when the catalog / a selected ref is not a
 ///   dictionary, the page-tree depth limit is exceeded, or canonical indirect
 ///   allocation fails while duplicating a selection.
@@ -402,8 +401,7 @@ pub fn rebuild_page_tree<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - [`Error::Missing`] when `selected` is empty, or when `/Root` or the
-///   catalog `/Pages` value is absent.
+/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` value is absent.
 /// - [`Error::Unsupported`] when the catalog, a selected ref, or the `/Pages`
 ///   root is not a dictionary, a selected object is not a `/Page` dictionary,
 ///   the page-tree depth limit (`max_depth`) is exceeded, or canonical indirect
@@ -420,10 +418,6 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     selected: &[ObjectRef],
     max_depth: usize,
 ) -> Result<RebuildResult> {
-    if selected.is_empty() {
-        return Err(Error::Missing("page-tree rebuild: empty selection"));
-    }
-
     // qpdf obtains the effective /Pages handle through getAllPages before
     // flattening it. That handle can be either an indirect root or a direct
     // dictionary embedded in the catalog. Keep the ownership boundary through
@@ -873,10 +867,30 @@ mod tests {
     }
 
     #[test]
-    fn empty_selection_is_error() {
+    fn empty_selection_rebuilds_an_empty_page_tree() {
         let mut pdf = open(build_nested_pdf());
-        let err = rebuild_page_tree(&mut pdf, &[]).unwrap_err();
-        assert!(matches!(err, Error::Missing(_)), "got {err:?}");
+        let result = rebuild_page_tree(&mut pdf, &[]).expect("qpdf accepts zero selected pages");
+
+        assert!(result.new_kids.is_empty());
+        assert_eq!(
+            result.removed_pages,
+            BTreeSet::from([
+                ObjectRef::new(4, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(6, 0),
+            ])
+        );
+
+        let pages = resolved_handle(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(pages.get_key(b"/Count").as_integer(), Some(0));
+        assert_eq!(
+            pages
+                .get_key(b"/Kids")
+                .as_array()
+                .expect("empty /Kids array")
+                .len(),
+            0
+        );
     }
 
     #[test]

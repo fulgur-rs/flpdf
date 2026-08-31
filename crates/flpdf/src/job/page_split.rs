@@ -141,9 +141,11 @@ impl QPDFJob {
         }
 
         let pages = PageDocumentHelper::new(source).get_all_pages()?;
-        if pages.is_empty() {
-            return Err(Error::Missing("document has no pages"));
-        }
+        // qpdf's doSplitPages has no page-count guard: `for (i = 0; i <
+        // num_pages; i += m->split_pages)` trivially iterates zero times
+        // when num_pages is 0, writing no chunks (confirmed live:
+        // `qpdf --empty --split-pages=1 out-%d.pdf` exits 0 with no output
+        // files, as does a --collate=0-produced empty page selection).
         let page_count = pages.len();
         // cov:ignore-start: a supported process cannot allocate more than
         // u32::MAX page references for one parsed PDF.
@@ -882,16 +884,19 @@ mod tests {
     }
 
     #[test]
-    fn split_pages_rejects_an_empty_source_document() {
+    fn split_pages_on_an_empty_source_document_writes_no_chunks() {
+        // qpdf's doSplitPages has no page-count guard (confirmed live:
+        // `qpdf --empty --split-pages=1 out-%d.pdf` exits 0 with no output
+        // files); split_pages must match rather than reject the input.
         let mut source = Pdf::empty().expect("empty PDF should parse");
         let temp = tempfile::tempdir().expect("temporary directory");
         let options = SplitPageOptions::new(1, temp.path().join("out.pdf"));
         let mut job = super::super::QPDFJob::new();
 
-        let error = job
+        let written = job
             .split_pages(&mut source, options)
-            .expect_err("a document without pages must be rejected");
-        assert!(error.to_string().contains("document has no pages"));
+            .expect("a document without pages is a no-op, not an error");
+        assert!(written.is_empty());
     }
 
     #[test]
