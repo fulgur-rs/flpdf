@@ -427,6 +427,25 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 ## 5. 暗号
 
+### Encrypted writer matrix (`flpdf-25kg.6.1`, 2026-08-31)
+
+qpdf 11.9.0 の Standard handler は、`QPDFWriter.cc:777-840` の V/R/CFM ごとの
+version floor と `QPDF_encryption.cc:601-660,1180-1204` の V=5 random input 順を
+持つ。`flpdf-cli/tests/encrypt_cli_tests.rs` の
+`encrypted_writer_direct_handler_matrix_matches_qpdf_after_decrypt` は、固定された
+入力・password・permission と全 6 direct handler（V=1/R=2、V=2/R=3、V=4 RC4/R=4、
+V=4 AES/R=4、V=5/R=5、V=5/R=6）を qpdf で復号して QDF に再出力し、semantic/structural
+bytes を比較する。qpdf-zlib-compat の
+`encrypted_writer_deterministic_direct_handler_matrix_is_byte_identical_to_qpdf` は
+V5 以外の deterministic 4 handler を raw bytes で比較し、
+`encrypted_writer_copy_encryption_tuple_is_byte_identical_to_qpdf` は固定 V4 AES-128
+donor の copy-encryption tuple を direct encryption と独立に比較する。
+
+V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invocation
+でも毎回変化）を含むため raw qpdf CLI byte gate の対象外とし、既存の test-only
+`V5Randomness` seam（`.6.5`）で flpdf の deterministic repeat を検証し、qpdf とは
+復号後の QDF で比較する。production default は引き続き OS CSPRNG である。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF_encryption.cc` | 1410 | `encryption.rs` (facade) + `encryption/state.rs` + `encryption/crypt_filters.rs` + `encryption/keys.rs` + `encryption/standard.rs`(1879) + `encryption/permissions.rs`(206) + `encryption/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当) | 🔀 |
