@@ -1975,10 +1975,9 @@ mod tests {
     fn owned_decode_pipeline_applies_tiff_memory_limit_before_codec_construction() {
         let mut filter = wide_tiff_filter();
         let mut sink = RecordingSink::new(&[], &[]);
-        let error = match filter.decode_pipeline_owned(PipelineRef::from(&mut sink)) {
-            Err(error) => error,
-            Ok(_) => panic!("the wide TIFF row must exceed the configured budget"),
-        };
+        let result = filter.decode_pipeline_owned(PipelineRef::from(&mut sink));
+        assert!(result.is_err());
+        let error = result.err().unwrap();
 
         assert!(error
             .to_string()
@@ -1988,10 +1987,9 @@ mod tests {
     #[test]
     fn recovering_decode_pipeline_applies_tiff_memory_limit_before_codec_writes() {
         let mut filter = wide_tiff_filter();
-        let error = match filter.pipe_decode_recovering(&[], None, &mut |_, _, _, _| Ok(())) {
-            Err(error) => error,
-            Ok(_) => panic!("the wide TIFF row must exceed the configured budget"),
-        };
+        let result = filter.pipe_decode_recovering(&[], None, &mut |_, _, _, _| Ok(()));
+        assert!(result.is_err());
+        let error = result.err().unwrap();
 
         assert!(error
             .to_string()
