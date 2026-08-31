@@ -4,7 +4,7 @@
 
 **Goal:** Route every flpdf CLI `--pages` selection that uses one source document through the qpdf-shaped `QPDFJob::handle_page_specs` boundary, removing the duplicated in-place single-source orchestration.
 
-**Architecture:** Keep `QPDFJob::handle_page_specs` as the sole page-spec owner, matching qpdf 11.9.0's unconditional `handlePageSpecs` call whenever page specifications exist (`libqpdf/QPDFJob.cc:466-470`). The single-source CLI path will construct a source vector containing the already-opened primary and one `PageSpecInput` per occurrence, then reuse the existing job-route post-copy writer boundary. The standalone `CombinedPlan::build_repeated` plus `job::collate` path will be removed from the production CLI route; comma-separated collate values belong to the dependent `flpdf-egzr.8.11` slice and are not mixed into this PR.
+**Architecture:** Keep `QPDFJob::handle_page_specs` as the sole page-spec owner, matching qpdf 11.9.0's unconditional `handlePageSpecs` call whenever page specifications exist (`libqpdf/QPDFJob.cc:466-470`). The single-source CLI path constructs a source vector containing the already-opened primary and one `PageSpecInput` per occurrence; the job returns an in-place primary result so qdf output retains qpdf's live object identities. Multi-source calls retain the existing fresh `Merged` result. The standalone `CombinedPlan::build_repeated` plus `job::collate` path is removed from the production CLI route; comma-separated collate values belong to the dependent `flpdf-egzr.8.11` slice and are not mixed into this PR.
 
 **Tech Stack:** Rust workspace, `flpdf`/`flpdf-cli`, qpdf 11.9.0 oracle, `assert_cmd`, qpdf CLI differential tests.
 
@@ -82,11 +82,11 @@ git commit -m "test: require canonical qpdf page job route"
 
 **Interfaces:**
 - Consumes: `InputSpec` ranges, the already-opened `Pdf<R>` from the JSON/file job lifecycle, scalar `parse_collate_n`, and `QPDFJob::handle_page_specs`.
-- Produces: `run_page_extraction_from_single_source`, which keeps the source alive while the returned merged document is written and passes `reconstruct_labels = false` because the job route already rebuilds labels.
+- Produces: `run_page_extraction_from_single_source`, which keeps the source alive while the job result is written and passes the page-job result into the shared post-copy boundary.
 
 - [x] **Step 1: Rename the old route and replace its planning body**
 
-Change `run_page_extraction_from_repeated_pdf` to `run_page_extraction_from_single_source`. Before moving `pdf` into the source vector, capture `primary_copy_encryption` and `primary_encrypted`. Build one `PageSpecInput::new(0, input.range.clone())` per resolved input occurrence, parse the existing scalar collate option, configure a `QPDFJob` logger/message prefix, and call:
+Change `run_page_extraction_from_repeated_pdf` to `run_page_extraction_from_single_source`. Capture `primary_copy_encryption` and `primary_encrypted`, build one `PageSpecInput::new(0, input.range.clone())` per resolved input occurrence, parse the existing scalar collate option, configure a `QPDFJob` logger/message prefix, and call the sole `QPDFJob::handle_page_specs` entry point. Its single-source branch performs the qpdf-shaped in-place page-tree operation and returns the primary live document plus `RebuildResult`; its multi-source branch returns the fresh merged document. The shared post-copy writer boundary consumes either result without reinstating the old planner:
 
 ```rust
 let mut sources = vec![pdf];
@@ -94,7 +94,7 @@ let mut job = QPDFJob::new();
 job.set_logger(cli_logger());
 job.set_message_prefix(progname());
 let before_warnings = job.has_warnings();
-let mut merged = job.handle_page_specs(
+let page_output = job.handle_page_specs(
     &mut sources,
     &specs,
     collate,
@@ -104,7 +104,7 @@ let mut merged = job.handle_page_specs(
 let source_warnings = before_warnings || job.has_warnings();
 ```
 
-Use the returned merged document's `pages::page_refs` to construct the existing `CombinedPage` output projection. Call `run_page_extraction_after_plan` with `CliRemoveUnreferencedResources::No`, `reconstruct_labels = false`, the captured primary encryption source, and the same `source_warnings` value used by the existing multi-source job route. Keep `sources` in scope through the call so provider-backed copied streams retain their source lifetime.
+For `InPlace`, project `RebuildResult::new_kids` to the existing `CombinedPage` shape and pass the result/pruning mode into `run_page_extraction_after_plan`; for `Merged`, project the fresh output page tree and pass no prebuilt result. The shared function applies only the remaining rotate/navigation/writer stages when the job already rebuilt the primary. Keep `sources` in scope through the call so provider-backed copied streams retain their source lifetime.
 
 Remove the `CombinedPlan` and standalone `collate` imports if no production use remains. Update both `JobPdf::File` and `JobPdf::Json` dispatch calls to the renamed function.
 
@@ -169,7 +169,13 @@ cargo test --workspace --all-features --quiet
 
 Expected: zero failures and no new ignored test introduced for this route.
 
-- [ ] **Step 3: Commit only evidence-backed test adjustments**
+The latest full qtest run at `e24f7f6d` produced 2,811 parsed subtests,
+2,260 ordinary passes, zero allowlist regressions, and zero parity-manifest
+validation errors. The initial single-source cutover exposed qtest
+`merge-and-split` 20/22 object-identity regressions; the qpdf-shaped in-place
+result branch was added and a focused rerun returned both to PASS.
+
+- [x] **Step 3: Commit only evidence-backed test adjustments**
 
 If the live oracle identifies a missing supported scalar regression, add that regression first, run it RED against the pre-change commit, then implement the smallest canonical correction and rerun GREEN. Otherwise do not modify existing test expectations.
 
@@ -188,7 +194,7 @@ python3 scripts/qpdf-module-docs.py --check
 python3 scripts/check-qpdf-deviation-markers.py --check
 ```
 
-- [ ] **Step 2: Run authoritative changed-line coverage**
+- [x] **Step 2: Run authoritative changed-line coverage**
 
 ```bash
 bash scripts/patch-coverage.sh --base origin/main
@@ -196,7 +202,7 @@ bash scripts/patch-coverage.sh --base origin/main
 
 Expected: `flpdf changed ..., uncovered 0 -> PASS (100%)`.
 
-- [ ] **Step 3: Inspect the final worktree**
+- [x] **Step 3: Inspect the final worktree**
 
 ```bash
 git diff --check
