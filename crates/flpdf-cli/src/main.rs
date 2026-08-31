@@ -541,6 +541,7 @@ struct Cli {
               "show_object",
               "show_npages", "show_pages", "show_xref", "show_linearization",
               "show_encryption",
+              "is_encrypted", "requires_password",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption",
               "add_attachment", "remove_attachment", "list_attachments",
@@ -590,6 +591,20 @@ struct Cli {
         require_equals = true,
         value_name = "VERSION",
         value_parser = ["1", "2", "latest"],
+        conflicts_with_all = [
+            "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
+            "show_object",
+            "show_npages", "show_pages", "show_xref", "show_linearization",
+            "show_encryption",
+            "is_encrypted", "requires_password",
+            "compress_streams", "linearize_pass1", "remove_restrictions",
+            "decrypt", "encrypt", "copy_encryption",
+            "add_attachment", "remove_attachment", "list_attachments",
+            "show_attachment", "copy_attachments_from",
+            "no_original_object_ids", "qdf", "coalesce_contents",
+            "flatten_annotations",
+            "preserve_unreferenced",
+        ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
     )]
     json_output: Option<String>,

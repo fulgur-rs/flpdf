@@ -1391,6 +1391,67 @@ fn json_flag_conflicts_with_compress_streams() {
     .code(2);
 }
 
+/// `--json-output` dispatches through the same `run_json` boundary as
+/// `--json`. Every rewrite or inspection flag that the latter rejects must be
+/// rejected here too; otherwise the second flag is silently dropped before
+/// its consumer can run. Keep this table aligned with `Cli::json`'s
+/// `conflicts_with_all` list, including the later-added encryption checks.
+#[test]
+fn json_output_conflicts_with_the_json_exclusive_flag_set() {
+    let cases: &[&[&str]] = &[
+        &["--check"],
+        &["--linearize"],
+        &["--static-id"],
+        &["--deterministic-id"],
+        &["--static-aes-iv"],
+        &["--show-object=trailer"],
+        &["--show-npages"],
+        &["--show-pages"],
+        &["--show-xref"],
+        &["--show-linearization"],
+        &["--show-encryption"],
+        &["--is-encrypted"],
+        &["--requires-password"],
+        &["--compress-streams=n"],
+        &["--linearize-pass1=pass1"],
+        &["--remove-restrictions"],
+        &["--decrypt"],
+        &["--encrypt", "u", "o", "128", "--"],
+        &["--copy-encryption=donor.pdf"],
+        &["--add-attachment", "file.bin", "--"],
+        &["--remove-attachment=key"],
+        &["--list-attachments"],
+        &["--show-attachment=key"],
+        &["--copy-attachments-from", "donor.pdf", "--"],
+        &["--no-original-object-ids"],
+        &["--qdf"],
+        &["--coalesce-contents"],
+        &["--flatten-annotations=all"],
+        &["--preserve-unreferenced"],
+    ];
+
+    for extra in cases {
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--json-output=2"])
+            .args(*extra)
+            .arg("../../tests/fixtures/minimal.pdf")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "--json-output must reject {extra:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
+            "--json-output conflict for {extra:?} must be a usage error; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 // ===========================================================================
 // flpdf-5st: --json-stream-data must apply DecodeLevel to the stream payload.
 //
