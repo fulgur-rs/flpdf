@@ -50,9 +50,6 @@ use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::sha2::PlSha2;
 use crate::pipeline::Pipeline;
 use crate::ObjectHandle;
-use aes::{Aes128, Aes256};
-use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
-use cbc::{Decryptor, Encryptor};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -245,14 +242,18 @@ fn r5_salted_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> Result<[u8; 32]
 }
 
 fn aes256_cbc_zero_iv_unwrap(encrypted_key: &[u8; 32], aes_key: &[u8; 32]) -> Result<Vec<u8>> {
-    let iv = [0u8; 16];
-    let mut ciphertext = encrypted_key.to_vec();
-    let dec = <Decryptor<Aes256> as KeyIvInit>::new(aes_key.into(), (&iv).into());
-    dec.decrypt_padded::<NoPadding>(&mut ciphertext)
-        .map_err(|_| EncryptedError::Malformed {
-            reason: "invalid V=5 encrypted file-key entry".into(),
-        })?;
-    Ok(ciphertext)
+    PlAesPdf::process_to_vec_without_padding(
+        "AES V=5 file-key unwrap",
+        false,
+        encrypted_key,
+        aes_key,
+        1,
+        None,
+    )
+    .map_err(|_| EncryptedError::Malformed {
+        reason: "invalid V=5 encrypted file-key entry".into(),
+    })
+    .map_err(Into::into)
 }
 
 fn decrypt_r5_file_key(
@@ -296,18 +297,18 @@ fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> Result<[u8; 3
         k1.extend_from_slice(&key);
         k1.extend_from_slice(extra);
 
-        let mut e = Vec::with_capacity(k1.len() * 64);
-        for _ in 0..64 {
-            e.extend_from_slice(&k1);
-        }
-
         let mut aes_key = [0u8; 16];
         aes_key.copy_from_slice(&key[..16]);
         let mut iv = [0u8; 16];
         iv.copy_from_slice(&key[16..32]);
-        let enc = <Encryptor<Aes128> as KeyIvInit>::new((&aes_key).into(), (&iv).into());
-        enc.encrypt_padded::<NoPadding>(&mut e, k1.len() * 64)
-            .expect("R=6 hash input repeated 64 times is block-aligned");
+        let e = PlAesPdf::process_to_vec_without_padding(
+            "AES R=6 hash",
+            true,
+            &k1,
+            &aes_key,
+            64,
+            Some(&iv),
+        )?;
 
         let e_mod_3 = e[..16]
             .iter()
@@ -1064,7 +1065,7 @@ pub(crate) fn build_v4_encrypt_dict(
 // (Algorithm 10, the V=5 R=6 piece of flpdf-9hc.4.8)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// ISO 32000-2 Algorithm 10 — Encode and AES-256-ECB-encrypt the 16-byte
+/// ISO 32000-2 Algorithm 10 — Encode and AES-256-encrypt the 16-byte
 /// `/Perms` block.
 ///
 /// Plaintext layout (PDF 1.7 §7.6.4.6 / ISO 32000-2 §7.6.4.4.5):
@@ -1077,22 +1078,37 @@ pub(crate) fn build_v4_encrypt_dict(
 /// | 9..12 | ASCII magic `b"adb"`                                       |
 /// | 12..16| `random_tail` (spec-arbitrary; round-tripped opaquely)     |
 ///
-/// Encrypted with AES-256 in ECB mode (single block) under `file_key`.
-/// Verified by the reader via the inverse path in `r6_perms_warning`.
+/// qpdf sends the block through `process_with_aes` with a zero IV and disabled
+/// padding (`QPDF_encryption.cc:655-663`). For this one block that is
+/// byte-equivalent to AES-256 ECB, but the pipeline route preserves qpdf's
+/// ownership and error contract. Verified by the reader via the inverse path
+/// in `r6_perms_warning`.
 pub(crate) fn compute_perms_blob(
     p: i32,
     encrypt_metadata: bool,
     random_tail: &[u8; 4],
     file_key: &[u8; 32],
-) -> [u8; 16] {
+) -> Result<[u8; 16]> {
     let mut block = [0u8; 16];
     block[0..4].copy_from_slice(&p.to_le_bytes());
     block[4..8].copy_from_slice(&[0xFF; 4]);
     block[8] = if encrypt_metadata { b'T' } else { b'F' };
     block[9..12].copy_from_slice(b"adb");
     block[12..16].copy_from_slice(random_tail);
-    crate::encryption::primitives::aes256_ecb_encrypt_block(file_key, &mut block);
-    block
+    let encrypted = PlAesPdf::process_to_vec_without_padding(
+        "AES /Perms encryption",
+        true,
+        &block,
+        file_key,
+        1,
+        None,
+    )?;
+    encrypted.try_into().map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "invalid V=5 /Perms encrypted length".into(),
+        }
+        .into()
+    })
 }
 
 /// Wrap `file_key` for a V=5 R=6 password using a zero IV and AES-256-CBC
@@ -1100,14 +1116,21 @@ pub(crate) fn compute_perms_blob(
 ///
 /// Shared by Algorithm 8 (writer-side `/UE`) and Algorithm 9 (writer-side
 /// `/OE`); the reverse path is [`aes256_cbc_zero_iv_unwrap`].
-fn aes256_cbc_zero_iv_wrap(file_key: &[u8; 32], aes_key: &[u8; 32]) -> [u8; 32] {
-    let iv = [0u8; 16];
-    let mut buf = *file_key;
-    let enc = <Encryptor<Aes256> as KeyIvInit>::new(aes_key.into(), (&iv).into());
-    // Plaintext is exactly two 16-byte blocks, so no padding is appended.
-    enc.encrypt_padded::<NoPadding>(&mut buf, 32)
-        .expect("32-byte input is exactly 2 AES blocks; padding-less encrypt cannot fail");
-    buf
+fn aes256_cbc_zero_iv_wrap(file_key: &[u8; 32], aes_key: &[u8; 32]) -> Result<[u8; 32]> {
+    let ciphertext = PlAesPdf::process_to_vec_without_padding(
+        "AES V=5 file-key wrap",
+        true,
+        file_key,
+        aes_key,
+        1,
+        None,
+    )?;
+    ciphertext.try_into().map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "invalid V=5 encrypted file-key length".into(),
+        }
+        .into()
+    })
 }
 
 /// ISO 32000-2 Algorithm 8 — Compute the V=5 R=6 `/U` and `/UE` entries.
@@ -1137,7 +1160,7 @@ pub(crate) fn compute_u_ue_r6(
 ) -> Result<([u8; 48], [u8; 32])> {
     let validation_hash = r6_password_hash(user_password, validation_salt, &[])?;
     let aes_key = r6_password_hash(user_password, key_salt, &[])?;
-    let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+    let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key)?;
 
     let mut u_entry = [0u8; 48];
     u_entry[0..32].copy_from_slice(&validation_hash);
@@ -1167,7 +1190,7 @@ pub(crate) fn compute_o_oe_r6(
 ) -> Result<([u8; 48], [u8; 32])> {
     let validation_hash = r6_password_hash(owner_password, validation_salt, user_entry)?;
     let aes_key = r6_password_hash(owner_password, key_salt, user_entry)?;
-    let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+    let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key)?;
 
     let mut o_entry = [0u8; 48];
     o_entry[0..32].copy_from_slice(&validation_hash);
@@ -1274,7 +1297,7 @@ pub(crate) fn build_v5_r6_encrypt_dict(
         params.encrypt_metadata,
         &secrets.perms_random_tail,
         &secrets.file_key,
-    );
+    )?;
 
     // /CF /StdCF entry (CFM AESV3, Length 32).
     let std_cf = ObjectHandle::dictionary(vec![
@@ -1331,7 +1354,7 @@ pub(crate) fn compute_u_ue_r5(
 ) -> Result<([u8; 48], [u8; 32])> {
     let validation_hash = r5_salted_hash(user_password, validation_salt, &[])?;
     let aes_key = r5_salted_hash(user_password, key_salt, &[])?;
-    let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+    let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key)?;
 
     let mut u_entry = [0u8; 48];
     u_entry[0..32].copy_from_slice(&validation_hash);
@@ -1359,7 +1382,7 @@ pub(crate) fn compute_o_oe_r5(
 ) -> Result<([u8; 48], [u8; 32])> {
     let validation_hash = r5_salted_hash(owner_password, validation_salt, user_entry)?;
     let aes_key = r5_salted_hash(owner_password, key_salt, user_entry)?;
-    let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
+    let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key)?;
 
     let mut o_entry = [0u8; 48];
     o_entry[0..32].copy_from_slice(&validation_hash);
@@ -1417,7 +1440,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
         params.encrypt_metadata,
         &secrets.perms_random_tail,
         &secrets.file_key,
-    );
+    )?;
 
     let mut entries = vec![
         (b"CF".to_vec(), cf),
@@ -1543,47 +1566,22 @@ pub(crate) fn encrypt_cipher_bytes(
             Ok(())
         }
         StringEncryptCipher::Aes128 { key } => {
-            *bytes = aes128_cbc_encrypt_with_iv(key, iv, bytes);
+            let encrypted =
+                PlAesPdf::encrypt_to_vec_with_iv("AES-128 string encryption", bytes, key, iv)?;
+            bytes.clear();
+            bytes.extend_from_slice(iv);
+            bytes.extend_from_slice(&encrypted);
             Ok(())
         }
         StringEncryptCipher::Aes256 { key } => {
-            *bytes = aes256_cbc_encrypt_with_iv(key, iv, bytes);
+            let encrypted =
+                PlAesPdf::encrypt_to_vec_with_iv("AES-256 string encryption", bytes, key, iv)?;
+            bytes.clear();
+            bytes.extend_from_slice(iv);
+            bytes.extend_from_slice(&encrypted);
             Ok(())
         }
     }
-}
-
-fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-    // `encrypt_padded::<Pkcs7>` always appends at least one byte of
-    // padding (a full block of `0x10` when plaintext is block-aligned), so
-    // the worst-case ciphertext length is `plaintext.len() + 16`.
-    let pt_len = plaintext.len();
-    let mut buf = Vec::with_capacity(16 + pt_len + 16);
-    buf.extend_from_slice(iv);
-    buf.extend_from_slice(plaintext);
-    buf.resize(16 + pt_len + 16, 0);
-    let enc = <Encryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
-    let ciphertext = enc
-        .encrypt_padded::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
-        .expect("Pkcs7 encrypt cannot fail with sufficient buffer");
-    let ct_len = ciphertext.len();
-    buf.truncate(16 + ct_len);
-    buf
-}
-
-fn aes256_cbc_encrypt_with_iv(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-    let pt_len = plaintext.len();
-    let mut buf = Vec::with_capacity(16 + pt_len + 16);
-    buf.extend_from_slice(iv);
-    buf.extend_from_slice(plaintext);
-    buf.resize(16 + pt_len + 16, 0);
-    let enc = <Encryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
-    let ciphertext = enc
-        .encrypt_padded::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
-        .expect("Pkcs7 encrypt cannot fail with sufficient buffer");
-    let ct_len = ciphertext.len();
-    buf.truncate(16 + ct_len);
-    buf
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -1022,6 +1022,20 @@ live probe は深さ 5,000 では exit 0、50,000 と 100,000 では構築完了
 
 ---
 
+### Pl_AES_PDF production consumer correction (flpdf-qynx.10)
+
+The `Pl_AES_PDF` production cutover is complete. Reader string decryption,
+reader stream decryption, writer stream encryption, writer encrypted-string
+emission, V=5 `/UE` and `/OE` wrapping, R=6 Algorithm 2.B's repeated AES step,
+and R=5/R=6 `/Perms` verification/construction all use the canonical
+`pipeline/aes.rs::PlAesPdf` stage. The no-padding zero/specified-IV helper
+preserves qpdf's `process_with_aes` state across repeated writes
+(`libqpdf/QPDF_encryption.cc:209-236,601-663`). The direct CBC and single-block
+AES helpers formerly in `encryption/standard.rs`, `encryption/state.rs`, and
+`encryption/primitives.rs` were removed. `disableCBC` remains test-only, while
+`useZeroIV` and `disablePadding` are production controls because qpdf uses both
+in its V=5 and `/Perms` consumers.
+
 ### DCT whole-buffer consumer correction (flpdf-n9t0.9)
 
 The DCT row above predates the qtest `qpdf_dl_all` follow-up. The legacy

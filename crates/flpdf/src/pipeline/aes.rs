@@ -190,6 +190,62 @@ impl<'a> PlAesPdf<'a> {
         sink.take_buffer()
     }
 
+    /// Encrypt a complete buffer with a caller-supplied IV and qpdf's normal
+    /// PDF padding, returning only the ciphertext. The caller adds the IV to
+    /// the stored string representation when the surrounding qpdf consumer
+    /// requires it.
+    pub(crate) fn encrypt_to_vec_with_iv(
+        identifier: impl Into<String>,
+        data: &[u8],
+        key: &[u8],
+        iv: &[u8; 16],
+    ) -> PipelineResult<Vec<u8>> {
+        let mut sink = super::buffer::Buffer::new("AES encryption buffer", None);
+        {
+            let mut stage = PlAesPdf::new_encrypt(identifier, &mut sink, key)?;
+            stage.set_iv(iv)?;
+            stage.write(data)?;
+            stage.finish()?;
+        }
+        sink.take_buffer()
+    }
+
+    /// Run qpdf's `process_with_aes` shape (`QPDF_encryption.cc:209-236`):
+    /// select a zero or specified IV, disable PDF padding, feed the same input
+    /// the requested number of times, and finish the one stateful stage once.
+    ///
+    /// This is used for V=5 key wrapping, `/Perms`, and Algorithm 2.B's
+    /// repeated AES input. Keeping the loop inside the pipeline owner is
+    /// important: qpdf retains CBC state across all repetitions.
+    pub(crate) fn process_to_vec_without_padding(
+        identifier: impl Into<String>,
+        encrypt: bool,
+        data: &[u8],
+        key: &[u8],
+        repetitions: usize,
+        iv: Option<&[u8]>,
+    ) -> PipelineResult<Vec<u8>> {
+        let mut sink = super::buffer::Buffer::new("AES process buffer", None);
+        {
+            let mut stage = if encrypt {
+                PlAesPdf::new_encrypt(identifier, &mut sink, key)?
+            } else {
+                PlAesPdf::new_decrypt(identifier, &mut sink, key)?
+            };
+            if let Some(iv) = iv {
+                stage.set_iv(iv)?;
+            } else {
+                stage.use_zero_iv();
+            }
+            stage.disable_padding();
+            for _ in 0..repetitions {
+                stage.write(data)?;
+            }
+            stage.finish()?;
+        }
+        sink.take_buffer()
+    }
+
     /// An encrypting stage, mirroring `Pl_AES_PDF(identifier, next, true, key,
     /// key_bytes)`. Unless a vector is supplied or zeroed, a fresh random
     /// initialization vector is generated and written ahead of the ciphertext.
@@ -225,7 +281,6 @@ impl<'a> PlAesPdf<'a> {
     /// qpdf `Pl_AES_PDF::useZeroIV` (`Pl_AES_PDF.cc:36-40`): use an all-zero
     /// vector, which AESV3 key wrapping needs. Like a specified vector it is
     /// not written to the output.
-    #[cfg(test)]
     pub(crate) fn use_zero_iv(&mut self) {
         self.use_zero_iv = true;
     }
@@ -233,7 +288,6 @@ impl<'a> PlAesPdf<'a> {
     /// qpdf `Pl_AES_PDF::disablePadding` (`Pl_AES_PDF.cc:42-46`): append no
     /// padding block when encrypting and strip none when decrypting, which
     /// AESV3 key wrapping needs.
-    #[cfg(test)]
     pub(crate) fn disable_padding(&mut self) {
         self.disable_padding = true;
     }

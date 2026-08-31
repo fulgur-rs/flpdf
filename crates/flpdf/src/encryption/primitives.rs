@@ -1,4 +1,4 @@
-//! qpdf correspondence: Rust crypto-crate substitution for qpdf's single-block AES and MD5 native implementations.
+//! qpdf correspondence: Rust crypto-crate substitution for qpdf's MD5 native implementation.
 //! Low-level cryptographic primitives used by the PDF security handler.
 //!
 //! All functions are `pub(crate)`; no dependency types from RustCrypto crates
@@ -25,8 +25,6 @@
 //! else.
 #![allow(dead_code)]
 
-use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use aes::Aes256;
 use md5::{Digest, Md5};
 
 use thiserror::Error;
@@ -39,24 +37,6 @@ pub(crate) enum PrimitiveError {
     /// Key or IV has an unexpected length.
     #[error("invalid key/IV length")]
     InvalidLength,
-}
-
-/// Decrypt one AES-256-ECB block in place.
-pub(crate) fn aes256_ecb_decrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
-    let dec = <Aes256 as KeyInit>::new(key.into());
-    dec.decrypt_block(block.into());
-}
-
-/// Encrypt one AES-256-ECB block in place.
-///
-/// Used by V=5 R=6 Algorithm 10 (`/Perms` blob construction): the 16-byte
-/// plaintext block carrying `/P` + `/EncryptMetadata` + `adb` magic is
-/// encrypted single-block-ECB with the file encryption key. Algorithm 13
-/// reverses this via [`aes256_ecb_decrypt_block`] during reader-side
-/// validation.
-pub(crate) fn aes256_ecb_encrypt_block(key: &[u8; 32], block: &mut [u8; 16]) {
-    let enc = <Aes256 as KeyInit>::new(key.into());
-    enc.encrypt_block(block.into());
 }
 
 /// Compute the MD5 digest of `data`.
