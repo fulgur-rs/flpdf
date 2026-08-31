@@ -2391,7 +2391,6 @@ impl LinearizationPlan {
             !self.outline_first_page_members.is_empty(),
             &containers,
         );
-
         let mut open_document_batches: Vec<Vec<ObjectRef>> = Vec::new();
         // qpdf part 6 is private, shared, then outline containers. Preserve
         // first-encounter order within each bucket.

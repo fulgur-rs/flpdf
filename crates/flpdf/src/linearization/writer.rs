@@ -2265,6 +2265,17 @@ fn do_write_pass<R: Read + Seek>(
     // XObject before the OD ObjStm at a lower object number (e.g. obj 7 before obj
     // 8 ObjStm); --object-streams=disable places the whole AcroForm subtree here.
     for original_ref in &plan.part4_open_document_plain {
+        // Preserve mode starts from qpdf's source member-to-container map. The
+        // linearization plan is built before the resolved ObjStm layout, so an
+        // object that is later retained in a source container can still appear
+        // in this broad open-document list. qpdf's enqueueObject routes that
+        // member through its container and never writes a second plain copy
+        // (QPDFWriter.cc:1097-1105); apply the same ownership decision at the
+        // final emission boundary. Generate-mode members are not in this list
+        // because its planner already separates eligible members from streams.
+        if objstm_layout.member_to_container.contains_key(original_ref) {
+            continue;
+        }
         if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
             continue;
         }
@@ -2787,6 +2798,12 @@ fn second_half_container_anchors(
             plain_ranked.push((r, (2, 0, 0, r.number)));
         }
     }
+    let part9_pages: BTreeSet<ObjectRef> = plan
+        .optimization
+        .as_ref()
+        .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+        .filter(|pages| !pages.is_empty())
+        .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
 
     let page_private_sets: Vec<BTreeSet<ObjectRef>> = plan
         .per_page_private_objects
@@ -2813,6 +2830,17 @@ fn second_half_container_anchors(
                     (0, owner, 1, object_number)
                 }
                 ContainerPart::OtherPageShared => (1, 0, 0, object_number),
+                ContainerPart::Rest
+                    if batch.source_container_number.is_some()
+                        && batch.members.iter().any(|m| part9_pages.contains(m)) =>
+                {
+                    // qpdf places the complete /Pages user set before the
+                    // remaining lc_other set. If that user set is folded into
+                    // a preserved ObjStm, the container inherits the same
+                    // head position rather than sorting by its source object
+                    // number (QPDF_linearization.cc:1286-1290).
+                    (2, 0, 0, 0)
+                }
                 ContainerPart::Rest => (2, 0, 0, object_number),
                 // cov:ignore-start: first-half routes cannot enter resolved second-half batches
                 ContainerPart::OpenDocument
@@ -3466,15 +3494,26 @@ fn write_linearized_impl<R: Read + Seek>(
         .map(|optimization| optimization.objects_for_root_key(b"Pages"))
         .filter(|pages| !pages.is_empty())
         .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
-    let second_half_post_plain: BTreeSet<ObjectRef> = plan
-        .part4_rest
-        .iter()
-        .chain(&plan.part9_outline_objects)
-        .copied()
-        .filter(|r| {
-            !part4_member_set.contains(r) && !part9_pages.contains(r) && Some(*r) != plan.info_ref
-        })
-        .collect();
+    let second_half_post_plain: BTreeSet<ObjectRef> =
+        if options.object_streams == crate::writer::ObjectStreamMode::Preserve {
+            // Preserve containers retain their source object numbers in qpdf's
+            // part-7/8/9 sets. Plain objects therefore remain in the same ordered
+            // stream as the containers and are placed by their source-number
+            // anchors; deferring them would move an ordinary lc_other object past
+            // a later source container.
+            BTreeSet::new()
+        } else {
+            plan.part4_rest
+                .iter()
+                .chain(&plan.part9_outline_objects)
+                .copied()
+                .filter(|r| {
+                    !part4_member_set.contains(r)
+                        && !part9_pages.contains(r)
+                        && Some(*r) != plan.info_ref
+                })
+                .collect()
+        };
     // First-half mirror of `second_half_post_plain`: under /PageMode /UseOutlines
     // the outline objects route to qpdf part6 (first half) via
     // `part6_outline_objects`. Eligible members ride in a first-half ObjStm batch
@@ -3527,9 +3566,53 @@ fn write_linearized_impl<R: Read + Seek>(
     // before the `/Encrypt` slot is inserted; the slot reservation below then
     // shifts the placed map and the derived ObjStm layout is built afterwards
     // from the shifted map.
+    let open_document_source_container_numbers: Vec<Option<u32>> =
+        if options.object_streams == crate::writer::ObjectStreamMode::Preserve {
+            let source_container_by_member: BTreeMap<ObjectRef, u32> = pdf
+                .source_xref_entries()
+                .into_iter()
+                .filter_map(|(object_ref, entry)| match entry {
+                    crate::XrefEntry::Compressed { stream, .. } => Some((object_ref, stream)),
+                    _ => None,
+                })
+                .collect();
+            resolved_batch_plan
+                .open_document_batches
+                .iter()
+                .map(|members| {
+                    let source = members
+                        .first()
+                        .and_then(|member| source_container_by_member.get(member).copied())
+                        .ok_or_else(|| {
+                            // cov:ignore-start: resolved Preserve batches come directly from source xref compressed-member groups; every non-empty batch therefore has a source container.
+                            crate::Error::Unsupported(
+                                "linearization writer: preserved open-document ObjStm batch \
+                                 has no source container"
+                                    .to_string(),
+                            )
+                        })?; // cov:ignore-end
+                    if members.iter().any(|member| {
+                        source_container_by_member.get(member).copied() != Some(source)
+                        // cov:ignore: objstm_batches_preserve groups each non-empty batch by one source container
+                    }) {
+                        // cov:ignore-start: source-container homogeneity is guaranteed by objstm_batches_preserve's per-container grouping.
+                        return Err(crate::Error::Unsupported(
+                            "linearization writer: preserved open-document ObjStm batch \
+                             combines multiple source containers"
+                                .to_string(),
+                        ));
+                        // cov:ignore-end
+                    }
+                    Ok(Some(source))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; resolved_batch_plan.open_document_batches.len()]
+        };
     let relocation = if emits_object_streams {
         local_renumber.place_objstm_members_per_half(
             &resolved_batch_plan.open_document_batches,
+            &open_document_source_container_numbers,
             &resolved_batch_plan.part3_batches,
             &part4_members,
             &second_half_anchors,
@@ -4412,10 +4495,43 @@ fn write_linearized_impl<R: Read + Seek>(
         dict_writable_region: part1_dict_region,
     };
 
-    let old_to_new = renumber
+    let mut old_to_new: BTreeMap<ObjectRef, ObjectRef> = renumber
         .iter_in_layout_order()
         .map(|(new_ref, old_ref)| (old_ref, new_ref))
         .collect();
+
+    // qpdf's getRenumberedObjGen reports the source ObjStm container's logical
+    // output identity even though the output container is a freshly serialized
+    // object. The source container is intentionally absent from the ordinary
+    // linearization plan (only its members are body objects), so add this
+    // canonical writer-result mapping from the resolved Preserve layout. This
+    // lets test_renumber compare the same source object universe as qpdf
+    // without making the helper reconstruct container ownership.
+    if options.object_streams == crate::writer::ObjectStreamMode::Preserve
+        && !objstm_layout.is_empty()
+    {
+        let source_container_by_member: BTreeMap<ObjectRef, u32> = pdf
+            .source_xref_entries()
+            .into_iter()
+            .filter_map(|(object_ref, entry)| match entry {
+                crate::XrefEntry::Compressed { stream, .. } => Some((object_ref, stream)),
+                _ => None,
+            })
+            .collect();
+        for container in objstm_layout
+            .open_document
+            .iter()
+            .chain(&objstm_layout.part3)
+            .chain(&objstm_layout.part4)
+        {
+            let source_container_number =
+                preserved_source_container_number(container, &source_container_by_member)?;
+            old_to_new.insert(
+                ObjectRef::new(source_container_number, 0),
+                ObjectRef::new(container.container_new_num, 0),
+            );
+        }
+    }
 
     let mut written_xref = final_xref_offsets
         .iter()

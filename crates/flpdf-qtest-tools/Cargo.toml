@@ -61,6 +61,10 @@ path = "src/bin/pdf_from_scratch.rs"
 name = "test_many_nulls"
 path = "src/bin/test_many_nulls.rs"
 
+[[bin]]
+name = "test_renumber"
+path = "src/bin/test_renumber.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"
