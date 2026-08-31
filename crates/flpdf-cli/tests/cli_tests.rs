@@ -8557,6 +8557,161 @@ fn rewrite_flatten_annotations_all_removes_widget_from_annots() {
     );
 }
 
+/// `--json-output` has no dispatch check of its own the way `--json` does
+/// (main's dispatch chain routes to `run_json` for either flag before any
+/// rewrite path that consumes `flatten_annotations`), so without this
+/// conflict `--flatten-annotations=all --json-output=2 IN OUT` would exit 0
+/// and silently write a JSON dump of the unmodified input while dropping the
+/// requested transformation entirely.
+#[test]
+fn top_level_flatten_annotations_rejects_json_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_with_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--flatten-annotations=all", "--json-output=2"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot be used with '--json-output",
+        ));
+}
+
+/// The qpdf-compatible top-level form must route the same flattening
+/// transformation as the native `rewrite` subcommand.
+#[test]
+fn top_level_flatten_annotations_all_removes_widget_from_annots() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_with_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--static-id",
+            "--no-original-object-ids",
+            "--flatten-annotations=all",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    assert!(
+        annots.is_empty(),
+        "top-level flattening should remove the widget from /Annots"
+    );
+}
+
+/// qpdf applies annotation flattening before its linearized writer as well as
+/// before the ordinary rewrite writer.
+#[test]
+fn top_level_flatten_annotations_linearize_removes_widget_from_annots() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_with_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--linearize",
+            "--static-id",
+            "--no-original-object-ids",
+            "--flatten-annotations=all",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
+    assert!(
+        annots.is_empty(),
+        "linearized top-level flattening should remove the widget from /Annots"
+    );
+}
+
+/// qpdf reports a warning and exits 3 when flattening a document whose
+/// `/NeedAppearances` marker says form appearances are stale.
+#[test]
+fn top_level_flatten_annotations_preserves_need_appearances_warning_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_without_ap()).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--qdf", "--static-id", "--no-original-object-ids"])
+        .arg("--flatten-annotations=all")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("document does not have updated appearance streams, so form fields will not be flattened"),
+        "top-level flattening must preserve qpdf's NeedAppearances warning"
+    );
+    assert!(output.is_file());
+}
+
+/// `--no-warn` suppresses the printed NeedAppearances warning text and the
+/// trailing "operation succeeded with warnings" summary, while the exit
+/// status still correctly reflects the recorded warning (qpdf's
+/// `suppress_warnings` gates delivery, not collection: `QPDF::warn` always
+/// records, only the print is conditional).
+#[test]
+fn top_level_flatten_annotations_no_warn_suppresses_warning_text_but_keeps_exit_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("form.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_form_pdf_without_ap()).unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--static-id",
+            "--no-original-object-ids",
+            "--no-warn",
+        ])
+        .arg("--flatten-annotations=all")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(
+        result.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert!(
+        result.stderr.is_empty(),
+        "--no-warn must suppress both the WARNING line and the trailing \
+         summary: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.is_file());
+}
+
 /// `--generate-appearances` followed by `--flatten-annotations=all` cooperate:
 /// the missing appearance is generated first, then the widget is flattened into
 /// page content and removed from `/Annots`. Without the ordering (generate

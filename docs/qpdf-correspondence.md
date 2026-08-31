@@ -578,6 +578,7 @@ cargo test -p flpdf-cli --test cli_json --quiet
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
 
 `generateAppearances` も生成 handler (`auto_job_json_init.hh:383-385`)、Config (`QPDFJob_config.cc:218-221`)、変換順序 (`QPDFJob.cc:2177-2180`) に対応し、既存の `AcroFormDocumentHelper::generate_appearances_if_needed` (`QPDFAcroFormDocumentHelper.cc:393-417`) を `job/lifecycle.rs` から `coalesceContents` の前に呼ぶ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
+top-level `--flatten-annotations=all|screen|print` も `auto_job_init.hh:117` / `QPDFJob_config.cc:190-200` の choices を `flpdf-cli` の shared `run_rewrite` route に接続し、通常 rewrite と linearize rewrite の両方で `PageDocumentHelper::flatten_annotations` (`QPDFPageDocumentHelper.cc:55-77`) を実行する。`NeedAppearances` 時の `warnIfPossible` と stream filter warning の parsed-offset/suppression 境界も qpdf の warning/status contract に合わせる。
 
 `QPDF::initializeEncryption` (`QPDF_encryption.cc:718-751`) は、`/ID` が無い、配列でない、
 要素数が2でない、または第1要素が文字列でない場合に `invalid /ID in trailer dictionary` を

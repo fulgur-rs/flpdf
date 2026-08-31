@@ -23,8 +23,12 @@ fn cli_transformation_order_matches_qpdf_job() {
     let generate = source
         .find("if generate_appearances {")
         .expect("appearance generation route");
+    // The linearize rewrite path flattens before handing the document to the
+    // linearization writer and has no appearance-generation step.  Check the
+    // ordinary rewrite pipeline here, where qpdf's combined transformation
+    // order is represented by the later flatten call.
     let flatten = source
-        .find(".flatten_annotations(required_flags, forbidden_flags)?")
+        .rfind(".flatten_annotations(required_flags, forbidden_flags)?")
         .expect("annotation flatten route");
     let coalesce = source
         .find("PageObjectHelper::new(page_ref, &mut pdf).coalesce_content_streams()?")
