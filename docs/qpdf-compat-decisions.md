@@ -25,6 +25,42 @@ the final state and add a short rationale.
 
 Grouped by area for navigation.
 
+### Pipeline callback adapters
+
+#### `flpdf-6ftu` — `Pl_Function` is a qpdf C API boundary
+
+**Decision:** divergent (scope-limited omission)
+**Owner:** Mitsuru Hayasaka
+
+**Evidence:** qpdf's `Pl_Function` class (`include/qpdf/Pl_Function.hh:37-62`,
+`libqpdf/Pl_Function.cc:10-61`) has three constructors: one taking a
+C++-native `std::function<void(unsigned char const*, size_t)>` callback
+(not C-ABI-specific on its own), and two taking C-style function pointers
+plus a `void*` udata for C callers. Only the C-style overloads are ever
+actually called in qpdf 11.9.0's own source — `qpdf_write_json`
+(`libqpdf/qpdf-c.cc:1936`) and custom logger destinations
+(`libqpdf/qpdflogger-c.cc:58`), both C API wrapper files — and the
+`std::function` overload has no caller anywhere in qpdf's codebase. The
+qpdf core PDF reader/writer paths do not consume `Pl_Function` at all.
+
+Because every actual `Pl_Function` construction in qpdf routes through the
+C-style overload from a C API wrapper, there is no non-C-API qpdf
+production consumer to port a Rust `PlFunction` stage for — flpdf lacking a
+C ABI is why the two consumers that do exist are out of scope, not a claim
+that the class itself is inherently C-specific. The Rust-native equivalent
+to `qpdf_write_json`'s output callback is the caller-supplied `Pipeline`
+passed to `Json::write` (`json/writer.rs:97`), which receives
+already-serialized JSON bytes the same way the C callback does —
+`Json::make_blob` is the opposite boundary, a producer closure that writes
+raw bytes for `Json::write` to base64-encode into an inline string value,
+not an output sink. Custom logger destinations correspond to `QPDFLogger`'s
+`PipelineHandle`-typed setters (`logger.rs`'s `set_info`/`set_warn`/
+`set_error`/`set_save`). These paths preserve callback bytes, error
+propagation, and finish ownership for their actual Rust consumers. Do not
+add a standalone `PlFunction` stage unless a future qpdf production
+consumer actually calls its `std::function` overload, or a C ABI is
+explicitly adopted.
+
 ### Stream encoding
 
 #### `flpdf-9hc.5.4` — ObjStm stream wrapping with FlateDecode
