@@ -37,7 +37,8 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::process::Command as ShellCommand;
+use std::io::Write;
+use std::process::{Command as ShellCommand, Stdio};
 
 /// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
 /// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
@@ -107,6 +108,113 @@ fn is_encrypted_weak_rc4_no_password_exits_0() {
     // password and without --allow-weak-crypto (guards the probe's forced
     // weak-crypto opt-in, flpdf-63g).
     flpdf().args(["is-encrypted", V2_RC4]).assert().success();
+}
+
+#[test]
+fn top_level_is_encrypted_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--is-encrypted", "--password=", R4_EMPTY_PW])
+        .output()
+        .unwrap();
+    assert_eq!(qpdf.status.code(), Some(0));
+
+    flpdf()
+        .args(["--is-encrypted", "--password=", R4_EMPTY_PW])
+        .assert()
+        .code(qpdf.status.code().unwrap());
+}
+
+#[test]
+fn top_level_requires_password_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--requires-password", "--password=user-v4-aes", V4_AES])
+        .output()
+        .unwrap();
+    assert_eq!(qpdf.status.code(), Some(3));
+
+    flpdf()
+        .args(["--requires-password", "--password=user-v4-aes", V4_AES])
+        .assert()
+        .code(qpdf.status.code().unwrap());
+}
+
+#[test]
+fn top_level_is_encrypted_requires_an_input() {
+    flpdf()
+        .arg("--is-encrypted")
+        .assert()
+        .code(2)
+        .stderr(predicate::eq(
+            "flpdf: --is-encrypted requires an input file\n",
+        ));
+}
+
+#[test]
+fn top_level_requires_password_requires_an_input() {
+    flpdf()
+        .arg("--requires-password")
+        .assert()
+        .code(2)
+        .stderr(predicate::eq(
+            "flpdf: --requires-password requires an input file\n",
+        ));
+}
+
+#[test]
+fn password_file_uses_only_the_first_line() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let password_file = temp.path().join("password.txt");
+    std::fs::write(&password_file, b"user-v4-aes\nignored\n").unwrap();
+    let password_arg = format!("--password-file={}", password_file.display());
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--check", &password_arg, V4_AES])
+        .output()
+        .unwrap();
+    assert!(qpdf.status.success());
+
+    let flpdf = flpdf()
+        .args(["--check", &password_arg, V4_AES])
+        .output()
+        .unwrap();
+    assert!(flpdf.status.success());
+    assert_eq!(
+        flpdf.stderr,
+        b"flpdf: WARNING: all but the first line of the password file are ignored\n"
+    );
+}
+
+#[test]
+fn password_file_dash_reads_from_stdin() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let mut child = ShellCommand::new(env!("CARGO_BIN_EXE_flpdf"))
+        .args(["--check", "--password-file=-", V4_AES])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"user-v4-aes\n")
+        .unwrap();
+    let flpdf = child.wait_with_output().unwrap();
+    assert!(flpdf.status.success());
+    assert!(flpdf.stderr.is_empty());
 }
 
 // ---------------------------------------------------------------------------
