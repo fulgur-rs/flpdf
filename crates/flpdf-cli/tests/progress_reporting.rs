@@ -458,7 +458,10 @@ fn progress_rotate_to_a_valid_destination_still_reports_progress() {
         )
     );
     assert!(output.stderr.is_empty());
-    assert!(output_path.exists(), "the destination validation guard must leave a valid destination untouched and still let the rotate write succeed");
+    assert!(
+        output_path.exists(),
+        "the canonical writer must create the valid destination and let the rotate write succeed"
+    );
 }
 
 #[test]
@@ -483,7 +486,7 @@ fn progress_rewrite_to_unusable_destination_fails_before_any_progress_output() {
     assert!(!output.status.success());
     assert!(
         output.stdout.is_empty(),
-        "no progress output must be printed before the destination is validated: {:?}",
+        "no progress output must be printed before the writer opens the destination: {:?}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
@@ -494,11 +497,11 @@ fn progress_rewrite_to_unusable_destination_fails_before_any_progress_output() {
     assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
 }
 
-// qpdf opens its real output destination exactly once. A destination
-// validation probe that opens-then-closes a FIFO would let a blocking
-// reader observe EOF and exit before the later real write reopens the
-// pipe, so the real write would hang with no reader left (Unix-only:
-// named pipes are not exercised on Windows).
+// qpdf opens its real output destination exactly once in `wb+` mode before
+// progress starts. An O_RDWR FIFO open does not wait for a reader, so the
+// canonical file sink must retain that mode instead of reopening it with
+// O_WRONLY after progress (Unix-only: named pipes are not exercised on
+// Windows).
 #[cfg(unix)]
 #[test]
 fn progress_rotate_to_a_fifo_destination_does_not_hang() {
@@ -561,9 +564,8 @@ fn progress_rotate_to_a_fifo_destination_does_not_hang() {
 }
 
 // Unlike a FIFO, opening a Unix domain socket path as a plain file fails
-// immediately (ENXIO) with no reader-synchronization hazard, so the
-// destination-validation guard must still exempt only FIFOs and continue to
-// fail fast here (Unix-only: this socket kind is not exercised on Windows).
+// immediately (ENXIO), so the canonical writer must still fail before any
+// progress here (Unix-only: this socket kind is not exercised on Windows).
 #[cfg(unix)]
 #[test]
 fn progress_rotate_to_a_socket_destination_fails_before_any_progress_output() {
@@ -586,7 +588,7 @@ fn progress_rotate_to_a_socket_destination_fails_before_any_progress_output() {
     assert!(!output.status.success());
     assert!(
         output.stdout.is_empty(),
-        "no progress output must be printed before the destination is validated: {:?}",
+        "no progress output must be printed before the writer opens the destination: {:?}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");
@@ -613,7 +615,7 @@ fn progress_pages_extraction_to_unusable_destination_fails_before_any_progress_o
     assert!(!output.status.success());
     assert!(
         output.stdout.is_empty(),
-        "no progress output must be printed before the destination is validated: {:?}",
+        "no progress output must be printed before the writer opens the destination: {:?}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("diagnostics are UTF-8");

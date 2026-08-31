@@ -49,9 +49,49 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+/// File sink for qpdf's `QPDFWriter::setOutputFilename` path.
+///
+/// qpdf opens named output files as `wb+` (`QPDFWriter.cc:83-98`) and routes
+/// writes through a stdio-buffered `Pl_StdioFile`. Its final
+/// `Pl_StdioFile::finish` ignores non-EBADF flush errors
+/// (`Pl_StdioFile.cc:41-45`), and `QPDFWriter::write` also discards `fclose`'s
+/// result (`QPDFWriter.cc:2187-2212`). Keep the 4096-byte boundary and the
+/// final non-EBADF error swallowing for the owned file-output route while
+/// leaving arbitrary caller-provided writers strict.
+struct QpdfFileWriter {
+    output: BufWriter<File>,
+}
+
+impl QpdfFileWriter {
+    const BUFFER_SIZE: usize = 4096;
+
+    fn new(file: File) -> Self {
+        Self {
+            output: BufWriter::with_capacity(Self::BUFFER_SIZE, file),
+        }
+    }
+}
+
+impl Write for QpdfFileWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.output.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.output.flush() {
+            Err(error) if error.raw_os_error() == Some(9) => {
+                // cov:ignore-start: the owned file cannot be externally closed while this writer is live
+                Err(error)
+                // cov:ignore-end
+            }
+            Ok(()) | Err(_) => Ok(()),
+        }
+    }
+}
 
 enum WriterOutput {
     Memory(Option<Vec<u8>>),
@@ -406,7 +446,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             .truncate(true)
             .open(path)
             .map_err(|error| Error::file_io("open output", path.to_path_buf(), error))?;
-        self.output = Some(WriterOutput::Writer(Box::new(file)));
+        self.output = Some(WriterOutput::Writer(Box::new(QpdfFileWriter::new(file))));
         Ok(())
     }
 
