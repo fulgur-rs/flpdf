@@ -3594,6 +3594,7 @@ fn write_linearized_impl<R: Read + Seek>(
                         })?;
                     if members.iter().any(|member| {
                         source_container_by_member.get(member).copied() != Some(source)
+                        // cov:ignore: objstm_batches_preserve groups each non-empty batch by one source container
                     }) {
                         // cov:ignore-start: source-container homogeneity is guaranteed by objstm_batches_preserve's per-container grouping.
                         return Err(crate::Error::Unsupported(
