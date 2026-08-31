@@ -1395,7 +1395,7 @@ fn json_flag_conflicts_with_compress_streams() {
 /// `--json`. Every rewrite or inspection flag that the latter rejects must be
 /// rejected here too; otherwise the second flag is silently dropped before
 /// its consumer can run. Keep this table aligned with `Cli::json`'s
-/// `conflicts_with_all` list.
+/// `conflicts_with_all` list, including the later-added encryption checks.
 #[test]
 fn json_output_conflicts_with_the_json_exclusive_flag_set() {
     let cases: &[&[&str]] = &[
@@ -1410,6 +1410,8 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
         &["--show-xref"],
         &["--show-linearization"],
         &["--show-encryption"],
+        &["--is-encrypted"],
+        &["--requires-password"],
         &["--compress-streams=n"],
         &["--linearize-pass1=pass1"],
         &["--remove-restrictions"],
