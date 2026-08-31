@@ -5257,20 +5257,16 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let bytes = write_qpdf_to_memory(pdf, output, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let (written, mut split_job) = split_rewritten_pdf(
+        let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
             output,
             input_path,
             options.deterministic_id,
             split_progress,
+            verbose,
             writer_configuration(&options, false),
         )?;
-        if verbose {
-            for path in &written {
-                logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
-            }
-        }
         // The intermediate rewrite may already have repaired the condition
         // that produced a warning in the original source (e.g. --repair's
         // xref reconstruction) or the source document `pdf` itself, so the
@@ -5350,6 +5346,7 @@ fn parse_split_n(raw: &str) -> CliResult<usize> {
 /// annotation, label, and output-file lifecycle. `input_path` remains the
 /// original command input so the qpdf same-file guard can reject a generated
 /// chunk that would truncate it.
+#[allow(clippy::too_many_arguments)]
 fn split_rewritten_pdf(
     bytes: Vec<u8>,
     chunk_size: usize,
@@ -5357,6 +5354,7 @@ fn split_rewritten_pdf(
     input_path: &Path,
     deterministic_id: bool,
     progress: bool,
+    verbose: bool,
     writer_configuration: WriterConfiguration,
 ) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
@@ -5371,6 +5369,7 @@ fn split_rewritten_pdf(
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
+        .with_verbose(verbose)
         .with_writer_configuration(writer_configuration);
     let written = job.split_pages(&mut pdf, options)?;
     Ok((written, job))
@@ -5448,22 +5447,16 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let (written, mut split_job) = split_rewritten_pdf(
+        let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
             output,
             input,
             options.deterministic_id,
             split_progress,
+            verbose,
             writer_configuration(&options, false),
         )?;
-        if verbose {
-            for path in &written {
-                // cov:ignore-start: exercised by verbose split-pages subprocess integration tests
-                logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
-                // cov:ignore-end
-            }
-        }
         // The intermediate rewrite may already have repaired the condition
         // that produced a warning on the original `pdf` (e.g. --repair's
         // xref reconstruction), so the freshly re-opened split source can
