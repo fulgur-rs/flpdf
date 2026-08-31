@@ -695,6 +695,29 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
     );
 }
 
+/// Keep the existing QDF encrypted ObjStm serializer covered while the
+/// non-QDF Generate route adopts qpdf's container-first numbering.
+#[test]
+fn encrypted_qdf_generate_objstm_remains_checkable() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    let mut options = encrypted_options();
+    options.qdf = true;
+    options.object_streams = ObjectStreamMode::Generate;
+
+    let bytes = rewrite_fixture(&input, &options);
+    assert!(bytes
+        .windows(b"%QDF-1.0".len())
+        .any(|part| part == b"%QDF-1.0"));
+    assert!(bytes
+        .windows(b"/Type /ObjStm".len())
+        .any(|part| part == b"/Type /ObjStm"));
+    assert_qpdf_check(&bytes);
+
+    let reopened = open_encrypted(&bytes, b"");
+    assert!(reopened.is_encrypted());
+    assert!(reopened.root_ref().is_some());
+}
+
 #[test]
 fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
     let input = nested_string_fixture(INFO_PLAINTEXT);
