@@ -96,10 +96,10 @@ impl<'a> TiffPredictor<'a> {
             ));
         }
         if let Some(limit) = max_memory
-            .and_then(|limit| u32::try_from(limit).ok())
+            .map(|limit| u64::try_from(limit).unwrap_or(u64::MAX))
             .filter(|&limit| limit > 0)
         {
-            if bytes_per_row > u64::from(limit / 2) {
+            if bytes_per_row > limit / 2 {
                 return Err(PipelineError::runtime(
                     "TIFFPredictor memory limit exceeded",
                 ));
@@ -391,6 +391,21 @@ mod tests {
             Some(1024),
         )
         .is_ok());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn memory_limit_uses_the_qpdf_unsigned_long_long_range() {
+        assert_eq!(
+            construction_error_with_memory_limit(
+                3_000_000_000,
+                1,
+                8,
+                Some(u64::from(u32::MAX) as usize + 1),
+            )
+            .to_string(),
+            "TIFFPredictor memory limit exceeded"
+        );
     }
 
     #[test]
