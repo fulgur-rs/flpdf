@@ -5,10 +5,11 @@ mod arg_parser;
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
 use flpdf::job::{
-    apply_rotate_to_pages, flatten_rotation_on_pages, remap_outline_and_dests,
-    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
-    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
-    QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
+    apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
+    remap_outline_and_dests, should_remove_unreferenced_resources, AttachmentAddOptions,
+    AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput,
+    JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
+    SplitPageOptions,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -29,7 +30,7 @@ use flpdf::{
     thread_bead_p::drop_thread_bead_dangling_p,
     CombinedPage, InputSpec, PageRange, RotateSpec,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -4896,7 +4897,7 @@ fn run_page_extraction_from_multiple_sources(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     let source_warnings = job.has_warnings();
-    let mut merged = job.handle_page_specs(
+    let page_output = job.handle_page_specs(
         &mut sources,
         &specs,
         collate,
@@ -4904,6 +4905,13 @@ fn run_page_extraction_from_multiple_sources(
         options.preserve_unreferenced_objects,
     )?;
     let source_warnings = source_warnings || job.has_warnings();
+
+    let mut merged = match page_output {
+        PageSpecJobOutput::Merged(merged) => merged,
+        PageSpecJobOutput::InPlace { .. } => {
+            return Err("--pages: multiple-source job returned an in-place result".into());
+        }
+    };
 
     // The merge job has already rebuilt the target page tree and copied the
     // primary document-level structures. Represent its current output pages
@@ -4927,7 +4935,7 @@ fn run_page_extraction_from_multiple_sources(
         .collect::<CliResult<Vec<_>>>()?;
 
     run_page_extraction_after_plan(
-        merged,
+        &mut merged,
         output,
         primary_input,
         repair,
@@ -4947,7 +4955,7 @@ fn run_page_extraction_from_multiple_sources(
         primary_encrypted,
         primary_copy_encryption,
         source_warnings,
-        false,
+        None,
         combined_pages,
     )
 }
@@ -5007,7 +5015,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     let before_warnings = job.has_warnings();
-    let mut merged = job.handle_page_specs(
+    let page_output = job.handle_page_specs(
         &mut sources,
         &specs,
         collate,
@@ -5016,48 +5024,94 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     )?;
     let source_warnings = before_warnings || job.has_warnings();
 
-    let selected = pages::page_refs(&mut merged)?;
-    let combined_pages: Vec<CombinedPage> = selected
-        .iter()
-        .enumerate()
-        .map(|(index, &page_ref)| {
-            Ok(CombinedPage {
-                source_index: 0,
-                page: flpdf::SelectedPage {
-                    index_1based: u32::try_from(index + 1)
-                        .map_err(|_| "--pages: too many output pages")?,
-                    page_ref,
-                },
-            })
-        })
-        .collect::<CliResult<Vec<_>>>()?;
+    match page_output {
+        PageSpecJobOutput::InPlace {
+            pdf,
+            result,
+            prune_mode,
+        } => {
+            let combined_pages: Vec<CombinedPage> = result
+                .new_kids
+                .iter()
+                .enumerate()
+                .map(|(index, &page_ref)| {
+                    Ok(CombinedPage {
+                        source_index: 0,
+                        page: flpdf::SelectedPage {
+                            index_1based: u32::try_from(index + 1)
+                                .map_err(|_| "--pages: too many output pages")?,
+                            page_ref,
+                        },
+                    })
+                })
+                .collect::<CliResult<Vec<_>>>()?;
 
-    run_page_extraction_after_plan(
-        merged,
-        output,
-        primary_input,
-        repair,
-        password,
-        page_ops,
-        overlay_specs,
-        // QPDFJob::handle_page_specs already applied the page-copy resource
-        // policy. The shared post-copy boundary must not apply it again.
-        CliRemoveUnreferencedResources::No,
-        options,
-        verbose,
-        standard_output,
-        creates_output,
-        primary_encrypted,
-        primary_copy_encryption,
-        source_warnings,
-        false,
-        combined_pages,
-    )
+            run_page_extraction_after_plan(
+                pdf,
+                output,
+                primary_input,
+                repair,
+                password,
+                page_ops,
+                overlay_specs,
+                CliRemoveUnreferencedResources::No,
+                options,
+                verbose,
+                standard_output,
+                creates_output,
+                primary_encrypted,
+                primary_copy_encryption,
+                source_warnings,
+                Some((result, prune_mode)),
+                combined_pages,
+            )
+        }
+        PageSpecJobOutput::Merged(mut merged) => {
+            let selected = pages::page_refs(&mut merged)?;
+            let combined_pages: Vec<CombinedPage> = selected
+                .iter()
+                .enumerate()
+                .map(|(index, &page_ref)| {
+                    Ok(CombinedPage {
+                        source_index: 0,
+                        page: flpdf::SelectedPage {
+                            index_1based: u32::try_from(index + 1)
+                                .map_err(|_| "--pages: too many output pages")?,
+                            page_ref,
+                        },
+                    })
+                })
+                .collect::<CliResult<Vec<_>>>()?;
+
+            run_page_extraction_after_plan(
+                &mut merged,
+                output,
+                primary_input,
+                repair,
+                password,
+                page_ops,
+                overlay_specs,
+                // QPDFJob has already applied the page-copy resource policy
+                // to each source page. The post-copy completion boundary must
+                // not run the document-wide resource pass a second time.
+                CliRemoveUnreferencedResources::No,
+                options,
+                verbose,
+                standard_output,
+                creates_output,
+                primary_encrypted,
+                primary_copy_encryption,
+                source_warnings,
+                None,
+                combined_pages,
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
-    mut pdf: Pdf<R>,
+    pdf: &mut Pdf<R>,
     output: &Path,
     input_path: &Path,
     repair: bool,
@@ -5072,7 +5126,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     primary_encrypted: bool,
     primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
-    reconstruct_labels: bool,
+    page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
 ) -> CliResult<()> {
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
@@ -5080,45 +5134,34 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         return Err("--pages: page selection is empty".into());
     }
 
-    // qpdf's --pages Auto mode scans the source page tree before it removes
-    // the old pages. A page-local indirect /Resources that appears only once
-    // does not trigger the expensive page-helper pruning route; inherited or
-    // shared resources do (QPDFJob.cc:2251-2337). Preserve that decision
-    // before rebuild_page_tree flattens the original inheritance structure.
-    let prune_mode = if remove_unref == CliRemoveUnreferencedResources::Auto
-        && !should_remove_unreferenced_resources(&mut pdf)?
-    {
-        CliRemoveUnreferencedResources::No
+    let (result, prune_mode) = if let Some((result, prune_mode)) = page_job_result {
+        (result, prune_mode)
     } else {
-        remove_unref
+        // qpdf's --pages Auto mode scans the source page tree before it
+        // removes the old pages. A page-local indirect /Resources that appears
+        // only once does not trigger the expensive page-helper pruning route;
+        // inherited or shared resources do (QPDFJob.cc:2251-2337). Preserve
+        // that decision before rebuild_page_tree flattens the original
+        // inheritance structure.
+        let prune_mode = if remove_unref == CliRemoveUnreferencedResources::Auto
+            && !should_remove_unreferenced_resources(pdf)?
+        {
+            CliRemoveUnreferencedResources::No
+        } else {
+            remove_unref
+        };
+        let result = rebuild_page_tree(pdf, &selected)?;
+        copy_duplicate_page_annotations(pdf, &result)?;
+        (result, prune_mode.into())
     };
+    apply_rotate_specs(pdf, &page_ops.rotate, &result.new_kids)?;
 
-    let result = rebuild_page_tree(&mut pdf, &selected)?;
-    copy_duplicate_page_annotations(&mut pdf, &result)?;
-    apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
-
-    if reconstruct_labels {
-        let mut labels = pdf.page_labels();
-        if labels.has_page_labels()? {
-            let src_indices: Vec<i64> = combined_pages
-                .iter()
-                .map(|cp| i64::from(cp.page.index_1based) - 1)
-                .collect();
-            let entries = labels.labels_for_selection_with_prefix_presence(&src_indices, 0)?;
-            // QPDFPageLabelDocumentHelper::getLabelForPage keeps the raw
-            // `/P` handle when QPDFJob reconstructs a selected range
-            // (libqpdf/QPDFPageLabelDocumentHelper.cc:37-49, 57-92).
-            let folded = flpdf::merge_adjacent_ranges_with_prefix_presence(entries);
-            labels.write_reconstructed_labels_with_prefix_presence(&folded)?;
-        }
-    }
-
-    remap_outline_and_dests(&mut pdf, &result)?;
-    let objr_obj_targets = drop_struct_elem_dangling_pg(&mut pdf, &result)?;
-    drop_thread_bead_dangling_p(&mut pdf, &result)?;
-    drop_objr_obj_annot_dangling_p(&mut pdf, &result, &objr_obj_targets)?;
-    QPDFJob::prune_after_subset(&mut pdf, prune_mode.into())?;
-    QPDFJob::prune_acroform_after_subset(&mut pdf, &result)?;
+    remap_outline_and_dests(pdf, &result)?;
+    let objr_obj_targets = drop_struct_elem_dangling_pg(pdf, &result)?;
+    drop_thread_bead_dangling_p(pdf, &result)?;
+    drop_objr_obj_annot_dangling_p(pdf, &result, &objr_obj_targets)?;
+    QPDFJob::prune_after_subset(pdf, prune_mode)?;
+    QPDFJob::prune_acroform_after_subset(pdf, &result)?;
 
     let mut options = options;
     options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
@@ -5184,7 +5227,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
         if verbose {
-            let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
+            let report = flpdf::overlay_verbose_report(pdf, &mut built)?;
             let mut message = String::from("flpdf: processing underlay/overlay\n");
             for page in &report {
                 message.push_str(&format!("  page {}\n", page.dest_page));
@@ -5200,7 +5243,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             logger_info(message)?;
         }
 
-        flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
+        flpdf::apply_overlay_specs(pdf, &mut built)?;
         Some(built)
     } else {
         None
@@ -5215,7 +5258,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     } else if options.progress && standard_output.is_none() {
         validate_progress_output_destination(output)?;
     }
-    let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
+    let bytes = write_qpdf_to_memory(pdf, output, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
         let (written, mut split_job) = split_rewritten_pdf(
@@ -5239,7 +5282,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         // original input was not. Fold both signals into the split job
         // before completing it, matching what the non-split branch's
         // `finish_operation_warnings_with_prior` checks below.
-        split_job.record_document_warnings(&pdf);
+        split_job.record_document_warnings(pdf);
         if prior_warnings {
             split_job.record_warnings();
         }
@@ -5252,48 +5295,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
-    finish_operation_warnings_with_prior(&pdf, creates_output, prior_warnings)
-}
-
-/// Apply qpdf's same-document `fixCopiedAnnotations` boundary to duplicate
-/// page slots created by [`rebuild_page_tree`]. The page rebuild intentionally
-/// shallow-copies only the page dictionary, so its `/Annots` carrier still
-/// points at the first occurrence. qpdf replaces that carrier with a fresh
-/// annotation/field-tree copy for every repeated primary page before it
-/// resolves field-name collisions.
-fn copy_duplicate_page_annotations<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    result: &RebuildResult,
-) -> flpdf::Result<()> {
-    // `result.ref_map` groups every duplicate by its *source* page ref, so
-    // iterating `.values()` visits groups in BTreeMap key order rather than
-    // the final output order. `PageObjectHelper::copy_annotations` appends
-    // and collision-renames copied AcroForm fields immediately as each
-    // duplicate is processed, so that grouping can assign `+N` suffixes out
-    // of sequence relative to qpdf's own per-page copy events. Walk
-    // `result.new_kids` (already in selection order) instead, and process
-    // each duplicate only when its turn in the final page sequence arrives.
-    let mut first_occurrence: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
-    for page_refs in result.ref_map.values() {
-        let Some(&first_page) = page_refs.first() else {
-            continue;
-        };
-        for &duplicate_page in page_refs.iter().skip(1) {
-            first_occurrence.insert(duplicate_page, first_page);
-        }
-    }
-    for &new_page in &result.new_kids {
-        let Some(&source_page_ref) = first_occurrence.get(&new_page) else {
-            continue;
-        };
-        let source_page = pdf.get_object_handle(source_page_ref);
-        let destination_page = pdf.get_object_handle(new_page);
-        destination_page.remove_key(b"/Annots");
-        pdf.mark_object_handle_dirty(&destination_page)?;
-        PageObjectHelper::new(new_page, pdf)
-            .copy_annotations(source_page, flpdf::Matrix::default())?;
-    }
-    Ok(())
+    finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
 }
 
 /// Apply each `--rotate` spec (in order) to `target_pages`, resolving each

@@ -11,7 +11,7 @@ use super::page_merge::{
     source_top_level_field_names, MergeInput,
 };
 use super::page_plan::PagePlan;
-use super::resource_pruning::RemoveUnreferencedResources;
+use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::page_label_document_helper::LabelRange;
 use crate::pages::tree_rebuild::RebuildResult;
@@ -35,6 +35,155 @@ pub struct PageSpecInput {
     pub source_index: usize,
     /// qpdf page-range expression for this source occurrence.
     pub range: PageRange,
+}
+
+/// Result of qpdf's page-specification boundary.
+///
+/// qpdf keeps a one-source page job in its primary `QPDF` and therefore
+/// preserves the primary object's live identities. Multi-source jobs use the
+/// existing fresh primary-based merge target because the copied foreign graph
+/// must outlive the source-page operation. The caller must keep the source
+/// documents alive while using either result's returned document.
+pub enum PageSpecJobOutput<'a, R: Read + Seek + 'static> {
+    /// The primary document was updated in place by the single-source page
+    /// job. `result` is the page-tree rebuild result used by later job stages.
+    InPlace {
+        /// The primary document carrying the selected page tree.
+        pdf: &'a mut Pdf<R>,
+        /// The qpdf-shaped page-tree rebuild mapping.
+        result: RebuildResult,
+        /// The effective page-resource pruning mode selected before rebuild.
+        prune_mode: RemoveUnreferencedResources,
+    },
+    /// A fresh target produced by the multi-source foreign-copy route.
+    Merged(Box<Pdf<std::io::Cursor<Vec<u8>>>>),
+}
+
+/// Select pages from one already-opened source, retaining source identities.
+///
+/// This is the planning and page-tree half of qpdf's single-source
+/// `QPDFJob::handlePageSpecs`: range resolution remains in `PagePlan`, while
+/// the source document itself is rebuilt in place so the writer can emit the
+/// original object identities (`QPDFJob.cc:2514-2600`).
+fn select_single_source_pages<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    specs: &[PageSpecInput],
+    collate: Option<usize>,
+) -> Result<Vec<super::page_plan::SelectedPage>> {
+    if specs.is_empty() {
+        return Err(Error::Unsupported(
+            "--pages: no page specifications were supplied".into(),
+        ));
+    }
+    if collate == Some(0) {
+        return Err(Error::Unsupported(
+            "--collate chunk size must be >= 1; got 0".into(),
+        ));
+    }
+
+    let mut plans = Vec::with_capacity(specs.len());
+    for (spec_index, spec) in specs.iter().enumerate() {
+        if spec.source_index != 0 {
+            return Err(Error::Unsupported(format!(
+                "--pages: single-source specification {spec_index} refers to source {}",
+                spec.source_index
+            )));
+        }
+        plans.push(PagePlan::build(source, &spec.range).map_err(|error| {
+            Error::Unsupported(format!(
+                "--pages: source 0 specification {spec_index}: {error}"
+            ))
+        })?);
+    }
+
+    let mut selected = Vec::new();
+    if let Some(chunk) = collate {
+        let mut cursors = vec![0usize; plans.len()];
+        loop {
+            let mut emitted = false;
+            for (plan_index, plan) in plans.iter().enumerate() {
+                let start = cursors[plan_index];
+                let end = start.saturating_add(chunk).min(plan.pages().len());
+                selected.extend(plan.pages()[start..end].iter().cloned());
+                emitted |= end > start;
+                cursors[plan_index] = end;
+            }
+            if !emitted {
+                break;
+            }
+        }
+    } else {
+        selected.extend(plans.into_iter().flat_map(|plan| plan.pages().to_vec()));
+    }
+
+    if selected.is_empty() {
+        return Err(Error::Unsupported(
+            "--pages: page selection is empty".into(),
+        ));
+    }
+    Ok(selected)
+}
+
+/// Apply qpdf's same-document duplicate-page annotation copy while adding a
+/// repeated primary page (`QPDFJob.cc:2564-2585`).
+pub fn copy_duplicate_page_annotations<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    result: &RebuildResult,
+) -> Result<()> {
+    let mut first_occurrence: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+    for page_refs in result.ref_map.values() {
+        let Some(&first_page) = page_refs.first() else {
+            continue;
+        };
+        for &duplicate_page in page_refs.iter().skip(1) {
+            first_occurrence.insert(duplicate_page, first_page);
+        }
+    }
+    for &new_page in &result.new_kids {
+        let Some(&source_page_ref) = first_occurrence.get(&new_page) else {
+            continue;
+        };
+        let source_page = pdf.get_object_handle(source_page_ref);
+        let destination_page = pdf.get_object_handle(new_page);
+        destination_page.remove_key(b"/Annots");
+        pdf.mark_object_handle_dirty(&destination_page)?;
+        PageObjectHelper::new(new_page, pdf).copy_annotations(source_page, Matrix::default())?;
+    }
+    Ok(())
+}
+
+/// Execute the qpdf-shaped in-place page-tree portion for one source.
+fn handle_single_source_page_specs<R: Read + Seek>(
+    job: &mut super::QPDFJob,
+    source: &mut Pdf<R>,
+    specs: &[PageSpecInput],
+    collate: Option<usize>,
+    resource_mode: RemoveUnreferencedResources,
+) -> Result<(RebuildResult, RemoveUnreferencedResources)> {
+    let selected = select_single_source_pages(source, specs, collate)?;
+    let prune_mode = if resource_mode == RemoveUnreferencedResources::Auto
+        && !should_remove_unreferenced_resources(source)?
+    {
+        RemoveUnreferencedResources::No
+    } else {
+        resource_mode
+    };
+    let selected_refs: Vec<_> = selected.iter().map(|page| page.page_ref).collect();
+    let result = crate::pages::tree_rebuild::rebuild_page_tree(source, &selected_refs)?;
+    copy_duplicate_page_annotations(source, &result)?;
+
+    let mut labels = source.page_labels();
+    if labels.has_page_labels()? {
+        let src_indices: Vec<i64> = selected
+            .iter()
+            .map(|page| i64::from(page.index_1based) - 1)
+            .collect();
+        let entries = labels.labels_for_selection_with_prefix_presence(&src_indices, 0)?;
+        let folded = crate::merge_adjacent_ranges_with_prefix_presence(entries);
+        labels.write_reconstructed_labels_with_prefix_presence(&folded)?;
+    }
+    job.record_document_warnings(source);
+    Ok((result, prune_mode))
 }
 
 impl PageSpecInput {
@@ -592,9 +741,8 @@ impl super::QPDFJob {
     ///
     /// - per-spec range resolution and source-index validation;
     /// - qpdf's round-robin `--collate` order across specifications;
-    /// - retaining the source documents while copied objects are
-    ///   materialized;
-    /// - rebuilding the merged page tree in the final spec order; and
+    /// - retaining the source documents while copied objects are materialized;
+    /// - rebuilding the page tree in the final spec order; and
     /// - reconstructing `/PageLabels` in that same final order.
     ///
     /// `sources` supplies source documents in qpdf order, with the primary
@@ -613,14 +761,27 @@ impl super::QPDFJob {
     /// `handlePageSpecs`, so this stays the single Rust entry point rather
     /// than growing a family of same-named overloads with one more
     /// parameter each.
-    pub fn handle_page_specs<R: Read + Seek + 'static>(
+    pub fn handle_page_specs<'a, R: Read + Seek + 'static>(
         &mut self,
-        sources: &mut [Pdf<R>],
+        sources: &'a mut [Pdf<R>],
         specs: &[PageSpecInput],
         collate: Option<usize>,
         resource_mode: RemoveUnreferencedResources,
         preserve_unreferenced: bool,
-    ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    ) -> Result<PageSpecJobOutput<'a, R>> {
+        if sources.len() == 1 && specs.iter().all(|spec| spec.source_index == 0) {
+            let source = sources.first_mut().ok_or_else(|| {
+                Error::Unsupported("--pages: a primary source is required".to_owned())
+            })?;
+            let (result, prune_mode) =
+                handle_single_source_page_specs(self, source, specs, collate, resource_mode)?;
+            return Ok(PageSpecJobOutput::InPlace {
+                pdf: source,
+                result,
+                prune_mode,
+            });
+        }
+
         handle_page_specs(
             self,
             sources,
@@ -629,6 +790,7 @@ impl super::QPDFJob {
             resource_mode,
             preserve_unreferenced,
         )
+        .map(|merged| PageSpecJobOutput::Merged(Box::new(merged)))
     }
 }
 
@@ -884,6 +1046,66 @@ mod tests {
         .expect("an unused secondary source must not be read");
 
         assert_eq!(selected_page_count(&mut merged), 1);
+    }
+
+    #[test]
+    fn qpdf_job_keeps_a_single_source_page_job_in_place() {
+        let mut sources = vec![three_page_pdf()];
+        let specs = [PageSpecInput::new(0, PageRange::parse("2").unwrap())];
+        let mut job = QPDFJob::new();
+
+        match job
+            .handle_page_specs(
+                &mut sources,
+                &specs,
+                None,
+                RemoveUnreferencedResources::Auto,
+                false,
+            )
+            .expect("single-source page job")
+        {
+            PageSpecJobOutput::InPlace {
+                pdf,
+                result,
+                prune_mode: _,
+            } => {
+                assert_eq!(result.new_kids.len(), 1);
+                assert_eq!(selected_page_count(pdf), 1);
+                assert!(pdf
+                    .repair_diagnostics()
+                    .entries()
+                    .iter()
+                    .all(|entry| !entry.message.contains("foreign object")));
+            }
+            PageSpecJobOutput::Merged(_) => {
+                panic!("one-source page jobs must retain the primary Pdf in place")
+            }
+        }
+    }
+
+    #[test]
+    fn qpdf_job_in_place_page_job_copies_repeated_page_annotations() {
+        let mut sources = vec![acroform_pdf()];
+        let specs = [
+            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
+        ];
+        let mut job = QPDFJob::new();
+
+        let output = job
+            .handle_page_specs(
+                &mut sources,
+                &specs,
+                None,
+                RemoveUnreferencedResources::Auto,
+                false,
+            )
+            .expect("repeated single-source page job");
+        let PageSpecJobOutput::InPlace { pdf, result, .. } = output else {
+            panic!("repeated one-source page jobs must stay on the primary Pdf")
+        };
+        assert_eq!(result.new_kids.len(), 2);
+        assert_eq!(selected_page_count(pdf), 2);
     }
 
     #[test]
