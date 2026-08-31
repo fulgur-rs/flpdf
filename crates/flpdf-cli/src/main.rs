@@ -214,46 +214,6 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
     Ok(())
 }
 
-/// Fail fast on an unusable output destination before a progress-reporting
-/// page-operation rewrite begins.
-///
-/// qpdf opens (and therefore validates) its real output destination before
-/// any writing -- including progress notifications -- starts. Confirmed
-/// against live qpdf 11.9.0: `qpdf --progress --rotate=90:1 in.pdf
-/// a-directory` fails immediately with no progress line printed at all.
-/// flpdf's page-operation rewrite instead computes the complete output into
-/// an internal memory buffer first (`write_qpdf_to_memory`) and persists it
-/// to `output` only afterward, so without this guard an unusable
-/// destination would let the full 0..100 progress sequence print before the
-/// later persistence step fails. Opens without truncating so an
-/// already-existing, otherwise-valid destination is left untouched until
-/// the real write.
-///
-/// Skips the check for an existing named pipe (Unix only): qpdf itself opens
-/// its real destination exactly once, and a FIFO's reader observes EOF and
-/// can exit as soon as this validation open closes, so the later real write
-/// would reopen a FIFO with no reader left and hang. Every other destination
-/// kind (regular files, directories, sockets, device files, and nonexistent
-/// paths) has no such open/close synchronization hazard and is still probed
-/// here, so this remains a fail-fast guard for those.
-fn validate_progress_output_destination(output: &Path) -> CliResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        if let Ok(metadata) = std::fs::metadata(output) {
-            if metadata.file_type().is_fifo() {
-                return Ok(());
-            }
-        }
-    }
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(output)?;
-    Ok(())
-}
-
 /// Attach qpdf's logger-backed progress reporter to a direct CLI writer.
 ///
 /// The event accounting remains owned by `PdfWriter`; `QPDFJob` owns the
@@ -5309,11 +5269,9 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         // rewrite is flpdf's internal preparation step and is not an
         // observable qpdf writer, so it must not consume the progress stream.
         options.progress = false;
-    } else if options.progress && standard_output.is_none() {
-        validate_progress_output_destination(output)?;
     }
-    let bytes = write_qpdf_to_memory(pdf, output, &options)?;
     if let Some(n) = split_pages.filter(|size| *size > 0) {
+        let bytes = write_qpdf_to_memory(pdf, output, &options)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -5336,11 +5294,10 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             split_job.record_warnings();
         }
         return finish_job_exit_status(split_job.complete(true)?);
-    } else if let Some(writer) = standard_output.as_mut() {
-        writer.write_all(&bytes)?;
     } else {
-        std::fs::write(output, &bytes)?;
-        if verbose {
+        let announce_file = standard_output.is_none();
+        write_with_pdf_writer(pdf, output, &mut standard_output, &options, false, None)?;
+        if verbose && announce_file {
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
@@ -5509,12 +5466,10 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
         // rewrite is flpdf's internal preparation step and is not an
         // observable qpdf writer, so it must not consume the progress stream.
         options.progress = false;
-    } else if options.progress && creates_output {
-        validate_progress_output_destination(output)?;
     }
-    let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
 
     if let Some(n) = split_pages.filter(|size| *size > 0) {
+        let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -5531,13 +5486,17 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
         // look clean even though the original input was not.
         split_job.record_document_warnings(&pdf);
         return finish_job_exit_status(split_job.complete(true)?);
-    } else if let Some(writer) = standard_output.as_mut() {
-        // cov:ignore-start: exercised by binary_rotate_dash subprocess integration test
-        writer.write_all(&bytes)?;
-        // cov:ignore-end
     } else {
-        std::fs::write(output, &bytes)?;
-        if verbose {
+        let announce_file = standard_output.is_none();
+        write_with_pdf_writer(
+            &mut pdf,
+            output,
+            &mut standard_output,
+            &options,
+            false,
+            None,
+        )?;
+        if verbose && announce_file {
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }

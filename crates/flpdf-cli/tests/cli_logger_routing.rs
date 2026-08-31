@@ -280,6 +280,54 @@ fn qpdf_differential_matches_small_and_large_pass1_dev_full_boundaries() {
     assert!(flpdf_stderr.contains("No space left on device"));
 }
 
+#[cfg(unix)]
+#[test]
+fn qpdf_differential_matches_file_write_error_swallowing() {
+    if !Path::new("/dev/full").exists() || !qpdf_available() {
+        eprintln!("skipping final file-write /dev/full differential");
+        return;
+    }
+
+    let plain_args = ["--static-id", ONE_PAGE, "/dev/full"];
+    assert_observables_equal(
+        "plain file output",
+        &run_qpdf(&plain_args),
+        &run_flpdf(&plain_args),
+        true,
+    );
+
+    let page_operation_args = [
+        "--progress",
+        "--static-id",
+        "--rotate=90:1",
+        ONE_PAGE,
+        "/dev/full",
+    ];
+    assert_observables_equal(
+        "page-operation file output",
+        &run_qpdf(&page_operation_args),
+        &run_flpdf(&page_operation_args),
+        true,
+    );
+
+    let page_extraction_args = [
+        "--progress",
+        "--static-id",
+        ONE_PAGE,
+        "--pages",
+        ".",
+        "1",
+        "--",
+        "/dev/full",
+    ];
+    assert_observables_equal(
+        "page-extraction file output",
+        &run_qpdf(&page_extraction_args),
+        &run_flpdf(&page_extraction_args),
+        true,
+    );
+}
+
 #[test]
 fn binary_qdf_dash_uses_the_same_save_route() {
     let output = flpdf().args(["qdf", MINIMAL, "-"]).output().unwrap();
