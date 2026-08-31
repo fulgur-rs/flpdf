@@ -43,6 +43,7 @@ pub(crate) struct WriterSettings {
     pub(crate) decode_level: DecodeLevel,
     pub(crate) decode_level_set: bool,
     pub(crate) recompress_flate: bool,
+    pub(crate) compression_level: Option<i32>,
     pub(crate) content_normalization: bool,
     pub(crate) content_normalization_set: bool,
     pub(crate) qdf_mode: bool,
@@ -74,6 +75,7 @@ impl Default for WriterSettings {
             decode_level: DecodeLevel::None,
             decode_level_set: false,
             recompress_flate: false,
+            compression_level: None,
             content_normalization: false,
             content_normalization_set: false,
             qdf_mode: false,
@@ -137,6 +139,7 @@ impl WriterSettings {
             // state. Keep this field aligned with that setter ordering.
             stream_data: self.stream_data_mode,
             recompress_flate: self.recompress_flate,
+            compression_level: self.compression_level,
             content_normalization,
             qdf: self.qdf_mode,
             qdf_stream_policy_precomputed: true,

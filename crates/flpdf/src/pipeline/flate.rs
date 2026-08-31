@@ -1,4 +1,9 @@
 //! qpdf correspondence: Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2.
+//!
+//! qpdf's `QPDFJob::setWriterOptions` applies the process-wide compression
+//! level before any writer streams are created (`QPDFJob.cc:2847-2851`), so
+//! the crate-private setter below intentionally updates the same shared codec
+//! state for the canonical writer.
 
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -8,6 +13,9 @@ pub(crate) const DEFAULT_OUT_BUFFER_SIZE: usize = 65_536;
 const Z_BUF_ERROR: i32 = -5;
 const BUF_ERROR_WARNING: &str = "input stream is complete but output may still be valid";
 static COMPRESSION_LEVEL: AtomicI32 = AtomicI32::new(-1);
+
+#[cfg(test)]
+pub(crate) static COMPRESSION_LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlateAction {
@@ -111,11 +119,10 @@ impl<'a> Flate<'a> {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn set_compression_level(level: i32) -> PipelineResult<()> {
-        if level != -1 && !(1..=9).contains(&level) {
+        if level != -1 && !(0..=9).contains(&level) {
             return Err(PipelineError::runtime(
-                "Pl_Flate: compression level must be -1 or between 1 and 9",
+                "Pl_Flate: compression level must be -1 or between 0 and 9",
             ));
         }
         COMPRESSION_LEVEL.store(level, Ordering::Relaxed);
@@ -410,15 +417,11 @@ impl Pipeline for Flate<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flate, FlateAction, BUF_ERROR_WARNING, Z_BUF_ERROR};
+    use super::{Flate, FlateAction, BUF_ERROR_WARNING, COMPRESSION_LEVEL_TEST_LOCK, Z_BUF_ERROR};
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
-    use std::sync::Mutex;
-
-    static COMPRESSION_LEVEL_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn deflate_chunks(chunks: &[&[u8]], out_buffer_size: usize) -> PipelineResult<Vec<u8>> {
         let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
         Flate::set_compression_level(-1)?;
@@ -591,12 +594,13 @@ mod tests {
     }
 
     #[test]
-    fn compression_level_accepts_qpdf_domain_only() {
+    fn compression_level_accepts_qpdf_zlib_values() {
         let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
         Flate::set_compression_level(-1).unwrap();
+        Flate::set_compression_level(0).unwrap();
         Flate::set_compression_level(1).unwrap();
         Flate::set_compression_level(9).unwrap();
-        assert!(Flate::set_compression_level(0).is_err());
+        assert!(Flate::set_compression_level(-2).is_err());
         assert!(Flate::set_compression_level(10).is_err());
         Flate::set_compression_level(-1).unwrap();
     }
