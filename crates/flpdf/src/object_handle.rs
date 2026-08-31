@@ -48,6 +48,17 @@
 //! The `Rc` choice is an internal Rust ownership detail; qpdf's observable
 //! callback, identity, retry, error, and `/Length` contracts remain the
 //! authority.
+//
+// qpdf-deviation-start: qpdf 11.9.0's default destruction of a sufficiently
+// deep programmatic direct container graph recursively follows the
+// shared-pointer children. Its depth-unbounded direct factories and default
+// container destructors are documented by `QPDFObjectHandle.cc:1944-2013`,
+// `QPDF_Array.hh:9-50`, and `QPDF_Dictionary.hh:11-38`; a pinned live probe
+// drops depth 5,000 successfully but finishes construction and exits 139 at
+// depths 50,000 and 100,000. flpdf automatically drains only final-owner
+// acyclic direct children with a heap worklist, preserving shared identity,
+// payload, and PDF output while avoiding Rust stack exhaustion.
+// qpdf-deviation-end
 //!
 //! ## Page/Form content-family correspondence
 //!
@@ -1009,6 +1020,27 @@ pub(crate) enum ObjectValue {
     },
 }
 
+fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
+    Rc::new(RefCell::new(ObjectSlot {
+        initialized: false,
+        state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
+        state_owners: Rc::new(RefCell::new(Vec::new())),
+        object_ref: None,
+        active_pdf_unique_id: None,
+        resolver: None,
+        parsed_offset: NO_PARSED_OFFSET,
+        end_before_space: NO_PARSED_OFFSET,
+        end_after_space: NO_PARSED_OFFSET,
+        pdf_unique_ids: BTreeSet::new(),
+        tree_pdf_unique_id: None,
+        containment_parents: Vec::new(),
+        description: None,
+        stream_token_filters: Rc::new(RefCell::new(Vec::new())),
+        content_normalization_applied: Rc::new(Cell::new(false)),
+        mutation_generation: Rc::new(Cell::new(0)),
+    }))
+}
+
 impl ObjectValue {
     /// Return qpdf's value-layer type ordinal.
     ///
@@ -1337,24 +1369,7 @@ impl ObjectHandle {
     /// value report qpdf's uninitialized-handle error at the dereference
     /// boundary (`include/qpdf/QPDFObjectHandle.hh:325-326`).
     pub fn uninitialized() -> Self {
-        let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            initialized: false,
-            state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
-            state_owners: Rc::new(RefCell::new(Vec::new())),
-            object_ref: None,
-            active_pdf_unique_id: None,
-            resolver: None,
-            parsed_offset: NO_PARSED_OFFSET,
-            end_before_space: NO_PARSED_OFFSET,
-            end_after_space: NO_PARSED_OFFSET,
-            pdf_unique_ids: BTreeSet::new(),
-            tree_pdf_unique_id: None,
-            containment_parents: Vec::new(),
-            description: None,
-            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
-            content_normalization_applied: Rc::new(Cell::new(false)),
-            mutation_generation: Rc::new(Cell::new(0)),
-        })));
+        let handle = Self(empty_object_slot());
         handle.register_state_owner();
         handle
     }
@@ -2080,7 +2095,7 @@ impl ObjectHandle {
     /// Returns `None` for an indirect handle, or for a direct handle whose
     /// `Rc` is still shared elsewhere (refcount > 1) — the latter cannot
     /// happen for a handle a caller alone constructed and never cloned.
-    pub(crate) fn into_direct_value(self) -> Option<(ObjectValue, i64)> {
+    pub(crate) fn into_direct_value(mut self) -> Option<(ObjectValue, i64)> {
         if self.0.borrow().object_ref.is_some() {
             return None; // cov:ignore: unreachable per the invariant noted above
         }
@@ -2104,7 +2119,9 @@ impl ObjectHandle {
         for child in children {
             Self::detach_child_from_parent(&child, &parent);
         }
-        let slot = Rc::try_unwrap(self.0).ok()?.into_inner();
+        let slot = Rc::try_unwrap(std::mem::replace(&mut self.0, empty_object_slot()))
+            .ok()?
+            .into_inner();
         let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
         Some((state, slot.parsed_offset))
     }
@@ -4459,6 +4476,55 @@ impl ObjectHandle {
             ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
             ObjectValue::Stream { stream_dict, .. } => vec![stream_dict.clone()],
             _ => Vec::new(),
+        }
+    }
+
+    /// Empty a final owner's direct container edges before its `ObjectHandle`
+    /// or `ObjectHandleIdentity` wrapper releases the slot.
+    ///
+    /// qpdf's `QPDFObject`/`QPDFValue` ownership is shared, so a child may be
+    /// removed here only when both the slot and its payload have no other
+    /// strong owner. Leaving an empty container in the payload makes the
+    /// ordinary field drop constant-depth; the moved children are then walked
+    /// by [`Self::drain_owned_descendants`].
+    fn take_owned_direct_children(slot: &Rc<RefCell<ObjectSlot>>) -> Vec<Self> {
+        if Rc::strong_count(slot) != 1 {
+            return Vec::new();
+        }
+
+        let parent = Rc::downgrade(slot);
+        let children = {
+            let slot_ref = slot.borrow();
+            if Rc::strong_count(&slot_ref.state) != 1 {
+                return Vec::new();
+            }
+
+            let mut state = slot_ref.state.borrow_mut();
+            match &mut *state {
+                ObjectValue::Array(children) => std::mem::take(children),
+                ObjectValue::Dictionary(entries) => std::mem::take(entries).into_values().collect(),
+                ObjectValue::Stream { stream_dict, .. } => {
+                    vec![std::mem::replace(stream_dict, ObjectHandle::null())]
+                }
+                _ => Vec::new(),
+            }
+        };
+
+        for child in &children {
+            Self::detach_child_from_parent(child, &parent);
+        }
+        children
+    }
+
+    /// Release a direct acyclic object graph with an explicit heap worklist.
+    ///
+    /// This is deliberately called from both wrapper types that retain the
+    /// slot's `Rc`: internal identity keys can outlive the last public
+    /// `ObjectHandle`, and must not reintroduce recursive field destruction.
+    fn drain_owned_descendants(slot: &Rc<RefCell<ObjectSlot>>) {
+        let mut pending = Self::take_owned_direct_children(slot);
+        while let Some(handle) = pending.pop() {
+            pending.extend(Self::take_owned_direct_children(&handle.0));
         }
     }
 
@@ -7400,6 +7466,18 @@ impl<'a> ObjectJsonWriter<'a> {
         }
         self.first = false;
         self.write(&[delimiter])
+    }
+}
+
+impl Drop for ObjectHandle {
+    fn drop(&mut self) {
+        Self::drain_owned_descendants(&self.0);
+    }
+}
+
+impl Drop for ObjectHandleIdentity {
+    fn drop(&mut self) {
+        ObjectHandle::drain_owned_descendants(&self.0);
     }
 }
 
@@ -18735,5 +18813,129 @@ mod filter_on_write_tests {
             Err(crate::Error::System(message))
                 if message == "operation for stream attempted on object of type integer"
         ));
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use std::process::Command;
+    use std::rc::Rc;
+
+    const DEEP_DROP_DEPTH: usize = 100_000;
+
+    fn assert_drop_probe_succeeds(test_name: &str, environment: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--ignored", "--nocapture"])
+            .env(environment, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "drop probe failed: status={} stderr={}",
+            output.status,
+            stderr
+        );
+    }
+
+    #[test]
+    fn deep_direct_array_drop_is_stack_independent() {
+        assert_drop_probe_succeeds(
+            "object_handle::drop_tests::deep_direct_array_drop_probe",
+            "FLPDF_DEEP_DIRECT_ARRAY_DROP_PROBE",
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
+    fn deep_direct_array_drop_probe() {
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_DIRECT_ARRAY_DROP_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..DEEP_DROP_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+        drop(handle);
+    }
+
+    #[test]
+    fn deep_direct_dictionary_drop_is_stack_independent() {
+        assert_drop_probe_succeeds(
+            "object_handle::drop_tests::deep_direct_dictionary_drop_probe",
+            "FLPDF_DEEP_DIRECT_DICTIONARY_DROP_PROBE",
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
+    fn deep_direct_dictionary_drop_probe() {
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_DIRECT_DICTIONARY_DROP_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..DEEP_DROP_DEPTH {
+            handle = ObjectHandle::dictionary(vec![(b"/Next".to_vec(), handle)]);
+        }
+        drop(handle);
+    }
+
+    #[test]
+    fn deep_direct_stream_dictionary_drop_is_stack_independent() {
+        assert_drop_probe_succeeds(
+            "object_handle::drop_tests::deep_direct_stream_dictionary_drop_probe",
+            "FLPDF_DEEP_DIRECT_STREAM_DROP_PROBE",
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
+    fn deep_direct_stream_dictionary_drop_probe() {
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_DIRECT_STREAM_DROP_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+
+        let data = Rc::new(Vec::new());
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..DEEP_DROP_DEPTH {
+            let dictionary = ObjectHandle::dictionary(vec![(b"/Next".to_vec(), handle)]);
+            handle = ObjectHandle::stream(dictionary, Rc::clone(&data));
+        }
+        drop(handle);
+        assert_eq!(Rc::strong_count(&data), 1);
+    }
+
+    #[test]
+    fn dropping_a_parent_does_not_dismantle_a_shared_child_alias() {
+        let child = ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(7))]);
+        let alias = child.clone();
+        let parent = ObjectHandle::array(vec![child]);
+
+        drop(parent);
+
+        assert_eq!(alias.get_key(b"/Value").as_integer(), Some(7));
+        assert!(alias.containing_object_refs().is_empty());
+        drop(alias);
+    }
+
+    #[test]
+    fn an_identity_key_can_be_the_last_owner_of_a_direct_container() {
+        let root_ref = ObjectRef::new(12, 0);
+        let leaf = ObjectHandle::integer(3);
+        let root = ObjectHandle::new_indirect_unresolved(root_ref, -1);
+        root.set_resolved(ObjectValue::Array(vec![leaf.clone()]));
+        let identity = root.identity_key();
+
+        drop(root);
+        assert_eq!(leaf.containing_object_refs(), vec![root_ref]);
+
+        drop(identity);
+        assert!(leaf.containing_object_refs().is_empty());
     }
 }
