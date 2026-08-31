@@ -43,8 +43,14 @@ fn qpdf_ctest_2_reports_invalid_password_through_the_c_api_error_surface() {
 /// filename qpdf was given, byte for byte, so a non-UTF-8 name must survive
 /// into the "invalid password" error report unchanged rather than being
 /// replaced with U+FFFD by a lossy conversion.
+///
+/// Linux-only: this requires actually creating a file with an
+/// invalid-UTF-8 name on disk. Linux filesystems accept arbitrary
+/// non-NUL/non-`/` bytes; macOS's APFS/HFS+ reject non-UTF-8 names outright
+/// (`fs::copy` fails with `EILSEQ`/"Illegal byte sequence"), so this
+/// scenario cannot be reproduced there.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn qpdf_ctest_2_reports_a_non_utf8_input_path_verbatim() {
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
