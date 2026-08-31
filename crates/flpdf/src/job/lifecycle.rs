@@ -8,6 +8,7 @@
 
 use super::attachments::{AttachmentAddOptions, AttachmentCopyOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
+use super::outline_dest_remap::remap_outline_and_dests;
 use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
 use super::page_range::PageRange;
 use super::page_specs::{PageSpecInput, PageSpecJobOutput};
@@ -1831,6 +1832,7 @@ impl QPDFJob {
                     result,
                     prune_mode,
                 } => {
+                    remap_outline_and_dests(pdf, &result)?;
                     QPDFJob::prune_after_subset(pdf, prune_mode)?;
                     QPDFJob::prune_acroform_after_subset(pdf, &result)?;
                     self.apply_configured_rotations(pdf, configuration)?;
