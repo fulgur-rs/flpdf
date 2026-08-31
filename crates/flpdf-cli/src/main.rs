@@ -4624,7 +4624,7 @@ fn run_page_extraction(
     // literal file to compare against `primary_input` — matching qpdf's own
     // `(!m->split_pages) && QUtil::same_file(...)` exclusion in
     // `checkConfiguration()` (`QPDFJob.cc:627`).
-    if page_ops.split_pages.is_none() {
+    if !split_pages_active(page_ops.split_pages.as_deref()) {
         reject_same_job_output(primary_input, output)?;
     }
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
@@ -5162,7 +5162,13 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     QPDFJob::prune_acroform_after_subset(pdf, &result)?;
 
     let mut options = options;
-    options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
+    let split_pages = page_ops
+        .split_pages
+        .as_deref()
+        .map(parse_split_n)
+        .transpose()?;
+    let split_pages_active = split_pages.is_some_and(|size| size > 0);
+    options.preserve_encryption = primary_encrypted && !split_pages_active;
     // qpdf keeps the authenticated primary input as the output/base document
     // for `--pages` (libqpdf/QPDFJob.cc:2360-2633). The multi-source job has
     // already copied selected pages into a fresh plaintext Pdf, so its writer
@@ -5179,7 +5185,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // and an explicit non-`none` `--decode-level` does the same directly,
     // both of which `can_preserve` would likewise refuse to auto-preserve
     // through.
-    if page_ops.split_pages.is_none()
+    if !split_pages_active
         && options.copy_encryption.is_none()
         && !options.qdf
         && !options.content_normalization
@@ -5247,7 +5253,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         None
     };
 
-    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    let split_progress = split_pages_active && options.progress;
     if split_progress {
         // qpdf creates a fresh writer for each split output. The memory
         // rewrite is flpdf's internal preparation step and is not an
@@ -5257,8 +5263,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         validate_progress_output_destination(output)?;
     }
     let bytes = write_qpdf_to_memory(pdf, output, &options)?;
-    if let Some(raw) = page_ops.split_pages.as_deref() {
-        let n = parse_split_n(raw)?;
+    if let Some(n) = split_pages.filter(|size| *size > 0) {
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -5334,11 +5339,17 @@ fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
 fn parse_split_n(raw: &str) -> CliResult<usize> {
     let n: usize = raw
         .parse()
-        .map_err(|_| format!("--split-pages: expected a positive integer, got {raw:?}"))?;
-    if n == 0 {
-        return Err("--split-pages: group size must be >= 1".into());
-    }
+        .map_err(|_| format!("--split-pages: expected a non-negative integer, got {raw:?}"))?;
     Ok(n)
+}
+
+/// Whether `--split-pages` selects qpdf's chunk-writing path.
+///
+/// qpdf stores the parsed value in a signed field and dispatches only when it
+/// is truthy. Invalid values remain active here so `parse_split_n` can report a
+/// usage error instead of silently selecting the ordinary rewrite path.
+fn split_pages_active(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.parse::<usize>().map_or(true, |size| size > 0))
 }
 
 /// Run qpdf's fresh-document split job on a rewritten in-memory source.
@@ -5435,8 +5446,14 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     // are cleartext unless explicit encryption options are configured. Keep
     // the memory intermediate decryptable before split_pages re-opens it.
     let mut options = options;
-    options.preserve_encryption = page_ops.split_pages.is_none() && pdf.is_encrypted();
-    let split_progress = page_ops.split_pages.is_some() && options.progress;
+    let split_pages = page_ops
+        .split_pages
+        .as_deref()
+        .map(parse_split_n)
+        .transpose()?;
+    let split_pages_active = split_pages.is_some_and(|size| size > 0);
+    options.preserve_encryption = !split_pages_active && pdf.is_encrypted();
+    let split_progress = split_pages_active && options.progress;
     if split_progress {
         // qpdf creates a fresh writer for each split output. The memory
         // rewrite is flpdf's internal preparation step and is not an
@@ -5447,8 +5464,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     }
     let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
 
-    if let Some(raw) = page_ops.split_pages.as_deref() {
-        let n = parse_split_n(raw)?;
+    if let Some(n) = split_pages.filter(|size| *size > 0) {
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -5482,7 +5498,10 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 /// set. `--collate` alone (no `--pages`) is a documented no-op and does NOT
 /// trigger this on its own.
 fn page_ops_active(p: &PageOpArgs) -> bool {
-    !p.pages.is_empty() || !p.rotate.is_empty() || p.split_pages.is_some() || p.empty
+    !p.pages.is_empty()
+        || !p.rotate.is_empty()
+        || split_pages_active(p.split_pages.as_deref())
+        || p.empty
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6416,7 +6435,7 @@ fn prepare_page_operation_standard_output(
     output: &Path,
     page_ops: &PageOpArgs,
 ) -> CliResult<Option<PipelineWriter>> {
-    if output.as_os_str() == "-" && page_ops.split_pages.is_some() {
+    if output.as_os_str() == "-" && split_pages_active(page_ops.split_pages.as_deref()) {
         return Err("--split-pages may not be used when writing to standard output".into());
     }
     prepare_pdf_standard_output(output)
