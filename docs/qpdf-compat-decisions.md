@@ -25,6 +25,29 @@ the final state and add a short rationale.
 
 Grouped by area for navigation.
 
+### Pipeline callback adapters
+
+#### `flpdf-6ftu` — `Pl_Function` is a qpdf C API boundary
+
+**Decision:** divergent (scope-limited omission)
+**Owner:** Mitsuru Hayasaka
+
+**Evidence:** qpdf's `Pl_Function` class (`include/qpdf/Pl_Function.hh:37-62`,
+`libqpdf/Pl_Function.cc:10-61`) adapts a byte callback to the C++ `Pipeline`
+chain. In qpdf 11.9.0 its production constructors are reached by
+`qpdf_write_json` (`libqpdf/qpdf-c.cc:1925-1950`) and custom logger destinations
+(`libqpdf/qpdflogger-c.cc:35-100`), both C API surfaces. The qpdf core PDF
+reader/writer paths do not consume `Pl_Function` directly.
+
+flpdf has no qpdf-compatible C ABI, so a C function-pointer/`void*` adapter
+would add an API surface outside this project scope. The Rust-native
+equivalents already exist: `Pipeline`/`PipelineRef` provide the byte sink
+contract, JSON blob serialization accepts a Rust closure in `Json::make_blob`,
+and writer/job callbacks use Rust closures with `PipelineResult`. These paths
+preserve callback bytes, error propagation, and finish ownership for their
+actual Rust consumers. Do not add a standalone `PlFunction` stage unless a
+future C ABI is explicitly adopted.
+
 ### Stream encoding
 
 #### `flpdf-9hc.5.4` — ObjStm stream wrapping with FlateDecode

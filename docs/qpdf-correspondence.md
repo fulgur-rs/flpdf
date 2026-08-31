@@ -498,7 +498,7 @@ V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invo
 | `Pl_StdioFile.cc` | 46 | `pipeline/stdio_file.rs`（positive partial write の継続、zero/error—including `Interrupted`—の即時 Runtime 化、`EBADF` finish のみ Logic 化）+ `json_inspect.rs`（4096-byte buffer、top-level file は close/drop、side file は explicit finish） | ✅ |
 | `Pl_Buffer` | 82 | `pipeline/buffer.rs`（accumulation、optional pass-through、finish readiness、buffer ownership transfer） | ✅ |
 | `Pl_Discard.cc` | 23 | `pipeline/discard.rs`（public terminal identifier、no-op write/finish、finish 後の再利用）+ `filespec_helper/embedded_file_stream.rs`（EmbeddedFile checksum terminal consumer） | ✅ |
-| `Pl_Function.cc` | 62 | 専用 stage は未実装。使用箇所ごとの closure 実装 | ⚪ |
+| `Pl_Function.cc` | 62 | `include/qpdf/Pl_Function.hh:37-62` / `libqpdf/Pl_Function.cc:10-61` は C API の callback adapter。production consumer は `qpdf-c.cc:1925-1950` の `qpdf_write_json` と `qpdflogger-c.cc:35-100` の custom logger に限られ、qpdf core の PDF reader/writer は直接使用しない。flpdf は C ABI を持たないため専用 stage を追加せず、JSON の `Json::make_blob` closure、public `Pipeline`/`PipelineRef`、writer/job の Rust callback を各責務の canonical route とする | ➖ |
 | `Pl_SHA2.cc` | 75 | `pipeline/sha2.rs`（SHA-256/384/512 の bit 選択、`resetBits`、digest access、optional next への write/finish forwarding と error 順序、再利用 lifecycle）。`Pl_SHA2.hh:9-11` の契約通り `finish()` 後の最初の `write()` は同じ bit size の新 cycle を開始し、連続 `finish()` は empty digest を生成する。native backend が finalize 後に同じ context を再初期化する挙動（`sha2.c:670-673`; `sha2big.c:209-228`）は RustCrypto の `finalize_reset` に対応する。⚪ `bits=0` のままの write/finish は qpdf では null crypto provider を dereference し、最初の finish 前の digest access は未初期化 result buffer を読むため、Rust では定義済み logic error に変換する。production consumer は `encryption/standard.rs` の `r5_salted_hash` / `r6_password_hash`（qpdf `hash_V5`、`QPDF_encryption.cc:239-311`）で、初期 hash は連結バッファを作らずpassword/salt/udata を 3 回 write し（`:246-249`）、R=6 ループは毎周 fresh な `Pl_SHA2` を算出 bit size で構築する（`:295-299`）。qpdf が identifier を `"sha2"` に固定している（`Pl_SHA2.cc:8`）のに合わせ、callsite も同じ値を渡す | ✅ |
 
 `/ID` が qpdf と非 parity だった原因は **アルゴリズム**（qpdf は 2 段階 MD5 で seed を
@@ -1087,8 +1087,8 @@ remain outside this consumer slice.
 | ✅ 境界一致 | 5,255 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
 | 🔀 smeared | 27,138 | 再配置の主対象。qpdf 全体の 65% |
 | ❌ missing | 169 | `Pl_DCT.cc` compression(119) / `QTC`(50) |
-| ⚪ 逸脱候補 | 6,660 | 要承認（下記の方針矛盾を参照） |
-| ➖ 対象外 | 2,237 | C API |
+| ⚪ 逸脱候補 | 6,598 | 要承認（下記の方針矛盾を参照） |
+| ➖ 対象外 | 2,299 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
 
 本文の各行を機械的に集計した値である（`状態` 列の記号ごとに `行` 列を合算）。
