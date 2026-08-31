@@ -7,9 +7,9 @@ use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
     remap_outline_and_dests, should_remove_unreferenced_resources, AttachmentAddOptions,
-    AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput,
-    JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources,
-    SplitPageOptions,
+    AttachmentCopyOptions, CheckError, ImageOptimizationOptions, JobExitCode, JsonJobError,
+    JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
+    RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -160,6 +160,49 @@ fn apply_cli_decode_level(options: &mut WriterOptions, decode_level: Option<CliD
 
 fn parse_compression_level(value: Option<&str>) -> CliResult<Option<i32>> {
     value.map(qpdf_selector_integer).transpose()
+}
+
+/// Parse the unsigned image thresholds through the same qpdf `strtoull` /
+/// `QIntC::to_uint` boundary used by `QPDFJob::Config::oiMin*` and
+/// `iiMinBytes` (`libqpdf/QPDFJob_config.cc:232-234,422-445`).
+fn parse_image_uint(value: Option<&str>) -> CliResult<Option<u32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(Some(0));
+    }
+    let parsed = QPDFJob::parse_collate(value)?
+        .into_iter()
+        .next()
+        .unwrap_or(0);
+    // QPDFJob::parse_collate uses the same QUtil::string_to_uint conversion
+    // and rejects values above u32::MAX before returning the usize.
+    Ok(Some(parsed as u32))
+}
+
+fn image_optimization_options(
+    keep_inline_images: bool,
+    oi_min_width: Option<&str>,
+    oi_min_height: Option<&str>,
+    oi_min_area: Option<&str>,
+    ii_min_bytes: Option<&str>,
+) -> CliResult<ImageOptimizationOptions> {
+    let mut options = ImageOptimizationOptions::default();
+    if let Some(value) = parse_image_uint(oi_min_width)? {
+        options.min_width = value;
+    }
+    if let Some(value) = parse_image_uint(oi_min_height)? {
+        options.min_height = value;
+    }
+    if let Some(value) = parse_image_uint(oi_min_area)? {
+        options.min_area = value;
+    }
+    if let Some(value) = parse_image_uint(ii_min_bytes)? {
+        options.inline_min_bytes = value as usize;
+    }
+    options.keep_inline_images = keep_inline_images;
+    Ok(options)
 }
 
 /// Translate the CLI's effective writer options into the reusable library
@@ -859,6 +902,40 @@ struct Cli {
               "pages", "rotate", "split_pages", "empty", "json_output",
           ])]
     generate_appearances: bool,
+
+    /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
+    /// `--optimize-images`). Rejected against inspection and attachment
+    /// modes: those dispatch branches call their dedicated writers without
+    /// ever consuming the computed image options, so without these
+    /// conflicts an accepted `--optimize-images` would be silently dropped.
+    /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
+    /// `--json-output` are intentionally absent: all of those routes are
+    /// already threaded through (see `top_level_image_options` at each call
+    /// site).
+    #[arg(long = "optimize-images",
+          conflicts_with_all = [
+              "check", "show_object",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
+              "list_attachments", "show_attachment", "remove_attachment",
+              "add_attachment", "copy_attachments_from",
+          ])]
+    optimize_images: bool,
+    /// Exclude inline images from the optimization pass.
+    #[arg(long = "keep-inline-images")]
+    keep_inline_images: bool,
+    /// Minimum image width for `--optimize-images` (qpdf default: 128).
+    #[arg(long = "oi-min-width", value_name = "WIDTH")]
+    oi_min_width: Option<String>,
+    /// Minimum image height for `--optimize-images` (qpdf default: 128).
+    #[arg(long = "oi-min-height", value_name = "HEIGHT")]
+    oi_min_height: Option<String>,
+    /// Minimum image area for `--optimize-images` (qpdf default: 16384).
+    #[arg(long = "oi-min-area", value_name = "AREA")]
+    oi_min_area: Option<String>,
+    /// Minimum inline-image payload to externalize (qpdf default: 1024).
+    #[arg(long = "ii-min-bytes", value_name = "BYTES")]
+    ii_min_bytes: Option<String>,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -1634,6 +1711,26 @@ struct RewriteCommand {
     )]
     generate_appearances: bool,
 
+    /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
+    /// `--optimize-images`).
+    #[arg(long = "optimize-images")]
+    optimize_images: bool,
+    /// Exclude inline images from the optimization pass.
+    #[arg(long = "keep-inline-images")]
+    keep_inline_images: bool,
+    /// Minimum image width for `--optimize-images` (qpdf default: 128).
+    #[arg(long = "oi-min-width", value_name = "WIDTH")]
+    oi_min_width: Option<String>,
+    /// Minimum image height for `--optimize-images` (qpdf default: 128).
+    #[arg(long = "oi-min-height", value_name = "HEIGHT")]
+    oi_min_height: Option<String>,
+    /// Minimum image area for `--optimize-images` (qpdf default: 16384).
+    #[arg(long = "oi-min-area", value_name = "AREA")]
+    oi_min_area: Option<String>,
+    /// Minimum inline-image payload to externalize (qpdf default: 1024).
+    #[arg(long = "ii-min-bytes", value_name = "BYTES")]
+    ii_min_bytes: Option<String>,
+
     /// Flatten page rotation by baking `/Rotate` into page content
     /// (qpdf `--flatten-rotation`).
     ///
@@ -2097,6 +2194,19 @@ fn main() {
                 std::process::exit(2);
             }
         };
+    let top_level_image_options = match image_optimization_options(
+        args.keep_inline_images,
+        args.oi_min_width.as_deref(),
+        args.oi_min_height.as_deref(),
+        args.oi_min_area.as_deref(),
+        args.ii_min_bytes.as_deref(),
+    ) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("flpdf: {error}");
+            std::process::exit(2);
+        }
+    };
     let normalize_content = normalize_content_enabled(args.normalize_content, args.qdf);
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
@@ -2218,7 +2328,7 @@ fn main() {
     } else if json_input_inspection {
         run_json_input_inspection(&args)
     } else if args.json.is_some() || args.json_output.is_some() {
-        run_json(&args)
+        run_json(&args, top_level_image_options)
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
     } else if args.is_encrypted {
@@ -2389,6 +2499,7 @@ fn main() {
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
             args.generate_appearances,
+            args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
@@ -2464,6 +2575,7 @@ fn main() {
                     &args.page_ops,
                     &overlay_specs,
                     options,
+                    args.optimize_images.then_some(top_level_image_options),
                     args.verbose,
                 ),
                 None => Err("--empty page operations require an output file".into()),
@@ -2482,6 +2594,7 @@ fn main() {
                         &overlay_specs,
                         CliRemoveUnreferencedResources::Auto,
                         options.clone(),
+                        args.optimize_images.then_some(top_level_image_options),
                         args.verbose,
                     )
                 } else {
@@ -2502,6 +2615,7 @@ fn main() {
                         args.update_from_json.as_deref(),
                         &args.page_ops,
                         options.clone(),
+                        args.optimize_images.then_some(top_level_image_options),
                         args.verbose,
                     )
                 }
@@ -2572,6 +2686,7 @@ fn main() {
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
             args.generate_appearances,
+            args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
@@ -2682,7 +2797,7 @@ fn format_job_json_error(path: &Path, error: impl std::fmt::Display) -> String {
     )
 }
 
-fn run_json(cli: &Cli) -> CliResult<()> {
+fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()> {
     const QPDF_JSON_KEY_NAMES: &[&str] = &[
         "acroform",
         "attachments",
@@ -2820,6 +2935,15 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     if cli.json_input {
         let mut pdf = job.create_from_json_document(input_file, input.display().to_string())?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+        if cli.optimize_images {
+            flpdf::optimize_images(
+                &mut pdf,
+                &cli_logger(),
+                &progname(),
+                cli.verbose,
+                image_options,
+            )?;
+        }
         let mut runtime = JsonJobRuntime {
             input_identity: &input_identity,
             standard_output: &mut standard_output,
@@ -2841,6 +2965,15 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         let mut pdf = open_pdf_from_file(input, input_file, cli.repair, &cli.password)?;
         job.record_document_warnings(&pdf);
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+        if cli.optimize_images {
+            flpdf::optimize_images(
+                &mut pdf,
+                &cli_logger(),
+                &progname(),
+                cli.verbose,
+                image_options,
+            )?;
+        }
         let mut runtime = JsonJobRuntime {
             input_identity: &input_identity,
             standard_output: &mut standard_output,
@@ -3142,6 +3275,13 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             options.content_normalization_set = cmd.normalize_content.is_some();
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
+            let image_options = image_optimization_options(
+                cmd.keep_inline_images,
+                cmd.oi_min_width.as_deref(),
+                cmd.oi_min_height.as_deref(),
+                cmd.oi_min_area.as_deref(),
+                cmd.ii_min_bytes.as_deref(),
+            )?;
 
             // --flatten-rotation remains unsupported on the linearize path;
             // qpdf accepts --generate-appearances before its linearized writer
@@ -3187,6 +3327,12 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // rejecting upfront surfaces the unsupported combination
                 // instead of leaving the user wondering whether decryption
                 // happened.
+                // --optimize-images is NOT in this list: unlike the other
+                // rewrite-only mutation passes above, the page-operation
+                // functions below (run_page_extraction /
+                // run_rewrite_with_page_ops) already accept and apply it via
+                // `cmd.optimize_images.then_some(image_options)`, mirroring
+                // the top-level --pages/--rotate/--split-pages routes.
                 if coalesce_contents
                     || cmd.remove_restrictions
                     || cmd.decrypt
@@ -3235,6 +3381,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.page_ops,
                         overlay_specs,
                         options,
+                        cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                     )
                 } else if !cmd.page_ops.pages.is_empty() {
@@ -3249,6 +3396,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         overlay_specs,
                         remove_unref,
                         options,
+                        cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                     )
                 } else {
@@ -3261,6 +3409,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         None,
                         &cmd.page_ops,
                         options,
+                        cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                     )
                 };
@@ -3281,6 +3430,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 coalesce_contents,
                 remove_unref,
                 cmd.generate_appearances,
+                cmd.optimize_images.then_some(image_options),
                 cmd.flatten_annotations,
                 cmd.flatten_rotation,
                 overlay_specs,
@@ -3919,6 +4069,7 @@ fn run_rewrite(
     coalesce_contents: bool,
     _remove_unref: CliRemoveUnreferencedResources,
     generate_appearances: bool,
+    image_options: Option<ImageOptimizationOptions>,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
@@ -3952,6 +4103,7 @@ fn run_rewrite(
             coalesce_contents,
             _remove_unref,
             generate_appearances,
+            image_options,
             flatten_annotations_mode,
             flatten_rotation,
             overlay_specs,
@@ -3973,6 +4125,7 @@ fn run_rewrite(
             coalesce_contents,
             _remove_unref,
             generate_appearances,
+            image_options,
             flatten_annotations_mode,
             flatten_rotation,
             overlay_specs,
@@ -3998,6 +4151,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     coalesce_contents: bool,
     _remove_unref: CliRemoveUnreferencedResources,
     generate_appearances: bool,
+    image_options: Option<ImageOptimizationOptions>,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
@@ -4032,6 +4186,9 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let mut options = options;
         if decrypt {
             options.preserve_encryption = false;
+        }
+        if let Some(image_options) = image_options {
+            flpdf::optimize_images(&mut pdf, &cli_logger(), &progname(), verbose, image_options)?;
         }
         if generate_appearances {
             generate_missing_appearances(&mut pdf)?;
@@ -4085,6 +4242,9 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let mut options = options;
         if decrypt {
             options.preserve_encryption = false;
+        }
+        if let Some(image_options) = image_options {
+            flpdf::optimize_images(&mut pdf, &cli_logger(), &progname(), verbose, image_options)?;
         }
         // ── Content mutation pass ─────────────────────────────────────────────
         //
@@ -4760,6 +4920,7 @@ fn run_page_extraction(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
 ) -> CliResult<()> {
     // `--split-pages` writes one numbered file per output page rather than a
@@ -4859,6 +5020,7 @@ fn run_page_extraction(
                 overlay_specs,
                 remove_unref,
                 options,
+                image_options,
                 verbose,
                 standard_output,
                 creates_output,
@@ -4875,6 +5037,7 @@ fn run_page_extraction(
                 overlay_specs,
                 remove_unref,
                 options,
+                image_options,
                 verbose,
                 standard_output,
                 creates_output,
@@ -4898,6 +5061,7 @@ fn run_page_extraction(
             overlay_specs,
             remove_unref,
             options,
+            image_options,
             verbose,
             standard_output,
             creates_output,
@@ -4915,6 +5079,7 @@ fn run_page_extraction(
         overlay_specs,
         remove_unref,
         options,
+        image_options,
         verbose,
         standard_output,
         creates_output,
@@ -4939,6 +5104,7 @@ fn run_empty_page_extraction(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     options: WriterOptions,
+    image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
 ) -> CliResult<()> {
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
@@ -5094,6 +5260,7 @@ fn run_empty_page_extraction(
         source_warnings,
         None,
         combined_pages,
+        image_options,
     )
 }
 
@@ -5115,6 +5282,7 @@ fn run_page_extraction_from_multiple_sources(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
@@ -5297,6 +5465,7 @@ fn run_page_extraction_from_multiple_sources(
         source_warnings,
         None,
         combined_pages,
+        image_options,
     )
 }
 
@@ -5311,6 +5480,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
@@ -5408,6 +5578,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 source_warnings,
                 Some((result, prune_mode)),
                 combined_pages,
+                image_options,
             )
         }
         PageSpecJobOutput::Merged(mut merged) => {
@@ -5448,6 +5619,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 source_warnings,
                 None,
                 combined_pages,
+                image_options,
             )
         }
     }
@@ -5472,6 +5644,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     prior_warnings: bool,
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
+    image_options: Option<ImageOptimizationOptions>,
 ) -> CliResult<()> {
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
 
@@ -5503,6 +5676,14 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     drop_objr_obj_annot_dangling_p(pdf, &result, &objr_obj_targets)?;
     QPDFJob::prune_after_subset(pdf, prune_mode)?;
     QPDFJob::prune_acroform_after_subset(pdf, &result)?;
+
+    // qpdf runs image externalization/optimization after page selection and
+    // before the final writer (`QPDFJob.cc:2151-2174`). Keep the same order so
+    // selected pages, including copied pages from secondary sources, are the
+    // only images considered by this job.
+    if let Some(image_options) = image_options {
+        flpdf::optimize_images(pdf, &cli_logger(), &progname(), verbose, image_options)?;
+    }
 
     let mut options = options;
     let split_pages = page_ops
@@ -5744,16 +5925,29 @@ fn run_rewrite_with_page_ops(
     update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
     options: WriterOptions,
+    image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
 ) -> CliResult<()> {
     let opened = open_job_pdf(input, repair, password, json_input, update_from_json, false)?;
     match opened {
-        JobPdf::File(pdf) => {
-            run_rewrite_with_page_ops_opened(pdf, input, output, page_ops, options, verbose)
-        }
-        JobPdf::Json(pdf) => {
-            run_rewrite_with_page_ops_opened(pdf, input, output, page_ops, options, verbose)
-        }
+        JobPdf::File(pdf) => run_rewrite_with_page_ops_opened(
+            pdf,
+            input,
+            output,
+            page_ops,
+            options,
+            image_options,
+            verbose,
+        ),
+        JobPdf::Json(pdf) => run_rewrite_with_page_ops_opened(
+            pdf,
+            input,
+            output,
+            page_ops,
+            options,
+            image_options,
+            verbose,
+        ),
     }
 }
 
@@ -5763,6 +5957,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     output: &std::path::Path,
     page_ops: &PageOpArgs,
     options: WriterOptions,
+    image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
 ) -> CliResult<()> {
     let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
@@ -5777,6 +5972,9 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     if !page_ops.rotate.is_empty() {
         let page_refs = pages::page_refs(&mut pdf)?;
         apply_rotate_specs(&mut pdf, &page_ops.rotate, &page_refs)?;
+    }
+    if let Some(image_options) = image_options {
+        flpdf::optimize_images(&mut pdf, &cli_logger(), &progname(), verbose, image_options)?;
     }
 
     // Page operations emit a fresh document and preserve encryption only when

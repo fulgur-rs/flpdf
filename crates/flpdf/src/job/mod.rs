@@ -17,6 +17,7 @@ mod acroform_field_prune;
 mod attachment_list;
 mod attachments;
 mod check;
+mod image_optimization;
 mod inspection;
 mod json;
 mod json_sections;
@@ -48,6 +49,7 @@ pub use attachments::{
 #[cfg(test)]
 pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
+pub use image_optimization::{optimize_images, ImageOptimizationOptions};
 pub use json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 pub(crate) use json_sections::checksum_to_hex;
 pub use lifecycle::{JobDocument, JobExitCode, QPDFJob};

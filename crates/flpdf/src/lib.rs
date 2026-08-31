@@ -184,7 +184,10 @@ pub use job::{
     OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, PageSpecJobOutput, Parity,
     RotateSpec, SelectedPage, DEFAULT_MAX_ACROFORM_DEPTH,
 };
-pub use job::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
+pub use job::{
+    optimize_images, should_remove_unreferenced_resources, ImageOptimizationOptions,
+    RemoveUnreferencedResources,
+};
 pub use matrix::{Matrix, Rectangle};
 pub use nntree::{
     NameTree, NameTreeCursor, NumberTree, NumberTreeCursor, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
