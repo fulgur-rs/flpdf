@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
+use std::fs::File;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -42,10 +45,12 @@ fn test_renumber_rejects_unknown_options_and_missing_input() {
         .output()
         .expect("test_renumber must be runnable");
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+    let expected_open_error = if cfg!(windows) {
+        "open : The system cannot find the path specified.\n"
+    } else {
         "open : No such file or directory\n"
-    );
+    };
+    assert_eq!(String::from_utf8_lossy(&output.stderr), expected_open_error);
 }
 
 #[test]
@@ -78,4 +83,26 @@ fn test_renumber_signed_qpdf_fixture_preserve_linearization_reports_success() {
     assert_eq!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stdout).ends_with("succeeded\n"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn preserve_linearization_handles_generated_open_document_objstms() {
+    let input = fixture("compat/objstm-lin-openaction-80-80.pdf");
+    let mut source = Pdf::open(File::open(input).expect("fixture must be readable"))
+        .expect("fixture must parse");
+    let generated = {
+        let mut writer = PdfWriter::new(&mut source);
+        writer.set_output_memory().expect("configure memory output");
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.write().expect("generate source ObjStms");
+        writer.get_buffer().expect("read generated PDF")
+    };
+
+    let mut preserved = Pdf::open_mem_owned(generated).expect("generated PDF must reload");
+    let mut writer = PdfWriter::new(&mut preserved);
+    writer.set_output_memory().expect("configure memory output");
+    writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    writer.set_linearization(true);
+    writer.write().expect("preserve linearization must succeed");
+    assert!(!writer.get_buffer().expect("read linearized PDF").is_empty());
 }
