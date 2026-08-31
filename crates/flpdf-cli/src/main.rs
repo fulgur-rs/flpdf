@@ -802,6 +802,13 @@ struct Cli {
     /// Flatten annotations into page content (top-level alias of
     /// `rewrite --flatten-annotations`; qpdf `--flatten-annotations`
     /// equivalent). Values are `all`, `screen`, or `print`.
+    // `json_output` has no dedicated dispatch check of its own (unlike
+    // `json`, which lists `flatten_annotations` on its own conflicts_with_all
+    // for the same reason): without it, `--flatten-annotations=all
+    // --json-output=2 in out` exits 0 and silently writes a JSON dump of the
+    // unmodified input while dropping the requested transformation, since
+    // main's dispatch chain routes to run_json before either rewrite path
+    // that consumes flatten_annotations. Confirmed live.
     #[arg(
         long = "flatten-annotations",
         value_enum,
@@ -813,6 +820,7 @@ struct Cli {
             "list_attachments", "show_attachment", "remove_attachment",
             "add_attachment", "copy_attachments_from",
             "pages", "rotate", "split_pages", "empty",
+            "json_output",
         ],
         help = "Flatten annotations into page content; MODE is all, screen, or print"
     )]
@@ -2291,6 +2299,7 @@ fn main() {
             false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
             args.verbose,
+            args.no_warn,
             options,
         );
         result
@@ -2453,6 +2462,7 @@ fn main() {
             false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
             args.verbose,
+            args.no_warn,
             options,
         )
     };
@@ -3133,6 +3143,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.flatten_rotation,
                 overlay_specs,
                 cmd.verbose,
+                false, // no_warn: the `rewrite` subcommand has no --no-warn flag
                 options,
             )
         }
@@ -3657,6 +3668,7 @@ fn run_rewrite(
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
+    no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
@@ -3689,6 +3701,7 @@ fn run_rewrite(
             flatten_rotation,
             overlay_specs,
             verbose,
+            no_warn,
             options,
         ),
         JobPdf::Json(pdf) => run_rewrite_opened(
@@ -3709,6 +3722,7 @@ fn run_rewrite(
             flatten_rotation,
             overlay_specs,
             verbose,
+            no_warn,
             options,
         ),
     }
@@ -3733,8 +3747,15 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
+    no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
+    // qpdf's `--no-warn` suppresses warning delivery for the entire job,
+    // including warnings raised by transformations applied after the
+    // document opens (e.g. --flatten-annotations's /NeedAppearances
+    // warning), not only open-time diagnostics. Without this, a warning
+    // raised mid-rewrite would still print live despite --no-warn.
+    pdf.set_suppress_warnings(no_warn);
     let mut standard_output = prepare_pdf_standard_output(output)?;
 
     // Overlay/underlay stacking mutates page dictionaries and adds objects
@@ -3786,7 +3807,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         }
         // On an encrypted input, `--decrypt`/`--remove-restrictions` has
         // already disabled source-encryption preservation above.
-        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file)?;
+        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     } else {
         // Capture encryption state before the write for the qpdf-compatible
         // restriction diagnostic.
@@ -3987,7 +4008,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file)?;
+        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     }
     Ok(())
 }
@@ -5835,7 +5856,7 @@ fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
             if result.warnings.is_empty() {
                 Ok(())
             } else {
-                finish_warning_state(true, false)
+                finish_warning_state(true, false, false)
             }
         }
         Err(ShowLinearizationError::Malformed { message }) => {
@@ -6387,6 +6408,7 @@ fn finish_operation_warnings_with_prior<R: Read + Seek>(
     finish_warning_state(
         prior_warnings || !pdf.repair_diagnostics().entries().is_empty(),
         creates_output,
+        false,
     )
 }
 
@@ -6418,10 +6440,11 @@ fn finish_check_job(result: std::result::Result<JobExitCode, CheckError>) -> Cli
     }
 }
 
-fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<()> {
+fn finish_warning_state(has_warnings: bool, creates_output: bool, no_warn: bool) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     if has_warnings {
         job.record_warnings();
     }
@@ -6467,6 +6490,7 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     pdf: &Pdf<R>,
     normalization_warnings: &[ContentNormalizationWarning],
     creates_output: bool,
+    no_warn: bool,
 ) -> CliResult<()> {
     // qpdf retains open-time warnings in the document warning collection and
     // emits the final summary after the output writer completes. Include the
@@ -6479,7 +6503,7 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     if normalization_warnings.is_empty() && !has_repair_warnings {
         return Ok(());
     }
-    finish_warning_state(true, creates_output)
+    finish_warning_state(true, creates_output, no_warn)
 }
 
 /// Prefix a fatal error with the input path so main() renders the observed
