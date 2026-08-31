@@ -149,18 +149,38 @@ fn qpdf_objects_json(path: &Path, password: &str, allow_weak_crypto: bool) -> Ve
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const REMOVE_RESTRICTIONS_DIAGNOSTIC: &str =
-    "flpdf: removed restrictions (encryption and advisory permissions stripped)";
+    "flpdf: removed restrictions (digital-signature restrictions stripped)";
 
 #[test]
-fn remove_restrictions_strips_encryption_and_emits_diagnostic() {
+fn remove_restrictions_preserves_encryption_and_emits_diagnostic() {
     // v4-aes-128-r4 needs no --allow-weak-crypto, keeping the case clean.
     let input = encrypted_fixture("v4-aes-128-r4.pdf");
     let tmp = tempfile::tempdir().unwrap();
+    let qpdf_output = tmp.path().join("qpdf-derestricted.pdf");
     let output = tmp.path().join("derestricted.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--password=user-v4-aes", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf remove-restrictions failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    assert!(
+        qpdf_bytes
+            .windows(b"/Encrypt".len())
+            .any(|w| w == b"/Encrypt"),
+        "qpdf --remove-restrictions must preserve /Encrypt without --decrypt"
+    );
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--remove-restrictions", "--password=user-v4-aes"])
+        .args(["--remove-restrictions", "--password=user-v4-aes"])
         .arg(&input)
         .arg(&output)
         .assert()
@@ -169,18 +189,82 @@ fn remove_restrictions_strips_encryption_and_emits_diagnostic() {
 
     let bytes = std::fs::read(&output).unwrap();
     assert!(
-        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
-        "remove-restrictions output must not contain /Encrypt"
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "remove-restrictions output must preserve /Encrypt without --decrypt"
     );
 
-    // Layer-4 show-encryption is qpdf-verbatim: must report unencrypted, exit 0.
+    // The preserved output must remain readable with the original password.
+    let check = ShellCommand::new("qpdf")
+        .args(["--password=user-v4-aes", "--check"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "preserved output must remain qpdf-readable: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn linearize_remove_restrictions_preserves_encryption() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let tmp = tempfile::tempdir().unwrap();
+    let qpdf_output = tmp.path().join("qpdf-linearized.pdf");
+    let output = tmp.path().join("linearized.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--password=", "--linearize", "--remove-restrictions"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf linearized remove-restrictions failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    assert!(
+        qpdf_bytes
+            .windows(b"/Encrypt".len())
+            .any(|w| w == b"/Encrypt"),
+        "qpdf linearized --remove-restrictions must preserve /Encrypt"
+    );
+
     Command::cargo_bin("flpdf")
         .unwrap()
-        .arg("show-encryption")
+        .args([
+            "rewrite",
+            "--linearize",
+            "--remove-restrictions",
+            "--password=",
+        ])
+        .arg(&input)
         .arg(&output)
         .assert()
-        .success()
-        .stdout(predicates::str::contains("File is not encrypted"));
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "linearized --remove-restrictions output must preserve /Encrypt"
+    );
+    let check = ShellCommand::new("qpdf")
+        .args(["--password=", "--check"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "linearized preserved output must remain qpdf-readable: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
 }
 
 #[test]
@@ -249,10 +333,9 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
 // ---------------------------------------------------------------------------
 // flpdf-9hc.4.10: `--decrypt`
 //
-// `--decrypt` is the silent qpdf-compatible alias of `--remove-restrictions`
-// on the current rewrite path: both flags explicitly disable source-encryption
-// preservation and drop /Encrypt entirely. The flag exists so qtest cases can
-// use qpdf's silent decryption spelling. These tests pin the silence + no-op
+// `--decrypt` is qpdf's silent encryption-removal flag. Unlike
+// `--remove-restrictions`, it explicitly disables source-encryption
+// preservation and drops /Encrypt. These tests pin its silence + no-op
 // semantics.
 // ---------------------------------------------------------------------------
 

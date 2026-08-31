@@ -674,9 +674,11 @@ struct Cli {
     /// production.** Mirrors `qpdf --static-aes-iv`.
     #[arg(long = "static-aes-iv", hide = true)]
     static_aes_iv: bool,
-    /// Strip encryption and advisory permission restrictions from the output
-    /// (top-level alias of `flpdf rewrite --remove-restrictions`; qpdf
-    /// `--remove-restrictions` equivalent). Does NOT bypass authentication.
+    /// Remove digital-signature restrictions while preserving authenticated
+    /// source encryption (top-level alias of `flpdf rewrite
+    /// --remove-restrictions`; qpdf `--remove-restrictions` equivalent).
+    /// Combine with `--decrypt` to strip encryption too. Does NOT bypass
+    /// authentication.
     // This is a rewrite-path modifier. main()'s dispatch chain runs the
     // inspection modes (--check / --show-object / --show-*) before the
     // rewrite branch, so without these conflicts `flpdf --check
@@ -700,9 +702,9 @@ struct Cli {
     /// qpdf), unlike `--remove-restrictions` which prints a one-line
     /// diagnostic when an encrypted input was de-restricted.
     ///
-    /// Relationship with `--remove-restrictions`: both select the same
-    /// unencrypted output bytes; this flag is silent while
-    /// `--remove-restrictions` prints its diagnostic.
+    /// Relationship with `--remove-restrictions`: this flag removes source
+    /// encryption, while `--remove-restrictions` preserves it and only removes
+    /// digital-signature restrictions. The latter prints a diagnostic.
     // Same conflict semantics as --remove-restrictions: this is a
     // rewrite-path modifier and must be rejected against the inspection
     // subcommands so `flpdf --check --decrypt in out` is a usage error
@@ -1335,16 +1337,16 @@ struct RewriteCommand {
     /// production.** Mirrors `qpdf --static-aes-iv`.
     #[arg(long = "static-aes-iv", hide = true)]
     static_aes_iv: bool,
-    /// Strip encryption and advisory permission restrictions from the output
-    /// (qpdf `--remove-restrictions` equivalent).
+    /// Remove digital-signature restrictions while preserving authenticated
+    /// source encryption (qpdf `--remove-restrictions` equivalent). Combine
+    /// with `--decrypt` to strip encryption too.
     ///
     /// A normal rewrite preserves authenticated source encryption. This flag
-    /// explicitly disables that preservation, removes `/Encrypt` (and its
-    /// advisory `/P` permissions), and prints a one-line diagnostic when an
-    /// encrypted input was de-restricted. It does NOT bypass authentication.
+    /// removes qpdf's digital-signature restrictions and prints a one-line
+    /// diagnostic when an encrypted input was de-restricted. It does NOT
+    /// bypass authentication.
     ///
-    /// See `--decrypt` for the silent qpdf-compatible variant; on the current
-    /// rewrite path the two flags produce identical output bytes.
+    /// See `--decrypt` for the silent qpdf-compatible encryption-removal flag.
     #[arg(long = "remove-restrictions")]
     remove_restrictions: bool,
     /// Strip the `/Encrypt` dictionary from the output (qpdf `--decrypt`
@@ -1352,9 +1354,9 @@ struct RewriteCommand {
     /// authenticate; on plaintext input it is a no-op pass-through. Silent
     /// in both cases, matching qpdf `--decrypt`.
     ///
-    /// Relationship with `--remove-restrictions`: both select the same
-    /// unencrypted output bytes; this flag is silent while
-    /// `--remove-restrictions` prints its diagnostic.
+    /// Relationship with `--remove-restrictions`: this flag removes source
+    /// encryption, while `--remove-restrictions` preserves it and only removes
+    /// digital-signature restrictions. The latter prints a diagnostic.
     #[arg(long = "decrypt")]
     decrypt: bool,
     /// Encrypt the output (qpdf `--encrypt` compatible). See the top-level
@@ -3909,7 +3911,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             false
         };
         let mut options = options;
-        if decrypt || remove_restrictions {
+        if decrypt {
             options.preserve_encryption = false;
         }
         if let Some(mode) = flatten_annotations_mode {
@@ -3939,8 +3941,8 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         if had_signatures {
             logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
         }
-        // On an encrypted input, `--decrypt`/`--remove-restrictions` has
-        // already disabled source-encryption preservation above.
+        // On an encrypted input, `--decrypt` has already disabled
+        // source-encryption preservation above.
         finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     } else {
         // Capture encryption state before the write for the qpdf-compatible
@@ -3959,7 +3961,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             false
         };
         let mut options = options;
-        if decrypt || remove_restrictions {
+        if decrypt {
             options.preserve_encryption = false;
         }
         // ── Content mutation pass ─────────────────────────────────────────────
@@ -4133,7 +4135,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
         if remove_restrictions && was_encrypted {
-            eprintln!("flpdf: removed restrictions (encryption and advisory permissions stripped)");
+            eprintln!("flpdf: removed restrictions (digital-signature restrictions stripped)");
         }
         if had_signatures {
             logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
