@@ -117,9 +117,12 @@ fn select_single_source_pages<R: Read + Seek>(
     }
 
     if selected.is_empty() {
+        // cov:ignore-start: PagePlan rejects empty source page selections, so
+        // a non-empty validated plan always contributes at least one page.
         return Err(Error::Unsupported(
             "--pages: page selection is empty".into(),
         ));
+        // cov:ignore-end
     }
     Ok(selected)
 }
@@ -770,9 +773,11 @@ impl super::QPDFJob {
         preserve_unreferenced: bool,
     ) -> Result<PageSpecJobOutput<'a, R>> {
         if sources.len() == 1 && specs.iter().all(|spec| spec.source_index == 0) {
+            // cov:ignore-start: len()==1 guarantees first_mut() succeeds.
             let source = sources.first_mut().ok_or_else(|| {
                 Error::Unsupported("--pages: a primary source is required".to_owned())
             })?;
+            // cov:ignore-end
             let (result, prune_mode) =
                 handle_single_source_page_specs(self, source, specs, collate, resource_mode)?;
             return Ok(PageSpecJobOutput::InPlace {
@@ -1054,7 +1059,7 @@ mod tests {
         let specs = [PageSpecInput::new(0, PageRange::parse("2").unwrap())];
         let mut job = QPDFJob::new();
 
-        match job
+        let output = job
             .handle_page_specs(
                 &mut sources,
                 &specs,
@@ -1062,24 +1067,21 @@ mod tests {
                 RemoveUnreferencedResources::Auto,
                 false,
             )
-            .expect("single-source page job")
+            .expect("single-source page job");
+        assert!(matches!(&output, PageSpecJobOutput::InPlace { .. }));
+        if let PageSpecJobOutput::InPlace {
+            pdf,
+            result,
+            prune_mode: _,
+        } = output
         {
-            PageSpecJobOutput::InPlace {
-                pdf,
-                result,
-                prune_mode: _,
-            } => {
-                assert_eq!(result.new_kids.len(), 1);
-                assert_eq!(selected_page_count(pdf), 1);
-                assert!(pdf
-                    .repair_diagnostics()
-                    .entries()
-                    .iter()
-                    .all(|entry| !entry.message.contains("foreign object")));
-            }
-            PageSpecJobOutput::Merged(_) => {
-                panic!("one-source page jobs must retain the primary Pdf in place")
-            }
+            assert_eq!(result.new_kids.len(), 1);
+            assert_eq!(selected_page_count(pdf), 1);
+            assert!(pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .all(|entry| !entry.message.contains("foreign object")));
         }
     }
 
@@ -1101,11 +1103,30 @@ mod tests {
                 false,
             )
             .expect("repeated single-source page job");
-        let PageSpecJobOutput::InPlace { pdf, result, .. } = output else {
-            panic!("repeated one-source page jobs must stay on the primary Pdf")
-        };
-        assert_eq!(result.new_kids.len(), 2);
-        assert_eq!(selected_page_count(pdf), 2);
+        assert!(matches!(&output, PageSpecJobOutput::InPlace { .. }));
+        if let PageSpecJobOutput::InPlace { pdf, result, .. } = output {
+            assert_eq!(result.new_kids.len(), 2);
+            assert_eq!(selected_page_count(pdf), 2);
+        }
+    }
+
+    #[test]
+    fn single_source_page_planner_reports_its_input_errors() {
+        let mut source = three_page_pdf();
+        assert!(select_single_source_pages(&mut source, &[], None).is_err());
+        assert!(select_single_source_pages(&mut source, &[], Some(0)).is_err());
+        assert!(select_single_source_pages(
+            &mut source,
+            &[PageSpecInput::new(1, PageRange::parse("1").unwrap())],
+            None,
+        )
+        .is_err());
+        assert!(select_single_source_pages(
+            &mut source,
+            &[PageSpecInput::new(0, PageRange::parse("999").unwrap())],
+            None,
+        )
+        .is_err());
     }
 
     #[test]
