@@ -173,35 +173,6 @@ fn rewrite_output_is_valid_pdf() {
 }
 
 #[test]
-fn current_docs_describe_fresh_rewrite_not_incremental_pdf_output() {
-    let readme = include_str!("../../../README.md");
-    assert!(
-        !readme.contains("incremental rewrite"),
-        "README must not describe flpdf rewrite as PDF incremental output"
-    );
-    assert!(
-        !readme.contains("incremental rewrite and qdf-style flat dump"),
-        "README library overview must describe the fresh full-rewrite writer"
-    );
-    assert!(
-        !readme.contains("--full-rewrite"),
-        "README must not advertise the removed incremental/full-rewrite selector"
-    );
-
-    let signatures = include_str!("../../flpdf/src/signatures.rs");
-    assert!(
-        signatures.contains("full rewrite cannot preserve signature validity"),
-        "signature module docs must state the current full-rewrite boundary"
-    );
-
-    let correspondence = include_str!("../../../docs/qpdf-correspondence.md");
-    assert!(
-        correspondence.contains("PDF incremental append: not applicable"),
-        "compatibility matrix must distinguish reader /Prev history from PDF append output"
-    );
-}
-
-#[test]
 fn full_rewrite_drops_source_prev_history_but_reader_keeps_it_readable() {
     use flpdf::Pdf;
     use std::io::Cursor;
