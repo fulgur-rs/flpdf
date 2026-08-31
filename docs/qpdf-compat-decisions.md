@@ -49,7 +49,7 @@ raw bytes for `Json::write` to base64-encode into an inline string value, not
 an output sink. Custom logger destinations correspond to `QPDFLogger`'s
 `PipelineHandle`-typed setters (`logger.rs`'s `set_info`/`set_warn`/
 `set_error`/`set_save`), and progress reporting corresponds to
-`PdfWriter::register_progress_reporter`/`Job::register_progress_reporter`,
+`PdfWriter::register_progress_reporter`/`QPDFJob::register_progress_reporter`,
 whose closures return the crate-wide `Result<()>`. These paths preserve
 callback bytes, error propagation, and finish ownership for their actual
 Rust consumers. Do not add a standalone `PlFunction` stage unless a future C
