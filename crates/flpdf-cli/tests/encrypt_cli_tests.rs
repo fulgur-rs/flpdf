@@ -1079,6 +1079,17 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
             &["u", "", "128", "--allow-insecure"],
             "unrecognized argument",
         ),
+        // A sub-flag missing its leading `-` must not be silently reinterpreted
+        // as the corresponding named flag (qpdf rejects it as an unrecognized
+        // positional argument, not as `--force-R5`).
+        (&["u", "o", "256", "force-R5"], "unrecognized argument"),
+        // In the dashed `--user-password=`/`--bits=` form, qpdf stays in its
+        // password-argument table (no named options recognized) until `--bits`
+        // selects the key-length-specific table.
+        (
+            &["--user-password=u", "--allow-insecure", "--bits=256"],
+            "unrecognized argument",
+        ),
     ];
     for (enc_args, needle) in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -1101,6 +1112,32 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
             "no output for incompatible combo {enc_args:?}"
         );
     }
+}
+
+/// A zero-token `--encrypt --` segment must be rejected the same as an
+/// absent one is accepted — clap's `num_args = 0..` means both an omitted
+/// `--encrypt` and one given with no sub-arguments produce an empty list, so
+/// the two must stay distinguishable or `--encrypt --` would silently write
+/// an unencrypted (plaintext) output despite the user asking for encryption
+/// (qpdf itself rejects this with "encryption key length is required").
+#[test]
+fn encrypt_empty_segment_is_rejected_not_treated_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("nope.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--encrypt", "--"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "--encrypt requires USER-PW OWNER-PW KEY-LEN",
+        ));
+    assert!(
+        !output.exists(),
+        "no output must be written for an empty --encrypt segment"
+    );
 }
 
 /// flpdf-9hc.4.9.5: the R>=3 `--encrypt` permission sub-flags must produce the

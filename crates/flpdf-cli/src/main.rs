@@ -989,7 +989,7 @@ struct Cli {
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
     )]
-    encrypt: Vec<String>,
+    encrypt: Option<Vec<String>>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
@@ -1372,7 +1372,7 @@ struct RewriteCommand {
             "copy_encryption",
         ]
     )]
-    encrypt: Vec<String>,
+    encrypt: Option<Vec<String>>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
@@ -2275,7 +2275,7 @@ fn main() {
         // plaintext output even though the user asked for encryption.
         apply_encryption_options(
             &mut options,
-            &args.encrypt,
+            args.encrypt.as_deref(),
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             &args.password,
@@ -2316,7 +2316,7 @@ fn main() {
         // (mirrors the existing `--decrypt` / `--remove-restrictions`
         // rejection in the subcommand surface). Wiring encryption
         // through the page-op pipeline is a flpdf-9hc.4.9 follow-up.
-        if !args.encrypt.is_empty() {
+        if args.encrypt.is_some() {
             eprintln!(
                 "flpdf: --encrypt is not applied in the \
                  --pages/--rotate/--split-pages/--collate pipeline; \
@@ -2438,7 +2438,7 @@ fn main() {
         // the non-page-op branch, so no further page-op guard is needed here.
         apply_encryption_options(
             &mut options,
-            &args.encrypt,
+            args.encrypt.as_deref(),
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             &args.password,
@@ -3003,7 +3003,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // apply_encryption_options).
             apply_encryption_options(
                 &mut options,
-                &cmd.encrypt,
+                cmd.encrypt.as_deref(),
                 cmd.copy_encryption.as_deref(),
                 cmd.encryption_file_password.as_deref(),
                 &cmd.password,
@@ -3065,7 +3065,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 if coalesce_contents
                     || cmd.remove_restrictions
                     || cmd.decrypt
-                    || !cmd.encrypt.is_empty()
+                    || cmd.encrypt.is_some()
                     || cmd.copy_encryption.is_some()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
@@ -3204,12 +3204,12 @@ fn run_check_linearization(
 /// fires.
 fn apply_encryption_options(
     options: &mut WriterOptions,
-    encrypt: &[String],
+    encrypt: Option<&[String]>,
     copy_encryption: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
     password_args: &PasswordArgs,
 ) {
-    if !encrypt.is_empty() {
+    if let Some(encrypt) = encrypt {
         match parse_encrypt_segment(encrypt, password_args.allow_weak_crypto) {
             Ok(parsed) => {
                 if parsed.accessibility_warning {
@@ -3418,6 +3418,15 @@ fn parse_encrypt_segment(
             if !token.starts_with('-') || token == "-" {
                 return Err("positional and dashed encryption arguments may not be mixed".into());
             }
+            // qpdf's password-argument table has no key-specific options;
+            // `--bits` must select the key-length-specific table before any
+            // other named option is recognized.
+            if !key_len_seen {
+                return Err(format!(
+                    "unrecognized argument {token} (encryption options must be terminated with --)"
+                )
+                .into());
+            }
             subflags.push(token.clone());
         } else if positional.len() < 3 {
             if token.starts_with('-') && token != "-" {
@@ -3429,6 +3438,12 @@ fn parse_encrypt_segment(
             positional_mode = true;
             positional.push(token.clone());
         } else {
+            if !token.starts_with('-') || token == "-" {
+                return Err(format!(
+                    "unrecognized argument {token} (encryption options must be terminated with --)"
+                )
+                .into());
+            }
             subflags.push(token.clone());
         }
         index += 1;
