@@ -39,6 +39,31 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process::Command as ShellCommand;
 
+/// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
+/// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
+/// translates every `\n` write to `\r\n`; flpdf's CLI writes plain `\n`
+/// everywhere, matching qpdf's C++ source (`cout << "...\n"`) rather than
+/// that platform-specific translation. Comparing raw bytes on Windows would
+/// therefore flag a line-ending artifact of the oracle process, not a real
+/// content difference (same pattern as `cli_logger_routing.rs`/
+/// `cli_attachment_lifecycle.rs`/`encrypt_cli_tests.rs`).
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+
+    normalized
+}
+
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const V4_AES: &str = "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf";
 const V5_R6: &str = "../../tests/fixtures/encrypted/v5-aes-256-r6.pdf";
@@ -214,8 +239,14 @@ fn check_show_encryption_key_matches_qpdf() {
         .expect("run flpdf --check --show-encryption-key");
 
     assert_eq!(flpdf.status, qpdf.status);
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr)
+    );
 }
 
 #[test]
