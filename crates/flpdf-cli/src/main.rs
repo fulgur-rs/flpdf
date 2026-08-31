@@ -3362,6 +3362,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.page_ops,
                         overlay_specs,
                         options,
+                        cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                     )
                 } else if !cmd.page_ops.pages.is_empty() {
