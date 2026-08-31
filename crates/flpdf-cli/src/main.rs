@@ -1108,12 +1108,13 @@ struct PageOpArgs {
     #[arg(
         long = "collate",
         num_args = 0..=1,
+        action = clap::ArgAction::Append,
         default_missing_value = "1",
         require_equals = true,
-        value_name = "N",
-        help = "Collate --pages selections in groups of N (qpdf --collate[=n], default 1)"
+        value_name = "N[,M,...]",
+        help = "Collate --pages selections in groups of N[,M,...] (qpdf --collate[=n[,m,...]], default 1)"
     )]
-    collate: Option<String>,
+    collate: Vec<String>,
 
     /// `qpdf --empty` — start from an empty document. Parsed for qpdf-script
     /// compatibility but NOT implemented at this layer (would silently
@@ -2024,6 +2025,7 @@ fn main() {
         }
     };
     let args = Cli::parse_from(residual_args);
+    validate_collate_values(&args.page_ops.collate);
     let top_level_version_options =
         match parse_cli_version_options(args.min_version.as_deref(), args.force_version.as_deref())
         {
@@ -2965,6 +2967,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             run_show_encryption_key(&cmd.input, cmd.repair, &cmd.password)
         }
         Commands::Rewrite(cmd) => {
+            validate_collate_values(&cmd.page_ops.collate);
             let version_options = match parse_cli_version_options(
                 cmd.min_version.as_deref(),
                 cmd.force_version.as_deref(),
@@ -4555,24 +4558,28 @@ fn build_overlay_specs(
     Ok(built)
 }
 
-/// Parse `--collate` value: `n` or `i,j,k,...`. flpdf's [`collate`] supports a
-/// single chunk size `n`; the comma form is parsed but only the first value is
-/// honoured (a documented divergence — full per-input groups are out of
-/// scope).
-fn parse_collate_n(raw: &str) -> CliResult<usize> {
-    // Only a single positive integer is supported. Silently using the first
-    // value of `--collate=1,2` would emit a different page order than the
-    // user asked for, so reject comma-separated group lists explicitly.
-    let n: usize = raw.parse().map_err(|_| {
-        format!(
-            "--collate: expected a single positive integer, got {raw:?} \
-             (comma-separated group lists are not supported)"
-        )
-    })?;
-    if n == 0 {
-        return Err("--collate: group size must be >= 1".into());
+/// Parse each raw CLI `--collate` occurrence through the shared qpdf job
+/// configuration parser. qpdf appends values when the option is repeated, so
+/// preserve occurrence order in the returned vector.
+fn parse_collate_values(raw_values: &[String]) -> CliResult<Option<Vec<usize>>> {
+    if raw_values.is_empty() {
+        return Ok(None);
     }
-    Ok(n)
+    let mut values = Vec::new();
+    for raw in raw_values {
+        values.extend(QPDFJob::parse_collate(raw)?);
+    }
+    Ok(Some(values))
+}
+
+fn validate_collate_values(raw_values: &[String]) {
+    if let Err(error) = parse_collate_values(raw_values) {
+        if let Some(usage_error) = find_usage_error(error.as_ref()) {
+            usage_exit(usage_error);
+        }
+        emit_logger_error(format!("{}: {error}\n", progname()));
+        std::process::exit(2);
+    }
 }
 
 /// Basename of `p` for `--verbose --pages` progress lines (qpdf uses the
@@ -4888,11 +4895,7 @@ fn run_page_extraction_from_multiple_sources(
         .ok_or("--pages: primary input was not opened")?
         .writer_copy_encryption_source()?;
 
-    let collate = page_ops
-        .collate
-        .as_deref()
-        .map(parse_collate_n)
-        .transpose()?;
+    let collate = parse_collate_values(&page_ops.collate)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
@@ -4900,7 +4903,7 @@ fn run_page_extraction_from_multiple_sources(
     let page_output = job.handle_page_specs(
         &mut sources,
         &specs,
-        collate,
+        collate.as_deref(),
         remove_unref.into(),
         options.preserve_unreferenced_objects,
     )?;
@@ -5005,11 +5008,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
         .iter()
         .map(|input| PageSpecInput::new(0, input.range.clone()))
         .collect();
-    let collate = page_ops
-        .collate
-        .as_deref()
-        .map(parse_collate_n)
-        .transpose()?;
+    let collate = parse_collate_values(&page_ops.collate)?;
     let mut sources = vec![pdf];
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -5018,7 +5017,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     let page_output = job.handle_page_specs(
         &mut sources,
         &specs,
-        collate,
+        collate.as_deref(),
         remove_unref.into(),
         options.preserve_unreferenced_objects,
     )?;
@@ -5130,9 +5129,6 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     combined_pages: Vec<CombinedPage>,
 ) -> CliResult<()> {
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
-    if selected.is_empty() {
-        return Err("--pages: page selection is empty".into());
-    }
 
     let (result, prune_mode) = if let Some((result, prune_mode)) = page_job_result {
         (result, prune_mode)

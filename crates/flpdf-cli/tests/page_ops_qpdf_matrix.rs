@@ -1462,6 +1462,179 @@ fn collate_n_gt_1_matches_qpdf_count() {
     );
 }
 
+#[test]
+fn collate_comma_separated_values_match_qpdf_page_order() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary_file = distinct_pages_pdf(3);
+    let secondary_file = distinct_pages_pdf(4);
+    let primary = primary_file.path();
+    let secondary = secondary_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let common = [
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        secondary.to_str().unwrap(),
+        "1-4",
+        "--",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.extend(["--collate=2,3", q.to_str().unwrap()]);
+    let mut f_args = common.to_vec();
+    f_args.extend(["--collate=2,3", f.to_str().unwrap()]);
+
+    let (q_ok, _) = run_qpdf(&q_args);
+    assert!(q_ok, "qpdf must accept comma-separated collate values");
+    flpdf_ok(&f_args);
+
+    assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+    assert_eq!(npages_of(&f), 7);
+}
+
+#[test]
+fn collate_repeated_values_match_the_equivalent_qpdf_comma_list() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary_file = distinct_pages_pdf(3);
+    let secondary_file = distinct_pages_pdf(4);
+    let primary = primary_file.path();
+    let secondary = secondary_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let common = [
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        secondary.to_str().unwrap(),
+        "1-4",
+        "--",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.extend(["--collate=2", "--collate=3", q.to_str().unwrap()]);
+    let mut f_args = common.to_vec();
+    f_args.extend(["--collate=2", "--collate=3", f.to_str().unwrap()]);
+
+    let (q_ok, _) = run_qpdf(&q_args);
+    assert!(q_ok, "qpdf must accept repeated collate parameters");
+    flpdf_ok(&f_args);
+
+    assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+}
+
+#[test]
+fn collate_zero_matches_qpdf_empty_page_result() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source_file = distinct_pages_pdf(3);
+    let source = source_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+    let common = [
+        source.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-3",
+        ".",
+        "1-3",
+        "--",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.extend(["--collate=0", q.to_str().unwrap()]);
+    let mut f_args = common.to_vec();
+    f_args.extend(["--collate=0", f.to_str().unwrap()]);
+
+    let (q_ok, _) = run_qpdf(&q_args);
+    assert!(q_ok, "qpdf accepts zero collate groups");
+    flpdf_ok(&f_args);
+
+    assert_eq!(npages_of(&q), 0);
+    assert_eq!(npages_of(&f), 0);
+    assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+}
+
+#[test]
+fn collate_invalid_parameter_without_pages_is_rejected_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source_file = distinct_pages_pdf(1);
+    let source = source_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let q_output = Shell::new(QPDF)
+        .args([
+            "--collate=2,",
+            source.to_str().unwrap(),
+            q.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--collate=2,",
+            source.to_str().unwrap(),
+            f.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(q_output.status.code(), Some(2));
+    assert_eq!(f_output.status.code(), Some(2));
+}
+
+#[test]
+fn collate_vector_cardinality_error_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source_file = distinct_pages_pdf(3);
+    let source = source_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+    let common = [
+        source.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        ".",
+        "2",
+        ".",
+        "3",
+        "--",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.extend(["--collate=2,3", q.to_str().unwrap()]);
+    let mut f_args = common.to_vec();
+    f_args.extend(["--collate=2,3", f.to_str().unwrap()]);
+
+    let q_output = Shell::new(QPDF).args(q_args).output().unwrap();
+    let f_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(f_args)
+        .output()
+        .unwrap();
+
+    assert_eq!(q_output.status.code(), Some(2));
+    assert_eq!(f_output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&f_output.stderr).contains("one value per page specification"));
+}
+
 // ===========================================================================
 // Combinations
 // ===========================================================================

@@ -131,7 +131,7 @@ git commit -m "feat: allow empty qpdf page-tree selections"
 // Two specifications, explicit per-spec groups: [1, 2] then [1, 3]...
 // A single value is padded to every specification.
 assert_eq!(selected_indices(&mut source, &two_specs, Some(&[2, 1])), vec![1, 2, 1, 3, 2, 3]);
-assert_eq!(selected_indices(&mut source, &two_specs, Some(&[2])), vec![1, 2, 1, 2, 3]);
+assert_eq!(selected_indices(&mut source, &two_specs, Some(&[2])), vec![1, 2, 1, 2, 3, 3]);
 
 // Zero is valid and can produce an empty page result.
 assert!(selected_indices(&mut source, &two_specs, Some(&[0])).is_empty());
@@ -241,7 +241,7 @@ Run: `cargo test -p flpdf --test page_job_route_cutover_tests --quiet`
 
 Run: `python3 scripts/check-qpdf-deviation-markers.py --check`
 
-Run: `python3 scripts/check-qpdf-correspondence.py --check`
+Run: `python3 scripts/qpdf-module-docs.py --check`
 
 Expected: PASS with no new deviation marker and no stale collate route.
 

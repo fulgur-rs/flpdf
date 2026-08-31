@@ -17,7 +17,7 @@ use crate::page_label_document_helper::LabelRange;
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::{
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
-    Pdf, Result,
+    Pdf, Result, UsageError,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -68,16 +68,11 @@ pub enum PageSpecJobOutput<'a, R: Read + Seek + 'static> {
 fn select_single_source_pages<R: Read + Seek>(
     source: &mut Pdf<R>,
     specs: &[PageSpecInput],
-    collate: Option<usize>,
+    collate: Option<&[usize]>,
 ) -> Result<Vec<super::page_plan::SelectedPage>> {
     if specs.is_empty() {
         return Err(Error::Unsupported(
             "--pages: no page specifications were supplied".into(),
-        ));
-    }
-    if collate == Some(0) {
-        return Err(Error::Unsupported(
-            "--collate chunk size must be >= 1; got 0".into(),
         ));
     }
 
@@ -97,34 +92,63 @@ fn select_single_source_pages<R: Read + Seek>(
     }
 
     let mut selected = Vec::new();
-    if let Some(chunk) = collate {
-        let mut cursors = vec![0usize; plans.len()];
-        loop {
-            let mut emitted = false;
-            for (plan_index, plan) in plans.iter().enumerate() {
-                let start = cursors[plan_index];
-                let end = start.saturating_add(chunk).min(plan.pages().len());
-                selected.extend(plan.pages()[start..end].iter().cloned());
-                emitted |= end > start;
-                cursors[plan_index] = end;
+    let collate_values = collate_values_for_specs(collate, plans.len())?;
+    if plans.len() > 1 {
+        if let Some(values) = collate_values.as_deref() {
+            let mut cursors = vec![0usize; plans.len()];
+            loop {
+                let mut emitted = false;
+                for (plan_index, plan) in plans.iter().enumerate() {
+                    let start = cursors[plan_index];
+                    let end = start
+                        .saturating_add(values[plan_index])
+                        .min(plan.pages().len());
+                    selected.extend(plan.pages()[start..end].iter().cloned());
+                    emitted |= end > start;
+                    cursors[plan_index] = end;
+                }
+                if !emitted {
+                    break;
+                }
             }
-            if !emitted {
-                break;
-            }
+        } else {
+            selected.extend(plans.iter().flat_map(|plan| plan.pages().iter().cloned()));
         }
     } else {
-        selected.extend(plans.into_iter().flat_map(|plan| plan.pages().to_vec()));
+        selected.extend(plans.iter().flat_map(|plan| plan.pages().iter().cloned()));
     }
 
-    if selected.is_empty() {
-        // cov:ignore-start: PagePlan rejects empty source page selections, so
-        // a non-empty validated plan always contributes at least one page.
+    let allows_empty_selection = plans.len() > 1
+        && collate_values
+            .as_ref()
+            .is_some_and(|values| values.iter().all(|&value| value == 0));
+    if selected.is_empty() && !allows_empty_selection {
         return Err(Error::Unsupported(
             "--pages: page selection is empty".into(),
         ));
-        // cov:ignore-end
     }
     Ok(selected)
+}
+
+fn collate_values_for_specs(
+    collate: Option<&[usize]>,
+    spec_count: usize,
+) -> Result<Option<Vec<usize>>> {
+    let Some(values) = collate else {
+        return Ok(None);
+    };
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 1 && values.len() != spec_count {
+        return Err(Error::Usage(UsageError::new(
+            "--pages: if --collate has more than one value, it must have one value per page specification",
+        )));
+    }
+    if values.len() == 1 && spec_count > 1 {
+        return Ok(Some(vec![values[0]; spec_count]));
+    }
+    Ok(Some(values.to_vec()))
 }
 
 /// Apply qpdf's same-document duplicate-page annotation copy while adding a
@@ -160,7 +184,7 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     job: &mut super::QPDFJob,
     source: &mut Pdf<R>,
     specs: &[PageSpecInput],
-    collate: Option<usize>,
+    collate: Option<&[usize]>,
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<(RebuildResult, RemoveUnreferencedResources)> {
     let selected = select_single_source_pages(source, specs, collate)?;
@@ -491,7 +515,7 @@ fn handle_page_specs<R: Read + Seek + 'static>(
     job: &mut super::QPDFJob,
     sources: &mut [Pdf<R>],
     specs: &[PageSpecInput],
-    collate: Option<usize>,
+    collate: Option<&[usize]>,
     resource_mode: RemoveUnreferencedResources,
     preserve_unreferenced: bool,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
@@ -505,12 +529,6 @@ fn handle_page_specs<R: Read + Seek + 'static>(
             "--pages: no page specifications were supplied".into(),
         ));
     }
-    if collate == Some(0) {
-        return Err(Error::Unsupported(
-            "--collate chunk size must be >= 1; got 0".into(),
-        ));
-    }
-
     // Build one PagePlan per *specification*, rather than one per source.
     // Repeated occurrences of the same file are distinct qpdf specs and must
     // remain distinct for collate ordering even though their object-copy
@@ -531,6 +549,7 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         })?;
         plans.push(plan);
     }
+    let collate_values = collate_values_for_specs(collate, plans.len())?;
 
     // `grouped_pages[source]` is the order in which that source is handed to
     // merge_documents. `ordered_pages` records the corresponding final order
@@ -546,23 +565,33 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         ordered_pages.push((source_index, group_index));
     };
 
-    if let Some(chunk) = collate {
-        let mut cursors = vec![0usize; plans.len()];
-        loop {
-            let mut emitted = false;
+    if plans.len() > 1 {
+        if let Some(values) = collate_values.as_deref() {
+            let mut cursors = vec![0usize; plans.len()];
+            loop {
+                let mut emitted = false;
+                for (spec_index, plan) in plans.iter().enumerate() {
+                    let start = cursors[spec_index];
+                    let end = start
+                        .saturating_add(values[spec_index])
+                        .min(plan.pages().len());
+                    for page in &plan.pages()[start..end] {
+                        append_page(specs[spec_index].source_index, page.index_1based);
+                    }
+                    if end > start {
+                        emitted = true;
+                    }
+                    cursors[spec_index] = end;
+                }
+                if !emitted {
+                    break;
+                }
+            }
+        } else {
             for (spec_index, plan) in plans.iter().enumerate() {
-                let start = cursors[spec_index];
-                let end = start.saturating_add(chunk).min(plan.pages().len());
-                for page in &plan.pages()[start..end] {
+                for page in plan.pages() {
                     append_page(specs[spec_index].source_index, page.index_1based);
                 }
-                if end > start {
-                    emitted = true;
-                }
-                cursors[spec_index] = end;
-            }
-            if !emitted {
-                break;
             }
         }
     } else {
@@ -573,7 +602,11 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         }
     }
 
-    if ordered_pages.is_empty() {
+    let allows_empty_selection = plans.len() > 1
+        && collate_values
+            .as_ref()
+            .is_some_and(|values| values.iter().all(|&value| value == 0));
+    if ordered_pages.is_empty() && !allows_empty_selection {
         return Err(Error::Unsupported(
             "--pages: page selection is empty".into(),
         ));
@@ -752,8 +785,10 @@ impl super::QPDFJob {
     /// at index zero, and must remain mutable because page-tree repair and
     /// inherited-attribute materialization are part of the qpdf copy
     /// operation. `collate` is `None` for the ordinary concatenation order
-    /// and `Some(n)` for qpdf's `--collate=n`; zero is rejected before any
-    /// document is mutated. `resource_mode` is qpdf's
+    /// and `Some(values)` for qpdf's `--collate=n[,m,...]`; a single value is
+    /// applied to every specification, and zero is a valid group size. A
+    /// vector with more than one value must have one value per specification.
+    /// `resource_mode` is qpdf's
     /// `--remove-unreferenced-resources={auto,yes,no}` job-level policy
     /// (qpdf's default is `auto`). `preserve_unreferenced` is qpdf's
     /// `--preserve-unreferenced` writer policy (`QPDFWriter.cc:2907-2913`),
@@ -768,7 +803,7 @@ impl super::QPDFJob {
         &mut self,
         sources: &'a mut [Pdf<R>],
         specs: &[PageSpecInput],
-        collate: Option<usize>,
+        collate: Option<&[usize]>,
         resource_mode: RemoveUnreferencedResources,
         preserve_unreferenced: bool,
     ) -> Result<PageSpecJobOutput<'a, R>> {
@@ -893,6 +928,18 @@ mod tests {
         crate::pages::page_refs(pdf)
             .expect("read merged page tree")
             .len()
+    }
+
+    fn selected_indices(
+        source: &mut Pdf<Cursor<Vec<u8>>>,
+        specs: &[PageSpecInput],
+        collate: Option<&[usize]>,
+    ) -> Vec<u32> {
+        select_single_source_pages(source, specs, collate)
+            .expect("valid page specifications")
+            .into_iter()
+            .map(|page| page.index_1based)
+            .collect()
     }
 
     fn resolved_object(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
@@ -1117,7 +1164,7 @@ mod tests {
         assert!(select_single_source_pages(
             &mut source,
             &[PageSpecInput::new(0, PageRange::parse("1").unwrap())],
-            Some(0),
+            Some(&[1, 2]),
         )
         .is_err());
         assert!(select_single_source_pages(
@@ -1132,6 +1179,60 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn collate_value_cardinality_matches_qpdf() {
+        assert_eq!(collate_values_for_specs(None, 2).unwrap(), None);
+        assert_eq!(collate_values_for_specs(Some(&[]), 2).unwrap(), None);
+        assert_eq!(
+            collate_values_for_specs(Some(&[2]), 2).unwrap(),
+            Some(vec![2, 2])
+        );
+        assert_eq!(
+            collate_values_for_specs(Some(&[2, 3]), 2).unwrap(),
+            Some(vec![2, 3])
+        );
+        assert!(collate_values_for_specs(Some(&[1, 2, 3]), 2).is_err());
+    }
+
+    #[test]
+    fn single_source_page_planner_applies_qpdf_collate_values_per_spec() {
+        let specs = [
+            PageSpecInput::new(0, PageRange::parse("1-3").unwrap()),
+            PageSpecInput::new(0, PageRange::parse("1-3").unwrap()),
+        ];
+
+        let mut source = three_page_pdf();
+        assert_eq!(
+            selected_indices(&mut source, &specs, Some(&[2, 1])),
+            vec![1, 2, 1, 3, 2, 3]
+        );
+
+        let mut source = three_page_pdf();
+        assert_eq!(
+            selected_indices(&mut source, &specs, Some(&[2])),
+            vec![1, 2, 1, 2, 3, 3]
+        );
+
+        let mut source = three_page_pdf();
+        assert!(selected_indices(&mut source, &specs, Some(&[0])).is_empty());
+
+        let mut source = three_page_pdf();
+        assert_eq!(
+            selected_indices(&mut source, &specs, Some(&[0, 1])),
+            vec![1, 2, 3]
+        );
+
+        let mut source = three_page_pdf();
+        let single_spec = [PageSpecInput::new(0, PageRange::parse("1").unwrap())];
+        assert_eq!(
+            selected_indices(&mut source, &single_spec, Some(&[0])),
+            vec![1]
+        );
+
+        let mut source = three_page_pdf();
+        assert!(select_single_source_pages(&mut source, &specs, Some(&[1, 2, 3])).is_err());
     }
 
     #[test]
@@ -1246,17 +1347,6 @@ mod tests {
         .is_err());
 
         let mut sources = vec![three_page_pdf()];
-        assert!(handle_page_specs(
-            &mut QPDFJob::new(),
-            &mut sources,
-            &spec,
-            Some(0),
-            RemoveUnreferencedResources::Auto,
-            false,
-        )
-        .is_err());
-
-        let mut sources = vec![three_page_pdf()];
         let missing = [PageSpecInput::new(1, PageRange::parse("1").unwrap())];
         assert!(handle_page_specs(
             &mut QPDFJob::new(),
@@ -1320,12 +1410,56 @@ mod tests {
             &mut QPDFJob::new(),
             &mut sources,
             &collated,
-            Some(1),
+            Some(&[1]),
             RemoveUnreferencedResources::Auto,
             false,
         )
         .unwrap();
         assert_eq!(selected_page_count(&mut collated_output), 4);
+    }
+
+    #[test]
+    fn handle_page_specs_accepts_per_spec_and_zero_collate_values() {
+        let specs = [
+            PageSpecInput::new(0, PageRange::parse("1-3").unwrap()),
+            PageSpecInput::new(1, PageRange::parse("1-3").unwrap()),
+        ];
+
+        let mut sources = vec![three_page_pdf(), three_page_pdf()];
+        let mut per_spec = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            Some(&[2, 3]),
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("per-spec collate values are valid");
+        assert_eq!(selected_page_count(&mut per_spec), 6);
+
+        let mut sources = vec![three_page_pdf(), three_page_pdf()];
+        let mut second_only = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            Some(&[0, 1]),
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("zero collate value is valid");
+        assert_eq!(selected_page_count(&mut second_only), 3);
+
+        let mut sources = vec![three_page_pdf(), three_page_pdf()];
+        let mut empty = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            Some(&[0]),
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("all-zero collate value is valid");
+        assert_eq!(selected_page_count(&mut empty), 0);
     }
 
     #[test]

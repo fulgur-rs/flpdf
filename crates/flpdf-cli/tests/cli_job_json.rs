@@ -3,6 +3,7 @@ use flpdf::{PageDocumentHelper, Pdf};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 fn expected_usage(message: &str) -> String {
     format!(
@@ -10,6 +11,21 @@ fn expected_usage(message: &str) -> String {
 flpdf --help=topic       help on a topic\n  flpdf --help=--option    help on an option\n  \
 flpdf --help             general help and a topic list\n\n"
     )
+}
+
+fn qpdf_available() -> bool {
+    ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn page_count(path: &std::path::Path) -> usize {
+    let mut pdf = Pdf::open(Cursor::new(fs::read(path).unwrap())).unwrap();
+    PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .unwrap()
+        .len()
 }
 
 #[test]
@@ -33,6 +49,122 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
         .stdout("");
 
     assert!(directory.path().join("output.pdf").is_file());
+}
+
+#[test]
+fn job_json_file_collate_values_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+
+    let q_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "q.pdf",
+        "pages": [
+            {"file": "input.pdf", "range": "1-3"},
+            {"file": "input.pdf", "range": "1-3"}
+        ],
+        "collate": "2,1",
+        "staticId": ""
+    });
+    fs::write(
+        directory.path().join("q.json"),
+        serde_json::to_vec(&q_job).unwrap(),
+    )
+    .unwrap();
+    let f_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "f.pdf",
+        "pages": [
+            {"file": "input.pdf", "range": "1-3"},
+            {"file": "input.pdf", "range": "1-3"}
+        ],
+        "collate": "2,1",
+        "staticId": ""
+    });
+    fs::write(
+        directory.path().join("f.json"),
+        serde_json::to_vec(&f_job).unwrap(),
+    )
+    .unwrap();
+
+    let q_output = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=q.json")
+        .output()
+        .unwrap();
+    assert!(
+        q_output.status.success(),
+        "qpdf job JSON failed: {}",
+        String::from_utf8_lossy(&q_output.stderr)
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=f.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    assert_eq!(page_count(&directory.path().join("q.pdf")), 6);
+    assert_eq!(
+        page_count(&directory.path().join("f.pdf")),
+        page_count(&directory.path().join("q.pdf"))
+    );
+
+    let q_zero_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "q-zero.pdf",
+        "pages": [
+            {"file": "input.pdf", "range": "1-3"},
+            {"file": "input.pdf", "range": "1-3"}
+        ],
+        "collate": "0,1",
+        "staticId": ""
+    });
+    fs::write(
+        directory.path().join("q-zero.json"),
+        serde_json::to_vec(&q_zero_job).unwrap(),
+    )
+    .unwrap();
+    let f_zero_job = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "f-zero.pdf",
+        "pages": [
+            {"file": "input.pdf", "range": "1-3"},
+            {"file": "input.pdf", "range": "1-3"}
+        ],
+        "collate": "0,1",
+        "staticId": ""
+    });
+    fs::write(
+        directory.path().join("f-zero.json"),
+        serde_json::to_vec(&f_zero_job).unwrap(),
+    )
+    .unwrap();
+    let q_zero_output = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=q-zero.json")
+        .output()
+        .unwrap();
+    assert!(q_zero_output.status.success());
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=f-zero.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    assert_eq!(page_count(&directory.path().join("q-zero.pdf")), 3);
+    assert_eq!(
+        page_count(&directory.path().join("f-zero.pdf")),
+        page_count(&directory.path().join("q-zero.pdf"))
+    );
 }
 
 #[test]
