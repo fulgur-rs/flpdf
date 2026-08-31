@@ -239,8 +239,14 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
                 refs.len()
             )));
         }
+        let removed_page = refs[idx];
         refs.remove(idx);
         if refs.is_empty() {
+            // qpdf's removePage flattens the page tree before erasing the
+            // final leaf (`QPDF_pages.cc:304-306`). Do the same here so
+            // skipped intermediate `/Pages` keys are warned about before the
+            // empty-tree mutation takes the fast path.
+            rebuild_page_tree(self.pdf, &[removed_page])?;
             return self.clear_page_tree();
         }
         let result = rebuild_page_tree(self.pdf, &refs)?;
@@ -299,9 +305,9 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     }
 
     /// Clear the live document's root page tree after qpdf-style final-page
-    /// removal. `rebuild_page_tree` intentionally rejects an empty selection
-    /// because page-selection callers use that as invalid input, while qpdf's
-    /// `removePage` permits an empty document.
+    /// removal. `remove_page_at` has already flattened a one-page tree through
+    /// `rebuild_page_tree`, so this method only performs the final empty-tree
+    /// mutation that qpdf's `removePage` leaves behind.
     fn clear_page_tree(&mut self) -> Result<RebuildResult> {
         let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
         let catalog = self.pdf.root_handle()?;
@@ -329,18 +335,11 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
 
         // QPDF::removePage itself only erases the removed child and updates
-        // /Count on the existing /Pages handle (QPDF_pages.cc:253-266); it
-        // does not touch /Type or /Parent. /Type repair is a precondition
-        // that removePage's findPage()->flattenPagesTree() call chain
-        // reaches via getAllPagesInternal (QPDF_pages.cc:89-91), and a
-        // correctly-identified root simply has no /Parent to begin with by
-        // the time removePage runs -- getAllPages's climb-up loop
-        // (QPDF_pages.cc:50-66) only ever walks up TO the true root, never
-        // past it, so nothing here is "removing" a /Parent qpdf itself
-        // wrote. This final-page path folds both preconditions into the
-        // same live mutation rather than reaching them as a side effect of
-        // walking the (now-empty) tree, and also preserves a direct catalog
-        // /Pages root without re-materializing the catalog.
+        // /Count on the existing /Pages handle (QPDF_pages.cc:253-266); the
+        // preceding `rebuild_page_tree` call supplied the
+        // `findPage()->flattenPagesTree()` precondition
+        // (`QPDF_pages.cc:304-306`). Preserve the direct catalog `/Pages`
+        // root while applying the final empty-tree values in place.
         root.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
         root.replace_key(b"/Kids", ObjectHandle::array(Vec::new()))?;
         root.replace_key(b"/Count", ObjectHandle::integer(0))?;

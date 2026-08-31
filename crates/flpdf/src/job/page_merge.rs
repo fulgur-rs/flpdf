@@ -23,8 +23,10 @@
 //! The target document is built via [`Pdf::empty`] (qpdf's
 //! `QPDF::emptyPDF()`). Its merge-specific union copy retains the primary
 //! Catalog/trailer graph and the AcroForm handling needed by
-//! `QPDFJob::handlePageSpecs`; each source is nevertheless prepared through
-//! [`PageDocumentHelper::push_inherited_attributes_to_pages`] and each copied
+//! `QPDFJob::handlePageSpecs`; the primary source is flattened by the
+//! qpdf-shaped `removePage` route before its selected pages are copied, while
+//! foreign sources are prepared through
+//! [`PageDocumentHelper::push_inherited_attributes_to_pages`]. Each copied
 //! leaf is reparented through a live destination handle, matching qpdf's
 //! `insertPage` boundary. Neither the empty-document construction nor this
 //! page preparation touches PDF version, so the returned document keeps
@@ -35,6 +37,7 @@
 
 use super::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
+use crate::object_copy::copy_foreign_object_for_preserve;
 use crate::page_extract::{append_selection_kids, null_copied_removed_pages, target_pages_root};
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
@@ -211,8 +214,18 @@ struct PrimaryAcroForm {
 /// Catalog copy below owns the actual `/DR` and `/DA` graph transfer; this
 /// snapshot only carries the qpdf field-rebuild gates.
 fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryAcroForm> {
+    // `QPDFJob::handlePageSpecs` constructs the primary AcroForm helper only
+    // after it has removed every primary page (`QPDFJob.cc:2514-2521`). The
+    // pre-removal snapshot therefore must read the field tree without running
+    // the helper's page-based orphan-widget pass; otherwise a direct Widget
+    // on the still-present primary page is warned before qpdf would ever scan
+    // that page set.
+    let had_fields_array = {
+        let mut acroform = AcroFormDocumentHelper::new_for_field_tree(source)?;
+        acroform.has_fields_array()?
+    };
     let mut out = PrimaryAcroForm {
-        had_fields_array: source.acroform()?.has_fields_array()?,
+        had_fields_array,
         ..Default::default()
     };
     let Some(root_ref) = source.root_ref() else {
@@ -239,6 +252,29 @@ pub(crate) fn source_top_level_field_names<R: Read + Seek>(
     source: &mut Pdf<R>,
 ) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
     let top_fields = source.acroform()?.top_level_fields()?;
+    source_top_level_field_names_from_refs(source, top_fields)
+}
+
+/// Read top-level field names through qpdf's field-tree-only construction.
+///
+/// The page job uses this before removing the primary page tree. qpdf does not
+/// construct the primary's full `QPDFAcroFormDocumentHelper` until after that
+/// removal (`QPDFJob.cc:2514-2521`), so this snapshot must not run the eager
+/// page-based orphan-widget scan.
+fn source_top_level_field_names_without_page_scan<R: Read + Seek>(
+    source: &mut Pdf<R>,
+) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
+    let top_fields = {
+        let mut acroform = AcroFormDocumentHelper::new_for_field_tree(source)?;
+        acroform.top_level_fields()?
+    };
+    source_top_level_field_names_from_refs(source, top_fields)
+}
+
+fn source_top_level_field_names_from_refs<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    top_fields: Vec<ObjectRef>,
+) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
     let mut out = Vec::with_capacity(top_fields.len());
     for field_ref in top_fields {
         // A top-level `/Fields` element may be a holder chain (a ref to a ref to
@@ -790,6 +826,25 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         ));
     }
 
+    // The primary page tree is flattened and emptied below to mirror
+    // qpdf::handlePageSpecs. Keep the original source page identities before
+    // that mutation so later AcroForm and removed-page bookkeeping can still
+    // address the source pages that qpdf retains in its object cache.
+    let original_page_refs: Vec<Vec<ObjectRef>> = inputs
+        .iter_mut()
+        .enumerate()
+        .map(|(input_index, input)| {
+            if input_index != 0 && input.pages.is_empty() {
+                // Keep the documented unused-secondary fast path below: qpdf
+                // never opens or walks a source that contributes no selected
+                // pages, so its malformed page tree cannot abort this merge.
+                Ok(Vec::new())
+            } else {
+                page_refs(input.source)
+            }
+        })
+        .collect::<Result<_>>()?;
+
     // qpdf computes the Auto decision once per source QPDF, before any page
     // is copied or the source page tree is flattened. Keep the result by input
     // index so duplicate page specifications share the same source decision.
@@ -852,13 +907,22 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             continue;
         }
 
-        // qpdf's `QPDF::insertPage` prepares every foreign source through
-        // `pushInheritedAttributesToPage` before `copyForeignObject`. This
-        // source-side mutation promotes shared non-scalar inherited values
-        // (such as a direct `/MediaBox` on `/Pages`) once, and only writes a
-        // leaf key when an ancestor actually supplies it. In particular, an
-        // absent `/Rotate` must stay absent rather than becoming `/Rotate 0`.
-        PageDocumentHelper::new(input.source).push_inherited_attributes_to_pages()?;
+        // Capture qpdf's original page list before the primary page tree is
+        // cleared. `handlePageSpecs` calls `removePage` for every primary page
+        // before it adds the selected pages back; that first removal flattens
+        // the tree with skipped-key warnings enabled. Foreign sources are not
+        // removed from, so they take the ordinary `copyForeignObject`-
+        // preparation path instead.
+        let all = original_page_refs[input_index].clone();
+        if !is_primary {
+            // qpdf's `QPDF::insertPage` prepares every foreign source through
+            // `pushInheritedAttributesToPage` before `copyForeignObject`.
+            // This promotes shared non-scalar inherited values (such as a
+            // direct `/MediaBox` on `/Pages`) once, and only writes a leaf key
+            // when an ancestor actually supplies it. In particular, an absent
+            // `/Rotate` must stay absent rather than becoming `/Rotate 0`.
+            PageDocumentHelper::new(input.source).push_inherited_attributes_to_pages()?;
+        }
 
         // Reconstruct this input's page-label contribution, one entry per
         // selected page (in selection order, duplicates included), before any
@@ -887,7 +951,17 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         }
         // Source top-level field names, read before the copy severs numbering;
         // each is mapped through this input's copy map below.
-        let source_fields = source_top_level_field_names(input.source)?;
+        // qpdf constructs the primary AcroForm helper only after the primary
+        // page tree has been removed, while a selected secondary helper is
+        // constructed at the foreign-copy boundary after that same removal
+        // (`QPDFJob.cc:2514-2524`). Preserve those analysis points: the
+        // primary snapshot reads only the field tree, and a secondary snapshot
+        // keeps the normal eager orphan-widget scan.
+        let source_fields = if is_primary {
+            source_top_level_field_names_without_page_scan(input.source)?
+        } else {
+            source_top_level_field_names(input.source)?
+        };
         if is_primary {
             primary_acroform.original_field_names.extend(
                 source_fields
@@ -896,7 +970,6 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             );
         }
 
-        let all = page_refs(input.source)?;
         // Resolve the selected source page refs (range-checked, duplicates
         // allowed), in selection order.
         let mut selected: Vec<ObjectRef> = Vec::with_capacity(input.pages.len());
@@ -930,6 +1003,12 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         if remove_resources[input_index] {
             for &page_ref in &unique {
                 PageObjectHelper::new(page_ref, input.source).remove_unreferenced_resources()?;
+            }
+        }
+
+        if is_primary {
+            for &page_ref in &all {
+                PageDocumentHelper::new(input.source).remove_page(page_ref)?;
             }
         }
 
@@ -982,10 +1061,12 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 
         // `--preserve-unreferenced` mirrors qpdf's writer-side
         // `enqueueObjectsStandard` over the primary's complete live object
-        // cache. Copy every semantic object through the same persistent map;
-        // ObjStm containers are writer-owned compression artifacts and are
-        // intentionally regenerated by the target writer rather than copied as
-        // source streams (`QPDFWriter.cc:1093-1103,1955-2003`).
+        // cache. Copy every non-ObjStm object through the preserve-specific
+        // traversal, which treats `/Pages` containers as ordinary graph nodes
+        // just as qpdf's writer enqueue does. ObjStm containers are writer-owned
+        // compression artifacts and are intentionally regenerated by the
+        // target writer rather than copied as source streams
+        // (`QPDFWriter.cc:1093-1103,1955-2003`).
         if is_primary && preserve_primary_unreferenced {
             let target_catalog_ref = target
                 .root_ref()
@@ -995,7 +1076,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
                 if source_object.try_is_stream_of_type(b"ObjStm", b"")? {
                     continue;
                 }
-                let copied = target.copy_foreign_object(&source_object)?;
+                let copied = copy_foreign_object_for_preserve(&mut target, &source_object)?;
                 let Some(target_ref) = copied.object_ref() else {
                     continue; // cov:ignore: an indirect live source always maps to an indirect target
                 };
@@ -1150,8 +1231,8 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_retained_widget_refs, field_kid_refs, merge_documents, rewrite_field_kids,
-        unique_field_name, widget_page_ref, MergeInput,
+        collect_retained_widget_refs, discover_primary_acroform, field_kid_refs, merge_documents,
+        rewrite_field_kids, unique_field_name, widget_page_ref, MergeInput,
     };
     use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1200,6 +1281,34 @@ mod tests {
             0,
             "page_merge production must use the canonical ObjectHandle resolver"
         );
+    }
+
+    #[test]
+    fn primary_field_snapshot_does_not_scan_pages_before_page_job_removes_them() {
+        let bytes = build_pdf(
+            &[
+                (
+                    1,
+                    "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
+                ),
+                (2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [<< /Type /Annot /Subtype /Widget /T (Direct) /Rect [0 0 10 10] >>] >>",
+                ),
+                (5, "<< /Fields [] >>"),
+            ],
+            1,
+        );
+        let mut source = Pdf::open_mem_owned(bytes).expect("open source");
+
+        discover_primary_acroform(&mut source).expect("snapshot primary AcroForm");
+
+        assert!(!source.repair_diagnostics().entries().iter().any(|entry| {
+            entry
+                .message
+                .contains("this widget annotation is not reachable from /AcroForm")
+        }));
     }
 
     #[test]

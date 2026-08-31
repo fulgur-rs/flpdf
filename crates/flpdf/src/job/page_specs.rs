@@ -180,6 +180,7 @@ fn set_annotation_page_refs(
 fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
     merged: &mut Pdf<Cursor<Vec<u8>>>,
     sources: &mut [Pdf<R>],
+    source_page_refs: &[Vec<ObjectRef>],
     grouped_pages: &[Vec<usize>],
     ordered_pages: &[OrderedPage],
     final_refs: &[ObjectRef],
@@ -197,13 +198,6 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
             .collect(),
         None => BTreeSet::new(),
     };
-
-    // Resolve source page refs once, before the occurrence replay mutably
-    // borrows individual source documents.
-    let source_page_refs: Vec<Vec<ObjectRef>> = sources
-        .iter_mut()
-        .map(crate::pages::page_refs)
-        .collect::<Result<_>>()?;
 
     // qpdf's branch is based on document ownership. The primary's first
     // occurrence remains on the primary route; repeated primary pages use the
@@ -248,10 +242,9 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
     // qpdf's field prune (`QPDFJob.cc:2609-2610`, `hasAcroForm() &&
     // fields.isArray()`) only fires when the primary's *original* `/Fields`
     // was an array; an `/AcroForm` with no `/Fields` (e.g. only
-    // `/NeedAppearances`) is left untouched. `sources[0]` is the untouched
-    // primary document -- confirmed unmutated by the merge above even when
-    // the primary is also referenced as a later page-spec source -- so this
-    // reads the pre-merge value.
+    // `/NeedAppearances`) is left untouched. The primary page tree has already
+    // been flattened by the merge, but its AcroForm dictionary remains live;
+    // this reads the original field-array gate from that same source document.
     let had_fields_array = match sources.first_mut() {
         Some(primary) => primary.acroform()?.has_fields_array()?,
         None => false,
@@ -464,6 +457,24 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         }
     }
 
+    // Capture source page identities before the primary page tree is flattened
+    // by the job-owned merge. The qpdf source keeps these handles alive after
+    // `removePage` has emptied the primary tree, and the AcroForm occurrence
+    // replay below needs the same source-space mapping.
+    let source_page_refs: Vec<Vec<ObjectRef>> = sources
+        .iter_mut()
+        .enumerate()
+        .map(|(source_index, source)| {
+            if source_index != 0 && grouped_pages[source_index].is_empty() {
+                // An unused secondary is intentionally not read by the merge
+                // route; preserve that qpdf-shaped fast path here as well.
+                Ok(Vec::new())
+            } else {
+                crate::pages::page_refs(source)
+            }
+        })
+        .collect::<Result<_>>()?;
+
     // qpdf aggregates all occurrences of one source document into one live
     // source QPDF. That gives merge_documents one copy map per source while
     // `ordered_pages` above preserves the original spec order and repeated
@@ -515,6 +526,7 @@ fn handle_page_specs<R: Read + Seek + 'static>(
     rebuild_acroform_in_final_page_order(
         &mut merged,
         sources,
+        &source_page_refs,
         &grouped_pages,
         &ordered_pages,
         &final_refs,
@@ -743,7 +755,7 @@ mod tests {
     fn rebuild_acroform_ignores_a_missing_merged_root() {
         let mut merged = pdf_without_root();
         let mut sources: Vec<Pdf<Cursor<Vec<u8>>>> = Vec::new();
-        rebuild_acroform_in_final_page_order(&mut merged, &mut sources, &[], &[], &[])
+        rebuild_acroform_in_final_page_order(&mut merged, &mut sources, &[], &[], &[], &[])
             .expect("a missing merged root has no AcroForm to rebuild");
     }
 
@@ -773,9 +785,15 @@ mod tests {
         let mut merged = three_page_pdf();
         let invalid_final_ref = ObjectRef::new(999, 0);
         let mut sources = vec![three_page_pdf()];
+        let source_page_refs = sources
+            .iter_mut()
+            .map(crate::pages::page_refs)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         rebuild_acroform_in_final_page_order(
             &mut merged,
             &mut sources,
+            &source_page_refs,
             &[vec![0]],
             &[(0, 0)],
             &[invalid_final_ref],
@@ -787,10 +805,16 @@ mod tests {
     fn rebuild_acroform_uses_foreign_copy_route_for_secondary_acroform() {
         let mut merged = three_page_pdf();
         let mut sources = vec![three_page_pdf(), acroform_pdf()];
+        let source_page_refs = sources
+            .iter_mut()
+            .map(crate::pages::page_refs)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
 
         rebuild_acroform_in_final_page_order(
             &mut merged,
             &mut sources,
+            &source_page_refs,
             &[vec![], vec![0]],
             &[(1, 0)],
             &[ObjectRef::new(3, 0)],

@@ -32,7 +32,7 @@
 - Consumes: the current `run_page_extraction_from_repeated_pdf` single-source path and the existing `QPDFJob::handle_page_specs` multi-source path.
 - Produces: a test-only route contract that requires the single-source production function to call `handle_page_specs` and forbids `CombinedPlan::build_repeated` and standalone `collate(&plan, ...)` in that function.
 
-- [ ] **Step 1: Write the failing route-lock test**
+- [x] **Step 1: Write the failing route-lock test**
 
 ```rust
 #[test]
@@ -57,7 +57,7 @@ fn single_source_pages_use_the_qpdf_job_page_specs_route() {
 }
 ```
 
-- [ ] **Step 2: Run the route-lock test and verify the expected RED failure**
+- [x] **Step 2: Run the route-lock test and verify the expected RED failure**
 
 Run:
 
@@ -67,7 +67,7 @@ cargo test -p flpdf --test page_job_route_cutover_tests --quiet
 
 Expected: FAIL because the current source has no `run_page_extraction_from_single_source` function and the existing single-source route still calls `CombinedPlan::build_repeated` and `collate(&plan, ...)`. This confirms the test guards the intended route change rather than an unrelated behavior.
 
-- [ ] **Step 3: Commit the plan and RED test**
+- [x] **Step 3: Commit the plan and RED test**
 
 ```bash
 git add docs/superpowers/plans/2026-08-31-flpdf-hxmj-canonical-pages.md crates/flpdf/tests/page_job_route_cutover_tests.rs
@@ -84,7 +84,7 @@ git commit -m "test: require canonical qpdf page job route"
 - Consumes: `InputSpec` ranges, the already-opened `Pdf<R>` from the JSON/file job lifecycle, scalar `parse_collate_n`, and `QPDFJob::handle_page_specs`.
 - Produces: `run_page_extraction_from_single_source`, which keeps the source alive while the returned merged document is written and passes `reconstruct_labels = false` because the job route already rebuilds labels.
 
-- [ ] **Step 1: Rename the old route and replace its planning body**
+- [x] **Step 1: Rename the old route and replace its planning body**
 
 Change `run_page_extraction_from_repeated_pdf` to `run_page_extraction_from_single_source`. Before moving `pdf` into the source vector, capture `primary_copy_encryption` and `primary_encrypted`. Build one `PageSpecInput::new(0, input.range.clone())` per resolved input occurrence, parse the existing scalar collate option, configure a `QPDFJob` logger/message prefix, and call:
 
@@ -108,7 +108,7 @@ Use the returned merged document's `pages::page_refs` to construct the existing 
 
 Remove the `CombinedPlan` and standalone `collate` imports if no production use remains. Update both `JobPdf::File` and `JobPdf::Json` dispatch calls to the renamed function.
 
-- [ ] **Step 2: Run the route-lock test and focused scalar page-operation tests**
+- [x] **Step 2: Run the route-lock test and focused scalar page-operation tests**
 
 Run:
 
@@ -120,7 +120,7 @@ cargo test -p flpdf --lib page_collate --quiet
 
 Expected: the route-lock test passes; all existing scalar page-operation/qpdf matrix tests remain green, demonstrating that the canonical cutover preserves the already-supported `--collate` behavior.
 
-- [ ] **Step 3: Run the full relevant CLI tests**
+- [x] **Step 3: Run the full relevant CLI tests**
 
 Run:
 
@@ -131,7 +131,7 @@ cargo test -p flpdf-cli --test encrypted_rewrite_tests --quiet
 
 Expected: zero failures, including JSON-input page selection, repeated same-file selections, warnings, encryption preservation, and split-page combinations.
 
-- [ ] **Step 4: Commit the canonical cutover**
+- [x] **Step 4: Commit the canonical cutover**
 
 ```bash
 git add crates/flpdf-cli/src/main.rs crates/flpdf/tests/page_job_route_cutover_tests.rs
@@ -148,7 +148,7 @@ git commit -m "refactor: route single-source pages through qpdf job"
 - Consumes: pinned qpdf 11.9.0 and the current `flpdf` binary.
 - Produces: same-input qpdf/flpdf evidence for repeated same-source page specs, page labels, AcroForm annotations, warnings, encryption source, and supported scalar collate.
 
-- [ ] **Step 1: Run the focused qpdf matrix and binary probes**
+- [x] **Step 1: Run the focused qpdf matrix and binary probes**
 
 Run:
 
@@ -159,7 +159,7 @@ qpdf --version
 
 For the existing repeated-source and form fixtures, compare qpdf and flpdf page counts, page order markers, AcroForm JSON fields, warning exit status, and output readability. Do not accept object-number differences as semantic failures; compare the reachable structure and observable diagnostics.
 
-- [ ] **Step 2: Run the full workspace test suite**
+- [x] **Step 2: Run the full workspace test suite**
 
 Run:
 
@@ -178,7 +178,7 @@ If the live oracle identifies a missing supported scalar regression, add that re
 **Files:**
 - Test: repository quality gates and changed-line coverage
 
-- [ ] **Step 1: Run formatting and strict static checks**
+- [x] **Step 1: Run formatting and strict static checks**
 
 ```bash
 cargo fmt --all -- --check

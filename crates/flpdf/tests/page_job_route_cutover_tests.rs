@@ -2,7 +2,7 @@
 fn single_source_pages_use_the_qpdf_job_page_specs_route() {
     let source = include_str!("../../flpdf-cli/src/main.rs");
     let start = source
-        .find("fn run_page_extraction_from_single_source(")
+        .find("fn run_page_extraction_from_single_source")
         .expect("single-source job route must have a named production function");
     let body = &source[start..];
     assert!(
