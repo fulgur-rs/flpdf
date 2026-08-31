@@ -91,12 +91,17 @@ pub struct EncryptParams {
     /// user password per Algorithm 3 step 1 inside the dict builder.
     pub owner_password: Vec<u8>,
     /// Capability flags encoded into `/P` via
-    /// [`PermissionsConfig::to_p_bits`].
+    /// [`PermissionsConfig::to_p_bits`]. Applies only when the selected
+    /// [`Self::method`] writes an R>=3 dictionary; a V=1/R=2 method
+    /// ([`EncryptMethod::V1Rc440`]) ignores this field and reads
+    /// [`Self::r2_permissions`] instead. Setting this field alone does not
+    /// restrict a V=1/R=2 document's permissions.
     pub permissions: PermissionsConfig,
     /// R=2 capability flags encoded into `/P` via
     /// [`R2PermissionsConfig::to_p_bits`]. This is kept separate from
     /// [`Self::permissions`] because qpdf exposes distinct R=2 and R>=3
-    /// writer setter contracts.
+    /// writer setter contracts; only a V=1/R=2 method
+    /// ([`EncryptMethod::V1Rc440`]) reads this field.
     pub r2_permissions: R2PermissionsConfig,
     /// Whether the `/Metadata` stream is encrypted alongside the rest of
     /// the document. When `false`, the writer:
