@@ -869,6 +869,24 @@ mod tests {
     }
 
     #[test]
+    fn handle_page_specs_skips_an_unused_secondary_source() {
+        let mut sources = vec![three_page_pdf(), pdf_without_root()];
+        let specs = [PageSpecInput::new(0, PageRange::parse("1").unwrap())];
+
+        let mut merged = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("an unused secondary source must not be read");
+
+        assert_eq!(selected_page_count(&mut merged), 1);
+    }
+
+    #[test]
     fn handle_page_specs_preserves_an_acroform_with_no_fields_array_across_sources() {
         let mut sources = vec![acroform_no_fields_array_pdf(), three_page_pdf()];
         let specs = [

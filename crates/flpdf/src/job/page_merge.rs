@@ -1304,11 +1304,40 @@ mod tests {
 
         discover_primary_acroform(&mut source).expect("snapshot primary AcroForm");
 
-        assert!(!source.repair_diagnostics().entries().iter().any(|entry| {
-            entry
-                .message
-                .contains("this widget annotation is not reachable from /AcroForm")
-        }));
+        assert!(source.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn merge_skips_page_reads_for_an_unused_secondary() {
+        let primary = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+            1,
+        );
+        let mut primary = Pdf::open_mem_owned(primary).expect("open primary");
+        let mut secondary = Pdf::empty().expect("open unused secondary");
+        secondary.trailer().remove_key(b"/Root");
+        let mut inputs = [
+            MergeInput {
+                source: &mut primary,
+                pages: vec![0],
+            },
+            MergeInput {
+                source: &mut secondary,
+                pages: Vec::new(),
+            },
+        ];
+
+        let mut merged = merge_documents(&mut inputs).expect("unused secondary is ignored");
+        assert_eq!(
+            crate::pages::page_refs(&mut merged)
+                .expect("read merged pages")
+                .len(),
+            1
+        );
     }
 
     #[test]

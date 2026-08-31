@@ -734,6 +734,24 @@ mod tests {
     fn preserve_copy_allows_page_tree_containers_without_pages_boundary_warning() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
+
+        let direct_error = copy_foreign_object_for_preserve(&mut target, &ObjectHandle::integer(1))
+            .expect_err("preserve copy must reject a direct object");
+        assert!(matches!(direct_error, Error::System(message)
+            if message == "QPDF::copyForeign called with direct object handle"));
+
+        let unowned = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let unowned_error = copy_foreign_object_for_preserve(&mut target, &unowned)
+            .expect_err("preserve copy must reject an unowned indirect object");
+        assert!(matches!(unowned_error, Error::System(message)
+            if message == "QPDF::copyForeign called with object with no owning PDF"));
+
+        let owned = target.get_object_handle(ObjectRef::new(3, 0));
+        let same_document_error = copy_foreign_object_for_preserve(&mut target, &owned)
+            .expect_err("preserve copy must reject a target-owned object");
+        assert!(matches!(same_document_error, Error::System(message)
+            if message == "QPDF::copyForeign called with object from this QPDF"));
+
         let page = source.get_object_handle(ObjectRef::new(3, 0));
         let intermediate = source
             .make_indirect_object_handle(ObjectHandle::dictionary(vec![
@@ -753,13 +771,7 @@ mod tests {
         target
             .resolve(&copied)
             .expect("resolve preserved page tree");
-        assert!(!target
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|diagnostic| diagnostic
-                .message
-                .contains("unexpected reference to /Pages object while copying foreign object")));
+        assert!(target.repair_diagnostics().entries().is_empty());
         assert_eq!(copied.get_key(b"/Kids").try_array_len().unwrap(), Some(1));
     }
 
