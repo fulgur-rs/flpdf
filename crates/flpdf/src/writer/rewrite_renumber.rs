@@ -98,6 +98,11 @@ impl NewNumberLookup for CanonicalCatalogFirstRenumber {
 }
 
 impl CanonicalCatalogFirstRenumber {
+    /// Number of source objects reached by the canonical qpdf-style walk.
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+
     /// Return the new number assigned to an original object reference.
     pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()

@@ -3908,51 +3908,35 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     // Drive emission from the qpdf enqueue order: `(new_ref, old_ref)` pairs in
-    // ascending reservation order. qpdf assigns the container and all of its
-    // sorted members when the first member is enqueued in every non-linearized
-    // writer mode — not only QDF (`QPDFWriter.cc:1057-1118`); this applies to
-    // encrypted output too (qpdf's `enqueueObject` gates only on
-    // `!m->linearized`, not on encryption).
+    // ascending reservation order. QDF and encrypted non-QDF Generate both use
+    // the ObjStm-aware walk; other specialized routes retain Catalog-first
+    // numbering.
     use crate::writer::object_streams::ObjectStreamGroup;
     use crate::writer::rewrite_renumber::{NewNumberLookup, ObjectStreamRenumber};
-    let object_stream_renumber = if plan.batches.is_empty() {
-        None
-    } else {
-        // The compact Preserve path carries source-container identity for
-        // `/Extends`; QDF's dedicated emission-number pre-scan must keep its
-        // existing synthetic-container ordering (`QPDFWriter.cc:1057-1118`).
-        let source_xref_entries = (!options.qdf
-            && options.object_streams == ObjectStreamMode::Preserve)
-            .then(|| pdf.source_xref_entries());
-        let object_stream_groups = plan
-            .batches
-            .iter()
-            .cloned()
-            .map(|members| {
-                if let Some(source_xref_entries) = source_xref_entries.as_ref() {
-                    if let Some(source) =
-                        source_objstm_container_for_batch(&members, source_xref_entries)
-                    {
-                        return ObjectStreamGroup::SourceBacked { source, members };
-                    }
-                }
-                ObjectStreamGroup::Synthetic { members }
-            })
-            .collect::<Vec<_>>();
-        let numbering_removed_refs = if qpdf_generate_encrypted {
-            &qpdf_generate_removed_refs
+    let object_stream_groups = plan
+        .batches
+        .iter()
+        .cloned()
+        .map(|members| ObjectStreamGroup::Synthetic { members })
+        .collect::<Vec<_>>();
+    let object_stream_renumber =
+        if (options.qdf && !plan.batches.is_empty()) || qpdf_generate_encrypted {
+            let numbering_removed_refs = if qpdf_generate_encrypted {
+                &qpdf_generate_removed_refs
+            } else {
+                &removed_refs
+            };
+            Some(ObjectStreamRenumber::build_with_stream_policy(
+                pdf,
+                &object_stream_groups,
+                true,
+                numbering_removed_refs,
+                options.preserve_unreferenced_objects,
+                Some(&stream_parameters_removed),
+            )?) // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
         } else {
-            &removed_refs
+            None
         };
-        Some(ObjectStreamRenumber::build_with_stream_policy(
-            pdf,
-            &object_stream_groups,
-            true,
-            numbering_removed_refs,
-            options.preserve_unreferenced_objects,
-            Some(&stream_parameters_removed),
-        )?) // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
-    };
     let renumbered: Vec<(ObjectRef, ObjectRef)> =
         if let Some(object_stream_renumber) = object_stream_renumber.as_ref() {
             let mut pairs = object_stream_renumber.pairs().collect::<Vec<_>>();
@@ -3967,8 +3951,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         .unwrap_or(&renumber);
 
     // The new /Root reference is looked up after selecting the final numbering
-    // route. In Generate mode the Catalog remains outside ObjStm, but the
-    // surrounding object numbers can be reserved by a container first.
+    // route. In encrypted Generate mode the Catalog remains outside ObjStm,
+    // but the surrounding object numbers can be reserved by a container first.
     let new_root = root_ref.and_then(|root_ref| renumber_lookup.new_for_original(root_ref));
     if root_ref.is_some() && new_root.is_none() {
         // cov:ignore-start: every canonical numbering route seeds the live
@@ -3979,39 +3963,51 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // cov:ignore-end
     }
 
-    let output_renumber_map: HashMap<ObjectRef, ObjectRef> = renumbered
-        .iter()
-        .map(|(new_ref, old_ref)| (*old_ref, *new_ref))
-        .collect();
+    let existing_max: u32 = u32::try_from(renumber.len()).map_err(|_| {
+        crate::Error::Unsupported("full-rewrite: renumbered object count overflows u32".to_string())
+    })?;
 
     // A QDF container receives its number when the standard enqueue walk first
     // reaches any member of its group. This applies to both generated and
-    // source-preserved groups; compact output uses these numbers directly.
+    // source-preserved groups; compact output retains its contiguous allocation
+    // above the Catalog-first object range.
     let mut container_refs: Vec<ObjectRef> = if options.qdf {
         if plan.batches.is_empty() {
             Vec::new()
         } else {
             vec![ObjectRef::new(0, 0); plan.batches.len()]
         }
-    } else if !plan.batches.is_empty() {
-        (0..plan.batches.len())
+    } else if qpdf_generate_encrypted {
+        let refs = (0..plan.batches.len())
             .map(|group_index| {
                 object_stream_renumber
                     .as_ref()
                     .and_then(|renumber| renumber.container_number(group_index))
                     .map(|number| ObjectRef::new(number, 0))
-                    .ok_or_else(|| {
-                        // cov:ignore-start: every filtered group is reachable by
-                        // the same canonical walk that assigned its members.
-                        crate::Error::Unsupported(
-                            "ObjStm container absent from qpdf renumber map".to_string(),
-                        )
-                        // cov:ignore-end
-                    })
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Option<Vec<_>>>();
+        refs.ok_or_else(|| {
+            // cov:ignore-start: every filtered Generate group is reachable by
+            // the same canonical walk that assigned its members.
+            crate::Error::Internal(
+                "encrypted Generate ObjStm group was not assigned a container number".to_string(),
+            )
+            // cov:ignore-end
+        })? // cov:ignore: the canonical walk assigns every emitted Generate group
     } else {
-        Vec::new()
+        (1..=plan.batches.len())
+            .map(|i| {
+                let number = existing_max.checked_add(i as u32)?;
+                Some(ObjectRef::new(number, 0))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                // cov:ignore-start: a supported PDF cannot allocate more than u32::MAX ObjStm batches
+                crate::Error::Unsupported(
+                    "full-rewrite: ObjStm container number overflows u32".to_string(),
+                )
+                // cov:ignore-end
+            })? // cov:ignore: batch-count overflow is impossible for a supported PDF
     };
 
     // For compact output this is the highest body object number, including
@@ -4876,7 +4872,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &container_refs,
                     options.qdf,
                     &qdf_emission_renumber,
-                    &output_renumber_map,
+                    &renumber,
                 )
             })
         } else {
