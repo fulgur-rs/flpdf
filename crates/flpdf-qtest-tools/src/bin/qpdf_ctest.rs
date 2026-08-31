@@ -97,13 +97,32 @@ fn is_bad_password(error: &Error) -> bool {
     }
 }
 
+/// Write `path`'s raw bytes to `output`, matching `qpdf_get_error_filename`'s
+/// verbatim `argv` filename (`qpdf-ctest.c:40`) rather than a lossy
+/// UTF-8 projection that would replace non-UTF-8 bytes with U+FFFD before
+/// the name ever reaches the terminal.
+#[cfg(unix)]
+fn write_native_path(output: &mut impl Write, path: &std::path::Path) -> Result<()> {
+    output.write_all(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_native_path(output: &mut impl Write, path: &std::path::Path) -> Result<()> {
+    write!(output, "{}", path.display())?;
+    Ok(())
+}
+
 fn report_invalid_password(input: &std::path::Path) -> Result<()> {
-    let name = input.display().to_string();
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    writeln!(stdout, "error: {name}: invalid password")?;
+    write!(stdout, "error: ")?;
+    write_native_path(&mut stdout, input)?;
+    writeln!(stdout, ": invalid password")?;
     writeln!(stdout, "  code: 4")?;
-    writeln!(stdout, "  file: {name}")?;
+    write!(stdout, "  file: ")?;
+    write_native_path(&mut stdout, input)?;
+    writeln!(stdout)?;
     writeln!(stdout, "  pos: 0")?;
     writeln!(stdout, "  text: invalid password")?;
     Ok(())
@@ -117,7 +136,7 @@ fn report_invalid_password(input: &std::path::Path) -> Result<()> {
 fn run_test2(
     input_arg: &std::ffi::OsStr,
     password_arg: &std::ffi::OsStr,
-    _output_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
 ) -> Result<()> {
     let input = PathBuf::from(input_arg);
     let password = password_bytes(password_arg);
@@ -132,9 +151,14 @@ fn run_test2(
         },
     );
     match result {
-        Ok(_) => Err(Error::Internal(
-            "qpdf-ctest test02 expected authentication to fail".to_owned(),
-        )),
+        Ok(mut pdf) => {
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_output_file(PathBuf::from(output_arg))?;
+            writer.set_static_id(true);
+            writer.write()?;
+            println!("C test 2 done");
+            Ok(())
+        }
         Err(error) if is_bad_password(&error) => {
             report_invalid_password(&input)?;
             println!("C test 2 done");

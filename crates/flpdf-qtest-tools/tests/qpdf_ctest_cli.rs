@@ -39,6 +39,60 @@ fn qpdf_ctest_2_reports_invalid_password_through_the_c_api_error_surface() {
     );
 }
 
+/// `qpdf_get_error_filename` (`qpdf-ctest.c:40`) reports the raw `argv`
+/// filename qpdf was given, byte for byte, so a non-UTF-8 name must survive
+/// into the "invalid password" error report unchanged rather than being
+/// replaced with U+FFFD by a lossy conversion.
+#[test]
+#[cfg(unix)]
+fn qpdf_ctest_2_reports_a_non_utf8_input_path_verbatim() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = encrypted_fixture("v1-rc4-40-r2.pdf");
+    let input_name = OsString::from_vec(b"has-\xff-byte.pdf".to_vec());
+    let input = directory.path().join(&input_name);
+    fs::copy(&source, &input).expect("copy fixture to non-UTF-8-named path");
+    let output = directory.path().join("unused.pdf");
+
+    let mut expected = b"error: ".to_vec();
+    expected.extend_from_slice(input.as_os_str().as_bytes());
+    expected.extend_from_slice(b": invalid password\n  code: 4\n  file: ");
+    expected.extend_from_slice(input.as_os_str().as_bytes());
+    expected.extend_from_slice(b"\n  pos: 0\n  text: invalid password\nC test 2 done\n");
+
+    let assert = Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .arg("2")
+        .arg(&input)
+        .arg("wrong")
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr("");
+    assert_eq!(assert.get_output().stdout, expected);
+}
+
+#[test]
+fn qpdf_ctest_2_writes_output_and_completes_on_successful_authentication() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = minimal_pdf();
+    let output = directory.path().join("test-2.pdf");
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args(["2", input.to_str().unwrap(), "", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout("C test 2 done\n")
+        .stderr("");
+
+    let pdf = Pdf::open(std::fs::File::open(&output).expect("open ctest output"))
+        .expect("test02's written output must be a valid PDF");
+    assert!(!pdf.is_encrypted());
+}
+
 #[test]
 fn qpdf_ctest_encryption_writer_cases_cover_r2_through_r6() {
     let directory = tempfile::tempdir().expect("temporary directory");

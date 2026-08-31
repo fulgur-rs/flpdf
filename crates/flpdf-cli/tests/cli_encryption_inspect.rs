@@ -218,8 +218,31 @@ fn show_encryption_key_v5_r6_matches_qpdf() {
         .stdout("fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290\n");
 }
 
+/// Skip the live qpdf-oracle comparison when `qpdf` is not installed locally
+/// (still required on CI, matching `encrypt_cli_tests.rs`'s
+/// `ensure_qpdf_or_skip`; see `AGENTS.md`'s note that qpdf-dependent
+/// compatibility tests are skippable when the executable is absent).
+fn ensure_qpdf_or_skip() -> bool {
+    let available = ShellCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if available {
+        return true;
+    }
+    if std::env::var_os("CI").is_some() {
+        panic!("qpdf required for encryption inspection oracle tests on CI");
+    }
+    eprintln!("skipping: qpdf not available");
+    false
+}
+
 #[test]
 fn check_show_encryption_key_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(V5_R6);
     let qpdf = ShellCommand::new("qpdf")
         .args(["--check", "--show-encryption-key", "--password=user-v5-r6"])
