@@ -100,12 +100,66 @@ pub enum PrintPermission {
     High,
 }
 
+/// Typed `/P` permission configuration for the Standard handler's R=2
+/// writer path.
+///
+/// qpdf keeps R=2's four permission inputs separate from its R>=3
+/// configuration (`QPDFWriter::setR2EncryptionParametersInsecure`,
+/// `libqpdf/QPDFWriter.cc:337-360`). R=2 uses bits 3 through 6 only; the
+/// R>=3 fields for form filling, accessibility, assembly, and high-quality
+/// printing do not exist in this revision's writer contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct R2PermissionsConfig {
+    /// Bit 3 — allow printing.
+    pub print: bool,
+    /// Bit 4 — allow document modification.
+    pub modify: bool,
+    /// Bit 5 — allow extraction.
+    pub extract: bool,
+    /// Bit 6 — allow annotation changes.
+    pub annotate: bool,
+}
+
+impl Default for R2PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            print: true,
+            modify: true,
+            extract: true,
+            annotate: true,
+        }
+    }
+}
+
+impl R2PermissionsConfig {
+    /// Encode qpdf's R=2 `/P` bitfield.
+    pub fn to_p_bits(self) -> i32 {
+        // qpdf's setEncryptionParameters starts with all bits set, then
+        // clears the two reserved low bits and the denied capability bits.
+        let mut bits = 0xFFFF_FFC0u32;
+        if self.print {
+            bits |= 0x004;
+        }
+        if self.modify {
+            bits |= 0x008;
+        }
+        if self.extract {
+            bits |= 0x010;
+        }
+        if self.annotate {
+            bits |= 0x020;
+        }
+        bits as i32
+    }
+}
+
 /// Typed `/P` permission configuration for the writer side of the Standard
 /// security handler.
 ///
 /// Fields correspond one-to-one to ISO 32000-1 §7.6.3.2 Table 22 bit
-/// assignments for revisions ≥ 3 (the only revisions flpdf emits today —
-/// V=1/R=2 reuses the same encoding and ignores the R≥3-specific bits).
+/// assignments for revisions ≥ 3. R=2 has a separate
+/// [`R2PermissionsConfig`] because qpdf's writer exposes a separate four-bit
+/// setter for that revision.
 /// Encode to the `/P` integer via [`Self::to_p_bits`]; decode an
 /// already-stored `/P` via [`Self::from_p_bits`].
 ///
@@ -437,5 +491,17 @@ mod tests {
     #[test]
     fn print_permission_default_is_high() {
         assert_eq!(PrintPermission::default(), PrintPermission::High);
+    }
+
+    #[test]
+    fn r2_permissions_encode_the_qpdf_four_bit_layout() {
+        let permissions = R2PermissionsConfig {
+            print: false,
+            modify: true,
+            extract: true,
+            annotate: true,
+        };
+
+        assert_eq!(permissions.to_p_bits(), -8);
     }
 }
