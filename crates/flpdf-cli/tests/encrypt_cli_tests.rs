@@ -1871,6 +1871,122 @@ fn decrypt_to_qdf(input: &Path, output: &Path, allow_weak_crypto: bool) {
     );
 }
 
+/// qpdf's non-linearized Generate writer assigns an ObjStm container and all
+/// of its members when the first member is reached. The encrypted coordinator
+/// must preserve that container-first numbering for both freshly derived
+/// encryption and copy-encryption from a fixed V4 AES-128 donor.
+///
+/// The fixture has more than one generated ObjStm, so a route that merely
+/// keeps the output valid or moves one container can not satisfy this gate.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_generate_objstm_direct_and_copy_are_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let input = fixture("../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf");
+
+    let direct_args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--object-streams=generate",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+    let direct_qpdf = tmp.path().join("direct-qpdf.pdf");
+    let direct_flpdf = tmp.path().join("direct-flpdf.pdf");
+    let qpdf = ShellCommand::new("qpdf")
+        .args(direct_args)
+        .arg(&input)
+        .arg(&direct_qpdf)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf direct Generate reference failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(direct_args)
+        .arg(&input)
+        .arg(&direct_flpdf)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&direct_flpdf).unwrap(),
+        std::fs::read(&direct_qpdf).unwrap(),
+        "direct encrypted Generate output must be byte-identical to qpdf 11.9.0"
+    );
+
+    let donor = tmp.path().join("donor.pdf");
+    let donor_args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+    let donor_result = ShellCommand::new("qpdf")
+        .args(donor_args)
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&donor)
+        .output()
+        .unwrap();
+    assert!(
+        donor_result.status.success(),
+        "qpdf donor generation failed: {}",
+        String::from_utf8_lossy(&donor_result.stderr)
+    );
+
+    let copy_qpdf = tmp.path().join("copy-qpdf.pdf");
+    let copy_flpdf = tmp.path().join("copy-flpdf.pdf");
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=generate",
+        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .args(["--encryption-file-password=", "--"])
+        .arg(&input)
+        .arg(&copy_qpdf)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf copy-encryption Generate reference failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=generate",
+            "--copy-encryption",
+        ])
+        .arg(&donor)
+        .args(["--encryption-file-password", "", "--"])
+        .arg(&input)
+        .arg(&copy_flpdf)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&copy_flpdf).unwrap(),
+        std::fs::read(&copy_qpdf).unwrap(),
+        "copy-encryption Generate output must be byte-identical to qpdf 11.9.0"
+    );
+}
+
 /// The 16 bytes at the head of the first stream payload. Under AES-CBC that is
 /// the initialization vector, which the encrypting side writes ahead of the
 /// ciphertext.

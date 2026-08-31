@@ -391,6 +391,25 @@ Encrypt-map emission を handle tree で再現し、直接の `/O` `/U` `/OE` `/
 `/Perms` だけを hex 化する。`flpdf-egzr.3.2.5`（close 済み）writer cutover が
 この surface を production consumer として使用している。
 
+### Non-linearized encrypted Generate ObjStm numbering (`flpdf-cecz`, 2026-08-31)
+
+qpdf 11.9.0 の standard writer は、`QPDFWriter.cc:1072-1118` の enqueue 中に
+generated ObjStm の最初の member へ到達すると、`assignCompressedObjectNumbers`
+（`:1057-1066`）で container とその全 member の番号を直ちに予約する。
+`getCompressibleObjGens` は `QPDF.cc:2393-2440` で `/Encrypt` を候補から除外し、
+全 body の書き出し後に `writeEncryptionDictionary`（`:2244-2255`）が
+`openObject(0)` で `/Encrypt` を末尾へ割り当てる。実測では複数 ObjStm の
+container-first 番号、source object-number 順の member index、type-2 xref、
+`/Encrypt` の後置がこの順序になる。
+
+flpdf の非 linearized encrypted Generate route は `ObjectStreamRenumber` を
+同じ canonical walk として利用し、通常 object と container の chunks を番号順に
+interleave してから xref を確定する。ObjStm dictionary は qpdf の固定順
+`/Type /ObjStm /Length ... /Filter ... /N ... /First ...` で直接 emission し、
+copy-encryption の Generate でも同じ xref-stream/container route を使う。
+QDF、linearized encrypted Generate、非 Generate の copy-encryption はこの issue の
+scope 外であり、それぞれ既存の dedicated route と `flpdf-j4ph` が担当する。
+
 **renumber は重複していない**: `writer/rewrite_renumber.rs` は `linearization/plan.rs` からも
 使われる共有機構で、`linearization/renumber.rs` はその上に載る最終採番層。qpdf の
 `obj_renumber` 1 本に対して 2 層構造だが、二重実装ではない。
