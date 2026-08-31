@@ -842,8 +842,22 @@ struct Cli {
     flatten_annotations: Option<CliFlattenMode>,
 
     /// Generate appearance streams for form fields that need them (qpdf
-    /// `--generate-appearances`).
-    #[arg(long = "generate-appearances")]
+    /// `--generate-appearances`). Rejected against inspection, attachment,
+    /// and page-operation modes: the page-op dispatch never reads
+    /// `args.generate_appearances`, so without these conflicts the flag
+    /// would be silently dropped and the requested appearance generation
+    /// would not appear in the output. Combining with `--linearize` is
+    /// supported (threaded through the linearize branch of `run_rewrite`),
+    /// so it is intentionally absent from this list.
+    #[arg(long = "generate-appearances",
+          conflicts_with_all = [
+              "check", "show_object",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
+              "list_attachments", "show_attachment", "remove_attachment",
+              "add_attachment", "copy_attachments_from",
+              "pages", "rotate", "split_pages", "empty", "json_output",
+          ])]
     generate_appearances: bool,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
