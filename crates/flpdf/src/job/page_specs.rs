@@ -136,7 +136,7 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
     let mut first_occurrence: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
     for page_refs in result.ref_map.values() {
         let Some(&first_page) = page_refs.first() else {
-            continue;
+            continue; // cov:ignore: RebuildResult stores only non-empty page-reference groups
         };
         for &duplicate_page in page_refs.iter().skip(1) {
             first_occurrence.insert(duplicate_page, first_page);
@@ -1082,7 +1082,7 @@ mod tests {
                 .entries()
                 .iter()
                 .all(|entry| !entry.message.contains("foreign object")));
-        }
+        } // cov:ignore: structural close of the asserted InPlace result branch
     }
 
     #[test]
@@ -1107,14 +1107,19 @@ mod tests {
         if let PageSpecJobOutput::InPlace { pdf, result, .. } = output {
             assert_eq!(result.new_kids.len(), 2);
             assert_eq!(selected_page_count(pdf), 2);
-        }
+        } // cov:ignore: structural close of the asserted InPlace result branch
     }
 
     #[test]
     fn single_source_page_planner_reports_its_input_errors() {
         let mut source = three_page_pdf();
         assert!(select_single_source_pages(&mut source, &[], None).is_err());
-        assert!(select_single_source_pages(&mut source, &[], Some(0)).is_err());
+        assert!(select_single_source_pages(
+            &mut source,
+            &[PageSpecInput::new(0, PageRange::parse("1").unwrap())],
+            Some(0),
+        )
+        .is_err());
         assert!(select_single_source_pages(
             &mut source,
             &[PageSpecInput::new(1, PageRange::parse("1").unwrap())],
