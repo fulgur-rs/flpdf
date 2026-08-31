@@ -13,6 +13,7 @@ use super::standard::{
 };
 use crate::encryption::standard::{decrypt_cipher_bytes, StringCipher};
 use crate::error::{EncryptedError, Result};
+use crate::pipeline::aes::PlAesPdf;
 use crate::{ObjectHandle, ObjectRef};
 use std::collections::BTreeMap;
 
@@ -873,7 +874,7 @@ fn r6_perms_warning_from_handle(
     let Some(bytes) = perms.as_string() else {
         return Ok(Some("R=6 /Perms entry is not a string".into()));
     };
-    let Ok(mut block) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+    let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice()) else {
         return Ok(Some("R=6 /Perms entry is not 16 bytes".into()));
     };
     let Ok(file_key) = <&[u8; 32]>::try_from(file_key) else {
@@ -881,7 +882,17 @@ fn r6_perms_warning_from_handle(
             "R=6 /Perms cannot be verified with non-256-bit file key".into(),
         ));
     };
-    super::primitives::aes256_ecb_decrypt_block(file_key, &mut block);
+    let decrypted = PlAesPdf::process_to_vec_without_padding(
+        "AES /Perms decryption",
+        false,
+        &bytes,
+        file_key,
+        1,
+        None,
+    )?; // cov:ignore: qpdf's fixed AES key, IV, and 16-byte input cannot fail
+    let block: [u8; 16] = decrypted
+        .try_into()
+        .expect("qpdf AES /Perms processing returns one decrypted block");
     let perms_p = i32::from_le_bytes(block[..4].try_into().expect("slice length checked"));
     let perms_metadata = match block[8] {
         b'T' => true,

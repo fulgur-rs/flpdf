@@ -20,7 +20,7 @@
 | `crates/flpdf/src/encryption/keys.rs` | correspondence | \`QPDF_encryption.cc\` file/object-key ownership |
 | `crates/flpdf/src/encryption/password.rs` | correspondence | QPDF_encryption.cc password normalization |
 | `crates/flpdf/src/encryption/permissions.rs` | correspondence | \`QPDF_encryption.cc\` permission projection and \`/P\` encoding |
-| `crates/flpdf/src/encryption/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf's single-block AES and MD5 native implementations |
+| `crates/flpdf/src/encryption/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf's MD5 native implementation |
 | `crates/flpdf/src/encryption/rc4.rs` | mirror | libqpdf/RC4.cc, libqpdf/RC4_native.cc |
 | `crates/flpdf/src/encryption/standard.rs` | correspondence | QPDF_encryption.cc Standard security handler algorithms split from writer setup |
 | `crates/flpdf/src/encryption/state.rs` | correspondence | \`QPDF.hh:899-923\` and \`QPDF_encryption.cc:700-1205\` encryption state, crypt-filter dispatch, object-key cache, and inspection projection |
