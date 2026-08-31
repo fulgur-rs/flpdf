@@ -904,8 +904,22 @@ struct Cli {
     generate_appearances: bool,
 
     /// Recompress eligible non-JPEG images as DCT/JPEG (qpdf
-    /// `--optimize-images`).
-    #[arg(long = "optimize-images")]
+    /// `--optimize-images`). Rejected against inspection and attachment
+    /// modes: those dispatch branches call their dedicated writers without
+    /// ever consuming the computed image options, so without these
+    /// conflicts an accepted `--optimize-images` would be silently dropped.
+    /// `--pages`/`--rotate`/`--split-pages`/`--empty`/`--json`/
+    /// `--json-output` are intentionally absent: all of those routes are
+    /// already threaded through (see `top_level_image_options` at each call
+    /// site).
+    #[arg(long = "optimize-images",
+          conflicts_with_all = [
+              "check", "show_object",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
+              "show_encryption",
+              "list_attachments", "show_attachment", "remove_attachment",
+              "add_attachment", "copy_attachments_from",
+          ])]
     optimize_images: bool,
     /// Exclude inline images from the optimization pass.
     #[arg(long = "keep-inline-images")]
@@ -3313,6 +3327,12 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // rejecting upfront surfaces the unsupported combination
                 // instead of leaving the user wondering whether decryption
                 // happened.
+                // --optimize-images is NOT in this list: unlike the other
+                // rewrite-only mutation passes above, the page-operation
+                // functions below (run_page_extraction /
+                // run_rewrite_with_page_ops) already accept and apply it via
+                // `cmd.optimize_images.then_some(image_options)`, mirroring
+                // the top-level --pages/--rotate/--split-pages routes.
                 if coalesce_contents
                     || cmd.remove_restrictions
                     || cmd.decrypt
@@ -3321,7 +3341,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
                     || cmd.flatten_rotation
-                    || cmd.optimize_images
                 {
                     eprintln!(
                         "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / --encrypt / \

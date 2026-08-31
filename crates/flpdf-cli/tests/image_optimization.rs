@@ -243,3 +243,68 @@ fn optimize_images_recompresses_an_eligible_raw_image() {
 
     assert_eq!(image_filters(&output), vec!["/DCTDecode"]);
 }
+
+#[test]
+fn rewrite_subcommand_applies_optimize_images_with_page_selection() {
+    // The rewrite subcommand's page-operation guard used to reject
+    // --optimize-images unconditionally, even though run_page_extraction
+    // (called for `--pages`) already threads image options through via
+    // `cmd.optimize_images.then_some(image_options)` — the same way the
+    // top-level `--pages` route already does (see
+    // optimize_images_runs_after_page_selection above).
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("input.pdf");
+    let output = tempdir.path().join("output.pdf");
+    std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("rewrite")
+        .arg(&input)
+        .arg(&output)
+        .args(["--static-id", "--optimize-images", "--pages"])
+        .arg(&input)
+        .args(["1", "--"])
+        .assert()
+        .success();
+
+    assert_eq!(image_filters(&output), vec!["/DCTDecode"]);
+}
+
+#[test]
+fn optimize_images_conflicts_with_check() {
+    // --check's inspection dispatch never reaches a rewrite path that
+    // consumes the computed image options, so without this clap-level
+    // conflict the flag would be silently accepted and dropped.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("input.pdf");
+    std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--check"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn optimize_images_conflicts_with_remove_attachment() {
+    // run_remove_attachment (and the other attachment-mutation dispatch
+    // branches) call their dedicated writers without ever consuming
+    // top_level_image_options, so the same silent-drop risk applies here.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("input.pdf");
+    let output = tempdir.path().join("output.pdf");
+    std::fs::write(&input, build_raw_grayscale_image_pdf(200, 200)).expect("write input");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--optimize-images", "--remove-attachment=missing"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2);
+}
