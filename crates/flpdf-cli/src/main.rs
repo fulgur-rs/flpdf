@@ -493,6 +493,24 @@ struct Cli {
     #[arg(long = "show-encryption", conflicts_with = "output")]
     show_encryption: bool,
 
+    /// Exit 0 when INPUT is encrypted and 2 otherwise (qpdf
+    /// `--is-encrypted`). This is an inspection-only top-level argv option;
+    /// it does not authenticate the input or produce output.
+    #[arg(
+        long = "is-encrypted",
+        conflicts_with_all = ["requires_password", "output"]
+    )]
+    is_encrypted: bool,
+
+    /// Exit 3 when INPUT is encrypted and the supplied password opens it, 0
+    /// when another password is required, and 2 when it is not encrypted
+    /// (qpdf `--requires-password`).
+    #[arg(
+        long = "requires-password",
+        conflicts_with_all = ["is_encrypted", "output"]
+    )]
+    requires_password: bool,
+
     /// Include the derived encryption key in JSON's `encrypt.parameters.key`
     /// field (qpdf `--show-encryption-key`).
     #[arg(long = "show-encryption-key")]
@@ -1839,7 +1857,8 @@ struct PasswordArgs {
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
     password: Option<String>,
-    /// File containing password bytes. One trailing LF or CRLF is stripped.
+    /// File containing password bytes. Only the first LF-delimited line is
+    /// used; a trailing CR before that LF is stripped. `-` reads from stdin.
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<PathBuf>,
     /// How qpdf-style password modes interpret --password bytes. On read
@@ -2161,6 +2180,16 @@ fn main() {
         run_json(&args)
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
+    } else if args.is_encrypted {
+        match args.input.as_ref() {
+            Some(input) => run_is_encrypted(input, args.repair, &args.password),
+            None => Err("--is-encrypted requires an input file".into()),
+        }
+    } else if args.requires_password {
+        match args.input.as_ref() {
+            Some(input) => run_requires_password(input, args.repair, &args.password),
+            None => Err("--requires-password requires an input file".into()),
+        }
     } else if let Some(object_ref) = args.show_object.as_deref() {
         run_show_object(
             args.input,
@@ -2961,7 +2990,13 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // flag combines with `--show-encryption-key`.
             run_show_encryption(&cmd.input, cmd.repair, &cmd.password, false, false)
         }
-        Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair, cmd.recovery),
+        Commands::IsEncrypted(cmd) => {
+            let password = PasswordArgs {
+                recovery: cmd.recovery,
+                ..PasswordArgs::default()
+            };
+            run_is_encrypted(&cmd.input, cmd.repair, &password)
+        }
         Commands::RequiresPassword(cmd) => {
             run_requires_password(&cmd.input, cmd.repair, &cmd.password)
         }
@@ -6045,16 +6080,12 @@ fn is_bad_password_error(error: &flpdf::Error) -> bool {
 /// `is-encrypted FILE`: exit 0 if encrypted, exit 2 if not.
 ///
 /// qpdf `--is-encrypted` (qpdf manual): exit 0 = encrypted, exit 2 = not
-/// encrypted (`qpdf_exit_is_not_encrypted = 2`). No required stdout.
-fn run_is_encrypted(input: &PathBuf, repair: bool, recovery: RecoveryArgs) -> CliResult<()> {
-    // No password is taken/used: qpdf detects encryption structurally
-    // (presence of /Encrypt) without authenticating, so we deliberately
-    // probe with an empty password and accept the auth-failed outcome.
-    let password = PasswordArgs {
-        recovery,
-        ..PasswordArgs::default()
-    };
-    let encrypted = match probe_encryption(input, repair, &password)? {
+/// encrypted (`qpdf_exit_is_not_encrypted = 2`). No required stdout. A
+/// supplied password is still forwarded because qpdf passes its configured
+/// password to `processFile`; it does not change the classification of an
+/// encrypted input, but password-file parsing and diagnostics remain visible.
+fn run_is_encrypted(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    let encrypted = match probe_encryption(input, repair, password)? {
         EncryptionProbe::Opened { encrypted } => encrypted,
         EncryptionProbe::EncryptedAuthFailed => true,
     };
@@ -6369,13 +6400,7 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
     let password_bytes = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
     } else if let Some(path) = &password.password_file {
-        let mut bytes = std::fs::read(path)?;
-        if bytes.ends_with(b"\r\n") {
-            bytes.truncate(bytes.len() - 2);
-        } else if bytes.ends_with(b"\n") {
-            bytes.truncate(bytes.len() - 1);
-        }
-        bytes
+        read_password_file(path)?
     } else {
         Vec::new()
     };
@@ -6385,6 +6410,38 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         password,
         password_bytes,
     ))
+}
+
+/// Read qpdf's `--password-file` value as raw bytes.
+///
+/// qpdf 11.9.0 calls `QUtil::read_lines_from_file` and uses only `lines.front()`
+/// (`QUtil.cc:1231-1286`, `QPDFJob_config.cc:661-679`). The line reader splits
+/// on `\n`, removes only a preceding `\r`, retains arbitrary non-UTF-8 bytes,
+/// and does not create an extra line for a final newline. qpdf also treats
+/// `-` as stdin and warns about every line after the first; that warning is a
+/// configuration diagnostic, so it is emitted even for `--no-warn`.
+fn read_password_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let bytes = if path == Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes)?;
+        bytes
+    } else {
+        std::fs::read(path)?
+    };
+
+    let first_newline = bytes.iter().position(|&byte| byte == b'\n');
+    let first_line_len = first_newline.unwrap_or(bytes.len());
+    let mut first_line = bytes[..first_line_len].to_vec();
+    if first_line.ends_with(b"\r") {
+        first_line.pop();
+    }
+    if first_newline.is_some_and(|index| index + 1 < bytes.len()) {
+        emit_logger_error(format!(
+            "{}: WARNING: all but the first line of the password file are ignored\n",
+            progname()
+        ));
+    }
+    Ok(first_line)
 }
 
 fn pdf_open_options_with_password_bytes(
