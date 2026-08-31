@@ -26,6 +26,7 @@ use crate::{
     WriterConfiguration,
 };
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,10 @@ use std::rc::Rc;
 
 type ProgressHandler = Box<dyn FnMut(u8) -> Result<()> + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
+
+/// qpdf's `QPDFJob::Members::DEFAULT_KEEP_FILES_OPEN_THRESHOLD`
+/// (`include/qpdf/QPDFJob.hh:579`).
+const DEFAULT_KEEP_FILES_OPEN_THRESHOLD: usize = 200;
 
 /// The single document type owned by a qpdf job.
 ///
@@ -88,6 +93,11 @@ struct JobConfiguration {
     require_output: bool,
     progress: bool,
     split_pages: Option<usize>,
+    /// qpdf's explicit `--keep-files-open=y|n` setting. `None` selects the
+    /// automatic distinct-page-source threshold in `handle_page_specs`.
+    keep_files_open: Option<bool>,
+    /// qpdf's automatic source-count threshold (`200` by default).
+    keep_files_open_threshold: Option<usize>,
     rotations: Vec<RotateSpec>,
     remove_restrictions: bool,
     coalesce_contents: bool,
@@ -1006,6 +1016,19 @@ impl QPDFJob {
         parse_qpdf_collate_parameter(value.as_bytes())
     }
 
+    /// Parse qpdf's unsigned `--keep-files-open-threshold` parameter.
+    ///
+    /// qpdf delegates this value to `QUtil::string_to_uint`, whose
+    /// `strtoull` conversion accepts an optional leading `+`, leading
+    /// whitespace, and a valid digit prefix while rejecting underflow and
+    /// values outside `unsigned int` (`libqpdf/QPDFJob_config.cc:350-353`,
+    /// `libqpdf/QUtil.cc:396-425`). Reuse the same byte parser as the
+    /// qpdf-shaped collate configuration rather than Rust's stricter
+    /// `usize::parse`.
+    pub fn parse_keep_files_open_threshold(value: &str) -> Result<usize> {
+        parse_qpdf_collate_uint(value.as_bytes())
+    }
+
     /// Construct a job with qpdf's default message prefix and logger.
     ///
     /// Corresponds to `QPDFJob::QPDFJob` (`libqpdf/QPDFJob.cc:290-293`), whose
@@ -1102,6 +1125,43 @@ impl QPDFJob {
         self.configuration.progress = value;
     }
 
+    /// Set qpdf's explicit secondary-source file lifetime policy.
+    ///
+    /// `false` selects the close-and-reopen source path used by qpdf when a
+    /// page job has too many distinct input files; `true` keeps those sources
+    /// open for the job. The setting affects only `handle_page_specs`, just as
+    /// qpdf's `QPDFJob::Config::keepFilesOpen` does.
+    pub fn set_keep_files_open(&mut self, value: bool) {
+        self.configuration.keep_files_open = Some(value);
+    }
+
+    /// Override qpdf's automatic `--keep-files-open` source-count threshold.
+    pub fn set_keep_files_open_threshold(&mut self, value: usize) {
+        self.configuration.keep_files_open_threshold = Some(value);
+    }
+
+    /// Return qpdf's effective keep-open decision for one page-spec list.
+    ///
+    /// qpdf counts distinct page-spec filenames, not source-document object
+    /// occurrences (`QPDFJob.cc:2374-2383`). The Rust page boundary has
+    /// already assigned one source index to each literal filename, so the
+    /// distinct source-index count is the same observable set operation.
+    #[must_use]
+    pub fn keep_files_open_for_page_specs(&self, specs: &[PageSpecInput]) -> bool {
+        self.configuration.keep_files_open.unwrap_or_else(|| {
+            let distinct_sources = specs
+                .iter()
+                .map(|spec| spec.source_index)
+                .collect::<BTreeSet<_>>()
+                .len();
+            distinct_sources
+                <= self
+                    .configuration
+                    .keep_files_open_threshold
+                    .unwrap_or(DEFAULT_KEEP_FILES_OPEN_THRESHOLD)
+        })
+    }
+
     /// Include the derived encryption key in check/show-encryption output.
     ///
     /// This is the job-owned equivalent of qpdf's `--show-encryption-key`
@@ -1196,6 +1256,24 @@ impl QPDFJob {
                     }
                     "--progress" => configuration.progress = true,
                     "--check" => configuration.check = true,
+                    _ if argument.starts_with("--keep-files-open=") => {
+                        let value = &argument["--keep-files-open=".len()..];
+                        configuration.keep_files_open = match value {
+                            "y" => Some(true),
+                            "n" => Some(false),
+                            _ => {
+                                return Err(UsageError::new(format!(
+                                    "invalid value for --keep-files-open: {value}"
+                                ))
+                                .into())
+                            }
+                        };
+                    }
+                    _ if argument.starts_with("--keep-files-open-threshold=") => {
+                        let value = &argument["--keep-files-open-threshold=".len()..];
+                        configuration.keep_files_open_threshold =
+                            Some(parse_qpdf_collate_uint(value.as_bytes())?);
+                    }
                     _ if argument.starts_with("--password=") => {
                         configuration.password = argument.as_bytes()[11..].to_vec();
                     }
@@ -1399,6 +1477,10 @@ impl QPDFJob {
         configuration.allow_weak_crypto = job_json_bare(&members, b"allowWeakCrypto")?;
         configuration.progress = job_json_bare(&members, b"progress")?;
         configuration.verbose = job_json_bare(&members, b"verbose")?;
+        configuration.keep_files_open = job_json_yn(&members, b"keepFilesOpen")?;
+        if let Some(value) = job_json_string(&members, b"keepFilesOpenThreshold")? {
+            configuration.keep_files_open_threshold = Some(parse_qpdf_collate_uint(&value)?);
+        }
         if let Some(value) = job_json_string(&members, b"splitPages")? {
             configuration.split_pages = Some(parse_job_split_pages(&value)?);
         }
@@ -1680,10 +1762,17 @@ impl QPDFJob {
         // right after `QPDF` construction, before dispatching to empty,
         // JSON-input, or file-based creation (`QPDFJob.cc:1701-1710`), so
         // `noWarn` suppresses warnings for an empty document exactly like the
-        // other two creation kinds.
+        // other two creation kinds. `description` mirrors qpdf's
+        // `QPDF::emptyPDF` calling `processMemoryFile("empty PDF", ...)`
+        // (`libqpdf/QPDF.cc:290-293`), which becomes the description qpdf
+        // shows in warnings involving this document (e.g. an
+        // `--update-from-json` validation failure against the empty
+        // primary: `WARNING: empty PDF ( from <path>): ...`, live-probed
+        // against qpdf 11.9.0).
         let mut pdf = crate::engine::open_empty_with_options_erased(PdfOpenOptions {
             logger: Some(self.logger.clone()),
             suppress_warnings: self.suppress_warnings,
+            description: "empty PDF".to_owned(),
             ..PdfOpenOptions::default()
         })?;
         self.input_name.clear();
@@ -1885,15 +1974,26 @@ impl QPDFJob {
             self.run_document_stages(&mut primary, configuration)
         } else {
             let mut page_sources = vec![primary];
+            // qpdf keys its opened-source cache by filename alone
+            // (`page_spec_qpdfs.count(page_spec.filename) == 0`,
+            // `QPDFJob.cc:2389-2427`), reusing the existing QPDF for a
+            // repeated literal path rather than reopening it. `source_paths`
+            // mirrors that cache for the secondary sources opened here (the
+            // primary's own aliases are already handled by the check above).
+            let mut source_paths: Vec<PathBuf> = Vec::new();
             let mut specs = Vec::with_capacity(configuration.page_specs.len());
             for page in &configuration.page_specs {
                 let source_index = if page.path == Path::new(".")
                     || self.configuration.input_file.as_deref() == Some(page.path.as_path())
                 {
                     0
+                } else if let Some(index) = source_paths.iter().position(|path| *path == page.path)
+                {
+                    index + 1
                 } else {
                     let source = self.open_job_source(&page.path, &page.password)?;
                     page_sources.push(source);
+                    source_paths.push(page.path.clone());
                     page_sources.len() - 1
                 };
                 specs.push(PageSpecInput::new(source_index, page.range.clone()));
@@ -2108,19 +2208,21 @@ impl QPDFJob {
     }
 
     fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
-        let file =
-            File::open(path).map_err(|error| Error::file_io("open", path.to_path_buf(), error))?;
-        let primary_name = self.input_name.clone();
-        let result = self.open_document(
-            BufReader::new(file),
-            path.display().to_string(),
-            PdfOpenOptions {
-                password: password.to_vec(),
-                ..PdfOpenOptions::default()
-            },
-        );
-        self.input_name = primary_name;
-        result
+        let mut options = PdfOpenOptions {
+            password: password.to_vec(),
+            logger: Some(self.logger.clone()),
+            suppress_warnings: self.suppress_warnings,
+            description: path.display().to_string(),
+            ..PdfOpenOptions::default()
+        };
+        // `open_file_with_options` installs the qpdf-shaped reopenable source;
+        // keep the job's warning policy on this secondary document exactly as
+        // `open_document` does for the primary.
+        options.suppress_warnings |= self.suppress_warnings;
+        let mut pdf = Pdf::<Box<dyn ReadSeek>>::open_file_with_options(path, options)?;
+        pdf.root_handle()?;
+        self.record_document_warnings(&pdf);
+        Ok(pdf)
     }
 
     fn write_configured_json<R>(

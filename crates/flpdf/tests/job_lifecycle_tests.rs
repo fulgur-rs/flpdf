@@ -1,9 +1,9 @@
 use flpdf::job::{
-    JobDocument, JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob,
+    JobDocument, JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob,
 };
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
+use flpdf::{Error, PageRange, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -142,6 +142,81 @@ fn new_job_matches_qpdf_defaults() {
     assert_eq!(JobExitCode::Error.as_i32(), 2);
     assert_eq!(JobExitCode::Success.as_i32(), 0);
     assert_eq!(JobExitCode::Warning.as_i32(), 3);
+}
+
+#[test]
+fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
+    let range = PageRange::parse("1").unwrap();
+    let one_source = [
+        PageSpecInput::new(1, range.clone()),
+        PageSpecInput::new(1, range.clone()),
+    ];
+    let two_sources = [
+        PageSpecInput::new(1, range.clone()),
+        PageSpecInput::new(2, range),
+    ];
+
+    let mut job = QPDFJob::new();
+    job.set_keep_files_open_threshold(1);
+    assert!(job.keep_files_open_for_page_specs(&one_source));
+    assert!(!job.keep_files_open_for_page_specs(&two_sources));
+
+    job.set_keep_files_open(true);
+    assert!(job.keep_files_open_for_page_specs(&two_sources));
+    job.set_keep_files_open(false);
+    assert!(!job.keep_files_open_for_page_specs(&one_source));
+
+    assert_eq!(
+        QPDFJob::parse_keep_files_open_threshold("+50junk").unwrap(),
+        50
+    );
+}
+
+#[test]
+fn keep_files_open_policy_is_parsed_at_argv_and_json_job_boundaries() {
+    let range = PageRange::parse("1").unwrap();
+    let specs = [PageSpecInput::new(1, range.clone())];
+
+    let mut argv_job = QPDFJob::new();
+    argv_job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--keep-files-open=n".to_owned(),
+            "--keep-files-open-threshold=+50junk".to_owned(),
+        ])
+        .unwrap();
+    assert!(!argv_job.keep_files_open_for_page_specs(&specs));
+
+    let json = serde_json::json!({
+        "inputFile": "input.pdf",
+        "outputFile": "output.pdf",
+        "keepFilesOpen": "n",
+        "keepFilesOpenThreshold": "50junk"
+    })
+    .to_string();
+    let mut json_job = QPDFJob::new();
+    json_job.initialize_from_json(&json).unwrap();
+    assert!(!json_job.keep_files_open_for_page_specs(&specs));
+}
+
+#[test]
+fn argv_keep_files_open_rejects_an_unknown_choice() {
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "input.pdf".to_owned(),
+            "output.pdf".to_owned(),
+            "--keep-files-open=maybe".to_owned(),
+        ])
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "invalid value for --keep-files-open: maybe"
+    ));
 }
 
 #[test]
@@ -339,6 +414,48 @@ fn json_job_run_applies_rotate_to_a_collate_zero_empty_page_selection() {
     assert_eq!(job.run().unwrap(), JobExitCode::Success);
     let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
     assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 0);
+}
+
+/// qpdf keys its opened-source cache by filename alone
+/// (`page_spec_qpdfs.count(page_spec.filename) == 0`, `QPDFJob.cc:2389`),
+/// reusing the same already-open QPDF for a repeated literal path rather
+/// than reopening it — so a page spec's own `password` is only consulted
+/// the first time a filename is seen. Encode this as an observable pass/fail:
+/// the first spec references an encrypted fixture with its correct (empty)
+/// password; a second spec repeats the exact same path with a wrong
+/// password. If flpdf reopened the file for the second spec (the pre-fix
+/// bug), the wrong password would fail the job; deduplicating by path
+/// (matching qpdf) never attempts that second open, so the wrong password
+/// is never consulted and the job succeeds.
+#[test]
+fn json_job_run_reuses_an_already_opened_page_source_for_a_repeated_filename() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("repeated-filename.pdf");
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "staticId": "",
+        "keepFilesOpenThreshold": "1",
+        "pages": [
+            {"file": &fixture, "range": "1"},
+            {"file": &fixture, "password": "definitely-wrong", "range": "2"},
+        ],
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(
+        job.run().unwrap(),
+        JobExitCode::Success,
+        "a repeated filename must reuse the first spec's already-open \
+         source and never consult a later spec's password"
+    );
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 2);
 }
 
 /// 2-page document with an outline item pointing at page 2 (obj 4).

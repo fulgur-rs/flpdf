@@ -7,7 +7,7 @@ use crate::cache::ObjectCache;
 #[allow(unused_imports)]
 use crate::error::EncryptedError;
 use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
-use crate::reader::PdfOpenOptions;
+use crate::reader::{PdfOpenOptions, ReopenableFile};
 use crate::xref::{load_xref_state_with_options, XrefLoadOptions};
 #[allow(unused_imports)]
 use crate::{Error, ObjectHandle};
@@ -15,6 +15,7 @@ use crate::{Pdf, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -192,6 +193,7 @@ impl<R: Read + Seek> Pdf<R> {
         let mut pdf = Self {
             unique_id,
             resolver,
+            input_source_control: None,
             version: loaded.version,
             trailer,
             last_xref_form: loaded.last_xref_form,
@@ -421,6 +423,32 @@ impl Pdf<Cursor<Vec<u8>>> {
         options: PdfOpenOptions,
     ) -> crate::Result<Self> {
         Self::open_with_options(Cursor::new(bytes), options)
+    }
+}
+
+impl Pdf<Box<dyn crate::ReadSeek>> {
+    /// Open a path through qpdf's reopenable file-source boundary.
+    ///
+    /// The returned erased document is suitable for a mixed qpdf page job:
+    /// its source can be closed and reopened by
+    /// [`crate::job::QPDFJob::handle_page_specs`] without exposing a concrete
+    /// reader type to the caller. The source is initially kept open so the
+    /// opening parse can complete; the job selects the final policy before
+    /// resolving page specifications.
+    ///
+    /// This corresponds to `QPDF::processFile` plus
+    /// `ClosedFileInputSource::before`/`after`
+    /// (`libqpdf/QPDF.cc:244-249`, `libqpdf/ClosedFileInputSource.cc:18-35`).
+    pub fn open_file_with_options(
+        path: impl AsRef<Path>,
+        options: PdfOpenOptions,
+    ) -> crate::Result<Self> {
+        let path = path.as_ref();
+        let source = ReopenableFile::new(path).map_err(crate::Error::Io)?;
+        let controller = source.controller();
+        let mut pdf = Self::open_with_options(Box::new(source), options)?;
+        pdf.input_source_control = Some(controller);
+        Ok(pdf)
     }
 }
 

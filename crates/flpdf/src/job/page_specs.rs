@@ -807,6 +807,17 @@ impl super::QPDFJob {
         resource_mode: RemoveUnreferencedResources,
         preserve_unreferenced: bool,
     ) -> Result<PageSpecJobOutput<'a, R>> {
+        let keep_files_open = self.keep_files_open_for_page_specs(specs);
+        // qpdf never replaces the primary input's `InputSource` here, but it
+        // selects the secondary-source implementation before page-spec reads
+        // begin (`QPDFJob.cc:2392-2427`). Generic readers are unaffected; the
+        // file factory installs a controller that closes/reopens at the same
+        // boundary.
+        for (source_index, source) in sources.iter().enumerate().skip(1) {
+            if specs.iter().any(|spec| spec.source_index == source_index) {
+                source.set_input_source_stay_open(keep_files_open);
+            }
+        }
         if sources.len() == 1 && specs.iter().all(|spec| spec.source_index == 0) {
             // cov:ignore-start: len()==1 guarantees first_mut() succeeds.
             let source = sources.first_mut().ok_or_else(|| {
