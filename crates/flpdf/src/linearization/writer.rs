@@ -3584,20 +3584,24 @@ fn write_linearized_impl<R: Read + Seek>(
                         .first()
                         .and_then(|member| source_container_by_member.get(member).copied())
                         .ok_or_else(|| {
+                            // cov:ignore-start: resolved Preserve batches come directly from source xref compressed-member groups; every non-empty batch therefore has a source container.
                             crate::Error::Unsupported(
                                 "linearization writer: preserved open-document ObjStm batch \
                                  has no source container"
                                     .to_string(),
                             )
+                            // cov:ignore-end
                         })?;
                     if members.iter().any(|member| {
                         source_container_by_member.get(member).copied() != Some(source)
                     }) {
+                        // cov:ignore-start: source-container homogeneity is guaranteed by objstm_batches_preserve's per-container grouping.
                         return Err(crate::Error::Unsupported(
                             "linearization writer: preserved open-document ObjStm batch \
                              combines multiple source containers"
                                 .to_string(),
                         ));
+                        // cov:ignore-end
                     }
                     Ok(Some(source))
                 })
