@@ -3590,8 +3590,7 @@ fn write_linearized_impl<R: Read + Seek>(
                                  has no source container"
                                     .to_string(),
                             )
-                            // cov:ignore-end
-                        })?;
+                        })?; // cov:ignore-end
                     if members.iter().any(|member| {
                         source_container_by_member.get(member).copied() != Some(source)
                         // cov:ignore: objstm_batches_preserve groups each non-empty batch by one source container
