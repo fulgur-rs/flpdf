@@ -1022,7 +1022,7 @@ fn dict_name_str<R: Read + Seek>(
 /// `p_raw` is the signed /P value. Per ISO 32000-1 §7.6.3.2 the bits are
 /// tested after casting to u32 so that negative values (like -4) behave as
 /// the expected all-bits-set value.
-fn capabilities_from_p(p_raw: i32, revision: i64) -> Vec<(String, Json)> {
+fn capabilities_from_p(p_raw: i32, revision: i64, json_version: i32) -> Vec<(String, Json)> {
     let p = p_raw as u32;
     // All nine capabilities in alphabetical order (qpdf schema). These
     // projections follow QPDF_encryption.cc:1331-1420, where the meaning of
@@ -1038,7 +1038,11 @@ fn capabilities_from_p(p_raw: i32, revision: i64) -> Vec<(String, Json)> {
     let printhigh = printlow && (revision < 3 || bit(12));
     let modify = bit(4) && modifyannotations && (revision < 3 || (modifyforms && modifyassembly));
 
-    let modify_annotations_key = if revision == 1 {
+    // The legacy misspelled key is a JSON output-schema quirk, not an
+    // encryption-revision one: qpdf selects it on `m->json_version == 1`
+    // (`QPDFJob.cc:1236`), the same schema version `all_true_capabilities`
+    // above already keys on for the plaintext projection.
+    let modify_annotations_key = if json_version == 1 {
         "moddifyannotations"
     } else {
         "modifyannotations"
@@ -1206,7 +1210,7 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
             // top-level `method` mirrors streammethod (qpdf behaviour)
             let method = streammethod;
 
-            let capabilities = json_dictionary(capabilities_from_p(p_raw, r))?;
+            let capabilities = json_dictionary(capabilities_from_p(p_raw, r, version))?;
             let key = if show_encryption_key {
                 pdf.encryption_file_key()
                     .map(|value| Json::make_string(hex::encode(value)))
@@ -1343,11 +1347,17 @@ mod tests {
     }
 
     #[test]
-    fn encryption_capabilities_and_v1_key_spelling_are_both_built() {
-        let v1 = capabilities_from_p(-4, 1);
-        let v2 = capabilities_from_p(-4, 2);
-        assert!(v1.iter().any(|(key, _)| key == "moddifyannotations"));
-        assert!(v2.iter().any(|(key, _)| key == "modifyannotations"));
+    fn modify_annotations_key_spelling_follows_json_version_not_encryption_revision() {
+        // The legacy misspelled key is a JSON schema-version quirk
+        // (`QPDFJob.cc:1236`: `m->json_version == 1`), independent of the
+        // encryption revision `R` used for the bit-semantics projections
+        // below. A `--json=1` inspection of a modern R>=3 document must still
+        // emit the typo'd key, and a `--json=2` inspection of a legacy R=1
+        // document must not.
+        let json1_r2 = capabilities_from_p(-4, 2, 1);
+        let json2_r1 = capabilities_from_p(-4, 1, 2);
+        assert!(json1_r2.iter().any(|(key, _)| key == "moddifyannotations"));
+        assert!(json2_r1.iter().any(|(key, _)| key == "modifyannotations"));
     }
 
     #[test]

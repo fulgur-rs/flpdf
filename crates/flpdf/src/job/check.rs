@@ -165,7 +165,12 @@ impl QPDFJob {
         password_is_hex_key: bool,
     ) -> Result<()> {
         let logger = self.logger();
-        emit_encryption_report(pdf, &logger, password_is_hex_key, false)
+        emit_encryption_report(
+            pdf,
+            &logger,
+            password_is_hex_key,
+            self.show_encryption_key(),
+        )
     }
 }
 

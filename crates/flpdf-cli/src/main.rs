@@ -2178,7 +2178,13 @@ fn main() {
         run_show_linearization(args.input)
     } else if args.show_encryption {
         match args.input.as_ref() {
-            Some(input) => run_show_encryption(input, args.repair, &args.password, args.no_warn),
+            Some(input) => run_show_encryption(
+                input,
+                args.repair,
+                &args.password,
+                args.no_warn,
+                args.show_encryption_key,
+            ),
             None => Err("--show-encryption requires an input file".into()),
         }
     } else if args.check {
@@ -2818,6 +2824,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
         return finish_job_exit_status(job.show_xref(pdf)?);
     }
     if cli.show_encryption {
+        job.set_show_encryption_key(cli.show_encryption_key);
         return finish_show_encryption(job, pdf, cli.password.password_is_hex_key);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
@@ -2944,7 +2951,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => {
-            run_show_encryption(&cmd.input, cmd.repair, &cmd.password, false)
+            // The native subcommand has no `--show-encryption-key` flag of its
+            // own (the dedicated `show-encryption-key` subcommand covers that
+            // need); only the qpdf-argv-compatible top-level `--show-encryption`
+            // flag combines with `--show-encryption-key`.
+            run_show_encryption(&cmd.input, cmd.repair, &cmd.password, false, false)
         }
         Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair, cmd.recovery),
         Commands::RequiresPassword(cmd) => {
@@ -6171,12 +6182,14 @@ fn run_show_encryption(
     repair: bool,
     password: &PasswordArgs,
     no_warn: bool,
+    show_encryption_key: bool,
 ) -> CliResult<()> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     job.set_suppress_warnings(no_warn);
+    job.set_show_encryption_key(show_encryption_key);
     let mut options = pdf_open_options(repair, password)?;
     // qpdf's `--no-warn` drops open-time repair diagnostics entirely for
     // `--show-encryption` (no deferred replay, unlike `--check`'s report
