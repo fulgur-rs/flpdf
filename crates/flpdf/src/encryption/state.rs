@@ -874,6 +874,9 @@ fn r6_perms_warning_from_handle(
     let Some(bytes) = perms.as_string() else {
         return Ok(Some("R=6 /Perms entry is not a string".into()));
     };
+    let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        return Ok(Some("R=6 /Perms entry is not 16 bytes".into()));
+    };
     let Ok(file_key) = <&[u8; 32]>::try_from(file_key) else {
         return Ok(Some(
             "R=6 /Perms cannot be verified with non-256-bit file key".into(),
@@ -886,10 +889,10 @@ fn r6_perms_warning_from_handle(
         file_key,
         1,
         None,
-    )?;
-    let Ok(block) = <[u8; 16]>::try_from(decrypted.as_slice()) else {
-        return Ok(Some("R=6 /Perms entry is not 16 bytes".into()));
-    };
+    )?; // cov:ignore: qpdf's fixed AES key, IV, and 16-byte input cannot fail
+    let block: [u8; 16] = decrypted
+        .try_into()
+        .expect("qpdf AES /Perms processing returns one decrypted block");
     let perms_p = i32::from_le_bytes(block[..4].try_into().expect("slice length checked"));
     let perms_metadata = match block[8] {
         b'T' => true,

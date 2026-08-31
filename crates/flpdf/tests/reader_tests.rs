@@ -627,6 +627,24 @@ fn r6_perms_mismatch_warns_without_failing_open() {
 }
 
 #[test]
+fn r6_perms_wrong_length_warns_without_attempting_decryption() {
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(encrypted_r5_or_r6_pdf(6, " /Perms <00>", &[])),
+        PdfOpenOptions {
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|entry| { entry.message.contains("R=6 /Perms entry is not 16 bytes") }));
+}
+
+#[test]
 fn resolve_decrypts_encrypted_strings_after_authentication() {
     let bytes = writer_generated_rc4_reader_fixture(false);
     let mut pdf = Pdf::open_with_options(
