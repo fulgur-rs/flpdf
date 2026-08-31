@@ -2204,10 +2204,7 @@ fn decode_field_name(name: &[u8]) -> String {
 /// the qpdf `double_to_string` rounding contract, adapted to return an
 /// [`ObjectHandle`] instead of an independent raw value snapshot.
 fn qpdf_real(v: f64) -> ObjectHandle {
-    let s = format!("{v:.6}");
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    let rounded: f64 = trimmed.parse().unwrap_or(0.0);
-    ObjectHandle::real(rounded)
+    ObjectHandle::real(crate::pdf_syntax::qpdf_real_value(v))
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {

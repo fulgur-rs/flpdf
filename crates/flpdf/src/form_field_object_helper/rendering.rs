@@ -26,7 +26,7 @@ use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
-use crate::pdf_syntax::write_literal_string;
+use crate::pdf_syntax::{qpdf_real_value, write_string_value};
 use crate::pipeline::PipelineResult;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
@@ -409,8 +409,8 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     let bbox = ObjectHandle::array(vec![
         ObjectHandle::real(0.0),
         ObjectHandle::real(0.0),
-        ObjectHandle::real(bbox_w),
-        ObjectHandle::real(bbox_h),
+        ObjectHandle::real(qpdf_real_value(bbox_w)),
+        ObjectHandle::real(qpdf_real_value(bbox_h)),
     ]);
     stream_dict.replace_key(b"/BBox", bbox)?;
 
@@ -622,22 +622,15 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
 /// differs from the parsed literal by more than qpdf's `0.001` tolerance,
 /// mirroring `TfFinder::getDA()` (`QPDFFormFieldObjectHelper.cc:729-746`).
 ///
-/// Returns `default_appearance` unchanged when no `<name> <size> Tf` pattern
-/// is present at all: qpdf's `tf_idx` never matches a token index when
-/// `/DA` has no `Tf` operator (`tf_idx` stays `-1`,
-/// `QPDFFormFieldObjectHelper.cc:689-716`), so `getDA()` performs no
-/// substitution there and no `Tf` operator is invented either.
-///
-/// Unlike qpdf's raw last-number/last-name tracking (which persists across
-/// unrelated operators), this locates the candidate operand using the same
-/// `<name> <size> Tf` operand-stack pattern as [`parse_default_appearance`]
-/// (operands clear at every operator boundary), so the two functions always
-/// agree on which `Tf` occurrence is authoritative. This is within the
-/// module's documented observable-equivalence policy for `/DA` text, not
-/// byte-identical reproduction of qpdf's own token-level bookkeeping.
+/// Returns `default_appearance` unchanged when no numeric token precedes a
+/// `Tf` operator. qpdf's `TfFinder` records the last numeric token globally,
+/// rather than requiring a valid `<name> <size>` operand pair, and replaces only
+/// the numeric token belonging to the last `Tf` (`QPDFFormFieldObjectHelper.cc:
+/// 667-745`). Preserve that token-level recovery for malformed/default-size
+/// appearances such as `0 Tf 0 g`, where qpdf substitutes its 11pt fallback.
 fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) -> Vec<u8> {
     struct TfOperandFinder {
-        operands: Vec<(ObjectHandle, usize, usize)>,
+        last_number: Option<(usize, usize, f64)>,
         tf_size_span: Option<(usize, usize, f64)>,
     }
 
@@ -648,28 +641,19 @@ fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) 
             offset: usize,
             length: usize,
         ) -> Result<ParseControl> {
-            if let Some(operator) = object.as_operator() {
-                if operator.as_slice() == b"Tf" {
-                    if let [.., name, size] = self.operands.as_slice() {
-                        if let (Some(_), Some(value)) = (
-                            name.0.as_name(),
-                            size.0
-                                .as_real()
-                                .or_else(|| size.0.as_integer().map(|n| n as f64)),
-                        ) {
-                            self.tf_size_span = Some((size.1, size.2, value));
-                        }
-                    }
-                }
-                // Every operator is an operand-stack boundary, matching
-                // `OperationCallbacks::handle_object` (`content_stream.rs`):
-                // clearing only on `Tf` would let any other operator (`g`,
-                // `cm`, ...) fall through and be retained as a bogus operand
-                // for the rest of the string, growing unboundedly on a
-                // malformed `/DA` with many non-`Tf` operators.
-                self.operands.clear();
-            } else if object.as_inline_image().is_none() {
-                self.operands.push((object, offset, length));
+            if let Some(value) = object
+                .as_real()
+                .or_else(|| object.as_integer().map(|number| number as f64))
+            {
+                // qpdf's TfFinder keeps this number across every token and
+                // operator; it does not clear the candidate at `rg`, `g`, or
+                // another malformed operator boundary.
+                self.last_number = Some((offset, length, value));
+            } else if object
+                .as_operator()
+                .is_some_and(|operator| operator.as_slice() == b"Tf")
+            {
+                self.tf_size_span = self.last_number;
             }
             Ok(ParseControl::Continue)
         }
@@ -680,7 +664,7 @@ fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) 
     }
 
     let mut finder = TfOperandFinder {
-        operands: Vec::new(),
+        last_number: None,
         tf_size_span: None,
     };
     // Best-effort, matching parse_default_appearance's own "skip malformed,
@@ -786,7 +770,11 @@ fn build_qpdf_choice_appearance_content(
             out.extend_from_slice(fmt_f64(-tfh).as_bytes());
             out.extend_from_slice(b" Td\n");
         }
-        write_literal_string(&mut out, line);
+        // qpdf writes each generated value with `QPDF_String::unparse`, which
+        // selects literal or hexadecimal syntax from the encoded bytes. This
+        // matters for a single-byte value such as PDFDocEncoding 0xf7:
+        // `10\xf7` becomes `<3130f7>`, not a UTF-8 lossy literal.
+        write_string_value(&mut out, line);
         out.extend_from_slice(b" Tj\n");
     }
     out.extend_from_slice(b"ET\nQ\nEMC\n");
@@ -1085,9 +1073,7 @@ mod tests {
                 .expect("Tx handled");
         let stream = generated_stream(&mut pdf, reference);
         let data = stream.as_stream_data().expect("appearance data");
-        assert!(data
-            .windows(b"\\216".len())
-            .any(|window| window == b"\\216"));
+        assert!(data.windows(b"<8e>".len()).any(|window| window == b"<8e>"));
     }
 
     #[test]
@@ -1119,6 +1105,7 @@ mod tests {
             substitute_da_tf_operand(b"/Helv 12 Tf 0 g", 11.0),
             b"/Helv 11 Tf 0 g"
         );
+        assert_eq!(substitute_da_tf_operand(b"0 Tf 0 g", 11.0), b"11 Tf 0 g");
         assert_eq!(substitute_da_tf_operand(b"0 g", 11.0), b"0 g");
     }
 

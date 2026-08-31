@@ -5560,6 +5560,86 @@ fn top_level_coalesce_contents_conflicts_with_empty() {
 }
 
 #[test]
+fn top_level_generate_appearances_conflicts_with_check() {
+    // Silent-shadow guard: --check's inspection dispatch never reaches the
+    // rewrite path that reads `args.generate_appearances`.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--generate-appearances", "--check", "in.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_generate_appearances_conflicts_with_pages() {
+    // Silent-shadow guard: the page-op dispatch branch owns the write via
+    // run_page_extraction / run_rewrite_with_page_ops, neither of which
+    // reads `args.generate_appearances` (mirrors the `--coalesce-contents`
+    // / `--encrypt` treatment in the same branch).
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--generate-appearances",
+            "in.pdf",
+            "--pages",
+            ".",
+            "--",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_generate_appearances_conflicts_with_rotate() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--generate-appearances",
+            "--rotate",
+            "+90:1",
+            "in.pdf",
+            "out.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_generate_appearances_conflicts_with_split_pages() {
+    // Sibling of the --pages case.
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--generate-appearances",
+            "--split-pages",
+            "in.pdf",
+            "out-%d.pdf",
+        ])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
+fn top_level_generate_appearances_conflicts_with_json_output() {
+    // Without this conflict, `--generate-appearances --json-output=2 in`
+    // would exit 0 while run_json dumps the unmodified input, silently
+    // dropping the requested appearance generation (same class of bug
+    // documented on `--flatten-annotations` above).
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--generate-appearances", "--json-output=2", "in.pdf"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn top_level_coalesce_contents_with_overlay_underlay_trailing_position() {
     // The exact shape qtest form-xobject uo-3 emits (via the PATH-shim
     // qpdf→flpdf): --coalesce-contents at the very end of argv, after

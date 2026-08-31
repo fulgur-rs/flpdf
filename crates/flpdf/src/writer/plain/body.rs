@@ -685,6 +685,38 @@ pub(crate) fn canonical_stream_will_be_refiltered_with_policy(
     if handle.is_data_modified() {
         return Ok(false);
     }
+    canonical_stream_filter_probe(
+        handle,
+        options,
+        apply_full_rewrite_metadata_policy,
+        normalize_content,
+    )
+}
+
+/// Consume the writer's qpdf-shaped stream probe without retaining its bytes.
+///
+/// `QPDFWriter::writeLinearized` calls `QPDF::optimize` with a
+/// `skip_stream_parameters` callback. That callback delegates to
+/// `willFilterStream`, which pipes a token-filtered stream once before either
+/// outer linearization pass (`QPDFWriter.cc:2543-2553`, `1239-1314`). qpdf's
+/// `ValueSetter` is stateful, so the later pass observes the filter's consumed
+/// state. The linearized route must preserve that ownership and timing; the
+/// plain writer instead caches the produced bytes and therefore must continue
+/// to use [`canonical_stream_will_be_refiltered_with_policy`].
+pub(crate) fn canonical_stream_filter_probe_for_linearization(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    normalize_content: bool,
+) -> crate::Result<bool> {
+    canonical_stream_filter_probe(handle, options, true, normalize_content)
+}
+
+fn canonical_stream_filter_probe(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
+) -> crate::Result<bool> {
     let Some((encode_flags, decode_level, _normalized_content)) = canonical_stream_filter_plan(
         handle,
         options,
