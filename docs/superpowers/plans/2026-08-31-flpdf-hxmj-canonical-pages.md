@@ -218,7 +218,7 @@ Confirm no generated artifacts or unrelated files are present.
 - Modify: Beads notes for `flpdf-hxmj` and the dependent issue `flpdf-egzr.8.11`
 - Create: GitHub Draft PR from `flpdf-hxmj-canonical-pages` to `main`
 
-- [ ] **Step 1: Rebase the feature branch onto current origin/main**
+- [x] **Step 1: Rebase the feature branch onto current origin/main**
 
 ```bash
 git fetch --prune origin
@@ -227,7 +227,7 @@ git rebase origin/main
 
 Rerun the focused tests, full workspace tests, strict gates, and patch coverage after the rebase.
 
-- [ ] **Step 2: Push and create a Draft PR**
+- [x] **Step 2: Push and create a Draft PR**
 
 ```bash
 git push -u origin flpdf-hxmj-canonical-pages
@@ -236,7 +236,7 @@ gh pr create --draft --base main --head flpdf-hxmj-canonical-pages --title "refa
 
 The PR body must cite qpdf `QPDFJob.cc:466-470` and `QPDFJob.cc:2360-2632`, explain that the single-source duplicate route was removed, list focused/full verification, and avoid claiming merge or completion beyond the actual checks.
 
-- [ ] **Step 3: Wait for every required CI check and address review findings against qpdf**
+- [x] **Step 3: Wait for every required CI check and address review findings against qpdf**
 
 ```bash
 gh pr checks flpdf-hxmj-canonical-pages --watch
@@ -244,7 +244,7 @@ gh pr checks flpdf-hxmj-canonical-pages --watch
 
 For any review finding, re-check the pinned qpdf source/live behavior before changing code. Reply in the original inline thread with the source and test evidence; resolve only after the finding is addressed and the check is green.
 
-- [ ] **Step 4: Mark the PR ready only after all CI is green**
+- [x] **Step 4: Mark the PR ready only after all CI is green**
 
 ```bash
 gh pr ready flpdf-hxmj-canonical-pages
@@ -252,7 +252,7 @@ gh pr ready flpdf-hxmj-canonical-pages
 
 Do not merge this PR in the implementation session.
 
-- [ ] **Step 5: Record implementation evidence and persist Beads**
+- [x] **Step 5: Record implementation evidence and persist Beads**
 
 ```bash
 pr_url="$(gh pr view flpdf-hxmj-canonical-pages --json url --jq .url)"
