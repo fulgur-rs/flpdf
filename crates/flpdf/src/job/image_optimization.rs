@@ -456,8 +456,10 @@ mod tests {
             PrepareResult::Skip(SkipReason::Colorspace)
         ));
 
-        let mut small_options = ImageOptimizationOptions::default();
-        small_options.min_width = 200;
+        let small_options = ImageOptimizationOptions {
+            min_width: 200,
+            ..ImageOptimizationOptions::default()
+        };
         let small = ObjectHandle::stream(
             image_dictionary(ObjectHandle::integer(200), ObjectHandle::integer(200)),
             Rc::new(Vec::new()),
