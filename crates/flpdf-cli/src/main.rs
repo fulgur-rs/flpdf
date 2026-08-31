@@ -7771,10 +7771,10 @@ mod tests {
         )
         .expect("R=2 encryption options");
         assert_eq!(parsed.params.method, EncryptMethod::V1Rc440);
-        assert_eq!(parsed.params.r2_permissions.print, false);
-        assert_eq!(parsed.params.r2_permissions.modify, true);
-        assert_eq!(parsed.params.r2_permissions.extract, false);
-        assert_eq!(parsed.params.r2_permissions.annotate, true);
+        assert!(!parsed.params.r2_permissions.print);
+        assert!(parsed.params.r2_permissions.modify);
+        assert!(!parsed.params.r2_permissions.extract);
+        assert!(parsed.params.r2_permissions.annotate);
         assert_eq!(parsed.params.permissions, PermissionsConfig::default());
     }
 
