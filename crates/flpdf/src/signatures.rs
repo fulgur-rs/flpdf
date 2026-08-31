@@ -21,8 +21,9 @@ pub const DEFAULT_MAX_SIGNATURE_FIELD_DEPTH: usize = crate::pages::DEFAULT_MAX_P
 
 /// `/AcroForm /SigFlags` bit 1: the document contains at least one signature field.
 pub const SIG_FLAGS_SIGNATURES_EXIST: u32 = 1;
-/// `/AcroForm /SigFlags` bit 2 (append-only): the document must only be modified
-/// via incremental updates so existing signatures stay valid.
+/// `/AcroForm /SigFlags` bit 2 (append-only) is an informational PDF constraint.
+/// The full rewrite cannot preserve signature validity through incremental updates;
+/// this bit does not select an output mode in flpdf.
 pub const SIG_FLAGS_APPEND_ONLY: u32 = 2;
 
 /// Read-only information about a signed AcroForm signature field.

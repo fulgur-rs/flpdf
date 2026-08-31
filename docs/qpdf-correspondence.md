@@ -891,7 +891,7 @@ byte golden の無い書き込み経路は安全に移動できない。🔀 行
 | null 可視性 | `cmp_null_visibility_tests` ✅ | — |
 | QDF | 🟡 **部分的にあり**（下記）。`job::overlay::byte_gate` の QDF 12 件を含む | 🟡 `cli_byte_identical_overlay.rs` の QDF 3 件 |
 | 暗号化出力 | ❌ gated byte gate 無し | 🟡 `encrypt_cli_tests` の `encrypted_document_is_byte_identical_to_qpdf` / `cli_linearize_encrypt_aes128_byte_identical_to_qpdf` 2件（`qpdf-zlib-compat` 関数レベル gate、CI 列挙済み） |
-| incremental update | ❌ gated byte gate 無し | ❌ |
+| PDF incremental append: not applicable | qpdf 11.9.0 has no incremental append writer; `/Prev` is reader-side xref history | flpdf `PdfWriter` always emits a fresh full rewrite; reader-side `/Prev` parsing remains |
 
 ### QDF の既存カバレッジ（部分的）
 

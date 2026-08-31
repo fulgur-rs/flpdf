@@ -47,6 +47,35 @@ fn build_pdf(objects: &[(u32, &[u8])]) -> Vec<u8> {
     out
 }
 
+fn append_incremental_revision(mut base: Vec<u8>) -> Vec<u8> {
+    let marker = b"startxref\n";
+    let marker_start = base
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("base PDF must have a startxref marker");
+    let previous_xref_start = marker_start + marker.len();
+    let previous_xref_end = base[previous_xref_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| previous_xref_start + offset)
+        .expect("base PDF startxref must end with a newline");
+    let previous_xref: u64 = std::str::from_utf8(&base[previous_xref_start..previous_xref_end])
+        .expect("base startxref must be ASCII")
+        .parse()
+        .expect("base startxref must be numeric");
+
+    let object_offset = base.len() as u64;
+    base.extend_from_slice(b"7 0 obj\n<< /Producer (incremental revision) >>\nendobj\n");
+    let xref_start = base.len() as u64;
+    base.extend_from_slice(
+        format!(
+            "xref\n7 1\n{object_offset:010} 00000 n \ntrailer\n<< /Size 8 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{xref_start}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    base
+}
+
 fn build_signed_acroform_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
@@ -140,6 +169,45 @@ fn rewrite_output_is_valid_pdf() {
     assert!(
         !pdf.trailer().try_has_key(b"/Prev").unwrap(),
         "full-rewrite output must not have /Prev"
+    );
+}
+
+#[test]
+fn full_rewrite_drops_source_prev_history_but_reader_keeps_it_readable() {
+    use flpdf::Pdf;
+    use std::io::Cursor;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("incremental.pdf");
+    let output = temp.path().join("rewritten.pdf");
+    let base = build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        ),
+    ]);
+    let input_bytes = append_incremental_revision(base);
+    std::fs::write(&input, &input_bytes).unwrap();
+
+    let mut input_pdf = Pdf::open(Cursor::new(input_bytes)).unwrap();
+    assert!(
+        input_pdf.trailer().try_has_key(b"/Prev").unwrap(),
+        "the regression fixture must contain source /Prev history"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", input.to_str().unwrap(), output.to_str().unwrap()])
+        .assert()
+        .success();
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    let mut rewritten = Pdf::open(Cursor::new(output_bytes)).unwrap();
+    assert!(
+        !rewritten.trailer().try_has_key(b"/Prev").unwrap(),
+        "fresh full rewrite must remove source /Prev history"
     );
 }
 
