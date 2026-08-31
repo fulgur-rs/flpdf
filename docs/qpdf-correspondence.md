@@ -1035,6 +1035,30 @@ CLI probes.
 
 ### coalesceContentStreams correspondence
 
+### qtest document-construction helper ports (`flpdf-egzr.5`)
+
+`flpdf-qtest-tools::document_construction` ports the two qpdf test programs
+without introducing a shell-out or a test-only document builder. The
+`pdf_from_scratch` binary follows `qpdf/pdf_from_scratch.cc:33-79`: it creates
+`Pdf::empty()` (qpdf `QPDF::emptyPDF`, `libqpdf/QPDF.cc:290-293`), promotes the
+parsed font and procset with the document-owned indirect-object route, creates
+the `First Page` stream, inserts the page through
+`PageDocumentHelper::add_page` (qpdf `QPDFPageDocumentHelper.cc:37-40`), and
+writes `a.pdf` with static IDs and preserved stream data. Its usage,
+`invalid test N`, stdout, status 2, and output-write failure boundaries mirror
+`pdf_from_scratch.cc:14-19,75-101`.
+
+The `test_many_nulls` binary follows `qpdf/test_many_nulls.cc:18-41`: it builds
+one outer array containing 20 inner arrays of 20,000 shared null handles,
+stores the outer array under the trailer `/Nulls`, appends one direct page to
+`/Pages/Kids`, and writes with generated object streams and a deterministic ID.
+The release qtest path enables `qpdf-zlib-compat`, so the pinned qpdf 11.9.0
+helper and Rust helper produce byte-identical output; the qpdf-test-compare
+and `qpdf --check` steps also pass. The full qtest survey promotes the five
+previously helper-blocked rows (`from-scratch` 1-2 and `many-nulls` 1-3) to
+`passing`; unchanged allowlist regressions remain separately classified by
+the survey.
+
 qpdf の `QPDFPageObjectHelper::coalesceContentStreams`（`QPDFPageObjectHelper.cc:474-476`）から
 `QPDFObjectHandle::coalesceContentStreams`（`QPDFObjectHandle.cc:1550-1572`）へ委譲される
 coalesce は、`QPDF.cc:1912-1917` の `newStream()` と
