@@ -3198,7 +3198,7 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
 }
 
 /// Write the fixed-order dictionary used by qpdf's non-QDF
-/// `QPDFWriter::writeObjectStream` (`QPDFWriter.cc:2248-2260`). The generic
+/// `QPDFWriter::writeObjectStream` (`QPDFWriter.cc:1714-1743`). The generic
 /// ObjectHandle stream serializer sorts dictionary keys for ordinary streams,
 /// but qpdf writes ObjStm's structural keys in this explicit order so the
 /// encrypted Generate route can remain byte-identical.
