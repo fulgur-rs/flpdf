@@ -33,6 +33,7 @@ pub(crate) struct TiffPredictor<'a> {
 impl<'a> TiffPredictor<'a> {
     /// Construct a TIFF predictor with qpdf's constructor validation and
     /// 32-bit-wrapping row geometry.
+    #[cfg(test)]
     pub(crate) fn new(
         identifier: impl Into<String>,
         next: impl Into<PipelineRef<'a>>,
@@ -40,6 +41,27 @@ impl<'a> TiffPredictor<'a> {
         columns: u32,
         samples_per_pixel: u32,
         bits_per_sample: u32,
+    ) -> PipelineResult<Self> {
+        Self::new_with_memory_limit(
+            identifier,
+            next,
+            action,
+            columns,
+            samples_per_pixel,
+            bits_per_sample,
+            None,
+        )
+    }
+
+    /// Construct a TIFF predictor with qpdf-head's optional row-memory budget.
+    pub(crate) fn new_with_memory_limit(
+        identifier: impl Into<String>,
+        next: impl Into<PipelineRef<'a>>,
+        action: TiffPredictorAction,
+        columns: u32,
+        samples_per_pixel: u32,
+        bits_per_sample: u32,
+        max_memory: Option<usize>,
     ) -> PipelineResult<Self> {
         if samples_per_pixel == 0 {
             return Err(PipelineError::runtime(
@@ -72,6 +94,16 @@ impl<'a> TiffPredictor<'a> {
             return Err(PipelineError::runtime(
                 "TIFFPredictor created with invalid columns value",
             ));
+        }
+        if let Some(limit) = max_memory
+            .and_then(|limit| u32::try_from(limit).ok())
+            .filter(|&limit| limit > 0)
+        {
+            if bytes_per_row > u64::from(limit / 2) {
+                return Err(PipelineError::runtime(
+                    "TIFFPredictor memory limit exceeded",
+                ));
+            }
         }
 
         // Keep pinned qpdf 11.9.0's wrapped row width for inputs that remain
@@ -242,6 +274,26 @@ mod tests {
         .expect("construction must fail")
     }
 
+    fn construction_error_with_memory_limit(
+        columns: u32,
+        colors: u32,
+        bits: u32,
+        max_memory: Option<usize>,
+    ) -> PipelineError {
+        let mut sink = RecordingSink::new(&[], &[]);
+        TiffPredictor::new_with_memory_limit(
+            "tiff",
+            &mut sink,
+            TiffPredictorAction::Decode,
+            columns,
+            colors,
+            bits,
+            max_memory,
+        )
+        .err()
+        .expect("construction must fail")
+    }
+
     struct FixtureCase<'a> {
         columns: u32,
         colors: u32,
@@ -307,6 +359,26 @@ mod tests {
             construction_error(u32::MAX, 1, 8).to_string(),
             "TIFFPredictor created with invalid columns value"
         );
+    }
+
+    #[test]
+    fn memory_limit_rejects_partial_row_padding_before_allocation() {
+        assert_eq!(
+            construction_error_with_memory_limit(536_870_911, 1, 8, Some(1 << 20)).to_string(),
+            "TIFFPredictor memory limit exceeded"
+        );
+
+        let mut sink = RecordingSink::new(&[], &[]);
+        assert!(TiffPredictor::new_with_memory_limit(
+            "tiff",
+            &mut sink,
+            TiffPredictorAction::Decode,
+            536_870_911,
+            1,
+            8,
+            Some(0),
+        )
+        .is_ok());
     }
 
     #[test]

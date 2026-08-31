@@ -334,6 +334,7 @@ fn write_object_details<R: Read + Seek>(
                 &data,
                 DecodeLimits {
                     max_output: None,
+                    max_tiff_memory: None,
                     max_filter_chain: None,
                 },
             ) {
