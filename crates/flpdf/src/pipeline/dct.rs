@@ -18,6 +18,17 @@ pub(crate) struct PlDct<'a> {
     next: PipelineRef<'a>,
     buffer: Buffer<'static>,
     max_output: Option<usize>,
+    mode: DctMode,
+}
+
+#[derive(Clone, Copy)]
+enum DctMode {
+    Decode,
+    Compress {
+        width: usize,
+        height: usize,
+        pixel_format: libjpeg_turbo_rs::PixelFormat,
+    },
 }
 
 impl<'a> PlDct<'a> {
@@ -27,6 +38,34 @@ impl<'a> PlDct<'a> {
             next: next.into(),
             buffer: Buffer::new("DCT buffer", None),
             max_output: None,
+            mode: DctMode::Decode,
+        }
+    }
+
+    /// Construct qpdf's compression form of `Pl_DCT`.
+    ///
+    /// qpdf's image optimizer uses `Pl_DCT("jpg", next, width, height,
+    /// components, color_space)` (`libqpdf/QPDFJob.cc:188-194`). The Rust
+    /// codec expresses the same three qpdf-supported PDF color spaces through
+    /// [`libjpeg_turbo_rs::PixelFormat`], retains the whole decoded image until
+    /// `finish`, and emits the resulting JPEG to the downstream pipeline.
+    pub(crate) fn new_compressor(
+        identifier: impl Into<String>,
+        next: impl Into<PipelineRef<'a>>,
+        width: usize,
+        height: usize,
+        pixel_format: libjpeg_turbo_rs::PixelFormat,
+    ) -> Self {
+        Self {
+            identifier: identifier.into(),
+            next: next.into(),
+            buffer: Buffer::new("DCT uncompressed image", None),
+            max_output: None,
+            mode: DctMode::Compress {
+                width,
+                height,
+                pixel_format,
+            },
         }
     }
 
@@ -136,6 +175,27 @@ impl Pipeline for PlDct<'_> {
             return self.next.finish();
         }
 
+        if let DctMode::Compress {
+            width,
+            height,
+            pixel_format,
+        } = self.mode
+        {
+            let subsampling = if pixel_format == libjpeg_turbo_rs::PixelFormat::Cmyk {
+                // libjpeg's JCS_CMYK defaults every component to 1x1. qpdf
+                // passes that colorspace unchanged to Pl_DCT; using S420 here
+                // would change the optimized image bytes and size.
+                libjpeg_turbo_rs::Subsampling::S444
+            } else {
+                libjpeg_turbo_rs::Subsampling::S420
+            };
+            let jpeg =
+                libjpeg_turbo_rs::compress(&data, width, height, pixel_format, 75, subsampling)
+                    .map_err(|error| PipelineError::runtime(error.to_string()))?;
+            self.next.write(&jpeg)?;
+            return self.next.finish();
+        }
+
         #[cfg(feature = "qpdf-libjpeg-compat")]
         return self.decode_with_compat_backend(&data);
 
@@ -227,10 +287,11 @@ impl Pipeline for PlDct<'_> {
     }
 }
 
-#[cfg(all(test, feature = "qpdf-libjpeg-compat"))]
+#[cfg(test)]
 mod tests {
     use super::PlDct;
-    use crate::pipeline::{Pipeline, PipelineResult};
+    use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
     struct Sink;
 
@@ -258,6 +319,98 @@ mod tests {
             .expect("compatibility test sink finish must succeed");
     }
 
+    #[test]
+    fn compressor_emits_default_grayscale_jpeg_and_finishes_downstream() {
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        let mut stage = PlDct::new_compressor(
+            "jpg",
+            &mut sink,
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+        );
+        stage
+            .write(&[128; 64])
+            .expect("compressor accepts a complete image");
+        stage.finish().expect("compressor finishes");
+        drop(stage);
+
+        assert!(trace.borrow().output.starts_with(&[0xff, 0xd8]));
+        assert_eq!(
+            trace.borrow().calls.last(),
+            Some(&TraceCall::Finish { failed: false })
+        );
+    }
+
+    #[test]
+    fn compressor_empty_input_only_finishes_downstream() {
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        let mut stage = PlDct::new_compressor(
+            "jpg",
+            &mut sink,
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+        );
+        stage.finish().expect("empty compressor input is valid");
+
+        assert!(trace.borrow().output.is_empty());
+        assert_eq!(trace.borrow().calls, [TraceCall::Finish { failed: false }]);
+    }
+
+    #[test]
+    fn compressor_rejects_incomplete_image_buffer() {
+        let mut destination = Vec::new();
+        let mut sink = super::super::PlString::new("sink", None, &mut destination);
+        let mut stage = PlDct::new_compressor(
+            "jpg",
+            &mut sink,
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+        );
+        stage.write(&[128]).unwrap();
+
+        let error = stage.finish().expect_err("incomplete image must fail");
+        assert!(matches!(error, PipelineError::Runtime(_)));
+    }
+
+    #[test]
+    fn compressor_propagates_downstream_write_and_finish_failures() {
+        let write_trace = shared_trace();
+        let mut write_sink = RecordingSink::with_trace(write_trace.clone(), &[1], &[]);
+        let mut write_stage = PlDct::new_compressor(
+            "jpg",
+            &mut write_sink,
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+        );
+        write_stage.write(&[128; 64]).unwrap();
+        assert_eq!(
+            write_stage.finish().unwrap_err().message(),
+            "sink write failure 1"
+        );
+
+        let finish_trace = shared_trace();
+        let mut finish_sink = RecordingSink::with_trace(finish_trace.clone(), &[], &[1]);
+        let mut finish_stage = PlDct::new_compressor(
+            "jpg",
+            &mut finish_sink,
+            8,
+            8,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+        );
+        finish_stage.write(&[128; 64]).unwrap();
+        assert_eq!(
+            finish_stage.finish().unwrap_err().message(),
+            "sink finish failure 1"
+        );
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
     #[test]
     fn libjpeg_compat_backend_preserves_libjpeg_diagnostic() {
         let mut sink = Sink;
