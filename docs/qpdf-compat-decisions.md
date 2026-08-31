@@ -41,12 +41,19 @@ reader/writer paths do not consume `Pl_Function` directly.
 
 flpdf has no qpdf-compatible C ABI, so a C function-pointer/`void*` adapter
 would add an API surface outside this project scope. The Rust-native
-equivalents already exist: `Pipeline`/`PipelineRef` provide the byte sink
-contract, JSON blob serialization accepts a Rust closure in `Json::make_blob`,
-and writer/job callbacks use Rust closures with `PipelineResult`. These paths
-preserve callback bytes, error propagation, and finish ownership for their
-actual Rust consumers. Do not add a standalone `PlFunction` stage unless a
-future C ABI is explicitly adopted.
+equivalent to `qpdf_write_json`'s output callback is the caller-supplied
+`Pipeline` passed to `Json::write` (`json/writer.rs:97`), which receives
+already-serialized JSON bytes the same way the C callback does —
+`Json::make_blob` is the opposite boundary, a producer closure that writes
+raw bytes for `Json::write` to base64-encode into an inline string value, not
+an output sink. Custom logger destinations correspond to `QPDFLogger`'s
+`PipelineHandle`-typed setters (`logger.rs`'s `set_info`/`set_warn`/
+`set_error`/`set_save`), and progress reporting corresponds to
+`PdfWriter::register_progress_reporter`/`Job::register_progress_reporter`,
+whose closures return the crate-wide `Result<()>`. These paths preserve
+callback bytes, error propagation, and finish ownership for their actual
+Rust consumers. Do not add a standalone `PlFunction` stage unless a future C
+ABI is explicitly adopted.
 
 ### Stream encoding
 
