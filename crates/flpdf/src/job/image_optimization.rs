@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob::ImageOptimizer and Pl_DCT image compression.
 //! qpdf 11.9.0 image-optimization transformation.
 //!
 //! The implementation follows `QPDFJob::ImageOptimizer` and the surrounding
