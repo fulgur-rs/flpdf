@@ -145,6 +145,28 @@ fn top_level_requires_password_matches_qpdf() {
 }
 
 #[test]
+fn top_level_is_encrypted_requires_an_input() {
+    flpdf()
+        .arg("--is-encrypted")
+        .assert()
+        .code(2)
+        .stderr(predicate::eq(
+            "flpdf: --is-encrypted requires an input file\n",
+        ));
+}
+
+#[test]
+fn top_level_requires_password_requires_an_input() {
+    flpdf()
+        .arg("--requires-password")
+        .assert()
+        .code(2)
+        .stderr(predicate::eq(
+            "flpdf: --requires-password requires an input file\n",
+        ));
+}
+
+#[test]
 fn password_file_uses_only_the_first_line() {
     if !ensure_qpdf_or_skip() {
         return;
