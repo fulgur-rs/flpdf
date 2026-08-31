@@ -2830,7 +2830,10 @@ fn second_half_container_anchors(
                     (0, owner, 1, object_number)
                 }
                 ContainerPart::OtherPageShared => (1, 0, 0, object_number),
-                ContainerPart::Rest if batch.members.iter().any(|m| part9_pages.contains(m)) => {
+                ContainerPart::Rest
+                    if batch.source_container_number.is_some()
+                        && batch.members.iter().any(|m| part9_pages.contains(m)) =>
+                {
                     // qpdf places the complete /Pages user set before the
                     // remaining lc_other set. If that user set is folded into
                     // a preserved ObjStm, the container inherits the same
