@@ -553,6 +553,7 @@ impl RenumberMap {
     ///
     /// Panics if a member ref is not present in the map (a planner / renumber
     /// inconsistency the caller must not paper over).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn place_objstm_members_per_half(
         &mut self,
         open_document_batches: &[Vec<ObjectRef>],
