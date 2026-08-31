@@ -20,6 +20,20 @@ pub(crate) fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
         .unwrap_or(false)
 }
 
+/// Return the numeric value represented by qpdf's default `newReal(double)`
+/// serializer.
+///
+/// qpdf formats newly-created real values with six fixed decimal places and
+/// trims trailing zeroes (`QUtil::double_to_string`, `libqpdf/QUtil.cc:349-369`).
+/// The canonical Rust object serializer uses shortest-roundtrip formatting, so
+/// callers that create a qpdf-owned real from arithmetic must round through the
+/// same six-place representation before constructing [`crate::ObjectHandle::real`].
+pub(crate) fn qpdf_real_value(value: f64) -> f64 {
+    let formatted = format!("{value:.6}");
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    trimmed.parse().unwrap_or(0.0)
+}
+
 /// Escape decoded PDF name bytes into a single PDF name token.
 ///
 /// `QPDFTokenizer` uses a raw NUL byte as a sentinel for a recoverable stray

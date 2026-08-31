@@ -148,16 +148,31 @@ fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
             collect_direct_handle_refs(&value, 0, &mut refs)?;
             has_indirect_parameter |= !refs.is_empty();
         }
-        // cov:ignore-start: qpdf probe errors are covered by body-level probe tests; this caller only propagates the defensive branch
-        if has_indirect_parameter
-            && crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
-                &handle,
-                options,
-                true,
-                content_normalize_refs.contains(&object_ref),
-            )?
-        // cov:ignore-end
-        {
+        // qpdf's linearization optimizer probes a token-filtered stream even
+        // when its /Filter and /DecodeParms entries are direct. That probe is
+        // observable because ValueSetter is stateful; use the linearization
+        // probe for modified streams so the first body pass sees qpdf's
+        // already-consumed filter. Unmodified streams retain the plain-writer
+        // cache-aware probe used to decide whether parameter edges disappear.
+        let parameters_removed = if has_indirect_parameter {
+            if handle.is_data_modified() {
+                crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
+                    &handle,
+                    options,
+                    content_normalize_refs.contains(&object_ref),
+                )? // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
+            } else {
+                crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
+                    &handle,
+                    options,
+                    true,
+                    content_normalize_refs.contains(&object_ref),
+                )? // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
+            }
+        } else {
+            false
+        };
+        if has_indirect_parameter && parameters_removed {
             skipped_streams.insert(object_ref);
         }
     }
@@ -988,13 +1003,21 @@ impl LinearizationPlan {
             pdf,
             &BTreeMap::new(),
             true,
-            |stream_ref, _stream| {
+            |stream_ref, stream| {
                 if stream_ref.is_some_and(|object_ref| {
                     skipped_stream_parameter_streams.contains(&object_ref)
                 }) {
-                    2
+                    Ok(2)
                 } else {
-                    1
+                    let refiltered =
+                        crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
+                            stream,
+                            options,
+                            stream_ref.is_some_and(|object_ref| {
+                                content_normalize_refs.contains(&object_ref)
+                            }),
+                        )?; // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
+                    Ok(if refiltered { 2 } else { 1 })
                 }
             },
         )?;
@@ -2879,3 +2902,93 @@ fn is_thumbnail_user(user: &crate::optimization::ObjectUser) -> bool {
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::LinearizationPlan;
+    use crate::acroform_document_helper::AcroFormDocumentHelper;
+    use crate::writer::{ObjectStreamMode, WriterOptions};
+    use crate::Pdf;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::{Cursor, Write};
+
+    fn flate(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("compress fixture stream");
+        encoder.finish().expect("finish fixture stream")
+    }
+
+    fn stream_object(number: u32, dictionary: &str, data: &[u8]) -> Vec<u8> {
+        let mut object = format!(
+            "{number} 0 obj\n<< {dictionary} /Length {} >>\nstream\n",
+            data.len()
+        )
+        .into_bytes();
+        object.extend_from_slice(data);
+        object.extend_from_slice(b"\nendstream\nendobj\n");
+        object
+    }
+
+    fn parameter_probe_fixture() -> Vec<u8> {
+        let page_content_indirect_filter = flate(b"q Q\n");
+        let page_content_direct_filter = flate(b"q Q\n");
+        let existing_appearance = flate(b"/Tx BMC\nEMC\n");
+        let objects = vec![
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>\nendobj\n"
+                .to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 12 0 R] /Annots [5 0 R] >>\nendobj\n".to_vec(),
+            stream_object(4, "/Filter 9 0 R", &page_content_indirect_filter),
+            b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (Hello) /DA (/Helv 12 Tf 0 g) /Rect [10 10 200 30] /P 3 0 R /AP << /N 8 0 R >> >>\nendobj\n".to_vec(),
+            b"6 0 obj\n<< /Fields [5 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >>\nendobj\n".to_vec(),
+            b"7 0 obj\nnull\nendobj\n".to_vec(),
+            stream_object(
+                8,
+                "/Type /XObject /Subtype /Form /BBox [0 0 190 20] /Resources << >> /Filter 9 0 R",
+                &existing_appearance,
+            ),
+            b"9 0 obj\n/FlateDecode\nendobj\n".to_vec(),
+            b"10 0 obj\nnull\nendobj\n".to_vec(),
+            b"11 0 obj\nnull\nendobj\n".to_vec(),
+            stream_object(12, "/Filter /FlateDecode", &page_content_direct_filter),
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let object_count = objects.len();
+        let mut offsets = Vec::with_capacity(object_count);
+        for object in objects {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(&object);
+        }
+        let xref = pdf.len();
+        let _ = writeln!(&mut pdf, "xref\n0 {}", object_count + 1);
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            let _ = writeln!(&mut pdf, "{offset:010} 00000 n ");
+        }
+        let _ = writeln!(
+            &mut pdf,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF",
+            object_count + 1
+        );
+        pdf
+    }
+
+    #[test]
+    fn qpdf_linearization_probe_consumes_modified_and_parameterized_streams() {
+        let mut pdf = Pdf::open(Cursor::new(parameter_probe_fixture())).expect("parse fixture");
+        AcroFormDocumentHelper::new(&mut pdf)
+            .expect("AcroForm")
+            .generate_appearances_if_needed()
+            .expect("generate appearance");
+
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..WriterOptions::default()
+        };
+        let plan = LinearizationPlan::from_pdf_with_writer_options(&mut pdf, &options)
+            .expect("build linearization plan");
+        assert_eq!(plan.page_hints.len(), 1);
+        assert!(!plan.part2_objects.is_empty());
+    }
+}

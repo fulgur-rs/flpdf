@@ -425,6 +425,7 @@ struct Cli {
             "copy_encryption",
             "encryption_file_password",
             "flatten_annotations",
+            "generate_appearances",
             "output",
         ]
     )]
@@ -517,7 +518,7 @@ struct Cli {
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf", "coalesce_contents",
-              "flatten_annotations",
+              "flatten_annotations", "generate_appearances",
               "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
@@ -573,7 +574,7 @@ struct Cli {
             "add_attachment", "remove_attachment", "list_attachments",
             "show_attachment", "copy_attachments_from",
             "no_original_object_ids", "qdf", "coalesce_contents",
-            "flatten_annotations",
+            "flatten_annotations", "generate_appearances",
             "preserve_unreferenced",
         ],
         help = "Generate qpdf JSON output; VERSION defaults to 2 and the output file is positional"
@@ -839,6 +840,11 @@ struct Cli {
         help = "Flatten annotations into page content; MODE is all, screen, or print"
     )]
     flatten_annotations: Option<CliFlattenMode>,
+
+    /// Generate appearance streams for form fields that need them (qpdf
+    /// `--generate-appearances`).
+    #[arg(long = "generate-appearances")]
+    generate_appearances: bool,
 
     // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
@@ -2354,7 +2360,7 @@ fn main() {
             normalize_content,
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
-            false,                              // generate_appearances (not on top-level surface)
+            args.generate_appearances,
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
@@ -2521,7 +2527,7 @@ fn main() {
             normalize_content,
             args.coalesce_contents,
             CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
-            false,                              // generate_appearances (not on top-level surface)
+            args.generate_appearances,
             args.flatten_annotations,
             false, // flatten_rotation (not on top-level surface)
             &overlay_specs,
@@ -3092,15 +3098,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
 
-            // --generate-appearances / --flatten-rotation remain unsupported
-            // on the linearize path, but flattenAnnotations is applied by
-            // qpdf before its linearized writer and is handled by the shared
-            // run_rewrite route below.
-            if cmd.linearize && (cmd.generate_appearances || cmd.flatten_rotation) {
-                eprintln!(
-                    "flpdf: --linearize cannot be combined with \
-                     --generate-appearances/--flatten-rotation"
-                );
+            // --flatten-rotation remains unsupported on the linearize path;
+            // qpdf accepts --generate-appearances before its linearized writer
+            // and the shared run_rewrite route now preserves that ordering.
+            if cmd.linearize && cmd.flatten_rotation {
+                eprintln!("flpdf: --linearize cannot be combined with --flatten-rotation");
                 std::process::exit(1);
             }
 
@@ -3968,6 +3970,9 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let mut options = options;
         if decrypt {
             options.preserve_encryption = false;
+        }
+        if generate_appearances {
+            generate_missing_appearances(&mut pdf)?;
         }
         if let Some(mode) = flatten_annotations_mode {
             let (required_flags, forbidden_flags) = mode.flags();

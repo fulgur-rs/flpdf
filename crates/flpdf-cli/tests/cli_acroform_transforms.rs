@@ -345,6 +345,82 @@ fn two_annots_print_and_non_print() -> Vec<u8> {
 
 // ── Tests: generate-appearances ───────────────────────────────────────────────
 
+/// The qpdf-shaped top-level argv surface must route appearance generation to
+/// the same canonical helper as the native rewrite subcommand.
+#[test]
+fn top_level_generate_appearances_routes_to_canonical_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("top-level-tx.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_widget_with_ap_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--no-original-object-ids",
+            "--static-id",
+            "--generate-appearances",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let widget_ref = first_widget_ref(&mut pdf);
+    let mut form = flpdf::AcroFormDocumentHelper::new(&mut pdf).unwrap();
+    assert!(!form.get_need_appearances().unwrap());
+    drop(form);
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let appearance = helper
+        .get_appearance_stream(b"N", None)
+        .unwrap()
+        .get_stream_data(DecodeLevel::Generalized)
+        .expect("top-level generation must install /AP/N");
+    assert!(
+        appearance.windows(2).any(|window| window == b"Tj"),
+        "top-level --generate-appearances must render the field value"
+    );
+}
+
+/// qpdf accepts the linearized combination even though its two-pass writer
+/// may expose the known stale token-filter content on the second pass. The
+/// CLI must preserve qpdf's acceptance and output lifecycle rather than
+/// rejecting the option combination before the writer runs.
+#[test]
+fn native_linearize_generate_appearances_is_accepted_like_qpdf() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("linearized-tx.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_widget_with_ap_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--static-id",
+            "--generate-appearances",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+    assert!(
+        output.is_file(),
+        "accepted linearized job must write output"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["check-linearization", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no linearization errors"));
+}
+
 /// qpdf's `generateAppearancesIfNeeded` returns before scanning pages when
 /// `/NeedAppearances` is absent or false. The CLI option must preserve that
 /// gate rather than treating the option as an unconditional renderer switch.

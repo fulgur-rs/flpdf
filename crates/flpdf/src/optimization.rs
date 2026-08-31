@@ -112,7 +112,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
+        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> crate::Result<u8>,
     {
         let prepared = Self::prepare_pdf(pdf, allow_changes)?;
         let page_refs = prepared
@@ -190,7 +190,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
+        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> crate::Result<u8>,
     {
         let mut maps = Self::default();
 
@@ -239,7 +239,7 @@ impl Optimization {
         skip_stream_parameters: &mut F,
     ) -> crate::Result<()>
     where
-        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
+        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> crate::Result<u8>,
     {
         let mut visited = BTreeSet::new();
         let mut stack = vec![Pending {
@@ -302,7 +302,7 @@ impl Optimization {
 
             if let Some(stream_dict) = pending.object.as_stream_dict() {
                 let skip_level =
-                    skip_stream_parameters(pending.object.object_ref(), &pending.object);
+                    skip_stream_parameters(pending.object.object_ref(), &pending.object)?;
                 for key in stream_dict.try_get_keys()?.into_iter().rev() {
                     if (skip_level >= 1 && key == b"/Length")
                         || (skip_level >= 2
