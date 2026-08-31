@@ -159,3 +159,134 @@ fn explicit_keep_files_open_y_overrides_automatic_selection() {
 fn explicit_keep_files_open_n_overrides_automatic_selection() {
     run_keep_files_open_case(9, &["--keep-files-open=n"], None);
 }
+
+#[test]
+fn empty_pages_route_applies_a_requested_overlay() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = minimal_fixture();
+    let with_overlay = temp.path().join("with-overlay.pdf");
+    let without_overlay = temp.path().join("without-overlay.pdf");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--static-id", "--empty", "--overlay"])
+        .arg(&fixture)
+        .args(["--", "--pages"])
+        .arg(&fixture)
+        .args(["1", "--"])
+        .arg(&with_overlay)
+        .assert()
+        .success();
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--static-id", "--empty", "--pages"])
+        .arg(&fixture)
+        .args(["1", "--"])
+        .arg(&without_overlay)
+        .assert()
+        .success();
+
+    let with_bytes = fs::read(&with_overlay).expect("read overlay output");
+    let without_bytes = fs::read(&without_overlay).expect("read baseline output");
+    assert_ne!(
+        with_bytes, without_bytes,
+        "--overlay must change the --empty --pages output, not be silently dropped"
+    );
+}
+
+#[test]
+fn rewrite_subcommand_accepts_empty_pages_like_the_top_level_route() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = minimal_fixture();
+    let top_level_output = temp.path().join("top-level.pdf");
+    let rewrite_output = temp.path().join("rewrite.pdf");
+    // `rewrite`'s own `input` positional is unused for an empty primary
+    // (mirrors the top-level route's own repurposed positional), and need
+    // not exist.
+    let unused_input = temp.path().join("unused-input.pdf");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--static-id", "--empty", "--pages"])
+        .arg(&fixture)
+        .args(["1", "--"])
+        .arg(&top_level_output)
+        .assert()
+        .success();
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .arg("rewrite")
+        .arg(&unused_input)
+        .arg(&rewrite_output)
+        .args(["--static-id", "--empty", "--pages"])
+        .arg(&fixture)
+        .args(["1", "--"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&top_level_output).expect("read top-level output"),
+        fs::read(&rewrite_output).expect("read rewrite-subcommand output"),
+        "rewrite --empty --pages must match the top-level --empty --pages route byte-for-byte"
+    );
+}
+
+#[test]
+fn empty_pages_route_applies_a_valid_update_from_json_to_the_empty_primary() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = minimal_fixture();
+    let output = temp.path().join("updated.pdf");
+    let update_json = temp.path().join("update.json");
+    // A well-formed qpdf JSON v2 update against the fixed empty primary
+    // (object 1 is its Catalog, pointing at empty Pages object 2, per
+    // `EMPTY_PDF_BYTES`); adds a harmless custom key to prove the update
+    // actually ran.
+    fs::write(
+        &update_json,
+        r#"{"qpdf":[{"jsonversion":2},{"obj:1 0 R":{"value":{"/Type":"/Catalog","/Pages":"2 0 R","/Custom":"/UPDATED"}}}]}"#,
+    )
+    .expect("write update JSON");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--static-id"])
+        .arg(format!("--update-from-json={}", update_json.display()))
+        .args(["--empty", "--pages"])
+        .arg(&fixture)
+        .args(["1", "--"])
+        .arg(&output)
+        .assert()
+        .success();
+    assert!(output.is_file(), "update-from-json route must write output");
+}
+
+#[test]
+fn empty_pages_route_surfaces_malformed_update_from_json_as_an_error() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = minimal_fixture();
+    let output = temp.path().join("rejected.pdf");
+    let update_json = temp.path().join("bad-update.json");
+    fs::write(&update_json, r#"{"bogus": "not a qpdf JSON v2 update"}"#)
+        .expect("write malformed update JSON");
+
+    // qpdf 11.9.0 live-probed: `--update-from-json` against `--empty --pages`
+    // is not a silent no-op; malformed JSON exits 2 with "errors found in
+    // JSON" and no output file is written.
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg(format!("--update-from-json={}", update_json.display()))
+        .args(["--empty", "--pages"])
+        .arg(&fixture)
+        .args(["1", "--"])
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains("errors found in JSON"));
+    assert!(
+        !output.exists(),
+        "a rejected --update-from-json must not write output"
+    );
+}

@@ -1762,10 +1762,17 @@ impl QPDFJob {
         // right after `QPDF` construction, before dispatching to empty,
         // JSON-input, or file-based creation (`QPDFJob.cc:1701-1710`), so
         // `noWarn` suppresses warnings for an empty document exactly like the
-        // other two creation kinds.
+        // other two creation kinds. `description` mirrors qpdf's
+        // `QPDF::emptyPDF` calling `processMemoryFile("empty PDF", ...)`
+        // (`libqpdf/QPDF.cc:290-293`), which becomes the description qpdf
+        // shows in warnings involving this document (e.g. an
+        // `--update-from-json` validation failure against the empty
+        // primary: `WARNING: empty PDF ( from <path>): ...`, live-probed
+        // against qpdf 11.9.0).
         let mut pdf = crate::engine::open_empty_with_options_erased(PdfOpenOptions {
             logger: Some(self.logger.clone()),
             suppress_warnings: self.suppress_warnings,
+            description: "empty PDF".to_owned(),
             ..PdfOpenOptions::default()
         })?;
         self.input_name.clear();
@@ -1967,15 +1974,26 @@ impl QPDFJob {
             self.run_document_stages(&mut primary, configuration)
         } else {
             let mut page_sources = vec![primary];
+            // qpdf keys its opened-source cache by filename alone
+            // (`page_spec_qpdfs.count(page_spec.filename) == 0`,
+            // `QPDFJob.cc:2389-2427`), reusing the existing QPDF for a
+            // repeated literal path rather than reopening it. `source_paths`
+            // mirrors that cache for the secondary sources opened here (the
+            // primary's own aliases are already handled by the check above).
+            let mut source_paths: Vec<PathBuf> = Vec::new();
             let mut specs = Vec::with_capacity(configuration.page_specs.len());
             for page in &configuration.page_specs {
                 let source_index = if page.path == Path::new(".")
                     || self.configuration.input_file.as_deref() == Some(page.path.as_path())
                 {
                     0
+                } else if let Some(index) = source_paths.iter().position(|path| *path == page.path)
+                {
+                    index + 1
                 } else {
                     let source = self.open_job_source(&page.path, &page.password)?;
                     page_sources.push(source);
+                    source_paths.push(page.path.clone());
                     page_sources.len() - 1
                 };
                 specs.push(PageSpecInput::new(source_index, page.range.clone()));

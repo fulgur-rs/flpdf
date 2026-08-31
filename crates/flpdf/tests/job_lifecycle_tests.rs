@@ -416,6 +416,48 @@ fn json_job_run_applies_rotate_to_a_collate_zero_empty_page_selection() {
     assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 0);
 }
 
+/// qpdf keys its opened-source cache by filename alone
+/// (`page_spec_qpdfs.count(page_spec.filename) == 0`, `QPDFJob.cc:2389`),
+/// reusing the same already-open QPDF for a repeated literal path rather
+/// than reopening it — so a page spec's own `password` is only consulted
+/// the first time a filename is seen. Encode this as an observable pass/fail:
+/// the first spec references an encrypted fixture with its correct (empty)
+/// password; a second spec repeats the exact same path with a wrong
+/// password. If flpdf reopened the file for the second spec (the pre-fix
+/// bug), the wrong password would fail the job; deduplicating by path
+/// (matching qpdf) never attempts that second open, so the wrong password
+/// is never consulted and the job succeeds.
+#[test]
+fn json_job_run_reuses_an_already_opened_page_source_for_a_repeated_filename() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("repeated-filename.pdf");
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "staticId": "",
+        "keepFilesOpenThreshold": "1",
+        "pages": [
+            {"file": &fixture, "range": "1"},
+            {"file": &fixture, "password": "definitely-wrong", "range": "2"},
+        ],
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(
+        job.run().unwrap(),
+        JobExitCode::Success,
+        "a repeated filename must reuse the first spec's already-open \
+         source and never consult a later spec's password"
+    );
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 2);
+}
+
 /// 2-page document with an outline item pointing at page 2 (obj 4).
 fn build_outline_fixture() -> Vec<u8> {
     use std::collections::BTreeMap;

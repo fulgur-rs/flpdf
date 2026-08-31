@@ -2460,7 +2460,9 @@ fn main() {
                     &output,
                     args.repair,
                     &args.password,
+                    args.update_from_json.as_deref(),
                     &args.page_ops,
+                    &overlay_specs,
                     options,
                     args.verbose,
                 ),
@@ -3218,7 +3220,24 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     );
                     std::process::exit(1);
                 }
-                return if !cmd.page_ops.pages.is_empty() {
+                return if cmd.page_ops.empty && !cmd.page_ops.pages.is_empty() {
+                    // `PageOpArgs` is shared with the top-level surface, whose
+                    // `--empty --pages` route dispatches here too (main
+                    // dispatch, `args.page_ops.empty && ...`); without this
+                    // arm `cmd.input` (unused for an empty primary) is
+                    // rejected instead of routed, and the two surfaces
+                    // silently diverge on the identical flag combination.
+                    run_empty_page_extraction(
+                        &cmd.output,
+                        cmd.repair,
+                        &cmd.password,
+                        None,
+                        &cmd.page_ops,
+                        overlay_specs,
+                        options,
+                        cmd.verbose,
+                    )
+                } else if !cmd.page_ops.pages.is_empty() {
                     run_page_extraction(
                         &cmd.input,
                         &cmd.output,
@@ -4911,11 +4930,14 @@ fn run_page_extraction(
 /// boundary used by ordinary multi-source extraction so source-count policy,
 /// collate order, copying, and final writing cannot drift between the two
 /// command shapes.
+#[allow(clippy::too_many_arguments)]
 fn run_empty_page_extraction(
     output: &Path,
     repair: bool,
     password: &PasswordArgs,
+    update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
+    overlay_specs: &[OverlaySpec],
     options: WriterOptions,
     verbose: bool,
 ) -> CliResult<()> {
@@ -4959,6 +4981,13 @@ fn run_empty_page_extraction(
 
     let mut sources = Vec::with_capacity(source_paths.len() + 1);
     sources.push(job.create_empty_document()?);
+    // qpdf's createQPDF applies --update-from-json to the primary
+    // immediately after creating it (empty or otherwise), before any page
+    // specification is processed (QPDFJob.cc:459-462). Live-probed:
+    // `qpdf --update-from-json=<file> --empty --pages ...` actually applies
+    // the update against the empty primary and surfaces JSON validation
+    // errors (exit 2 on malformed JSON), it is not a silent no-op.
+    apply_json_update_with_job(&mut job, &mut sources[0], update_from_json)?;
     for (source_index, path) in source_paths.iter().enumerate() {
         if verbose {
             logger_info(format!(
@@ -5054,7 +5083,7 @@ fn run_empty_page_extraction(
         repair,
         password,
         page_ops,
-        &[],
+        overlay_specs,
         CliRemoveUnreferencedResources::No,
         options,
         verbose,
