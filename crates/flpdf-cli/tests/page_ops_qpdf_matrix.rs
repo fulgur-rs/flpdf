@@ -1236,6 +1236,78 @@ fn split_pages_leading_dot_template_matches_qpdf() {
 }
 
 #[test]
+fn split_pages_zero_matches_qpdf_unsplit_output() {
+    // qpdf stores zero in its signed split-pages field, then treats it as
+    // falsy at output dispatch and writes one ordinary output file.
+    if !qpdf_available() {
+        return;
+    }
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+    let q = qdir.path().join("q.pdf");
+    let f = fdir.path().join("f.pdf");
+
+    let (q_ok, q_stdout) = run_qpdf(&[
+        src.to_str().unwrap(),
+        "--split-pages=0",
+        q.to_str().unwrap(),
+    ]);
+    assert!(q_ok, "qpdf split-pages=0 failed: {q_stdout}");
+    assert!(q.is_file());
+    assert!(split_outputs(qdir.path()).is_empty());
+
+    flpdf_ok(&[
+        src.to_str().unwrap(),
+        "--split-pages=0",
+        f.to_str().unwrap(),
+    ]);
+    assert!(f.is_file());
+    assert!(split_outputs(fdir.path()).is_empty());
+    assert_eq!(npages_of(&f), npages_of(&q));
+    assert_eq!(rotates_of(&f), rotates_of(&q));
+}
+
+#[test]
+fn pages_then_split_pages_zero_matches_qpdf_unsplit_output() {
+    // With page selection, qpdf still applies the selection and then writes
+    // one ordinary output because zero disables only the split writer branch.
+    if !qpdf_available() {
+        return;
+    }
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+    let q = qdir.path().join("q.pdf");
+    let f = fdir.path().join("f.pdf");
+
+    let (q_ok, q_stdout) = run_qpdf(&[
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+        "--split-pages=0",
+        q.to_str().unwrap(),
+    ]);
+    assert!(q_ok, "qpdf pages+split-pages=0 failed: {q_stdout}");
+    assert_eq!(npages_of(&q), 2);
+    assert!(split_outputs(qdir.path()).is_empty());
+
+    flpdf_ok(&[
+        src.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-2",
+        "--",
+        "--split-pages=0",
+        f.to_str().unwrap(),
+    ]);
+    assert_eq!(npages_of(&f), npages_of(&q));
+    assert!(split_outputs(fdir.path()).is_empty());
+}
+
+#[test]
 fn top_level_split_pages_verbose_preserves_earlier_reports_after_later_failure() {
     // qpdf reports each successfully written chunk before attempting the next
     // one. A later destination failure must not erase the earlier report.
