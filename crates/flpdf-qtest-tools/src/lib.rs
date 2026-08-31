@@ -14,6 +14,7 @@ pub mod character_encoding;
 pub mod clean;
 pub mod common;
 pub mod compare;
+pub mod document_construction;
 pub mod driver;
 pub mod large_file;
 pub mod metadata;

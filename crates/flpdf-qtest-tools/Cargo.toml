@@ -53,6 +53,14 @@ path = "src/bin/test_parsedoffset.rs"
 name = "flpdf-test-large-file"
 path = "src/bin/test_large_file.rs"
 
+[[bin]]
+name = "pdf_from_scratch"
+path = "src/bin/pdf_from_scratch.rs"
+
+[[bin]]
+name = "test_many_nulls"
+path = "src/bin/test_many_nulls.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"
