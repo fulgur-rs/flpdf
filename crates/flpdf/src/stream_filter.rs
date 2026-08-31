@@ -894,6 +894,10 @@ pub(crate) trait StreamFilter {
         Ok(())
     }
 
+    /// Install the optional qpdf-head TIFF row-memory budget before preflight
+    /// and execution. Other filters ignore this setting.
+    fn set_tiff_memory_limit(&mut self, _limit: Option<usize>) {}
+
     /// Construct the same stage with a downstream pipeline that may already
     /// own inner stages. This is the Rust ownership seam used by
     /// `QPDF_Stream::pipeStreamData`'s reverse chain construction.
@@ -946,6 +950,7 @@ struct FlateLzwStreamFilter {
     bits_per_component: i32,
     early_code_change: bool,
     warning_callback: Option<FilterWarningCallback>,
+    tiff_max_memory: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -979,6 +984,7 @@ impl FlateLzwStreamFilter {
             bits_per_component: 8,
             early_code_change: true,
             warning_callback: None,
+            tiff_max_memory: None,
         }
     }
 }
@@ -1276,9 +1282,18 @@ impl StreamFilter for FlateLzwStreamFilter {
     fn preflight_decode_pipeline(&self) -> Result<()> {
         if let Some(geometry) = self.decode_predictor_geometry()? {
             let mut sink = OutputBuffer::new(None);
-            let _predictor = make_predictor_pipeline(geometry, &mut sink, PredictorAction::Decode)?;
+            let _predictor = make_predictor_pipeline(
+                geometry,
+                &mut sink,
+                PredictorAction::Decode,
+                self.tiff_max_memory,
+            )?;
         }
         Ok(())
+    }
+
+    fn set_tiff_memory_limit(&mut self, limit: Option<usize>) {
+        self.tiff_max_memory = limit;
     }
 
     /// Mirrors `SF_FlateLzwDecode::getDecodePipeline`
@@ -1291,7 +1306,12 @@ impl StreamFilter for FlateLzwStreamFilter {
         next: PipelineRef<'a>,
     ) -> Result<OwnedDecodePipeline<'a>> {
         let next: PipelineRef<'a> = match self.decode_predictor_geometry()? {
-            Some(geometry) => make_predictor_pipeline(geometry, next, PredictorAction::Decode)?,
+            Some(geometry) => make_predictor_pipeline(
+                geometry,
+                next,
+                PredictorAction::Decode,
+                self.tiff_max_memory,
+            )?,
             None => next,
         };
         let stage: Box<dyn Pipeline + 'a> = if self.lzw {
@@ -1327,8 +1347,12 @@ impl StreamFilter for FlateLzwStreamFilter {
         // any construction failure precedes every codec write.
         let error = match geometry {
             Some(geometry) => {
-                let mut predictor =
-                    make_predictor_pipeline(geometry, &mut sink, PredictorAction::Decode)?;
+                let mut predictor = make_predictor_pipeline(
+                    geometry,
+                    &mut sink,
+                    PredictorAction::Decode,
+                    self.tiff_max_memory,
+                )?;
                 let phase = Some(finish_phase.as_ref());
                 self.pipe_codec(&mut predictor, data, warn, phase, &output_position)?
             }
@@ -1422,6 +1446,7 @@ fn make_predictor_pipeline<'a>(
     geometry: PredictorGeometry,
     next: impl Into<PipelineRef<'a>>,
     action: PredictorAction,
+    tiff_max_memory: Option<usize>,
 ) -> Result<PipelineRef<'a>> {
     let next = next.into();
     let pipeline = match (geometry.kind, action) {
@@ -1448,24 +1473,26 @@ fn make_predictor_pipeline<'a>(
             .map_err(map_pipeline_error)?,
         ) as Box<dyn Pipeline + 'a>,
         (PredictorKind::Tiff, PredictorAction::Encode) => Box::new(
-            TiffPredictor::new(
+            TiffPredictor::new_with_memory_limit(
                 "tiff encode",
                 next,
                 TiffPredictorAction::Encode,
                 geometry.columns,
                 geometry.colors,
                 geometry.bits_per_component,
+                tiff_max_memory,
             )
             .map_err(map_pipeline_error)?,
         ) as Box<dyn Pipeline + 'a>,
         (PredictorKind::Tiff, PredictorAction::Decode) => Box::new(
-            TiffPredictor::new(
+            TiffPredictor::new_with_memory_limit(
                 "tiff decode",
                 next,
                 TiffPredictorAction::Decode,
                 geometry.columns,
                 geometry.colors,
                 geometry.bits_per_component,
+                tiff_max_memory,
             )
             .map_err(map_pipeline_error)?,
         ) as Box<dyn Pipeline + 'a>,
@@ -1904,7 +1931,8 @@ pub(crate) fn encode_predictor(
 fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Vec<u8>> {
     let mut sink = Buffer::new("stream data buffer", None);
     {
-        let mut predictor = make_predictor_pipeline(geometry, &mut sink, PredictorAction::Encode)?;
+        let mut predictor =
+            make_predictor_pipeline(geometry, &mut sink, PredictorAction::Encode, None)?;
         predictor.write(data).map_err(map_pipeline_error)?;
         predictor.finish().map_err(map_pipeline_error)?;
     }
@@ -1919,4 +1947,67 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
         stage.finish().map_err(map_pipeline_error)?;
     }
     sink.take_buffer().map_err(map_pipeline_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeParams, FlateLzwStreamFilter, ParamValue, StreamFilter};
+    use crate::pipeline::test_support::RecordingSink;
+    use crate::pipeline::PipelineRef;
+
+    fn wide_tiff_decode_params() -> DecodeParams {
+        DecodeParams::Present(vec![
+            (b"Predictor".to_vec(), ParamValue::Int(2)),
+            (b"Columns".to_vec(), ParamValue::Int(536_870_911)),
+            (b"Colors".to_vec(), ParamValue::Int(1)),
+            (b"BitsPerComponent".to_vec(), ParamValue::Int(8)),
+        ])
+    }
+
+    fn wide_tiff_filter() -> FlateLzwStreamFilter {
+        let mut filter = FlateLzwStreamFilter::new(false);
+        assert!(filter.set_decode_params(&wide_tiff_decode_params()));
+        filter.set_tiff_memory_limit(Some(1 << 20));
+        filter
+    }
+
+    #[test]
+    fn owned_decode_pipeline_applies_tiff_memory_limit_before_codec_construction() {
+        let mut filter = wide_tiff_filter();
+        let mut sink = RecordingSink::new(&[], &[]);
+        let result = filter.decode_pipeline_owned(PipelineRef::from(&mut sink));
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("TIFFPredictor memory limit exceeded"));
+    }
+
+    #[test]
+    fn recovering_decode_pipeline_applies_tiff_memory_limit_before_codec_writes() {
+        let mut filter = wide_tiff_filter();
+        let result = filter.pipe_decode_recovering(&[], None, &mut |_, _, _, _| Ok(()));
+        assert!(result.is_err());
+        let error = result.err().unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("TIFFPredictor memory limit exceeded"));
+    }
+
+    #[test]
+    fn encode_predictor_uses_the_tiff_stream_filter_pipeline() {
+        let params = DecodeParams::Present(vec![
+            (b"Predictor".to_vec(), ParamValue::Int(2)),
+            (b"Columns".to_vec(), ParamValue::Int(2)),
+            (b"Colors".to_vec(), ParamValue::Int(1)),
+            (b"BitsPerComponent".to_vec(), ParamValue::Int(8)),
+        ]);
+
+        assert_eq!(
+            super::encode_predictor(&[10, 20], b"FlateDecode", &params).unwrap(),
+            [10, 10]
+        );
+    }
 }

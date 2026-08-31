@@ -215,12 +215,20 @@ pub fn decode_stream_data_recovering_with_limits(
 /// `FlateDecode`, `LZWDecode`, `ASCII85Decode`, `ASCIIHexDecode`, or
 /// `RunLengthDecode` stage, trading completeness for a per-stage bound. It is
 /// not a ceiling on the total work or cumulative output across a filter chain.
+/// [`max_tiff_memory`](Self::max_tiff_memory) is a separate optional qpdf-head
+/// hardening budget for TIFF predictor row geometry; `None` and `Some(0)` are
+/// unlimited, matching qpdf's zero-valued global limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeLimits {
     /// Maximum decoded byte count permitted out of any single supported filter
     /// stage, counted after that stage's predictor if it has one. `None`
     /// (default) is unlimited.
     pub max_output: Option<usize>,
+    /// Maximum TIFF predictor row-memory budget in bytes. qpdf's hardening
+    /// rejects a row when its wide `bytes_per_row` exceeds half this value,
+    /// before partial-row padding or predictor state allocation. `None` and
+    /// `Some(0)` (default) leave the pinned qpdf 11.9.0 behavior unlimited.
+    pub max_tiff_memory: Option<usize>,
     /// Maximum `/Filter` stages accepted before individual filter items are
     /// validated. `None` disables this count limit.
     pub max_filter_chain: Option<usize>,
@@ -230,6 +238,7 @@ impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
             max_output: None,
+            max_tiff_memory: None,
             max_filter_chain: Some(MAX_FILTER_CHAIN_LEN),
         }
     }
@@ -505,7 +514,7 @@ fn decode_prepared_specs(
     data_events: DataEventMode,
     decrypt_crypt: CryptProvider<'_>,
 ) -> Result<StreamDecodeOutcome> {
-    let prepared = prepare_decode_filters(specs)?;
+    let prepared = prepare_decode_filters(specs, limits.max_tiff_memory)?;
     let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
     let mut events = Vec::new();
@@ -667,7 +676,10 @@ struct PreparedDecodeFilter {
     stage: PreparedStage,
 }
 
-fn prepare_decode_filters(specs: Vec<FilterSpec>) -> Result<Vec<PreparedDecodeFilter>> {
+fn prepare_decode_filters(
+    specs: Vec<FilterSpec>,
+    max_tiff_memory: Option<usize>,
+) -> Result<Vec<PreparedDecodeFilter>> {
     let mut prepared = Vec::with_capacity(specs.len());
     for spec in specs {
         let filter_name = spec.normalized_name();
@@ -688,6 +700,7 @@ fn prepare_decode_filters(specs: Vec<FilterSpec>) -> Result<Vec<PreparedDecodeFi
                 String::from_utf8_lossy(filter_name)
             )));
         }
+        adapter.set_tiff_memory_limit(max_tiff_memory);
 
         prepared.push(PreparedDecodeFilter {
             spec,
@@ -825,6 +838,7 @@ fn decode_codec_prefix(
     // a different event boundary, and ultimately a different public error.
     let applied = adapter.set_decode_params(&spec.decode_params);
     debug_assert!(applied);
+    adapter.set_tiff_memory_limit(limits.max_tiff_memory);
     adapter
         .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
         .expect("preflighted codec prefix pipeline is infallible")
