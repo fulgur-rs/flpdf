@@ -3356,12 +3356,12 @@ impl ObjectHandle {
     /// # Errors
     ///
     /// As [`Self::try_get_int_value`]. A clamp warning also goes through
-    /// [`Self::warn_if_possible`], which — unlike [`Self::type_warning`] —
+    /// `warn_if_possible`, which — unlike `type_warning` —
     /// usually reports no error of its own; but a *reachable* document whose
     /// warning sink itself fails (no default logger sink, a resolver with no
     /// warn receiver) still propagates that failure here, and the saturated
     /// value is not returned in that case.
-    pub(crate) fn try_get_int_value_as_int(&self) -> Result<i32> {
+    pub fn try_get_int_value_as_int(&self) -> Result<i32> {
         let value = self.try_get_int_value()?;
         if value < i64::from(i32::MIN) {
             self.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
@@ -3371,6 +3371,42 @@ impl ObjectHandle {
             Ok(i32::MAX)
         } else {
             Ok(value as i32)
+        }
+    }
+
+    /// Return qpdf's unsigned-long-long integer value, warning and yielding
+    /// `0` for a negative integer (`libqpdf/QPDFObjectHandle.cc:556-575`).
+    /// Non-integer values use [`Self::try_get_int_value`]'s zero fallback,
+    /// so they emit only that type warning.
+    pub fn try_get_uint_value(&self) -> Result<u64> {
+        let value = self.try_get_int_value()?;
+        if value < 0 {
+            self.warn_if_possible("unsigned value request for negative number; returning 0")?;
+            Ok(0)
+        } else {
+            // A non-negative i64 always fits in qpdf's unsigned long long
+            // counterpart on the supported 64-bit targets.
+            Ok(value as u64)
+        }
+    }
+
+    /// Return qpdf's unsigned-int integer value, warning and saturating at
+    /// `0`/`u32::MAX` when the signed value is outside that range
+    /// (`libqpdf/QPDFObjectHandle.cc:580-604`).
+    /// Non-integer values use [`Self::try_get_int_value`]'s zero fallback,
+    /// so they emit only that type warning.
+    pub fn try_get_uint_value_as_uint(&self) -> Result<u32> {
+        let value = self.try_get_int_value()?;
+        if value < 0 {
+            let warning = "unsigned integer value request for negative number; returning 0";
+            self.warn_if_possible(warning)?;
+            Ok(0)
+        } else if value > i64::from(u32::MAX) {
+            let warning = "requested value of unsigned integer is too big; returning UINT_MAX";
+            self.warn_if_possible(warning)?;
+            Ok(u32::MAX)
+        } else {
+            Ok(value as u32)
         }
     }
 
@@ -18110,6 +18146,50 @@ pub(crate) mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
+            ["object 3 0: requested value of integer is too big; returning INT_MAX"]
+        );
+    }
+
+    #[test]
+    fn integer_size_accessors_match_qpdf_test_62() {
+        // `qpdf/test_driver.cc:2263-2287` exercises the same values and
+        // conversions. Keep each handle separate so the warning sequence
+        // remains the sequence of calls made by qpdf's test.
+        let q1_l = 3_u64 * u64::from(u32::try_from(i32::MAX).unwrap());
+        let q1 = i64::try_from(q1_l).unwrap();
+        let (q1_handle, q1_recorder) = handle_resolving(ObjectValue::Integer(q1));
+        assert_eq!(q1_handle.try_get_int_value().unwrap(), q1);
+        assert_eq!(q1_handle.try_get_uint_value().unwrap(), q1_l);
+        assert_eq!(q1_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
+        assert_eq!(q1_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
+        assert_eq!(
+            warnings(&q1_recorder),
+            [
+                "object 3 0: requested value of integer is too big; returning INT_MAX",
+                "object 3 0: requested value of unsigned integer is too big; returning UINT_MAX",
+            ]
+        );
+
+        let q2 = 3_i64 * i64::from(i32::MIN);
+        let (q2_handle, q2_recorder) = handle_resolving(ObjectValue::Integer(q2));
+        assert_eq!(q2_handle.try_get_int_value().unwrap(), q2);
+        assert_eq!(q2_handle.try_get_uint_value().unwrap(), 0);
+        assert_eq!(q2_handle.try_get_int_value_as_int().unwrap(), i32::MIN);
+        assert_eq!(q2_handle.try_get_uint_value_as_uint().unwrap(), 0);
+        assert_eq!(
+            warnings(&q2_recorder),
+            [
+                "object 3 0: unsigned value request for negative number; returning 0",
+                "object 3 0: requested value of integer is too small; returning INT_MIN",
+                "object 3 0: unsigned integer value request for negative number; returning 0",
+            ]
+        );
+
+        let (q3_handle, q3_recorder) = handle_resolving(ObjectValue::Integer(i64::from(u32::MAX)));
+        assert_eq!(q3_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
+        assert_eq!(q3_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
+        assert_eq!(
+            warnings(&q3_recorder),
             ["object 3 0: requested value of integer is too big; returning INT_MAX"]
         );
     }

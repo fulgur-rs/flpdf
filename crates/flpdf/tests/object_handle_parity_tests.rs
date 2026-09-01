@@ -131,6 +131,60 @@ fn trailer_returns_a_direct_handle_with_an_indirect_root() {
 }
 
 #[test]
+fn integer_width_accessors_are_public_and_match_qpdf_boundaries() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let trailer = pdf.trailer();
+
+    let q1_l = 3_u64 * u64::from(u32::try_from(i32::MAX).unwrap());
+    let q1 = i64::try_from(q1_l).unwrap();
+    let q2 = 3_i64 * i64::from(i32::MIN);
+    trailer
+        .replace_key(b"/Q1", ObjectHandle::integer(q1))
+        .unwrap();
+    trailer
+        .replace_key(b"/Q2", ObjectHandle::integer(q2))
+        .unwrap();
+    trailer
+        .replace_key(b"/Q3", ObjectHandle::integer(i64::from(u32::MAX)))
+        .unwrap();
+
+    let q1_handle = trailer.get_key(b"/Q1");
+    assert_eq!(q1_handle.try_get_int_value().unwrap(), q1);
+    assert_eq!(q1_handle.try_get_uint_value().unwrap(), q1_l);
+    assert_eq!(q1_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
+    assert_eq!(q1_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
+
+    let q2_handle = trailer.get_key(b"/Q2");
+    assert_eq!(q2_handle.try_get_int_value().unwrap(), q2);
+    assert_eq!(q2_handle.try_get_uint_value().unwrap(), 0);
+    assert_eq!(q2_handle.try_get_int_value_as_int().unwrap(), i32::MIN);
+    assert_eq!(q2_handle.try_get_uint_value_as_uint().unwrap(), 0);
+
+    let q3_handle = trailer.get_key(b"/Q3");
+    assert_eq!(q3_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
+    assert_eq!(q3_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
+
+    let diagnostics = pdf.repair_diagnostics();
+    let messages: Vec<_> = diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "requested value of integer is too big; returning INT_MAX",
+            "requested value of unsigned integer is too big; returning UINT_MAX",
+            "unsigned value request for negative number; returning 0",
+            "requested value of integer is too small; returning INT_MIN",
+            "unsigned integer value request for negative number; returning 0",
+            "requested value of integer is too big; returning INT_MAX",
+        ]
+    );
+}
+
+#[test]
 fn resolve_resolves_a_fresh_handle_in_place() {
     let file = File::open(minimal_fixture_path()).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();

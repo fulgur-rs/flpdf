@@ -253,6 +253,18 @@ eight-case qpdf 11.9.0 helper differential.
 
 `flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、`object_refs()` / `live_object_refs()` が allocated indirect null を落とさないようにする。legacy cache/memo の互換 bridge や qpdf-deviation marker は追加しない。
 
+### `test_driver` test 62 の整数幅アクセサ
+
+qpdf `test_driver.cc:2262-2287` の `getUIntValue` / `getIntValueAsInt` /
+`getUIntValueAsUInt` は、`ObjectHandle::try_get_uint_value`、
+`ObjectHandle::try_get_int_value_as_int`、
+`ObjectHandle::try_get_uint_value_as_uint` に対応する。負値の 0 への変換、
+`INT_MIN` / `INT_MAX` / `UINT_MAX` への飽和、および qpdf と同じ警告文は
+`object_handle.rs` の canonical accessor が担う。`flpdf-test-driver` は値の
+検査をこの API に委譲し、qtest の stderr 境界だけを qpdf の生の警告行へ戻す。
+Rust unit test と qtest の `error-condition 45`
+（`test_driver 62 minimal.pdf`）が、qpdf 11.9.0 の値・警告順・出力を固定する。
+
 ## 2. パース / 読み取り
 
 | qpdf | 行 | flpdf | 状態 |
