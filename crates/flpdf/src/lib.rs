@@ -106,6 +106,8 @@ pub mod json_inspect;
 pub mod linearization;
 pub mod logger;
 pub mod matrix;
+#[allow(unsafe_code)]
+mod memory_usage;
 mod nntree;
 pub mod object_copy;
 mod object_handle;

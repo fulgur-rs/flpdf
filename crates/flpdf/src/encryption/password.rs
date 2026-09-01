@@ -54,6 +54,58 @@ pub(crate) fn password_candidates_for_read(raw: &[u8], mode: PasswordMode) -> Re
     Ok(possible_repaired_encodings(&password))
 }
 
+/// Normalize one job-configured output password using qpdf's
+/// `QPDFJob::maybeFixWritePassword` rules (`QPDFJob.cc:2655-2723`). The
+/// boolean reports qpdf's auto-mode fallback warning for a non-PDFDoc-encodable
+/// UTF-8 password on an R<5 writer; the caller owns the logger/prefix.
+pub(crate) fn password_bytes_for_write(
+    raw: &[u8],
+    mode: PasswordMode,
+    revision: i32,
+) -> Result<(Vec<u8>, bool)> {
+    match mode {
+        PasswordMode::Bytes => Ok((raw.to_vec(), false)),
+        PasswordMode::HexBytes => Ok((decode_hex(raw)?, false)),
+        PasswordMode::Unicode => {
+            if std::str::from_utf8(raw).is_err() {
+                return Err(crate::Error::System(
+                    "supplied password is not valid UTF-8".to_owned(),
+                ));
+            }
+            if revision < 5 {
+                let encoded = transcode_utf8(raw, SingleByteEncoding::PdfDoc).ok_or_else(|| {
+                    crate::Error::System(
+                        "supplied password cannot be encoded for 40-bit or 128-bit encryption formats"
+                            .to_owned(),
+                    )
+                })?;
+                Ok((encoded, false))
+            } else {
+                Ok((raw.to_vec(), false))
+            }
+        }
+        PasswordMode::Auto => {
+            let (has_8bit_chars, is_valid_utf8, _) = analyze_encoding(raw);
+            if !has_8bit_chars {
+                return Ok((raw.to_vec(), false));
+            }
+            if revision < 5 && is_valid_utf8 {
+                if let Some(encoded) = transcode_utf8(raw, SingleByteEncoding::PdfDoc) {
+                    return Ok((encoded, false));
+                }
+                return Ok((raw.to_vec(), true));
+            }
+            if revision >= 5 && !is_valid_utf8 {
+                return Err(crate::Error::System(
+                    "supplied password is not a valid Unicode password, which is required for 256-bit encryption; to really use this password, rerun with the --password-mode=bytes option"
+                        .to_owned(),
+                ));
+            }
+            Ok((raw.to_vec(), false))
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum SingleByteEncoding {
     PdfDoc,
@@ -449,6 +501,55 @@ mod tests {
 
         assert_eq!(candidates[0], b"caf\xe9");
         assert_eq!(candidates[1], "café".as_bytes());
+    }
+
+    #[test]
+    fn write_password_modes_match_qpdf_normalization() {
+        assert_eq!(
+            password_bytes_for_write(b"raw", PasswordMode::Bytes, 2)
+                .unwrap()
+                .0,
+            b"raw"
+        );
+        assert_eq!(
+            password_bytes_for_write(b"636166e9", PasswordMode::HexBytes, 6)
+                .unwrap()
+                .0,
+            b"caf\xe9"
+        );
+        assert_eq!(
+            password_bytes_for_write("café".as_bytes(), PasswordMode::Unicode, 4)
+                .unwrap()
+                .0,
+            b"caf\xe9"
+        );
+        assert_eq!(
+            password_bytes_for_write("café".as_bytes(), PasswordMode::Auto, 4)
+                .unwrap()
+                .0,
+            b"caf\xe9"
+        );
+        assert_eq!(
+            password_bytes_for_write("café".as_bytes(), PasswordMode::Unicode, 6)
+                .unwrap()
+                .0,
+            "café".as_bytes()
+        );
+        assert_eq!(
+            password_bytes_for_write("café".as_bytes(), PasswordMode::Auto, 6)
+                .unwrap()
+                .0,
+            "café".as_bytes()
+        );
+    }
+
+    #[test]
+    fn write_password_unicode_rejects_invalid_or_unencodable_values() {
+        assert!(password_bytes_for_write(b"bad\xff", PasswordMode::Unicode, 6).is_err());
+        assert!(password_bytes_for_write("😀".as_bytes(), PasswordMode::Unicode, 4).is_err());
+        let (_, warned) = password_bytes_for_write("😀".as_bytes(), PasswordMode::Auto, 4).unwrap();
+        assert!(warned);
+        assert!(password_bytes_for_write(b"bad\xff", PasswordMode::Auto, 6).is_err());
     }
 
     #[test]

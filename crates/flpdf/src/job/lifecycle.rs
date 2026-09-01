@@ -17,14 +17,15 @@ use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::{apply_rotate_to_pages, flatten_rotation_on_pages};
 use super::rotate_spec::RotateSpec;
-use crate::encryption::{EncryptMethod, EncryptParams};
+use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
 use crate::json::input::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
+use crate::linearization::show_linearization_pdf_with_warnings;
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
-    AcroFormDocumentHelper, Error, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, Pdf,
-    PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, Severity, UsageError,
-    WriterConfiguration,
+    AcroFormDocumentHelper, Error, ObjectRef, ObjectStreamMode, PageDocumentHelper,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, Severity,
+    UsageError, WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -113,6 +114,13 @@ struct JobConfiguration {
     empty_input: bool,
     output_file: Option<PathBuf>,
     password: Vec<u8>,
+    copy_encryption: Option<PathBuf>,
+    encryption_file_password: Vec<u8>,
+    password_mode: PasswordMode,
+    ignore_xref_streams: bool,
+    password_is_hex_key: bool,
+    suppress_password_recovery: bool,
+    suppress_recovery: bool,
     verbose: bool,
     json_input: bool,
     update_from_json: Option<PathBuf>,
@@ -170,6 +178,24 @@ struct JobConfiguration {
     test_json_schema: bool,
     show_encryption_key: bool,
     show_encryption: bool,
+    is_encrypted: bool,
+    requires_password: bool,
+    report_memory_usage: bool,
+    show_xref: bool,
+    show_linearization: bool,
+    show_object: Option<JobObjectSelector>,
+    show_raw_stream_data: bool,
+    show_filtered_stream_data: bool,
+    list_attachments: bool,
+    show_attachment: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobObjectSelector {
+    Trailer,
+    Object(ObjectRef),
+    Null,
+    NoObject,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +295,7 @@ fn job_json_schema() -> crate::json::Json {
         "showObject",
         "showPages",
         "showXref",
+        "showAttachment",
         "withImages",
         "listAttachments",
         "json",
@@ -434,6 +461,77 @@ fn validate_job_json_schema(value: &crate::json::Json) -> Result<()> {
         message.push_str(&error.to_string());
     }
     Err(Error::Usage(UsageError::new(message)))
+}
+
+fn expand_job_json_files(value: &crate::json::Json) -> Result<crate::json::Json> {
+    fn expand(
+        value: &crate::json::Json,
+        active: &mut BTreeSet<PathBuf>,
+    ) -> Result<crate::json::Json> {
+        if !value.is_dictionary() {
+            return Err(Error::Usage(UsageError::new(
+                "top-level object is supposed to be a dictionary",
+            )));
+        }
+        let members = job_json_members(value);
+        let Some(path_bytes) = job_json_string(&members, b"jobJsonFile")? else {
+            return Ok(value.clone());
+        };
+        let path = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
+        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        // qpdf recursively re-enters `initializeFromJson` without a cycle
+        // guard. Keep the Rust job boundary finite for a hostile include
+        // graph; this input shape has no successful qpdf output to preserve.
+        // qpdf-deviation-start: reject recursive jobJsonFile includes instead of recursing until stack exhaustion
+        if !active.insert(identity.clone()) {
+            return Err(Error::Usage(UsageError::new(format!(
+                "recursive jobJsonFile reference: {}",
+                path.display()
+            ))));
+        }
+        // qpdf-deviation-end
+        let nested_result = (|| {
+            let bytes = std::fs::read(&path)
+                .map_err(|error| Error::file_io("read job-json file", path.clone(), error))?;
+            let nested = crate::json::Json::parse(&bytes)
+                .map_err(|error| Error::System(error.to_string()))?;
+            if !nested.is_dictionary() {
+                return Err(Error::Usage(UsageError::new(
+                    "top-level object is supposed to be a dictionary",
+                )));
+            }
+            validate_job_json_schema(&nested)?;
+            let nested = expand(&nested, active)?;
+            let nested_members = job_json_members(&nested);
+            let merged = crate::json::Json::make_dictionary();
+            for (key, item) in &nested_members {
+                merged
+                    .add_dictionary_member(key, item.clone())
+                    .map_err(|error| Error::System(error.to_string()))?;
+            }
+            for (key, item) in members {
+                if key == b"jobJsonFile" {
+                    continue;
+                }
+                // JSON dictionaries are stored in qpdf's ordered map. The
+                // nested file is applied at the `jobJsonFile` key's position:
+                // keys before it are overwritten by the nested handler, and
+                // keys after it overwrite nested settings.
+                // cov:ignore-start: the merged value is always a dictionary, so its insertion type error is unreachable
+                if !nested_members.contains_key(&key) || key.as_slice() > b"jobJsonFile" {
+                    merged
+                        .add_dictionary_member(key, item)
+                        .map_err(|error| Error::System(error.to_string()))?;
+                }
+                // cov:ignore-end
+            }
+            Ok(merged)
+        })();
+        active.remove(&identity);
+        nested_result
+    }
+
+    expand(value, &mut BTreeSet::new())
 }
 
 fn job_json_members(
@@ -613,6 +711,16 @@ fn parse_job_encrypt(value: &crate::json::Json, allow_weak_crypto: bool) -> Resu
         .get(key_length.as_bytes())
         .expect("key length was found in the encryption dictionary");
     let settings = job_json_members(settings);
+    let allow_insecure = job_json_bare(&settings, b"allowInsecure")?;
+    if key_length == "256bit"
+        && owner_password.is_empty()
+        && !user_password.is_empty()
+        && !allow_insecure
+    {
+        return Err(Error::Usage(UsageError::new(
+            "A PDF with a non-empty user password and an empty owner password encrypted with a 256-bit key is insecure as it can be opened without a password. If you really want to do this, you must also give the --allow-insecure option before the -- that follows --encrypt.",
+        )));
+    }
     let mut permissions = crate::PermissionsConfig::default();
     if let Some(value) = job_json_yn(&settings, b"accessibility")? {
         permissions.accessibility = value;
@@ -831,6 +939,76 @@ fn parse_job_split_pages(value: &[u8]) -> Result<i32> {
             ".splitPages: invalid page count {text}"
         )))),
     }
+}
+
+fn parse_job_compression_level(value: &[u8]) -> Result<i32> {
+    let text = String::from_utf8_lossy(value);
+    match qpdf_string_to_int_checked(&text) {
+        QpdfIntParse::NoDigits => Ok(0),
+        QpdfIntParse::Value(level) => Ok(level),
+        QpdfIntParse::Overflow(message) => Err(Error::System(message)),
+    }
+}
+
+fn parse_job_object_selector(value: &[u8]) -> Result<JobObjectSelector> {
+    let value = String::from_utf8_lossy(value);
+    if value == "trailer" {
+        return Ok(JobObjectSelector::Trailer);
+    }
+
+    let (number, generation) = value.split_once(',').unwrap_or((&value, "0"));
+    let number = parse_job_selector_integer(number)?;
+    let generation = if generation.is_empty() {
+        0
+    } else {
+        parse_job_selector_integer(generation)?
+    };
+    if number <= 0 {
+        return Ok(JobObjectSelector::NoObject);
+    }
+    if !(0..=i32::from(u16::MAX)).contains(&generation) {
+        return Ok(JobObjectSelector::Null);
+    }
+    Ok(JobObjectSelector::Object(ObjectRef::new(
+        u32::try_from(number).expect("positive i32 fits u32"),
+        u16::try_from(generation).expect("validated u16 generation"),
+    )))
+}
+
+fn parse_job_selector_integer(value: &str) -> Result<i32> {
+    let original = value;
+    let value = value.trim_start_matches(|character| {
+        matches!(
+            character,
+            ' ' | '\n' | '\r' | '\t' | '\u{000c}' | '\u{000b}'
+        )
+    });
+    let sign_len = usize::from(matches!(value.as_bytes().first(), Some(b'+') | Some(b'-')));
+    let digits_end = sign_len
+        + value[sign_len..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+    if digits_end == sign_len {
+        return Ok(0);
+    }
+    let prefix = &value[..digits_end];
+    let parsed = prefix.parse::<i128>().map_err(|_| {
+        Error::Usage(UsageError::new(format!(
+            "overflow/underflow converting {original} to 64-bit integer"
+        )))
+    })?;
+    if !(i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&parsed) {
+        return Err(Error::Usage(UsageError::new(format!(
+            "overflow/underflow converting {original} to 64-bit integer"
+        ))));
+    }
+    let parsed = parsed as i64;
+    i32::try_from(parsed).map_err(|_| {
+        Error::Usage(UsageError::new(format!(
+            "integer out of range converting {parsed} from a 8-byte signed type to a 4-byte signed type"
+        )))
+    })
 }
 
 fn parse_job_attachment(value: &crate::json::Json, path: &str) -> Result<AttachmentAddOptions> {
@@ -1369,19 +1547,16 @@ impl QPDFJob {
     /// Initialize the qpdf-compatible job-JSON fields supported by this
     /// lifecycle.
     ///
-    /// This includes input/output setup, writer settings, page transformations
-    /// (`splitPages`, `rotate`, `removeRestrictions`,
-    /// `generateAppearances`, `flattenAnnotations`, `coalesceContents`, and
-    /// `flattenRotation`),
-    /// attachments, page selection, and JSON output.
+    /// This includes the qpdf 11.9.0 generated handler surface: input/output
+    /// setup, reader policy, writer settings, encryption, page transformations,
+    /// attachments, page selection, inspections, JSON output, memory reporting,
+    /// and nested `jobJsonFile` includes.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] if `json` does not parse as a
-    /// dictionary, if `inputFile` is missing or empty, if `outputFile` is
-    /// missing, or if the dictionary contains a top-level key outside the
-    /// subset above (qpdf's full job JSON schema key, but not yet
-    /// implemented by this crate).
+    /// Returns an error if `json` is not a dictionary, if a nested job file
+    /// cannot be read or parsed, if a value violates qpdf's generated handler
+    /// contract, or if the non-partial form fails final input/output checks.
     pub fn initialize_from_json(&mut self, json: &str) -> Result<()> {
         self.initialize_from_json_with_partial(json, false)
     }
@@ -1393,6 +1568,20 @@ impl QPDFJob {
     /// (`libqpdf/QPDFJob_config.cc:774-784`).
     pub fn initialize_from_json_partial(&mut self, json: &str) -> Result<()> {
         self.initialize_from_json_with_partial(json, true)
+    }
+
+    fn configured_open_options(&self, password: Vec<u8>) -> PdfOpenOptions {
+        PdfOpenOptions {
+            // qpdf's `suppressRecovery` sets `attempt_recovery` false on every
+            // QPDF created by the job (`QPDFJob.cc:651-659`).
+            repair: !self.configuration.suppress_recovery,
+            ignore_xref_streams: self.configuration.ignore_xref_streams,
+            password,
+            password_mode: self.configuration.password_mode,
+            suppress_password_recovery: self.configuration.suppress_password_recovery,
+            password_is_hex_key: self.configuration.password_is_hex_key,
+            ..PdfOpenOptions::default()
+        }
     }
 
     fn initialize_from_json_with_partial(&mut self, json: &str, partial: bool) -> Result<()> {
@@ -1412,6 +1601,7 @@ impl QPDFJob {
         // configuration mutation so a schema failure cannot leave a partially
         // initialized job behind.
         validate_job_json_schema(&value)?;
+        let value = expand_job_json_files(&value)?;
         let members = job_json_members(&value);
         let mut configuration = JobConfiguration {
             require_output: true,
@@ -1439,6 +1629,13 @@ impl QPDFJob {
             configuration.output_file =
                 Some(PathBuf::from(String::from_utf8_lossy(&output).into_owned()));
         }
+        if let Some(copy_encryption) = job_json_string(&members, b"copyEncryption")? {
+            configuration.copy_encryption = Some(PathBuf::from(
+                String::from_utf8_lossy(&copy_encryption).into_owned(),
+            ));
+        }
+        configuration.encryption_file_password =
+            job_json_string(&members, b"encryptionFilePassword")?.unwrap_or_default();
         configuration.replace_input = job_json_bare(&members, b"replaceInput")?;
         configuration.password = job_json_string(&members, b"password")?.unwrap_or_default();
         if let Some(password_file) = job_json_string(&members, b"passwordFile")? {
@@ -1463,6 +1660,25 @@ impl QPDFJob {
                 first_line.pop();
             }
             configuration.password = first_line;
+        }
+        configuration.ignore_xref_streams = job_json_bare(&members, b"ignoreXrefStreams")?;
+        configuration.password_is_hex_key = job_json_bare(&members, b"passwordIsHexKey")?;
+        configuration.suppress_password_recovery =
+            job_json_bare(&members, b"suppressPasswordRecovery")?;
+        configuration.suppress_recovery = job_json_bare(&members, b"suppressRecovery")?;
+        if let Some(value) = job_json_choice(
+            &members,
+            b"passwordMode",
+            &["bytes", "hex-bytes", "unicode", "auto"],
+            true,
+        )? {
+            configuration.password_mode = match value.as_str() {
+                "bytes" => PasswordMode::Bytes,
+                "hex-bytes" => PasswordMode::HexBytes,
+                "unicode" => PasswordMode::Unicode,
+                "auto" => PasswordMode::Auto,
+                _ => unreachable!("passwordMode was validated above"), // cov:ignore: passwordMode comes only from the validated qpdf job schema choices
+            };
         }
         configuration.json_input = job_json_bare(&members, b"jsonInput")?;
 
@@ -1500,6 +1716,11 @@ impl QPDFJob {
         }
         if job_json_bare(&members, b"recompressFlate")? {
             configuration.writer.set_recompress_flate(true);
+        }
+        if let Some(value) = job_json_string(&members, b"compressionLevel")? {
+            configuration
+                .writer
+                .set_compression_level(parse_job_compression_level(&value)?);
         }
         if let Some(value) = job_json_choice(
             &members,
@@ -1701,13 +1922,49 @@ impl QPDFJob {
             configuration.show_encryption = true;
             configuration.require_output = false;
         }
+        if job_json_bare(&members, b"isEncrypted")? {
+            configuration.is_encrypted = true;
+            configuration.require_output = false;
+        }
+        if job_json_bare(&members, b"requiresPassword")? {
+            configuration.requires_password = true;
+            configuration.require_output = false;
+        }
         if job_json_bare(&members, b"checkLinearization")? {
             configuration.check_linearization = true;
             configuration.require_output = false;
         }
+        if job_json_bare(&members, b"showXref")? {
+            configuration.show_xref = true;
+            configuration.require_output = false;
+        }
+        if job_json_bare(&members, b"showLinearization")? {
+            configuration.show_linearization = true;
+            configuration.require_output = false;
+        }
+        configuration.show_filtered_stream_data = job_json_bare(&members, b"filteredStreamData")?;
+        configuration.show_raw_stream_data = job_json_bare(&members, b"rawStreamData")?;
+        if let Some(value) = job_json_string(&members, b"showObject")? {
+            configuration.show_object = Some(parse_job_object_selector(&value)?);
+            configuration.require_output = false;
+        }
+        if job_json_bare(&members, b"listAttachments")? {
+            configuration.list_attachments = true;
+            configuration.require_output = false;
+        }
+        if let Some(value) = job_json_string(&members, b"showAttachment")? {
+            configuration.show_attachment = Some(value);
+            configuration.require_output = false;
+        }
         configuration.show_page_images = job_json_bare(&members, b"withImages")?;
+        configuration.report_memory_usage = job_json_bare(&members, b"reportMemoryUsage")?;
 
         if let Some(value) = members.get(b"encrypt".as_slice()) {
+            // qpdf's `EncConfig::endEncrypt` clears copy-encryption and
+            // decrypt state (`QPDFJob_config.cc:1158-1167`). The generated
+            // handler visits `copyEncryption` before `encrypt`, so preserve
+            // that precedence in the configuration snapshot.
+            configuration.copy_encryption = None;
             configuration
                 .writer
                 .set_encryption_parameters(parse_job_encrypt(
@@ -1869,12 +2126,11 @@ impl QPDFJob {
         // `--update-from-json` validation failure against the empty
         // primary: `WARNING: empty PDF ( from <path>): ...`, live-probed
         // against qpdf 11.9.0).
-        let mut pdf = crate::engine::open_empty_with_options_erased(PdfOpenOptions {
-            logger: Some(self.logger.clone()),
-            suppress_warnings: self.suppress_warnings,
-            description: "empty PDF".to_owned(),
-            ..PdfOpenOptions::default()
-        })?;
+        let mut options = self.configured_open_options(Vec::new());
+        options.logger = Some(self.logger.clone());
+        options.suppress_warnings = self.suppress_warnings;
+        options.description = "empty PDF".to_owned();
+        let mut pdf = crate::engine::open_empty_with_options_erased(options)?;
         self.input_name.clear();
         pdf.root_handle()?;
         self.record_document_warnings(&pdf);
@@ -1895,15 +2151,10 @@ impl QPDFJob {
         self.input_name = input_name.clone();
         // See `create_empty_document`: qpdf applies `noWarn` to every
         // creation kind uniformly, including JSON-input.
-        let pdf = crate::json::create_from_json_erased(
-            source,
-            input_name,
-            PdfOpenOptions {
-                logger: Some(self.logger.clone()),
-                suppress_warnings: self.suppress_warnings,
-                ..PdfOpenOptions::default()
-            },
-        )?;
+        let mut options = self.configured_open_options(Vec::new());
+        options.logger = Some(self.logger.clone());
+        options.suppress_warnings = self.suppress_warnings;
+        let pdf = crate::json::create_from_json_erased(source, input_name, options)?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
     }
@@ -1947,10 +2198,7 @@ impl QPDFJob {
         match self.open_document(
             BufReader::new(file),
             input.display().to_string(),
-            PdfOpenOptions {
-                password: self.configuration.password.clone(),
-                ..PdfOpenOptions::default()
-            },
+            self.configured_open_options(self.configuration.password.clone()),
         ) {
             Ok(pdf) => Ok(Some(pdf)),
             Err(error) => {
@@ -1975,6 +2223,30 @@ impl QPDFJob {
             return Ok(JobExitCode::Error);
         };
         let mut writer_configuration = self.configuration.writer.clone();
+        if let Some(path) = self.configuration.copy_encryption.clone() {
+            match self.copy_encryption_source(&path) {
+                Ok(source) => writer_configuration.copy_encryption_parameters(source),
+                Err(error) => {
+                    self.report_job_error(&error)?;
+                    return Ok(JobExitCode::Error);
+                }
+            }
+        }
+        let auto_password_warnings = match writer_configuration
+            .normalize_encryption_passwords(self.configuration.password_mode)
+        {
+            Ok(count) => count,
+            Err(error) => {
+                self.report_job_error(&error)?;
+                return Ok(JobExitCode::Error);
+            }
+        };
+        for _ in 0..auto_password_warnings {
+            self.logger.error(format!(
+                "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
+                self.message_prefix
+            ))?; // cov:ignore: custom error-sink failure is an injected logger edge; the warning emission path is covered by the differential CLI test
+        }
         writer_configuration.set_linearization(self.configuration.linearize);
         if let Some(path) = self.configuration.linearize_pass1.as_deref() {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
@@ -2035,6 +2307,9 @@ impl QPDFJob {
 
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
+        if self.configuration.is_encrypted || self.configuration.requires_password {
+            return self.run_encryption_status();
+        }
         let Some(pdf) = self.create_qpdf()? else {
             return Ok(JobExitCode::Error);
         };
@@ -2047,6 +2322,9 @@ impl QPDFJob {
                 JobExitCode::Error
             }
         };
+        if configuration.report_memory_usage && status != JobExitCode::Error {
+            self.report_memory_usage()?;
+        }
         if configuration.replace_input {
             if status == JobExitCode::Error {
                 self.remove_replace_input_temp();
@@ -2055,6 +2333,64 @@ impl QPDFJob {
             }
         }
         Ok(status)
+    }
+
+    fn report_memory_usage(&self) -> Result<()> {
+        self.logger.warn(format!(
+            "qpdf-max-memory-usage {}\n",
+            crate::memory_usage::max_memory_usage()
+        ))
+    }
+
+    fn run_encryption_status(&mut self) -> Result<JobExitCode> {
+        self.check_configuration()?;
+        let Some(input) = self.configuration.input_file.clone() else {
+            // cov:ignore-start: `check_configuration` rejects status queries without an input before this defensive guard
+            return Err(UsageError::new("an input file name is required").into());
+            // cov:ignore-end
+        };
+        let file = match File::open(&input) {
+            Ok(file) => file,
+            Err(error) => {
+                let error = Error::file_io("open", input.clone(), error);
+                self.report_job_error(&error)?;
+                return Ok(JobExitCode::Error);
+            }
+        };
+        let options = self.configured_open_options(self.configuration.password.clone());
+        let pdf = match self.open_for_encryption_inspection(
+            BufReader::new(file),
+            input.display().to_string(),
+            options,
+        ) {
+            Ok(pdf) => pdf,
+            Err(error) => {
+                self.report_job_error(&error)?;
+                return Ok(JobExitCode::Error);
+            }
+        };
+        let encrypted = pdf.is_encrypted();
+        if self.configuration.is_encrypted {
+            return Ok(if encrypted {
+                JobExitCode::Success
+            } else {
+                JobExitCode::Error
+            });
+        }
+
+        // qpdf's `requiresPassword` uses exit 3 when authentication succeeds,
+        // exit 0 when an encrypted document still needs another password, and
+        // exit 2 for a plaintext document (`QPDFJob::getExitCode`,
+        // `QPDFJob.cc:535-557`). `encryption_file_key` also covers the raw
+        // `passwordIsHexKey` path, where user/owner match flags stay false.
+        if !encrypted {
+            return Ok(JobExitCode::Error);
+        }
+        Ok(if pdf.encryption_file_key().is_some() {
+            JobExitCode::Warning
+        } else {
+            JobExitCode::Success
+        })
     }
 
     fn run_document_erased(
@@ -2342,6 +2678,11 @@ impl QPDFJob {
             || configuration.show_pages
             || configuration.show_encryption
             || configuration.check_linearization
+            || configuration.show_xref
+            || configuration.show_linearization
+            || configuration.show_object.is_some()
+            || configuration.list_attachments
+            || configuration.show_attachment.is_some()
         {
             let status = self.run_configured_inspection(pdf, configuration)?;
             drop(attachment_sources);
@@ -2389,26 +2730,82 @@ impl QPDFJob {
             self.show_npages_report(pdf)?;
         }
         if configuration.show_encryption {
-            self.show_encryption(pdf, false)?;
+            self.show_encryption(pdf, configuration.password_is_hex_key)?;
         }
         if configuration.check_linearization {
             self.check_linearization_report(pdf)?;
         }
+        if configuration.show_linearization {
+            self.show_linearization_report(pdf)?;
+        }
+        if configuration.show_xref {
+            self.show_xref_report(pdf)?;
+        }
+        if let Some(selector) = configuration.show_object {
+            match selector {
+                JobObjectSelector::Trailer => {
+                    let object = pdf.trailer();
+                    // cov:ignore-start: malformed object-report errors are covered by the public inspection route; only this propagated edge is excluded
+                    self.show_object_report(
+                        pdf,
+                        &object,
+                        configuration.show_raw_stream_data,
+                        configuration.show_filtered_stream_data,
+                    )?;
+                    // cov:ignore-end
+                }
+                JobObjectSelector::Object(object_ref) => {
+                    let object = pdf.get_object_handle(object_ref);
+                    // cov:ignore-start: malformed object-report errors are covered by the public inspection route; only this propagated edge is excluded
+                    self.show_object_report(
+                        pdf,
+                        &object,
+                        configuration.show_raw_stream_data,
+                        configuration.show_filtered_stream_data,
+                    )?;
+                    // cov:ignore-end
+                }
+                JobObjectSelector::Null => self.logger.info(b"null\n")?,
+                JobObjectSelector::NoObject => {}
+            }
+        }
         if configuration.show_pages {
             self.show_pages_report_with_images(pdf, configuration.show_page_images)?;
+        }
+        if configuration.list_attachments {
+            self.list_attachments_report(pdf, configuration.verbose)?;
+        }
+        if let Some(key) = configuration
+            .show_attachment
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            self.show_attachment_report(pdf, key)?;
         }
         self.record_document_warnings(pdf);
         self.complete(false)
     }
 
+    fn show_linearization_report<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        let input_name = self.input_name.clone();
+        let output = show_linearization_pdf_with_warnings(pdf, &input_name)
+            .map_err(|error| Error::System(error.to_string()))?;
+        for warning in output.warnings {
+            self.record_warnings();
+            // cov:ignore-start: warning-sink propagation is an injected logger edge; the data warning and status branches are covered separately
+            if !self.suppress_warnings {
+                self.logger
+                    .warn(format!("WARNING: {input_name}: {warning}\n"))?;
+            }
+            // cov:ignore-end
+        }
+        self.logger.info(output.dump)
+    }
+
     fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
-        let mut options = PdfOpenOptions {
-            password: password.to_vec(),
-            logger: Some(self.logger.clone()),
-            suppress_warnings: self.suppress_warnings,
-            description: path.display().to_string(),
-            ..PdfOpenOptions::default()
-        };
+        let mut options = self.configured_open_options(password.to_vec());
+        options.logger = Some(self.logger.clone());
+        options.description = path.display().to_string();
         // `open_file_with_options` installs the qpdf-shaped reopenable source;
         // keep the job's warning policy on this secondary document exactly as
         // `open_document` does for the primary.
@@ -2417,6 +2814,17 @@ impl QPDFJob {
         pdf.root_handle()?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
+    }
+
+    fn copy_encryption_source(&mut self, path: &Path) -> Result<crate::CopyEncryptionSource> {
+        let password = self.configuration.encryption_file_password.clone();
+        let mut donor = self.open_job_source(path, &password)?;
+        donor.writer_copy_encryption_source()?.ok_or_else(|| {
+            Error::Usage(UsageError::new(format!(
+                "copyEncryption donor {} is not encrypted",
+                path.display()
+            )))
+        })
     }
 
     fn write_configured_json<R>(
@@ -2581,7 +2989,14 @@ impl QPDFJob {
                 || self.configuration.show_npages
                 || self.configuration.show_pages
                 || self.configuration.check_linearization
+                || self.configuration.show_xref
+                || self.configuration.show_linearization
+                || self.configuration.show_object.is_some()
+                || self.configuration.list_attachments
+                || self.configuration.show_attachment.is_some()
                 || self.configuration.show_encryption
+                || self.configuration.is_encrypted
+                || self.configuration.requires_password
                 || self.configuration.output_file.is_some()
                 || self.configuration.replace_input)
         {
@@ -2619,7 +3034,14 @@ impl QPDFJob {
             || self.configuration.show_npages
             || self.configuration.show_pages
             || self.configuration.check_linearization
-            || self.configuration.show_encryption)
+            || self.configuration.show_xref
+            || self.configuration.show_linearization
+            || self.configuration.show_object.is_some()
+            || self.configuration.list_attachments
+            || self.configuration.show_attachment.is_some()
+            || self.configuration.show_encryption
+            || self.configuration.is_encrypted
+            || self.configuration.requires_password)
             // qpdf's JSON output defaults to stdout before this conflict
             // check (`QPDFJob.cc:582-595`), so it is an output destination
             // even when no explicit outputFile was supplied.
@@ -2628,6 +3050,12 @@ impl QPDFJob {
                 || self.configuration.json_version.is_some())
         {
             return Err(UsageError::new("no output file may be given for this option").into());
+        }
+        if self.configuration.is_encrypted && self.configuration.requires_password {
+            return Err(UsageError::new(
+                "--requires-password and --is-encrypted may not be given together",
+            )
+            .into());
         }
         if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
             if self.configuration.split_pages.is_some_and(|size| size != 0) {
@@ -3267,6 +3695,15 @@ mod tests {
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o","256bit":{}}"#)
                 .unwrap();
         assert!(parse_job_encrypt(&encrypt_256_r6, true).is_ok());
+        let insecure_256 =
+            crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"","256bit":{}}"#)
+                .unwrap();
+        assert!(parse_job_encrypt(&insecure_256, true).is_err());
+        let allowed_insecure_256 = crate::json::Json::parse(
+            br#"{"userPassword":"u","ownerPassword":"","256bit":{"allowInsecure":""}}"#,
+        )
+        .unwrap();
+        assert!(parse_job_encrypt(&allowed_insecure_256, true).is_ok());
         let missing_password = crate::json::Json::parse(br#"{"128bit":{}}"#).unwrap();
         assert!(parse_job_encrypt(&missing_password, true).is_err());
         let duplicate_key_length = crate::json::Json::parse(
@@ -3287,6 +3724,44 @@ mod tests {
             error.to_string(),
             ".splitPages: invalid page count 2147483648"
         );
+    }
+
+    #[test]
+    fn job_json_compression_level_uses_qpdf_integer_prefix_conversion() {
+        assert_eq!(parse_job_compression_level(b"  +9tail").unwrap(), 9);
+        assert_eq!(parse_job_compression_level(b"not-a-number").unwrap(), 0);
+        assert!(parse_job_compression_level(b"99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn job_json_show_object_selector_preserves_qpdf_forms() {
+        assert_eq!(
+            parse_job_object_selector(b"trailer").unwrap(),
+            JobObjectSelector::Trailer
+        );
+        assert_eq!(
+            parse_job_object_selector(b"1").unwrap(),
+            JobObjectSelector::Object(ObjectRef::new(1, 0))
+        );
+        assert_eq!(
+            parse_job_object_selector(b"1,").unwrap(),
+            JobObjectSelector::Object(ObjectRef::new(1, 0))
+        );
+        assert_eq!(
+            parse_job_object_selector(b"-1").unwrap(),
+            JobObjectSelector::NoObject
+        );
+        assert_eq!(
+            parse_job_object_selector(b"").unwrap(),
+            JobObjectSelector::NoObject
+        );
+        assert_eq!(
+            parse_job_object_selector(b"1,65536").unwrap(),
+            JobObjectSelector::Null
+        );
+        assert!(parse_job_object_selector(b"999999999999999999999").is_err());
+        assert!(parse_job_object_selector(b"99999999999999999999999999999999999999999").is_err());
+        assert!(parse_job_object_selector(b"2147483648").is_err());
     }
 
     #[test]
@@ -3320,6 +3795,8 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let password_file = tempdir.path().join("password.txt");
         std::fs::write(&password_file, b"file-password\n").unwrap();
+        let nested_job_file = tempdir.path().join("nested.json");
+        std::fs::write(&nested_job_file, b"{}").unwrap();
         let mut root = serde_json::Map::new();
         for (key, value) in [
             ("inputFile", "input.pdf"),
@@ -3339,6 +3816,8 @@ mod tests {
             ("staticAesIv", ""),
             ("staticId", ""),
             ("noOriginalObjectIds", ""),
+            ("copyEncryption", "donor.pdf"),
+            ("encryptionFilePassword", "donor-password"),
             ("allowWeakCrypto", ""),
             ("progress", ""),
             ("verbose", ""),
@@ -3369,7 +3848,22 @@ mod tests {
             ("oiMinArea", "100"),
             ("oiMinHeight", "100"),
             ("oiMinWidth", "100"),
+            ("ignoreXrefStreams", ""),
+            ("passwordIsHexKey", ""),
+            ("passwordMode", "auto"),
+            ("suppressPasswordRecovery", ""),
+            ("suppressRecovery", ""),
+            ("compressionLevel", "1"),
             ("reportMemoryUsage", ""),
+            ("isEncrypted", ""),
+            ("requiresPassword", ""),
+            ("filteredStreamData", ""),
+            ("rawStreamData", ""),
+            ("showXref", ""),
+            ("showLinearization", ""),
+            ("showObject", "trailer"),
+            ("listAttachments", ""),
+            ("showAttachment", "attachment.txt"),
             ("jobJsonFile", "nested.json"),
         ] {
             root.insert(key.to_owned(), serde_json::json!(value));
@@ -3390,6 +3884,10 @@ mod tests {
                 "ownerPassword": "o",
                 "128bit": {"useAes": "y"}
             }),
+        );
+        root.insert(
+            "jobJsonFile".to_owned(),
+            serde_json::json!(nested_job_file.to_string_lossy()),
         );
         root.insert(
             "pages".to_owned(),
@@ -3494,6 +3992,9 @@ mod tests {
             ))
             .unwrap();
         }
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"passwordMode":"invalid"}"#)
+            .expect_err("passwordMode choices must be known");
 
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"addAttachment":[{"file":"/"}]}"#)
@@ -3533,6 +4034,206 @@ mod tests {
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"inputFile":"input.pdf","empty":""}"#)
             .expect_err("empty and inputFile are mutually exclusive");
+    }
+
+    #[test]
+    fn job_json_file_rejects_recursive_includes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let first = tempdir.path().join("first.json");
+        let second = tempdir.path().join("second.json");
+        std::fs::write(
+            &first,
+            format!(r#"{{"jobJsonFile":"{}"}}"#, second.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            format!(r#"{{"jobJsonFile":"{}"}}"#, first.display()),
+        )
+        .unwrap();
+        let json = format!(r#"{{"jobJsonFile":"{}"}}"#, first.display());
+        let mut job = QPDFJob::new();
+        let error = job
+            .initialize_from_json_partial(&json)
+            .expect_err("recursive job JSON includes must be bounded");
+        assert!(error
+            .to_string()
+            .contains("recursive jobJsonFile reference"));
+
+        assert!(
+            expand_job_json_files(&crate::json::Json::make_string("not-a-dictionary")).is_err()
+        );
+        let scalar_file = tempdir.path().join("scalar.json");
+        std::fs::write(&scalar_file, b"[]").unwrap();
+        let scalar_json = crate::json::Json::parse(
+            format!(r#"{{"jobJsonFile":"{}"}}"#, scalar_file.display()).as_bytes(),
+        )
+        .unwrap();
+        assert!(expand_job_json_files(&scalar_json).is_err());
+    }
+
+    #[test]
+    fn job_json_encryption_status_and_copy_errors_use_job_boundaries() {
+        let fixture_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+        let encrypted = fixture_root.join("encrypted/v4-aes-128-r4.pdf");
+        let plaintext = fixture_root.join("minimal.pdf");
+        let cases = [
+            (
+                format!(
+                    r#"{{"inputFile":"{}","isEncrypted":""}}"#,
+                    encrypted.display()
+                ),
+                JobExitCode::Success,
+            ),
+            (
+                format!(
+                    r#"{{"inputFile":"{}","requiresPassword":""}}"#,
+                    plaintext.display()
+                ),
+                JobExitCode::Error,
+            ),
+        ];
+        for (json, expected) in cases {
+            let mut job = QPDFJob::new();
+            let logger = QPDFLogger::create();
+            logger.set_info(Some(logger.discard()));
+            logger.set_warn(Some(logger.discard()));
+            logger.set_error(Some(logger.discard()));
+            job.set_logger(logger);
+            job.initialize_from_json_partial(&json).unwrap();
+            assert_eq!(job.run().unwrap(), expected);
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing = tempdir.path().join("missing.pdf");
+        let mut missing_job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        missing_job.set_logger(logger);
+        missing_job
+            .initialize_from_json_partial(&format!(
+                r#"{{"inputFile":"{}","isEncrypted":""}}"#,
+                missing.display()
+            ))
+            .unwrap();
+        assert_eq!(missing_job.run().unwrap(), JobExitCode::Error);
+
+        let malformed = tempdir.path().join("malformed.pdf");
+        std::fs::write(&malformed, b"not a PDF").unwrap();
+        let mut malformed_job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        malformed_job.set_logger(logger);
+        malformed_job
+            .initialize_from_json_partial(&format!(
+                r#"{{"inputFile":"{}","requiresPassword":""}}"#,
+                malformed.display()
+            ))
+            .unwrap();
+        assert_eq!(malformed_job.run().unwrap(), JobExitCode::Error);
+
+        let mut copy_job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        copy_job.set_logger(logger);
+        copy_job
+            .initialize_from_json_partial(&format!(
+                r#"{{"inputFile":"{}","outputFile":"{}","copyEncryption":"{}"}}"#,
+                plaintext.display(),
+                tempdir.path().join("output.pdf").display(),
+                plaintext.display()
+            ))
+            .unwrap();
+        assert_eq!(copy_job.run().unwrap(), JobExitCode::Error);
+    }
+
+    #[test]
+    fn job_json_status_rejects_combined_encryption_queries() {
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/minimal.pdf");
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(&format!(
+            r#"{{"inputFile":"{}","isEncrypted":"","requiresPassword":""}}"#,
+            input.display()
+        ))
+        .unwrap();
+        let error = job
+            .run()
+            .expect_err("status queries are mutually exclusive");
+        assert!(error
+            .to_string()
+            .contains("--requires-password and --is-encrypted may not be given together"));
+    }
+
+    #[test]
+    fn job_json_show_linearization_reports_soft_warnings() {
+        let mut bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat/linearized-one-page.pdf"),
+        )
+        .unwrap();
+        let offset = bytes
+            .windows(3)
+            .position(|window| window == b"/N ")
+            .expect("linearized fixture has /N");
+        bytes[offset + 3] = b'Z';
+        let tempdir = tempfile::tempdir().unwrap();
+        let input = tempdir.path().join("linearized.pdf");
+        std::fs::write(&input, bytes).unwrap();
+
+        let mut job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        job.set_logger(logger);
+        job.initialize_from_json_partial(&format!(
+            r#"{{"inputFile":"{}","showLinearization":""}}"#,
+            input.display()
+        ))
+        .unwrap();
+        assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    }
+
+    #[test]
+    fn job_json_inspection_dispatch_covers_object_and_report_variants() {
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/minimal.pdf");
+        for selector in ["trailer", "1", "-1", "1,65536"] {
+            let mut job = QPDFJob::new();
+            let logger = QPDFLogger::create();
+            logger.set_info(Some(logger.discard()));
+            logger.set_warn(Some(logger.discard()));
+            logger.set_error(Some(logger.discard()));
+            job.set_logger(logger);
+            job.initialize_from_json_partial(&format!(
+                r#"{{"inputFile":"{}","showObject":"{}"}}"#,
+                input.display(),
+                selector
+            ))
+            .unwrap();
+            assert_eq!(job.run().unwrap(), JobExitCode::Success);
+        }
+
+        let mut job = QPDFJob::new();
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(logger.discard()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        job.set_logger(logger);
+        job.initialize_from_json_partial(&format!(
+            r#"{{"inputFile":"{}","showNpages":"","showPages":"","showLinearization":"","showXref":"","listAttachments":""}}"#,
+            input.display()
+        ))
+        .unwrap();
+        assert_eq!(job.run().unwrap(), JobExitCode::Success);
     }
 
     #[test]

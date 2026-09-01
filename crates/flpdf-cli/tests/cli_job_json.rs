@@ -115,6 +115,525 @@ fn job_json_file_show_npages_matches_qpdf_without_output_file() {
 }
 
 #[test]
+fn job_json_file_show_xref_matches_qpdf_without_output_file() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","showXref":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_file_show_object_matches_qpdf_without_output_file() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","showObject":"trailer"}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_file_show_object_stream_modes_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+
+    for mode in ["rawStreamData", "filteredStreamData"] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::copy(&fixture, directory.path().join("input.pdf")).unwrap();
+        fs::write(
+            directory.path().join("job.json"),
+            format!(r#"{{"inputFile":"input.pdf","showObject":"7","{mode}":""}}"#),
+        )
+        .unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+
+        assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+        assert_eq!(flpdf.status.code(), Some(0));
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
+fn job_json_file_list_attachments_matches_qpdf_without_output_file() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","listAttachments":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_file_show_attachment_matches_qpdf_without_output_file() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","showAttachment":"attachment.txt"}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_file_compression_level_reaches_the_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/lone-flate-l9.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    let mut outputs = Vec::new();
+    for level in ["1", "9"] {
+        let output = directory.path().join(format!("out-{level}.pdf"));
+        fs::write(
+            directory.path().join(format!("job-{level}.json")),
+            format!(
+                r#"{{"inputFile":"input.pdf","outputFile":"{}","staticId":"","recompressFlate":"","objectStreams":"disable","compressionLevel":"{level}"}}"#,
+                output.display()
+            ),
+        )
+        .unwrap();
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg(format!("--job-json-file=job-{level}.json"))
+            .assert()
+            .success();
+        outputs.push(fs::read(output).unwrap());
+    }
+    assert_ne!(
+        outputs[0], outputs[1],
+        "job JSON compressionLevel must reach the Flate writer"
+    );
+}
+
+#[test]
+fn job_json_file_copy_encryption_reaches_the_writer() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.pdf");
+    let donor = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+    let output = directory.path().join("output.pdf");
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        format!(
+            r#"{{"inputFile":"{}","outputFile":"{}","copyEncryption":"{}","encryptionFilePassword":"user-v4-aes","staticId":""}}"#,
+            input.display(),
+            output.display(),
+            donor.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .assert()
+        .success();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--password=user-v4-aes")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf must authenticate copied encryption: {qpdf:?}"
+    );
+}
+
+#[test]
+fn job_json_file_password_mode_reaches_encryption_writer() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.pdf");
+    let output = directory.path().join("output.pdf");
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        format!(
+            r#"{{"inputFile":"{}","outputFile":"{}","passwordMode":"hex-bytes","encrypt":{{"userPassword":"75736572","ownerPassword":"6f776e","128bit":{{"useAes":"y"}}}}}}"#,
+            input.display(),
+            output.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .assert()
+        .success();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--password=user")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "passwordMode=hex-bytes must decode encryption passwords: {qpdf:?}"
+    );
+}
+
+#[test]
+fn job_json_file_auto_password_warning_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        r#"{"inputFile":"input.pdf","outputFile":"output.pdf","passwordMode":"auto","encrypt":{"userPassword":"😀","ownerPassword":"owner","128bit":{"useAes":"y"}}}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert!(flpdf.status.success(), "flpdf job JSON failed: {flpdf:?}");
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("qpdf:", "flpdf:");
+    assert_eq!(flpdf.stderr, qpdf_stderr.as_bytes());
+}
+
+#[test]
+fn job_json_file_unicode_password_error_is_deferred_to_write() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        r#"{"inputFile":"input.pdf","outputFile":"output.pdf","passwordMode":"unicode","encrypt":{"userPassword":"😀","ownerPassword":"owner","128bit":{"useAes":"y"}}}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "supplied password cannot be encoded for 40-bit or 128-bit encryption formats",
+        ));
+}
+
+#[test]
+fn job_json_file_encryption_status_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    for (fixture, json, expected_code) in [
+        (
+            "minimal.pdf",
+            r#"{"inputFile":"input.pdf","isEncrypted":""}"#,
+            2,
+        ),
+        (
+            "encrypted/v4-aes-128-r4.pdf",
+            r#"{"inputFile":"input.pdf","password":"user-v4-aes","requiresPassword":""}"#,
+            3,
+        ),
+        (
+            "encrypted/v4-aes-128-r4.pdf",
+            r#"{"inputFile":"input.pdf","password":"wrong","requiresPassword":""}"#,
+            0,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::copy(
+            fixture_root.join(fixture),
+            directory.path().join("input.pdf"),
+        )
+        .unwrap();
+        fs::write(directory.path().join("job.json"), json).unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            qpdf.status.code(),
+            Some(expected_code),
+            "qpdf probe: {qpdf:?}"
+        );
+        assert_eq!(
+            flpdf.status.code(),
+            Some(expected_code),
+            "flpdf probe: {flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
+fn job_json_file_show_encryption_honors_raw_key_and_key_output() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted/v5-aes-256-r6.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","password":"fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290","passwordIsHexKey":"","showEncryption":"","showEncryptionKey":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert!(flpdf.status.success(), "flpdf job JSON failed: {flpdf:?}");
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("qpdf:", "flpdf:");
+    assert_eq!(flpdf.stderr, qpdf_stderr.as_bytes());
+}
+
+#[test]
+fn job_json_file_report_memory_usage_matches_qpdf_shape() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"/dev/null","reportMemoryUsage":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert!(flpdf.status.success(), "flpdf job JSON failed: {flpdf:?}");
+    let qpdf_line = String::from_utf8_lossy(&qpdf.stderr);
+    let flpdf_line = String::from_utf8_lossy(&flpdf.stderr);
+    assert!(
+        qpdf_line.starts_with("qpdf-max-memory-usage "),
+        "{qpdf_line}"
+    );
+    assert!(
+        flpdf_line.starts_with("qpdf-max-memory-usage "),
+        "{flpdf_line}"
+    );
+    assert!(
+        flpdf_line
+            .trim_end()
+            .strip_prefix("qpdf-max-memory-usage ")
+            .is_some_and(|value| value.parse::<usize>().is_ok()),
+        "{flpdf_line}"
+    );
+}
+
+#[test]
+fn job_json_file_nested_job_json_file_is_applied() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("nested.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"output.pdf","staticId":""}"#,
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("outer.json"),
+        br#"{"jobJsonFile":"nested.json"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=outer.json")
+        .assert()
+        .success();
+    assert!(directory.path().join("output.pdf").is_file());
+}
+
+#[test]
 fn job_json_file_show_npages_preserves_qpdf_inspection_order() {
     if !qpdf_available() {
         return;
@@ -727,6 +1246,72 @@ fn job_json_file_check_linearization_matches_qpdf_without_output_file() {
         Some(0),
         "flpdf job JSON failed: {flpdf:?}"
     );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_file_show_linearization_matches_qpdf_without_output_file() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearized-one-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","showLinearization":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn job_json_file_places_show_linearization_before_show_xref() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearized-one-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","showLinearization":"","showXref":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), Some(0));
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
