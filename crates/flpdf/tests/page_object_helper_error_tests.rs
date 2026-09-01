@@ -366,3 +366,91 @@ fn accessors_reject_non_page_object() {
     assert_unsupported(helper.media_box());
     assert_unsupported(helper.get_annotations());
 }
+
+// ---------------------------------------------------------------------------
+// XObject image classification
+// ---------------------------------------------------------------------------
+
+fn image_mask_page() -> Vec<u8> {
+    single_page(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources 4 0 R >>",
+        &[
+            (
+                4,
+                "<< /XObject << /Mask 5 0 R /Image 6 0 R >> >>".into(),
+            ),
+            (
+                5,
+                "<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /Length 0 >>\nstream\nendstream".into(),
+            ),
+            (
+                6,
+                "<< /Type /XObject /Subtype /Image /Width 2 /Height 3 /Length 0 >>\nstream\nendstream".into(),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn image_enumeration_excludes_image_masks_like_qpdf() {
+    let (mut pdf, page_ref) = helper_for(image_mask_page());
+
+    let mut direct = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut direct_names = Vec::new();
+    direct
+        .for_each_image(false, |_, _, key| {
+            direct_names.push(key);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(direct_names, vec![b"/Image".to_vec()]);
+
+    let mut recursive = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut recursive_names = Vec::new();
+    recursive
+        .for_each_image(true, |_, _, key| {
+            recursive_names.push(key);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(recursive_names, vec![b"/Image".to_vec()]);
+
+    let mut maps = PageObjectHelper::new(page_ref, &mut pdf);
+    assert_eq!(
+        maps.get_images().unwrap().into_keys().collect::<Vec<_>>(),
+        vec![b"/Image".to_vec()]
+    );
+}
+
+#[test]
+fn xobject_enumeration_uses_inherited_resources() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>".into(),
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R >>".into()),
+            (
+                4,
+                "<< /XObject << /Image 5 0 R >> >>".into(),
+            ),
+            (
+                5,
+                "<< /Type /XObject /Subtype /Image /Width 2 /Height 3 /Length 0 >>\nstream\nendstream".into(),
+            ),
+        ],
+        1,
+    );
+    let (mut pdf, page_ref) = helper_for(bytes);
+    let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+    let mut names = Vec::new();
+    helper
+        .for_each_xobject(false, |_, _, key| {
+            names.push(key);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(names, vec![b"/Image".to_vec()]);
+}

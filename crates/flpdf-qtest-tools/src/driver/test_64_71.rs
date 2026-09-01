@@ -704,21 +704,44 @@ mod tests {
         )
         .expect("test 71 should enumerate page and nested Form XObjects");
 
-        assert!(stdout
-            .windows(b" -> /Fx1 -> 6 0 R\n".len())
-            .any(|window| { window == b" -> /Fx1 -> 6 0 R\n" }));
-        assert!(stdout
-            .windows(b" -> /Im1 -> 8 0 R\n".len())
-            .any(|window| { window == b" -> /Im1 -> 8 0 R\n" }));
-        assert!(stdout
-            .windows(b" -> /Im2 -> 8 0 R\n".len())
-            .any(|window| { window == b" -> /Im2 -> 8 0 R\n" }));
-        assert!(stdout
-            .windows(b"/Im1 -> 8 0 R\n".len())
-            .any(|window| { window == b"/Im1 -> 8 0 R\n" }));
-        assert!(stdout
-            .windows(b"/Im2 -> 8 0 R\n".len())
-            .any(|window| { window == b"/Im2 -> 8 0 R\n" }));
+        assert_eq!(
+            stdout,
+            b"--- recursive, all ---\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Fx1 -> 6 0 R\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Im1 -> 8 0 R\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Fx2 -> 9 0 R\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Im2 -> 8 0 R\n\
+<< /Im3 8 0 R >> -> /Im3 -> 8 0 R\n\
+--- non-recursive, all ---\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Fx1 -> 6 0 R\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Im1 -> 8 0 R\n\
+--- recursive, images ---\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Im1 -> 8 0 R\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Im2 -> 8 0 R\n\
+<< /Im3 8 0 R >> -> /Im3 -> 8 0 R\n\
+--- non-recursive, images ---\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Im1 -> 8 0 R\n\
+--- recursive, form XObjects ---\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Fx1 -> 6 0 R\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Fx2 -> 9 0 R\n\
+--- non-recursive, form XObjects ---\n\
+<< /Fx1 6 0 R /Im1 8 0 R >> -> /Fx1 -> 6 0 R\n\
+--- recursive, all, from fx1 ---\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Fx2 -> 9 0 R\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Im2 -> 8 0 R\n\
+<< /Im3 8 0 R >> -> /Im3 -> 8 0 R\n\
+--- non-recursive, all, from fx1 ---\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Fx2 -> 9 0 R\n\
+<< /Fx2 9 0 R /Im2 8 0 R >> -> /Im2 -> 8 0 R\n\
+--- get images, page ---\n\
+/Im1 -> 8 0 R\n\
+--- get images, fx ---\n\
+/Im2 -> 8 0 R\n\
+--- get form XObjects, page ---\n\
+/Fx1 -> 6 0 R\n\
+--- get form XObjects, fx ---\n\
+/Fx2 -> 9 0 R\n"
+        );
         assert!(stderr.is_empty());
     }
 }
