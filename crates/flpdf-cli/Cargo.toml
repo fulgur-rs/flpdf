@@ -44,6 +44,7 @@ qpdf-libjpeg-compat = ["flpdf/qpdf-libjpeg-compat"]
 clap.workspace = true
 flpdf = { path = "../flpdf", version = "0.5.0" }
 same-file.workspace = true
+stacker.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

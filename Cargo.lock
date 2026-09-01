@@ -362,6 +362,7 @@ dependencies = [
  "regex",
  "same-file",
  "serde_json",
+ "stacker",
  "tempfile",
  "yaml-rust2",
 ]

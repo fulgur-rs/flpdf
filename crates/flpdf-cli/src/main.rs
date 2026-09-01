@@ -2104,7 +2104,7 @@ fn warn_if_static_id(args: &Cli) {
 }
 
 fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
-    let parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(args)?;
+    let parsed = arg_parser::ArgParser::from_command(cli_command()).parse(args)?;
     let mut overlay_specs = Vec::new();
     let mut attachment_segments = Vec::new();
 
@@ -2128,6 +2128,29 @@ fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
         overlay_specs,
         attachment_segments,
     })
+}
+
+// The flattened clap model is deep enough that constructing it can exhaust
+// Windows' default process stack after a small option addition. Keep every
+// production command-construction boundary on a grown stack; the returned
+// command itself and all parsing behavior remain unchanged.
+const CLI_COMMAND_STACK_RED_ZONE: usize = 1024 * 1024;
+const CLI_COMMAND_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+fn cli_command() -> clap::Command {
+    stacker::maybe_grow(
+        CLI_COMMAND_STACK_RED_ZONE,
+        CLI_COMMAND_STACK_GROWTH_SIZE,
+        || Cli::command(),
+    )
+}
+
+fn cli_parse_from(args: Vec<String>) -> Cli {
+    stacker::maybe_grow(
+        CLI_COMMAND_STACK_RED_ZONE,
+        CLI_COMMAND_STACK_GROWTH_SIZE,
+        || Cli::parse_from(args),
+    )
 }
 
 /// Print qpdf's sole-option version response (`QPDFJob_argv.cc:99-105`).
@@ -2205,7 +2228,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let args = Cli::parse_from(residual_args);
+    let args = cli_parse_from(residual_args);
     validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
         eprintln!("flpdf: {error}");
@@ -4748,7 +4771,7 @@ fn parse_test_args(args: Vec<String>) -> CliResult<arg_parser::ParsedArgs> {
     if !has_program {
         parser_args.insert(0, "flpdf".to_owned());
     }
-    let mut parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(parser_args)?;
+    let mut parsed = arg_parser::ArgParser::from_command(cli_command()).parse(parser_args)?;
     if !has_program {
         parsed.residual_args.remove(0);
     }
@@ -7879,6 +7902,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_command_builds_on_a_small_stack() {
+        let command = std::thread::Builder::new()
+            .name("small-stack-cli-command".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(cli_command)
+            .expect("small-stack thread should start")
+            .join()
+            .expect("Cli::command must not overflow a small stack");
+
+        assert_eq!(command.get_name(), "flpdf");
+    }
+
+    #[test]
+    fn cli_parse_from_builds_on_a_small_stack() {
+        let args = std::thread::Builder::new()
+            .name("small-stack-cli-parse".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(|| cli_parse_from(vec!["flpdf".to_owned()]))
+            .expect("small-stack thread should start")
+            .join()
+            .expect("Cli::parse_from must not overflow a small stack");
+
+        assert!(args.command.is_none());
+    }
+
+    #[test]
     fn show_pages_writes_each_logical_line_incrementally() {
         let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let logger = QPDFLogger::create();
@@ -8422,7 +8471,7 @@ mod tests {
 
     #[test]
     fn single_dash_segment_sub_option_is_rewritten() {
-        let parsed = arg_parser::ArgParser::from_command(Cli::command())
+        let parsed = arg_parser::ArgParser::from_command(cli_command())
             .parse(strs(&["flpdf", "-overlay", "stamp.pdf", "-to=1", "--"]))
             .unwrap();
         assert_eq!(parsed.residual_args, strs(&["flpdf"]));
@@ -8435,7 +8484,7 @@ mod tests {
 
     #[test]
     fn each_segment_kind_recognizes_its_sub_options() {
-        let parsed = arg_parser::ArgParser::from_command(Cli::command())
+        let parsed = arg_parser::ArgParser::from_command(cli_command())
             .parse(strs(&[
                 "flpdf",
                 "--encrypt",
