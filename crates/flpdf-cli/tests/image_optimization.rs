@@ -4,6 +4,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 
 fn build_raw_grayscale_image_pdf(width: usize, height: usize) -> Vec<u8> {
     build_raw_image_pdf(width, height, "DeviceGray", 1)
@@ -16,6 +17,17 @@ fn build_raw_image_pdf(
     components: usize,
 ) -> Vec<u8> {
     let pixels = vec![128u8; width * height * components];
+    build_raw_image_pdf_with_pixels(width, height, colorspace, components, pixels)
+}
+
+fn build_raw_image_pdf_with_pixels(
+    width: usize,
+    height: usize,
+    colorspace: &str,
+    components: usize,
+    pixels: Vec<u8>,
+) -> Vec<u8> {
+    assert_eq!(pixels.len(), width * height * components);
     let content = b"q 200 0 0 200 0 0 cm /Im1 Do Q\n";
     let image_dictionary = format!(
         "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /{colorspace} /BitsPerComponent 8 /Length {} >>",
@@ -102,6 +114,39 @@ fn image_object(path: &Path) -> u32 {
         .and_then(|object| object.split_whitespace().next())
         .and_then(|number| number.parse().ok())
         .expect("image object reference")
+}
+
+fn qpdf_11_9_available() -> bool {
+    let output = ProcessCommand::new("/usr/bin/qpdf")
+        .arg("--version")
+        .output();
+    output.is_ok_and(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("11.9.0")
+    })
+}
+
+fn qpdf_first_image(path: &Path) -> Value {
+    let output = ProcessCommand::new("/usr/bin/qpdf")
+        .args(["--json", "--json-key=pages"])
+        .arg(path)
+        .output()
+        .expect("run qpdf JSON");
+    assert!(output.status.success(), "qpdf JSON failed: {output:?}");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid qpdf JSON");
+    json["pages"][0]["images"][0].clone()
+}
+
+fn qpdf_raw_stream(path: &Path, object: u32) -> Vec<u8> {
+    let output = ProcessCommand::new("/usr/bin/qpdf")
+        .args([&format!("--show-object={object}"), "--raw-stream-data"])
+        .arg(path)
+        .output()
+        .expect("run qpdf raw stream");
+    assert!(
+        output.status.success(),
+        "qpdf raw stream failed: {output:?}"
+    );
+    output.stdout
 }
 
 #[test]
@@ -242,6 +287,90 @@ fn optimize_images_recompresses_an_eligible_raw_image() {
         ));
 
     assert_eq!(image_filters(&output), vec!["/DCTDecode"]);
+}
+
+#[test]
+fn optimize_images_emits_qpdf_identical_jpeg_bytes_for_gray_rgb_and_cmyk() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+
+    for (colorspace, components) in [("DeviceGray", 1), ("DeviceRGB", 3), ("DeviceCMYK", 4)] {
+        for (pattern, pixels) in [
+            ("uniform", vec![128u8; 200 * 200 * components]),
+            (
+                "structured",
+                (0..200 * 200 * components)
+                    .map(|index| ((index * 37 + index / 200 * 11) % 256) as u8)
+                    .collect(),
+            ),
+        ] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let input = tempdir.path().join("input.pdf");
+            let qpdf_output = tempdir.path().join("qpdf.pdf");
+            let flpdf_output = tempdir.path().join("flpdf.pdf");
+            std::fs::write(
+                &input,
+                build_raw_image_pdf_with_pixels(200, 200, colorspace, components, pixels),
+            )
+            .expect("write input");
+
+            let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+                .args([
+                    "--static-id",
+                    "--optimize-images",
+                    "--oi-min-width=0",
+                    "--oi-min-height=0",
+                    "--oi-min-area=0",
+                ])
+                .arg(&input)
+                .arg(&qpdf_output)
+                .output()
+                .expect("run qpdf optimize-images");
+            assert!(
+                qpdf.status.success(),
+                "qpdf optimize-images failed for {colorspace}/{pattern}: {qpdf:?}"
+            );
+
+            Command::cargo_bin("flpdf")
+                .expect("flpdf binary")
+                .args([
+                    "--static-id",
+                    "--optimize-images",
+                    "--oi-min-width=0",
+                    "--oi-min-height=0",
+                    "--oi-min-area=0",
+                ])
+                .arg(&input)
+                .arg(&flpdf_output)
+                .assert()
+                .success();
+
+            let qpdf_image = qpdf_first_image(&qpdf_output);
+            assert_eq!(
+                qpdf_image["filter"],
+                serde_json::json!(["/DCTDecode"]),
+                "fixture was not optimized by qpdf for {colorspace}/{pattern}"
+            );
+            assert_eq!(
+                image_filters(&flpdf_output),
+                vec!["/DCTDecode"],
+                "fixture was not optimized by flpdf for {colorspace}/{pattern}"
+            );
+
+            let qpdf_object = qpdf_image["object"]
+                .as_str()
+                .and_then(|object| object.split_whitespace().next())
+                .and_then(|number| number.parse().ok())
+                .expect("qpdf image object reference");
+            let flpdf_object = image_object(&flpdf_output);
+            assert_eq!(
+                qpdf_raw_stream(&qpdf_output, qpdf_object),
+                raw_stream(&flpdf_output, flpdf_object),
+                "JPEG bytes differ from qpdf for {colorspace}/{pattern}"
+            );
+        }
+    }
 }
 
 #[test]
