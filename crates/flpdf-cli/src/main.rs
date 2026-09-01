@@ -489,6 +489,11 @@ struct Cli {
     show_npages: bool,
     #[arg(long, conflicts_with = "output")]
     show_pages: bool,
+    /// Include image XObject details in `--show-pages` output (qpdf
+    /// `--with-images`). This is a modifier and does not itself select an
+    /// inspection mode.
+    #[arg(long = "with-images")]
+    with_images: bool,
     #[arg(long, conflicts_with = "output")]
     show_xref: bool,
     #[arg(long, conflicts_with = "output")]
@@ -2382,7 +2387,7 @@ fn main() {
     } else if args.show_npages {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
-        run_show_pages(args.input, args.repair, &args.password)
+        run_show_pages(args.input, args.repair, &args.password, args.with_images)
     } else if args.show_xref {
         run_show_xref(args.input, args.repair, &args.password)
     } else if args.check_linearization {
@@ -3074,6 +3079,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
+    job.set_with_images(cli.with_images);
     if cli.check {
         job.set_show_encryption_key(cli.show_encryption_key);
         return finish_check_job(job.check(pdf));
@@ -3202,7 +3208,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             if cmd.show_npages {
                 run_show_npages(Some(cmd.input), cmd.repair, &cmd.password)
             } else {
-                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password)
+                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password, false)
             }
         }
         Commands::Qdf(cmd) => run_qdf(
@@ -6607,12 +6613,18 @@ fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs
     finish_job_exit_status(job.show_npages(&mut pdf)?)
 }
 
-fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+fn run_show_pages(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    with_images: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_with_images(with_images);
     finish_job_exit_status(job.show_pages(&mut pdf)?)
 }
 
@@ -7886,11 +7898,8 @@ mod tests {
         assert_eq!(job.show_pages(&mut pdf).unwrap(), JobExitCode::Success);
 
         let chunks = chunks.lock().unwrap();
-        assert_eq!(chunks.len(), 5);
-        assert_eq!(
-            chunks.concat(),
-            b"page 1: 3 0 R\n  media-box: [ 0 0 612 792 ]\n  resources: << /Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] >>\n  contents: 7 0 R\n  rotate: 0\n"
-        );
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.concat(), b"page 1: 3 0 R\n  content:\n    7 0 R\n");
     }
 
     #[test]

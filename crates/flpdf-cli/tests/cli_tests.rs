@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use flpdf::{
-    acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper, Pdf,
+    acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper,
+    PageObjectHelper, Pdf,
 };
 use predicates::prelude::*;
 use std::fs::File;
@@ -3739,8 +3740,9 @@ fn show_pages_lists_each_page() {
         .success()
         .stdout(predicate::str::contains("page 1: 3 0 R"))
         .stdout(predicate::str::contains("page 2: 6 0 R"))
-        .stdout(predicate::str::contains("media-box: [ 0 0 595.28 842 ]"))
-        .stdout(predicate::str::contains("media-box: [ 0 0 200 100 ]"));
+        .stdout(predicate::str::contains("  content:\n"))
+        .stdout(predicate::str::contains("    5 0 R"))
+        .stdout(predicate::str::contains("    7 0 R"));
 }
 
 #[test]
@@ -6256,12 +6258,19 @@ fn rotate_single_spec_rewrites_all_pages() {
         .assert()
         .success();
 
-    Command::cargo_bin("flpdf")
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let rotations = pages::page_refs(&mut pdf)
         .unwrap()
-        .args(["--show-pages", output.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("rotate: 180"));
+        .into_iter()
+        .map(|page_ref| {
+            PageObjectHelper::new(page_ref, &mut pdf)
+                .get_attribute(b"/Rotate", false)
+                .unwrap()
+                .try_get_int_value()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rotations, vec![180, 180, 180]);
 }
 
 #[test]
@@ -6449,23 +6458,19 @@ fn pages_then_rotate_targets_output_page_numbering() {
         .assert()
         .success();
 
-    let show = Command::cargo_bin("flpdf")
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let rotations = pages::page_refs(&mut pdf)
         .unwrap()
-        .args(["--show-pages", output.to_str().unwrap()])
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
-    // Two output pages; first rotated 90, second 0.
-    let p1 = stdout.find("page 1:").unwrap();
-    let p2 = stdout.find("page 2:").unwrap();
-    assert!(
-        stdout[p1..p2].contains("rotate: 90"),
-        "page 1 should be rotated 90: {stdout}"
-    );
-    assert!(
-        stdout[p2..].contains("rotate: 0"),
-        "page 2 should stay 0: {stdout}"
-    );
+        .into_iter()
+        .map(|page_ref| {
+            PageObjectHelper::new(page_ref, &mut pdf)
+                .get_attribute(b"/Rotate", false)
+                .unwrap()
+                .try_get_int_value()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rotations, vec![90, 0]);
 }
 
 #[test]

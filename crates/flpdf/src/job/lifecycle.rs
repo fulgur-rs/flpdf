@@ -119,6 +119,8 @@ struct JobConfiguration {
     replace_input: bool,
     check: bool,
     show_npages: bool,
+    show_pages: bool,
+    show_page_images: bool,
     check_linearization: bool,
     require_output: bool,
     progress: bool,
@@ -1208,6 +1210,18 @@ impl QPDFJob {
         self.configuration.show_encryption_key = show;
     }
 
+    /// Select qpdf's optional image details for the `showPages` inspection.
+    ///
+    /// This is the CLI-side setter for `QPDFJob::Config::withImages`; the
+    /// job-JSON parser stores the same setting in `JobConfiguration`.
+    pub fn set_with_images(&mut self, show: bool) {
+        self.configuration.show_page_images = show;
+    }
+
+    pub(crate) fn show_page_images(&self) -> bool {
+        self.configuration.show_page_images
+    }
+
     pub(crate) fn show_encryption_key(&self) -> bool {
         self.configuration.show_encryption_key
     }
@@ -1678,6 +1692,10 @@ impl QPDFJob {
             configuration.show_npages = true;
             configuration.require_output = false;
         }
+        if job_json_bare(&members, b"showPages")? {
+            configuration.show_pages = true;
+            configuration.require_output = false;
+        }
         if job_json_bare(&members, b"showEncryption")? {
             configuration.show_encryption = true;
             configuration.require_output = false;
@@ -1686,6 +1704,7 @@ impl QPDFJob {
             configuration.check_linearization = true;
             configuration.require_output = false;
         }
+        configuration.show_page_images = job_json_bare(&members, b"withImages")?;
 
         if let Some(value) = members.get(b"encrypt".as_slice()) {
             configuration
@@ -2304,6 +2323,7 @@ impl QPDFJob {
 
         if configuration.check
             || configuration.show_npages
+            || configuration.show_pages
             || configuration.show_encryption
             || configuration.check_linearization
         {
@@ -2357,6 +2377,9 @@ impl QPDFJob {
         }
         if configuration.check_linearization {
             self.check_linearization_report(pdf)?;
+        }
+        if configuration.show_pages {
+            self.show_pages_report_with_images(pdf, configuration.show_page_images)?;
         }
         self.record_document_warnings(pdf);
         self.complete(false)
@@ -2540,6 +2563,7 @@ impl QPDFJob {
             && (self.configuration.require_output
                 || self.configuration.check
                 || self.configuration.show_npages
+                || self.configuration.show_pages
                 || self.configuration.check_linearization
                 || self.configuration.show_encryption
                 || self.configuration.output_file.is_some()
@@ -2577,6 +2601,7 @@ impl QPDFJob {
         }
         if (self.configuration.check
             || self.configuration.show_npages
+            || self.configuration.show_pages
             || self.configuration.check_linearization
             || self.configuration.show_encryption)
             // qpdf's JSON output defaults to stdout before this conflict

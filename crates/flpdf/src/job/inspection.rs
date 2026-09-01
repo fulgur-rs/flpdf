@@ -179,40 +179,30 @@ impl QPDFJob {
         })
     }
 
-    /// Show the CLI page description through the page/job ObjectHandle route.
+    /// Show pages through qpdf's `QPDFJob::doShowPages` route.
+    ///
+    /// The output contains only page identity, optional direct image details,
+    /// and `/Contents` stream references, matching
+    /// `libqpdf/QPDFJob.cc:842-874`. In particular, effective inheritable
+    /// attributes such as `/MediaBox` and `/Rotate` are not part of qpdf's
+    /// `--show-pages` output.
     pub fn show_pages<R: Read + Seek + 'static>(
         &mut self,
         pdf: &mut Pdf<R>,
     ) -> Result<JobExitCode> {
         let logger = self.logger();
-        self.inspect(pdf, |pdf| {
-            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-            for (index, page_ref) in page_refs.iter().enumerate() {
-                // `/Contents` is not an inheritable page attribute and only
-                // its reference syntax is printed below (unparse, not
-                // unparse_resolved), so read it as a raw dictionary entry
-                // rather than through get_attribute: that helper always
-                // resolves the target to its terminal value, which would
-                // trigger a stream-length repair scan on the content stream
-                // merely to list pages.
-                let contents = pdf.get_object_handle(*page_ref).try_get_key(b"/Contents")?;
-                let (media_box, resources, rotate) = {
-                    let mut page = PageObjectHelper::new(*page_ref, pdf);
-                    (
-                        page.get_attribute(b"/MediaBox", false)?,
-                        page.get_attribute(b"/Resources", false)?,
-                        page.get_attribute(b"/Rotate", false)?,
-                    )
-                };
+        let show_page_images = self.show_page_images();
+        self.inspect(pdf, |pdf| emit_show_pages(pdf, &logger, show_page_images))
+    }
 
-                logger.info(format!("page {}: {}\n", index + 1, page_ref))?;
-                write_page_attribute(&logger, "media-box", &media_box)?;
-                write_page_attribute(&logger, "resources", &resources)?;
-                write_page_attribute(&logger, "contents", &contents)?;
-                write_page_attribute(&logger, "rotate", &rotate)?;
-            }
-            Ok(())
-        })
+    /// Emit qpdf's page report without completing the enclosing job.
+    pub(crate) fn show_pages_report_with_images<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        show_page_images: bool,
+    ) -> Result<()> {
+        let logger = self.logger();
+        emit_show_pages(pdf, &logger, show_page_images)
     }
 }
 
@@ -318,16 +308,60 @@ fn write_to_standard_output(logger: &crate::QPDFLogger, data: &[u8]) -> Result<(
     logger.get_save()?.write(data).map_err(Error::from)
 }
 
-fn write_page_attribute(
+fn emit_show_pages<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
     logger: &crate::QPDFLogger,
-    label: &str,
-    value: &ObjectHandle,
+    show_page_images: bool,
 ) -> Result<()> {
-    if value.is_null() {
-        return Ok(());
+    let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+    for (index, page_ref) in page_refs.iter().enumerate() {
+        logger.info(format!("page {}: {}\n", index + 1, page_ref))?;
+
+        if show_page_images {
+            let images = PageObjectHelper::new(*page_ref, pdf).get_images()?;
+            if !images.is_empty() {
+                logger.info("  images:\n")?;
+                for (name, image) in images {
+                    // `get_images` selects only `/Subtype /Image` stream XObjects, so
+                    // this defensive error is unreachable through the canonical helper.
+                    // cov:ignore-start: PageObjectHelper::get_images guarantees stream dictionaries for image XObjects
+                    let dictionary = image.as_stream_dict().ok_or_else(|| {
+                        Error::Internal("image XObject has no stream dictionary".to_owned())
+                    })?;
+                    // cov:ignore-end
+                    let width = dictionary
+                        .try_get_key(b"/Width")?
+                        .try_get_int_value_as_int()?;
+                    let height = dictionary
+                        .try_get_key(b"/Height")?
+                        .try_get_int_value_as_int()?;
+                    let mut line = b"    ".to_vec();
+                    line.extend_from_slice(&name);
+                    line.extend_from_slice(b": ");
+                    line.extend_from_slice(&image.unparse());
+                    line.extend_from_slice(b", ");
+                    line.extend_from_slice(width.to_string().as_bytes());
+                    line.extend_from_slice(b" x ");
+                    line.extend_from_slice(height.to_string().as_bytes());
+                    line.push(b'\n');
+                    logger.info(line)?;
+                }
+            }
+        }
+
+        // qpdf writes the section heading before asking the page helper for
+        // its stream array (`QPDFJob.cc:869-872`). This preserves warning
+        // order when a malformed `/Contents` value is encountered.
+        logger.info("  content:\n")?;
+        let contents = PageObjectHelper::new(*page_ref, pdf).get_page_contents()?;
+        for content in contents {
+            let mut line = b"    ".to_vec();
+            line.extend_from_slice(&content.unparse());
+            line.push(b'\n');
+            logger.info(line)?;
+        }
     }
-    let rendered = String::from_utf8_lossy(&value.unparse()).into_owned();
-    logger.info(format!("  {label}: {rendered}\n"))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -470,14 +504,6 @@ mod tests {
             cli_stream_bytes(&pdf, object_ref, &handle, data, false).unwrap(),
             data
         );
-    }
-
-    #[test]
-    fn write_page_attribute_skips_null_and_renders_handles() {
-        let logger = crate::QPDFLogger::create();
-        logger.set_info(Some(logger.discard()));
-        write_page_attribute(&logger, "missing", &ObjectHandle::null()).unwrap();
-        write_page_attribute(&logger, "value", &ObjectHandle::integer(7)).unwrap();
     }
 
     #[test]
