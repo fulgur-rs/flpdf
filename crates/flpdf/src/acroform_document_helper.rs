@@ -418,6 +418,40 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .and_then(|field| field.object_ref()))
     }
 
+    /// Return qpdf's terminal form fields as live object handles in
+    /// `QPDFObjGen` order.
+    ///
+    /// This is the handle-native counterpart of
+    /// `QPDFAcroFormDocumentHelper::getFormFields`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:163-171`). The result contains
+    /// only fields represented by the canonical `field_to_annotations` cache:
+    /// intermediate field-tree nodes are omitted, while orphan Widgets found
+    /// on pages are included as self-associated fields by [`Self::analyze`].
+    /// Handles remain attached to the document's canonical object registry, so
+    /// mutations through a returned handle are visible to later consumers.
+    pub fn get_form_fields(&mut self) -> Result<Vec<ObjectHandle>> {
+        Ok(self.form_field_handles()?.into_values().collect())
+    }
+
+    /// Return the live Widget annotation handles associated with a terminal
+    /// field, preserving qpdf's field-tree traversal order.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::getAnnotationsForField`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:186-195`). An unknown field
+    /// returns an empty vector, matching qpdf's map lookup.
+    pub fn get_annotations_for_field(&mut self, field: ObjectHandle) -> Result<Vec<ObjectHandle>> {
+        self.analyze()?;
+        let field = self.pdf.resolve_handle(&field)?;
+        let cache = self.cache.borrow();
+        Ok(cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache")
+            .field_to_annotations
+            .get(&field.identity_key())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Return the Widget annotations listed by a page, preserving their live
     /// handles for qpdf-shaped consumers.
     ///
@@ -425,7 +459,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage`, which is a
     /// thin delegation to `QPDFPageObjectHelper::getAnnotations("/Widget")`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-201`).
-    pub(crate) fn get_widget_annotations_for_page(
+    pub fn get_widget_annotations_for_page(
         &mut self,
         page_ref: ObjectRef,
     ) -> Result<Vec<ObjectHandle>> {
@@ -439,7 +473,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// `QPDFAcroFormDocumentHelper::getFieldForAnnotation` for a Widget that
     /// cannot be associated with a field. The analysis itself supplies qpdf's
     /// orphan-Widget self-association when possible.
-    pub(crate) fn get_field_for_annotation_handle(
+    pub fn get_field_for_annotation_handle(
         &mut self,
         annotation: ObjectHandle,
     ) -> Result<ObjectHandle> {
@@ -572,6 +606,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             for field in fields {
                 self.traverse_field_handles(field, None, 0, &mut visited, &mut cache)?;
             }
+        } else {
+            // qpdf replaces a malformed /Fields value with an empty array
+            // after warning through the live /AcroForm object
+            // (`QPDFAcroFormDocumentHelper.cc:247-254`). Keep the warning at
+            // this canonical analysis boundary so every consumer observes it.
+            acroform.warn_if_possible(
+                "/Fields key of /AcroForm dictionary is not an array; ignoring",
+            )?;
         }
         Ok(Some(cache))
     }
