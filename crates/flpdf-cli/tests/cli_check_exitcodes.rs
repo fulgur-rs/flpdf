@@ -286,6 +286,39 @@ fn extension_level_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// The Catalog is valid at open time, but its indirect `/Extensions` value
+/// emits a lazy recovery warning when the check summary reads the Adobe
+/// extension level. The warning must be included before the final check
+/// snapshot and therefore select qpdf's warning exit status 3.
+fn late_extension_warning_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n");
+    let off1 = pdf.len();
+    pdf.extend_from_slice(
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+    );
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    // Deliberately omit `endobj`; resolving this object is the late warning.
+    pdf.extend_from_slice(b"4 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>\n");
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 fn linearized_with_parameter_replacement(marker: &[u8], replacement: &[u8]) -> Vec<u8> {
     assert_eq!(marker.len(), replacement.len());
     let mut bytes =
@@ -391,6 +424,23 @@ fn check_appends_adobe_extension_level_to_version() {
         .stdout(predicate::str::contains(
             "PDF Version: 1.7 extension level 8\n",
         ));
+}
+
+#[test]
+fn check_reports_late_extension_warning_and_exits_3() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&late_extension_warning_pdf_bytes()).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains(
+            "PDF Version: 1.7 extension level 8\n",
+        ))
+        .stderr(predicate::str::contains("expected endobj"));
 }
 
 /// qpdf's repository fixture is a valid linearized document. `--check` reports

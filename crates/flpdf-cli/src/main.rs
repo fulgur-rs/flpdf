@@ -4401,7 +4401,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             let mut max_version = PdfVersion::new(
                 initial_version.major(),
                 initial_version.minor(),
-                pdf.adobe_extension_level().unwrap_or(0),
+                pdf.adobe_extension_level()?.unwrap_or(0),
             );
             for spec in built.iter_mut() {
                 let source_version =
@@ -4409,7 +4409,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
                 max_version.update_if_greater(PdfVersion::new(
                     source_version.major(),
                     source_version.minor(),
-                    spec.source.adobe_extension_level().unwrap_or(0),
+                    spec.source.adobe_extension_level()?.unwrap_or(0),
                 ));
             }
             // Preserve any pre-existing --min-version / --min-extension-level
@@ -5263,7 +5263,7 @@ fn run_empty_page_extraction(
         max_version.update_if_greater(PdfVersion::new(
             source_version.major(),
             source_version.minor(),
-            source.adobe_extension_level().unwrap_or(0),
+            source.adobe_extension_level()?.unwrap_or(0),
         ));
     }
     if let Some(ref current) = options.min_version {
@@ -5454,7 +5454,7 @@ fn run_page_extraction_from_multiple_sources(
         max_version.update_if_greater(PdfVersion::new(
             source_version.major(),
             source_version.minor(),
-            source.adobe_extension_level().unwrap_or(0),
+            source.adobe_extension_level()?.unwrap_or(0),
         ));
     }
     if let Some(ref current) = options.min_version {
@@ -5802,7 +5802,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         let mut max_version = PdfVersion::new(
             initial_version.major(),
             initial_version.minor(),
-            pdf.adobe_extension_level().unwrap_or(0),
+            pdf.adobe_extension_level()?.unwrap_or(0),
         );
         for spec in built.iter_mut() {
             let source_version =
@@ -5810,7 +5810,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             max_version.update_if_greater(PdfVersion::new(
                 source_version.major(),
                 source_version.minor(),
-                spec.source.adobe_extension_level().unwrap_or(0),
+                spec.source.adobe_extension_level()?.unwrap_or(0),
             ));
         }
         if let Some(ref current) = options.min_version {

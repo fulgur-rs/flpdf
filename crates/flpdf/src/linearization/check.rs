@@ -97,9 +97,11 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// This ports `QPDF::isLinearized` from
     /// `libqpdf/QPDF_linearization.cc:84-155`: only the first 1024-byte
-    /// candidate scan, `/Linearized`, and integer `/L` participate. Candidate
-    /// resolution failures become `false`, as qpdf's `QPDF::resolve` converts
-    /// damaged objects to null (`libqpdf/QPDF.cc:1700-1753`).
+    /// candidate scan, `/Linearized`, and integer `/L` participate. Structural
+    /// candidate resolution failures become `false`, as qpdf's
+    /// `QPDF::resolve` converts damaged objects to null
+    /// (`libqpdf/QPDF.cc:1700-1753`); logger and source-operation failures are
+    /// returned to the caller.
     ///
     /// The predicate lives with the `QPDF_linearization.cc` responsibility;
     /// the source seek/read seam remains owned by the canonical resolver.
@@ -111,16 +113,14 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let candidate = self.get_object_handle(object_ref);
-        let Some(dictionary) = candidate.try_as_dictionary().ok().flatten() else {
+        let Some(dictionary) = candidate.try_as_dictionary()? else {
             return Ok(false);
         };
 
         let Some(linearized) = dictionary.get(&b"/Linearized"[..]) else {
             return Ok(false);
         };
-        if linearized.try_dereference().is_err() {
-            return Ok(false);
-        }
+        linearized.try_dereference()?;
         let Some(value) = linearized
             .as_integer()
             .map(|value| value as f64)
@@ -133,9 +133,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         if let Some(l_value) = dictionary.get(&b"/L"[..]) {
-            if l_value.try_dereference().is_err() {
-                return Ok(false);
-            }
+            l_value.try_dereference()?;
             if let Some(l_value) = l_value.as_integer() {
                 let file_size = self.resolver.source_length()?;
                 if l_value < 0 || l_value as u64 != file_size {

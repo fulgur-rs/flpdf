@@ -3684,7 +3684,7 @@ fn write_linearized_impl<R: Read + Seek>(
             let metadata_ref = if params.encrypt_metadata {
                 None
             } else {
-                crate::writer::resolve_metadata_stream_ref(pdf)
+                crate::writer::resolve_metadata_stream_ref(pdf)?
             };
             let ctx_result = crate::writer::build_encryption_context(
                 options,
@@ -3720,7 +3720,7 @@ fn write_linearized_impl<R: Read + Seek>(
             let metadata_ref = if encrypt_metadata {
                 None
             } else {
-                crate::writer::resolve_metadata_stream_ref(pdf)
+                crate::writer::resolve_metadata_stream_ref(pdf)?
             };
             let mut ctx = crate::writer::build_copy_encryption_context(
                 source,
@@ -3788,7 +3788,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // `pdf.adobe_extension_level()` call just below it (mirrors the flat
     // writer's own `source_ver`/`source_ext` locals).
     let source_ver = pdf.version().to_string();
-    let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+    let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
     let (eff_version, eff_ext) =
         effective_pdf_version_and_ext(&source_ver, source_ext, options, true, emits_object_streams);
     let adbe_status = resolve_catalog_adbe_status(pdf)?;

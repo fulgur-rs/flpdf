@@ -348,7 +348,7 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
     // Match qpdf-ctest.c:test01's accessor order: version, extension level,
     // linearization, encryption, then the encrypted-only projections.
     let version = pdf.version().to_owned();
-    let extension_level = pdf.adobe_extension_level();
+    let extension_level = pdf.adobe_extension_level()?;
     let linearized = pdf.is_linearized()?;
     let encrypted = pdf.is_encrypted();
     let encryption_info = if encrypted {
