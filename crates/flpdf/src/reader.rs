@@ -1670,6 +1670,12 @@ impl<R: Read + Seek> Pdf<R> {
                 "cannot make an already-indirect ObjectHandle indirect".to_string(),
             ));
         };
+        // qpdf's makeIndirectObject calls nextObjGen, which first calls
+        // getObjectCount and therefore prepares every effective xref entry
+        // before choosing the next object number. The shared helper below is
+        // also used by lazy reservation paths, so keep this preparation on
+        // the qpdf-shaped allocation boundary only.
+        self.resolver.get_object_count()?;
         let new_ref = self.next_available_object_ref()?;
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);

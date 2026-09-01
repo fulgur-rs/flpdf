@@ -1489,7 +1489,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let Error::Parse { offset, message } = &trigger_error else {
             unreachable!("guard above ensures Parse variant"); // cov:ignore: unreachable after guard
         };
-        self.push_warning_at(*offset as u64, message.clone())?;
+        let location = format!(
+            "(object {} {}, offset {}): {}",
+            object_ref.number, object_ref.generation, offset, message
+        );
+        self.push_warning(location)?;
         self.push_warning("Attempting to reconstruct cross-reference table")?;
 
         // Read logical bytes (header_offset already consumed), matching qpdf's
@@ -2725,27 +2729,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let (found, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
             let mut tokenizer = LiveTokenSource::new(&mut input);
-            let number = read_live_header_integer(
-                tokenizer
-                    .next_token()
-                    .map_err(ReadObjectAtOffsetError::Header)?,
-            )
-            .map_err(ReadObjectAtOffsetError::Header)?;
-            let generation = read_live_header_integer(
-                tokenizer
-                    .next_token()
-                    .map_err(ReadObjectAtOffsetError::Header)?,
-            )
-            .map_err(ReadObjectAtOffsetError::Header)?;
+            let number_token = tokenizer
+                .next_token()
+                .map_err(ReadObjectAtOffsetError::Header)?;
+            let generation_token = tokenizer
+                .next_token()
+                .map_err(ReadObjectAtOffsetError::Header)?;
             let obj = tokenizer
                 .next_token()
                 .map_err(ReadObjectAtOffsetError::Header)?;
-            if !obj.is_word_value(b"obj") {
-                return Err(ReadObjectAtOffsetError::Header(Error::parse(
-                    obj.start,
-                    "expected obj",
-                )));
-            }
+            let (number, generation) = match (
+                read_live_header_integer(number_token),
+                read_live_header_integer(generation_token),
+                obj.is_word_value(b"obj"),
+            ) {
+                (Ok(number), Ok(generation), true) => (number, generation),
+                _ => {
+                    // qpdf reads all three header tokens before reporting
+                    // the single damagedPDF("expected n n obj") error at
+                    // the object's xref offset (QPDF.cc:1589-1594).
+                    return Err(ReadObjectAtOffsetError::Header(Error::parse(
+                        offset as usize,
+                        "expected n n obj",
+                    )));
+                }
+            };
             // qpdf consumes the object header before entering QPDF::readObject,
             // which captures `m->file->tell()` at this exact point
             // (`libqpdf/QPDF.cc:1331-1335`). Keep this separate from `offset`,
@@ -9935,13 +9943,13 @@ mod tests {
         let bad_keyword = resolver_over(b"1 0 nope".to_vec());
         assert!(matches!(
             bad_keyword.read_object_at_offset(0, ObjectRef::new(1, 0)),
-            Err(Error::Parse { offset: 4, ref message }) if message == "expected obj"
+            Err(Error::Parse { offset: 0, ref message }) if message == "expected n n obj"
         ));
 
         let bad_number = resolver_over(b"/N 0 obj".to_vec());
         assert!(matches!(
             bad_number.read_object_at_offset(0, ObjectRef::new(1, 0)),
-            Err(Error::Parse { offset: 0, ref message }) if message == "expected integer"
+            Err(Error::Parse { offset: 0, ref message }) if message == "expected n n obj"
         ));
 
         let resolver = resolver_over(b"x".to_vec());
@@ -10358,16 +10366,9 @@ mod tests {
     /// `WARNING: (object 2 0, offset 286): unexpected )` — the same message
     /// flpdf produces, at the same position, once rebased.
     ///
-    /// **Two things this does not claim.**
-    ///
-    /// *The header check anchors differently.* qpdf throws
-    /// `damagedPDF(offset, "expected n n obj")` (`libqpdf/QPDF.cc:1592-1594`)
-    /// with `readObjectAtOffset`'s `offset` argument — the object's own start
-    /// — so a `2 0 zzz` header at 256 is reported at 256, where flpdf reports
-    /// the offending token at 260 (both observed). Both are absolute after
-    /// this change; only the anchor within the object differs, and matching
-    /// qpdf's would mean discarding the more precise position rather than
-    /// gaining one.
+    /// Header errors use qpdf's generic `expected n n obj` message and the
+    /// object's xref offset (`libqpdf/QPDF.cc:1589-1594`); the live parser
+    /// retains that same boundary before it enters the body parser.
     #[test]
     fn a_recovered_malformed_body_reports_its_warning_at_the_file_offset() {
         // 200 bytes of filler put object 2 far enough into the file that a
