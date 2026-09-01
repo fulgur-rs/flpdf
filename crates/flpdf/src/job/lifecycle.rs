@@ -118,6 +118,7 @@ struct JobConfiguration {
     update_from_json: Option<PathBuf>,
     replace_input: bool,
     check: bool,
+    check_linearization: bool,
     require_output: bool,
     progress: bool,
     split_pages: Option<usize>,
@@ -1676,6 +1677,10 @@ impl QPDFJob {
             configuration.show_encryption = true;
             configuration.require_output = false;
         }
+        if job_json_bare(&members, b"checkLinearization")? {
+            configuration.check_linearization = true;
+            configuration.require_output = false;
+        }
 
         if let Some(value) = members.get(b"encrypt".as_slice()) {
             configuration
@@ -2297,6 +2302,12 @@ impl QPDFJob {
             self.record_document_warnings(pdf);
             return self.complete(false);
         }
+        if configuration.check_linearization {
+            let status = self.check_linearization(pdf)?;
+            drop(attachment_sources);
+            drop(overlay_specs);
+            return Ok(status);
+        }
         if configuration.json_version.is_some() {
             return self.write_configured_json(pdf, configuration);
         }
@@ -2492,6 +2503,7 @@ impl QPDFJob {
             && !self.configuration.empty_input
             && (self.configuration.require_output
                 || self.configuration.check
+                || self.configuration.check_linearization
                 || self.configuration.show_encryption
                 || self.configuration.output_file.is_some()
                 || self.configuration.replace_input)
@@ -2527,7 +2539,9 @@ impl QPDFJob {
             )
             .into());
         }
-        if (self.configuration.check || self.configuration.show_encryption)
+        if (self.configuration.check
+            || self.configuration.check_linearization
+            || self.configuration.show_encryption)
             && !json_output_allowed
             && (self.configuration.output_file.is_some() || self.configuration.replace_input)
         {
@@ -3244,6 +3258,7 @@ mod tests {
             ("updateFromJson", "update.json"),
             ("collate", "2"),
             ("flattenAnnotations", "all"),
+            ("checkLinearization", ""),
             ("jsonOutput", "latest"),
             ("externalizeInlineImages", ""),
             ("iiMinBytes", "100"),
