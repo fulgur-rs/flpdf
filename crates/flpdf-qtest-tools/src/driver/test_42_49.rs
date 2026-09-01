@@ -317,6 +317,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         let mut node = field.clone();
         loop {
             let parent = FormFieldObjectHelper::from_object_handle(node, pdf).get_parent()?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             if parent.is_null() {
                 writeln!(stdout, "  Parent: none")?;
                 break;
@@ -327,55 +328,99 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             node = parent;
         }
 
-        let annotations = {
+        let fully_qualified_name = {
             let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            writeln!(
-                stdout,
-                "  Fully qualified name: {}",
-                field_helper.fully_qualified_name()?
-            )?;
-            writeln!(stdout, "  Partial name: {}", field_helper.partial_name()?)?;
-            writeln!(
-                stdout,
-                "  Alternative name: {}",
-                field_helper.alternative_name()?
-            )?;
-            writeln!(stdout, "  Mapping name: {}", field_helper.mapping_name()?)?;
-            write!(stdout, "  Field type: ")?;
-            write_bytes(stdout, &field_helper.field_type()?.unwrap_or_default())?;
-            writeln!(stdout)?;
+            field_helper.fully_qualified_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Fully qualified name: {fully_qualified_name}")?;
 
-            let value = field_helper.value()?.unwrap_or_else(ObjectHandle::null);
-            write!(stdout, "  Value: ")?;
-            write_bytes(stdout, &value.unparse())?;
-            writeln!(stdout)?;
-            writeln!(
-                stdout,
-                "  Value as string: {}",
-                field_helper.value_as_string()?
-            )?;
+        let partial_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.partial_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Partial name: {partial_name}")?;
 
-            let default_value = field_helper
+        let alternative_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.alternative_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Alternative name: {alternative_name}")?;
+
+        let mapping_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.mapping_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Mapping name: {mapping_name}")?;
+
+        let field_type = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.field_type()?.unwrap_or_default()
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write!(stdout, "  Field type: ")?;
+        write_bytes(stdout, &field_type)?;
+        writeln!(stdout)?;
+
+        let value = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.value()?.unwrap_or_else(ObjectHandle::null)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write!(stdout, "  Value: ")?;
+        write_bytes(stdout, &value.unparse())?;
+        writeln!(stdout)?;
+
+        let value_as_string = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.value_as_string()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Value as string: {value_as_string}")?;
+
+        let default_value = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper
                 .default_value()?
-                .unwrap_or_else(ObjectHandle::null);
-            write!(stdout, "  Default value: ")?;
-            write_bytes(stdout, &default_value.unparse())?;
-            writeln!(stdout)?;
-            writeln!(
-                stdout,
-                "  Default value as string: {}",
-                field_helper.default_value_as_string()?
-            )?;
-            writeln!(
-                stdout,
-                "  Default appearance: {}",
-                field_helper.default_appearance()?
-            )?;
-            writeln!(stdout, "  Quadding: {}", field_helper.quadding()?)?;
+                .unwrap_or_else(ObjectHandle::null)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write!(stdout, "  Default value: ")?;
+        write_bytes(stdout, &default_value.unparse())?;
+        writeln!(stdout)?;
 
+        let default_value_as_string = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.default_value_as_string()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(
+            stdout,
+            "  Default value as string: {default_value_as_string}"
+        )?;
+
+        let default_appearance = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.default_appearance()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Default appearance: {default_appearance}")?;
+
+        let quadding = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.quadding()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Quadding: {quadding}")?;
+
+        let annotations = {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
             acroform.get_annotations_for_field(field.clone())?
         };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
         for annotation in annotations {
             write!(stdout, "  Annotation: ")?;
@@ -386,6 +431,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
 
     writeln!(stdout, "iterating over annotations per page")?;
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     for page_ref in pages {
         let page = pdf.get_object_handle(page_ref);
         write!(stdout, "Page: ")?;
@@ -396,6 +442,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
             acroform.get_widget_annotations_for_page(page_ref)?
         };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         for annotation in annotations {
             write!(stdout, "  Annotation: ")?;
             write_bytes(stdout, &annotation.unparse())?;
@@ -405,41 +452,63 @@ pub(crate) fn run_test_43<R: Read + Seek>(
                 let mut acroform = AcroFormDocumentHelper::new(pdf)?;
                 acroform.get_field_for_annotation_handle(annotation.clone())?
             };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Field: ")?;
             write_bytes(stdout, &field.unparse())?;
             writeln!(stdout)?;
 
-            let mut annotation_helper = AnnotationObjectHelper::from_object_handle(annotation, pdf);
+            let subtype = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_subtype()?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Subtype: /")?;
-            write_bytes(stdout, &annotation_helper.get_subtype()?)?;
+            write_bytes(stdout, &subtype)?;
             writeln!(stdout)?;
-            let rect = annotation_helper.get_rect()?;
+
+            let rect = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_rect()?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             writeln!(
                 stdout,
                 "    Rect: [{}, {}, {}, {}]",
                 rect.llx, rect.lly, rect.urx, rect.ury
             )?;
-            let state = annotation_helper.get_appearance_state()?;
+
+            let state = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_appearance_state()?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             if !state.is_empty() {
                 write!(stdout, "    Appearance state: /")?;
                 write_bytes(stdout, &state)?;
                 writeln!(stdout)?;
             }
+
+            let normal_appearance = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_appearance_stream(b"N", None)?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Appearance stream (/N): ")?;
-            write_bytes(
-                stdout,
-                &annotation_helper
-                    .get_appearance_stream(b"N", None)?
-                    .unparse(),
-            )?;
+            write_bytes(stdout, &normal_appearance.unparse())?;
             writeln!(stdout)?;
+
+            let state_appearance = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation, pdf);
+                annotation_helper.get_appearance_stream(b"N", Some(b"3"))?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write!(stdout, "    Appearance stream (/N, /3): ")?;
-            write_bytes(
-                stdout,
-                &annotation_helper
-                    .get_appearance_stream(b"N", Some(b"3"))?
-                    .unparse(),
-            )?;
+            write_bytes(stdout, &state_appearance.unparse())?;
             writeln!(stdout)?;
         }
     }
@@ -1175,6 +1244,56 @@ mod tests {
         .expect("open malformed form fixture")
     }
 
+    fn pdf_with_non_dictionary_field_parent() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] >>",
+            ),
+            (4, b"<< /Fields [6 0 R] >>"),
+            (5, b"42"),
+            (
+                6,
+                b"<< /Parent 5 0 R /FT /Tx /T (child) /Subtype /Widget /Rect [1 2 3 4] >>",
+            ),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for &(number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        let size = objects.last().expect("parent fixture objects").0 + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..size {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "form-parent-error.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open non-dictionary parent fixture")
+    }
+
     fn pdf_with_object_types_qtest() -> Vec<u8> {
         let objects: &[(u32, &[u8])] = &[
             (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1477,6 +1596,31 @@ mod tests {
             .any(|window| {
                 window == b"/Fields key of /AcroForm dictionary is not an array; ignoring\n"
             }));
+    }
+
+    #[test]
+    fn test_43_flushes_warnings_raised_during_field_consumption() {
+        let mut pdf = pdf_with_non_dictionary_field_parent();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_43(
+            &mut pdf,
+            b"form-parent-error.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 43");
+
+        assert!(stderr.windows(
+            b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n".len()
+        ).any(|window| {
+            window
+                == b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n"
+        }));
     }
 
     #[test]

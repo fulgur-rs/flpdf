@@ -129,11 +129,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// [`Self::parent`] projection, this preserves the qpdf helper's direct
     /// object identity for callers that continue traversing the field tree.
     pub fn get_parent(&mut self) -> Result<ObjectHandle> {
-        let field = self.resolved(self.field.clone())?;
-        if field.as_dictionary().is_none() {
-            return Ok(ObjectHandle::null());
-        }
-        self.resolved(field.get_key(b"/Parent"))
+        // `QPDFFormFieldObjectHelper::getParent` delegates directly to
+        // `QPDFObjectHandle::getKey`, which resolves only the receiver and
+        // leaves the returned child lazy (`QPDFFormFieldObjectHelper.cc:30-33`,
+        // `QPDFObjectHandle.cc:978-988`). `try_get_key` preserves both the
+        // contextual type warning for a non-dictionary receiver and the live
+        // child identity for the next parent-chain iteration.
+        self.field.try_get_key(b"/Parent")
     }
 
     /// Return the top-level field and whether it differs from this field.
