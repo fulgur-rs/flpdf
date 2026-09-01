@@ -784,6 +784,17 @@ fn parent_returns_none_for_a_null_parent() {
 }
 
 #[test]
+fn get_parent_returns_a_null_handle_for_a_non_dictionary_field() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut field = FormFieldObjectHelper::from_object_handle(ObjectHandle::integer(42), &mut pdf);
+
+    assert!(field
+        .get_parent()
+        .expect("get parent from non-dictionary field")
+        .is_null());
+}
+
+#[test]
 fn is_null_resolves_a_multi_hop_field_holder_to_its_terminal_value() {
     let bytes = doc(vec![(10, "null".into())]);
     let mut pdf = open(bytes);
