@@ -1264,6 +1264,72 @@ fn warning_sink_errors_are_returned_to_the_caller() {
 }
 
 #[test]
+fn show_linearization_propagates_custom_info_sink_failure() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearized-one-page.pdf");
+    let logger = QPDFLogger::create();
+    logger.set_info(Some(PipelineHandle::new(FailingSink)));
+    logger.set_warn(Some(logger.discard()));
+    logger.set_error(Some(logger.discard()));
+
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    let mut pdf = job
+        .open(
+            BufReader::new(File::open(&path).unwrap()),
+            path.display().to_string(),
+            PdfOpenOptions::default(),
+        )
+        .unwrap();
+
+    let error = job
+        .show_linearization(&mut pdf)
+        .expect_err("custom info sink failure must propagate");
+    assert!(matches!(
+        error,
+        Error::System(message) if message == "warning sink failed"
+    ));
+}
+
+#[test]
+fn show_linearization_propagates_custom_warning_sink_failure() {
+    let mut bytes = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/linearized-one-page.pdf"),
+    )
+    .unwrap();
+    let marker = b"/O 6 /E";
+    let replacement = b"/O 7 /E";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("linearized fixture should contain /O");
+    bytes[offset..offset + marker.len()].copy_from_slice(replacement);
+
+    let logger = QPDFLogger::create();
+    logger.set_info(Some(logger.discard()));
+    logger.set_warn(Some(PipelineHandle::new(FailingSink)));
+    logger.set_error(Some(logger.discard()));
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    let mut pdf = job
+        .open(
+            Cursor::new(bytes),
+            "linearized-mismatch.pdf",
+            PdfOpenOptions::default(),
+        )
+        .unwrap();
+
+    let error = job
+        .show_linearization(&mut pdf)
+        .expect_err("custom warning sink failure must propagate");
+    assert!(matches!(
+        error,
+        Error::System(message) if message == "warning sink failed"
+    ));
+}
+
+#[test]
 fn document_repair_warnings_feed_the_shared_completion_state() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/test_driver/repairable_input.pdf");

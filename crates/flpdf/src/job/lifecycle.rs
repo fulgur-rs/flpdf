@@ -2786,14 +2786,35 @@ impl QPDFJob {
         self.complete(false)
     }
 
+    /// Run qpdf's standalone `--show-linearization` inspection on an already
+    /// opened document and complete the shared warning/status boundary.
+    ///
+    /// qpdf calls `showLinearizationData` on the same `QPDF` that
+    /// `createQPDF` configured and later passes through its inspection
+    /// completion (`libqpdf/QPDFJob.cc:650-665,1646-1674`). Keeping the
+    /// document supplied by the caller avoids a second default-logger open and
+    /// preserves the configured input description.
+    pub fn show_linearization<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode> {
+        self.show_linearization_report(pdf)?;
+        self.record_document_warnings(pdf);
+        self.complete(false)
+    }
+
     fn show_linearization_report<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
+        // QPDFJob installs its logger on the one document before inspection
+        // (`libqpdf/QPDFJob.cc:650-665,1646-1674`). Keep this report safe for
+        // callers that supply an already-opened Pdf as well as for job-owned
+        // documents, and preserve an explicit document-level suppression flag.
+        let suppress_warnings = pdf.suppress_warnings() || self.suppress_warnings;
+        pdf.set_logger(self.logger.clone());
+        pdf.set_suppress_warnings(suppress_warnings);
         let input_name = self.input_name.clone();
         let output = show_linearization_pdf_with_warnings(pdf, &input_name)
             .map_err(map_show_linearization_error)?;
         for warning in output.warnings {
             self.record_warnings();
             // cov:ignore-start: warning-sink propagation is an injected logger edge; the data warning and status branches are covered separately
-            if !self.suppress_warnings {
+            if !suppress_warnings {
                 self.logger
                     .warn(format!("WARNING: {input_name}: {warning}\n"))?;
             }
