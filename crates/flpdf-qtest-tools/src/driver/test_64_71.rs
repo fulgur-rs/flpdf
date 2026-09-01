@@ -656,12 +656,18 @@ mod tests {
                 b"<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources 7 0 R /Length 0 >>\nstream\n\nendstream"
                     .as_slice(),
             ),
-            (7, b"<< /XObject << /Im2 8 0 R >> >>".as_slice()),
+            (7, b"<< /XObject << /Fx2 9 0 R /Im2 8 0 R >> >>".as_slice()),
             (
                 8,
                 b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Length 1 >>\nstream\nx\nendstream"
                     .as_slice(),
             ),
+            (
+                9,
+                b"<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources 10 0 R /Length 0 >>\nstream\n\nendstream"
+                    .as_slice(),
+            ),
+            (10, b"<< /XObject << /Im3 8 0 R >> >>".as_slice()),
         ];
         for (number, body) in objects {
             offsets.insert(number, bytes.len());
@@ -670,12 +676,12 @@ mod tests {
             bytes.extend_from_slice(b"\nendobj\n");
         }
         let xref_offset = bytes.len();
-        bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
-        for number in 1..=8 {
+        bytes.extend_from_slice(b"xref\n0 11\n0000000000 65535 f \n");
+        for number in 1..=10 {
             bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
         }
         bytes.extend_from_slice(
-            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            format!("trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
                 .as_bytes(),
         );
         bytes

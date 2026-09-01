@@ -272,9 +272,9 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         writeln!(stdout, "  images:")?;
         let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
         for (name, image) in page_helper.get_images()? {
-            let image_dict = image.as_stream_dict().ok_or_else(|| {
-                Error::Internal("QPDFPageObjectHelper::getImages returned a non-stream".into())
-            })?;
+            let image_dict = image
+                .as_stream_dict()
+                .expect("get_images only returns image stream handles");
             let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
             let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
             write!(stdout, "    ")?;
