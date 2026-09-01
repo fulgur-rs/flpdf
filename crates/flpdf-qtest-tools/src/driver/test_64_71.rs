@@ -2,10 +2,12 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::{
-    DecodeLevel, ObjectHandle, PageDocumentHelper, PageInput, Pdf, PdfOpenOptions, PdfWriter,
+    DecodeLevel, ObjectHandle, PageDocumentHelper, PageInput, PageObjectHelper, Pdf,
+    PdfOpenOptions, PdfWriter,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
+use crate::output::write_bytes;
 
 // This file ports qpdf's `test_64` through `test_71` (`qpdf/test_driver.cc:2303-2457`).
 
@@ -327,23 +329,37 @@ pub(crate) fn run_test_70<R: Read + Seek>(
 
 /// qpdf source: `qpdf/test_driver.cc:2416-2457` (`test_71`).
 ///
-/// GAP(`QPDFPageObjectHelper::forEachXObject` / `::forEachImage` /
-/// `::forEachFormXObject` / `::getImages` / `::getFormXObjects`): none of
-/// qpdf's five XObject-enumeration operations
-/// (`libqpdf/QPDFPageObjectHelper.cc`) have an flpdf equivalent -- confirmed:
-/// no `for_each_x_object` / `for_each_image` / `for_each_form_x_object` /
-/// `get_images` / `get_form_x_objects` `pub fn` anywhere in
-/// `crates/flpdf/src`. `get_images` is the same missing primitive this
-/// crate's `run_test_5` (`test_02_09.rs`) already documents its own
-/// `GAP(QPDFPageObjectHelper::getImages)` against; this function extends
-/// that same gap to its four siblings. Every one of this test's 12
-/// `--- ... ---` section headers is printed directly by the driver itself
-/// (qpdf's `show` lambda is only ever invoked *inside* the gapped calls), so
-/// all 12 are real, faithful, independent output and are kept below; each
-/// section's own per-item content, produced only by the missing calls, is
-/// not. `fx1` (test_driver.cc:2435-2436, `page`'s `/Resources/XObject/Fx1`)
-/// is real and cheaply fetchable but feeds only these same gapped calls, so
-/// it is not constructed here.
+/// Port qpdf's five XObject-enumeration calls through the canonical
+/// `PageObjectHelper` surface (`libqpdf/QPDFPageObjectHelper.cc:318-395`).
+/// The helper owns inherited-resource lookup, breadth-first recursive
+/// traversal, canonical identity de-duplication, and the non-recursive map
+/// helpers; this driver only formats qpdf's callback arguments.
+fn write_xobject_line(
+    output: &mut dyn Write,
+    object: ObjectHandle,
+    xobject_dict: ObjectHandle,
+    key: Vec<u8>,
+) -> flpdf::Result<()> {
+    write_bytes(output, &xobject_dict.unparse())?;
+    write!(output, " -> ")?;
+    write_bytes(output, &key)?;
+    write!(output, " -> ")?;
+    write_bytes(output, &object.unparse())?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn write_xobject_map_line(
+    output: &mut dyn Write,
+    key: Vec<u8>,
+    object: ObjectHandle,
+) -> flpdf::Result<()> {
+    write_bytes(output, &key)?;
+    write!(output, " -> ")?;
+    write_bytes(output, &object.unparse())?;
+    writeln!(output)?;
+    Ok(())
+}
 pub(crate) fn run_test_71<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -358,30 +374,112 @@ pub(crate) fn run_test_71<R: Read + Seek>(
     // way on the fixture this test is designed for, preserving crash parity
     // at this exact point even though nothing downstream can use the page.
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
-    let _page = pages[0];
+    let page_ref = pages[0];
 
-    // GAP(QPDFPageObjectHelper::forEachXObject / ::forEachImage /
-    // ::forEachFormXObject / ::getImages / ::getFormXObjects): see this
-    // function's own doc above.
     writeln!(stdout, "--- recursive, all ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.for_each_xobject(true, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- non-recursive, all ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.for_each_xobject(false, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- recursive, images ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.for_each_image(true, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- non-recursive, images ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.for_each_image(false, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- recursive, form XObjects ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.for_each_form_xobject(true, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- non-recursive, form XObjects ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.for_each_form_xobject(false, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
+
+    // qpdf obtains Fx1 directly from the page's resource dictionary after the
+    // six page-level traversals, then constructs a helper over that Form.
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page)?;
+    let resources = page.try_get_key(b"/Resources")?;
+    pdf.resolve(&resources)?;
+    let xobjects = resources.try_get_key(b"/XObject")?;
+    pdf.resolve(&xobjects)?;
+    let fx1 = xobjects.try_get_key(b"/Fx1")?;
+    pdf.resolve(&fx1)?;
+
     writeln!(stdout, "--- recursive, all, from fx1 ---")?;
+    {
+        let mut form = PageObjectHelper::from_object_handle(fx1.clone(), pdf);
+        form.for_each_xobject(true, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- non-recursive, all, from fx1 ---")?;
+    {
+        let mut form = PageObjectHelper::from_object_handle(fx1.clone(), pdf);
+        form.for_each_xobject(false, |object, xobject_dict, key| {
+            write_xobject_line(stdout, object, xobject_dict, key)
+        })?;
+    }
     writeln!(stdout, "--- get images, page ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        for (key, object) in page.get_images()? {
+            write_xobject_map_line(stdout, key, object)?;
+        }
+    }
     writeln!(stdout, "--- get images, fx ---")?;
+    {
+        let mut form = PageObjectHelper::from_object_handle(fx1.clone(), pdf);
+        for (key, object) in form.get_images()? {
+            write_xobject_map_line(stdout, key, object)?;
+        }
+    }
     writeln!(stdout, "--- get form XObjects, page ---")?;
+    {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        for (key, object) in page.get_form_xobjects()? {
+            write_xobject_map_line(stdout, key, object)?;
+        }
+    }
     writeln!(stdout, "--- get form XObjects, fx ---")?;
+    {
+        let mut form = PageObjectHelper::from_object_handle(fx1, pdf);
+        for (key, object) in form.get_form_xobjects()? {
+            write_xobject_map_line(stdout, key, object)?;
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run_test_68;
+    use super::{run_test_68, run_test_71};
     use flpdf::{Error, Pdf, PdfOpenOptions};
+    use std::collections::BTreeMap;
 
     fn dct_qstream_pdf() -> Vec<u8> {
         let mut bytes =
@@ -534,6 +632,87 @@ mod tests {
         .expect("filterable stream should complete");
 
         assert_eq!(stdout, b"oops -- didn't throw\n");
+        assert!(stderr.is_empty());
+    }
+
+    fn nested_xobject_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources 4 0 R /Contents 5 0 R >>"
+                    .as_slice(),
+            ),
+            (
+                4,
+                b"<< /XObject << /Fx1 6 0 R /Im1 8 0 R >> >>".as_slice(),
+            ),
+            (5, b"<< /Length 0 >>\nstream\n\nendstream".as_slice()),
+            (
+                6,
+                b"<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources 7 0 R /Length 0 >>\nstream\n\nendstream"
+                    .as_slice(),
+            ),
+            (7, b"<< /XObject << /Im2 8 0 R >> >>".as_slice()),
+            (
+                8,
+                b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Length 1 >>\nstream\nx\nendstream"
+                    .as_slice(),
+            ),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+        for number in 1..=8 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_71_driver_emits_recursive_and_nonrecursive_xobject_callbacks() {
+        let mut pdf = Pdf::open_mem_owned(nested_xobject_pdf()).expect("open XObject fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_71(
+            &mut pdf,
+            b"nested-xobject.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 71 should enumerate page and nested Form XObjects");
+
+        assert!(stdout
+            .windows(b" -> /Fx1 -> 6 0 R\n".len())
+            .any(|window| { window == b" -> /Fx1 -> 6 0 R\n" }));
+        assert!(stdout
+            .windows(b" -> /Im1 -> 8 0 R\n".len())
+            .any(|window| { window == b" -> /Im1 -> 8 0 R\n" }));
+        assert!(stdout
+            .windows(b" -> /Im2 -> 8 0 R\n".len())
+            .any(|window| { window == b" -> /Im2 -> 8 0 R\n" }));
+        assert!(stdout
+            .windows(b"/Im1 -> 8 0 R\n".len())
+            .any(|window| { window == b"/Im1 -> 8 0 R\n" }));
+        assert!(stdout
+            .windows(b"/Im2 -> 8 0 R\n".len())
+            .any(|window| { window == b"/Im2 -> 8 0 R\n" }));
         assert!(stderr.is_empty());
     }
 }
