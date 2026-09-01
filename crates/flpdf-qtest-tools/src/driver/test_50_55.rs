@@ -336,12 +336,11 @@ pub(crate) fn run_test_53<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // qpdf allocates the next generation-zero object through its document
-    let root_ref = pdf
-        .root_ref()
-        .ok_or_else(|| Error::Internal("test 53 requires a document catalog".to_string()))?;
-    let root = pdf.get_object_handle(root_ref);
-    pdf.resolve(&root)?;
+    // qpdf allocates the next generation-zero object through its document.
+    // getRoot() (libqpdf/QPDF.cc:2355-2367) accepts a direct or indirect
+    // /Root dictionary, so use the live root handle rather than requiring
+    // an indirect object identity.
+    let root = pdf.root_handle()?;
 
     let new_object = pdf.make_indirect_object_handle(ObjectHandle::string(b"potato".to_vec()))?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;

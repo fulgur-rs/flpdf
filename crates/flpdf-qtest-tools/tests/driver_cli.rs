@@ -242,6 +242,37 @@ fn test_53_flushes_repair_diagnostics_before_object_output() {
         ));
 }
 
+fn direct_root_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let object_two_offset = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(&format!("xref\n0 3\n0000000000 65535 f \n0000000000 00000 f \n{object_two_offset:010} 00000 n \n").into_bytes());
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root << /Type /Catalog /Pages 2 0 R >> >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_53_accepts_a_direct_catalog_root() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("direct-root.pdf");
+    fs::write(&input, direct_root_pdf()).expect("write direct-root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["53", input])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout(predicates::str::contains("new object: 3 0 R"))
+        .stderr("");
+}
+
 #[test]
 fn zero_dispatches_the_test_zero_one_family() {
     driver()
