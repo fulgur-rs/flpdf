@@ -165,6 +165,31 @@ fn object_handle_api_test_93_uses_canonical_promotion_route() {
 }
 
 #[test]
+fn test_53_emits_all_objects_and_writes_dangling_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    driver()
+        .args(["53", minimal_pdf()])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout(
+            "new object: 3 0 R\n\
+             all objects\n\
+             1 0 R\n\
+             2 0 R\n\
+             3 0 R\n\
+             test 53 done\n",
+        )
+        .stderr("");
+
+    assert!(
+        directory.path().join("a.pdf").is_file(),
+        "test 53 must write the preserve-unreferenced output"
+    );
+}
+
+#[test]
 fn zero_dispatches_the_test_zero_one_family() {
     driver()
         .args(["0", minimal_pdf()])
