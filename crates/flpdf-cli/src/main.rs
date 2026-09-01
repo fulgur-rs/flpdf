@@ -16,7 +16,6 @@ use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
-    linearization::{show_linearization_path_with_warnings, ShowLinearizationError},
     normalize_content_stream, pages, parse_pdf_version, AcroFormDocumentHelper, CompressStreams,
     CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
     ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
@@ -2416,7 +2415,7 @@ fn main() {
     } else if args.check_linearization {
         run_check_linearization(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_linearization {
-        run_show_linearization(args.input)
+        run_show_linearization(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_encryption {
         match args.input.as_ref() {
             Some(input) => run_show_encryption(
@@ -6668,37 +6667,25 @@ fn run_show_xref(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) 
     finish_job_exit_status(job.show_xref(&mut pdf)?)
 }
 
-fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
+fn run_show_linearization(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    no_warn: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    match show_linearization_path_with_warnings(&input) {
-        Ok(result) => {
-            for warning in &result.warnings {
-                logger_warn(format!("WARNING: {}: {warning}\n", input.display()))?;
-            }
-            // `result.dump` already ends with a trailing newline (the hint-table
-            // dump, or qpdf's "<name> is not linearized" line). qpdf prints
-            // both to stdout and exits 0; use print! to avoid a second LF.
-            logger_info(result.dump)?;
-            if result.warnings.is_empty() {
-                Ok(())
-            } else {
-                finish_warning_state(true, false, false)
-            }
-        }
-        Err(ShowLinearizationError::Malformed { message }) => {
-            // cov:ignore-start: none of show.rs's public entry points return
-            // this variant any more (see ShowLinearizationError's doc) --
-            // every linearization-data decode failure qpdf's
-            // showLinearizationData would catch is now surfaced as an `Ok`
-            // with an empty dump and one warning, matching qpdf's own single
-            // try/catch around readLinearizationData. Retained as a
-            // defensive arm since the type still has this variant.
-            logger_error(format!("flpdf: malformed linearization data: {message}\n"))?;
-            std::process::exit(ExitCode::Errors.as_i32());
-            // cov:ignore-end
-        }
-        Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
-    }
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
+    let mut options = pdf_open_options(repair, password)?;
+    options.suppress_warnings = no_warn;
+    let mut pdf = match job.open(BufReader::new(file), input.display().to_string(), options) {
+        Ok(pdf) => pdf,
+        Err(error) => return Err(error_with_file(&input, actionable_password_error(error))),
+    };
+    finish_job_exit_status(job.show_linearization(&mut pdf)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -7220,11 +7207,6 @@ fn logger_info(data: impl AsRef<[u8]>) -> CliResult<()> {
 
 fn logger_warn(data: impl AsRef<[u8]>) -> CliResult<()> {
     cli_logger().warn(data)?;
-    Ok(())
-}
-
-fn logger_error(data: impl AsRef<[u8]>) -> CliResult<()> {
-    cli_logger().error(data)?;
     Ok(())
 }
 

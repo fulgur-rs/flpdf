@@ -743,6 +743,16 @@ logger consumer に移行済みである。
 - `error`: check error と top-level の通常 fatal error
 - `usage`: `UsageError` を `usage_exit` へ直接渡し、qpdf の空行・help block付き exit-2 を再現
 
+`flpdf-25kg.5.5` では、top-level `--show-linearization` も `QPDFJob::open` が
+設定した同じ `Pdf` を `QPDFJob::show_linearization` に渡す。これは qpdf の
+`setQPDFOptions` による logger/suppression 設定（`QPDFJob.cc:650-665`）、同じ
+documentへの `isLinearized` / `showLinearizationData`（同 `:1646-1674`）、および
+writer側の同一document利用（同 `:3030-3058`）に対応する。show用の hint decode は
+`show_linearization_pdf_with_warnings` が既存 `Pdf` 上で行い、入力名・warning
+抑制・custom sink・完了statusはjobの共有境界から配送する。path helperがdefault
+loggerで再openする経路はtop-level CLIから除去し、`--show-linearization` のwarning
+と `--no-warn` はqpdf 11.9.0とのCLI differential testで固定する。
+
 以下の direct output は意図的に retained とする。
 
 - `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
