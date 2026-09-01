@@ -473,7 +473,7 @@ fn overlay_bumps_header_from_non_encrypted_higher_version_source() {
     let mut opened =
         flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("output reopens as a valid PDF");
     assert_eq!(
-        opened.adobe_extension_level(),
+        opened.adobe_extension_level().expect("extension level"),
         None,
         "no /Extensions/ADBE must be injected when every source has ext_level == 0",
     );
@@ -499,7 +499,7 @@ fn overlay_bumps_header_and_injects_adbe_from_encrypted_source() {
     let mut opened =
         flpdf::Pdf::open(std::io::Cursor::new(bytes)).expect("output reopens as a valid PDF");
     assert_eq!(
-        opened.adobe_extension_level(),
+        opened.adobe_extension_level().expect("extension level"),
         Some(8),
         "expected /Extensions/ADBE/ExtensionLevel 8 propagated from AES-256 source",
     );

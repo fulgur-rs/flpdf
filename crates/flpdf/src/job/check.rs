@@ -257,13 +257,31 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     // qpdf's QPDF::getRoot reads trailer /Root through getKey and accepts
     // either a direct or indirect Catalog, rejecting only a missing,
     // dangling, or non-dictionary value (libqpdf/QPDF.cc:2329-2367).
+    let root_diagnostics_seen = diagnostic_count(pdf);
     if let Err(error) = pdf.root_handle() {
-        emit_error(logger, message_prefix, input_name, &error)?;
-        return Err(CheckError::ErrorsDetected);
+        return Err(map_check_error(
+            logger,
+            message_prefix,
+            input_name,
+            error,
+            logger_failure_since(pdf, root_diagnostics_seen),
+        ));
     }
 
     logger.info(format!("checking {input_name}\n"))?;
-    let extension_level = pdf.adobe_extension_level();
+    let extension_diagnostics_seen = diagnostic_count(pdf);
+    let extension_level = match pdf.adobe_extension_level() {
+        Ok(level) => level,
+        Err(error) => {
+            return Err(map_check_error(
+                logger,
+                message_prefix,
+                input_name,
+                error,
+                logger_failure_since(pdf, extension_diagnostics_seen),
+            ));
+        }
+    };
     match extension_level {
         Some(level) if level > 0 => {
             let version = format!("PDF Version: {} extension level {level}\n", pdf.version());
@@ -284,11 +302,17 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     // suppress it here.
     emit_encryption_report(pdf, logger, true, show_encryption_key)?;
 
+    let linearized_diagnostics_seen = diagnostic_count(pdf);
     let linearized = match pdf.is_linearized() {
         Ok(value) => value,
         Err(error) => {
-            emit_error(logger, message_prefix, input_name, &error)?;
-            return Err(CheckError::ErrorsDetected);
+            return Err(map_check_error(
+                logger,
+                message_prefix,
+                input_name,
+                error,
+                logger_failure_since(pdf, linearized_diagnostics_seen),
+            ));
         }
     };
     if linearized {
@@ -318,6 +342,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
+    let writer_diagnostics_seen = diagnostic_count(pdf);
     let writer_result = (|| -> Result<()> {
         let mut writer = PdfWriter::new(pdf);
         writer.set_output_pipeline(Discard)?;
@@ -325,8 +350,13 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         writer.write()
     })();
     if let Err(error) = writer_result {
-        emit_error(logger, message_prefix, input_name, &error)?;
-        return Err(CheckError::ErrorsDetected);
+        return Err(map_check_error(
+            logger,
+            message_prefix,
+            input_name,
+            error,
+            logger_failure_since(pdf, writer_diagnostics_seen),
+        ));
     }
 
     let (new_warnings, new_errors) = inspect_new_diagnostics(
@@ -344,14 +374,36 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
-    let pages = PageDocumentHelper::new(pdf)
-        .get_all_pages()
-        .map_err(|error| map_page_tree_error(logger, message_prefix, input_name, error))?;
+    let page_tree_diagnostics_seen = diagnostic_count(pdf);
+    let pages_result = PageDocumentHelper::new(pdf).get_all_pages();
+    let pages = match pages_result {
+        Ok(pages) => pages,
+        // cov:ignore-start: check's qpdf-shaped discard writer above runs the
+        // same page-tree preparation with DecodeLevel::All before this second
+        // page-list read; a failure in this defensive repeat is therefore
+        // unreachable for a live document state.
+        Err(error) => {
+            return Err(map_page_tree_error(
+                logger,
+                message_prefix,
+                input_name,
+                error,
+                logger_failure_since(pdf, page_tree_diagnostics_seen),
+            ));
+        } // cov:ignore-end
+    };
     let mut page_errors = false;
     for (index, page_ref) in pages.into_iter().enumerate() {
-        let mut page = PageObjectHelper::new(page_ref, pdf);
-        let mut discard_contents = DiscardContents;
-        if let Err(error) = page.parse_page_contents(&mut discard_contents) {
+        let page_diagnostics_seen = diagnostic_count(pdf);
+        let page_result = {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            let mut discard_contents = DiscardContents;
+            page.parse_page_contents(&mut discard_contents)
+        };
+        if let Err(error) = page_result {
+            if logger_failure_since(pdf, page_diagnostics_seen) && is_logger_error(&error) {
+                return Err(CheckError::Operation(error));
+            }
             page_errors = true;
             logger.error(format!("ERROR: page {}: {error}\n", index + 1))?;
         }
@@ -604,6 +656,7 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
         return Ok(warnings);
     }
 
+    let diagnostics_seen = diagnostic_count(pdf);
     match check_linearization_parameters(pdf) {
         Ok(LinearizationParameterCheck::Clean) => {
             warnings |= emit_linearization_check_warnings_with_suppression(
@@ -643,6 +696,9 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
                 emit_warning(logger, input_name, message)?;
             } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
         }
+        Err(error) if logger_failure_since(pdf, diagnostics_seen) && is_logger_error(&error) => {
+            return Err(error);
+        }
         Err(error) => {
             warnings = true;
             let message = format!("error encountered while checking linearization data: {error}");
@@ -663,6 +719,7 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
     skip_first_page_warning: bool,
     suppress_warnings: bool,
 ) -> Result<bool> {
+    let diagnostics_seen = diagnostic_count(pdf);
     match check_linearization_warnings(pdf, source_bytes, skip_first_page_warning) {
         Ok(messages) => {
             let has_warnings = !messages.is_empty();
@@ -688,15 +745,18 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
             } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
             Ok(true)
         }
-        // cov:ignore-start: I/O and resolver failures are reported by the outer
-        // open/preflight boundaries; this is a defensive propagation arm.
         Err(error) => {
-            let message = format!("error encountered while checking linearization data: {error}");
+            let error_message = error.to_string();
+            if let Some(error) = take_logger_failure(error, pdf, diagnostics_seen) {
+                return Err(error);
+            }
+            let message =
+                format!("error encountered while checking linearization data: {error_message}");
             if !suppress_warnings {
                 emit_warning(logger, input_name, message)?;
             }
             Ok(true)
-        } // cov:ignore-end
+        }
     }
 }
 
@@ -705,10 +765,51 @@ fn map_page_tree_error(
     message_prefix: &str,
     input_name: &str,
     error: crate::Error,
+    logger_failure: bool,
 ) -> CheckError {
-    match emit_error(logger, message_prefix, input_name, &error) {
-        Ok(()) => CheckError::ErrorsDetected,
-        Err(_) => CheckError::Operation(error),
+    map_check_error(logger, message_prefix, input_name, error, logger_failure)
+}
+
+fn is_logger_error(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::Internal(_) | crate::Error::System(_))
+}
+
+fn diagnostic_count<R: Read + Seek>(pdf: &Pdf<R>) -> usize {
+    pdf.repair_diagnostics().entries().len()
+}
+
+fn logger_failure_since<R: Read + Seek>(pdf: &Pdf<R>, seen: usize) -> bool {
+    !pdf.suppress_warnings() && diagnostic_count(pdf) > seen
+}
+
+fn take_logger_failure<R: Read + Seek>(
+    error: LinearizationCheckError,
+    pdf: &Pdf<R>,
+    diagnostics_seen: usize,
+) -> Option<crate::Error> {
+    let LinearizationCheckError::Io(error) = error else {
+        return None;
+    };
+    let Ok(error) = error.downcast::<crate::Error>() else {
+        return None;
+    };
+    (logger_failure_since(pdf, diagnostics_seen) && is_logger_error(&error)).then_some(*error)
+}
+
+fn map_check_error(
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    input_name: &str,
+    error: crate::Error,
+    logger_failure: bool,
+) -> CheckError {
+    if logger_failure && is_logger_error(&error) {
+        CheckError::Operation(error)
+    } else {
+        match emit_error(logger, message_prefix, input_name, &error) {
+            Ok(()) => CheckError::ErrorsDetected,
+            Err(delivery_error) => CheckError::Operation(delivery_error),
+        }
     }
 }
 
@@ -847,7 +948,7 @@ fn emit_error(
 mod tests {
     use super::*;
     use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
-    use crate::{Diagnostic, Diagnostics, Error, PdfOpenOptions, QPDFLogger};
+    use crate::{Diagnostic, Diagnostics, Error, ObjectRef, PdfOpenOptions, QPDFLogger};
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1018,6 +1119,61 @@ mod tests {
         );
         pdf.extend_from_slice(
             format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn linearization_candidate_warning_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        // Deliberately omit `endobj`: resolving the candidate is a qpdf
+        // recovery warning, and the test injects a failure in its warning
+        // sink. The next object gives the parser a concrete boundary.
+        pdf.extend_from_slice(b"1 0 obj\n<< /Linearized 1 >>\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn lazy_extension_warning_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len();
+        // The Catalog is valid; resolving this indirect extension dictionary
+        // later emits the expected-endobj recovery warning.
+        pdf.extend_from_slice(b"4 0 obj\n<< /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >>\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
                 .as_bytes(),
         );
         pdf
@@ -1657,7 +1813,7 @@ mod tests {
         page_tree_pdf.set_logger(failing_pdf_logger);
         assert!(matches!(
             check_document(&mut page_tree_pdf, &logger, "qpdf", "page-tree-failure.pdf"),
-            Err(CheckError::ErrorsDetected)
+            Err(CheckError::Operation(Error::System(message))) if message == "logger failure"
         ));
 
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -1676,6 +1832,7 @@ mod tests {
             "qpdf",
             "page-tree-failure.pdf",
             Error::Internal("page tree failure".to_owned()),
+            false,
         );
         assert!(matches!(mapped, CheckError::ErrorsDetected));
         let failing_logger = QPDFLogger::create();
@@ -1685,6 +1842,7 @@ mod tests {
             "qpdf",
             "page-tree-failure.pdf",
             Error::Internal("page tree failure".to_owned()),
+            true,
         );
         assert!(matches!(
             mapped,
@@ -1709,6 +1867,286 @@ mod tests {
             result,
             Err(CheckError::Operation(Error::System(message))) if message == "logger failure"
         ));
+    }
+
+    #[test]
+    fn document_check_propagates_a_page_tree_warning_logger_failure() {
+        let mut pdf = Pdf::open(Cursor::new(page_tree_warning_pdf_bytes()))
+            .expect("page-tree fixture should open");
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = check_document(&mut pdf, &report_logger, "qpdf", "page-tree.pdf");
+
+        assert!(matches!(
+            &result,
+            Err(CheckError::Operation(Error::System(message)))
+                if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
+    fn document_check_propagates_a_lazy_extension_logger_failure() {
+        let mut pdf = Pdf::open(Cursor::new(lazy_extension_warning_pdf_bytes()))
+            .expect("lazy extension fixture should open");
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = check_document(&mut pdf, &report_logger, "qpdf", "extension.pdf");
+
+        assert!(matches!(
+            &result,
+            Err(CheckError::Operation(Error::System(message)))
+                if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
+    fn document_check_reports_a_linearization_probe_operation_failure() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let mut pdf = Pdf::open(ToggleReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/linearized-one-page.pdf"
+                ))
+                .to_vec(),
+            ),
+            fail: Arc::clone(&failure),
+        })
+        .expect("linearized fixture should open");
+        pdf.root_handle()
+            .expect("Catalog should resolve before failure");
+        failure.store(true, Ordering::Relaxed);
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let result = check_document(&mut pdf, &logger, "qpdf", "probe-failure.pdf");
+
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("probe-failure.pdf: I/O error: test reader failure"));
+    }
+
+    #[test]
+    fn document_check_propagates_a_page_content_warning_logger_failure() {
+        let mut pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"q\nQ\n")))
+            .expect("content fixture should open");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        page.try_dereference().expect("page should resolve");
+        page.replace_key(b"/Contents", ObjectHandle::integer(42))
+            .expect("page should be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation should be tracked");
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = check_document(&mut pdf, &report_logger, "qpdf", "content.pdf");
+
+        assert!(matches!(
+            &result,
+            Err(CheckError::Operation(Error::System(message)))
+                if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
+    fn document_check_propagates_linearization_page_warning_logger_failure() {
+        let mut pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))))
+        .expect("linearized fixture should open");
+        let root = pdf.root_handle().expect("Catalog should resolve");
+        let pages = root
+            .try_get_key(b"/Pages")
+            .expect("Catalog /Pages should exist");
+        let pages_ref = pages.object_ref().expect("/Pages should be indirect");
+        let pages = pdf.get_object_handle(pages_ref);
+        pages
+            .try_dereference()
+            .expect("page-tree root should resolve");
+        pages
+            .replace_key(b"/Type", ObjectHandle::name(b"NotPages".to_vec()))
+            .expect("page-tree root should be mutable");
+
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = check_document(&mut pdf, &report_logger, "qpdf", "linearized.pdf");
+
+        assert!(matches!(
+            &result,
+            Err(CheckError::Operation(Error::System(message)))
+                if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
+    fn is_linearized_propagates_candidate_warning_logger_failure() {
+        let mut pdf = Pdf::open(Cursor::new(linearization_candidate_warning_pdf_bytes()))
+            .expect("candidate-warning fixture should open");
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(logger);
+
+        let result = pdf.is_linearized();
+
+        assert!(
+            matches!(
+                &result,
+                Err(Error::System(message)) if message == "sink write failure 1"
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn linearization_warning_checker_propagates_logger_failure() {
+        let mut pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))))
+        .expect("linearized fixture should open");
+        let root = pdf.root_handle().expect("Catalog should resolve");
+        let pages = root
+            .try_get_key(b"/Pages")
+            .expect("Catalog /Pages should exist");
+        let pages_ref = pages.object_ref().expect("/Pages should be indirect");
+        let pages = pdf.get_object_handle(pages_ref);
+        pages
+            .try_dereference()
+            .expect("page-tree root should resolve");
+        pages
+            .replace_key(b"/Type", ObjectHandle::name(b"NotPages".to_vec()))
+            .expect("page-tree root should be mutable");
+        let source_bytes = pdf.source_bytes().expect("source bytes");
+
+        let document_logger = QPDFLogger::create();
+        document_logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(document_logger);
+
+        let report_output = Arc::new(Mutex::new(Vec::new()));
+        let report_logger = logger_with_capture(Arc::clone(&report_output));
+        let result = emit_linearization_check_warnings_with_suppression(
+            &mut pdf,
+            &source_bytes,
+            &report_logger,
+            "linearized.pdf",
+            false,
+            false,
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(Error::System(message)) if message == "sink write failure 1"
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn linearization_warning_checker_downgrades_a_non_logger_operation_error() {
+        let failure = Arc::new(AtomicBool::new(false));
+        let mut pdf = Pdf::open(ToggleReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/linearized-one-page.pdf"
+                ))
+                .to_vec(),
+            ),
+            fail: Arc::clone(&failure),
+        })
+        .expect("linearized fixture should open");
+        failure.store(true, Ordering::Relaxed);
+        let source_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+
+        let result = emit_linearization_check_warnings_with_suppression(
+            &mut pdf,
+            source_bytes,
+            &logger,
+            "linearized.pdf",
+            false,
+            false,
+        );
+
+        assert!(matches!(result, Ok(true)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("I/O error: I/O error: test reader failure"));
+    }
+
+    #[test]
+    fn operation_error_helpers_keep_non_logger_errors_reportable() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/minimal.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("minimal fixture should open");
+
+        assert!(take_logger_failure(LinearizationCheckError::NotLinearized, &pdf, 0,).is_none());
+        assert!(take_logger_failure(
+            LinearizationCheckError::Io(Box::new(io::Error::other("disk gone"))),
+            &pdf,
+            0,
+        )
+        .is_none());
+        assert!(take_logger_failure(
+            LinearizationCheckError::Io(Box::new(Error::System("operation".to_owned()))),
+            &pdf,
+            0,
+        )
+        .is_none());
+
+        let failing_logger = QPDFLogger::create();
+        failing_logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+        let mapped = map_check_error(
+            &failing_logger,
+            "qpdf",
+            "input.pdf",
+            Error::parse(0, "malformed"),
+            false,
+        );
+        assert!(matches!(
+            mapped,
+            CheckError::Operation(Error::System(message)) if message == "logger failure"
+        ));
+
+        pdf.set_suppress_warnings(true);
+        assert!(!logger_failure_since(&pdf, 0));
     }
 
     #[test]

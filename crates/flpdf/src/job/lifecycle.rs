@@ -20,7 +20,7 @@ use super::rotate_spec::RotateSpec;
 use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
 use crate::json::input::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
-use crate::linearization::show_linearization_pdf_with_warnings;
+use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizationError};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectRef, ObjectStreamMode, PageDocumentHelper,
@@ -2789,7 +2789,7 @@ impl QPDFJob {
     fn show_linearization_report<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
         let input_name = self.input_name.clone();
         let output = show_linearization_pdf_with_warnings(pdf, &input_name)
-            .map_err(|error| Error::System(error.to_string()))?;
+            .map_err(map_show_linearization_error)?;
         for warning in output.warnings {
             self.record_warnings();
             // cov:ignore-start: warning-sink propagation is an injected logger edge; the data warning and status branches are covered separately
@@ -3413,6 +3413,18 @@ impl QPDFJob {
     }
 }
 
+fn map_show_linearization_error(error: ShowLinearizationError) -> Error {
+    match error {
+        ShowLinearizationError::Io(error) => match error.downcast::<Error>() {
+            Ok(error) => *error,
+            Err(error) => Error::System(format!("I/O error: {error}")),
+        },
+        ShowLinearizationError::Malformed { message } => {
+            Error::System(format!("malformed linearization data: {message}"))
+        }
+    }
+}
+
 fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
     match value {
         "preserve" => Ok(ObjectStreamMode::Preserve),
@@ -3561,6 +3573,32 @@ mod tests {
             .unwrap(),
             JobExitCode::Error
         );
+    }
+
+    #[test]
+    fn show_linearization_mapping_preserves_core_errors() {
+        let error =
+            ShowLinearizationError::Io(Box::new(Error::System("sink write failure 1".to_owned())));
+
+        let mapped = map_show_linearization_error(error);
+
+        assert!(matches!(
+            mapped,
+            Error::System(message) if message == "sink write failure 1"
+        ));
+
+        let error = ShowLinearizationError::Io(Box::new(std::io::Error::other("disk gone")));
+        assert!(matches!(
+            map_show_linearization_error(error),
+            Error::System(message) if message == "I/O error: disk gone"
+        ));
+        let error = ShowLinearizationError::Malformed {
+            message: "bad hint table".to_owned(),
+        };
+        assert!(matches!(
+            map_show_linearization_error(error),
+            Error::System(message) if message == "malformed linearization data: bad hint table"
+        ));
     }
 
     #[test]

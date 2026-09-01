@@ -317,18 +317,26 @@ impl<R: Read + Seek> Pdf<R> {
     /// The trailer's `/Root` may itself be a direct Catalog dictionary;
     /// qpdf's `QPDF::getRoot` accepts that shape via `getKey` rather than
     /// requiring an indirect object (`libqpdf/QPDF.cc:2329-2367`).
-    pub fn adobe_extension_level(&mut self) -> Option<i64> {
-        let catalog = self.trailer_key_handle(b"Root");
-        self.resolve(&catalog).ok()?;
-        let extensions = catalog.try_get_key(b"/Extensions").ok()?;
-        self.resolve(&extensions).ok()?;
-        extensions.try_as_dictionary().ok()?.as_ref()?;
-        let adbe = extensions.try_get_key(b"/ADBE").ok()?;
-        self.resolve(&adbe).ok()?;
-        adbe.try_as_dictionary().ok()?.as_ref()?;
-        let level = adbe.try_get_key(b"/ExtensionLevel").ok()?;
-        self.resolve(&level).ok()?;
-        level.try_as_integer().ok().flatten()
+    /// # Errors
+    ///
+    /// Propagates failures resolving the Catalog or any indirect value in the
+    /// `/Extensions /ADBE /ExtensionLevel` chain, including logger delivery
+    /// failures raised while resolving a damaged object.
+    pub fn adobe_extension_level(&mut self) -> Result<Option<i64>> {
+        let catalog = self.root_handle()?;
+        let extensions = catalog.try_get_key(b"/Extensions")?;
+        self.resolve(&extensions)?;
+        if extensions.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        let adbe = extensions.try_get_key(b"/ADBE")?;
+        self.resolve(&adbe)?;
+        if adbe.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        let level = adbe.try_get_key(b"/ExtensionLevel")?;
+        self.resolve(&level)?;
+        level.try_as_integer()
     }
 
     /// The live trailer dictionary as an [`ObjectHandle`].
@@ -384,8 +392,7 @@ impl<R: Read + Seek> Pdf<R> {
             .trailer_handle_memo
             .as_ref()
             .unwrap_or(&self.trailer)
-            .try_get_key(b"/Root")
-            .unwrap_or_else(|_| ObjectHandle::null());
+            .try_get_key(b"/Root")?;
         if !candidate.is_null() {
             self.root_handle_memo = Some(candidate.clone());
         }

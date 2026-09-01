@@ -214,7 +214,10 @@ fn create_from_json_exposes_the_imported_root_to_adobe_extension_level() {
     )
     .expect("catalog JSON should create a document");
 
-    assert_eq!(pdf.adobe_extension_level(), Some(8));
+    assert_eq!(
+        pdf.adobe_extension_level().expect("extension level"),
+        Some(8)
+    );
 }
 
 #[test]

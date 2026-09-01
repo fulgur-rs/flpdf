@@ -2059,12 +2059,8 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
 fn writer_catalog_copy<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> Result<(Option<ObjectRef>, ObjectHandle)> {
-    let root_candidate = pdf.trailer_key_handle(b"Root");
-    if root_candidate.is_null() {
-        return Err(crate::Error::Missing("/Root"));
-    }
-    let root_ref = pdf.root_ref();
     let source = pdf.root_handle()?;
+    let root_ref = source.object_ref();
     let entries = source
         .try_as_dictionary()?
         .ok_or_else(|| crate::Error::Unsupported("Catalog is not a dictionary".to_string()))?;
@@ -2120,12 +2116,11 @@ pub(crate) fn record_catalog_snapshot_dirty_baseline<R: Read + Seek + 'static>(
 pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> Result<Option<CatalogExtensionsSnapshot>> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(None); // cov:ignore: linearization planning rejects a missing /Root first
+    let catalog = pdf.root_handle()?;
+    let Some(root_ref) = catalog.object_ref() else {
+        return Ok(None);
     };
     let was_dirty = pdf.is_dirty(root_ref);
-    let catalog = pdf.get_object_handle(root_ref);
-    pdf.resolve(&catalog)?;
     // Raw dictionary membership, not `try_has_key`'s qpdf-semantic hasKey:
     // an explicit `/Extensions null` entry is a present key whose restored
     // shape must survive, even though qpdf's own `hasKey`/`getKeys` treat a
@@ -2201,17 +2196,7 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
 /// - Propagates canonical-handle resolution errors when materialising the
 ///   Catalog or an indirect `/Extensions` value.
 fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let catalog = if let Some(root_ref) = pdf.root_ref() {
-        let catalog = pdf.get_object_handle(root_ref);
-        pdf.resolve(&catalog)?;
-        catalog
-    } else {
-        let root_candidate = pdf.trailer_key_handle(b"Root");
-        if root_candidate.is_null() {
-            return Ok(false);
-        }
-        pdf.root_handle()?
-    };
+    let catalog = pdf.root_handle()?;
     if !catalog.try_has_key(b"/Extensions")? {
         return Ok(false);
     }
@@ -2374,10 +2359,17 @@ pub(crate) struct EncryptionContext {
 ///
 /// `pub(crate)`: also used by [`crate::linearization::writer::write_linearized_for_pdf_writer`],
 /// which needs the same `--cleartext-metadata` exemption for linearized output.
-pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
-    let root_handle = pdf.root_handle().ok()?;
-    let metadata = root_handle.try_get_key(b"/Metadata").ok()?;
-    metadata.object_ref()
+///
+/// # Errors
+///
+/// Propagates Catalog and `/Metadata` lookup failures; a missing or non-object
+/// `/Metadata` value remains `Ok(None)`.
+pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<Option<ObjectRef>> {
+    let root_handle = pdf.root_handle()?;
+    let metadata = root_handle.try_get_key(b"/Metadata")?;
+    Ok(metadata.object_ref())
 }
 
 /// `id0` is the `/ID[0]` bytes the file encryption key is derived from
@@ -3328,31 +3320,17 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
-    let catalog_snapshot = pdf.root_ref().and_then(|root_ref| {
-        let was_dirty = pdf.is_dirty(root_ref);
-        let root = pdf.get_object_handle(root_ref);
-        pdf.resolve(&root).ok().and_then(|()| {
-            let extensions = root
-                .try_as_dictionary()
-                .ok()?
-                .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
-            Some(CatalogExtensionsSnapshot {
-                root_ref,
-                extensions,
-                was_dirty,
-            })
-        })
-    });
-    let direct_catalog_snapshot = if pdf.root_ref().is_none() {
-        let root = pdf.trailer_key_handle(b"Root");
-        if root.is_null() {
-            None
-        } else {
-            let extensions = root
-                .try_as_dictionary()?
-                .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
-            Some((root, extensions))
-        }
+    // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
+    // turn a logger/read failure into an absent snapshot. QPDFWriter constructs
+    // its Members with `pdf.getRoot()` before writing and propagates that
+    // failure; the Rust snapshot must preserve the same error category.
+    let catalog_snapshot = snapshot_catalog_extensions(pdf)?;
+    let direct_catalog_snapshot = if catalog_snapshot.is_none() {
+        let root = pdf.root_handle()?;
+        let extensions = root
+            .try_as_dictionary()?
+            .and_then(|entries| entries.get(b"/Extensions".as_slice()).cloned());
+        Some((root, extensions))
     } else {
         None
     };
@@ -3663,7 +3641,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // drops out of the reachable graph — mirroring qpdf's writer behaviour.
     {
         let source_ver = pdf.version().to_string();
-        let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+        let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
         // Predict whether the header floor will bump to PDF 1.5 due to
         // ObjStm emission, so the pairwise pairwise-contribution logic in
         // `effective_pdf_version_and_ext` sees the same version race that
@@ -4166,7 +4144,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             .as_ref()
             .is_some_and(|source| !copy_encryption_encrypts_metadata(source))
     {
-        resolve_metadata_stream_ref(pdf)
+        resolve_metadata_stream_ref(pdf)?
     } else {
         None
     };

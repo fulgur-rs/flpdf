@@ -758,6 +758,39 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
     }
 }
 
+#[test]
+fn linearized_cleartext_metadata_resolves_direct_and_copied_encryption() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    let mut params = EncryptParams::v4_aes128(b"user", b"owner");
+    params.encrypt_metadata = false;
+
+    let mut direct_pdf = Pdf::open(Cursor::new(input.clone())).expect("open direct input");
+    let direct_settings = WriterTestSettings {
+        static_id: true,
+        static_aes_iv: true,
+        encrypt: Some(params.clone()),
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut direct_pdf, &direct_settings)
+        .expect("linearized direct encryption should support cleartext metadata");
+
+    let donor_bytes = encrypt_to_bytes(&input, params);
+    let mut donor = open_encrypted(&donor_bytes, b"user");
+    let copy_source = donor
+        .writer_copy_encryption_source()
+        .expect("authenticated donor should expose copy-encryption parameters")
+        .expect("donor should be encrypted");
+    let mut copied_pdf = Pdf::open(Cursor::new(input)).expect("open copied input");
+    let copied_settings = WriterTestSettings {
+        static_id: true,
+        static_aes_iv: true,
+        copy_encryption: Some(copy_source),
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut copied_pdf, &copied_settings)
+        .expect("linearized copied encryption should support cleartext metadata");
+}
+
 /// RC4-128 keeps qpdf's normal content heuristic after encryption. Cover every
 /// possible one-byte plaintext under one deterministic object key: RC4's XOR
 /// mapping is a permutation, so at least one resulting ciphertext byte is
@@ -893,4 +926,6 @@ fn v1_r2_writer_uses_the_separate_r2_permission_bits() {
 mod common;
 use common::PdfCanonicalTestExt;
 #[allow(unused_imports)]
-use common::{write_default, write_with_settings, WriterTestSettings};
+use common::{
+    write_default, write_linearized_with_settings, write_with_settings, WriterTestSettings,
+};

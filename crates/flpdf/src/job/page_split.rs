@@ -187,7 +187,7 @@ impl QPDFJob {
         let has_acro_form = source.acroform()?.has_acro_form()?;
         let source_version =
             crate::parse_pdf_version(source.version()).map(|version| version.get_version().0);
-        let source_extension_level = source.adobe_extension_level().unwrap_or(0);
+        let source_extension_level = source.adobe_extension_level()?.unwrap_or(0);
         let mut written = Vec::new();
 
         for chunk_start in (0..page_count).step_by(chunk_size) {

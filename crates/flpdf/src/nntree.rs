@@ -266,12 +266,12 @@ impl LiveDictionary {
         canonical_dictionary_key(key.as_bytes())
     }
 
-    fn get(&self, key: &str) -> Option<ObjectHandle> {
+    fn get(&self, key: &str) -> Result<Option<ObjectHandle>> {
         let key = self.actual_key(key);
-        let value = self.handle.try_get_key(&key).ok();
+        let value = self.handle.try_get_key(&key)?;
         // qpdf dereferences the value before its array/type checks, so a
         // dangling reference has the same null outcome as a literal null.
-        value.filter(|value| !value.is_null())
+        Ok((!value.is_null()).then_some(value))
     }
 
     fn insert(&self, key: &str, value: ObjectHandle) -> Result<()> {
@@ -1193,7 +1193,7 @@ impl<K: TreeKey> NNTree<K> {
             let item_number = cursor.item_number.expect("valid cursor has an item");
             let dictionary = self.load_node(pdf, &leaf)?;
             // cov:ignore-start: find just returned this leaf with an items array and no callback can mutate it here
-            let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())?
+            let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())?
             else {
                 return Err(structural_error(
                     leaf.diagnostic_ref(),
@@ -1239,7 +1239,7 @@ impl<K: TreeKey> NNTree<K> {
         let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
         let item_number = cursor.item_number.expect("valid cursor has an item");
         let dictionary = self.load_node(pdf, &leaf)?;
-        let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())? else {
+        let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())? else {
             return Err(structural_error(
                 leaf.diagnostic_ref(),
                 "node contains no items array",
@@ -1297,7 +1297,7 @@ impl<K: TreeKey> NNTree<K> {
         let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
         let item_number = cursor.item_number.expect("valid cursor has an item");
         let dictionary = self.load_node(pdf, &leaf)?;
-        let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())? else {
+        let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())? else {
             return Err(structural_error(
                 leaf.diagnostic_ref(),
                 "node contains no items array",
@@ -1352,7 +1352,7 @@ impl<K: TreeKey> NNTree<K> {
             .ok_or_else(|| structural_error(None, "unable to find a valid items node"))?;
         let dictionary = self.load_node(pdf, &leaf)?;
         // cov:ignore-start: begin returns an empty cursor leaf only after observing its items array
-        let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())? else {
+        let Some(mut items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())? else {
             return Err(structural_error(
                 self.root_node(pdf)?.diagnostic_ref(),
                 "unable to find a valid items node",
@@ -1387,7 +1387,7 @@ impl<K: TreeKey> NNTree<K> {
                 .clone()
                 .expect("a positioned NNTree cursor retains a leaf");
             let dictionary = self.load_node(pdf, &leaf)?;
-            let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())?
+            let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())?
                 .expect("a positioned NNTree cursor retains an items array");
             let item_number = cursor
                 .item_number
@@ -1431,7 +1431,7 @@ impl<K: TreeKey> NNTree<K> {
             let parent_handle = &cursor.path[index].node;
             let parent = self.load_node(pdf, parent_handle)?;
             // cov:ignore-start: the cursor path was built from this parent's /Kids array
-            let Some(kids) = resolved_array(pdf, parent.get("Kids").as_ref())? else {
+            let Some(kids) = resolved_array(pdf, parent.get("Kids")?.as_ref())? else {
                 return Err(structural_error(
                     parent_handle.diagnostic_ref(),
                     "node is missing /Kids",
@@ -1457,10 +1457,10 @@ impl<K: TreeKey> NNTree<K> {
         let replacement = self.load_node(pdf, &NodeHandle::root(replacement))?;
         current.remove("Kids");
         current.remove(K::ITEMS_KEY);
-        if let Some(kids) = replacement.get("Kids") {
+        if let Some(kids) = replacement.get("Kids")? {
             current.insert("Kids", kids)?;
         }
-        if let Some(items) = replacement.get(K::ITEMS_KEY) {
+        if let Some(items) = replacement.get(K::ITEMS_KEY)? {
             current.insert(K::ITEMS_KEY, items)?;
         }
         current.mark_dirty(pdf)?;
@@ -1475,8 +1475,8 @@ impl<K: TreeKey> NNTree<K> {
         mut parent_index: Option<usize>,
     ) -> Result<()> {
         let dictionary = self.load_node(pdf, &node)?;
-        let kids = resolved_array(pdf, dictionary.get("Kids").as_ref())?;
-        let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())?;
+        let kids = resolved_array(pdf, dictionary.get("Kids")?.as_ref())?;
+        let items = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())?;
         let (array_key, array, threshold, is_leaf) = if let Some(kids) = kids {
             if kids.values.is_empty() {
                 return Ok(());
@@ -1534,7 +1534,7 @@ impl<K: TreeKey> NNTree<K> {
         let parent_index = parent_index.expect("root was normalized above");
         let first_dictionary = self.load_node(pdf, &node)?;
         // cov:ignore-start: array_key was selected from this same node before root normalization
-        let Some(mut first_half) = resolved_array(pdf, first_dictionary.get(array_key).as_ref())?
+        let Some(mut first_half) = resolved_array(pdf, first_dictionary.get(array_key)?.as_ref())?
         else {
             return Err(structural_error(
                 node.diagnostic_ref(),
@@ -1563,7 +1563,7 @@ impl<K: TreeKey> NNTree<K> {
         let parent_handle = cursor.path[parent_index].node.clone();
         let parent = self.load_node(pdf, &parent_handle)?;
         // cov:ignore-start: split cursor path was built from this parent Kids array
-        let Some(mut parent_kids) = resolved_array(pdf, parent.get("Kids").as_ref())? else {
+        let Some(mut parent_kids) = resolved_array(pdf, parent.get("Kids")?.as_ref())? else {
             return Err(structural_error(
                 parent_handle.diagnostic_ref(),
                 "node is missing /Kids",
@@ -1621,7 +1621,7 @@ impl<K: TreeKey> NNTree<K> {
             let new_limits = self.edge_limits(pdf, &dictionary)?;
             let changed = match new_limits {
                 Some((first, last)) => {
-                    let old_limits = resolved_array(pdf, dictionary.get("Limits").as_ref())?;
+                    let old_limits = resolved_array(pdf, dictionary.get("Limits")?.as_ref())?;
                     let unchanged = if let Some(old_limits) = old_limits {
                         if old_limits.values.len() == 2 {
                             let old_first = resolved_key::<K, _>(pdf, &old_limits.values[0])?;
@@ -1671,7 +1671,7 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         dictionary: &LiveDictionary,
     ) -> Result<Option<(ObjectHandle, ObjectHandle)>> {
-        if let Some(items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())? {
+        if let Some(items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())? {
             if items.values.len() >= 2 {
                 return Ok(Some((
                     items.values[0].clone(),
@@ -1679,7 +1679,7 @@ impl<K: TreeKey> NNTree<K> {
                 )));
             }
         }
-        if let Some(kids) = resolved_array(pdf, dictionary.get("Kids").as_ref())? {
+        if let Some(kids) = resolved_array(pdf, dictionary.get("Kids")?.as_ref())? {
             if let (Some(first_kid), Some(last_kid)) = (kids.values.first(), kids.values.last()) {
                 first_kid.try_dereference()?;
                 let first_kid = first_kid.clone();
@@ -1693,10 +1693,10 @@ impl<K: TreeKey> NNTree<K> {
                 }
                 let first = LiveDictionary::new(first_kid.clone())?;
                 let last = LiveDictionary::new(last_kid.clone())?;
-                let Some(first_limits) = resolved_array(pdf, first.get("Limits").as_ref())? else {
+                let Some(first_limits) = resolved_array(pdf, first.get("Limits")?.as_ref())? else {
                     return Ok(None);
                 };
-                let Some(last_limits) = resolved_array(pdf, last.get("Limits").as_ref())? else {
+                let Some(last_limits) = resolved_array(pdf, last.get("Limits")?.as_ref())? else {
                     return Ok(None);
                 };
                 if first_limits.values.len() >= 2 && last_limits.values.len() >= 2 {
@@ -1720,7 +1720,7 @@ impl<K: TreeKey> NNTree<K> {
             let parent_handle = cursor.path[path_index].node.clone();
             let removed_kid = cursor.path[path_index].kid_number;
             let parent = self.load_node(pdf, &parent_handle)?;
-            let Some(mut kids) = resolved_array(pdf, parent.get("Kids").as_ref())? else {
+            let Some(mut kids) = resolved_array(pdf, parent.get("Kids")?.as_ref())? else {
                 return Err(structural_error(
                     parent_handle.diagnostic_ref(),
                     "node is missing /Kids",
@@ -1815,12 +1815,16 @@ impl<K: TreeKey> NNTree<K> {
                 ));
             }
 
-            let dictionary = self
-                .load_node(pdf, &node)
-                .map_err(|_| structural_error(node.diagnostic_ref(), "bad node during find"))?;
-            let items_source = dictionary.get(K::ITEMS_KEY);
+            // cov:ignore-start: begin() has already traversed this same live
+            // node path immediately above; without a mutating callback between
+            // the calls, this defensive reload error cannot be reached.
+            let dictionary = self.load_node(pdf, &node).map_err(|error| {
+                structuralize(error, node.diagnostic_ref(), "bad node during find")
+            })?;
+            // cov:ignore-end
+            let items_source = dictionary.get(K::ITEMS_KEY)?;
             let items = resolved_array(pdf, items_source.as_ref())?;
-            let kids_source = dictionary.get("Kids");
+            let kids_source = dictionary.get("Kids")?;
             let kids = resolved_array(pdf, kids_source.as_ref())?;
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
@@ -1860,12 +1864,17 @@ impl<K: TreeKey> NNTree<K> {
                         .values
                         .get(index)
                         .expect("binary-search index is in range");
-                    let kid_dictionary = LiveDictionary::new(kid.clone()).map_err(|_| {
-                        structural_error(
+                    // cov:ignore-start: begin() validates every child on the
+                    // live path before find_internal repeats this binary-search
+                    // probe, leaving no intervening mutation boundary.
+                    let kid_dictionary = LiveDictionary::new(kid.clone()).map_err(|error| {
+                        structuralize(
+                            error,
                             root_diagnostic_ref,
                             format!("invalid kid at index {index}"),
                         )
                     })?;
+                    // cov:ignore-end
                     self.within_limits(pdf, key, &kid_dictionary, kid.object_ref())
                 })?;
                 let index = index.ok_or_else(|| {
@@ -1897,7 +1906,7 @@ impl<K: TreeKey> NNTree<K> {
         dictionary: &LiveDictionary,
         object_ref: Option<ObjectRef>,
     ) -> Result<Ordering> {
-        let Some(limits) = resolved_array(pdf, dictionary.get("Limits").as_ref())? else {
+        let Some(limits) = resolved_array(pdf, dictionary.get("Limits")?.as_ref())? else {
             return Err(structural_error(object_ref, "node is missing /Limits"));
         };
         let (Some(first), Some(last)) = (
@@ -1991,18 +2000,21 @@ impl<K: TreeKey> NNTree<K> {
 
             let dictionary = match self.load_node(pdf, &node) {
                 Ok(dictionary) => dictionary,
-                Err(_) => {
-                    self.warn(
-                        pdf,
-                        &node,
-                        "non-dictionary node while traversing name/number tree",
-                    )?;
-                    break;
+                Err(error) => {
+                    if matches!(error, Error::Parse { .. }) {
+                        self.warn(
+                            pdf,
+                            &node,
+                            "non-dictionary node while traversing name/number tree",
+                        )?;
+                        break;
+                    }
+                    return Err(error);
                 }
             };
-            let items_source = dictionary.get(K::ITEMS_KEY);
+            let items_source = dictionary.get(K::ITEMS_KEY)?;
             let items = resolved_array(pdf, items_source.as_ref())?;
-            let kids_source = dictionary.get("Kids");
+            let kids_source = dictionary.get("Kids")?;
             let kids = resolved_array(pdf, kids_source.as_ref())?;
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
@@ -2072,7 +2084,7 @@ impl<K: TreeKey> NNTree<K> {
         loop {
             let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
             let dictionary = self.load_node(pdf, &leaf)?;
-            let Some(items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())? else {
+            let Some(items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())? else {
                 cursor.clear_position();
                 return Ok(());
             };
@@ -2105,7 +2117,7 @@ impl<K: TreeKey> NNTree<K> {
             while let Some(last_index) = cursor.path.len().checked_sub(1) {
                 let parent = cursor.path[last_index].node.clone();
                 let dictionary = self.load_node(pdf, &parent)?;
-                let Some(kids) = resolved_array(pdf, dictionary.get("Kids").as_ref())? else {
+                let Some(kids) = resolved_array(pdf, dictionary.get("Kids")?.as_ref())? else {
                     cursor.path.pop();
                     continue;
                 };
@@ -2174,7 +2186,7 @@ impl<K: TreeKey> NNTree<K> {
             return Ok(());
         };
         let dictionary = self.load_node(pdf, leaf)?;
-        let Some(items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY).as_ref())? else {
+        let Some(items) = resolved_array(pdf, dictionary.get(K::ITEMS_KEY)?.as_ref())? else {
             return Err(structural_error(
                 leaf.diagnostic_ref(),
                 format!("update ivalue: /{} is not an array", K::ITEMS_KEY),
@@ -2252,7 +2264,7 @@ impl<K: TreeKey> NNTree<K> {
                 .expect("canonical allocation returns an indirect kid");
             let dictionary = self.load_node(pdf, parent)?;
             // cov:ignore-start: prepare_kid receives kid_object from this same parent Kids array
-            let Some(mut kids) = resolved_array(pdf, dictionary.get("Kids").as_ref())? else {
+            let Some(mut kids) = resolved_array(pdf, dictionary.get("Kids")?.as_ref())? else {
                 return Err(structural_error(
                     parent.diagnostic_ref(),
                     "node is missing /Kids",
@@ -2410,6 +2422,13 @@ where
     )
 }
 
+fn structuralize(error: Error, object_ref: Option<ObjectRef>, message: impl AsRef<str>) -> Error {
+    match error {
+        Error::Parse { .. } => structural_error(object_ref, message),
+        other => other,
+    }
+}
+
 fn structural_error(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -> Error {
     Error::parse(0, structural_message(object_ref, message))
 }
@@ -2420,4 +2439,33 @@ fn structural_message(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -
         None => "Name/Number tree node: ".to_string(),
     };
     format!("{prefix}{}", message.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structuralize_rewrites_parse_errors_but_preserves_operations() {
+        let parse = structuralize(
+            Error::parse(17, "raw parse"),
+            Some(ObjectRef::new(8, 0)),
+            "bad node",
+        );
+        assert!(matches!(
+            parse,
+            Error::Parse { offset: 0, message }
+                if message == "Name/Number tree node (object 8): bad node"
+        ));
+
+        let system = structuralize(
+            Error::System("sink write failure 1".to_owned()),
+            Some(ObjectRef::new(8, 0)),
+            "bad node",
+        );
+        assert!(matches!(
+            system,
+            Error::System(message) if message == "sink write failure 1"
+        ));
+    }
 }
