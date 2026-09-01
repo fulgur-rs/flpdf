@@ -17,6 +17,14 @@ fn minimal_fixture() -> PathBuf {
 }
 
 #[cfg(unix)]
+fn qpdf_available() -> bool {
+    std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(unix)]
 fn run_with_low_fd_limit(
     directory: &Path,
     script: &Path,
@@ -205,6 +213,9 @@ fn explicit_keep_files_open_n_overrides_automatic_selection() {
 #[cfg(unix)]
 #[test]
 fn explicit_keep_files_open_n_bounds_cli_empty_page_source_fds_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
     let directory = tempfile::tempdir().expect("temporary low-fd directory");
     let inputs = low_fd_inputs(directory.path(), 40);
     let script = low_fd_script(directory.path());
@@ -249,6 +260,9 @@ fn explicit_keep_files_open_n_bounds_cli_empty_page_source_fds_like_qpdf() {
 #[cfg(unix)]
 #[test]
 fn explicit_keep_files_open_n_bounds_cli_nonempty_page_source_fds_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
     let directory = tempfile::tempdir().expect("temporary low-fd directory");
     let inputs = low_fd_inputs(directory.path(), 41);
     let script = low_fd_script(directory.path());
@@ -293,6 +307,9 @@ fn explicit_keep_files_open_n_bounds_cli_nonempty_page_source_fds_like_qpdf() {
 #[cfg(unix)]
 #[test]
 fn explicit_keep_files_open_n_bounds_job_json_page_source_fds_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
     let directory = tempfile::tempdir().expect("temporary low-fd job directory");
     let inputs = low_fd_inputs(directory.path(), 40);
     let script = low_fd_script(directory.path());
