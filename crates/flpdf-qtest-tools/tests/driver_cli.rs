@@ -25,6 +25,20 @@ fn fixture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures"))
 }
 
+fn form_xobject_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/fxo-red.pdf"
+    )
+}
+
+fn missing_mediabox_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/missing-mediabox-leaf.pdf"
+    )
+}
+
 fn repairable_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -240,6 +254,73 @@ fn test_53_flushes_repair_diagnostics_before_object_output() {
         .stderr(predicates::str::contains(
             "Attempting to reconstruct cross-reference table",
         ));
+}
+
+#[test]
+fn test_56_writes_the_form_xobject_overlay_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = form_xobject_fixture();
+
+    driver()
+        .args(["56", fixture, fixture])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 56 done\n")
+        .stderr("");
+
+    let output = fs::read(directory.path().join("a.pdf"))
+        .expect("test 56 must write the form-xobject overlay output");
+    assert!(
+        output
+            .windows(b"/Fx1".len())
+            .any(|window| window == b"/Fx1"),
+        "test 56 output must contain the imported source Form XObject resource"
+    );
+}
+
+#[test]
+fn test_64_writes_the_form_xobject_shrink_expand_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = form_xobject_fixture();
+
+    driver()
+        .args(["64", fixture, fixture])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 64 done\n")
+        .stderr("");
+
+    let output = fs::read(directory.path().join("a.pdf"))
+        .expect("test 64 must write the form-xobject overlay output");
+    assert!(
+        output
+            .windows(b"/Fx1".len())
+            .any(|window| window == b"/Fx1"),
+        "test 64 output must contain the imported source Form XObject resource"
+    );
+}
+
+#[test]
+fn test_56_keeps_primary_and_secondary_repair_diagnostics_separate() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = missing_mediabox_fixture();
+
+    let output = driver()
+        .args(["56", fixture, fixture])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 56");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = "MediaBox is undefined; setting to letter / ANSI A";
+    assert_eq!(
+        stderr.matches(warning).count(),
+        2,
+        "test 56 must retain one page-tree warning for each QPDF document"
+    );
 }
 
 fn direct_root_pdf() -> Vec<u8> {

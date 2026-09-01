@@ -578,6 +578,16 @@ V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invo
 | `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `acroform_document_helper.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
 
+`qpdf/test_driver.cc:2073-2137` の `test_56`–`test_59` と `:2303-2364` の
+`test_64`–`test_67` は、`PageObjectHelper::get_form_xobject_for_page`、
+`Pdf::copy_foreign_object`、`PageObjectHelper::get_resources`/
+`ObjectHandle::merge_resources`、`PageObjectHelper::place_form_xobject`、
+`PageObjectHelper::add_page_contents`、`PdfWriter` のQDF/static-ID経路を通る
+qtest consumerとして実装済みである。pinned qpdf 11.9.0との同一fixture比較で8件の
+`a.pdf`出力が一致し、対応するqtest比較行は `form-xobject 4,6,8,10,12,14,16,18`
+へ昇格した。driver側にForm XObjectの独自traversal・allocation・compatibility bridgeは
+追加していない。
+
 ## 8. JSON
 
 | qpdf | 行 | flpdf | 状態 |
