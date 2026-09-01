@@ -72,6 +72,7 @@
 //! | `QPDFObjectHandle::TokenFilter`, `QPDFObjectHandle::ParserCallbacks` (`include/qpdf/QPDFObjectHandle.hh:129-227`) | [`crate::token_filter::TokenFilter`], [`crate::content_stream::ObjectHandleParserCallbacks`], [`crate::content_stream::ParseControl`] | `object_handle_content_parser_tests.rs`: token-filter output/discard/EOF and parser callback lifecycle tests |
 //! | `parseContentStream`, `pipeContentStreams`, `addTokenFilter`, `parsePageContents`, `filterPageContents`, `pipePageContents`, `addContentTokenFilter`, `filterAsContents`, `parseAsContents` (`include/qpdf/QPDFObjectHandle.hh:421-473`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`], [`ObjectHandle::add_token_filter`], [`ObjectHandle::add_content_token_filter`], `ObjectHandle::parse_content_stream_handles` (private orchestration for `parseContentStream`) | `object_handle_content_parser_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
 //! | `makeResourcesIndirect` (`include/qpdf/QPDFObjectHandle.hh:789-793`; `libqpdf/QPDFObjectHandle.cc:1042-1060`) | [`ObjectHandle::make_resources_indirect`] | `object_handle::mutation_tests::make_resources_indirect_promotes_direct_second_level_values_only` and `acroform_document_helper::tests::prepare_foreign_resource_plan_indirectizes_both_dr_second_level_values` |
+//! | `getResourceNames` (`include/qpdf/QPDFObjectHandle.hh:831-835`; `libqpdf/QPDFObjectHandle.cc:1156-1170`) | [`ObjectHandle::get_resource_names`] | `public_object_primitives.rs::qpdf_object_handle_primitives_are_available_to_external_crates` |
 //! | `getUniqueResourceName` (`include/qpdf/QPDFObjectHandle.hh:837-850`) | [`ObjectHandle::get_unique_resource_name`] | `object_handle_content_shape_tests.rs::unique_resource_name_uses_the_supplied_prefix_and_suffix_cursor` and related shape tests |
 //! | `getPageContents`, `addPageContents`, `rotatePage`, `coalesceContentStreams` (`include/qpdf/QPDFObjectHandle.hh:1242-1254`) | [`ObjectHandle::get_page_contents`], [`ObjectHandle::add_page_contents`], [`ObjectHandle::rotate_page`], [`ObjectHandle::coalesce_content_streams`] | `object_handle_content_shape_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
 //! | `isFormXObject`, `isImage` (`include/qpdf/QPDFObjectHandle.hh:1328-1334`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | `object_handle_content_shape_tests.rs::form_and_image_classification_matches_qpdf` |
@@ -1525,7 +1526,7 @@ impl ObjectHandle {
     /// was minted by a [`crate::Pdf`]. This is qpdf's source-QPDF identity
     /// key used by `QPDF::copyForeignObject`'s per-source `ObjCopier` map
     /// (`libqpdf/QPDF.cc:2065`).
-    pub(crate) fn owning_pdf_unique_id(&self) -> Option<u64> {
+    pub fn owning_pdf_unique_id(&self) -> Option<u64> {
         self.0.borrow().active_pdf_unique_id
     }
 
@@ -2757,9 +2758,10 @@ impl ObjectHandle {
     ///
     /// Ports `QPDFObjectHandle::isNameAndEquals`
     /// (`libqpdf/QPDFObjectHandle.cc:456-459`). qpdf's canonical name string
-    /// includes its leading slash; [`ObjectValue::Name`] follows this crate's
-    /// existing representation and stores the same decoded bytes without it.
-    pub(crate) fn try_is_name_and_equals(&self, name: &[u8]) -> Result<bool> {
+    /// includes its leading slash; the internal name representation follows
+    /// this crate's existing convention and stores the same decoded bytes
+    /// without it.
+    pub fn try_is_name_and_equals(&self, name: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         Ok(self.with_value(
             |value| matches!(value, Some(ObjectValue::Name(actual)) if actual.as_slice() == name),
@@ -2773,7 +2775,7 @@ impl ObjectHandle {
     /// inspect the holder as a name first, then inspect array items one at a
     /// time (`libqpdf/QPDFObjectHandle.cc:1027-1039`). Each array borrow ends
     /// before the selected child is resolved.
-    pub(crate) fn try_is_or_has_name(&self, name: &[u8]) -> Result<bool> {
+    pub fn try_is_or_has_name(&self, name: &[u8]) -> Result<bool> {
         if self.try_is_name_and_equals(name)? {
             return Ok(true);
         }
@@ -2801,11 +2803,7 @@ impl ObjectHandle {
     /// keys use qpdf's canonical leading slash; the requested type names
     /// remain decoded name bytes without it, such as
     /// `CryptFilterDecodeParms`.
-    pub(crate) fn try_is_dictionary_of_type(
-        &self,
-        type_name: &[u8],
-        subtype_name: &[u8],
-    ) -> Result<bool> {
+    pub fn try_is_dictionary_of_type(&self, type_name: &[u8], subtype_name: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         let is_dictionary =
             self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_))));
@@ -5066,6 +5064,20 @@ impl ObjectHandle {
         Ok(())
     }
 
+    /// Return all names in the second-level dictionaries of a resource
+    /// dictionary.
+    ///
+    /// This ports `QPDFObjectHandle::getResourceNames`
+    /// (`include/qpdf/QPDFObjectHandle.hh:831-835`,
+    /// `libqpdf/QPDFObjectHandle.cc:1156-1170`). The receiver and each
+    /// top-level value are resolved through the owning document before their
+    /// dictionary shape is inspected. The fallible `Result` preserves this
+    /// crate's resolver error boundary; qpdf's equivalent reports the same
+    /// collection for successfully resolved values.
+    pub fn get_resource_names(&self) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+        try_get_resource_names(self)
+    }
+
     /// Return the unique resource name qpdf would select for `prefix`.
     ///
     /// This ports `QPDFObjectHandle::getUniqueResourceName`
@@ -5084,7 +5096,7 @@ impl ObjectHandle {
     ) -> Result<Vec<u8>> {
         let names = match resource_names {
             Some(names) => names.clone(),
-            None => try_get_resource_names(self)?,
+            None => self.get_resource_names()?,
         };
         let max_suffix = *min_suffix + names.len();
         while *min_suffix <= max_suffix {
