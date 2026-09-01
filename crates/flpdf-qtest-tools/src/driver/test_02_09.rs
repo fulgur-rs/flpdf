@@ -3,8 +3,9 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, Pdf, PdfWriter, Pipeline, PipelineError,
-    PipelineResult, StreamDataMode, StreamDataProvider, STREAM_ENCODE_NORMALIZE,
+    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter,
+    Pipeline, PipelineError, PipelineResult, StreamDataMode, StreamDataProvider,
+    STREAM_ENCODE_NORMALIZE,
 };
 
 use crate::driver::emit_new_diagnostics;
@@ -247,14 +248,11 @@ fn double_to_string_3(value: f64) -> String {
 
 /// qpdf source: `qpdf/test_driver.cc:374-420` (`test_5`).
 ///
-/// GAP(`QPDFPageObjectHelper::getImages`): no flpdf equivalent exists
-/// (confirmed: no `get_images`/`getImages` on any page helper or
-/// `ObjectHandle`). The `page N:` and `  images:` lines print unconditionally
-/// before the per-image loop in qpdf's own source, so they are kept as real
-/// output; the image name/width/height lines are not emitted. The
-/// `  content:`, `end page N`, `/QStrings`, and `/QNumbers` sections that
-/// follow in qpdf's source are independent of `getImages` and are ported in
-/// full.
+/// `QPDFPageObjectHelper::getImages` is the canonical non-recursive image
+/// enumeration route (`libqpdf/QPDFPageObjectHelper.cc:370-384`). The
+/// `PageObjectHelper` call resolves each returned image through the same live
+/// handle graph before the driver reads `/Width` and `/Height`, matching the
+/// qpdf `getDict().getKey(...).getIntValue()` sequence.
 pub(crate) fn run_test_5<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -272,11 +270,19 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         let pageno = index + 1;
         writeln!(stdout, "page {pageno}:")?;
         writeln!(stdout, "  images:")?;
-        // GAP(QPDFPageObjectHelper::getImages): see this function's own doc
-        // above.
+        let mut page_helper = PageObjectHelper::new(*page_ref, pdf);
+        for (name, image) in page_helper.get_images()? {
+            let image_dict = image
+                .as_stream_dict()
+                .expect("get_images only returns image stream handles");
+            let width = image_dict.try_get_key(b"/Width")?.try_get_int_value()?;
+            let height = image_dict.try_get_key(b"/Height")?.try_get_int_value()?;
+            write!(stdout, "    ")?;
+            write_bytes(stdout, &name)?;
+            writeln!(stdout, ": {width} x {height}")?;
+        }
         writeln!(stdout, "  content:")?;
-        let page = pdf.get_object_handle(*page_ref);
-        let content = page.get_page_contents()?;
+        let content = page_helper.get_page_contents()?;
         for item in &content {
             write!(stdout, "    ")?;
             write_bytes(stdout, &item.unparse())?;
@@ -584,8 +590,9 @@ pub(crate) fn run_test_9<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_3, StdoutPipeline};
+    use super::{run_test_3, run_test_5, StdoutPipeline};
     use flpdf::{ObjectHandle, Pdf, Pipeline};
+    use std::collections::BTreeMap;
     use std::io::{self, Write};
     use std::rc::Rc;
 
@@ -664,5 +671,66 @@ mod tests {
             stdout: &mut stdout,
         };
         assert_eq!(pipeline.identifier(), "tokenized stream");
+    }
+
+    fn image_page_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources 4 0 R /Contents 6 0 R >>"
+                    .as_slice(),
+            ),
+            (4, b"<< /XObject << /Im1 5 0 R >> >>".as_slice()),
+            (
+                5,
+                b"<< /Type /XObject /Subtype /Image /Width 7 /Height 11 /Length 1 >>\nstream\nx\nendstream"
+                    .as_slice(),
+            ),
+            (6, b"<< /Length 0 >>\nstream\n\nendstream".as_slice()),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for number in 1..=6 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_5_driver_emits_image_dimensions_from_canonical_page_helper() {
+        let mut pdf = Pdf::open_mem_owned(image_page_pdf()).expect("open image page fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_5(
+            &mut pdf,
+            b"image-page.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 5 should enumerate the image");
+
+        assert_eq!(
+            stdout,
+            b"page 1:\n  images:\n    /Im1: 7 x 11\n  content:\n    6 0 R\nend page 1\n"
+        );
+        assert!(stderr.is_empty());
     }
 }

@@ -1416,11 +1416,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     /// Visit image XObjects, optionally recursing through nested Forms.
+    ///
+    /// Image masks are excluded, matching qpdf's `isImage()` default
+    /// (`QPDFObjectHandle.hh:1331-1334`) and `forEachImage` selector
+    /// (`QPDFPageObjectHelper.cc:352-357`).
     pub fn for_each_image<F>(&mut self, recursive: bool, action: F) -> Result<()>
     where
         F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
     {
-        self.for_each_xobject_filtered(recursive, |object| object.is_image(false), action)
+        self.for_each_xobject_filtered(recursive, |object| object.is_image(true), action)
     }
 
     /// Visit Form XObjects, optionally recursing through nested Forms.
