@@ -4043,15 +4043,15 @@ mod tests {
         let second = tempdir.path().join("second.json");
         std::fs::write(
             &first,
-            format!(r#"{{"jobJsonFile":"{}"}}"#, second.display()),
+            serde_json::json!({"jobJsonFile": second.display().to_string()}).to_string(),
         )
         .unwrap();
         std::fs::write(
             &second,
-            format!(r#"{{"jobJsonFile":"{}"}}"#, first.display()),
+            serde_json::json!({"jobJsonFile": first.display().to_string()}).to_string(),
         )
         .unwrap();
-        let json = format!(r#"{{"jobJsonFile":"{}"}}"#, first.display());
+        let json = serde_json::json!({"jobJsonFile": first.display().to_string()}).to_string();
         let mut job = QPDFJob::new();
         let error = job
             .initialize_from_json_partial(&json)
@@ -4066,7 +4066,9 @@ mod tests {
         let scalar_file = tempdir.path().join("scalar.json");
         std::fs::write(&scalar_file, b"[]").unwrap();
         let scalar_json = crate::json::Json::parse(
-            format!(r#"{{"jobJsonFile":"{}"}}"#, scalar_file.display()).as_bytes(),
+            serde_json::json!({"jobJsonFile": scalar_file.display().to_string()})
+                .to_string()
+                .as_bytes(),
         )
         .unwrap();
         assert!(expand_job_json_files(&scalar_json).is_err());
@@ -4080,17 +4082,19 @@ mod tests {
         let plaintext = fixture_root.join("minimal.pdf");
         let cases = [
             (
-                format!(
-                    r#"{{"inputFile":"{}","isEncrypted":""}}"#,
-                    encrypted.display()
-                ),
+                serde_json::json!({
+                    "inputFile": encrypted.display().to_string(),
+                    "isEncrypted": ""
+                })
+                .to_string(),
                 JobExitCode::Success,
             ),
             (
-                format!(
-                    r#"{{"inputFile":"{}","requiresPassword":""}}"#,
-                    plaintext.display()
-                ),
+                serde_json::json!({
+                    "inputFile": plaintext.display().to_string(),
+                    "requiresPassword": ""
+                })
+                .to_string(),
                 JobExitCode::Error,
             ),
         ];
@@ -4114,10 +4118,13 @@ mod tests {
         logger.set_error(Some(logger.discard()));
         missing_job.set_logger(logger);
         missing_job
-            .initialize_from_json_partial(&format!(
-                r#"{{"inputFile":"{}","isEncrypted":""}}"#,
-                missing.display()
-            ))
+            .initialize_from_json_partial(
+                &serde_json::json!({
+                    "inputFile": missing.display().to_string(),
+                    "isEncrypted": ""
+                })
+                .to_string(),
+            )
             .unwrap();
         assert_eq!(missing_job.run().unwrap(), JobExitCode::Error);
 
@@ -4130,10 +4137,13 @@ mod tests {
         logger.set_error(Some(logger.discard()));
         malformed_job.set_logger(logger);
         malformed_job
-            .initialize_from_json_partial(&format!(
-                r#"{{"inputFile":"{}","requiresPassword":""}}"#,
-                malformed.display()
-            ))
+            .initialize_from_json_partial(
+                &serde_json::json!({
+                    "inputFile": malformed.display().to_string(),
+                    "requiresPassword": ""
+                })
+                .to_string(),
+            )
             .unwrap();
         assert_eq!(malformed_job.run().unwrap(), JobExitCode::Error);
 
@@ -4144,12 +4154,14 @@ mod tests {
         logger.set_error(Some(logger.discard()));
         copy_job.set_logger(logger);
         copy_job
-            .initialize_from_json_partial(&format!(
-                r#"{{"inputFile":"{}","outputFile":"{}","copyEncryption":"{}"}}"#,
-                plaintext.display(),
-                tempdir.path().join("output.pdf").display(),
-                plaintext.display()
-            ))
+            .initialize_from_json_partial(
+                &serde_json::json!({
+                    "inputFile": plaintext.display().to_string(),
+                    "outputFile": tempdir.path().join("output.pdf").display().to_string(),
+                    "copyEncryption": plaintext.display().to_string()
+                })
+                .to_string(),
+            )
             .unwrap();
         assert_eq!(copy_job.run().unwrap(), JobExitCode::Error);
     }
@@ -4159,10 +4171,14 @@ mod tests {
         let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/minimal.pdf");
         let mut job = QPDFJob::new();
-        job.initialize_from_json_partial(&format!(
-            r#"{{"inputFile":"{}","isEncrypted":"","requiresPassword":""}}"#,
-            input.display()
-        ))
+        job.initialize_from_json_partial(
+            &serde_json::json!({
+                "inputFile": input.display().to_string(),
+                "isEncrypted": "",
+                "requiresPassword": ""
+            })
+            .to_string(),
+        )
         .unwrap();
         let error = job
             .run()
@@ -4194,10 +4210,13 @@ mod tests {
         logger.set_warn(Some(logger.discard()));
         logger.set_error(Some(logger.discard()));
         job.set_logger(logger);
-        job.initialize_from_json_partial(&format!(
-            r#"{{"inputFile":"{}","showLinearization":""}}"#,
-            input.display()
-        ))
+        job.initialize_from_json_partial(
+            &serde_json::json!({
+                "inputFile": input.display().to_string(),
+                "showLinearization": ""
+            })
+            .to_string(),
+        )
         .unwrap();
         assert_eq!(job.run().unwrap(), JobExitCode::Warning);
     }
@@ -4213,11 +4232,13 @@ mod tests {
             logger.set_warn(Some(logger.discard()));
             logger.set_error(Some(logger.discard()));
             job.set_logger(logger);
-            job.initialize_from_json_partial(&format!(
-                r#"{{"inputFile":"{}","showObject":"{}"}}"#,
-                input.display(),
-                selector
-            ))
+            job.initialize_from_json_partial(
+                &serde_json::json!({
+                    "inputFile": input.display().to_string(),
+                    "showObject": selector
+                })
+                .to_string(),
+            )
             .unwrap();
             assert_eq!(job.run().unwrap(), JobExitCode::Success);
         }
@@ -4228,10 +4249,17 @@ mod tests {
         logger.set_warn(Some(logger.discard()));
         logger.set_error(Some(logger.discard()));
         job.set_logger(logger);
-        job.initialize_from_json_partial(&format!(
-            r#"{{"inputFile":"{}","showNpages":"","showPages":"","showLinearization":"","showXref":"","listAttachments":""}}"#,
-            input.display()
-        ))
+        job.initialize_from_json_partial(
+            &serde_json::json!({
+                "inputFile": input.display().to_string(),
+                "showNpages": "",
+                "showPages": "",
+                "showLinearization": "",
+                "showXref": "",
+                "listAttachments": ""
+            })
+            .to_string(),
+        )
         .unwrap();
         assert_eq!(job.run().unwrap(), JobExitCode::Success);
     }
