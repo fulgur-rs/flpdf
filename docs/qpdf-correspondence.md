@@ -661,6 +661,8 @@ cargo test -p flpdf-cli --test cli_json --quiet
 
 `--job-json-file` の page-transform fields `splitPages`、`rotate`、`removeRestrictions` は、qpdf の生成 JSON handler (`QPDFJob_json.cc:611-624`, `auto_job_json_init.hh`) と Config/Job call order (`QPDFJob_config.cc:535-540,597-609`; `QPDFJob.cc:369-411,428-520,2137-2150,2635-2651,2940-3025`) に対応して `job/lifecycle.rs` の canonical configuration から page split、rotation、security/signature mutation へ接続した。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。 |
 
+`splitPages` の値は qpdf の `int` と同じく signed のまま job configuration に保持する。したがって負の非ゼロ値は `checkConfiguration` の truthy split branch を通過し、`doSplitPages` の `QIntC::to_size(m->split_pages)` (`QPDFJob.cc:2970`, `QIntC.hh:112-216`) で初めて `integer out of range converting ...` を返す。flpdf も同じ page-split boundary まで値を保持し、parser の独自 early usage error に変換しない（`QPDFJob_config.cc:597-609`, `QPDFJob.cc:567-631`; `flpdf-sp4g`）。 |
+
 `coalesceContents` も生成 handler (`auto_job_json_init.hh:311-313`)、Config (`QPDFJob_config.cc:88-91`)、変換順序 (`QPDFJob.cc:2185-2188`) に対応し、既存の provider-backed `ObjectHandle::coalesce_content_streams` を `job/lifecycle.rs` から呼ぶ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
 
 `flattenRotation` も生成 handler (`auto_job_json_init.hh:377-382`)、Config (`QPDFJob_config.cc:204-207`)、変換順序 (`QPDFJob.cc:2190-2194`) に対応し、既存の `flatten_rotation_on_pages` (`QPDFPageObjectHelper.cc:862-991`) を `job/lifecycle.rs` から呼ぶ。`coalesceContents` の直後に配置して、qpdfのページ変換順序を保つ。残る schema-valid option の未接続責務は別の bounded Job JSON slices で扱う。
