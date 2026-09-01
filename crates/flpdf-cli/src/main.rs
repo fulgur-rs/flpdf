@@ -2141,7 +2141,7 @@ fn cli_command() -> clap::Command {
     stacker::maybe_grow(
         CLI_COMMAND_STACK_RED_ZONE,
         CLI_COMMAND_STACK_GROWTH_SIZE,
-        || Cli::command(),
+        Cli::command,
     )
 }
 
