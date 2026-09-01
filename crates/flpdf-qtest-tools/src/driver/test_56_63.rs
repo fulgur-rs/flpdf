@@ -357,12 +357,11 @@ pub(crate) fn run_test_61<R: Read + Seek>(
 /// is irrelevant here since this test never writes a file.
 ///
 /// `getIntValue` (unclamped `i64`, no warning path exercised for a plain
-/// integer) is real via [`ObjectHandle::as_integer`]. `getUIntValue` (`u64`,
-/// negative-clamps-to-0) has no flpdf equivalent at any visibility — not
-/// even searchable by name anywhere in `object_handle.rs`. `getIntValueAsInt`
-/// (`i32`, saturating) exists only as `ObjectHandle::try_get_int_value_as_int`
-/// (`object_handle.rs:2456`), `pub(crate)`-only. `getUIntValueAsUInt` (`u32`,
-/// saturating) has no equivalent at any visibility either.
+/// integer) is real via [`ObjectHandle::try_get_int_value`]. The three
+/// narrowing/unsigned accessors are exposed by the canonical `ObjectHandle`
+/// route as `try_get_uint_value`, `try_get_int_value_as_int`, and
+/// `try_get_uint_value_as_uint`; each retains qpdf's warning and saturation
+/// behavior instead of implementing a driver conversion shim.
 pub(crate) fn run_test_62<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
@@ -371,7 +370,7 @@ pub(crate) fn run_test_62<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let _ = (filename, stdout, stderr, diagnostics_written); // test_62 prints nothing and triggers no new diagnostics.
+    let _ = (filename, stdout); // test_62 writes only its qpdf warning lines.
 
     let t = pdf.trailer();
     // `QIntC::to_ulonglong(INT_MAX)`/`to_longlong(INT_MIN)`/`to_longlong(UINT_MAX)`
@@ -389,12 +388,30 @@ pub(crate) fn run_test_62<R: Read + Seek>(
     t.replace_key(b"/Q3", ObjectHandle::integer(q3))?;
 
     // qpdf: `assert_compare_numbers(q1, t.getKey("/Q1").getIntValue());` (test_driver.cc:2277).
-    assert_eq!(t.get_key(b"/Q1").as_integer(), Some(q1));
+    assert_eq!(t.get_key(b"/Q1").try_get_int_value()?, q1);
+    assert_eq!(t.get_key(b"/Q1").try_get_uint_value()?, q1_l);
+    assert_eq!(t.get_key(b"/Q1").try_get_int_value_as_int()?, i32::MAX);
+    assert_eq!(t.get_key(b"/Q1").try_get_uint_value_as_uint()?, u32::MAX);
+    assert_eq!(t.get_key(b"/Q2").try_get_int_value()?, q2_l);
+    assert_eq!(t.get_key(b"/Q2").try_get_uint_value()?, 0);
+    assert_eq!(t.get_key(b"/Q2").try_get_int_value_as_int()?, i32::MIN);
+    assert_eq!(t.get_key(b"/Q2").try_get_uint_value_as_uint()?, 0);
+    assert_eq!(t.get_key(b"/Q3").try_get_int_value_as_int()?, i32::MAX);
+    assert_eq!(t.get_key(b"/Q3").try_get_uint_value_as_uint()?, u32::MAX);
 
-    // GAP(QPDFObjectHandle::getUIntValue / getIntValueAsInt / getUIntValueAsUInt): see the
-    // function doc above. qpdf's remaining eight assertions on `/Q1`, `/Q2`, `/Q3`
-    // (test_driver.cc:2278-2286) each need one of these three accessors, so they are not
-    // attempted.
+    // qpdf's programmatic integers have no owning QPDF, so warnIfPossible
+    // writes the six range warnings directly to the default error logger.
+    // flpdf's inserted direct children retain the trailer resolver and queue
+    // the same messages as object diagnostics; replay those new diagnostics
+    // through the driver stderr boundary without adding the ordinary
+    // `WARNING: <filename>:` input prefix.
+    let diagnostics = pdf.repair_diagnostics();
+    for diagnostic in &diagnostics.entries()[*diagnostics_written..] {
+        if diagnostic.is_object_warning() {
+            writeln!(stderr, "{}", diagnostic.message)?;
+        }
+    }
+    *diagnostics_written = diagnostics.entries().len();
     Ok(())
 }
 

@@ -1371,6 +1371,32 @@ mod tests {
         assert!(stderr.is_empty());
     }
 
+    #[test]
+    fn test_62_integer_accessors_match_qpdf_output() {
+        let args = vec![
+            OsString::from("flpdf-test-driver"),
+            OsString::from("62"),
+            OsString::from(format!(
+                "{}/../../tests/fixtures/minimal.pdf",
+                env!("CARGO_MANIFEST_DIR")
+            )),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(run(&args, &mut stdout, &mut stderr), 0);
+        assert_eq!(stdout, b"test 62 done\n");
+        assert_eq!(
+            stderr,
+            b"requested value of integer is too big; returning INT_MAX\n\
+requested value of unsigned integer is too big; returning UINT_MAX\n\
+unsigned value request for negative number; returning 0\n\
+requested value of integer is too small; returning INT_MIN\n\
+unsigned integer value request for negative number; returning 0\n\
+requested value of integer is too big; returning INT_MAX\n"
+        );
+    }
+
     fn fixture(name: &str) -> String {
         format!(
             "{}/../../tests/fixtures/test_driver/{name}.pdf",
