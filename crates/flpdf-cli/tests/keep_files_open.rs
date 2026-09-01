@@ -7,10 +7,60 @@
 
 use assert_cmd::Command;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::process::Output;
 
 fn minimal_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf")
+}
+
+#[cfg(unix)]
+fn qpdf_available() -> bool {
+    std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(unix)]
+fn run_with_low_fd_limit(
+    directory: &Path,
+    script: &Path,
+    binary: &Path,
+    args: &[String],
+) -> Output {
+    std::process::Command::new("/bin/sh")
+        .current_dir(directory)
+        .arg(script)
+        .arg(binary)
+        .args(args)
+        .output()
+        .expect("low-fd process invocation")
+}
+
+#[cfg(unix)]
+fn low_fd_script(directory: &Path) -> PathBuf {
+    let script = directory.join("run-with-low-fd.sh");
+    fs::write(
+        &script,
+        b"#!/bin/sh\nulimit -n 32\nbinary=$1\nshift\nexec \"$binary\" \"$@\"\n",
+    )
+    .expect("write low-fd wrapper");
+    script
+}
+
+#[cfg(unix)]
+fn low_fd_inputs(directory: &Path, count: usize) -> Vec<PathBuf> {
+    let fixture = minimal_fixture();
+    (1..=count)
+        .map(|number| {
+            let path = directory.join(format!("{number:03}-low-fd.pdf"));
+            fs::copy(&fixture, &path).expect("copy low-fd input fixture");
+            path
+        })
+        .collect()
 }
 
 fn run_keep_files_open_case(
@@ -158,6 +208,160 @@ fn explicit_keep_files_open_y_overrides_automatic_selection() {
 #[test]
 fn explicit_keep_files_open_n_overrides_automatic_selection() {
     run_keep_files_open_case(9, &["--keep-files-open=n"], None);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_keep_files_open_n_bounds_cli_empty_page_source_fds_like_qpdf() {
+    let directory = tempfile::tempdir().expect("temporary low-fd directory");
+    let inputs = low_fd_inputs(directory.path(), 40);
+    let script = low_fd_script(directory.path());
+    let qpdf_output = directory.path().join("qpdf-empty.pdf");
+    let flpdf_output = directory.path().join("flpdf-empty.pdf");
+
+    let page_args = |output: &Path| {
+        let mut args = vec![
+            "--empty".to_owned(),
+            "--keep-files-open=n".to_owned(),
+            "--pages".to_owned(),
+        ];
+        args.extend(inputs.iter().map(|path| path.display().to_string()));
+        args.push("--".to_owned());
+        args.push(output.display().to_string());
+        args
+    };
+
+    if qpdf_available() {
+        let qpdf = run_with_low_fd_limit(
+            directory.path(),
+            &script,
+            Path::new("qpdf"),
+            &page_args(&qpdf_output),
+        );
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
+        assert!(qpdf_output.is_file(), "qpdf did not write the output");
+    }
+
+    let flpdf = run_with_low_fd_limit(
+        directory.path(),
+        &script,
+        Path::new(env!("CARGO_BIN_EXE_flpdf")),
+        &page_args(&flpdf_output),
+    );
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "flpdf must close each secondary source before opening the next: {flpdf:?}"
+    );
+    assert!(flpdf_output.is_file(), "flpdf did not write the output");
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_keep_files_open_n_bounds_cli_nonempty_page_source_fds_like_qpdf() {
+    let directory = tempfile::tempdir().expect("temporary low-fd directory");
+    let inputs = low_fd_inputs(directory.path(), 41);
+    let script = low_fd_script(directory.path());
+    let qpdf_output = directory.path().join("qpdf-nonempty.pdf");
+    let flpdf_output = directory.path().join("flpdf-nonempty.pdf");
+
+    let page_args = |output: &Path| {
+        let mut args = vec![
+            inputs[0].display().to_string(),
+            "--keep-files-open=n".to_owned(),
+            "--pages".to_owned(),
+        ];
+        args.extend(inputs.iter().skip(1).map(|path| path.display().to_string()));
+        args.push("--".to_owned());
+        args.push(output.display().to_string());
+        args
+    };
+
+    if qpdf_available() {
+        let qpdf = run_with_low_fd_limit(
+            directory.path(),
+            &script,
+            Path::new("qpdf"),
+            &page_args(&qpdf_output),
+        );
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
+        assert!(qpdf_output.is_file(), "qpdf did not write the output");
+    }
+
+    let flpdf = run_with_low_fd_limit(
+        directory.path(),
+        &script,
+        Path::new(env!("CARGO_BIN_EXE_flpdf")),
+        &page_args(&flpdf_output),
+    );
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "flpdf must keep the primary open and close each secondary before opening the next: {flpdf:?}"
+    );
+    assert!(flpdf_output.is_file(), "flpdf did not write the output");
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_keep_files_open_n_bounds_job_json_page_source_fds_like_qpdf() {
+    let directory = tempfile::tempdir().expect("temporary low-fd job directory");
+    let inputs = low_fd_inputs(directory.path(), 40);
+    let script = low_fd_script(directory.path());
+    let pages = inputs
+        .iter()
+        .map(|path| {
+            serde_json::json!({
+                "file": path
+                    .file_name()
+                    .expect("input file name")
+                    .to_string_lossy(),
+                "range": "1"
+            })
+        })
+        .collect::<Vec<_>>();
+    let job = serde_json::json!({
+        "inputFile": "",
+        "outputFile": "job-output.pdf",
+        "keepFilesOpen": "n",
+        "pages": pages
+    });
+    fs::write(
+        directory.path().join("job.json"),
+        serde_json::to_vec(&job).expect("serialize low-fd job JSON"),
+    )
+    .expect("write low-fd job JSON");
+
+    if qpdf_available() {
+        let qpdf = run_with_low_fd_limit(
+            directory.path(),
+            &script,
+            Path::new("qpdf"),
+            &["--job-json-file=job.json".to_owned()],
+        );
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf job failed: {qpdf:?}");
+        assert!(
+            directory.path().join("job-output.pdf").is_file(),
+            "qpdf job did not write the output"
+        );
+        fs::remove_file(directory.path().join("job-output.pdf")).expect("remove qpdf output");
+    }
+
+    let flpdf = run_with_low_fd_limit(
+        directory.path(),
+        &script,
+        Path::new(env!("CARGO_BIN_EXE_flpdf")),
+        &["--job-json-file=job.json".to_owned()],
+    );
+    assert_eq!(
+        flpdf.status.code(),
+        Some(0),
+        "flpdf job must close each secondary source before opening the next: {flpdf:?}"
+    );
+    assert!(
+        directory.path().join("job-output.pdf").is_file(),
+        "flpdf job did not write the output"
+    );
 }
 
 #[test]

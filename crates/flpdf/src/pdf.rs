@@ -212,7 +212,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Set qpdf's `ClosedFileInputSource::stayOpen` policy when this document
     /// was opened through the file-source factory. Non-file readers have no
     /// close/reopen controller and therefore remain unchanged.
-    pub(crate) fn set_input_source_stay_open(&self, value: bool) {
+    pub fn set_input_source_stay_open(&self, value: bool) {
         if let Some(control) = &self.input_source_control {
             control.set_stay_open(value);
         }

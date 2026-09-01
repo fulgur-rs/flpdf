@@ -5197,14 +5197,11 @@ fn run_empty_page_extraction(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     configure_keep_files_open(&mut job, page_ops)?;
+    let keep_files_open = job.keep_files_open_for_page_specs(&specs);
     if verbose && page_ops.keep_files_open.is_none() {
         logger_info(format!(
             "flpdf: selecting --keep-open-files={}\n",
-            if job.keep_files_open_for_page_specs(&specs) {
-                "y"
-            } else {
-                "n"
-            }
+            if keep_files_open { "y" } else { "n" }
         ))?;
     }
 
@@ -5227,7 +5224,12 @@ fn run_empty_page_extraction(
         let mut source_password = password.clone();
         source_password.password = source_passwords[source_index].clone();
         source_password.password_file = None;
-        sources.push(open_page_source(path, repair, &source_password)?);
+        sources.push(open_page_source(
+            path,
+            repair,
+            &source_password,
+            keep_files_open,
+        )?);
     }
 
     if verbose {
@@ -5355,7 +5357,7 @@ fn run_page_extraction_from_multiple_sources(
     // operations. Keep this probe separate from the mutable source vector so
     // source opening below can use the same top-level password policy.
     let primary_encrypted =
-        open_page_source(&primary_input.to_path_buf(), repair, password)?.is_encrypted();
+        open_page_source(&primary_input.to_path_buf(), repair, password, true)?.is_encrypted();
 
     // Build literal-path source identity and one qpdf page specification per
     // occurrence. `.` was already normalized to primary_input by
@@ -5383,8 +5385,8 @@ fn run_page_extraction_from_multiple_sources(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     configure_keep_files_open(&mut job, page_ops)?;
+    let keep_files_open = job.keep_files_open_for_page_specs(&specs);
     if verbose && page_ops.keep_files_open.is_none() {
-        let keep_files_open = job.keep_files_open_for_page_specs(&specs);
         logger_info(format!(
             "flpdf: selecting --keep-open-files={}\n",
             if keep_files_open { "y" } else { "n" }
@@ -5394,6 +5396,7 @@ fn run_page_extraction_from_multiple_sources(
         &primary_input.to_path_buf(),
         repair,
         password,
+        true,
     )?);
     for (source_index, path) in source_paths.iter().enumerate().skip(1) {
         let mut source_password = password.clone();
@@ -5410,7 +5413,12 @@ fn run_page_extraction_from_multiple_sources(
                 pages_progress_filename(path)
             ))?;
         }
-        sources.push(open_page_source(path, repair, &source_password)?);
+        sources.push(open_page_source(
+            path,
+            repair,
+            &source_password,
+            keep_files_open,
+        )?);
     }
 
     if verbose {
@@ -7007,6 +7015,7 @@ fn open_page_source(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
+    stay_open: bool,
 ) -> CliResult<Pdf<Box<dyn flpdf::ReadSeek>>> {
     let mut options = pdf_open_options(repair, password)?;
     options.logger = Some(cli_logger());
@@ -7015,6 +7024,7 @@ fn open_page_source(
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     pdf.root_handle()
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    pdf.set_input_source_stay_open(stay_open);
     Ok(pdf)
 }
 

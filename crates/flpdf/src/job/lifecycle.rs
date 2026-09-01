@@ -2080,6 +2080,7 @@ impl QPDFJob {
             // mirrors that cache for the secondary sources opened here (the
             // primary's own aliases are already handled by the check above).
             let mut source_paths: Vec<PathBuf> = Vec::new();
+            let mut source_passwords: Vec<Vec<u8>> = Vec::new();
             let mut specs = Vec::with_capacity(configuration.page_specs.len());
             for page in &configuration.page_specs {
                 let source_index = if page.path == Path::new(".")
@@ -2090,12 +2091,22 @@ impl QPDFJob {
                 {
                     index + 1
                 } else {
-                    let source = self.open_job_source(&page.path, &page.password)?;
-                    page_sources.push(source);
                     source_paths.push(page.path.clone());
-                    page_sources.len() - 1
+                    source_passwords.push(page.password.clone());
+                    source_paths.len()
                 };
                 specs.push(PageSpecInput::new(source_index, page.range.clone()));
+            }
+            let keep_files_open = self.keep_files_open_for_page_specs(&specs);
+            for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
+                let source = self.open_job_source(path, password)?;
+                if !keep_files_open {
+                    // qpdf calls ClosedFileInputSource::stayOpen(false)
+                    // immediately after processInputSource, before opening
+                    // the next distinct page source (`QPDFJob.cc:2414-2432`).
+                    source.set_input_source_stay_open(false);
+                }
+                page_sources.push(source);
             }
             let page_output = self.handle_page_specs(
                 &mut page_sources,
