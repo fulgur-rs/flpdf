@@ -35,6 +35,33 @@ use std::rc::Rc;
 type ProgressHandler = Box<dyn FnMut(u8) -> Result<()> + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
 
+/// qpdf's `flattenAnnotations` job setting.
+///
+/// The three modes map to the `required` and `forbidden` annotation flag masks
+/// used by `QPDFPageDocumentHelper::flattenAnnotations`
+/// (`libqpdf/QPDFJob_config.cc:190-200`). Keeping the choice and its masks in
+/// the job layer gives both job JSON and the CLI one canonical qpdf mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlattenAnnotationsMode {
+    /// Flatten all annotations except Invisible and Hidden annotations.
+    All,
+    /// Flatten annotations that render on screen, excluding NoView ones.
+    Screen,
+    /// Flatten annotations that are marked for printing.
+    Print,
+}
+
+impl FlattenAnnotationsMode {
+    /// Return qpdf's `(required, forbidden)` annotation flag masks.
+    pub const fn qpdf_flags(self) -> (i64, i64) {
+        match self {
+            Self::All => (0, 0x3),
+            Self::Screen => (0, 0x23),
+            Self::Print => (0x4, 0x3),
+        }
+    }
+}
+
 /// qpdf's `QPDFJob::Members::DEFAULT_KEEP_FILES_OPEN_THRESHOLD`
 /// (`include/qpdf/QPDFJob.hh:579`).
 const DEFAULT_KEEP_FILES_OPEN_THRESHOLD: usize = 200;
@@ -101,6 +128,7 @@ struct JobConfiguration {
     rotations: Vec<RotateSpec>,
     remove_restrictions: bool,
     coalesce_contents: bool,
+    flatten_annotations: Option<FlattenAnnotationsMode>,
     flatten_rotation: bool,
     generate_appearances: bool,
     writer: WriterConfiguration,
@@ -1319,7 +1347,8 @@ impl QPDFJob {
     /// This implements the qpdf job-JSON fields currently owned by this
     /// lifecycle, including input/output setup, writer settings, page
     /// transformations (`splitPages`, `rotate`, `removeRestrictions`,
-    /// `generateAppearances`, `coalesceContents`, and `flattenRotation`),
+    /// `generateAppearances`, `flattenAnnotations`, `coalesceContents`, and
+    /// `flattenRotation`),
     /// attachments, page selection, and JSON output.
     ///
     /// # Errors
@@ -1492,6 +1521,22 @@ impl QPDFJob {
         }
         configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
         configuration.coalesce_contents = job_json_bare(&members, b"coalesceContents")?;
+        // The generated qpdf handler accepts only these three strings
+        // (`libqpdf/qpdf/auto_job_json_init.hh:377-379`); unlike the bare
+        // transformation toggles, this setting carries a mode.
+        if let Some(value) = job_json_choice(
+            &members,
+            b"flattenAnnotations",
+            &["all", "print", "screen"],
+            true,
+        )? {
+            configuration.flatten_annotations = Some(match value.as_str() {
+                "all" => FlattenAnnotationsMode::All,
+                "print" => FlattenAnnotationsMode::Print,
+                "screen" => FlattenAnnotationsMode::Screen,
+                _ => unreachable!("flattenAnnotations was validated above"), // cov:ignore: flattenAnnotations comes only from the validated qpdf job schema choices
+            });
+        }
         configuration.flatten_rotation = job_json_bare(&members, b"flattenRotation")?;
         configuration.generate_appearances = job_json_bare(&members, b"generateAppearances")?;
         if let Some(value) = job_json_choice(
@@ -2119,6 +2164,15 @@ impl QPDFJob {
         if configuration.generate_appearances {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
             acroform.generate_appearances_if_needed()?;
+        }
+
+        // qpdf's `handleTransformations` flattens annotations after appearance
+        // generation and before content coalescing or rotation flattening
+        // (`QPDFJob.cc:2177-2194`). Keep the mode-to-mask mapping in the job
+        // boundary so JSON and CLI callers reach the same page helper route.
+        if let Some(mode) = configuration.flatten_annotations {
+            let (required_flags, forbidden_flags) = mode.qpdf_flags();
+            PageDocumentHelper::new(pdf).flatten_annotations(required_flags, forbidden_flags)?;
         }
 
         // qpdf's `handleTransformations` coalesces every page after the
@@ -3135,6 +3189,7 @@ mod tests {
             ("linearize", ""),
             ("updateFromJson", "update.json"),
             ("collate", "2"),
+            ("flattenAnnotations", "all"),
             ("jsonOutput", "latest"),
             ("jsonStreamPrefix", "stream"),
             ("jsonStreamData", "file"),

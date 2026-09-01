@@ -7,9 +7,9 @@ use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
     remap_outline_and_dests, should_remove_unreferenced_resources, AttachmentAddOptions,
-    AttachmentCopyOptions, CheckError, ImageOptimizationOptions, JobExitCode, JsonJobError,
-    JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
-    RemoveUnreferencedResources, SplitPageOptions,
+    AttachmentCopyOptions, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
+    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
+    PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -1895,14 +1895,18 @@ enum CliFlattenMode {
 }
 
 impl CliFlattenMode {
-    /// qpdf's `QPDFJob::Config::flattenAnnotations` mapping. Every CLI mode
-    /// rejects Invisible and Hidden; `screen` additionally rejects NoView,
-    /// while `print` requires the Print bit.
+    /// Delegate qpdf's mode-to-mask mapping to the canonical job boundary.
     fn flags(self) -> (i64, i64) {
-        match self {
-            CliFlattenMode::All => (0, 0x3),
-            CliFlattenMode::Screen => (0, 0x3 | 0x20),
-            CliFlattenMode::Print => (0x4, 0x3),
+        FlattenAnnotationsMode::from(self).qpdf_flags()
+    }
+}
+
+impl From<CliFlattenMode> for FlattenAnnotationsMode {
+    fn from(value: CliFlattenMode) -> Self {
+        match value {
+            CliFlattenMode::All => Self::All,
+            CliFlattenMode::Screen => Self::Screen,
+            CliFlattenMode::Print => Self::Print,
         }
     }
 }
@@ -7645,6 +7649,22 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cli_flatten_modes_use_the_canonical_job_masks() {
+        assert_eq!(
+            CliFlattenMode::All.flags(),
+            FlattenAnnotationsMode::All.qpdf_flags()
+        );
+        assert_eq!(
+            CliFlattenMode::Screen.flags(),
+            FlattenAnnotationsMode::Screen.qpdf_flags()
+        );
+        assert_eq!(
+            CliFlattenMode::Print.flags(),
+            FlattenAnnotationsMode::Print.qpdf_flags()
+        );
     }
 
     #[test]

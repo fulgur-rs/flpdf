@@ -52,7 +52,7 @@ pub use check::CheckError;
 pub use image_optimization::{optimize_images, ImageOptimizationOptions};
 pub use json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 pub(crate) use json_sections::checksum_to_hex;
-pub use lifecycle::{JobDocument, JobExitCode, QPDFJob};
+pub use lifecycle::{FlattenAnnotationsMode, JobDocument, JobExitCode, QPDFJob};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,

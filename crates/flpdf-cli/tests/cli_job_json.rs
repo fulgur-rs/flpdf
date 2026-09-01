@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use flpdf::{PageDocumentHelper, Pdf};
+use flpdf::{PageDocumentHelper, PageObjectHelper, Pdf};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -337,6 +337,219 @@ fn job_json_file_generate_appearances_clears_need_marker_and_adds_ap() {
         normal.as_stream_dict().is_some(),
         "generateAppearances must install a normal widget appearance"
     );
+}
+
+#[test]
+fn job_json_file_flatten_annotations_all_removes_widget_from_annots() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("input.pdf"),
+        job_json_flatten_annotation_fixture(),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("flatten.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flattened.pdf","flattenAnnotations":"all","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=flatten.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    let mut pdf = Pdf::open(Cursor::new(
+        fs::read(directory.path().join("flattened.pdf")).unwrap(),
+    ))
+    .unwrap();
+    let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
+    assert!(
+        PageObjectHelper::new(page_ref, &mut pdf)
+            .get_annotations_filtered(None)
+            .unwrap()
+            .is_empty(),
+        "flattenAnnotations=all must remove the Widget from /Annots"
+    );
+    assert!(
+        pdf.root_handle()
+            .unwrap()
+            .try_get_key(b"/AcroForm")
+            .unwrap()
+            .is_null(),
+        "flattenAnnotations=all must remove the now-empty /AcroForm"
+    );
+}
+
+#[test]
+fn job_json_file_flatten_annotations_modes_follow_qpdf_flag_masks() {
+    // qpdf's QPDFJob::Config uses (required, forbidden) masks of
+    // (0, 0x3), (0, 0x23), and (0x4, 0x3) for all, screen, and print
+    // respectively (`libqpdf/QPDFJob_config.cc:190-200`).
+    for (mode, expected_drawn) in [("all", 3), ("screen", 2), ("print", 1)] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("input.pdf"),
+            job_json_flagged_annotations_fixture(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("flatten.json"),
+            format!(
+                r#"{{"inputFile":"input.pdf","outputFile":"flattened.pdf","flattenAnnotations":"{mode}","staticId":""}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("qpdf.json"),
+            format!(
+                r#"{{"inputFile":"input.pdf","outputFile":"qpdf.pdf","flattenAnnotations":"{mode}","staticId":""}}"#
+            ),
+        )
+        .unwrap();
+
+        if qpdf_available() {
+            let qpdf_output = ProcessCommand::new("/usr/bin/qpdf")
+                .current_dir(directory.path())
+                .arg("--job-json-file=qpdf.json")
+                .output()
+                .unwrap();
+            assert!(
+                qpdf_output.status.success(),
+                "qpdf job JSON failed for flattenAnnotations={mode}: {}",
+                String::from_utf8_lossy(&qpdf_output.stderr)
+            );
+        }
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=flatten.json")
+            .assert()
+            .code(0)
+            .stdout("");
+
+        let mut pdf = Pdf::open(Cursor::new(
+            fs::read(directory.path().join("flattened.pdf")).unwrap(),
+        ))
+        .unwrap();
+        let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
+        let remaining = PageObjectHelper::new(page_ref, &mut pdf)
+            .get_annotations_filtered(None)
+            .unwrap()
+            .len();
+        assert_eq!(
+            remaining, 0,
+            "flattenAnnotations={mode} must remove annotations that have an appearance"
+        );
+        let content = flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+        let drawn = content
+            .windows(b" Do\n".len())
+            .filter(|window| *window == b" Do\n")
+            .count();
+        assert_eq!(
+            drawn, expected_drawn,
+            "flattenAnnotations={mode} must apply qpdf's required/forbidden masks"
+        );
+
+        if qpdf_available() {
+            let mut qpdf = Pdf::open(Cursor::new(
+                fs::read(directory.path().join("qpdf.pdf")).unwrap(),
+            ))
+            .unwrap();
+            let qpdf_page_ref = PageDocumentHelper::new(&mut qpdf).get_all_pages().unwrap()[0];
+            let qpdf_content = flpdf::pages::page_content_bytes(&mut qpdf, qpdf_page_ref).unwrap();
+            let qpdf_drawn = qpdf_content
+                .windows(b" Do\n".len())
+                .filter(|window| *window == b" Do\n")
+                .count();
+            assert_eq!(
+                qpdf_drawn, expected_drawn,
+                "qpdf 11.9.0 must draw the expected annotations for flattenAnnotations={mode}"
+            );
+            assert_eq!(
+                qpdf_drawn, drawn,
+                "flpdf and qpdf must agree on flattenAnnotations={mode}"
+            );
+        }
+    }
+}
+
+#[test]
+fn job_json_file_generate_appearances_runs_before_flatten_annotations() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("input.pdf"),
+        job_json_appearance_fixture(),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("flatten.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"flattened.pdf","generateAppearances":"","flattenAnnotations":"all","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=flatten.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    let mut pdf = Pdf::open(Cursor::new(
+        fs::read(directory.path().join("flattened.pdf")).unwrap(),
+    ))
+    .unwrap();
+    let page_ref = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap()[0];
+    assert!(
+        PageObjectHelper::new(page_ref, &mut pdf)
+            .get_annotations_filtered(None)
+            .unwrap()
+            .is_empty(),
+        "generateAppearances must run before flattenAnnotations"
+    );
+}
+
+#[test]
+fn job_json_file_flatten_annotations_rejects_invalid_values() {
+    let cases = [
+        ("\"bogus\"", "unexpected value"),
+        ("42", "value must be a string"),
+        ("\"\"", "unexpected value"),
+    ];
+    for (value, expected_message) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+            directory.path().join("input.pdf"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("invalid.json"),
+            format!(
+                r#"{{"inputFile":"input.pdf","outputFile":"output.pdf","flattenAnnotations":{value}}}"#
+            ),
+        )
+        .unwrap();
+
+        let output = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=invalid.json")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "value={value}");
+        assert!(stderr.contains(".flattenAnnotations"), "stderr={stderr}");
+        assert!(
+            stderr.contains(expected_message),
+            "value={value} stderr={stderr}"
+        );
+        assert!(!directory.path().join("output.pdf").exists());
+    }
 }
 
 #[test]
@@ -876,6 +1089,30 @@ fn job_json_appearance_fixture() -> Vec<u8> {
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [4 0 R] >>\n",
         b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) /V (Hello) /DA (/Helv 12 Tf 0 g) /Rect [100 700 300 720] /P 3 0 R >>\n",
         b"<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\n",
+    ])
+}
+
+fn job_json_flatten_annotation_fixture() -> Vec<u8> {
+    assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\n",
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [4 0 R] >>\n",
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (field1) /V (Hello) /Rect [100 700 300 720] /P 3 0 R /AP << /N 6 0 R >> >>\n",
+        b"<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\n",
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 200 20] /Length 17 >>\nstream\nBT (Hello) Tj ET\nendstream\n",
+    ])
+}
+
+fn job_json_flagged_annotations_fixture() -> Vec<u8> {
+    assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n",
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Annots [4 0 R 5 0 R 6 0 R] >>\n",
+        b"<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /F 0 /AP << /N 8 0 R >> >>\n",
+        b"<< /Type /Annot /Subtype /Text /Rect [40 10 60 30] /F 4 /AP << /N 8 0 R >> >>\n",
+        b"<< /Type /Annot /Subtype /Text /Rect [70 10 90 30] /F 32 /AP << /N 8 0 R >> >>\n",
+        b"<< /Length 0 >>\nstream\n\nendstream\n",
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 17 >>\nstream\nBT (Hello) Tj ET\nendstream\n",
     ])
 }
 
