@@ -8250,8 +8250,8 @@ fn try_get_resource_names(dict: &ObjectHandle) -> Result<std::collections::BTree
     };
     for (_, value) in entries {
         value.try_dereference()?;
-        if let Some(sub_entries) = value.as_dictionary() {
-            result.extend(sub_entries.into_keys());
+        if value.as_dictionary().is_some() {
+            result.extend(value.try_get_keys()?);
         }
     }
     Ok(result)

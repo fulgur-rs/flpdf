@@ -42,6 +42,23 @@ fn qpdf_object_handle_primitives_are_available_to_external_crates() {
 }
 
 #[test]
+fn get_resource_names_excludes_null_valued_entries_like_qpdf() {
+    // qpdf's getKeys() (libqpdf/QPDF_Dictionary.cc:118-125) excludes any key
+    // whose value is null, and getResourceNames() (QPDFObjectHandle.cc:1156-1170)
+    // collects second-level names through getKeys(). A `/F1 null` entry must
+    // not appear in the result.
+    let resources = ObjectHandle::dictionary(vec![(
+        b"/Font".to_vec(),
+        ObjectHandle::dictionary(vec![
+            (b"/F1".to_vec(), ObjectHandle::null()),
+            (b"/F2".to_vec(), ObjectHandle::integer(1)),
+        ]),
+    )]);
+    let expected: BTreeSet<Vec<u8>> = [b"/F2".to_vec()].into_iter().collect();
+    assert_eq!(resources.get_resource_names().unwrap(), expected);
+}
+
+#[test]
 fn object_handle_reports_and_clears_its_owning_pdf_identity() {
     let mut pdf = Pdf::empty().unwrap();
     let root = pdf.root_handle().unwrap();
