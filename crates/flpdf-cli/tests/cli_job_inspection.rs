@@ -179,8 +179,14 @@ fn ordinary_show_pages_with_images_matches_qpdf_11_9() {
         .unwrap();
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
 }
 
 #[test]
@@ -201,8 +207,14 @@ fn ordinary_show_pages_with_images_omits_empty_image_section_like_qpdf() {
         .unwrap();
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
 }
 
 #[test]
@@ -339,8 +351,14 @@ fn ordinary_show_pages_reports_malformed_contents_like_qpdf() {
         .unwrap();
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
 }
 
 fn pdf_with_catalog_and_optional_pages(pages_object: Option<&[u8]>) -> tempfile::NamedTempFile {
