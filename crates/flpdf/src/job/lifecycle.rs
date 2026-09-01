@@ -1262,8 +1262,9 @@ impl QPDFJob {
     /// Initialize the qpdf-compatible argument set supported by this job.
     ///
     /// This mirrors `QPDFJob::initializeFromArgv` for one input, one output,
-    /// deterministic/static IDs, object-stream mode, password, decrypt, and
-    /// check options. Other command-line options are handled by the CLI.
+    /// deterministic/static IDs, object-stream mode, password, decrypt,
+    /// check, progress reporting, and the `--keep-files-open` options. Other
+    /// command-line options are handled by the CLI.
     pub fn initialize_from_argv(&mut self, argv: &[String]) -> Result<()> {
         let mut configuration = JobConfiguration::default();
         let mut positionals = Vec::new();

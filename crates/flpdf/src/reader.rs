@@ -1636,9 +1636,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// The new object uses the next unused generation-zero object number,
     /// including object numbers registered by earlier calls.
     ///
-    /// Indirect handles nested in `handle`'s direct value are not validated as
-    /// belonging to this document. Callers must ensure that those handles
-    /// remain valid for as long as the new object can be used.
+    /// Indirect handles nested in `handle`'s direct value are not validated
+    /// or copied: they must already belong to this document. A nested
+    /// indirect handle from another `Pdf` is neither copied nor registered
+    /// here, so a later write can emit its foreign object number as a
+    /// dangling reference or resolve it to an unrelated object that happens
+    /// to share that number in this document. Use
+    /// [`Self::copy_foreign_object`] first for handles that belong to
+    /// another document.
     ///
     /// # Errors
     ///
