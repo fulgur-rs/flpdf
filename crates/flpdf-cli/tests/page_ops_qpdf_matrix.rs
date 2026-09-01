@@ -24,6 +24,8 @@
 //! re-derive qpdf's answer at runtime so they cannot silently rot).
 
 use assert_cmd::Command;
+use flpdf::{PageDocumentHelper, PageObjectHelper, Pdf};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as Shell;
 
@@ -142,26 +144,40 @@ fn npages_of_with_password(path: &Path, password: &str) -> usize {
         .expect("npages integer")
 }
 
-/// Per-page `/Rotate` values read from `path` via flpdf's `--show-pages`
-/// (`  rotate: <n>` lines), in page order. Common reader for both tools'
-/// outputs.
+/// Per-page effective `/Rotate` values read from the canonical library helper.
+/// `qpdf --show-pages` intentionally does not print page attributes, so these
+/// matrix assertions inspect the output PDF directly rather than depending on
+/// a non-qpdf formatter.
 fn rotates_of(path: &Path) -> Vec<i64> {
-    let out = flpdf_ok(&["--show-pages", path.to_str().unwrap()]);
-    out.lines()
-        .filter_map(|l| l.trim().strip_prefix("rotate: "))
-        .map(|n| n.trim().parse().expect("rotate integer"))
+    page_attribute_values(path, b"/Rotate")
+        .into_iter()
+        .map(|value| value.parse().expect("rotate integer"))
         .collect()
 }
 
-/// Per-page `/MediaBox` values read from `path` via flpdf's `--show-pages`
-/// (`  media-box: <arr>` lines), in page order. Used as a stable per-page
-/// identity marker so order-sensitive ops (reverse, collate) can assert the
-/// *sequence* matches qpdf, not merely the count.
+/// Per-page effective `/MediaBox` values read from the canonical library
+/// helper, in page order. Used as a stable per-page identity marker so
+/// order-sensitive ops (reverse, collate) can assert the *sequence* matches
+/// qpdf, not merely the count.
 fn media_boxes_of(path: &Path) -> Vec<String> {
-    let out = flpdf_ok(&["--show-pages", path.to_str().unwrap()]);
-    out.lines()
-        .filter_map(|l| l.trim().strip_prefix("media-box: "))
-        .map(|s| s.trim().to_string())
+    page_attribute_values(path, b"/MediaBox")
+}
+
+fn page_attribute_values(path: &Path, key: &[u8]) -> Vec<String> {
+    let mut pdf = Pdf::open(Cursor::new(std::fs::read(path).expect("read PDF")))
+        .expect("open PDF for page attribute inspection");
+    let page_refs = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect("enumerate PDF pages");
+    page_refs
+        .into_iter()
+        .filter_map(|page_ref| {
+            let mut page = PageObjectHelper::new(page_ref, &mut pdf);
+            let value = page
+                .get_attribute(key, false)
+                .expect("read effective page attribute");
+            (!value.is_null()).then(|| String::from_utf8_lossy(&value.unparse()).into_owned())
+        })
         .collect()
 }
 

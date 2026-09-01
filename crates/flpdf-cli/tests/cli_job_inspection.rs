@@ -1,6 +1,8 @@
 //! Ordinary read-only inspection routes through the qpdf-shaped QPDFJob boundary.
 
 use assert_cmd::Command;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command as ShellCommand;
 
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
@@ -36,6 +38,36 @@ fn normalize_newlines(bytes: &[u8]) -> Vec<u8> {
         }
     }
     normalized
+}
+
+fn one_page_with_image_pdf() -> Vec<u8> {
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n".as_slice(),
+        b"4 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 0 >>\nstream\n\nendstream\nendobj\n".as_slice(),
+        b"5 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.3\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
 }
 
 #[test]
@@ -93,6 +125,95 @@ fn ordinary_show_pages_preserves_qpdf_page_identity_line() {
         String::from_utf8_lossy(&flpdf.stdout).starts_with(qpdf_first_line),
         "flpdf page identity must retain qpdf's first line: {:?}",
         flpdf.stdout
+    );
+}
+
+#[test]
+fn ordinary_show_pages_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-pages", ONE_PAGE_PDF])
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-pages", ONE_PAGE_PDF])
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn ordinary_show_pages_with_images_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = PathBuf::from(directory.path()).join("input.pdf");
+    fs::write(&input, one_page_with_image_pdf()).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-pages", "--with-images"])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn ordinary_show_pages_with_images_omits_empty_image_section_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-pages", "--with-images", ONE_PAGE_PDF])
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-pages", "--with-images", ONE_PAGE_PDF])
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
     );
 }
 
@@ -161,17 +282,8 @@ fn ordinary_show_npages_matches_qpdf_without_weak_crypto_advisory() {
     assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("encrypted PDF uses weak crypto"));
 }
 
-/// `--show-pages`'s per-page attribute lines resolve inheritance through
-/// `PageObjectHelper::get_attribute` (a faithful port of
-/// `QPDFPageObjectHelper::getAttribute`,
-/// `libqpdf/QPDFPageObjectHelper.cc:224-260`), not just the page's own
-/// dictionary keys. This intentionally deviates from real qpdf's own
-/// `--show-pages`, which does not print these fields at all (there is no
-/// qpdf oracle either way for their presence/shape); this test pins flpdf's
-/// own chosen "effective attribute" behavior so a future refactor cannot
-/// silently narrow it back to direct-dictionary-only reads.
 #[test]
-fn ordinary_show_pages_resolves_inherited_attributes() {
+fn ordinary_show_pages_omits_effective_inherited_attributes_like_qpdf() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     offsets.push(bytes.len());
@@ -212,27 +324,25 @@ fn ordinary_show_pages_resolves_inherited_attributes() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicates::str::contains("media-box: [ 0 0 612 792 ]"))
-        .stdout(predicates::str::contains("rotate: 90"))
-        .stdout(predicates::str::contains("resources: << /Font"));
+        .stdout("page 1: 3 0 R\n  content:\n    4 0 R\n");
 }
 
-/// `--show-pages`'s `contents:` line only ever prints `/Contents`'s
-/// reference syntax (`write_page_attribute` calls `unparse()`, not
-/// `unparse_resolved()`), so listing pages must not resolve the content
-/// stream target at all -- qpdf's own `unparse()` for an indirect handle
-/// never dereferences it either
-/// (`libqpdf/QPDFObjectHandle.cc:1573-1582`; ported at
-/// `ObjectHandle::unparse`'s own doc). `chained-indirect-contents.pdf`'s
-/// page 1 content stream needs a stream-length repair scan to resolve
-/// cleanly (`expected endobj`); reading `/Contents` through the same
-/// resolving `get_attribute` used for inheritable attributes triggered
-/// that scan just to print the reference, turning a clean `--show-pages`
-/// (exit 0) into a warning exit (3).
 #[test]
-fn ordinary_show_pages_does_not_resolve_contents_reference() {
+fn ordinary_show_pages_reports_malformed_contents_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--show-pages",
+            "../../tests/fixtures/compat/chained-indirect-contents.pdf",
+        ])
+        .output()
+        .unwrap();
     let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
         .args([
             "--show-pages",
             "../../tests/fixtures/compat/chained-indirect-contents.pdf",
@@ -240,9 +350,15 @@ fn ordinary_show_pages_does_not_resolve_contents_reference() {
         .output()
         .unwrap();
 
-    assert_eq!(flpdf.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&flpdf.stderr).is_empty());
-    assert!(String::from_utf8_lossy(&flpdf.stdout).contains("contents: 5 0 R"));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
 }
 
 fn pdf_with_catalog_and_optional_pages(pages_object: Option<&[u8]>) -> tempfile::NamedTempFile {

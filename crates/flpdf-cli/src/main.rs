@@ -489,6 +489,11 @@ struct Cli {
     show_npages: bool,
     #[arg(long, conflicts_with = "output")]
     show_pages: bool,
+    /// Include image XObject details in `--show-pages` output (qpdf
+    /// `--with-images`). This is a modifier and does not itself select an
+    /// inspection mode.
+    #[arg(long = "with-images")]
+    with_images: bool,
     #[arg(long, conflicts_with = "output")]
     show_xref: bool,
     #[arg(long, conflicts_with = "output")]
@@ -2099,7 +2104,7 @@ fn warn_if_static_id(args: &Cli) {
 }
 
 fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
-    let parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(args)?;
+    let parsed = arg_parser::ArgParser::from_command(cli_command()).parse(args)?;
     let mut overlay_specs = Vec::new();
     let mut attachment_segments = Vec::new();
 
@@ -2123,6 +2128,29 @@ fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
         overlay_specs,
         attachment_segments,
     })
+}
+
+// The flattened clap model is deep enough that constructing it can exhaust
+// Windows' default process stack after a small option addition. Keep every
+// production command-construction boundary on a grown stack; the returned
+// command itself and all parsing behavior remain unchanged.
+const CLI_COMMAND_STACK_RED_ZONE: usize = 1024 * 1024;
+const CLI_COMMAND_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+fn cli_command() -> clap::Command {
+    stacker::maybe_grow(
+        CLI_COMMAND_STACK_RED_ZONE,
+        CLI_COMMAND_STACK_GROWTH_SIZE,
+        Cli::command,
+    )
+}
+
+fn cli_parse_from(args: Vec<String>) -> Cli {
+    stacker::maybe_grow(
+        CLI_COMMAND_STACK_RED_ZONE,
+        CLI_COMMAND_STACK_GROWTH_SIZE,
+        || Cli::parse_from(args),
+    )
 }
 
 /// Print qpdf's sole-option version response (`QPDFJob_argv.cc:99-105`).
@@ -2200,7 +2228,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let args = Cli::parse_from(residual_args);
+    let args = cli_parse_from(residual_args);
     validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
         eprintln!("flpdf: {error}");
@@ -2382,7 +2410,7 @@ fn main() {
     } else if args.show_npages {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
-        run_show_pages(args.input, args.repair, &args.password)
+        run_show_pages(args.input, args.repair, &args.password, args.with_images)
     } else if args.show_xref {
         run_show_xref(args.input, args.repair, &args.password)
     } else if args.check_linearization {
@@ -3074,6 +3102,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
+    job.set_with_images(cli.with_images);
     if cli.check {
         job.set_show_encryption_key(cli.show_encryption_key);
         return finish_check_job(job.check(pdf));
@@ -3202,7 +3231,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             if cmd.show_npages {
                 run_show_npages(Some(cmd.input), cmd.repair, &cmd.password)
             } else {
-                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password)
+                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password, false)
             }
         }
         Commands::Qdf(cmd) => run_qdf(
@@ -4742,7 +4771,7 @@ fn parse_test_args(args: Vec<String>) -> CliResult<arg_parser::ParsedArgs> {
     if !has_program {
         parser_args.insert(0, "flpdf".to_owned());
     }
-    let mut parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(parser_args)?;
+    let mut parsed = arg_parser::ArgParser::from_command(cli_command()).parse(parser_args)?;
     if !has_program {
         parsed.residual_args.remove(0);
     }
@@ -6607,12 +6636,18 @@ fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs
     finish_job_exit_status(job.show_npages(&mut pdf)?)
 }
 
-fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+fn run_show_pages(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    with_images: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_with_images(with_images);
     finish_job_exit_status(job.show_pages(&mut pdf)?)
 }
 
@@ -7867,6 +7902,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_command_builds_on_a_small_stack() {
+        let command = std::thread::Builder::new()
+            .name("small-stack-cli-command".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(cli_command)
+            .expect("small-stack thread should start")
+            .join()
+            .expect("Cli::command must not overflow a small stack");
+
+        assert_eq!(command.get_name(), "flpdf");
+    }
+
+    #[test]
+    fn cli_parse_from_builds_on_a_small_stack() {
+        let args = std::thread::Builder::new()
+            .name("small-stack-cli-parse".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(|| cli_parse_from(vec!["flpdf".to_owned()]))
+            .expect("small-stack thread should start")
+            .join()
+            .expect("Cli::parse_from must not overflow a small stack");
+
+        assert!(args.command.is_none());
+    }
+
+    #[test]
     fn show_pages_writes_each_logical_line_incrementally() {
         let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let logger = QPDFLogger::create();
@@ -7886,11 +7947,8 @@ mod tests {
         assert_eq!(job.show_pages(&mut pdf).unwrap(), JobExitCode::Success);
 
         let chunks = chunks.lock().unwrap();
-        assert_eq!(chunks.len(), 5);
-        assert_eq!(
-            chunks.concat(),
-            b"page 1: 3 0 R\n  media-box: [ 0 0 612 792 ]\n  resources: << /Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] >>\n  contents: 7 0 R\n  rotate: 0\n"
-        );
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.concat(), b"page 1: 3 0 R\n  content:\n    7 0 R\n");
     }
 
     #[test]
@@ -8413,7 +8471,7 @@ mod tests {
 
     #[test]
     fn single_dash_segment_sub_option_is_rewritten() {
-        let parsed = arg_parser::ArgParser::from_command(Cli::command())
+        let parsed = arg_parser::ArgParser::from_command(cli_command())
             .parse(strs(&["flpdf", "-overlay", "stamp.pdf", "-to=1", "--"]))
             .unwrap();
         assert_eq!(parsed.residual_args, strs(&["flpdf"]));
@@ -8426,7 +8484,7 @@ mod tests {
 
     #[test]
     fn each_segment_kind_recognizes_its_sub_options() {
-        let parsed = arg_parser::ArgParser::from_command(Cli::command())
+        let parsed = arg_parser::ArgParser::from_command(cli_command())
             .parse(strs(&[
                 "flpdf",
                 "--encrypt",
