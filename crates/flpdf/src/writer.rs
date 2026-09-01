@@ -40,7 +40,7 @@ where
     writer.get_buffer()
 }
 
-use crate::encryption::{CopyEncryptionSource, EncryptParams};
+use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams, PasswordMode};
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::pipeline::{flate::Flate, Pipeline, PlString};
@@ -348,6 +348,36 @@ impl WriterConfiguration {
     pub fn set_encryption_parameters(&mut self, params: EncryptParams) {
         self.settings.encryption_parameters = Some(params);
         self.settings.copy_encryption = None;
+    }
+
+    pub(crate) fn normalize_encryption_passwords(
+        &mut self,
+        password_mode: PasswordMode,
+    ) -> Result<usize> {
+        let Some(params) = self.settings.encryption_parameters.as_mut() else {
+            return Ok(0);
+        };
+        let revision = match params.method {
+            EncryptMethod::V1Rc440 => 2,
+            EncryptMethod::V2Rc4128 => 3,
+            EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128 => 4,
+            EncryptMethod::V5R5Aes256 => 5,
+            EncryptMethod::V5R6Aes256 => 6,
+        };
+        let (user_password, user_warning) = crate::encryption::password::password_bytes_for_write(
+            &params.user_password,
+            password_mode,
+            revision,
+        )?;
+        let (owner_password, owner_warning) =
+            crate::encryption::password::password_bytes_for_write(
+                &params.owner_password,
+                password_mode,
+                revision,
+            )?;
+        params.user_password = user_password;
+        params.owner_password = owner_password;
+        Ok(usize::from(user_warning) + usize::from(owner_warning))
     }
 
     /// Configure explicit encryption copied from an authenticated donor.
@@ -5748,6 +5778,39 @@ mod final_handle_writer_tests {
         };
 
         assert_eq!(encryption_shape(&options), Some((4, 4, true)));
+    }
+
+    #[test]
+    fn job_writer_password_normalization_covers_each_encryption_revision() {
+        let mut empty = WriterConfiguration::default();
+        assert_eq!(
+            empty
+                .normalize_encryption_passwords(PasswordMode::Bytes)
+                .unwrap(),
+            0
+        );
+        for params in [
+            EncryptParams::rc4(EncryptMethod::V1Rc440, b"u", b"o"),
+            EncryptParams::rc4(EncryptMethod::V2Rc4128, b"u", b"o"),
+            EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u", b"o"),
+            EncryptParams::v4_aes128(b"u", b"o"),
+            EncryptParams::v5_r5(b"u", b"o"),
+            EncryptParams::v5_r6(b"u", b"o"),
+        ] {
+            let mut configuration = WriterConfiguration::default();
+            configuration.set_encryption_parameters(params);
+            assert_eq!(
+                configuration
+                    .normalize_encryption_passwords(PasswordMode::Bytes)
+                    .unwrap(),
+                0
+            );
+        }
+        let mut invalid = WriterConfiguration::default();
+        invalid.set_encryption_parameters(EncryptParams::v5_r6(b"75", b"not-hex"));
+        assert!(invalid
+            .normalize_encryption_passwords(PasswordMode::HexBytes)
+            .is_err());
     }
 
     #[test]

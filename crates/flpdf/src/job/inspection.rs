@@ -39,38 +39,20 @@ impl QPDFJob {
     ) -> Result<JobExitCode> {
         let logger = self.logger();
         self.inspect(pdf, |pdf| {
-            object.type_code()?;
-            if object.as_stream_dict().is_some() {
-                if raw_stream_data || filtered_stream_data {
-                    let warning_count = pdf.repair_diagnostics().entries().len();
-                    let data_result = if filtered_stream_data {
-                        object.get_stream_data(DecodeLevel::All)
-                    } else {
-                        object.get_raw_stream_data()
-                    };
-                    let data = match data_result {
-                        Ok(data) => data,
-                        Err(_error) if pdf.repair_diagnostics().entries().len() > warning_count => {
-                            return Ok(());
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    write_to_standard_output(&logger, data.as_ref())
-                } else {
-                    let dictionary = object
-                        .as_stream_dict()
-                        .expect("stream type code guarantees a stream dictionary");
-                    let mut output = b"Object is stream.  Dictionary:\n".to_vec();
-                    output.extend_from_slice(&dictionary.unparse_resolved());
-                    output.push(b'\n');
-                    logger.info(output)
-                }
-            } else {
-                let mut output = object.unparse_resolved();
-                output.push(b'\n');
-                logger.info(output)
-            }
+            emit_show_object(pdf, &logger, &object, raw_stream_data, filtered_stream_data)
         })
+    }
+
+    /// Emit one object report without completing the enclosing job.
+    pub(crate) fn show_object_report<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        object: &ObjectHandle,
+        raw_stream_data: bool,
+        filtered_stream_data: bool,
+    ) -> Result<()> {
+        let logger = self.logger();
+        emit_show_object(pdf, &logger, object, raw_stream_data, filtered_stream_data)
     }
 
     /// Show one stream's raw or filtered data through qpdf's stream handle.
@@ -155,28 +137,13 @@ impl QPDFJob {
     /// inspect raw xref-stream bytes or reconstruct a second table.
     pub fn show_xref<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode> {
         let logger = self.logger();
-        self.inspect(pdf, |pdf| {
-            for (object_ref, entry) in pdf.get_xref_table() {
-                let line = match entry {
-                    XrefEntry::Free { .. } => {
-                        return Err(Error::Internal(
-                            "unknown cross-reference table type while showing xref_table"
-                                .to_owned(),
-                        ));
-                    }
-                    XrefEntry::Uncompressed { offset } => format!(
-                        "{}/{}: uncompressed; offset = {offset}\n",
-                        object_ref.number, object_ref.generation
-                    ),
-                    XrefEntry::Compressed { stream, index } => format!(
-                        "{}/{}: compressed; stream = {stream}, index = {index}\n",
-                        object_ref.number, object_ref.generation
-                    ),
-                };
-                logger.info(line)?;
-            }
-            Ok(())
-        })
+        self.inspect(pdf, |pdf| emit_xref(pdf, &logger))
+    }
+
+    /// Emit the xref report without completing the enclosing job.
+    pub(crate) fn show_xref_report<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
+        let logger = self.logger();
+        emit_xref(pdf, &logger)
     }
 
     /// Show pages through qpdf's `QPDFJob::doShowPages` route.
@@ -203,6 +170,68 @@ impl QPDFJob {
     ) -> Result<()> {
         let logger = self.logger();
         emit_show_pages(pdf, &logger, show_page_images)
+    }
+}
+
+fn emit_xref<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &crate::QPDFLogger) -> Result<()> {
+    for (object_ref, entry) in pdf.get_xref_table() {
+        let line = match entry {
+            XrefEntry::Free { .. } => {
+                return Err(Error::Internal(
+                    "unknown cross-reference table type while showing xref_table".to_owned(),
+                ));
+            }
+            XrefEntry::Uncompressed { offset } => format!(
+                "{}/{}: uncompressed; offset = {offset}\n",
+                object_ref.number, object_ref.generation
+            ),
+            XrefEntry::Compressed { stream, index } => format!(
+                "{}/{}: compressed; stream = {stream}, index = {index}\n",
+                object_ref.number, object_ref.generation
+            ),
+        };
+        logger.info(line)?;
+    }
+    Ok(())
+}
+
+fn emit_show_object<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    logger: &crate::QPDFLogger,
+    object: &ObjectHandle,
+    raw_stream_data: bool,
+    filtered_stream_data: bool,
+) -> Result<()> {
+    object.type_code()?;
+    if object.as_stream_dict().is_some() {
+        if raw_stream_data || filtered_stream_data {
+            let warning_count = pdf.repair_diagnostics().entries().len();
+            let data_result = if filtered_stream_data {
+                object.get_stream_data(DecodeLevel::All)
+            } else {
+                object.get_raw_stream_data()
+            };
+            let data = match data_result {
+                Ok(data) => data,
+                Err(_error) if pdf.repair_diagnostics().entries().len() > warning_count => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            write_to_standard_output(logger, data.as_ref())
+        } else {
+            let dictionary = object
+                .as_stream_dict()
+                .expect("stream type code guarantees a stream dictionary");
+            let mut output = b"Object is stream.  Dictionary:\n".to_vec();
+            output.extend_from_slice(&dictionary.unparse_resolved());
+            output.push(b'\n');
+            logger.info(output)
+        }
+    } else {
+        let mut output = object.unparse_resolved();
+        output.push(b'\n');
+        logger.info(output)
     }
 }
 

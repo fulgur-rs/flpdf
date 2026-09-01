@@ -294,12 +294,19 @@ impl QPDFJob {
         let logger = self.logger();
         let input_name = self.input_name().to_owned();
         self.inspect(pdf, |pdf| {
-            let listing = format_attachment_list_with_sink(pdf, verbose, |data| logger.info(data))?;
-            if listing.is_none() {
-                logger.info(format!("{input_name} has no embedded files\n"))?;
-            }
-            Ok(())
+            emit_list_attachments(pdf, &logger, &input_name, verbose)
         })
+    }
+
+    /// Emit the attachment list without completing the enclosing job.
+    pub(crate) fn list_attachments_report<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        verbose: bool,
+    ) -> Result<()> {
+        let logger = self.logger();
+        let input_name = self.input_name().to_owned();
+        emit_list_attachments(pdf, &logger, &input_name, verbose)
     }
 
     /// Show one embedded file through the shared qpdf save pipeline.
@@ -314,31 +321,60 @@ impl QPDFJob {
         key: &[u8],
     ) -> Result<JobExitCode> {
         let logger = self.logger();
-        self.inspect(pdf, |pdf| {
-            let filespec = {
-                let mut embedded_files = pdf.embedded_files();
-                embedded_files.get_embedded_file(key)?
-            }
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "attachment {:?} not found",
-                    String::from_utf8_lossy(key)
-                ))
-            })?;
-            let mut filespec = FileSpec::new(filespec, pdf)?;
-            let embedded_file = filespec.embedded_file()?.ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "attachment {:?} has no resolvable /EmbeddedFile stream",
-                    String::from_utf8_lossy(key)
-                ))
-            })?;
-            logger.save_to_standard_output(true)?;
-            let save = logger.get_save()?;
-            let mut sink = PipelineHandleSink(save);
-            let _ = embedded_file.pipe_stream_data(&mut sink)?;
-            Ok(())
-        })
+        self.inspect(pdf, |pdf| emit_show_attachment(pdf, &logger, key))
     }
+
+    /// Emit one embedded file without completing the enclosing job.
+    pub(crate) fn show_attachment_report<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        key: &[u8],
+    ) -> Result<()> {
+        let logger = self.logger();
+        emit_show_attachment(pdf, &logger, key)
+    }
+}
+
+fn emit_list_attachments<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    logger: &crate::QPDFLogger,
+    input_name: &str,
+    verbose: bool,
+) -> Result<()> {
+    let listing = format_attachment_list_with_sink(pdf, verbose, |data| logger.info(data))?;
+    if listing.is_none() {
+        logger.info(format!("{input_name} has no embedded files\n"))?;
+    }
+    Ok(())
+}
+
+fn emit_show_attachment<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    logger: &crate::QPDFLogger,
+    key: &[u8],
+) -> Result<()> {
+    let filespec = {
+        let mut embedded_files = pdf.embedded_files();
+        embedded_files.get_embedded_file(key)?
+    }
+    .ok_or_else(|| {
+        Error::Unsupported(format!(
+            "attachment {:?} not found",
+            String::from_utf8_lossy(key)
+        ))
+    })?;
+    let mut filespec = FileSpec::new(filespec, pdf)?;
+    let embedded_file = filespec.embedded_file()?.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "attachment {:?} has no resolvable /EmbeddedFile stream",
+            String::from_utf8_lossy(key)
+        ))
+    })?;
+    logger.save_to_standard_output(true)?;
+    let save = logger.get_save()?;
+    let mut sink = PipelineHandleSink(save);
+    let _ = embedded_file.pipe_stream_data(&mut sink)?;
+    Ok(())
 }
 
 /// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +

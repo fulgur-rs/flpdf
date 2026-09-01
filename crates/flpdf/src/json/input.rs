@@ -1201,10 +1201,20 @@ pub(crate) enum QpdfIntParse {
 }
 
 pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
-    let stripped = text.strip_prefix('+').unwrap_or(text);
-    let (negative, digits) = stripped
-        .strip_prefix('-')
-        .map_or((false, stripped), |digits| (true, digits));
+    // `QUtil::string_to_ll` delegates to `strtoll`, which consumes leading C
+    // whitespace and exactly one optional sign before the digit prefix.
+    let text = text.split('\0').next().unwrap_or(text);
+    let stripped = text.trim_start_matches(|character| {
+        matches!(
+            character,
+            ' ' | '\n' | '\r' | '\t' | '\u{000c}' | '\u{000b}'
+        )
+    });
+    let (negative, digits) = match stripped.as_bytes().first() {
+        Some(b'-') => (true, &stripped[1..]),
+        Some(b'+') => (false, &stripped[1..]),
+        _ => (false, stripped),
+    };
     let digits_end = digits
         .bytes()
         .position(|byte| !byte.is_ascii_digit())
@@ -1212,14 +1222,22 @@ pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
     if digits_end == 0 {
         return QpdfIntParse::NoDigits;
     }
-    let Ok(magnitude) = digits[..digits_end].parse::<i64>() else {
+    let Ok(magnitude) = digits[..digits_end].parse::<u128>() else {
         return QpdfIntParse::Overflow(format!(
             "overflow/underflow converting {text} to 64-bit integer"
         ));
     };
-    // `magnitude` is parsed from a non-negative digit run, so it is always
-    // in `0..=i64::MAX` and negating it can never overflow i64.
-    let value = if negative { -magnitude } else { magnitude };
+    let signed = if negative {
+        -(i128::try_from(magnitude).unwrap_or(i128::MAX))
+    } else {
+        i128::try_from(magnitude).unwrap_or(i128::MAX)
+    };
+    if signed < i128::from(i64::MIN) || signed > i128::from(i64::MAX) {
+        return QpdfIntParse::Overflow(format!(
+            "overflow/underflow converting {text} to 64-bit integer"
+        ));
+    }
+    let value = signed as i64;
     match i32::try_from(value) {
         Ok(value) => QpdfIntParse::Value(value),
         Err(_) => QpdfIntParse::Overflow(format!(
@@ -1236,6 +1254,15 @@ mod tests {
     fn qpdf_string_to_int_checked_handles_empty_and_negative_values() {
         assert_eq!(qpdf_string_to_int_checked("-"), QpdfIntParse::NoDigits);
         assert_eq!(qpdf_string_to_int_checked("-42"), QpdfIntParse::Value(-42));
+    }
+
+    #[test]
+    fn qpdf_string_to_int_checked_matches_strtoll_prefix_rules() {
+        assert_eq!(
+            qpdf_string_to_int_checked("  +42trailing"),
+            QpdfIntParse::Value(42)
+        );
+        assert_eq!(qpdf_string_to_int_checked("+-42"), QpdfIntParse::NoDigits);
     }
 
     #[test]
