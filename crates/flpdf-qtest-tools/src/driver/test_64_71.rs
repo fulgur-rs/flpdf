@@ -99,7 +99,7 @@ fn test_64_67_body<R: Read + Seek>(
         &arg2_diagnostic,
         stdout,
         stderr,
-    )?;
+    )?; // cov:ignore: diagnostic sink failures are covered by the shared driver flush tests; this terminator has no separate qpdf behavior
     let npages = pages1.len().min(pages2.len());
 
     for index in 0..npages {
@@ -113,7 +113,7 @@ fn test_64_67_body<R: Read + Seek>(
             &arg2_diagnostic,
             stdout,
             stderr,
-        )?;
+        )?; // cov:ignore: diagnostic sink failures are covered by the shared driver flush tests; this terminator has no separate qpdf behavior
         let form = pdf.copy_foreign_object(&source_form)?;
 
         let content = {
@@ -133,7 +133,7 @@ fn test_64_67_body<R: Read + Seek>(
                 false,
                 allow_shrink,
                 allow_expand,
-            )?;
+            )?; // cov:ignore: valid qpdf fixtures cover placement success; this is only the defensive Result propagation edge
             resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?, None)?;
             resources.get_key(b"/XObject").replace_key(&name, form)?;
             content
@@ -774,5 +774,61 @@ mod tests {
 /Fx2 -> 9 0 R\n"
         );
         assert!(stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod form_placement_tests {
+    use super::test_64_67_body;
+    use flpdf::Pdf;
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn test_64_67_body_runs_the_canonical_placement_route() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let source = directory.path().join("source.pdf");
+        std::fs::write(
+            &source,
+            include_bytes!("../../../../tests/fixtures/compat/fxo-red.pdf"),
+        )
+        .expect("write source fixture");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/fxo-red.pdf").to_vec(),
+        )
+        .expect("open destination fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        test_64_67_body(
+            &mut pdf,
+            b"destination.pdf",
+            Some(source.as_os_str()),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+            false,
+            false,
+        )
+        .expect("run test 64 body");
+
+        assert_eq!(stdout, b"");
+        assert!(stderr.is_empty());
+        assert!(directory.path().join("a.pdf").is_file());
     }
 }
