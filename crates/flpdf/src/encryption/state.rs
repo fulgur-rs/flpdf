@@ -66,11 +66,7 @@ type MethodChoice = (Option<bool>, bool);
 impl EncryptionState {
     /// qpdf's `decryptString` and `decryptStream` crypt-filter switch
     /// (`QPDF_encryption.cc:982-1006,1062-1134`).
-    pub(crate) fn select_method(
-        method: EncryptionMode,
-        cf: &mut EncryptionMode,
-        encryption_v: i64,
-    ) -> MethodChoice {
+    pub(crate) fn select_method(method: EncryptionMode, encryption_v: i64) -> MethodChoice {
         if encryption_v < 4 {
             // qpdf enters this switch only for V >= 4. Older revisions always
             // use RC4, regardless of the stored crypt-filter fields.
@@ -81,40 +77,56 @@ impl EncryptionState {
             EncryptionMode::Aes128 | EncryptionMode::Aes256 => (Some(true), false),
             EncryptionMode::Rc4 => (Some(false), false),
             EncryptionMode::Unknown => {
-                // qpdf rewrites the selected field so the warning is emitted
-                // only once for subsequent objects.
-                *cf = EncryptionMode::Aes128;
+                // The caller emits qpdf's warning before committing this
+                // fallback. Keeping the decision side-effect free is
+                // essential when the warning sink itself fails.
                 (Some(true), true)
             }
         }
     }
 
     /// qpdf `QPDF::decryptString` method selection.
-    pub(crate) fn string_method(&mut self) -> MethodChoice {
+    pub(crate) fn string_method(&self) -> MethodChoice {
         let (method, encryption_v) = (self.cf_string, self.encryption_v);
-        Self::select_method(method, &mut self.cf_string, encryption_v)
+        Self::select_method(method, encryption_v)
     }
 
-    /// qpdf `QPDF::decryptString` for one literal string.
+    /// Commit qpdf's unknown `/StrF` fallback after its warning was delivered.
+    pub(crate) fn commit_string_method(&mut self) {
+        if self.cf_string == EncryptionMode::Unknown {
+            self.cf_string = EncryptionMode::Aes128;
+        }
+    }
+
+    /// qpdf `QPDF::decryptString` cipher operation for one literal string.
     pub(crate) fn decrypt_object_string(
         &mut self,
         object_ref: ObjectRef,
         bytes: &mut Vec<u8>,
-    ) -> Result<bool> {
-        let (use_aes, warn_unknown_string) = self.string_method();
+        use_aes: Option<bool>,
+    ) -> Result<()> {
         if let Some(use_aes) = use_aes {
             self.with_object_cipher(object_ref, use_aes, |cipher| {
                 decrypt_cipher_bytes(bytes, cipher)
             })?;
         }
-        Ok(warn_unknown_string)
+        Ok(())
     }
 
     /// qpdf `QPDF::decryptStream` method selection, after the caller has
     /// inspected the stream's own `/Crypt` filter.
-    pub(crate) fn stream_method(&mut self, method: Option<EncryptionMode>) -> MethodChoice {
+    pub(crate) fn stream_method(&self, method: Option<EncryptionMode>) -> MethodChoice {
         let (method, encryption_v) = (method.unwrap_or(self.cf_stream), self.encryption_v);
-        Self::select_method(method, &mut self.cf_stream, encryption_v)
+        Self::select_method(method, encryption_v)
+    }
+
+    /// Commit qpdf's unknown `/StmF` fallback after its warning was delivered.
+    /// `method` is the stream-local override when one was selected; qpdf still
+    /// rewrites the shared default `/StmF` field in that case.
+    pub(crate) fn commit_stream_method(&mut self, method: Option<EncryptionMode>) {
+        if method.unwrap_or(self.cf_stream) == EncryptionMode::Unknown {
+            self.cf_stream = EncryptionMode::Aes128;
+        }
     }
 
     /// Whether qpdf would prepend a decryption stage for this stream method,

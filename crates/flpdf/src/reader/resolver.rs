@@ -731,22 +731,35 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
 
 impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R> {
     fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()> {
-        let warn_unknown_string = {
-            let mut encryption_parameters = self.encryption_parameters.borrow_mut();
+        let (use_aes, warn_unknown_string) = {
+            let encryption_parameters = self.encryption_parameters.borrow();
             // cov:ignore-start: read_object_at_offset constructs this adapter only after observing Some; parsing cannot mutate the shared slot
-            let encryption = encryption_parameters.as_mut().ok_or_else(|| {
+            let encryption = encryption_parameters.as_ref().ok_or_else(|| {
                 Error::Internal("string decrypter invoked without encryption parameters".into())
             })?;
             // cov:ignore-end
-            encryption.decrypt_object_string(self.object_ref, bytes)?
+            encryption.string_method()
         };
         if warn_unknown_string {
             self.resolver.push_warning(
                 "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
                  strings may be decrypted improperly",
             )?;
+            let mut encryption_parameters = self.encryption_parameters.borrow_mut();
+            // cov:ignore-start: the selection above proves the shared state is present
+            let encryption = encryption_parameters.as_mut().ok_or_else(|| {
+                Error::Internal("string decrypter lost encryption parameters".into())
+            })?;
+            // cov:ignore-end
+            encryption.commit_string_method();
         }
-        Ok(())
+        let mut encryption_parameters = self.encryption_parameters.borrow_mut();
+        // cov:ignore-start: the selection above proves the shared state is present
+        let encryption = encryption_parameters
+            .as_mut()
+            .ok_or_else(|| Error::Internal("string decrypter lost encryption parameters".into()))?;
+        // cov:ignore-end
+        encryption.decrypt_object_string(self.object_ref, bytes, use_aes)
     }
 }
 
@@ -3447,12 +3460,36 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         );
     }
 
+    let (use_aes, warn_unknown) = {
+        let encryption = encryption_parameters.borrow();
+        match encryption.as_ref() {
+            None => (None, false),
+            Some(encryption) => encryption.stream_method(inspection.method),
+        }
+    };
+    if warn_unknown {
+        warning_sink.warn_stream_data(
+            input.last_offset(),
+            description_override,
+            format!(
+                "unknown encryption filter for streams (check {}); \
+                 streams may be decrypted improperly",
+                inspection.method_source
+            ),
+        )?;
+        let mut encryption = encryption_parameters.borrow_mut();
+        // cov:ignore-start: the selection above proves the shared state is present
+        if let Some(encryption) = encryption.as_mut() {
+            encryption.commit_stream_method(inspection.method);
+        }
+        // cov:ignore-end
+    }
+
     let decryption = {
         let mut encryption = encryption_parameters.borrow_mut();
         match encryption.as_mut() {
             None => None,
             Some(encryption) => {
-                let (use_aes, warn_unknown) = encryption.stream_method(inspection.method);
                 let stage = match use_aes {
                     None => StreamDecryption::None,
                     Some(false) => {
@@ -3462,11 +3499,11 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
                         StreamDecryption::Aes(encryption.key_for_object(object_ref, true).to_vec())
                     }
                 };
-                Some((stage, warn_unknown))
+                Some(stage)
             }
         }
     };
-    let Some((decryption, warn_unknown)) = decryption else {
+    let Some(decryption) = decryption else {
         return pipe_stream_data_to_pipeline_for_input(
             input,
             warning_sink,
@@ -3479,17 +3516,6 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             will_retry,
         );
     };
-    if warn_unknown {
-        warning_sink.warn_stream_data(
-            input.last_offset(),
-            description_override,
-            format!(
-                "unknown encryption filter for streams (check {}); \
-                 streams may be decrypted improperly",
-                inspection.method_source
-            ),
-        )?;
-    }
 
     match decryption {
         StreamDecryption::None => pipe_stream_data_to_pipeline_for_input(
@@ -5819,7 +5845,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .expect("encryption state")
-            .decrypt_object_string(object_ref, &mut encrypted_string)
+            .decrypt_object_string(object_ref, &mut encrypted_string, Some(false))
             .expect("decrypt string");
         assert_eq!(encrypted_string, b"string first");
 
@@ -5890,7 +5916,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .expect("encryption state")
-            .decrypt_object_string(object_ref, &mut string_ciphertext)
+            .decrypt_object_string(object_ref, &mut string_ciphertext, Some(false))
             .expect("decrypt string");
         assert_eq!(string_ciphertext, string_plaintext);
     }
@@ -5995,6 +6021,42 @@ mod tests {
         .expect_err("warning sink failure must propagate");
         assert!(matches!(error, Error::Internal(message)
             if message == "stream warning sink failed"));
+        assert_eq!(
+            resolver
+                .encryption_parameters()
+                .borrow()
+                .as_ref()
+                .expect("encryption state")
+                .cf_stream,
+            EncryptionMode::Unknown,
+            "qpdf commits the unknown-filter fallback only after warning delivery"
+        );
+
+        let mut retry_sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+        assert!(pipe_stream_data_from_input(
+            &input,
+            &encryption_parameters,
+            0,
+            resolver.as_ref(),
+            None,
+            ObjectRef::new(4, 0),
+            0,
+            0,
+            &dict,
+            &mut retry_sink,
+            false,
+            false,
+        )
+        .expect("healthy warning sink should allow the retry"));
+        assert_eq!(
+            resolver
+                .encryption_parameters()
+                .borrow()
+                .as_ref()
+                .expect("encryption state")
+                .cf_stream,
+            EncryptionMode::Aes128
+        );
     }
 
     /// A bare `/Crypt` only overrides `/StmF` when its dictionary has qpdf's
@@ -7458,6 +7520,42 @@ mod tests {
             Err(Error::System(ref message)) if message == "sink write failure 1"
         ));
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+        assert_eq!(
+            pdf.resolver
+                .encryption_parameters()
+                .borrow()
+                .as_ref()
+                .expect("encryption state")
+                .cf_string,
+            crate::encryption::state::EncryptionMode::Unknown,
+            "qpdf commits the unknown-filter fallback only after warning delivery"
+        );
+
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let retry_logger = crate::QPDFLogger::create();
+        retry_logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        pdf.set_logger(retry_logger);
+        pdf.resolve(&info)
+            .expect("healthy warning sink should allow the retry");
+        assert_eq!(
+            pdf.resolver
+                .encryption_parameters()
+                .borrow()
+                .as_ref()
+                .expect("encryption state")
+                .cf_string,
+            crate::encryption::state::EncryptionMode::Aes128
+        );
+        let warning_output = output.lock().unwrap();
+        assert_eq!(
+            warning_output
+                .windows(b"unknown encryption filter for strings".len())
+                .filter(|window| *window == b"unknown encryption filter for strings")
+                .count(),
+            1
+        );
     }
 
     // This catches a production regression where a cipher-mode dispatch

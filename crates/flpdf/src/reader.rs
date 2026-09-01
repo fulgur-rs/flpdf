@@ -777,15 +777,15 @@ impl<R: Read + Seek> Pdf<R> {
             options.password_is_hex_key,
         )?;
         let state = authenticated.state;
+        if let Some(warning) = authenticated.perms_warning {
+            self.push_warning(warning)?;
+        }
         if let Some(inspection) = self.encryption_inspection.borrow_mut().as_mut() {
             inspection.user_password = state.user_password.clone();
             inspection.user_password_matched = state.user_password_matched;
             inspection.owner_password_matched = state.owner_password_matched;
         }
         *self.encryption.borrow_mut() = Some(state);
-        if let Some(warning) = authenticated.perms_warning {
-            self.push_warning(warning)?;
-        }
         Ok(())
     }
 
@@ -2306,6 +2306,55 @@ mod reopenable_source_tests {
         assert!(
             source.is_closed_for_test(),
             "failed nonpersistent read must close source"
+        );
+    }
+}
+
+#[cfg(test)]
+mod encryption_state_commit_tests {
+    use super::{Pdf, PdfOpenOptions};
+    use crate::{Error, ObjectHandle, QPDFLogger};
+    use std::io::Cursor;
+
+    #[test]
+    fn authenticated_state_is_not_committed_before_perms_warning_delivery() {
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/encrypted/v5-aes-256-r6.pdf"),
+        )
+        .expect("R6 fixture");
+        let options = PdfOpenOptions {
+            password: b"user-v5-r6".to_vec(),
+            ..PdfOpenOptions::default()
+        };
+        let mut pdf = Pdf::open_with_options(Cursor::new(fixture), options.clone())
+            .expect("R6 fixture authenticates");
+
+        let encrypt = pdf
+            .encrypt_dictionary_handle()
+            .expect("encryption dictionary lookup")
+            .expect("encrypted fixture");
+        encrypt
+            .replace_key(b"/Perms", ObjectHandle::string(vec![0]))
+            .expect("replace /Perms");
+        *pdf.encryption.borrow_mut() = None;
+
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(logger);
+
+        let error = pdf
+            .authenticate_if_encrypted_once(&options)
+            .expect_err("warning sink failure must propagate");
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "sink write failure 1"
+        ));
+        assert!(
+            pdf.encryption.borrow().is_none(),
+            "authentication state must remain uncommitted when /Perms warning delivery fails"
         );
     }
 }
