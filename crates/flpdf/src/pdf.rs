@@ -84,6 +84,10 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// file-open factory installs it for `QPDFJob::handle_page_specs`.
     pub(crate) input_source_control: Option<InputSourceControl>,
     pub(crate) version: String,
+    /// Whether qpdf's enhanced `QPDF::getRoot` checks are enabled for a
+    /// document check (`QPDF::JobSetter::setCheckMode`,
+    /// `libqpdf/QPDFJob.cc:745-752`).
+    pub(crate) check_mode: bool,
     pub(crate) trailer: ObjectHandle,
     pub(crate) last_xref_form: XrefForm,
     /// qpdf's xref-parser-owned `first_xref_item_offset` used by the
@@ -390,6 +394,25 @@ impl<R: Read + Seek> Pdf<R> {
         if root.as_dictionary().is_none() {
             return Err(Error::System("unable to find /Root dictionary".into()));
         }
+        if self.check_mode
+            && !root
+                .try_get_key(b"/Type")?
+                .try_is_name_and_equals(b"Catalog")?
+        {
+            // qpdf's check mode warns and repairs an invalid Catalog type in
+            // `QPDF::getRoot` (`libqpdf/QPDF.cc:2354-2366`). The replacement
+            // is on the live handle so later inspection branches observe the
+            // same repaired Catalog.
+            self.resolver
+                .push_warning("catalog /Type entry missing or invalid")?;
+            root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))?;
+            self.mark_object_handle_dirty(&root)?;
+        }
         Ok(root)
+    }
+
+    /// Enable or disable qpdf's enhanced root checks for a document check.
+    pub(crate) fn set_check_mode(&mut self, enabled: bool) {
+        self.check_mode = enabled;
     }
 }

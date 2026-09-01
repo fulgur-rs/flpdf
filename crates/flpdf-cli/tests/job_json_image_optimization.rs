@@ -428,6 +428,8 @@ fn job_json_image_options_reject_wrong_types_at_the_json_boundary() {
             .arg("--job-json-file=job.json")
             .assert()
             .code(2)
-            .stderr(predicates::str::contains("value must be a string"));
+            .stderr(predicates::str::contains(format!(
+                "JSON handler: value at .{name} is not of expected type"
+            )));
     }
 }

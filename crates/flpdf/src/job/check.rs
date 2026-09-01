@@ -161,6 +161,11 @@ impl QPDFJob {
         let input_name = self.input_name().to_owned();
         let message_prefix = self.message_prefix().to_owned();
 
+        // The top-level `--check` route suppresses document warnings while
+        // opening so the report can replay them after its banner. Job JSON
+        // opens with the job logger live, so replay only when the document's
+        // own warning delivery is suppressed.
+        let replay_diagnostics = pdf.suppress_warnings();
         pdf.set_logger(logger.clone());
         let outcome = check_document_with_suppression(
             pdf,
@@ -169,6 +174,7 @@ impl QPDFJob {
             &input_name,
             self.warnings_suppressed(),
             self.show_encryption_key(),
+            replay_diagnostics,
         )?;
         self.record_document_warnings(pdf);
         if outcome.warnings {
@@ -227,7 +233,7 @@ fn check_document<R: Read + Seek + 'static>(
     message_prefix: &str,
     input_name: &str,
 ) -> std::result::Result<CheckOutcome, CheckError> {
-    check_document_with_suppression(pdf, logger, message_prefix, input_name, false, false)
+    check_document_with_suppression(pdf, logger, message_prefix, input_name, false, false, true)
 }
 
 fn check_document_with_suppression<R: Read + Seek + 'static>(
@@ -237,9 +243,16 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     input_name: &str,
     suppress_warnings: bool,
     show_encryption_key: bool,
+    replay_diagnostics: bool,
 ) -> std::result::Result<CheckOutcome, CheckError> {
     let mut warnings = false;
     let mut diagnostics_seen = 0;
+
+    // qpdf's `JobSetter::setCheckMode` is applied before the first
+    // `QPDF::getRoot` in `doCheck` (`QPDFJob.cc:745-752`). Keep the flag on
+    // the document so the root accessor repairs an invalid Catalog type for
+    // every subsequent inspection branch on this same document.
+    pdf.set_check_mode(true);
 
     // qpdf's QPDF::getRoot reads trailer /Root through getKey and accepts
     // either a direct or indirect Catalog, rejecting only a missing,
@@ -290,13 +303,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         logger.info("File is not linearized\n")?;
     }
 
-    let (new_warnings, new_errors) = emit_new_diagnostics_with_suppression(
+    let (new_warnings, new_errors) = inspect_new_diagnostics(
         pdf,
         diagnostics_seen,
         logger,
         message_prefix,
         input_name,
         suppress_warnings,
+        replay_diagnostics,
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
@@ -315,13 +329,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         return Err(CheckError::ErrorsDetected);
     }
 
-    let (new_warnings, new_errors) = emit_new_diagnostics_with_suppression(
+    let (new_warnings, new_errors) = inspect_new_diagnostics(
         pdf,
         diagnostics_seen,
         logger,
         message_prefix,
         input_name,
         suppress_warnings,
+        replay_diagnostics,
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
@@ -345,13 +360,14 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         return Err(CheckError::ErrorsDetected);
     }
 
-    let (new_warnings, new_errors) = emit_new_diagnostics_with_suppression(
+    let (new_warnings, new_errors) = inspect_new_diagnostics(
         pdf,
         diagnostics_seen,
         logger,
         message_prefix,
         input_name,
         suppress_warnings,
+        replay_diagnostics,
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     if new_errors {
@@ -365,6 +381,35 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     }
 
     Ok(CheckOutcome { warnings })
+}
+
+fn inspect_new_diagnostics<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    seen: usize,
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    input_name: &str,
+    suppress_warnings: bool,
+    replay_diagnostics: bool,
+) -> std::result::Result<(bool, bool), CheckError> {
+    if replay_diagnostics {
+        return emit_new_diagnostics_with_suppression(
+            pdf,
+            seen,
+            logger,
+            message_prefix,
+            input_name,
+            suppress_warnings,
+        );
+    }
+
+    let diagnostics = pdf.repair_diagnostics();
+    let mut new_diagnostics = diagnostics.entries().iter().skip(seen);
+    let warnings = new_diagnostics
+        .clone()
+        .any(|diagnostic| matches!(diagnostic.severity, Severity::Warning));
+    let errors = new_diagnostics.any(|diagnostic| matches!(diagnostic.severity, Severity::Error));
+    Ok((warnings, errors))
 }
 
 fn emit_encryption_report<R: Read + Seek>(
@@ -1136,6 +1181,42 @@ mod tests {
                 "No syntax or stream encoding errors found; the file may still contain\n",
                 "errors that qpdf cannot detect\n",
             )
+        );
+    }
+
+    #[test]
+    fn document_check_repairs_invalid_catalog_type_on_the_live_root() {
+        let mut bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/one-page.pdf"
+        ))
+        .to_vec();
+        let marker = b"/Type /Catalog";
+        let start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("one-page fixture has a Catalog type");
+        bytes[start..start + marker.len()].copy_from_slice(b"/Type /Catxxxx");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("invalid Catalog type should open");
+
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "invalid-catalog.pdf")
+            .expect("invalid Catalog type is a check warning");
+        assert!(outcome.warnings);
+        let root = pdf.root_handle().expect("check mode keeps a live Catalog");
+        assert!(root
+            .try_get_key(b"/Type")
+            .expect("Catalog type lookup")
+            .try_is_name_and_equals(b"Catalog")
+            .expect("Catalog type inspection"));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert_eq!(
+            output
+                .matches("catalog /Type entry missing or invalid")
+                .count(),
+            1
         );
     }
 
