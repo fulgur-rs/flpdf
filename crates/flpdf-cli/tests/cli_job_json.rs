@@ -290,12 +290,12 @@ fn job_json_file_compression_level_reaches_the_writer() {
     fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
     let mut outputs = Vec::new();
     for level in ["1", "9"] {
-        let output = directory.path().join(format!("out-{level}.pdf"));
+        let output_name = format!("out-{level}.pdf");
+        let output = directory.path().join(&output_name);
         fs::write(
             directory.path().join(format!("job-{level}.json")),
             format!(
-                r#"{{"inputFile":"input.pdf","outputFile":"{}","staticId":"","recompressFlate":"","objectStreams":"disable","compressionLevel":"{level}"}}"#,
-                output.display()
+                r#"{{"inputFile":"input.pdf","outputFile":"{output_name}","staticId":"","recompressFlate":"","objectStreams":"disable","compressionLevel":"{level}"}}"#
             ),
         )
         .unwrap();
