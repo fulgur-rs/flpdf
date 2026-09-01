@@ -11,7 +11,7 @@ use flpdf::job::{
     JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
     PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
 };
-use flpdf::pipeline::PipelineHandle;
+use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
@@ -1271,6 +1271,11 @@ enum Commands {
         about = "Repair stream /Length, xref offsets, /Size and startxref in a hand-edited QDF file (qpdf fix-qdf equivalent)"
     )]
     QdfFix(QdfFixCommand),
+    #[command(
+        name = "zlib-flate",
+        about = "Compress or uncompress a raw zlib stream on stdin/stdout"
+    )]
+    ZlibFlate(ZlibFlateCommand),
     #[command(about = "Rewrite the input PDF to a normalized output")]
     Rewrite(RewriteCommand),
     #[command(
@@ -1420,6 +1425,14 @@ struct QdfCommand {
 struct QdfFixCommand {
     input: PathBuf,
     output: PathBuf,
+}
+
+/// Args for the qpdf `zlib-flate` utility surface.
+#[derive(Debug, ClapArgs)]
+struct ZlibFlateCommand {
+    /// `-uncompress`, `-compress`, or `-compress=n`.
+    #[arg(value_name = "MODE", allow_hyphen_values = true, num_args = 0..)]
+    modes: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -2150,6 +2163,18 @@ fn main() {
     // preserves named segment boundaries and returns feature-neutral raw
     // tokens to the existing semantic consumers below.
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args
+        .first()
+        .is_some_and(|program| is_zlib_flate_program(program))
+    {
+        if let Err(error) = run_zlib_flate(&raw_args[1..], "zlib-flate", "zlib-flate") {
+            let code = error
+                .downcast_ref::<CliExitError>()
+                .map_or(ExitCode::Errors, |error| error.code);
+            std::process::exit(code.as_i32());
+        }
+        return;
+    }
     if raw_args.len() == 2 {
         match raw_args[1].as_str() {
             "--version" | "-version" => {
@@ -3188,6 +3213,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             cmd.preserve_unreferenced,
         ),
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
+        Commands::ZlibFlate(cmd) => {
+            let whoami = progname();
+            let usage_name = format!("{whoami} zlib-flate");
+            run_zlib_flate(&cmd.modes, &whoami, &usage_name)
+        }
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => {
             // The native subcommand has no `--show-encryption-key` flag of its
@@ -6209,6 +6239,119 @@ fn run_qdf_fix(input: &std::path::Path, output: &std::path::Path) -> CliResult<(
     let bytes = std::fs::read(input)?;
     let fixed = fix_qdf(&bytes)?;
     std::fs::write(output, fixed)?;
+    Ok(())
+}
+
+fn is_zlib_flate_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "zlib-flate" || name == "zlib-flate.exe")
+}
+
+fn zlib_flate_usage(usage_name: &str) -> CliResult<()> {
+    eprintln!(
+        "Usage: {usage_name} {{ -uncompress | -compress[=n] }}\n\
+If n is specified with -compress, it is a zlib compression level from\n\
+1 to 9 where lower numbers are faster and less compressed and higher\n\
+numbers are slower and more compressed"
+    );
+    Err(Box::new(CliExitError {
+        code: ExitCode::Errors,
+        message: String::new(),
+    }))
+}
+
+fn zlib_flate_failure(whoami: &str, error: impl std::fmt::Display) -> CliResult<()> {
+    eprintln!("{whoami}: {error}");
+    Err(Box::new(CliExitError {
+        code: ExitCode::Errors,
+        message: String::new(),
+    }))
+}
+
+/// Run qpdf's raw zlib stdin/stdout utility over the canonical Flate pipeline.
+fn run_zlib_flate(args: &[String], whoami: &str, usage_name: &str) -> CliResult<()> {
+    if args.len() == 1 && args[0] == "--version" {
+        println!("{whoami} from qpdf version {}", flpdf::qpdf_version());
+        return Ok(());
+    }
+    if args.len() != 1 {
+        return zlib_flate_usage(usage_name);
+    }
+
+    let (action, compression_level) = match args[0].as_str() {
+        "-uncompress" => (FlateAction::Inflate, None),
+        "-compress" => (FlateAction::Deflate, None),
+        value => match value.strip_prefix("-compress=") {
+            Some(level) => {
+                let level = match qpdf_selector_integer(level) {
+                    Ok(level) => level,
+                    Err(error) => return zlib_flate_failure(whoami, error),
+                };
+                (FlateAction::Deflate, Some(level))
+            }
+            None => return zlib_flate_usage(usage_name),
+        },
+    };
+
+    let input = std::io::stdin();
+    let mut input = input.lock();
+    let output = std::io::stdout();
+    let mut output = output.lock();
+    let mut sink = PlStdioFile::new("stdout", &mut output);
+    let flate_result = match compression_level {
+        Some(level) => PlFlate::new_with_compression_level("flate", &mut sink, action, level),
+        None => PlFlate::new("flate", &mut sink, action),
+    };
+    let mut flate = match flate_result {
+        Ok(flate) => flate,
+        // cov:ignore-start: both constructors use a fixed valid output buffer size
+        Err(error) => return zlib_flate_failure(whoami, error),
+        // cov:ignore-end
+    };
+    let warned = std::rc::Rc::new(std::cell::Cell::new(false));
+    let warned_for_callback = std::rc::Rc::clone(&warned);
+    let warning_whoami = whoami.to_owned();
+    flate.set_warn_callback(move |message, code| {
+        warned_for_callback.set(true);
+        eprintln!("{warning_whoami}: WARNING: zlib code {code}, msg = {message}");
+        Ok(())
+    });
+
+    let mut buffer = [0u8; 10_000];
+    loop {
+        let length = match input.read(&mut buffer) {
+            Ok(length) => length,
+            // cov:ignore-start: integration processes cannot inject a stdin read error
+            Err(error) => {
+                drop(flate);
+                return zlib_flate_failure(whoami, error);
+                // cov:ignore-end
+            }
+        };
+        if length == 0 {
+            break;
+        }
+        if let Err(error) = flate.write(&buffer[..length]) {
+            drop(flate);
+            return zlib_flate_failure(whoami, error);
+        }
+    }
+
+    let finish = flate.finish();
+    drop(flate);
+    // cov:ignore-start: closed stdout/flush failure is owned by the host process boundary
+    if let Err(error) = finish {
+        return zlib_flate_failure(whoami, error);
+    }
+    // cov:ignore-end
+    if warned.get() {
+        return Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        }));
+    }
     Ok(())
 }
 

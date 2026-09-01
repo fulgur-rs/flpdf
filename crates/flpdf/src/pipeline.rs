@@ -54,6 +54,7 @@ pub mod stdio_file;
 pub(crate) mod test_support;
 
 pub use base64::{Base64Action, PlBase64};
+pub use flate::{FlateAction, PlFlate};
 pub mod string;
 pub use concatenate::PlConcatenate;
 pub use discard::Discard;
