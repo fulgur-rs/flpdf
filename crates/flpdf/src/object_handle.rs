@@ -670,14 +670,8 @@ mod parse_tests {
 /// (`include/qpdf/QPDFObjectHandle.hh:304-309,1338-1350`,
 /// `libqpdf/QPDFObjectHandle.cc:224-227`).
 ///
-/// Lazy dereference stays crate-internal until every document-created handle
-/// is attached to the complete qpdf-native resolver.
-///
-/// ```compile_fail
-/// let handle = flpdf::ObjectHandle::integer(1);
-/// handle.try_dereference()?;
-/// # Ok::<(), flpdf::Error>(())
-/// ```
+/// Document-created handles resolve indirect references lazily through their
+/// document's qpdf-compatible resolver.
 #[derive(Clone)]
 pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 
@@ -3759,13 +3753,12 @@ impl ObjectHandle {
     /// Return qpdf's live child handle for `key`, or a contextual null for a
     /// missing key/non-dictionary receiver.
     ///
-    /// This non-fallible convenience facade is intentionally not the
-    /// canonical Rust route: it delegates to the internal `try_get_key` route
-    /// and panics when lazy resolution or qpdf's type warning would return an
-    /// error. Callers that need the error boundary must use the fallible
-    /// `try_get_key` route. The normal successful behavior mirrors
-    /// `QPDFObjectHandle::getKey` (`libqpdf/QPDFObjectHandle.cc:978-989`),
-    /// including the parent-context description on a missing-key null from
+    /// This convenience method has the same successful behavior as qpdf's
+    /// `QPDFObjectHandle::getKey` (`libqpdf/QPDFObjectHandle.cc:978-989`). It
+    /// panics when lazy resolution or qpdf's type warning would return an
+    /// error; callers that need to propagate that error should use
+    /// [`Self::try_get_key`]. The successful behavior includes the
+    /// parent-context description on a missing-key null from
     /// `QPDF_Dictionary::getKey` (`libqpdf/QPDF_Dictionary.cc:103-115`).
     ///
     /// `key` must be qpdf's decoded, canonical dictionary key including its
@@ -3778,10 +3771,9 @@ impl ObjectHandle {
 
     /// Return whether qpdf considers `key` visible in this dictionary.
     ///
-    /// This non-fallible convenience facade delegates to the internal
-    /// `try_has_key` route and panics on lazy-resolution/type-warning errors;
-    /// use the fallible `try_has_key` route when the error must be propagated.
-    /// A present value that resolves to null is absent, matching
+    /// This convenience method panics on lazy-resolution or type-warning
+    /// errors; use [`Self::try_has_key`] when the error must be propagated. A
+    /// present value that resolves to null is absent, matching
     /// `QPDF_Dictionary::hasKey` (`libqpdf/QPDF_Dictionary.cc:97-101`) and
     /// `QPDFObjectHandle::hasKey` (`libqpdf/QPDFObjectHandle.cc:966-976`).
     /// `key` must be qpdf's decoded, canonical dictionary key including its
@@ -5960,8 +5952,7 @@ impl ObjectHandle {
     /// [`STREAM_ENCODE_NORMALIZE`], qpdf's `qpdf_ef_compress` and
     /// `qpdf_ef_normalize` bits. The output stages are built first, then
     /// the stream filters are added in reverse `/Filter` order. The source
-    /// is finally dispatched through the completed chain without a legacy
-    /// `Object` materialization.
+    /// is finally dispatched through the completed chain.
     #[allow(clippy::too_many_arguments)]
     pub fn pipe_stream_data(
         &self,

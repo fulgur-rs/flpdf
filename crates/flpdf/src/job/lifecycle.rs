@@ -104,7 +104,7 @@ impl Write for JobOutputWriter {
 /// Portable writer/input state populated by the qpdf job argv/JSON boundary.
 ///
 /// This is deliberately smaller than the CLI's clap model. It owns the
-/// settings exercised by `qpdf/qpdfjob-ctest.c`; full command-line transform
+/// settings needed for job initialization; full command-line transform
 /// dispatch remains in the operation-specific job slices.
 #[derive(Debug, Clone, Default)]
 struct JobConfiguration {
@@ -1259,12 +1259,12 @@ impl QPDFJob {
             .register_progress_reporter(Box::new(move |percent| (reporter.borrow_mut())(percent)));
     }
 
-    /// Initialize the portable qpdf-job argument surface used by qtest.
+    /// Initialize the qpdf-compatible argument set supported by this job.
     ///
-    /// This mirrors `QPDFJob::initializeFromArgv` for the arguments owned by
-    /// `qpdfjob-ctest.c`: one input, one output, deterministic/static IDs,
-    /// object-stream mode, password, decrypt, and check. The full CLI parser
-    /// remains outside this production library boundary.
+    /// This mirrors `QPDFJob::initializeFromArgv` for one input, one output,
+    /// deterministic/static IDs, object-stream mode, password, decrypt,
+    /// check, progress reporting, and the `--keep-files-open` options. Other
+    /// command-line options are handled by the CLI.
     pub fn initialize_from_argv(&mut self, argv: &[String]) -> Result<()> {
         let mut configuration = JobConfiguration::default();
         let mut positionals = Vec::new();
@@ -1342,11 +1342,11 @@ impl QPDFJob {
         Ok(())
     }
 
-    /// Initialize the portable qpdf-job JSON surface used by qtest.
+    /// Initialize the qpdf-compatible job-JSON fields supported by this
+    /// lifecycle.
     ///
-    /// This implements the qpdf job-JSON fields currently owned by this
-    /// lifecycle, including input/output setup, writer settings, page
-    /// transformations (`splitPages`, `rotate`, `removeRestrictions`,
+    /// This includes input/output setup, writer settings, page transformations
+    /// (`splitPages`, `rotate`, `removeRestrictions`,
     /// `generateAppearances`, `flattenAnnotations`, `coalesceContents`, and
     /// `flattenRotation`),
     /// attachments, page selection, and JSON output.
@@ -1362,9 +1362,9 @@ impl QPDFJob {
         self.initialize_from_json_with_partial(json, false)
     }
 
-    /// Initialize a job JSON document for the CLI's partial job-json-file
-    /// route. Configuration checks that require command-line input/output
-    /// values are deferred to [`QPDFJob::run`], matching qpdf's
+    /// Initialize a job from a partial qpdf job-JSON document. Configuration
+    /// checks that require command-line input/output values are deferred until
+    /// [`QPDFJob::run`], matching qpdf's
     /// `QPDFJob::Config::jobJsonFile` call to `initializeFromJson(..., true)`
     /// (`libqpdf/QPDFJob_config.cc:774-784`).
     pub fn initialize_from_json_partial(&mut self, json: &str) -> Result<()> {

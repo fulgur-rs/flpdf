@@ -3,7 +3,7 @@
 //!
 //! This module implements the planning layer for producing PDF linearized output
 //! (ISO 32000-1 Annex F / "fast web view").  It intentionally contains **no I/O**:
-//! the types here are pure data that downstream writer subtasks consume.
+//! the types here are pure data used by the writer components.
 
 pub mod back_patch;
 pub mod check;

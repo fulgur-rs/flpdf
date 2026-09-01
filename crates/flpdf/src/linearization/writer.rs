@@ -396,12 +396,11 @@ fn append_objstm_container_object<R: Read + Seek>(
 // Public result types
 // ---------------------------------------------------------------------------
 
-/// Byte offsets and derived values returned by the internal `write_linearized`
-/// implementation.
+/// Byte offsets and derived values for a linearized PDF.
 ///
 /// All values are absolute byte positions within `LinearizedDocument::bytes`
-/// unless stated otherwise.  The back-patcher uses these to
-/// fill the placeholder fields in the Part 1 parameter dictionary.
+/// unless stated otherwise. These values describe the byte layout used to
+/// fill the Part 1 parameter dictionary.
 #[derive(Debug, Clone)]
 pub struct LinearizedOffsets {
     /// Total file length in bytes — corresponds to `/L` in the param dict.
@@ -429,7 +428,6 @@ pub struct LinearizedOffsets {
     pub end_of_first_page_offset: usize,
 
     /// Byte offset of the Part 6 cross-reference table (`xref` keyword).
-    /// Used internally for layout diagnostics.
     pub last_xref_keyword_offset: usize,
 
     /// Byte offset of the first entry in the Part 6 cross-reference table
