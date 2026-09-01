@@ -2479,7 +2479,16 @@ impl QPDFJob {
         Ok(())
     }
 
-    fn report_job_error(&self, error: &Error) -> Result<()> {
+    /// Report one qpdf job error through the job's error logger.
+    ///
+    /// This is the Rust consumer boundary corresponding to the exception
+    /// catch in `qpdfjob-c.cc:32-40`: the prefix, separator, message, and
+    /// newline remain four writes so custom pipelines observe the same
+    /// boundaries as qpdf's stream insertion sequence. The ordinary
+    /// [`QPDFJob::run`] contract still returns usage errors to its caller;
+    /// callers that model qpdf's C wrapper can report the error here and map
+    /// it to the wrapper's error status.
+    pub fn report_job_error(&self, error: &Error) -> Result<()> {
         // qpdf's C wrapper streams the prefix, separator, message, and final
         // newline separately (`qpdfjob-c.cc:32-39`). Keeping those writes
         // separate preserves custom-pipeline boundaries as well as bytes.

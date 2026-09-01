@@ -777,6 +777,16 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 | `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |
 | `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | ✅ |
 
+### `qpdfjob-c` wrapper のエラー境界
+
+qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、
+`QPDFJob::initializeFromJson`/`run` が投げた例外を job logger の error
+pipeline へ prefix・区切り・本文・改行の順に送り、`EXIT_ERROR`へ変換する。
+flpdf は `QPDFJob::report_job_error` の canonical route を qtest の
+Rust consumerへ公開し、`qpdfjob_ctest.rs` がこの wrapper の継続順序だけを
+担う。通常の `QPDFJob::run` の `UsageError` contractや、CLIの別の usage
+表示経路は変更しない。
+
 ## 10. インフラ
 
 | qpdf | 行 | flpdf | 状態 |
