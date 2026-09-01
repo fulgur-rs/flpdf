@@ -426,7 +426,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:163-171`). The result contains
     /// only fields represented by the canonical `field_to_annotations` cache:
     /// intermediate field-tree nodes are omitted, while orphan Widgets found
-    /// on pages are included as self-associated fields by [`Self::analyze`].
+    /// on pages are included as self-associated fields by the helper's
+    /// qpdf-compatible analysis pass.
     /// Handles remain attached to the document's canonical object registry, so
     /// mutations through a returned handle are visible to later consumers.
     pub fn get_form_fields(&mut self) -> Result<Vec<ObjectHandle>> {
