@@ -7,6 +7,7 @@
 //! page-transform, and remaining inspection consumers are later job slices.
 
 use super::attachments::{AttachmentAddOptions, AttachmentCopyOptions};
+use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 use super::outline_dest_remap::remap_outline_and_dests;
 use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
@@ -128,6 +129,12 @@ struct JobConfiguration {
     rotations: Vec<RotateSpec>,
     remove_restrictions: bool,
     coalesce_contents: bool,
+    /// qpdf's image transformation toggles and thresholds. The actual image
+    /// traversal remains in `job::image_optimization`; this job state only
+    /// carries the generated JSON handler values to the canonical phase.
+    optimize_images: bool,
+    externalize_inline_images: bool,
+    image_options: ImageOptimizationOptions,
     flatten_annotations: Option<FlattenAnnotationsMode>,
     flatten_rotation: bool,
     generate_appearances: bool,
@@ -1521,6 +1528,24 @@ impl QPDFJob {
         }
         configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
         configuration.coalesce_contents = job_json_bare(&members, b"coalesceContents")?;
+        configuration.externalize_inline_images =
+            job_json_bare(&members, b"externalizeInlineImages")?;
+        configuration.image_options.keep_inline_images =
+            job_json_bare(&members, b"keepInlineImages")?;
+        configuration.optimize_images = job_json_bare(&members, b"optimizeImages")?;
+        if let Some(value) = job_json_string(&members, b"iiMinBytes")? {
+            configuration.image_options.inline_min_bytes =
+                parse_qpdf_collate_uint(&value)? as usize;
+        }
+        if let Some(value) = job_json_string(&members, b"oiMinArea")? {
+            configuration.image_options.min_area = parse_qpdf_collate_uint(&value)? as u32;
+        }
+        if let Some(value) = job_json_string(&members, b"oiMinHeight")? {
+            configuration.image_options.min_height = parse_qpdf_collate_uint(&value)? as u32;
+        }
+        if let Some(value) = job_json_string(&members, b"oiMinWidth")? {
+            configuration.image_options.min_width = parse_qpdf_collate_uint(&value)? as u32;
+        }
         // The generated qpdf handler accepts only these three strings
         // (`libqpdf/qpdf/auto_job_json_init.hh:377-379`); unlike the bare
         // transformation toggles, this setting carries a mode.
@@ -2155,6 +2180,35 @@ impl QPDFJob {
         if configuration.remove_restrictions {
             let mut acroform = AcroFormDocumentHelper::new(pdf)?;
             let _ = acroform.disable_digital_signatures()?;
+        }
+
+        // qpdf's `handleTransformations` externalizes inline images before
+        // optimizing reachable Image XObjects and before appearance
+        // generation (`libqpdf/QPDFJob.cc:2151-2174`). The existing image
+        // phase owns both the inline-image and deferred DCT provider routes;
+        // make an explicit externalization request plus optimization one
+        // pass so the inline content is not traversed twice. An explicit
+        // request wins over `keepInlineImages`, matching qpdf's condition.
+        if configuration.optimize_images {
+            let mut image_options = configuration.image_options;
+            if configuration.externalize_inline_images {
+                image_options.keep_inline_images = false;
+            }
+            optimize_images(
+                pdf,
+                &self.logger,
+                &self.message_prefix,
+                configuration.verbose,
+                image_options,
+            )?; // cov:ignore: llvm-cov attributes this successful multiline image phase call to its opening expressions
+        } else if configuration.externalize_inline_images {
+            let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
+            for page_ref in page_refs {
+                PageObjectHelper::new(page_ref, pdf).externalize_inline_images(
+                    configuration.image_options.inline_min_bytes,
+                    false,
+                )?; // cov:ignore: llvm-cov attributes this successful multiline image externalization call to its opening expressions
+            }
         }
 
         // qpdf's `handleTransformations` generates form appearances after
@@ -3191,6 +3245,10 @@ mod tests {
             ("collate", "2"),
             ("flattenAnnotations", "all"),
             ("jsonOutput", "latest"),
+            ("externalizeInlineImages", ""),
+            ("iiMinBytes", "100"),
+            ("keepInlineImages", ""),
+            ("optimizeImages", ""),
             ("jsonStreamPrefix", "stream"),
             ("jsonStreamData", "file"),
             ("testJsonSchema", ""),
