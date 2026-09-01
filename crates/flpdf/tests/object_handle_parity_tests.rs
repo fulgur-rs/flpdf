@@ -297,6 +297,14 @@ fn make_indirect_object_prepares_repaired_xref_before_allocating() {
             ObjectRef::new(4, 0)
         ]
     );
+    assert!(
+        pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+            diagnostic.message == "(object 1 0, offset 9): expected 1 0 obj"
+                && diagnostic.offset.is_none()
+        }),
+        "xref recovery must retain qpdf's object context in the trigger warning: {:?}",
+        pdf.repair_diagnostics().entries()
+    );
 }
 
 #[test]
