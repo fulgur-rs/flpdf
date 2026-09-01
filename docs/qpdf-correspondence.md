@@ -699,6 +699,14 @@ warning として記録し、空の `id1` で暗号鍵導出を継続する。`f
 `push_trailer_warning_at` が `(trailer, offset N): ...` を診断とloggerへ一度だけ渡す。
 pinned qpdf 11.9.0 と `/usr/bin/qpdf` の malformed `/ID` probe（offset 416）で一致する。
 
+`flpdf-25kg.5.4` では、qpdf の `QPDF::resolve` / `resolveObjectsInStream` が構造・member
+warningを配送してから `updateCache`/member valueを確定する順序
+（`QPDF.cc:1560-1833,1700-1753`）を維持する。暗号の unknown `/StrF`・`/StmF` fallbackも
+`QPDF_encryption.cc:976-1005,1041-1154` と同じくwarning成功後に `cf_string`/`cf_stream` を
+`AES`へ書き換え、R6 `/Perms` warningは認証済み`EncryptionState`のreader commitより先に
+配送する。warning sink failureではcache/stateを未commitのままcallerへ返し、正常sinkでの
+retry時だけfallbackを一度確定する。
+
 暗号の責務境界は `QPDFJob.cc:2753-2761` の `setEncryptionOptions` が新規RC4書き込みだけを
 `allow_weak_crypto` で拒否する形であり、既存のRC4/R=5入力を読む経路にはこの拒否がない。
 flpdfも `PdfOpenOptions` のread-side opt-in/error gateを撤去し、`--allow-weak-crypto` は
