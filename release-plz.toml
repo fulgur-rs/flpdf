@@ -28,6 +28,7 @@ changelog_path = "CHANGELOG.md"
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
+git_release_draft = true
 git_release_name = "v{{ version }}"
 
 # flpdf-cli is published (publish defaults to true) and version-locked to flpdf

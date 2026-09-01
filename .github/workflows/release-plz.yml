@@ -22,6 +22,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   # Manual escape hatch if a real release wasn't detected from the push (e.g. the
   # Release PR was squash-merged with a hand-edited subject). A workflow_dispatch
   # run still pauses on the `release` environment approval before publishing.
