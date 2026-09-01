@@ -145,6 +145,24 @@ fn new_job_matches_qpdf_defaults() {
 }
 
 #[test]
+fn qpdfjob_error_report_matches_the_qpdf_c_wrapper_boundary() {
+    let (logger, state) = logger_with_error_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.set_message_prefix("qpdfjob json");
+
+    job.report_job_error(&Error::Usage(flpdf::UsageError::new(
+        "an output file name is required; use - for standard output",
+    )))
+    .unwrap();
+
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdfjob json: an output file name is required; use - for standard output\n"
+    );
+}
+
+#[test]
 fn keep_files_open_policy_counts_distinct_page_sources_and_honors_overrides() {
     let range = PageRange::parse("1").unwrap();
     let one_source = [

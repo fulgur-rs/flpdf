@@ -120,12 +120,16 @@ fn run_tests() -> Result<()> {
         ));
     }
     job.set_message_prefix("qpdfjob json");
-    let _ = job.initialize_from_json(
+    let initialization = job.initialize_from_json(
         r#"{
   "inputFile": "nothing-there.pdf"
 }"#,
     );
-    expect_status(job.run()?, JobExitCode::Error, "json error")?;
+    expect_status(
+        run_after_ignored_initialization(&mut job, initialization)?,
+        JobExitCode::Error,
+        "json error",
+    )?;
     print_line("json error test passed");
 
     let argv = vec![
@@ -186,6 +190,28 @@ fn run_json(json: &str) -> Result<JobExitCode> {
     job.run()
 }
 
+/// Continue after an intentionally ignored initialization result, mirroring
+/// the full-interface sequence in `qpdfjob-ctest.c:94-99`. The qpdf C wrapper
+/// reports both the initialization exception and the subsequent `run()`
+/// exception through `wrap_qpdfjob` (`qpdfjob-c.cc:32-40`), so this adapter
+/// keeps `QPDFJob::run`'s library-level `Error` contract unchanged while
+/// reproducing the helper's observable status and logger ordering.
+fn run_after_ignored_initialization(
+    job: &mut QPDFJob,
+    initialization: Result<()>,
+) -> Result<JobExitCode> {
+    if let Err(error) = initialization {
+        job.report_job_error(&error)?;
+    }
+    match job.run() {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            job.report_job_error(&error)?;
+            Ok(JobExitCode::Error)
+        }
+    }
+}
+
 fn expect_status(actual: JobExitCode, expected: JobExitCode, stage: &str) -> Result<()> {
     if actual == expected {
         Ok(())
@@ -201,4 +227,55 @@ fn expect_status(actual: JobExitCode, expected: JobExitCode, stage: &str) -> Res
 fn print_line(line: impl AsRef<str>) {
     println!("{}", line.as_ref());
     let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingErrorLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Pipeline for RecordingErrorLog {
+        fn identifier(&self) -> &str {
+            "qpdfjob test logger"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            let mut output = self.0.lock().unwrap();
+            output.extend_from_slice(b"|custom|");
+            output.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ignored_json_initialization_error_matches_qpdf_c_wrapper() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingErrorLog(Arc::clone(
+            &output,
+        )))));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_message_prefix("qpdfjob json");
+
+        let initialization = job.initialize_from_json(
+            r#"{
+  "inputFile": "nothing-there.pdf"
+}"#,
+        );
+        let status = run_after_ignored_initialization(&mut job, initialization).unwrap();
+
+        assert_eq!(status, JobExitCode::Error);
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"|custom|qpdfjob json|custom|: |custom|an output file name is required; use - for standard output|custom|\n\
+|custom|qpdfjob json|custom|: |custom|an output file name is required; use - for standard output|custom|\n"
+        );
+    }
 }
