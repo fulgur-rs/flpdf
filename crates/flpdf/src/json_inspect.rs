@@ -75,12 +75,9 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns [`ConvertError::NonFiniteFloat`] when a real value is non-finite
-/// (NaN or infinity), or a [`ConvertError::PdfError`] when `handle` nests
-/// past an internal depth bound — unlike the legacy `Object` tree, a caller
-/// can build a cyclic `ObjectHandle` graph directly (two direct dictionaries
-/// linked to each other via `replace_key`, with no indirect object involved
-/// at all), so this bounds recursion the same way
-/// the canonical handle serializer does rather than assuming acyclic input.
+/// (NaN or infinity), or a [`ConvertError::PdfError`] when `handle` exceeds the
+/// maximum nesting depth. Direct `ObjectHandle` graphs can be cyclic, so the
+/// serializer bounds recursion rather than assuming acyclic input.
 pub fn pdf_object_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
     pdf_object_to_json_with_version(handle, QPDF_JSON_VERSION)
 }

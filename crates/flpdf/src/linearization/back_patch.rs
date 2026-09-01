@@ -52,7 +52,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! let mut doc = write_linearized(&plan, &renumber, &mut pdf)?;
+//! # let mut doc: flpdf::linearization::LinearizedDocument = todo!();
 //! doc.back_patch()?;
 //! // doc.bytes now contains the complete, patched linearized PDF.
 //! ```

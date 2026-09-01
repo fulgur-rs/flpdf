@@ -292,9 +292,9 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// selected.
     ///
     /// Mirrors `QPDFAnnotationObjectHelper::getAppearanceStream`
-    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:48-71`), including qpdf issue
-    /// #949's observed behavior: when `/AP/<which>` is already a stream, the
-    /// state is disregarded even if one was requested.
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:48-71`), including the behavior
+    /// that when `/AP/<which>` is already a stream, the state is disregarded
+    /// even if one was requested.
     ///
     /// # Errors
     ///
@@ -310,8 +310,8 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
             let ap_sub = ap.get_key(&dict_key(which));
             self.pdf.resolve(&ap_sub)?;
             if ap_sub.as_stream_dict().is_some() {
-                // qpdf issue #949: a direct appearance stream disregards
-                // state entirely (`QPDFAnnotationObjectHelper.cc:59-63`).
+                // A direct appearance stream disregards state entirely
+                // (`QPDFAnnotationObjectHelper.cc:59-63`).
                 // `/AS` must not even be resolved on this path — qpdf's own
                 // eager `getAppearanceState()` call is infallible in C++,
                 // but this crate's `/AS` resolution can genuinely error (a

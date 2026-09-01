@@ -5,9 +5,9 @@
 //! body parts defined by ISO 32000-1 Annex F, and carries the raw inputs needed
 //! to build the Page-offset hint table and the Shared-object hint table.
 //!
-//! The plan is intentionally a dumb data struct: no I/O, no serialization.
-//! Higher-level subtasks (e.g. the hint-table byte-builder and the linearized
-//! writer) consume this struct and fill in the placeholders.
+//! The plan is intentionally a data-only structure: no I/O or serialization.
+//! The hint-table builder and linearized writer consume this structure and fill
+//! in the placeholders.
 //!
 //! # Part layout (Annex F summary)
 //!
@@ -18,7 +18,7 @@
 //! | 3    | Non-first-page shared objects (catalog, font programs, etc.) |
 //! | 4    | Remaining (non-first-page) objects |
 //!
-//! # Object closure algorithm (subtask 2.2)
+//! # Object closure algorithm
 //!
 //! `from_pdf` now computes the transitive closure of objects reachable from the
 //! first page (`/Pages /Kids[0]`) and partitions them:
@@ -746,7 +746,8 @@ pub struct LinearizationPlan {
     // Part membership
     // ------------------------------------------------------------------
     /// Part 1: linearization parameter dictionary and its xref stream.
-    /// Populated by the writer subtask (2.3/2.4); empty as a placeholder.
+    /// Reserved for the linearization parameter dictionary and its xref
+    /// stream; plans built from a PDF leave this list empty.
     pub part1_objects: Vec<ObjectRef>,
     /// Part 2: first-page objects (page dict, resources, content streams).
     /// Computed by `from_pdf` using the first-page closure algorithm.

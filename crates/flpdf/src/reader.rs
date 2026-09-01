@@ -1420,9 +1420,9 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Promote and register an existing direct handle without cloning its
     /// allocation or scheduling writer output. This is qpdf's
-    /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`), exposed as
-    /// a document-owned canonical consumer boundary so callers do not fall
-    /// back to the legacy clone-based allocator.
+    /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`). The returned
+    /// handle retains the existing object allocation and is not automatically
+    /// scheduled for output.
     pub fn make_indirect_from_object_handle(&self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.resolver.make_indirect_from_object_handle(handle)
     }
@@ -1438,9 +1438,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// qpdf's `pipeStreamData` uses it to distinguish this no-data state from
     /// an original source stream (`libqpdf/QPDF_Stream.cc:571-607`).
     ///
-    /// The existing canonical promotion primitive registers this exact
-    /// `ObjectHandle` allocation; this method does not use the legacy
-    /// cloning allocator or an empty replacement buffer.
+    /// The new stream is registered with the document and can be mutated
+    /// through the returned handle.
     pub fn new_stream(&self) -> Result<ObjectHandle> {
         self.resolver.new_stream_handle()
     }
@@ -1630,37 +1629,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// `obj_cache[next] = ObjCache(obj, -1, -1)`,
     /// `libqpdf/QPDF.cc:1885-1888`).
     ///
-    /// The returned handle is a new, distinct object identity: unlike
-    /// qpdf's uniform `shared_ptr<QPDFObject>` (where the caller's original
-    /// handle and the new indirect one end up viewing the exact same
-    /// underlying value, so mutating either mutates both), this crate's
-    /// `Direct`/`Indirect` representations are different storage shapes
-    /// (`object_handle.rs`'s own `Repr` enum) — an internal structural
-    /// deviation only, not an output-byte difference. `handle`'s value is
-    /// cloned into the new indirect slot; further mutation of `handle`
-    /// itself (if the caller kept another clone of it) does not affect the
-    /// returned handle, or vice versa.
+    /// The returned handle is a new, distinct object identity. Its current
+    /// value is copied into the new indirect object, so later mutations through
+    /// either handle do not affect the other.
     ///
-    /// Allocation scans both [`Pdf::object_refs`] (the legacy object cache)
-    /// and the handle registry for the highest existing object number
-    /// (`max + 1`, generation `0`) rather than maintaining a running
-    /// counter, matching this crate's existing
-    /// `overlay_appearance_stream.rs::allocate_next_ref` convention.
-    /// `object_refs()` alone is not enough: a ref allocated by a prior call
-    /// to this same method is registered in [`Pdf::get_object_handle`]'s
-    /// handle registry but never written through to the legacy cache, so
-    /// scanning only `object_refs()` would let two back-to-back calls
-    /// compute the same "next" number and the second silently clobber the
-    /// first allocation's value.
+    /// The new object uses the next unused generation-zero object number,
+    /// including object numbers registered by earlier calls.
     ///
-    /// This does not validate that any indirect child handle reachable
-    /// from `handle`'s direct value belongs to this same [`Pdf`] — no
-    /// caller in this crate builds a direct value out of another
-    /// document's indirect handles today. Doing so would embed a foreign
-    /// document's live handle into this document's registry, which would
-    /// observe that foreign document's own lifecycle (e.g. going to the
-    /// destroyed state when the foreign `Pdf` is dropped) rather than this
-    /// one's.
+    /// Indirect handles nested in `handle`'s direct value are not validated as
+    /// belonging to this document. Callers must ensure that those handles
+    /// remain valid for as long as the new object can be used.
     ///
     /// # Errors
     ///
@@ -1675,9 +1653,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// (only reachable via [`ObjectHandle::shallow_copy`] on a reserved
     /// handle). Such a handle is not indirect, so this crate cannot
     /// honestly answer the "already indirect?" question with `false`
-    /// either: this legacy allocator intentionally rejects reserved values;
-    /// canonical qpdf-shaped promotion belongs to
-    /// `ObjectHandle::promote_to_indirect`.
+    /// either: reserved values cannot be promoted by this method. Use
+    /// [`Self::make_indirect_from_object_handle`] when the existing handle
+    /// identity must be preserved.
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         let Some(value) = handle.direct_value_clone()? else {
             return Err(Error::Unsupported(

@@ -26,8 +26,8 @@
 //! (`ObjectHandle::is_same_object_as`) in a side list, checked only when the
 //! current node is direct. This is a bound on an actual repeat, not on
 //! depth: a direct `/Parent` chain has no upper bound here other than a
-//! genuine cycle, matching qpdf's own unbounded-but-for-cycles walk and the
-//! behavior of this module before the `BTreeSet` migration. Direct
+//! genuine cycle, matching qpdf's own unbounded-but-for-cycles walk for
+//! indirect handles. Direct
 //! `/Parent` chains are rare in practice, so the linear scan this implies
 //! (O(n) per direct node, O(n^2) for a long acyclic direct-only chain) is
 //! accepted rather than adding new machinery for a shape indirect objects
