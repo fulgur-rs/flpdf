@@ -1,9 +1,25 @@
 use flpdf::{
-    AcroFormDocumentHelper, FormFieldObjectHelper, ObjectRef, PageDocumentHelper, PageObjectHelper,
-    Pdf, PdfOpenOptions,
+    AcroFormDocumentHelper, Error, FormFieldObjectHelper, ObjectRef, PageDocumentHelper,
+    PageObjectHelper, Pdf, PdfOpenOptions, Pipeline, PipelineError, PipelineHandle, QPDFLogger,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
+
+struct FailingWarningSink;
+
+impl Pipeline for FailingWarningSink {
+    fn identifier(&self) -> &str {
+        "failing-warning-sink"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> flpdf::PipelineResult<()> {
+        Err(PipelineError::runtime("warning sink failed"))
+    }
+
+    fn finish(&mut self) -> flpdf::PipelineResult<()> {
+        Ok(())
+    }
+}
 
 fn build_non_array_fields_pdf() -> Vec<u8> {
     let objects: &[(u32, &[u8])] = &[
@@ -95,4 +111,25 @@ fn canonical_acroform_analysis_warns_for_a_non_array_fields_value() {
             .message
             .contains("/Fields key of /AcroForm dictionary is not an array; ignoring")
     }));
+}
+
+#[test]
+fn canonical_acroform_analysis_propagates_a_warning_sink_failure() {
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        build_non_array_fields_pdf(),
+        PdfOpenOptions {
+            suppress_warnings: false,
+            description: "non-array-fields.pdf".to_owned(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingWarningSink)));
+    pdf.set_logger(logger);
+
+    let error = AcroFormDocumentHelper::new(&mut pdf)
+        .err()
+        .expect("warning sink failure must propagate from analyze");
+    assert!(matches!(error, Error::System(message) if message == "warning sink failed"));
 }
