@@ -256,6 +256,8 @@ eight-case qpdf 11.9.0 helper differential.
 
 `flpdf-25kg.2.5.12` では、qpdf の `makeIndirectObject` が `nextObjGen` → `getObjectCount` → `fixDanglingReferences` の順で新規番号を決める契約 (`QPDF.cc:1239-1294,1872-1901`) を `Pdf::make_indirect_object_handle` の allocation boundary に適用した。repairで再構築されるobjectがある場合も、canonical resolverを先に準備してから既存の番号走査を行うため、recovered objectとの番号衝突を起こさない。
 
+`flpdf-25kg.2.5.11` では qpdf `test_driver.cc:2025-2041` の test 53を、`Pdf::make_indirect_object_handle`、live Root handle mutation、`Pdf::get_all_objects`、および `PdfWriter::set_preserve_unreferenced_objects` のcanonical経路へ接続した。repair中に発生するdiagnosticsは `emit_new_diagnostics` で最初のobject出力前にflushし、qpdfのobject enumerationとwriter比較を同じdriver consumerで検証する。
+
 ### `test_driver` test 62 の整数幅アクセサ
 
 qpdf `test_driver.cc:2262-2287` の `getUIntValue` / `getIntValueAsInt` /

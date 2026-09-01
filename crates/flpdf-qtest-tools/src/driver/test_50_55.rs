@@ -329,25 +329,39 @@ pub(crate) fn run_test_52<R: Read + Seek>(
 /// test_driver.cc:2024-2041 (`test_53`). Get-all-objects and dangling-ref
 /// handling.
 pub(crate) fn run_test_53<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDF::makeIndirectObject): the entire body depends on it for its
-    // very first printed line (`"new object: " << new_obj.unparse() <<
-    // std::endl`) -- qpdf allocates a fresh object number from its own
-    // internal object cache (`libqpdf/QPDF.cc`), not from the trailer
-    // `/Size` or any other document-visible counter, so it cannot be
-    // emulated by picking an unused number and calling a replacement API.
-    // flpdf's `Pdf` exposes no public equivalent (only `version`/
-    // `trailer`/`trailer_handle`/`trailer_key_handle`/`root_ref`; the
-    // private `next_object_ref` helper in `page_form_xobject.rs` is
-    // crate-internal and unreachable here). The subsequent
-    // `pdf.getAllObjects()` loop (`QPDF::getAllObjects`) has no public
-    // equivalent either, so nothing in this test can produce real output.
+    // qpdf allocates the next generation-zero object through its document.
+    // getRoot() (libqpdf/QPDF.cc:2355-2367) accepts a direct or indirect
+    // /Root dictionary, so use the live root handle rather than requiring
+    // an indirect object identity.
+    let root = pdf.root_handle()?;
+
+    let new_object = pdf.make_indirect_object_handle(ObjectHandle::string(b"potato".to_vec()))?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    stdout.write_all(b"new object: ")?;
+    stdout.write_all(&new_object.unparse())?;
+    stdout.write_all(b"\n")?;
+
+    root.replace_key(b"/Q1", new_object)?;
+    pdf.mark_object_handle_dirty(&root)?;
+
+    writeln!(stdout, "all objects")?;
+    for object in pdf.get_all_objects()? {
+        stdout.write_all(&object.unparse())?;
+        stdout.write_all(b"\n")?;
+    }
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.write()?;
     Ok(())
 }
 
