@@ -184,6 +184,7 @@ pub(crate) struct AcroFormCache {
     annotation_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
     field_to_annotations: HashMap<ObjectHandleIdentity, Vec<ObjectHandle>>,
     field_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
+    direct_orphan_field: Option<ObjectHandle>,
     field_to_name: HashMap<ObjectHandleIdentity, String>,
     name_to_fields: BTreeMap<String, Vec<ObjectHandle>>,
 }
@@ -418,6 +419,72 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .and_then(|field| field.object_ref()))
     }
 
+    /// Return qpdf's terminal form fields as live object handles in
+    /// `QPDFObjGen` order.
+    ///
+    /// This is the handle-native counterpart of
+    /// `QPDFAcroFormDocumentHelper::getFormFields`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:163-171`). The result contains
+    /// only fields represented by the canonical `field_to_annotations` cache:
+    /// intermediate field-tree nodes are omitted, while orphan Widgets found
+    /// on pages are included as self-associated fields by the helper's
+    /// qpdf-compatible analysis pass. A direct orphan Widget has qpdf's
+    /// `QPDFObjGen(0, 0)` identity; matching qpdf's `QPDF::getObject(0, 0)`
+    /// projection, it appears as one null field handle and is retrievable
+    /// through [`Self::get_annotations_for_field`].
+    /// Handles remain attached to the document's canonical object registry, so
+    /// mutations through a returned handle are visible to later consumers.
+    pub fn get_form_fields(&mut self) -> Result<Vec<ObjectHandle>> {
+        self.analyze()?;
+        let has_direct_orphan = {
+            let cache = self.cache.borrow();
+            cache
+                .as_ref()
+                .expect("analyze always installs an AcroForm cache")
+                .direct_orphan_field
+                .is_some()
+        };
+        let mut fields: Vec<_> = self.form_field_handles()?.into_values().collect();
+        if has_direct_orphan {
+            // The qpdf map key for every direct object is QPDFObjGen(0, 0),
+            // which sorts before all indirect field keys and is materialized
+            // by QPDF::getObject(0, 0) as a null helper.
+            fields.insert(0, ObjectHandle::null());
+        }
+        Ok(fields)
+    }
+
+    /// Return the live Widget annotation handles associated with a terminal
+    /// field, preserving qpdf's field-tree traversal order.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::getAnnotationsForField`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:186-195`). An unknown field
+    /// returns an empty vector, matching qpdf's map lookup. A null handle from
+    /// [`Self::get_form_fields`] selects the `QPDFObjGen(0, 0)` bucket used for
+    /// direct orphan Widgets.
+    pub fn get_annotations_for_field(&mut self, field: ObjectHandle) -> Result<Vec<ObjectHandle>> {
+        self.analyze()?;
+        if field.object_ref().is_none() && field.is_null() {
+            let cache = self.cache.borrow();
+            return Ok(cache
+                .as_ref()
+                .expect("analyze always installs an AcroForm cache")
+                .direct_orphan_field
+                .iter()
+                .cloned()
+                .collect());
+        }
+        let field = self.pdf.resolve_handle(&field)?;
+        let cache = self.cache.borrow();
+        Ok(cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache")
+            .field_to_annotations
+            .get(&field.identity_key())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Return the Widget annotations listed by a page, preserving their live
     /// handles for qpdf-shaped consumers.
     ///
@@ -425,7 +492,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage`, which is a
     /// thin delegation to `QPDFPageObjectHelper::getAnnotations("/Widget")`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-201`).
-    pub(crate) fn get_widget_annotations_for_page(
+    pub fn get_widget_annotations_for_page(
         &mut self,
         page_ref: ObjectRef,
     ) -> Result<Vec<ObjectHandle>> {
@@ -439,7 +506,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// `QPDFAcroFormDocumentHelper::getFieldForAnnotation` for a Widget that
     /// cannot be associated with a field. The analysis itself supplies qpdf's
     /// orphan-Widget self-association when possible.
-    pub(crate) fn get_field_for_annotation_handle(
+    pub fn get_field_for_annotation_handle(
         &mut self,
         annotation: ObjectHandle,
     ) -> Result<ObjectHandle> {
@@ -530,10 +597,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     for annotation in widgets {
                         let annotation = self.pdf.resolve_handle(&annotation)?;
                         let identity = annotation.identity_key();
-                        if !cache.annotation_to_field.contains_key(&identity) {
+                        let already_associated = if annotation.object_ref().is_none() {
+                            // qpdf indexes direct objects by QPDFObjGen(0, 0),
+                            // so distinct direct orphan Widgets share one
+                            // association bucket.
+                            cache.direct_orphan_field.is_some()
+                        } else {
+                            cache.annotation_to_field.contains_key(&identity)
+                        };
+                        if !already_associated {
                             annotation.warn_if_possible(
                                 "this widget annotation is not reachable from /AcroForm in the document catalog",
                             )?;
+                            if annotation.object_ref().is_none() {
+                                cache.direct_orphan_field = Some(annotation.clone());
+                            }
                             record_association(&mut cache, annotation.clone(), annotation);
                         }
                     }
@@ -572,6 +650,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             for field in fields {
                 self.traverse_field_handles(field, None, 0, &mut visited, &mut cache)?;
             }
+        } else {
+            // qpdf replaces a malformed /Fields value with an empty array
+            // after warning through the live /AcroForm object
+            // (`QPDFAcroFormDocumentHelper.cc:247-254`). Keep the warning at
+            // this canonical analysis boundary so every consumer observes it.
+            acroform.warn_if_possible(
+                "/Fields key of /AcroForm dictionary is not an array; ignoring",
+            )?;
         }
         Ok(Some(cache))
     }
@@ -1506,9 +1592,16 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
         self.analyze()?;
         let cache = self.cache.borrow();
-        Ok(cache
+        let cache = cache
             .as_ref()
-            .expect("analyze always installs an AcroForm cache")
+            .expect("analyze always installs an AcroForm cache");
+        if annotation.object_ref().is_none() {
+            // qpdf's annotation_to_field map uses the shared
+            // QPDFObjGen(0, 0) key for every direct orphan Widget. A later
+            // direct Widget therefore resolves to the first orphan field.
+            return Ok(cache.direct_orphan_field.clone());
+        }
+        Ok(cache
             .annotation_to_field
             .get(&annotation.identity_key())
             .cloned())

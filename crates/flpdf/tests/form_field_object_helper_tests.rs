@@ -784,6 +784,24 @@ fn parent_returns_none_for_a_null_parent() {
 }
 
 #[test]
+fn get_parent_warns_before_returning_a_null_handle_for_a_non_dictionary_field() {
+    let bytes = doc(vec![(10, "42".into())]);
+    let mut pdf = open(bytes);
+    pdf.set_suppress_warnings(true);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert!(field
+        .get_parent()
+        .expect("get parent from non-dictionary field")
+        .is_null());
+    assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+        diagnostic.message.contains(
+            "operation for dictionary attempted on object of type integer: returning null for attempted key retrieval",
+        )
+    }));
+}
+
+#[test]
 fn is_null_resolves_a_multi_hop_field_holder_to_its_terminal_value() {
     let bytes = doc(vec![(10, "null".into())]);
     let mut pdf = open(bytes);

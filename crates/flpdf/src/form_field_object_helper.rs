@@ -102,7 +102,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Construct a helper from a live field handle, preserving direct-object
     /// identity for qpdf's orphan-Widget fallback.
-    pub(crate) fn from_object_handle(field: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+    pub fn from_object_handle(field: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
         Self {
             field_ref: field.object_ref(),
             field,
@@ -119,6 +119,23 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Return this field's direct `/Parent` reference, if present.
     pub fn parent(&mut self) -> Result<Option<ObjectRef>> {
         self.direct_parent(self.field.clone())
+    }
+
+    /// Return this field's parent as a live object handle, or a null handle
+    /// when no parent exists.
+    ///
+    /// Mirrors `QPDFFormFieldObjectHelper::getParent`
+    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:30-33`). Unlike the ref-valued
+    /// [`Self::parent`] projection, this preserves the qpdf helper's direct
+    /// object identity for callers that continue traversing the field tree.
+    pub fn get_parent(&mut self) -> Result<ObjectHandle> {
+        // `QPDFFormFieldObjectHelper::getParent` delegates directly to
+        // `QPDFObjectHandle::getKey`, which resolves only the receiver and
+        // leaves the returned child lazy (`QPDFFormFieldObjectHelper.cc:30-33`,
+        // `QPDFObjectHandle.cc:978-988`). `try_get_key` preserves both the
+        // contextual type warning for a non-dictionary receiver and the live
+        // child identity for the next parent-chain iteration.
+        self.field.try_get_key(b"/Parent")
     }
 
     /// Return the top-level field and whether it differs from this field.

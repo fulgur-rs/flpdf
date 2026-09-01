@@ -2,8 +2,9 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::{
-    Error, Matrix, NameTree, NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper,
-    PageDocumentHelper, PageLabelDocumentHelper, Pdf, PdfWriter, Rectangle,
+    AcroFormDocumentHelper, AnnotationObjectHelper, Error, FormFieldObjectHelper, Matrix, NameTree,
+    NumberTree, ObjectHandle, ObjectHandleMatrix, OutlineDocumentHelper, PageDocumentHelper,
+    PageLabelDocumentHelper, Pdf, PdfWriter, Rectangle,
 };
 
 use super::{emit_new_diagnostics, format_nntree_exception};
@@ -281,88 +282,274 @@ pub(crate) fn run_test_42<R: Read + Seek>(
 
 pub(crate) fn run_test_43<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // qpdf 11.9.0 qpdf/test_driver.cc:1551-1609.
-    //
-    // `hasAcroForm()` is `getRoot().hasKey("/AcroForm")`
-    // (`libqpdf/QPDFAcroFormDocumentHelper.cc:32-34`). qpdf's `hasKey`
-    // treats a key resolving to null the same as a missing key
-    // (`libqpdf/QPDF_Dictionary.cc:98-100`, the same rule `test_0_1.rs`
-    // documents for `/QTest`), so this chases `/AcroForm` to its terminal
-    // value rather than using `ObjectHandle::has_key` (raw map presence
-    // only).
-    let has_acroform = match pdf.root_ref() {
-        Some(root_ref) => {
-            let root = pdf.get_object_handle(root_ref);
-            pdf.resolve(&root)?;
-            let root = root.clone();
-            let acroform = root.get_key(b"/AcroForm");
-            pdf.resolve(&acroform)?;
-            !acroform.is_null()
-        }
-        None => false,
+    // Constructing the helper performs qpdf's eager analyze() pass, so drain
+    // its warnings before emitting the first test line just as qpdf's logger
+    // does before the field loop.
+    let (has_acroform, fields) = {
+        let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+        let has_acroform = acroform.has_acro_form()?;
+        let fields = if has_acroform {
+            acroform.get_form_fields()?
+        } else {
+            Vec::new()
+        };
+        (has_acroform, fields)
     };
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     if !has_acroform {
         writeln!(stdout, "no forms")?;
         return Ok(());
     }
 
     writeln!(stdout, "iterating over form fields")?;
-    // GAP(QPDFAcroFormDocumentHelper::getFormFields, ::getAnnotationsForField):
-    // qpdf's `getFormFields()` returns the fields reached while traversing
-    // `/AcroForm`'s widget-annotation graph, keyed by
-    // `m->field_to_annotations` -- a `std::map<QPDFObjGen, ...>`
-    // (`include/qpdf/QPDFAcroFormDocumentHelper.hh`), so both membership
-    // (fields with no associated widget annotation are excluded; orphan
-    // widgets are promoted to their own field) and order (by object number)
-    // differ from flpdf's `AcroFormDocumentHelper::fields()`, which returns
-    // every `/Fields`-tree node in raw `/Fields` array preorder. Using
-    // `fields()` here would silently iterate a different, differently
-    // ordered set of fields than qpdf's real loop, so the field-listing
-    // loop is skipped rather than approximated.
+    for field in fields {
+        write!(stdout, "Field: ")?;
+        write_bytes(stdout, &field.unparse())?;
+        writeln!(stdout)?;
+
+        let mut node = field.clone();
+        while !node.is_null() {
+            let parent = FormFieldObjectHelper::from_object_handle(node, pdf).get_parent()?;
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            if parent.is_null() {
+                writeln!(stdout, "  Parent: none")?;
+                break;
+            }
+            write!(stdout, "  Parent: ")?;
+            write_bytes(stdout, &parent.unparse())?;
+            writeln!(stdout)?;
+            node = parent;
+        }
+
+        let fully_qualified_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.fully_qualified_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Fully qualified name: {fully_qualified_name}")?;
+
+        let partial_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.partial_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Partial name: {partial_name}")?;
+
+        let alternative_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.alternative_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Alternative name: {alternative_name}")?;
+
+        let mapping_name = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.mapping_name()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Mapping name: {mapping_name}")?;
+
+        let field_type = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.field_type()?.unwrap_or_default()
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write!(stdout, "  Field type: ")?;
+        write_bytes(stdout, &field_type)?;
+        writeln!(stdout)?;
+
+        let value = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.value()?.unwrap_or_else(ObjectHandle::null)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write!(stdout, "  Value: ")?;
+        write_bytes(stdout, &value.unparse())?;
+        writeln!(stdout)?;
+
+        let value_as_string = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.value_as_string()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Value as string: {value_as_string}")?;
+
+        let default_value = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper
+                .default_value()?
+                .unwrap_or_else(ObjectHandle::null)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        write!(stdout, "  Default value: ")?;
+        write_bytes(stdout, &default_value.unparse())?;
+        writeln!(stdout)?;
+
+        let default_value_as_string = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.default_value_as_string()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(
+            stdout,
+            "  Default value as string: {default_value_as_string}"
+        )?;
+
+        let default_appearance = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.default_appearance()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Default appearance: {default_appearance}")?;
+
+        let quadding = {
+            let mut field_helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            field_helper.quadding()?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        writeln!(stdout, "  Quadding: {quadding}")?;
+
+        let annotations = {
+            let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+            acroform.get_annotations_for_field(field.clone())?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+        for annotation in annotations {
+            write!(stdout, "  Annotation: ")?;
+            write_bytes(stdout, &annotation.unparse())?;
+            writeln!(stdout)?;
+        }
+    }
 
     writeln!(stdout, "iterating over annotations per page")?;
-    // GAP(QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage,
-    // ::getFieldForAnnotation; QPDFAnnotationObjectHelper::getAppearanceState,
-    // ::getAppearanceStream): no flpdf equivalent exists for looking up the
-    // widget annotations on a page or the field that owns a given
-    // annotation (both rely on the same `field_to_annotations`/
-    // `annotation_to_field` analysis gapped above), nor for an annotation's
-    // appearance state or named appearance stream. The per-page annotation
-    // loop is skipped.
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    for page_ref in pages {
+        let page = pdf.get_object_handle(page_ref);
+        write!(stdout, "Page: ")?;
+        write_bytes(stdout, &page.unparse())?;
+        writeln!(stdout)?;
+
+        let annotations = {
+            let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+            acroform.get_widget_annotations_for_page(page_ref)?
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        for annotation in annotations {
+            write!(stdout, "  Annotation: ")?;
+            write_bytes(stdout, &annotation.unparse())?;
+            writeln!(stdout)?;
+
+            let field = {
+                let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+                acroform.get_field_for_annotation_handle(annotation.clone())?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            write!(stdout, "    Field: ")?;
+            write_bytes(stdout, &field.unparse())?;
+            writeln!(stdout)?;
+
+            let subtype = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_subtype()?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            write!(stdout, "    Subtype: /")?;
+            write_bytes(stdout, &subtype)?;
+            writeln!(stdout)?;
+
+            let rect = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_rect()?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            writeln!(
+                stdout,
+                "    Rect: [{}, {}, {}, {}]",
+                rect.llx, rect.lly, rect.urx, rect.ury
+            )?;
+
+            let state = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_appearance_state()?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            if !state.is_empty() {
+                write!(stdout, "    Appearance state: /")?;
+                write_bytes(stdout, &state)?;
+                writeln!(stdout)?;
+            }
+
+            let normal_appearance = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+                annotation_helper.get_appearance_stream(b"N", None)?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            write!(stdout, "    Appearance stream (/N): ")?;
+            write_bytes(stdout, &normal_appearance.unparse())?;
+            writeln!(stdout)?;
+
+            let state_appearance = {
+                let mut annotation_helper =
+                    AnnotationObjectHelper::from_object_handle(annotation, pdf);
+                annotation_helper.get_appearance_stream(b"N", Some(b"3"))?
+            };
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            write!(stdout, "    Appearance stream (/N, /3): ")?;
+            write_bytes(stdout, &state_appearance.unparse())?;
+            writeln!(stdout)?;
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn run_test_44<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // qpdf 11.9.0 qpdf/test_driver.cc:1611-1629.
-    //
-    // GAP(QPDFAcroFormDocumentHelper::getFormFields): as in test_43, qpdf's
-    // `getFormFields()` (membership + order via `m->field_to_annotations`)
-    // has no flpdf equivalent; `AcroFormDocumentHelper::fields()` walks a
-    // different set in a different order. Using it here would set `/V` on a
-    // different, differently ordered set of fields than qpdf's real
-    // `setV`/"Set field value" loop, so that loop (and its "Set field
-    // value: ..." lines) is skipped rather than approximated. The write
-    // below therefore serializes the document exactly as opened, without
-    // qpdf's field-value mutations.
+    let fields = {
+        let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+        acroform.get_form_fields()?
+    };
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    for field in fields {
+        let mut field_helper = FormFieldObjectHelper::from_object_handle(field, pdf);
+        if field_helper.field_type()?.as_deref() == Some(b"/Tx") {
+            field_helper.set_value_string("3.14 ÷ 0", true)?;
+            writeln!(
+                stdout,
+                "Set field value: {} -> {}",
+                field_helper.fully_qualified_name()?,
+                field_helper.value_as_string()?
+            )?;
+        }
+    }
+
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
     writer.set_qdf_mode(true);
     writer.set_static_id(true);
     writer.set_suppress_original_object_ids(true);
     writer.write()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 
@@ -935,10 +1122,20 @@ pub(crate) fn run_test_49<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{
-        chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, run_test_46,
+        chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, run_test_44, run_test_46,
         tree_string_value, write_nntree_error,
     };
-    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+    use flpdf::{AcroFormDocumentHelper, ObjectHandle, Pdf, PdfOpenOptions};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         Pdf::open_mem_owned_with_options(
@@ -946,6 +1143,203 @@ mod tests {
             PdfOpenOptions::default(),
         )
         .expect("open minimal fixture")
+    }
+
+    fn pdf_with_form_fields_and_widgets() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects: &[(u32, &[u8])] = &[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /AcroForm 20 0 R >>",
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R 6 0 R] >>",
+            ),
+            (
+                4,
+                b"<< /FT /Tx /T (alpha) /V (old) /DV (default) /DA (field-da) /Q 2 /Subtype /Widget /Rect [1 2 3 4] /AS /On /AP << /N << /On 8 0 R /3 9 0 R >> >> >>",
+            ),
+            (5, b"<< /T (group) /Kids [6 0 R] >>"),
+            (
+                6,
+                b"<< /Parent 5 0 R /FT /Tx /T (child) /V (value) /DV (dvalue) /Subtype /Widget /Rect [5 6 7 8] /AS /Off /AP << /N << /Off 10 0 R >> >> >>",
+            ),
+            (8, b"<< /Length 0 >>\nstream\n\nendstream"),
+            (9, b"<< /Length 0 >>\nstream\n\nendstream"),
+            (10, b"<< /Length 0 >>\nstream\n\nendstream"),
+            (20, b"<< /Fields [4 0 R 5 0 R] /DA (acro-da) /Q 1 >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for &(number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        let size = objects.last().expect("form fixture objects").0 + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..size {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned_with_options(bytes, PdfOpenOptions::default())
+            .expect("open form fixture")
+    }
+
+    fn pdf_with_non_array_form_fields() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (4, b"<< /Fields 5 0 R >>"),
+            (5, b"42"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for &(number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        let size = objects.last().expect("malformed form fixture objects").0 + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..size {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "form-bad-fields-array.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open malformed form fixture")
+    }
+
+    fn pdf_with_non_dictionary_field_parent() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [6 0 R] >>",
+            ),
+            (4, b"<< /Fields [6 0 R] >>"),
+            (5, b"42"),
+            (
+                6,
+                b"<< /Parent 5 0 R /FT /Tx /T (child) /Subtype /Widget /Rect [1 2 3 4] >>",
+            ),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for &(number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        let size = objects.last().expect("parent fixture objects").0 + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..size {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "form-parent-error.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open non-dictionary parent fixture")
+    }
+
+    fn pdf_with_direct_orphan_widget() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects: &[(u32, &[u8])] = &[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] >> << /Type /Annot /Subtype /Widget /Rect [20 20 30 30] >>] >>",
+            ),
+            (4, b"<< /Fields [] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for &(number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        let size = objects.last().expect("direct orphan fixture objects").0 + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..size {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "direct-orphan.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open direct orphan fixture")
     }
 
     fn pdf_with_object_types_qtest() -> Vec<u8> {
@@ -1154,6 +1548,210 @@ mod tests {
         .expect("run test 43");
         assert_eq!(stdout, b"no forms\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_43_executes_terminal_field_and_widget_consumers() {
+        let mut pdf = pdf_with_form_fields_and_widgets();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_43(
+            &mut pdf,
+            b"form-consumer.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 43");
+
+        assert_eq!(
+            stdout,
+            concat!(
+                "iterating over form fields\n",
+                "Field: 4 0 R\n",
+                "  Parent: none\n",
+                "  Fully qualified name: alpha\n",
+                "  Partial name: alpha\n",
+                "  Alternative name: alpha\n",
+                "  Mapping name: alpha\n",
+                "  Field type: /Tx\n",
+                "  Value: (old)\n",
+                "  Value as string: old\n",
+                "  Default value: (default)\n",
+                "  Default value as string: default\n",
+                "  Default appearance: field-da\n",
+                "  Quadding: 2\n",
+                "  Annotation: 4 0 R\n",
+                "Field: 6 0 R\n",
+                "  Parent: 5 0 R\n",
+                "  Parent: none\n",
+                "  Fully qualified name: group.child\n",
+                "  Partial name: child\n",
+                "  Alternative name: group.child\n",
+                "  Mapping name: group.child\n",
+                "  Field type: /Tx\n",
+                "  Value: (value)\n",
+                "  Value as string: value\n",
+                "  Default value: (dvalue)\n",
+                "  Default value as string: dvalue\n",
+                "  Default appearance: acro-da\n",
+                "  Quadding: 1\n",
+                "  Annotation: 6 0 R\n",
+                "iterating over annotations per page\n",
+                "Page: 3 0 R\n",
+                "  Annotation: 4 0 R\n",
+                "    Field: 4 0 R\n",
+                "    Subtype: /Widget\n",
+                "    Rect: [1, 2, 3, 4]\n",
+                "    Appearance state: /On\n",
+                "    Appearance stream (/N): 8 0 R\n",
+                "    Appearance stream (/N, /3): 9 0 R\n",
+                "  Annotation: 6 0 R\n",
+                "    Field: 6 0 R\n",
+                "    Subtype: /Widget\n",
+                "    Rect: [5, 6, 7, 8]\n",
+                "    Appearance state: /Off\n",
+                "    Appearance stream (/N): 10 0 R\n",
+                "    Appearance stream (/N, /3): null\n"
+            )
+            .as_bytes()
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_43_reports_a_non_array_acroform_fields_warning() {
+        let mut pdf = pdf_with_non_array_form_fields();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_43(
+            &mut pdf,
+            b"form-bad-fields-array.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 43");
+
+        assert!(stderr
+            .windows(b"/Fields key of /AcroForm dictionary is not an array; ignoring\n".len())
+            .any(|window| {
+                window == b"/Fields key of /AcroForm dictionary is not an array; ignoring\n"
+            }));
+    }
+
+    #[test]
+    fn test_43_flushes_warnings_raised_during_field_consumption() {
+        let mut pdf = pdf_with_non_dictionary_field_parent();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_43(
+            &mut pdf,
+            b"form-parent-error.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 43");
+
+        assert!(stderr.windows(
+            b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n".len()
+        ).any(|window| {
+            window
+                == b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n"
+        }));
+    }
+
+    #[test]
+    fn get_form_fields_preserves_qpdf_zero_objgen_orphan_membership() {
+        let mut pdf = pdf_with_direct_orphan_widget();
+        let (fields, annotations, widgets, first_field, second_field) = {
+            let mut acroform = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+            let widgets = acroform
+                .get_widget_annotations_for_page(flpdf::ObjectRef::new(3, 0))
+                .expect("get page widgets");
+            assert_eq!(widgets.len(), 2);
+            let first_field = acroform
+                .get_field_for_annotation_handle(widgets[0].clone())
+                .expect("get first orphan field");
+            let second_field = acroform
+                .get_field_for_annotation_handle(widgets[1].clone())
+                .expect("get second orphan field");
+            let fields = acroform.get_form_fields().expect("get form fields");
+            let annotations = acroform
+                .get_annotations_for_field(ObjectHandle::null())
+                .expect("get orphan annotations");
+            (fields, annotations, widgets, first_field, second_field)
+        };
+
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].is_null());
+        assert_eq!(annotations.len(), 1);
+        assert!(annotations[0].object_ref().is_none());
+        assert_eq!(widgets.len(), 2);
+        assert!(first_field.is_same_object_as(&annotations[0]));
+        assert!(second_field.is_same_object_as(&first_field));
+    }
+
+    #[test]
+    fn test_44_mutates_live_text_fields_and_writes_qdf() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = pdf_with_form_fields_and_widgets();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_44(
+            &mut pdf,
+            b"form-consumer.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 44");
+
+        assert_eq!(
+            stdout,
+            b"Set field value: alpha -> 3.14 \xc3\xb7 0\n\
+Set field value: group.child -> 3.14 \xc3\xb7 0\n"
+        );
+        assert!(stderr.is_empty());
+
+        let written = std::fs::read("a.pdf").expect("test 44 output");
+        let mut written = Pdf::open_mem_owned(written).expect("reopen test 44 output");
+        let fields = {
+            let mut acroform =
+                flpdf::AcroFormDocumentHelper::new(&mut written).expect("reopen AcroForm helper");
+            acroform
+                .get_form_fields()
+                .expect("read written form fields")
+        };
+        assert_eq!(fields.len(), 2);
+        for field in fields {
+            let mut field = flpdf::FormFieldObjectHelper::from_object_handle(field, &mut written);
+            assert_eq!(
+                field.value_as_string().expect("read updated field"),
+                "3.14 ÷ 0"
+            );
+        }
     }
 
     #[test]
