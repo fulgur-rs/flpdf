@@ -91,7 +91,11 @@ flpdf dump-object 7 0 input.pdf             # dump one indirect object
 flpdf qdf      input.pdf  out.qdf           # qdf-style flat dump
 flpdf rewrite  input.pdf  out.pdf           # fresh full rewrite
 flpdf rewrite --linearize    in.pdf out.pdf # produce a linearized PDF
+flpdf zlib-flate -compress < in.bin > out.z # raw zlib compression (stdin/stdout)
 ```
+
+The `zlib-flate` subcommand also ships as a standalone `zlib-flate` binary
+alias. It accepts qpdf's `-uncompress`, `-compress`, and `-compress=n` forms.
 
 Encrypted inputs are supported via `--password`, `--password-file`, and
 `--password-mode {auto,bytes,hex-bytes,unicode}` (the `unicode` mode validates

@@ -26,6 +26,11 @@ name = "flpdf"
 path = "src/main.rs"
 doc = false
 
+[[bin]]
+name = "zlib-flate"
+path = "src/main.rs"
+doc = false
+
 [features]
 default = []
 # Opt-in: build the `flpdf` binary against flpdf's zlib deflate backend so its

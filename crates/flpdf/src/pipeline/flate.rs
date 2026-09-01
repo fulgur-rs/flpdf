@@ -17,9 +17,12 @@ static COMPRESSION_LEVEL: AtomicI32 = AtomicI32::new(-1);
 #[cfg(test)]
 pub(crate) static COMPRESSION_LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The zlib operation performed by [`PlFlate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FlateAction {
+pub enum FlateAction {
+    /// Decode a zlib stream.
     Inflate,
+    /// Encode a zlib stream.
     Deflate,
 }
 
@@ -81,6 +84,7 @@ pub(crate) struct Flate<'a> {
     identifier: String,
     next: PipelineRef<'a>,
     action: FlateAction,
+    compression_level: Option<i32>,
     codec: Option<FlateCodec>,
     inflate_state: InflateState,
     finished: bool,
@@ -94,6 +98,16 @@ impl<'a> Flate<'a> {
         next: impl Into<PipelineRef<'a>>,
         action: FlateAction,
         out_buffer_size: usize,
+    ) -> PipelineResult<Self> {
+        Self::new_with_compression_level(identifier, next, action, out_buffer_size, None)
+    }
+
+    fn new_with_compression_level(
+        identifier: impl Into<String>,
+        next: impl Into<PipelineRef<'a>>,
+        action: FlateAction,
+        out_buffer_size: usize,
+        compression_level: Option<i32>,
     ) -> PipelineResult<Self> {
         let identifier = identifier.into();
         if out_buffer_size == 0 {
@@ -111,6 +125,7 @@ impl<'a> Flate<'a> {
             identifier,
             next: next.into(),
             action,
+            compression_level,
             codec: None,
             inflate_state: InflateState::new(),
             finished: false,
@@ -151,22 +166,30 @@ impl<'a> Flate<'a> {
         Ok(true)
     }
 
-    fn initialize_codec(&mut self) {
+    fn initialize_codec(&mut self) -> PipelineResult<()> {
         if self.codec.is_some() {
-            return;
+            return Ok(());
         }
         self.codec = Some(match self.action {
             FlateAction::Inflate => FlateCodec::Inflate(Decompress::new(false)),
             FlateAction::Deflate => {
-                let level = COMPRESSION_LEVEL.load(Ordering::Relaxed);
-                let compression = if level == -1 {
-                    Compression::default()
-                } else {
-                    Compression::new(level as u32)
+                let level = self
+                    .compression_level
+                    .unwrap_or_else(|| COMPRESSION_LEVEL.load(Ordering::Relaxed));
+                let compression = match level {
+                    -1 => Compression::default(),
+                    0..=9 => Compression::new(level as u32),
+                    _ => {
+                        return Err(PipelineError::runtime(format!(
+                            "{}: deflate: Init: zlib stream error",
+                            self.identifier
+                        )))
+                    }
                 };
                 FlateCodec::Deflate(Compress::new(compression, true))
             }
         });
+        Ok(())
     }
 
     fn zlib_format_error(&self, detail: &'static str) -> PipelineError {
@@ -392,7 +415,7 @@ impl Pipeline for Flate<'_> {
             return Ok(());
         }
 
-        self.initialize_codec();
+        self.initialize_codec()?;
         self.process_codec(data, false)
     }
 
@@ -415,9 +438,93 @@ impl Pipeline for Flate<'_> {
     }
 }
 
+/// Public qpdf-shaped `Pl_Flate` pipeline.
+///
+/// qpdf exposes `Pl_Flate` to standalone tools such as `zlib-flate`, while
+/// the writer's internal pipeline also needs the same codec. This wrapper
+/// exposes only the public qpdf consumer boundary and keeps the ownership
+/// adapter (`PipelineRef`) private to the crate.
+pub struct PlFlate<'a> {
+    inner: Flate<'a>,
+}
+
+impl<'a> PlFlate<'a> {
+    /// Construct a zlib pipeline with qpdf's default 65,536-byte output buffer.
+    pub fn new(
+        identifier: impl Into<String>,
+        next: &'a mut dyn Pipeline,
+        action: FlateAction,
+    ) -> PipelineResult<Self> {
+        Self::new_with_buffer_size(identifier, next, action, DEFAULT_OUT_BUFFER_SIZE)
+    }
+
+    /// Construct a zlib pipeline with an explicit output buffer size.
+    pub fn new_with_buffer_size(
+        identifier: impl Into<String>,
+        next: &'a mut dyn Pipeline,
+        action: FlateAction,
+        out_buffer_size: usize,
+    ) -> PipelineResult<Self> {
+        Ok(Self {
+            inner: Flate::new(identifier, next, action, out_buffer_size)?,
+        })
+    }
+
+    /// Construct a zlib pipeline with an explicit qpdf compression level.
+    ///
+    /// The level is validated lazily on the first non-empty deflate write,
+    /// matching qpdf's `Pl_Flate::setCompressionLevel` followed by zlib's
+    /// `deflateInit` timing. `-1` selects zlib's default level.
+    pub fn new_with_compression_level(
+        identifier: impl Into<String>,
+        next: &'a mut dyn Pipeline,
+        action: FlateAction,
+        compression_level: i32,
+    ) -> PipelineResult<Self> {
+        Ok(Self {
+            inner: Flate::new_with_compression_level(
+                identifier,
+                next,
+                action,
+                DEFAULT_OUT_BUFFER_SIZE,
+                Some(compression_level),
+            )?, // cov:ignore: the public constructor always uses its fixed valid default buffer size
+        })
+    }
+
+    /// Set qpdf's process-wide deflate compression level.
+    pub fn set_compression_level(level: i32) -> PipelineResult<()> {
+        Flate::set_compression_level(level)
+    }
+
+    /// Install qpdf's warning callback for inflate `Z_BUF_ERROR` conditions.
+    pub fn set_warn_callback(
+        &mut self,
+        callback: impl FnMut(&str, i32) -> PipelineResult<()> + 'a,
+    ) {
+        self.inner.set_warn_callback(callback);
+    }
+}
+
+impl Pipeline for PlFlate<'_> {
+    fn identifier(&self) -> &str {
+        self.inner.identifier()
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.inner.write(data)
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        self.inner.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Flate, FlateAction, BUF_ERROR_WARNING, COMPRESSION_LEVEL_TEST_LOCK, Z_BUF_ERROR};
+    use super::{
+        Flate, FlateAction, PlFlate, BUF_ERROR_WARNING, COMPRESSION_LEVEL_TEST_LOCK, Z_BUF_ERROR,
+    };
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use std::cell::{Cell, RefCell};
@@ -594,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn compression_level_accepts_qpdf_zlib_values() {
+    fn compression_level_setter_accepts_qpdf_zlib_values() {
         let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
         Flate::set_compression_level(-1).unwrap();
         Flate::set_compression_level(0).unwrap();
@@ -602,6 +709,54 @@ mod tests {
         Flate::set_compression_level(9).unwrap();
         assert!(Flate::set_compression_level(-2).is_err());
         assert!(Flate::set_compression_level(10).is_err());
+        Flate::set_compression_level(-1).unwrap();
+    }
+
+    #[test]
+    fn invalid_deflate_level_fails_at_first_nonempty_write_like_qpdf() {
+        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let mut sink = Buffer::new("sink", None);
+        let mut flate = Flate::new_with_compression_level(
+            "flate",
+            &mut sink,
+            FlateAction::Deflate,
+            8,
+            Some(10),
+        )
+        .unwrap();
+        let error = flate.write(b"payload").unwrap_err();
+        assert_eq!(error.message(), "flate: deflate: Init: zlib stream error");
+    }
+
+    #[test]
+    fn invalid_deflate_level_is_not_initialized_for_empty_input() {
+        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let mut sink = Buffer::new("sink", None);
+        let mut flate = Flate::new_with_compression_level(
+            "flate",
+            &mut sink,
+            FlateAction::Deflate,
+            8,
+            Some(10),
+        )
+        .unwrap();
+        flate.write(b"").unwrap();
+        flate.finish().unwrap();
+        drop(flate);
+        assert!(sink.take_buffer().unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_pl_flate_boundary_delegates_to_the_canonical_stage() {
+        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        PlFlate::set_compression_level(1).unwrap();
+        let mut sink = Buffer::new("sink", None);
+        let mut flate = PlFlate::new("public flate", &mut sink, FlateAction::Deflate).unwrap();
+        assert_eq!(flate.identifier(), "public flate");
+        flate.write(b"public boundary").unwrap();
+        flate.finish().unwrap();
+        drop(flate);
+        assert!(!sink.take_buffer().unwrap().is_empty());
         Flate::set_compression_level(-1).unwrap();
     }
 
