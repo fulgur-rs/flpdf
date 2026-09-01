@@ -330,11 +330,11 @@ pub(crate) fn run_test_52<R: Read + Seek>(
 /// handling.
 pub(crate) fn run_test_53<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // qpdf allocates the next generation-zero object through its document
     let root_ref = pdf
@@ -344,6 +344,7 @@ pub(crate) fn run_test_53<R: Read + Seek>(
     pdf.resolve(&root)?;
 
     let new_object = pdf.make_indirect_object_handle(ObjectHandle::string(b"potato".to_vec()))?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     stdout.write_all(b"new object: ")?;
     stdout.write_all(&new_object.unparse())?;
     stdout.write_all(b"\n")?;

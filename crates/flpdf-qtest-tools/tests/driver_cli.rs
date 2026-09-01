@@ -32,6 +32,41 @@ fn repairable_pdf() -> &'static str {
     )
 }
 
+fn malformed_recovery_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.3\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (
+            1,
+            b"<< /Type /Catalog /A 8 0 R /B 9 0 R /C 10 0 R >>".as_slice(),
+        ),
+        (2, b"<< >>".as_slice()),
+        (3, b"<< >>".as_slice()),
+        (4, b"<< >>".as_slice()),
+        (5, b"44".as_slice()),
+        (6, b"<< >>".as_slice()),
+        (7, b"[ /PDF ]".as_slice()),
+    ] {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    pdf.extend_from_slice(b"11 0 obj\n[ 12 0 R ]\nendobj\n");
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 8\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n0000010000 00000 n \n",
+            offsets[0], offsets[1], offsets[2], offsets[3], offsets[4], offsets[5]
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 const TEST_0_OUTPUT: &str = concat!(
     "/QTest is implicit\n",
     "/QTest is direct and has type null (2)\n",
@@ -187,6 +222,24 @@ fn test_53_emits_all_objects_and_writes_dangling_output() {
         directory.path().join("a.pdf").is_file(),
         "test 53 must write the preserve-unreferenced output"
     );
+}
+
+#[test]
+fn test_53_flushes_repair_diagnostics_before_object_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("damaged.pdf");
+    fs::write(&input, malformed_recovery_pdf()).expect("write damaged fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["53", input])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout(predicates::str::contains("new object: 13 0 R"))
+        .stderr(predicates::str::contains(
+            "Attempting to reconstruct cross-reference table",
+        ));
 }
 
 #[test]
