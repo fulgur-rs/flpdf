@@ -46,6 +46,10 @@ use std::path::{Path, PathBuf};
 pub struct SplitPageOptions {
     /// Number of source pages per output chunk.
     pub chunk_size: usize,
+    /// Signed qpdf job value, retained until `doSplitPages` reaches its
+    /// `QIntC::to_size` conversion. This is only populated by the job-JSON
+    /// boundary; the public split helper continues to accept a valid usize.
+    qpdf_chunk_size: Option<i32>,
     /// qpdf output filename pattern or literal output template.
     pub output_template: PathBuf,
     /// Original input path, when available, for qpdf's same-file guard.
@@ -64,12 +68,21 @@ impl SplitPageOptions {
     pub fn new(chunk_size: usize, output_template: impl Into<PathBuf>) -> Self {
         Self {
             chunk_size,
+            qpdf_chunk_size: None,
             output_template: output_template.into(),
             input_path: None,
             deterministic_id: false,
             writer_configuration: WriterConfiguration::default(),
             verbose: false,
         }
+    }
+
+    /// Retain qpdf's signed `splitPages` value until the split loop performs
+    /// its signed-to-unsigned conversion (`libqpdf/QPDFJob.cc:2970`).
+    #[must_use]
+    pub(crate) fn with_qpdf_chunk_size(mut self, chunk_size: i32) -> Self {
+        self.qpdf_chunk_size = Some(chunk_size);
+        self
     }
 
     /// Attach the original input path used by qpdf's overwrite guard.
@@ -99,6 +112,16 @@ impl SplitPageOptions {
         self.verbose = verbose;
         self
     }
+}
+
+fn qpdf_split_page_size(value: i32) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::System(format!(
+            "integer out of range converting {value} from a {}-byte signed type to a {}-byte unsigned type",
+            std::mem::size_of::<i32>(),
+            std::mem::size_of::<usize>(),
+        ))
+    })
 }
 
 impl QPDFJob {
@@ -134,13 +157,20 @@ impl QPDFJob {
         source: &mut Pdf<R>,
         options: SplitPageOptions,
     ) -> Result<Vec<PathBuf>> {
-        if options.chunk_size == 0 {
+        if options.qpdf_chunk_size.is_none() && options.chunk_size == 0 {
             return Err(Error::Unsupported(
                 "split_pages: chunk_size must be >= 1".to_owned(),
             ));
         }
-
         let pages = PageDocumentHelper::new(source).get_all_pages()?;
+        let chunk_size = options
+            .qpdf_chunk_size
+            .map_or(Ok(options.chunk_size), qpdf_split_page_size)?;
+        // The public constructor rejects zero before this point. The
+        // qpdf-specific setter is called only for a non-zero truthy job
+        // value, matching qpdf's `if (m->split_pages)` dispatch.
+        debug_assert_ne!(chunk_size, 0);
+
         // qpdf's doSplitPages has no page-count guard: `for (i = 0; i <
         // num_pages; i += m->split_pages)` trivially iterates zero times
         // when num_pages is 0, writing no chunks (confirmed live:
@@ -160,10 +190,8 @@ impl QPDFJob {
         let source_extension_level = source.adobe_extension_level().unwrap_or(0);
         let mut written = Vec::new();
 
-        for chunk_start in (0..page_count).step_by(options.chunk_size) {
-            let chunk_end = chunk_start
-                .saturating_add(options.chunk_size)
-                .min(page_count);
+        for chunk_start in (0..page_count).step_by(chunk_size) {
+            let chunk_end = chunk_start.saturating_add(chunk_size).min(page_count);
             // cov:ignore-start: page_count is bounded by the allocation above,
             // so these conversions cannot fail on supported targets.
             let first_page = u32::try_from(chunk_start + 1).map_err(|_| {
@@ -178,7 +206,7 @@ impl QPDFJob {
                 first_page,
                 last_page,
                 width,
-                options.chunk_size,
+                chunk_size,
             );
             if let Some(input_path) = options.input_path.as_deref() {
                 if same_file_if_existing(input_path, &output_path)? {

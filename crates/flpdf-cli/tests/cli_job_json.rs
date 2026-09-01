@@ -1600,6 +1600,30 @@ fn job_json_file_split_pages_writes_qpdf_named_chunks() {
 }
 
 #[test]
+fn job_json_file_split_pages_preserves_a_positive_chunk_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("split-two.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"split-two.pdf","splitPages":"2","staticId":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=split-two.json")
+        .assert()
+        .code(0);
+
+    assert_eq!(page_count(&directory.path().join("split-two-1-2.pdf")), 2);
+    assert_eq!(page_count(&directory.path().join("split-two-3-3.pdf")), 1);
+    assert!(!directory.path().join("split-two-1-1.pdf").exists());
+}
+
+#[test]
 fn job_json_file_split_pages_reports_each_chunk_filename_when_verbose() {
     // qpdf reports one "wrote file" line per real chunk from inside the
     // per-chunk split loop (`libqpdf/QPDFJob.cc:3019-3021`), never the
@@ -1784,16 +1808,15 @@ fn job_json_file_rotate_applies_to_the_selected_page() {
 }
 
 #[test]
-fn job_json_file_split_pages_rejects_a_negative_value() {
+fn job_json_file_split_pages_reports_qpdf_late_negative_conversion_error() {
     // Unlike a genuinely non-numeric value (which qpdf's strtoll silently
     // treats as 0, falling through to an unsplit write -- see
     // job_json_file_split_pages_non_numeric_value_falls_through_to_one_unsplit_output),
     // a negative value parses successfully in qpdf and is truthy in its
     // `if (m->split_pages)` checks, only failing later during the actual
     // split loop's unsigned narrowing conversion (libqpdf/QPDFJob.cc:2970).
-    // flpdf currently rejects it at parse time instead, a known tracked
-    // divergence in diagnostic text/path (not in whether the operation
-    // succeeds; both refuse) -- see flpdf-sp4g.
+    // The qpdf-shaped conversion error must be reported from the split path,
+    // not from the JSON parser.
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/three-page.pdf");
@@ -1811,8 +1834,9 @@ fn job_json_file_split_pages_rejects_a_negative_value() {
         .assert()
         .code(2)
         .stderr(predicates::str::contains(
-            ".splitPages: invalid page count -5",
+            "integer out of range converting -5 from a 4-byte signed type to a 8-byte unsigned type",
         ));
+    assert!(!directory.path().join("out.pdf").exists());
 }
 
 #[test]

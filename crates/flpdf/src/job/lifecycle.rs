@@ -124,7 +124,10 @@ struct JobConfiguration {
     check_linearization: bool,
     require_output: bool,
     progress: bool,
-    split_pages: Option<usize>,
+    /// qpdf stores this as a signed `int`, so a negative non-zero value must
+    /// survive configuration and fail only when the split loop converts it
+    /// to `size_t`.
+    split_pages: Option<i32>,
     /// qpdf's explicit `--keep-files-open=y|n` setting. `None` selects the
     /// automatic distinct-page-source threshold in `handle_page_specs`.
     keep_files_open: Option<bool>,
@@ -800,7 +803,7 @@ fn parse_qpdf_collate_parameter(parameter: &[u8]) -> Result<Vec<usize>> {
     Ok(values)
 }
 
-fn parse_job_split_pages(value: &[u8]) -> Result<usize> {
+fn parse_job_split_pages(value: &[u8]) -> Result<i32> {
     // qpdf's Config::splitPages treats an empty parameter as one page
     // (`libqpdf/QPDFJob_config.cc:597-609`); preserve that generated-handler
     // default instead of treating an empty JSON string as an absent option.
@@ -821,14 +824,12 @@ fn parse_job_split_pages(value: &[u8]) -> Result<usize> {
         // A negative value is truthy in qpdf's `if (m->split_pages)` check
         // and only fails later, inside the actual split loop, when qpdf
         // narrows it to an unsigned chunk size (`QIntC::to_size`,
-        // `libqpdf/QPDFJob.cc:2970`). Rejecting it here instead is a known,
-        // tracked residual divergence (flpdf-sp4g) -- it needs
-        // `configuration.split_pages` to hold a signed value so "truthy but
-        // not a usable chunk size" can be represented at all.
-        QpdfIntParse::Value(count) if count >= 0 => Ok(count as usize),
-        QpdfIntParse::Value(_) | QpdfIntParse::Overflow(_) => Err(Error::Usage(UsageError::new(
-            format!(".splitPages: invalid page count {text}"),
-        ))),
+        // `libqpdf/QPDFJob.cc:2970`). Preserve the signed value here so the
+        // split path can reproduce that late conversion error.
+        QpdfIntParse::Value(count) => Ok(count),
+        QpdfIntParse::Overflow(_) => Err(Error::Usage(UsageError::new(format!(
+            ".splitPages: invalid page count {text}"
+        )))),
     }
 }
 
@@ -1979,10 +1980,14 @@ impl QPDFJob {
             writer_configuration.set_linearization_pass1_filename(path.to_path_buf());
         }
         let progress_requested = self.configuration.progress;
-        let splitting = self.configuration.split_pages.is_some_and(|size| size > 0);
+        let splitting = self.configuration.split_pages.is_some_and(|size| size != 0);
         let write_result: Result<()> =
-            if let Some(chunk_size) = self.configuration.split_pages.filter(|size| *size > 0) {
-                let mut split_options = SplitPageOptions::new(chunk_size, output.clone())
+            if let Some(split_pages) = self.configuration.split_pages.filter(|size| *size != 0) {
+                // Keep the signed qpdf value until the split implementation has
+                // reached the same page-boundary conversion as
+                // `QIntC::to_size(m->split_pages)` (`libqpdf/QPDFJob.cc:2970`).
+                let mut split_options = SplitPageOptions::new(1, output.clone())
+                    .with_qpdf_chunk_size(split_pages)
                     .with_writer_configuration(writer_configuration.clone())
                     .with_verbose(self.configuration.verbose);
                 if let Some(input) = self.configuration.input_file.clone() {
@@ -2592,7 +2597,7 @@ impl QPDFJob {
             if self.configuration.empty_input {
                 return Err(UsageError::new("--replace-input may not be used with --empty").into());
             }
-            if self.configuration.split_pages.is_some_and(|size| size > 0) {
+            if self.configuration.split_pages.is_some_and(|size| size != 0) {
                 return Err(
                     UsageError::new("--split-pages may not be used with --replace-input").into(),
                 );
@@ -2625,7 +2630,7 @@ impl QPDFJob {
             return Err(UsageError::new("no output file may be given for this option").into());
         }
         if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
-            if self.configuration.split_pages.is_some_and(|size| size > 0) {
+            if self.configuration.split_pages.is_some_and(|size| size != 0) {
                 return Err(UsageError::new(
                     "--split-pages may not be used when writing to standard output",
                 )
@@ -2642,7 +2647,7 @@ impl QPDFJob {
             // the original input in place, so aliasing input and output is
             // not destructive when splitting.
             if !self.configuration.replace_input
-                && !self.configuration.split_pages.is_some_and(|size| size > 0)
+                && !self.configuration.split_pages.is_some_and(|size| size != 0)
                 && crate::qutil::same_file(input, output)
             {
                 return Err(UsageError::new(
@@ -3273,6 +3278,15 @@ mod tests {
             crate::json::Json::parse(br#"{"userPassword":"u","ownerPassword":"o"}"#).unwrap();
         assert!(parse_job_encrypt(&no_key_length, true).is_err());
         assert!(parse_job_encrypt(&encrypt_40, false).is_err());
+    }
+
+    #[test]
+    fn job_json_split_pages_rejects_an_i32_overflow_at_the_qpdf_boundary() {
+        let error = parse_job_split_pages(b"2147483648").expect_err("i32 overflow must fail");
+        assert_eq!(
+            error.to_string(),
+            ".splitPages: invalid page count 2147483648"
+        );
     }
 
     #[test]
