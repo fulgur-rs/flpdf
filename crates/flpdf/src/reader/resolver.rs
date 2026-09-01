@@ -1489,17 +1489,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let Error::Parse { offset, message } = &trigger_error else {
             unreachable!("guard above ensures Parse variant"); // cov:ignore: unreachable after guard
         };
-        let location = if *offset > 0 {
-            format!(
-                "(object {} {}, offset {}): {}",
-                object_ref.number, object_ref.generation, offset, message
-            )
-        } else {
-            format!(
-                "(object {} {}): {}",
-                object_ref.number, object_ref.generation, message
-            )
-        };
+        let location = format!(
+            "(object {} {}, offset {}): {}",
+            object_ref.number, object_ref.generation, offset, message
+        );
         self.push_warning(location)?;
         self.push_warning("Attempting to reconstruct cross-reference table")?;
 
