@@ -38,6 +38,27 @@ fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {
     pdf
 }
 
+/// A damaged classic xref whose object 1 row points at object 2's body.
+/// Recovery discovers the real object 1 and the unindexed object 3.
+fn recovery_discovers_an_unindexed_object_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let object_two_offset = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\ntrue\nendobj\n");
+    pdf.extend_from_slice(b"1 0 obj\n(recovered)\nendobj\n");
+    pdf.extend_from_slice(b"3 0 obj\n99\nendobj\n");
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{object_two_offset:010} 00000 n \n{object_two_offset:010} 00000 n \n"
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
     let bytes_u24 = value.to_be_bytes();
     bytes.extend_from_slice(&bytes_u24[1..]);
@@ -239,6 +260,43 @@ fn get_all_objects_prepares_source_and_dangling_canonical_handles() {
     assert_eq!(refs, vec![ObjectRef::new(1, 0), ObjectRef::new(9, 0)]);
     assert!(objects[0].is_resolved());
     assert!(objects[1].is_indirect());
+}
+
+#[test]
+fn make_indirect_object_prepares_repaired_xref_before_allocating() {
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        recovery_discovers_an_unindexed_object_pdf(),
+        flpdf::PdfOpenOptions {
+            repair: true,
+            ..flpdf::PdfOpenOptions::default()
+        },
+    )
+    .expect("open recovery fixture");
+
+    let allocated = pdf
+        .make_indirect_object_handle(ObjectHandle::integer(123))
+        .expect("allocate after repairing the xref");
+
+    assert_eq!(
+        allocated.object_ref(),
+        Some(ObjectRef::new(4, 0)),
+        "allocation must follow qpdf's repair-before-next-object order"
+    );
+    let refs: Vec<_> = pdf
+        .get_all_objects()
+        .expect("enumerate repaired object cache")
+        .into_iter()
+        .map(|handle| handle.object_ref().expect("indirect object"))
+        .collect();
+    assert_eq!(
+        refs,
+        vec![
+            ObjectRef::new(1, 0),
+            ObjectRef::new(2, 0),
+            ObjectRef::new(3, 0),
+            ObjectRef::new(4, 0)
+        ]
+    );
 }
 
 #[test]

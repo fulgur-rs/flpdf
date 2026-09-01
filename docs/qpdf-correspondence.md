@@ -254,6 +254,8 @@ eight-case qpdf 11.9.0 helper differential.
 
 `flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、`object_refs()` / `live_object_refs()` が allocated indirect null を落とさないようにする。legacy cache/memo の互換 bridge や qpdf-deviation marker は追加しない。
 
+`flpdf-25kg.2.5.12` では、qpdf の `makeIndirectObject` が `nextObjGen` → `getObjectCount` → `fixDanglingReferences` の順で新規番号を決める契約 (`QPDF.cc:1239-1294,1872-1901`) を `Pdf::make_indirect_object_handle` の allocation boundary に適用した。repairで再構築されるobjectがある場合も、canonical resolverを先に準備してから既存の番号走査を行うため、recovered objectとの番号衝突を起こさない。
+
 ### `test_driver` test 62 の整数幅アクセサ
 
 qpdf `test_driver.cc:2262-2287` の `getUIntValue` / `getIntValueAsInt` /
