@@ -1629,9 +1629,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// `obj_cache[next] = ObjCache(obj, -1, -1)`,
     /// `libqpdf/QPDF.cc:1885-1888`).
     ///
-    /// The returned handle is a new, distinct object identity. Its current
-    /// value is copied into the new indirect object, so later mutations through
-    /// either handle do not affect the other.
+    /// The returned handle is a new, distinct object identity: replacing
+    /// `handle`'s own top-level value afterward does not change the
+    /// returned object, or vice versa. `handle`'s current value is only
+    /// shallow-copied, though — an array or dictionary's own container is
+    /// cloned, but its direct children remain the same shared handles, so
+    /// mutating a nested child through either copy is visible through both.
     ///
     /// The new object uses the next unused generation-zero object number,
     /// including object numbers registered by earlier calls.
