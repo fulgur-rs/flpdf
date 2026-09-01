@@ -315,7 +315,7 @@ pub(crate) fn run_test_43<R: Read + Seek>(
         writeln!(stdout)?;
 
         let mut node = field.clone();
-        loop {
+        while !node.is_null() {
             let parent = FormFieldObjectHelper::from_object_handle(node, pdf).get_parent()?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             if parent.is_null() {
@@ -1125,7 +1125,7 @@ mod tests {
         chase_key, kids_item_0_is_indirect, run_test_42, run_test_43, run_test_44, run_test_46,
         tree_string_value, write_nntree_error,
     };
-    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+    use flpdf::{AcroFormDocumentHelper, ObjectHandle, Pdf, PdfOpenOptions};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -1292,6 +1292,54 @@ mod tests {
             },
         )
         .expect("open non-dictionary parent fixture")
+    }
+
+    fn pdf_with_direct_orphan_widget() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects: &[(u32, &[u8])] = &[
+            (
+                1,
+                b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>",
+            ),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] >>] >>",
+            ),
+            (4, b"<< /Fields [] >>"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for &(number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        let size = objects.last().expect("direct orphan fixture objects").0 + 1;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for number in 1..size {
+            match offsets.get(&number) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "direct-orphan.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open direct orphan fixture")
     }
 
     fn pdf_with_object_types_qtest() -> Vec<u8> {
@@ -1621,6 +1669,24 @@ mod tests {
             window
                 == b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval\n"
         }));
+    }
+
+    #[test]
+    fn get_form_fields_preserves_qpdf_zero_objgen_orphan_membership() {
+        let mut pdf = pdf_with_direct_orphan_widget();
+        let (fields, annotations) = {
+            let mut acroform = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+            let fields = acroform.get_form_fields().expect("get form fields");
+            let annotations = acroform
+                .get_annotations_for_field(ObjectHandle::null())
+                .expect("get orphan annotations");
+            (fields, annotations)
+        };
+
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].is_null());
+        assert_eq!(annotations.len(), 1);
+        assert!(annotations[0].object_ref().is_none());
     }
 
     #[test]

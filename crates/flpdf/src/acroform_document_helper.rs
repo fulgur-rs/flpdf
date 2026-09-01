@@ -184,6 +184,7 @@ pub(crate) struct AcroFormCache {
     annotation_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
     field_to_annotations: HashMap<ObjectHandleIdentity, Vec<ObjectHandle>>,
     field_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
+    direct_orphan_annotations: Vec<ObjectHandle>,
     field_to_name: HashMap<ObjectHandleIdentity, String>,
     name_to_fields: BTreeMap<String, Vec<ObjectHandle>>,
 }
@@ -427,11 +428,30 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// only fields represented by the canonical `field_to_annotations` cache:
     /// intermediate field-tree nodes are omitted, while orphan Widgets found
     /// on pages are included as self-associated fields by the helper's
-    /// qpdf-compatible analysis pass.
+    /// qpdf-compatible analysis pass. A direct orphan Widget has qpdf's
+    /// `QPDFObjGen(0, 0)` identity; matching qpdf's `QPDF::getObject(0, 0)`
+    /// projection, it appears as one null field handle and is retrievable
+    /// through [`Self::get_annotations_for_field`].
     /// Handles remain attached to the document's canonical object registry, so
     /// mutations through a returned handle are visible to later consumers.
     pub fn get_form_fields(&mut self) -> Result<Vec<ObjectHandle>> {
-        Ok(self.form_field_handles()?.into_values().collect())
+        self.analyze()?;
+        let has_direct_orphan = {
+            let cache = self.cache.borrow();
+            !cache
+                .as_ref()
+                .expect("analyze always installs an AcroForm cache")
+                .direct_orphan_annotations
+                .is_empty()
+        };
+        let mut fields: Vec<_> = self.form_field_handles()?.into_values().collect();
+        if has_direct_orphan {
+            // The qpdf map key for every direct object is QPDFObjGen(0, 0),
+            // which sorts before all indirect field keys and is materialized
+            // by QPDF::getObject(0, 0) as a null helper.
+            fields.insert(0, ObjectHandle::null());
+        }
+        Ok(fields)
     }
 
     /// Return the live Widget annotation handles associated with a terminal
@@ -439,9 +459,19 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// This mirrors `QPDFAcroFormDocumentHelper::getAnnotationsForField`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:186-195`). An unknown field
-    /// returns an empty vector, matching qpdf's map lookup.
+    /// returns an empty vector, matching qpdf's map lookup. A null handle from
+    /// [`Self::get_form_fields`] selects the `QPDFObjGen(0, 0)` bucket used for
+    /// direct orphan Widgets.
     pub fn get_annotations_for_field(&mut self, field: ObjectHandle) -> Result<Vec<ObjectHandle>> {
         self.analyze()?;
+        if field.object_ref().is_none() && field.is_null() {
+            let cache = self.cache.borrow();
+            return Ok(cache
+                .as_ref()
+                .expect("analyze always installs an AcroForm cache")
+                .direct_orphan_annotations
+                .clone());
+        }
         let field = self.pdf.resolve_handle(&field)?;
         let cache = self.cache.borrow();
         Ok(cache
@@ -569,6 +599,15 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                             annotation.warn_if_possible(
                                 "this widget annotation is not reachable from /AcroForm in the document catalog",
                             )?;
+                            if annotation.object_ref().is_none() {
+                                // qpdf keys all direct orphan Widgets under
+                                // QPDFObjGen(0, 0). Its getFormFields()
+                                // projection therefore contains one null
+                                // field while getAnnotationsForField(null)
+                                // returns the associated direct annotations
+                                // (`QPDFAcroFormDocumentHelper.cc:268-283`).
+                                cache.direct_orphan_annotations.push(annotation.clone());
+                            }
                             record_association(&mut cache, annotation.clone(), annotation);
                         }
                     }
