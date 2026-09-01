@@ -14,7 +14,10 @@ use std::io::{Read, Seek, Write};
 use flpdf::json_inspect::{DecodeLevel, StreamDataMode};
 #[cfg(test)]
 use flpdf::ObjectRef;
-use flpdf::{document_json, Error, ObjectHandle, Pdf, Pipeline, PipelineError, PipelineResult};
+use flpdf::{
+    document_json, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, Pipeline,
+    PipelineError, PipelineResult,
+};
 
 use super::emit_new_diagnostics;
 
@@ -467,24 +470,129 @@ pub(crate) fn run_test_93<R: Read + Seek>(
 
 /// Exercise methods to get page boxes. Built for `boxes2.pdf`.
 pub(crate) fn run_test_94<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+    pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&OsStr>,
     _stdout: &mut dyn Write,
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDFPageObjectHelper::getMediaBox / getCropBox / getBleedBox /
-    // getTrimBox / getArtBox): every assertion in this test
-    // (test_driver.cc:3271-3371) is an `isSameObjectAs`/`isIndirect`/
-    // copy-on-fallback identity check over `QPDFObjectHandle`-returning box
-    // getters that take `copy_if_shared`/`copy_if_fallback` flags. flpdf's
-    // box helpers (`PageObjectHelper::media_box`/`crop_box`/`bleed_box`/
-    // `trim_box`/`art_box`, `page_object_helper.rs:475-616`) return a
-    // numeric `PageBox` value struct with no handle identity and no
-    // copy-on-fallback flags at all, so none of this test's identity/sharing
-    // assertions has any primitive to port against; a numeric-only
-    // comparison would silently test something else entirely.
+    // qpdf 11.9.0 qpdf/test_driver.cc:3271-3371. The handle-returning
+    // PageObjectHelper methods below preserve the same live identity and
+    // copy-on-fallback semantics as qpdf; the numeric PageBox convenience
+    // methods are intentionally not used here.
+    let root = root_handle(pdf);
+    let pages_root = resolved_key(pdf, &root, b"/Pages")?;
+    let root_media = resolved_key(pdf, &pages_root, b"/MediaBox")?;
+    let root_media_unparse = root_media.unparse();
+
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    assert_eq!(pages.len(), 5);
+    let p1_ref = pages[0];
+    let p2_ref = pages[1];
+    let p3_ref = pages[2];
+    let p4_ref = pages[3];
+    let p5_ref = pages[4];
+
+    let p1 = pdf.get_object_handle(p1_ref);
+    assert!(p1.try_get_key(b"/MediaBox")?.is_null());
+    {
+        let mut page = PageObjectHelper::new(p1_ref, pdf);
+        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
+        assert!(page
+            .get_crop_box(false, false)?
+            .is_same_object_as(&root_media));
+        assert!(page
+            .get_bleed_box(false, false)?
+            .is_same_object_as(&root_media));
+        assert!(page
+            .get_trim_box(false, false)?
+            .is_same_object_as(&root_media));
+        assert!(page
+            .get_art_box(false, false)?
+            .is_same_object_as(&root_media));
+
+        let p1_new_art = page.get_art_box(false, true)?;
+        assert_eq!(p1_new_art.unparse(), root_media_unparse);
+        assert!(!p1_new_art.is_same_object_as(&root_media));
+
+        let p1_new_crop = page.get_crop_box(false, false)?;
+        assert!(!p1_new_crop.is_same_object_as(&root_media));
+        assert!(!p1_new_crop.is_same_object_as(&p1_new_art));
+        assert_eq!(p1_new_crop.unparse(), root_media_unparse);
+
+        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
+        assert!(page
+            .get_trim_box(false, false)?
+            .is_same_object_as(&p1_new_crop));
+
+        let p1_effective_media = page.get_media_box(true)?;
+        assert_eq!(p1_effective_media.unparse(), root_media_unparse);
+        assert!(!p1_effective_media.is_same_object_as(&root_media));
+    }
+
+    {
+        let mut page = PageObjectHelper::new(p2_ref, pdf);
+        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
+        let p2_crop = page.get_crop_box(false, false)?;
+        let p2_new_trim = page.get_trim_box(false, true)?;
+        assert_eq!(p2_new_trim.unparse(), p2_crop.unparse());
+        assert!(!p2_new_trim.is_same_object_as(&p2_crop));
+        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
+    }
+
+    {
+        let mut page = PageObjectHelper::new(p3_ref, pdf);
+        let p3_media = page.get_media_box(false)?;
+        let p3_crop = page.get_crop_box(false, false)?;
+        assert!(page.get_media_box(true)?.is_same_object_as(&p3_media));
+        assert!(page.get_crop_box(true, true)?.is_same_object_as(&p3_crop));
+    }
+
+    {
+        let p4 = pdf.get_object_handle(p4_ref);
+        let p4_orig_crop = p4.try_get_key(b"/CropBox")?;
+        let mut page = PageObjectHelper::new(p4_ref, pdf);
+        let p4_crop = page.get_crop_box(false, false)?;
+        assert!(p4_orig_crop.is_same_object_as(&p4_crop));
+        let p4_bleed1 = page.get_bleed_box(false, false)?;
+        let p4_bleed2 = page.get_bleed_box(false, true)?;
+        assert!(!p4_bleed1.is_same_object_as(&p4_crop));
+        assert!(p4_bleed1.is_same_object_as(&p4_bleed2));
+        let p4_art1 = page.get_art_box(false, false)?;
+        assert!(p4_art1.is_same_object_as(&p4_crop));
+        let p4_art2 = page.get_art_box(false, true)?;
+        assert!(!p4_art2.is_same_object_as(&p4_crop));
+        let p4_new_crop = page.get_crop_box(true, false)?;
+        assert!(!p4_new_crop.is_same_object_as(&p4_orig_crop));
+        assert!(p4_orig_crop.is_indirect());
+        assert!(!p4_new_crop.is_indirect());
+        assert_eq!(p4_new_crop.unparse(), p4_orig_crop.unparse_resolved());
+    }
+
+    {
+        let mut page = PageObjectHelper::new(p5_ref, pdf);
+        assert!(page.get_media_box(false)?.is_same_object_as(&root_media));
+        assert!(page
+            .get_crop_box(false, false)?
+            .is_same_object_as(&root_media));
+        assert!(page
+            .get_bleed_box(false, false)?
+            .is_same_object_as(&root_media));
+        let p5_new_bleed = page.get_bleed_box(true, true)?;
+        let p5_new_media = page.get_media_box(false)?;
+        let p5_new_crop = page.get_crop_box(false, false)?;
+        assert!(!p5_new_media.is_same_object_as(&root_media));
+        assert!(!p5_new_crop.is_same_object_as(&root_media));
+        assert!(!p5_new_crop.is_same_object_as(&p5_new_media));
+        assert!(!p5_new_bleed.is_same_object_as(&root_media));
+        assert!(!p5_new_bleed.is_same_object_as(&p5_new_media));
+        assert!(!p5_new_bleed.is_same_object_as(&p5_new_crop));
+        assert_eq!(p5_new_media.unparse(), root_media_unparse);
+        assert_eq!(p5_new_crop.unparse(), root_media_unparse);
+        assert_eq!(p5_new_bleed.unparse(), root_media_unparse);
+    }
+
     Ok(())
 }
 
@@ -792,5 +900,105 @@ mod tests {
             &mut diagnostics_written,
         )
         .expect("run test 89");
+    }
+}
+
+#[cfg(test)]
+mod test_94_tests {
+    use super::run_test_94;
+    use flpdf::{PageDocumentHelper, Pdf};
+    use std::collections::BTreeMap;
+
+    fn boxes2_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let objects = [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R] /Count 5 /MediaBox [0 0 612 792] >>",
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R >>"),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /CropBox [1 2 3 4] >>",
+            ),
+            (
+                5,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [5 6 7 8] /CropBox [1 2 3 4] >>",
+            ),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [5 6 7 8] /CropBox 8 0 R /TrimBox [1 2 3 4] /BleedBox [5 6 7 8] >>",
+            ),
+            (
+                7,
+                "<< /Type /Page /Parent 2 0 R /TrimBox [1 2 3 4] /ArtBox [5 6 7 8] >>",
+            ),
+            (8, "[10 20 30 40]"),
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (number, body) in objects {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+        for number in 1..=8 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        Pdf::open_mem_owned(bytes).expect("boxes2 fixture should parse")
+    }
+
+    #[test]
+    fn test_94_executes_box_assertions_and_copy_side_effects() {
+        let mut pdf = boxes2_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_94(
+            &mut pdf,
+            b"boxes2.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 94 should execute the page-box assertion matrix");
+
+        let pages = PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("boxes2 fixture should retain five pages");
+        assert_eq!(pages.len(), 5);
+
+        for key in [b"/MediaBox".as_slice(), b"/CropBox", b"/ArtBox"] {
+            assert!(
+                pdf.get_object_handle(pages[0])
+                    .try_has_key(key)
+                    .expect("page 1 key lookup"),
+                "test 94 should copy {key:?} onto page 1"
+            );
+        }
+        assert!(pdf
+            .get_object_handle(pages[1])
+            .try_has_key(b"/TrimBox")
+            .unwrap());
+        assert!(pdf
+            .get_object_handle(pages[3])
+            .try_has_key(b"/BleedBox")
+            .unwrap());
+        for key in [b"/MediaBox".as_slice(), b"/CropBox", b"/BleedBox"] {
+            assert!(
+                pdf.get_object_handle(pages[4])
+                    .try_has_key(key)
+                    .expect("page 5 key lookup"),
+                "test 94 should copy {key:?} onto page 5"
+            );
+        }
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
     }
 }
