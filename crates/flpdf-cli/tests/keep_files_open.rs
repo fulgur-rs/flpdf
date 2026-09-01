@@ -213,9 +213,6 @@ fn explicit_keep_files_open_n_overrides_automatic_selection() {
 #[cfg(unix)]
 #[test]
 fn explicit_keep_files_open_n_bounds_cli_empty_page_source_fds_like_qpdf() {
-    if !qpdf_available() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("temporary low-fd directory");
     let inputs = low_fd_inputs(directory.path(), 40);
     let script = low_fd_script(directory.path());
@@ -234,14 +231,16 @@ fn explicit_keep_files_open_n_bounds_cli_empty_page_source_fds_like_qpdf() {
         args
     };
 
-    let qpdf = run_with_low_fd_limit(
-        directory.path(),
-        &script,
-        Path::new("qpdf"),
-        &page_args(&qpdf_output),
-    );
-    assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
-    assert!(qpdf_output.is_file(), "qpdf did not write the output");
+    if qpdf_available() {
+        let qpdf = run_with_low_fd_limit(
+            directory.path(),
+            &script,
+            Path::new("qpdf"),
+            &page_args(&qpdf_output),
+        );
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
+        assert!(qpdf_output.is_file(), "qpdf did not write the output");
+    }
 
     let flpdf = run_with_low_fd_limit(
         directory.path(),
@@ -260,9 +259,6 @@ fn explicit_keep_files_open_n_bounds_cli_empty_page_source_fds_like_qpdf() {
 #[cfg(unix)]
 #[test]
 fn explicit_keep_files_open_n_bounds_cli_nonempty_page_source_fds_like_qpdf() {
-    if !qpdf_available() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("temporary low-fd directory");
     let inputs = low_fd_inputs(directory.path(), 41);
     let script = low_fd_script(directory.path());
@@ -281,14 +277,16 @@ fn explicit_keep_files_open_n_bounds_cli_nonempty_page_source_fds_like_qpdf() {
         args
     };
 
-    let qpdf = run_with_low_fd_limit(
-        directory.path(),
-        &script,
-        Path::new("qpdf"),
-        &page_args(&qpdf_output),
-    );
-    assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
-    assert!(qpdf_output.is_file(), "qpdf did not write the output");
+    if qpdf_available() {
+        let qpdf = run_with_low_fd_limit(
+            directory.path(),
+            &script,
+            Path::new("qpdf"),
+            &page_args(&qpdf_output),
+        );
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf failed: {qpdf:?}");
+        assert!(qpdf_output.is_file(), "qpdf did not write the output");
+    }
 
     let flpdf = run_with_low_fd_limit(
         directory.path(),
@@ -307,9 +305,6 @@ fn explicit_keep_files_open_n_bounds_cli_nonempty_page_source_fds_like_qpdf() {
 #[cfg(unix)]
 #[test]
 fn explicit_keep_files_open_n_bounds_job_json_page_source_fds_like_qpdf() {
-    if !qpdf_available() {
-        return;
-    }
     let directory = tempfile::tempdir().expect("temporary low-fd job directory");
     let inputs = low_fd_inputs(directory.path(), 40);
     let script = low_fd_script(directory.path());
@@ -337,19 +332,21 @@ fn explicit_keep_files_open_n_bounds_job_json_page_source_fds_like_qpdf() {
     )
     .expect("write low-fd job JSON");
 
-    let qpdf = run_with_low_fd_limit(
-        directory.path(),
-        &script,
-        Path::new("qpdf"),
-        &["--job-json-file=job.json".to_owned()],
-    );
-    assert_eq!(qpdf.status.code(), Some(0), "qpdf job failed: {qpdf:?}");
-    assert!(
-        directory.path().join("job-output.pdf").is_file(),
-        "qpdf job did not write the output"
-    );
+    if qpdf_available() {
+        let qpdf = run_with_low_fd_limit(
+            directory.path(),
+            &script,
+            Path::new("qpdf"),
+            &["--job-json-file=job.json".to_owned()],
+        );
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf job failed: {qpdf:?}");
+        assert!(
+            directory.path().join("job-output.pdf").is_file(),
+            "qpdf job did not write the output"
+        );
+        fs::remove_file(directory.path().join("job-output.pdf")).expect("remove qpdf output");
+    }
 
-    fs::remove_file(directory.path().join("job-output.pdf")).expect("remove qpdf output");
     let flpdf = run_with_low_fd_limit(
         directory.path(),
         &script,
