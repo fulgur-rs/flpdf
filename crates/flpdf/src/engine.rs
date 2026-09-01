@@ -195,6 +195,7 @@ impl<R: Read + Seek> Pdf<R> {
             resolver,
             input_source_control: None,
             version: loaded.version,
+            check_mode: false,
             trailer,
             last_xref_form: loaded.last_xref_form,
             first_xref_item_offset,

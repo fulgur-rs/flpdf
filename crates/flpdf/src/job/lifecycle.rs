@@ -470,7 +470,7 @@ fn job_json_bare(
             "{path}: value must be the empty string"
         )))),
         None => Err(Error::Usage(UsageError::new(format!(
-            "{path}: value must be a string"
+            "JSON handler: value at {path} is not of expected type"
         )))),
     }
 }
@@ -2566,7 +2566,6 @@ impl QPDFJob {
                 return Err(UsageError::new("--json may not be used with --replace-input").into());
             }
         }
-        let json_output_allowed = self.configuration.json_version.is_some();
         if self.configuration.require_output
             && self.configuration.output_file.is_none()
             && !self.configuration.replace_input
@@ -2580,8 +2579,12 @@ impl QPDFJob {
             || self.configuration.show_npages
             || self.configuration.check_linearization
             || self.configuration.show_encryption)
-            && !json_output_allowed
-            && (self.configuration.output_file.is_some() || self.configuration.replace_input)
+            // qpdf's JSON output defaults to stdout before this conflict
+            // check (`QPDFJob.cc:582-595`), so it is an output destination
+            // even when no explicit outputFile was supplied.
+            && (self.configuration.output_file.is_some()
+                || self.configuration.replace_input
+                || self.configuration.json_version.is_some())
         {
             return Err(UsageError::new("no output file may be given for this option").into());
         }

@@ -180,8 +180,14 @@ fn job_json_file_show_npages_rejects_invalid_values_like_qpdf() {
 
     for (value, expected) in [
         (serde_json::json!("yes"), "value must be the empty string"),
-        (serde_json::json!(42), "value must be a string"),
-        (serde_json::json!(false), "value must be a string"),
+        (
+            serde_json::json!(42),
+            "JSON handler: value at .showNpages is not of expected type",
+        ),
+        (
+            serde_json::json!(false),
+            "JSON handler: value at .showNpages is not of expected type",
+        ),
     ] {
         fs::write(
             directory.path().join("job.json"),
@@ -250,6 +256,175 @@ fn job_json_file_show_npages_rejects_an_output_file_like_qpdf() {
     assert!(String::from_utf8_lossy(&qpdf.stderr).contains("no output file may be given"));
     assert!(String::from_utf8_lossy(&flpdf.stderr).contains("no output file may be given"));
     assert!(!directory.path().join("output.pdf").exists());
+}
+
+#[test]
+fn job_json_file_show_npages_rejects_json_output_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+
+    for json_option in ["json", "jsonOutput"] {
+        fs::write(
+            directory.path().join("job.json"),
+            format!(r#"{{"inputFile":"input.pdf","showNpages":"","{json_option}":"2"}}"#),
+        )
+        .unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            qpdf.status.code(),
+            Some(2),
+            "qpdf unexpectedly passed: {qpdf:?}"
+        );
+        assert_eq!(
+            flpdf.status.code(),
+            Some(2),
+            "flpdf unexpectedly passed: {flpdf:?}"
+        );
+        assert_eq!(
+            flpdf.stderr,
+            String::from_utf8_lossy(&qpdf.stderr)
+                .replace("qpdf", "flpdf")
+                .as_bytes()
+        );
+        assert!(!directory.path().join("output.pdf").exists());
+    }
+}
+
+#[test]
+fn job_json_file_check_mode_repairs_catalog_type_like_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+
+    for job_json in [
+        r#"{"inputFile":"input.pdf","check":""}"#,
+        r#"{"inputFile":"input.pdf","check":"","showNpages":""}"#,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut input = fs::read(&fixture).unwrap();
+        let marker = b"/Type /Catalog";
+        let start = input
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap();
+        input[start..start + marker.len()].copy_from_slice(b"/Type /Catxxxx");
+        fs::write(directory.path().join("input.pdf"), input).unwrap();
+        fs::write(directory.path().join("job.json"), job_json).unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            qpdf.status.code(),
+            Some(3),
+            "qpdf unexpectedly passed: {qpdf:?}"
+        );
+        assert_eq!(
+            flpdf.status.code(),
+            Some(3),
+            "flpdf unexpectedly passed: {flpdf:?}"
+        );
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(
+            flpdf.stderr,
+            String::from_utf8_lossy(&qpdf.stderr)
+                .replace("qpdf", "flpdf")
+                .as_bytes()
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&flpdf.stderr)
+                .matches("catalog /Type entry missing or invalid")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn job_json_file_check_does_not_duplicate_repair_warnings_before_show_npages() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let mut input = fs::read(fixture).unwrap();
+    let marker = b"/Count 1";
+    let start = input
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .unwrap();
+    input[start..start + marker.len()].copy_from_slice(b"/Count  ");
+    fs::write(directory.path().join("input.pdf"), input).unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        br#"{"inputFile":"input.pdf","check":"","showNpages":""}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        qpdf.status.code(),
+        Some(3),
+        "qpdf unexpectedly passed: {qpdf:?}"
+    );
+    assert_eq!(
+        flpdf.status.code(),
+        Some(3),
+        "flpdf unexpectedly passed: {flpdf:?}"
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        flpdf.stderr,
+        String::from_utf8_lossy(&qpdf.stderr)
+            .replace("qpdf", "flpdf")
+            .as_bytes()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stderr)
+            .matches("expected dictionary key but found non-name object")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -405,8 +580,14 @@ fn job_json_file_check_linearization_rejects_non_string_values() {
     fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
 
     for (value, message) in [
-        ("42", ".checkLinearization: value must be a string"),
-        ("false", ".checkLinearization: value must be a string"),
+        (
+            "42",
+            "JSON handler: value at .checkLinearization is not of expected type",
+        ),
+        (
+            "false",
+            "JSON handler: value at .checkLinearization is not of expected type",
+        ),
     ] {
         fs::write(
             directory.path().join("job.json"),
