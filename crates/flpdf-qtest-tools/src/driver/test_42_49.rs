@@ -1303,7 +1303,7 @@ mod tests {
             (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
             (
                 3,
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] >>] >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] >> << /Type /Annot /Subtype /Widget /Rect [20 20 30 30] >>] >>",
             ),
             (4, b"<< /Fields [] >>"),
         ];
@@ -1674,19 +1674,32 @@ mod tests {
     #[test]
     fn get_form_fields_preserves_qpdf_zero_objgen_orphan_membership() {
         let mut pdf = pdf_with_direct_orphan_widget();
-        let (fields, annotations) = {
+        let (fields, annotations, widgets, first_field, second_field) = {
             let mut acroform = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+            let widgets = acroform
+                .get_widget_annotations_for_page(flpdf::ObjectRef::new(3, 0))
+                .expect("get page widgets");
+            assert_eq!(widgets.len(), 2);
+            let first_field = acroform
+                .get_field_for_annotation_handle(widgets[0].clone())
+                .expect("get first orphan field");
+            let second_field = acroform
+                .get_field_for_annotation_handle(widgets[1].clone())
+                .expect("get second orphan field");
             let fields = acroform.get_form_fields().expect("get form fields");
             let annotations = acroform
                 .get_annotations_for_field(ObjectHandle::null())
                 .expect("get orphan annotations");
-            (fields, annotations)
+            (fields, annotations, widgets, first_field, second_field)
         };
 
         assert_eq!(fields.len(), 1);
         assert!(fields[0].is_null());
         assert_eq!(annotations.len(), 1);
         assert!(annotations[0].object_ref().is_none());
+        assert_eq!(widgets.len(), 2);
+        assert!(first_field.is_same_object_as(&annotations[0]));
+        assert!(second_field.is_same_object_as(&first_field));
     }
 
     #[test]

@@ -184,7 +184,7 @@ pub(crate) struct AcroFormCache {
     annotation_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
     field_to_annotations: HashMap<ObjectHandleIdentity, Vec<ObjectHandle>>,
     field_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
-    direct_orphan_annotations: Vec<ObjectHandle>,
+    direct_orphan_field: Option<ObjectHandle>,
     field_to_name: HashMap<ObjectHandleIdentity, String>,
     name_to_fields: BTreeMap<String, Vec<ObjectHandle>>,
 }
@@ -438,11 +438,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         self.analyze()?;
         let has_direct_orphan = {
             let cache = self.cache.borrow();
-            !cache
+            cache
                 .as_ref()
                 .expect("analyze always installs an AcroForm cache")
-                .direct_orphan_annotations
-                .is_empty()
+                .direct_orphan_field
+                .is_some()
         };
         let mut fields: Vec<_> = self.form_field_handles()?.into_values().collect();
         if has_direct_orphan {
@@ -469,8 +469,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(cache
                 .as_ref()
                 .expect("analyze always installs an AcroForm cache")
-                .direct_orphan_annotations
-                .clone());
+                .direct_orphan_field
+                .iter()
+                .cloned()
+                .collect());
         }
         let field = self.pdf.resolve_handle(&field)?;
         let cache = self.cache.borrow();
@@ -595,18 +597,20 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     for annotation in widgets {
                         let annotation = self.pdf.resolve_handle(&annotation)?;
                         let identity = annotation.identity_key();
-                        if !cache.annotation_to_field.contains_key(&identity) {
+                        let already_associated = if annotation.object_ref().is_none() {
+                            // qpdf indexes direct objects by QPDFObjGen(0, 0),
+                            // so distinct direct orphan Widgets share one
+                            // association bucket.
+                            cache.direct_orphan_field.is_some()
+                        } else {
+                            cache.annotation_to_field.contains_key(&identity)
+                        };
+                        if !already_associated {
                             annotation.warn_if_possible(
                                 "this widget annotation is not reachable from /AcroForm in the document catalog",
                             )?;
                             if annotation.object_ref().is_none() {
-                                // qpdf keys all direct orphan Widgets under
-                                // QPDFObjGen(0, 0). Its getFormFields()
-                                // projection therefore contains one null
-                                // field while getAnnotationsForField(null)
-                                // returns the associated direct annotations
-                                // (`QPDFAcroFormDocumentHelper.cc:268-283`).
-                                cache.direct_orphan_annotations.push(annotation.clone());
+                                cache.direct_orphan_field = Some(annotation.clone());
                             }
                             record_association(&mut cache, annotation.clone(), annotation);
                         }
@@ -1588,9 +1592,16 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
         self.analyze()?;
         let cache = self.cache.borrow();
-        Ok(cache
+        let cache = cache
             .as_ref()
-            .expect("analyze always installs an AcroForm cache")
+            .expect("analyze always installs an AcroForm cache");
+        if annotation.object_ref().is_none() {
+            // qpdf's annotation_to_field map uses the shared
+            // QPDFObjGen(0, 0) key for every direct orphan Widget. A later
+            // direct Widget therefore resolves to the first orphan field.
+            return Ok(cache.direct_orphan_field.clone());
+        }
+        Ok(cache
             .annotation_to_field
             .get(&annotation.identity_key())
             .cloned())
