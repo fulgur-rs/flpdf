@@ -2821,7 +2821,7 @@ impl QPDFJob {
     {
         let creates_output = matches!(&output, JsonJobOutput::File { .. });
         pdf.set_logger(self.logger.clone());
-        super::json::write_json_with_version(
+        super::json::write_json_with_version_with_logger(
             pdf,
             version,
             test_json_schema,
@@ -2829,6 +2829,7 @@ impl QPDFJob {
             show_encryption_key,
             options,
             output,
+            &self.logger,
         )?;
         self.record_document_warnings(pdf);
         Ok(self.complete(creates_output)?)
