@@ -22,6 +22,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   # Manual escape hatch if a real release wasn't detected from the push (e.g. the
   # Release PR was squash-merged with a hand-edited subject). A workflow_dispatch
   # run still pauses on the `release` environment approval before publishing.
@@ -31,6 +33,149 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  setup:
+    name: Resolve release version
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid version from tag: $GITHUB_REF_NAME"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $VERSION"
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            rustflags: "-C link-arg=-fuse-ld=mold"
+            install-mold: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            rustflags: ""
+            install-mold: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            rustflags: "-C link-arg=-fuse-ld=mold"
+            install-mold: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            rustflags: ""
+            install-mold: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            rustflags: ""
+            install-mold: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            rustflags: "-C linker=lld-link"
+            install-mold: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "v${{ needs.setup.outputs.version }}"
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: ${{ matrix.target }}-release
+          save-if: false
+
+      - name: Install mold
+        if: matrix.install-mold
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Configure linker
+        if: matrix.rustflags != ''
+        shell: bash
+        run: echo "RUSTFLAGS=${{ matrix.rustflags }}" >> "$GITHUB_ENV"
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --bin flpdf -p flpdf-cli --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../flpdf-v${{ needs.setup.outputs.version }}-${{ matrix.target }}.tar.gz flpdf
+          cd ../../..
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/flpdf.exe" -DestinationPath "flpdf-v${{ needs.setup.outputs.version }}-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: flpdf-${{ matrix.target }}
+          path: flpdf-v${{ needs.setup.outputs.version }}-${{ matrix.target }}.*
+
+  release-binaries:
+    name: Publish GitHub Release binaries
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [setup, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          path: artifacts
+          pattern: flpdf-*
+          merge-multiple: true
+
+      - name: Generate App token for release publish
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Upload binaries and publish release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.setup.outputs.version }}"
+          REPO="${{ github.repository }}"
+          TAG="v$VERSION"
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Release $TAG" --draft --repo "$REPO"
+          fi
+          gh release upload "$TAG" artifacts/* --clobber --repo "$REPO"
+          gh release edit "$TAG" --draft=false --repo "$REPO"
+
   # The `release` job runs on EVERY push to main but only publishes when a Release
   # PR was just merged. Its `release` environment carries required reviewers (gate
   # ②), and an environment gate pauses a job the moment it becomes eligible — so

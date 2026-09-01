@@ -121,14 +121,21 @@ squash-merged with a hand-edited subject), trigger **Release-plz** manually:
 Actions → *Release-plz* → *Run workflow* on `main`. The `release` job still
 pauses on the `release` environment approval before publishing.
 
-## Deferred: prebuilt binaries
+## Prebuilt binaries
 
-Platform binary attachment (`release:published` → build matrix → attach →
-un-draft) is tracked separately (flpdf-ift.7) and is **not** wired up here. When
-it lands: set `git_release_draft = true` on the `flpdf` package in
-`release-plz.toml`, add a `v*`-tag-triggered `release.yml`, and add a tag
-protection ruleset restricting `v*` tag creation to the release App (to close
-the direct-tag-push bypass).
+The canonical `flpdf` Release is created as a draft by `release-plz` and carries
+the `vX.Y.Z` tag. The tag push starts the binary path in
+`.github/workflows/release-plz.yml`:
+
+1. `build-binaries` builds the CLI for six targets and creates one
+   `flpdf-vX.Y.Z-<target>.tar.gz` archive per Unix target or one
+   `flpdf-vX.Y.Z-x86_64-pc-windows-msvc.zip` archive for Windows.
+2. `release-binaries` uploads all six archives to the existing draft Release.
+3. The job removes the draft flag only after every upload succeeds.
+
+Configure a repository tag-protection ruleset that restricts creation of `v*`
+tags to the `RELEASE_APP`. Without that rule, a direct tag push could start the
+binary path without the approved release-plz publish flow.
 
 [crates.io]: https://crates.io
 [release-plz]: https://release-plz.dev
