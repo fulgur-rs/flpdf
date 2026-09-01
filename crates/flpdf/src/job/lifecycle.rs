@@ -118,6 +118,7 @@ struct JobConfiguration {
     update_from_json: Option<PathBuf>,
     replace_input: bool,
     check: bool,
+    show_npages: bool,
     check_linearization: bool,
     require_output: bool,
     progress: bool,
@@ -1673,6 +1674,10 @@ impl QPDFJob {
             configuration.check = true;
             configuration.require_output = false;
         }
+        if job_json_bare(&members, b"showNpages")? {
+            configuration.show_npages = true;
+            configuration.require_output = false;
+        }
         if job_json_bare(&members, b"showEncryption")? {
             configuration.show_encryption = true;
             configuration.require_output = false;
@@ -2297,13 +2302,12 @@ impl QPDFJob {
             attachment_sources.push(source);
         }
 
-        if configuration.show_encryption {
-            self.show_encryption(pdf, false)?;
-            self.record_document_warnings(pdf);
-            return self.complete(false);
-        }
-        if configuration.check_linearization {
-            let status = self.check_linearization(pdf)?;
+        if configuration.check
+            || configuration.show_npages
+            || configuration.show_encryption
+            || configuration.check_linearization
+        {
+            let status = self.run_configured_inspection(pdf, configuration)?;
             drop(attachment_sources);
             drop(overlay_specs);
             return Ok(status);
@@ -2324,6 +2328,38 @@ impl QPDFJob {
         drop(attachment_sources);
         drop(overlay_specs);
         status
+    }
+
+    fn run_configured_inspection<R>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        configuration: &JobConfiguration,
+    ) -> Result<JobExitCode>
+    where
+        R: Read + Seek + 'static,
+    {
+        // qpdf's doInspection executes selected branches independently in this
+        // order and emits one warning/status completion after the branches
+        // (`libqpdf/QPDFJob.cc:1646-1693`). Keep report generation separate
+        // from completion so combined job-JSON inspection flags do not emit
+        // duplicate summaries.
+        pdf.set_logger(self.logger.clone());
+        if configuration.check {
+            if let Err(error) = self.run_check_report(pdf) {
+                return self.map_check_result(Err(error));
+            }
+        }
+        if configuration.show_npages {
+            self.show_npages_report(pdf)?;
+        }
+        if configuration.show_encryption {
+            self.show_encryption(pdf, false)?;
+        }
+        if configuration.check_linearization {
+            self.check_linearization_report(pdf)?;
+        }
+        self.record_document_warnings(pdf);
+        self.complete(false)
     }
 
     fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
@@ -2503,6 +2539,7 @@ impl QPDFJob {
             && !self.configuration.empty_input
             && (self.configuration.require_output
                 || self.configuration.check
+                || self.configuration.show_npages
                 || self.configuration.check_linearization
                 || self.configuration.show_encryption
                 || self.configuration.output_file.is_some()
@@ -2540,6 +2577,7 @@ impl QPDFJob {
             .into());
         }
         if (self.configuration.check
+            || self.configuration.show_npages
             || self.configuration.check_linearization
             || self.configuration.show_encryption)
             && !json_output_allowed

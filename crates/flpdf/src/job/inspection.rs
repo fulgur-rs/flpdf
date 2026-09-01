@@ -136,12 +136,16 @@ impl QPDFJob {
         pdf: &mut Pdf<R>,
     ) -> Result<JobExitCode> {
         let logger = self.logger();
-        self.inspect(pdf, |pdf| {
-            let root = pdf.root_handle()?;
-            let pages = root.try_get_key(b"/Pages")?;
-            let count = pages.try_get_key(b"/Count")?.try_get_int_value()?;
-            logger.info(format!("{count}\n"))
-        })
+        self.inspect(pdf, |pdf| emit_npages(pdf, &logger))
+    }
+
+    /// Emit the page-count report without completing the enclosing job.
+    ///
+    /// This is used by the job-JSON inspection dispatcher so qpdf's one-shot
+    /// completion boundary is retained when several inspection flags are set.
+    pub(crate) fn show_npages_report<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
+        let logger = self.logger();
+        emit_npages(pdf, &logger)
     }
 
     /// Show the effective cross-reference table through qpdf's inspection
@@ -210,6 +214,13 @@ impl QPDFJob {
             Ok(())
         })
     }
+}
+
+fn emit_npages<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &crate::QPDFLogger) -> Result<()> {
+    let root = pdf.root_handle()?;
+    let pages = root.try_get_key(b"/Pages")?;
+    let count = pages.try_get_key(b"/Count")?.try_get_int_value()?;
+    logger.info(format!("{count}\n"))
 }
 
 fn ensure_present(object: &ObjectHandle, object_ref: ObjectRef) -> Result<()> {

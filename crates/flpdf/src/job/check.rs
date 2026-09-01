@@ -78,6 +78,19 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
     ) -> Result<JobExitCode> {
+        self.check_linearization_report(pdf)?;
+        self.complete(false)
+    }
+
+    /// Emit the linearization report without completing the enclosing job.
+    ///
+    /// The shared inspection dispatcher uses this report-only form to preserve
+    /// qpdf's ordered `doInspection` branches (`QPDFJob.cc:1652-1667`) and emit
+    /// one completion summary after all selected consumers finish.
+    pub(crate) fn check_linearization_report<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<()> {
         let logger = self.logger();
         let input_name = self.input_name().to_owned();
         pdf.set_logger(logger.clone());
@@ -85,7 +98,7 @@ impl QPDFJob {
         if !pdf.is_linearized()? {
             logger.info(format!("{input_name} is not linearized\n"))?;
             self.record_document_warnings(pdf);
-            return self.complete(false);
+            return Ok(());
         }
 
         let linearization_warnings = emit_linearization_check_for_document_with_suppression(
@@ -101,7 +114,7 @@ impl QPDFJob {
             logger.info(format!("{input_name}: no linearization errors\n"))?;
         }
         self.record_document_warnings(pdf);
-        self.complete(false)
+        Ok(())
     }
 
     /// Replay qpdf repair diagnostics retained by a failed permissive open.
@@ -131,6 +144,19 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
     ) -> std::result::Result<JobExitCode, CheckError> {
+        self.run_check_report(pdf)?;
+        Ok(self.complete(false)?)
+    }
+
+    /// Run the full check report without completing the enclosing job.
+    ///
+    /// qpdf's `doCheck` may be followed by other `doInspection` consumers on
+    /// success, so job JSON uses this report-only form before its final shared
+    /// completion (`QPDFJob.cc:1649-1655`).
+    pub(crate) fn run_check_report<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> std::result::Result<(), CheckError> {
         let logger = self.logger();
         let input_name = self.input_name().to_owned();
         let message_prefix = self.message_prefix().to_owned();
@@ -148,7 +174,7 @@ impl QPDFJob {
         if outcome.warnings {
             self.record_warnings();
         }
-        Ok(self.complete(false)?)
+        Ok(())
     }
 
     /// Emit qpdf's `QPDFJob::showEncryption` report for an already-open
