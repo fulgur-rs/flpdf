@@ -4014,6 +4014,44 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn read_uncompressed_object_pushes_the_accepted_read_s_own_diagnostics() {
+        // No `/Length` at all, so recovery is unavoidable even without any
+        // window truncation (`ActiveSection` never bounds the window, so
+        // there is nothing to retry here) -- this attempt's diagnostics are
+        // the only ones that can ever exist, and they must still reach the
+        // shared diagnostics list once accepted.
+        let bytes = b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n".to_vec();
+        let object_ref = ObjectRef::new(1, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 0 });
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &XrefRegistration::default(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (value, _) = context
+            .document
+            .read_uncompressed_object(object_ref, 0)
+            .expect("a missing /Length recovers through the endstream scan");
+        assert!(matches!(value, ObjectValue::Stream { .. }));
+
+        let mut collected = Diagnostics::default();
+        context.append_diagnostics_to(&mut collected);
+        assert!(
+            collected.entries().iter().any(|diagnostic| diagnostic
+                .message
+                .contains("stream dictionary lacks /Length key")),
+            "the accepted read's own diagnostics must reach the shared list: {collected:?}"
+        );
+    }
+
+    #[test]
     fn direct_only_bootstrap_access_does_not_initialize_the_source_snapshot() {
         let registration = XrefRegistration::default();
         let mut context = XrefReadContext::new(
