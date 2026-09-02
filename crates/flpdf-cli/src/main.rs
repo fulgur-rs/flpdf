@@ -2811,17 +2811,18 @@ fn run_job_json_file(
     output: Option<&Path>,
     password: &PasswordArgs,
 ) -> CliResult<()> {
-    let json = std::fs::read_to_string(path)
+    let json = std::fs::read(path)
         .map_err(|error| error_with_file(path, Box::new(error) as Box<dyn std::error::Error>))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
 
-    job.initialize_from_json_partial(&json).map_err(|error| {
-        Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: format_job_json_error(path, error),
-        }) as Box<dyn std::error::Error>
-    })?;
+    job.initialize_from_json_partial_bytes(&json)
+        .map_err(|error| {
+            Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: format_job_json_error(path, error),
+            }) as Box<dyn std::error::Error>
+        })?;
     if let Some(input) = input {
         job.set_input_file(input.to_path_buf()).map_err(|error| {
             Box::new(CliExitError {

@@ -85,6 +85,27 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
     assert!(directory.path().join("output.pdf").is_file());
 }
 
+#[test]
+fn job_json_file_accepts_literal_high_bit_password_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    let mut json = br#"{"inputFile":"input.pdf","outputFile":"output.pdf","password":""}"#.to_vec();
+    json.insert(json.len() - 2, 0x80);
+    fs::write(directory.path().join("job.json"), json).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .assert()
+        .code(0)
+        .stdout("");
+
+    assert!(directory.path().join("output.pdf").is_file());
+}
+
 /// A syntactically invalid job-json file fails during
 /// `initialize_from_json_partial`, which carries a non-empty
 /// `CliExitError::message` (unlike every other production `CliExitError`

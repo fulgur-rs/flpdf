@@ -538,12 +538,14 @@ fn job_json_choice(
     let value = value
         .get_string()
         .ok_or_else(|| Error::Usage(UsageError::new(format!("{path}: value must be a string"))))?;
-    let value = String::from_utf8_lossy(&value).into_owned();
     if !required && value.is_empty() {
-        return Ok(Some(value));
+        return Ok(Some(String::new()));
     }
-    if choices.iter().any(|choice| *choice == value) {
-        return Ok(Some(value));
+    if let Some(choice) = choices.iter().find(|choice| value == choice.as_bytes()) {
+        // qpdf compares the raw std::string value with these ASCII choice
+        // literals. Return the literal after the byte comparison rather than
+        // lossy-decoding an arbitrary JSON string before matching it.
+        return Ok(Some((*choice).to_owned()));
     }
     Err(Error::Usage(UsageError::new(format!(
         "{path}: unexpected value; expected one of {}",
@@ -1550,6 +1552,21 @@ impl QPDFJob {
     /// cannot be read or parsed, if a value violates qpdf's generated handler
     /// contract, or if the non-partial form fails final input/output checks.
     pub fn initialize_from_json(&mut self, json: &str) -> Result<()> {
+        self.initialize_from_json_bytes(json.as_bytes())
+    }
+
+    /// Initialize a job from raw qpdf job-JSON bytes.
+    ///
+    /// qpdf reads job JSON into a byte-preserving `std::string` before calling
+    /// `QPDFJob::initializeFromJson` (`qpdf/test_driver.cc:2864-2876` and
+    /// `libqpdf/QUtil.cc:1139-1170`). Keep this entry point byte-oriented so a
+    /// syntactically valid JSON string containing a literal high-bit byte can
+    /// reach the existing byte-oriented JSON parser and password fields.
+    ///
+    /// # Errors
+    ///
+    /// Has the same errors as [`Self::initialize_from_json`].
+    pub fn initialize_from_json_bytes(&mut self, json: &[u8]) -> Result<()> {
         self.initialize_from_json_with_partial(json, false)
     }
 
@@ -1559,6 +1576,22 @@ impl QPDFJob {
     /// `QPDFJob::Config::jobJsonFile` call to `initializeFromJson(..., true)`
     /// (`libqpdf/QPDFJob_config.cc:774-784`).
     pub fn initialize_from_json_partial(&mut self, json: &str) -> Result<()> {
+        self.initialize_from_json_partial_bytes(json.as_bytes())
+    }
+
+    /// Initialize a job from raw qpdf job-JSON bytes while deferring the
+    /// command-boundary input/output checks until [`QPDFJob::run`].
+    ///
+    /// This is the byte-preserving counterpart of
+    /// [`Self::initialize_from_json_partial`], used by qpdf's
+    /// `--job-json-file` path after its binary file read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte input is not a qpdf job-JSON dictionary,
+    /// if a nested job file cannot be read or parsed, or if a value violates
+    /// qpdf's generated handler contract.
+    pub fn initialize_from_json_partial_bytes(&mut self, json: &[u8]) -> Result<()> {
         self.initialize_from_json_with_partial(json, true)
     }
 
@@ -1576,13 +1609,13 @@ impl QPDFJob {
         }
     }
 
-    fn initialize_from_json_with_partial(&mut self, json: &str, partial: bool) -> Result<()> {
+    fn initialize_from_json_with_partial(&mut self, json: &[u8], partial: bool) -> Result<()> {
         // The qpdf C API sets this prefix before parsing JSON
         // (`libqpdf/qpdfjob-c.cc:79-87`), so initialization and run-time
         // configuration errors share the same observable source name.
         self.set_message_prefix("qpdfjob json");
-        let value = crate::json::Json::parse(json.as_bytes())
-            .map_err(|error| Error::System(error.to_string()))?;
+        let value =
+            crate::json::Json::parse(json).map_err(|error| Error::System(error.to_string()))?;
         if !value.is_dictionary() {
             return Err(Error::Usage(UsageError::new(
                 "top-level object is supposed to be a dictionary",
@@ -3823,6 +3856,18 @@ mod tests {
         let mut writer = JobOutputWriter(PipelineHandle::new(crate::pipeline::Discard));
         std::io::Write::write_all(&mut writer, b"job output").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
+    }
+
+    #[test]
+    fn job_json_byte_entry_point_preserves_literal_high_bit_password_bytes() {
+        let mut json =
+            br#"{"inputFile":"input.pdf","outputFile":"output.pdf","password":""}"#.to_vec();
+        json.insert(json.len() - 2, 0x80);
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_bytes(&json).unwrap();
+
+        assert_eq!(job.configuration.password, vec![0x80]);
     }
 
     #[test]

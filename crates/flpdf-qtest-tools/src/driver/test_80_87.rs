@@ -285,15 +285,11 @@ pub(crate) fn run_test_83<R: Read + Seek>(
 
     writeln!(stdout, "calling initializeFromJson")?;
     // qpdf reads the file into a raw `std::string` (`QUtil::read_file_into_memory`,
-    // `test_driver.cc:2871-2873`) with no UTF-8 validation, so a byte sequence that
-    // is not valid UTF-8 still reaches `initializeFromJson` and is reported through
-    // the same caught-exception path as any other malformed job JSON. flpdf's
-    // `initialize_from_json` takes `&str`, so the UTF-8 decode failure is folded
-    // into the same `exception:` arm rather than short-circuiting before the
-    // "calling initializeFromJson" line is printed.
-    let result = String::from_utf8(bytes)
-        .map_err(|error| Error::System(error.to_string()))
-        .and_then(|json| QPDFJob::new().initialize_from_json(&json));
+    // `test_driver.cc:2871-2873`) with no UTF-8 validation. Keep the same raw
+    // bytes through the public byte-taking QPDFJob boundary so valid high-bit
+    // string values are handled by the qpdf-compatible parser rather than
+    // rejected by an adapter-level UTF-8 conversion.
+    let result = QPDFJob::new().initialize_from_json_bytes(&bytes);
     match result {
         Ok(()) => writeln!(stdout, "called initializeFromJson")?,
         Err(Error::Usage(error)) => writeln!(stderr, "usage: {error}")?,
