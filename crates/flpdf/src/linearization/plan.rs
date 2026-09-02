@@ -488,7 +488,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                         collect_direct_handle_refs_with_context(&resources, 0, false, &mut seeds)?;
                         for &(r, va) in &seeds {
                             if va {
-                                seen_as_array.insert(r); // cov:ignore: fires only when /Resources is an inline dict/array with array-element refs; normal PDFs use an indirect /Resources ref, so seeds come from collect_direct_refs_with_context on a Reference (va=false)
+                                seen_as_array.insert(r);
                             }
                         }
                         // DFS via an explicit stack (no recursion) so deeply
@@ -635,7 +635,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                                 )?; // cov:ignore: LLVM maps this covered ancestor-entry call terminator to a zero-count continuation region
                                 for (r, va) in refs {
                                     if va {
-                                        seen_as_array.insert(r); // cov:ignore: fires when an ancestor /Pages node has a value with array-element refs (e.g. inherited /ColorSpace [X 0 R]); rare in practice and hard to construct as a minimal fixture
+                                        seen_as_array.insert(r);
                                     }
                                     if !visited.contains(&r) {
                                         queue.push_back((r, va));
@@ -2935,11 +2935,13 @@ mod tests {
         let page_content_indirect_filter = flate(b"q Q\n");
         let page_content_direct_filter = flate(b"q Q\n");
         let existing_appearance = flate(b"/Tx BMC\nEMC\n");
+        // The inline `/Resources` and ancestor `/ColorSpace` arrays exercise
+        // the generic array-edge context used by the qpdf-shaped closure walk.
         let objects = vec![
             b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>\nendobj\n"
                 .to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 12 0 R] /Annots [5 0 R] >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] /ColorSpace [10 0 R] >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /ProcSet [10 0 R] >> /Contents [4 0 R 12 0 R] /Annots [5 0 R] >>\nendobj\n".to_vec(),
             stream_object(4, "/Filter 9 0 R", &page_content_indirect_filter),
             b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (Hello) /DA (/Helv 12 Tf 0 g) /Rect [10 10 200 30] /P 3 0 R /AP << /N 8 0 R >> >>\nendobj\n".to_vec(),
             b"6 0 obj\n<< /Fields [5 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >>\nendobj\n".to_vec(),
@@ -2950,7 +2952,7 @@ mod tests {
                 &existing_appearance,
             ),
             b"9 0 obj\n/FlateDecode\nendobj\n".to_vec(),
-            b"10 0 obj\nnull\nendobj\n".to_vec(),
+            b"10 0 obj\n<< /Type /ExtGState >>\nendobj\n".to_vec(),
             b"11 0 obj\nnull\nendobj\n".to_vec(),
             stream_object(12, "/Filter /FlateDecode", &page_content_direct_filter),
         ];
@@ -2991,5 +2993,10 @@ mod tests {
             .expect("build linearization plan");
         assert_eq!(plan.page_hints.len(), 1);
         assert!(!plan.part2_objects.is_empty());
+        assert!(
+            plan.all_assigned_refs()
+                .contains(&crate::ObjectRef::new(10, 0)),
+            "inline resource and ancestor array references must reach the plan"
+        );
     }
 }

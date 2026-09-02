@@ -660,17 +660,18 @@ fn length_next_n<R: Read + Seek>(
 
     let mut length = 0_i128;
     for index in 0..nobjects {
-        // cov:ignore-start: the bounded hint count and u32 PDF object domain make these overflow arms unreachable for a valid input
-        let object_number = first_object
-            .checked_add(u32::try_from(index).map_err(|_| {
-                LinearizationCheckError::InvalidParam {
-                    message: format!("object sequence starting at {first_object} overflows u32"),
-                }
-            })?)
-            .ok_or_else(|| LinearizationCheckError::InvalidParam {
+        let index = u32::try_from(index).map_err(|_| {
+            // cov:ignore-start: the supported input bound cannot allocate more than u32 object entries
+            LinearizationCheckError::InvalidParam {
                 message: format!("object sequence starting at {first_object} overflows u32"),
-            })?;
-        // cov:ignore-end
+            }
+            // cov:ignore-end
+        })?; // cov:ignore: LLVM maps this successful conversion continuation to the closure's unhit error region
+        let object_number = first_object.checked_add(index).ok_or_else(|| {
+            LinearizationCheckError::InvalidParam {
+                message: format!("object sequence starting at {first_object} overflows u32"),
+            }
+        })?;
         let object_ref = ObjectRef::new(object_number, 0);
         if !xref.contains_key(&object_ref) {
             hint_warning(
@@ -1304,14 +1305,12 @@ fn check_linearization_inner<R: Read + Seek>(
     }
 
     let (shared_offset, outline_offset) = read_hint_offsets(&hint_dict).map_err(map_show_error)?;
-    // cov:ignore-start: the shared offset is bounds-checked by the show decoder before this shared checker runs
     if shared_offset >= hint_bytes.len() {
         fail!(
             "hint stream /S offset ({shared_offset}) is out of bounds (hint size {})",
             hint_bytes.len()
         );
     }
-    // cov:ignore-end
     // cov:ignore-start: an opened PDF page tree cannot contain more than u32::MAX pages on supported targets
     let n_pages = u32::try_from(n_val).map_err(|_| LinearizationCheckError::InvalidParam {
         message: format!("/N ({n_val}) does not fit in u32"),
@@ -1322,14 +1321,12 @@ fn check_linearization_inner<R: Read + Seek>(
         read_h_shared_object(&hint_bytes[shared_offset..]).map_err(map_show_error)?;
     let outline_hints = match outline_offset {
         Some(offset) => {
-            // cov:ignore-start: the outline offset is bounds-checked by the show decoder before this shared checker runs
             if offset >= hint_bytes.len() {
                 fail!(
                     "hint stream /O offset ({offset}) is out of bounds (hint size {})",
                     hint_bytes.len()
                 );
             }
-            // cov:ignore-end
             Some(read_h_generic(&hint_bytes[offset..]).map_err(map_show_error)?)
         }
         None => None,
@@ -1802,3 +1799,37 @@ pub fn check_linearization_path(
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{length_next_n, LinearizationCheckError};
+    use crate::Pdf;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn length_next_n_rejects_object_number_wrap() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut warnings = Vec::new();
+        let error = length_next_n(
+            &mut pdf,
+            &BTreeMap::new(),
+            u32::MAX - 1,
+            3,
+            3,
+            true,
+            &mut warnings,
+        )
+        .expect_err("a hint sequence that wraps u32 must be rejected");
+
+        assert!(matches!(
+            error,
+            LinearizationCheckError::InvalidParam { message }
+                if message == "object sequence starting at 4294967294 overflows u32"
+        ));
+        assert_eq!(
+            warnings.len(),
+            2,
+            "the two missing entries precede the wrap"
+        );
+    }
+}

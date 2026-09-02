@@ -1151,6 +1151,24 @@ fn canonical_linearization_trailer_entries(
     Ok(serialized)
 }
 
+/// Return the first-page xref subsection length for a linearization layout.
+///
+/// The subtraction is normally guaranteed by the contiguous slot allocation,
+/// but malformed hand-built layouts must fail before any xref bytes are emitted.
+pub(crate) fn first_page_xref_object_count(
+    total_count: u32,
+    param_dict_obj_number: u32,
+) -> Result<u32> {
+    total_count
+        .checked_sub(param_dict_obj_number)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "linearization writer: param-dict object number ({param_dict_obj_number}) \
+             exceeds /Size ({total_count}) — cannot size the first-page xref subsection"
+            ))
+        })
+}
+
 /// Compute the linearized output's `/ID` **once per save**.
 ///
 /// A PDF file identifier is file-scoped: every trailer / xref-stream dict in
@@ -2150,24 +2168,9 @@ fn do_write_pass<R: Read + Seek>(
         // First-page xref covers objects [param_slot, total): the param dict
         // plus every other first-page object (catalog, hint, first page, page-1
         // private).  total_count = /Size (highest object number + 1), so the
-        // count is `total_count − param_slot`.  Validate the subtraction to
-        // avoid an unsigned wrap if a future plan ever puts the param dict
-        // above /Size (a non-contiguous split). That precondition is currently
-        // unenforced (a dedicated guard is pending a later task); the
-        // checked_sub below is the only thing preventing the wrap today.
-        let first_page_count = total_count
-            .checked_sub(param_dict_obj_number)
-            // cov:ignore-start: defensive invariant — the param-dict object
-            // number is always a slot below /Size (the contiguous-split
-            // precondition), so the subtraction never underflows; the guard
-            // only prevents an unsigned wrap if a future plan breaks that.
-            .ok_or_else(|| {
-                crate::Error::Unsupported(format!(
-                    "linearization writer: param-dict object number ({param_dict_obj_number}) \
-                 exceeds /Size ({total_count}) — cannot size the first-page xref subsection"
-                ))
-            })?;
-        // cov:ignore-end
+        // count is `total_count − param_slot`. The helper validates the
+        // subtraction before any first-page xref bytes are emitted.
+        let first_page_count = first_page_xref_object_count(total_count, param_dict_obj_number)?;
         let section_start = bytes.len();
         let (p1_xref_offset, range, patch) = write_part1_xref_and_trailer(
             &mut bytes,
