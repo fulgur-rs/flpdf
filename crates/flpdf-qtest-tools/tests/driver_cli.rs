@@ -417,6 +417,23 @@ fn test_53_flushes_repair_diagnostics_before_object_output() {
 }
 
 #[test]
+fn test_60_completes_all_resource_merges_and_writes_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    let output = driver()
+        .args(["60", minimal_pdf()])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 60");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("third merge\n"));
+    assert!(stdout.contains("fourth merge\n"));
+    assert!(directory.path().join("a.pdf").is_file());
+}
+
+#[test]
 fn test_56_writes_the_form_xobject_overlay_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let fixture = form_xobject_fixture();

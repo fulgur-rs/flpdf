@@ -297,15 +297,10 @@ fn make_resource<R: Read + Seek>(
 /// test_60 (test_driver.cc:2139-2213): boundary-condition testing for
 /// `getUniqueResourceName` and conflict-detecting `mergeResources`.
 ///
-/// The first two merges (`show_conflicts("first merge")`/`"second merge"`,
-/// test_driver.cc:2186-2192) are real: every primitive they need
-/// ([`ObjectHandle::merge_resources`], [`ObjectHandle::get_unique_resource_name`],
-/// [`ObjectHandle::shallow_copy`], [`ObjectHandle::replace_key`],
-/// [`Pdf::make_indirect_object_handle`]) is public. `r2.makeResourcesIndirect(pdf)`
-/// (test_driver.cc:2197) has no flpdf equivalent at any visibility, so the
-/// third/fourth merges and the final `a.pdf` write cannot be attempted; see
-/// the `GAP` comment below.
-pub(crate) fn run_test_60<R: Read + Seek>(
+/// The four conflict-reporting merges and the final QDF/static-ID write use
+/// the public canonical resource and live-trailer routes, matching qpdf's
+/// `test_driver.cc:2186-2212` sequence.
+pub(crate) fn run_test_60<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
     _arg2: Option<&OsStr>,
@@ -346,23 +341,34 @@ pub(crate) fn run_test_60<R: Read + Seek>(
 
     r1.merge_resources(&r2, Some(&mut conflicts))?;
     show_conflicts("first merge", &conflicts, stdout)?;
-    let _r3 = r1.shallow_copy()?;
+    let r3 = r1.shallow_copy()?;
     // Merge again. The direct object gets recopied. Everything else is the same
     // (test_driver.cc:2189-2190).
     r1.merge_resources(&r2, Some(&mut conflicts))?;
     show_conflicts("second merge", &conflicts, stdout)?;
 
-    // GAP(QPDFObjectHandle::makeResourcesIndirect): flpdf has no equivalent at any
-    // visibility (searched `object_handle.rs`, `page_object_helper.rs`, and
-    // `page_form_xobject.rs` for `make_resources_indirect`/`MakeResourcesIndirect` with no
-    // match). qpdf's next step, `r2.makeResourcesIndirect(pdf)` (test_driver.cc:2197), makes
-    // every resource in `r2` an indirect object before merging twice more so the previously
-    // direct `/F5` value gets copied exactly once as an indirect object
-    // (test_driver.cc:2194-2201). Even if this existed, the final step —
-    // `pdf.getTrailer().replaceKey("/QTest1", r1)` / `"/QTest2"` / `"/QTest3"`
-    // (test_driver.cc:2205-2208) — is the same missing primitive as `run_test_26`'s GAP in
-    // `test_26_33.rs`: flpdf has no public API to mutate `Pdf::trailer()` after open. So the
-    // third/fourth merges and the `a.pdf` write (test_driver.cc:2209-2212) are not attempted.
+    // qpdf promotes every direct value in r2's resource subdictionaries
+    // before the third and fourth merges. This is the canonical qpdf-shaped
+    // operation, not a driver-local traversal.
+    r2.make_resources_indirect(pdf)?;
+    r1.merge_resources(&r2, Some(&mut conflicts))?;
+    show_conflicts("third merge", &conflicts, stdout)?;
+    r1.merge_resources(&r2, Some(&mut conflicts))?;
+    show_conflicts("fourth merge", &conflicts, stdout)?;
+
+    // Pdf::trailer returns the live dictionary observed by the writer, so the
+    // three qpdf trailer replacements remain on the canonical handle route.
+    let trailer = pdf.trailer();
+    trailer.replace_key(b"/QTest1", r1)?;
+    trailer.replace_key(b"/QTest2", r2)?;
+    trailer.replace_key(b"/QTest3", r3)?;
+    pdf.mark_object_handle_dirty(&trailer)?;
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.write()?;
     Ok(())
 }
 
