@@ -161,6 +161,11 @@ fn malformed_recovery_pdf() -> Vec<u8> {
     pdf
 }
 
+fn non_dictionary_root_pdf() -> Vec<u8> {
+    b"%PDF-1.3\n1 0 obj\n7\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"
+        .to_vec()
+}
+
 fn complete_json_for_test_89() -> &'static str {
     r#"{
   "qpdf": [
@@ -451,6 +456,27 @@ fn object_handle_api_test_93_uses_canonical_promotion_route() {
         !source.contains("GAP(QPDF::makeIndirectObject)"),
         "test 93 must not leave the qpdf promotion assertions as a GAP"
     );
+}
+
+#[test]
+fn test_93_reports_a_non_dictionary_root_like_qpdf() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad-root.pdf");
+    fs::write(&input, non_dictionary_root_pdf()).expect("write malformed root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+    let expected = format!(
+        "WARNING: {input}: file is damaged\n\
+         WARNING: {input}: can't find startxref\n\
+         WARNING: {input}: Attempting to reconstruct cross-reference table\n\
+         {input}: unable to find /Root dictionary\n"
+    );
+
+    driver()
+        .args(["93", input, "-"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
 }
 
 #[test]

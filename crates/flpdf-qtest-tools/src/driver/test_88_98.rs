@@ -151,9 +151,7 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     );
 
     // Test errors (test_driver.cc:3155-3159).
-    let root = root_handle(pdf);
-    pdf.resolve(&root)?;
-    let root = root.clone();
+    let root = pdf.root_handle()?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let arr2 = root.replace_key_and_get_new(b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
     arr2.set_object_description(pdf, "test array")?;
@@ -462,7 +460,7 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     // `Rc` -- `is_same_object_as` needs no resolution to observe that.
     let trailer = pdf.trailer();
     let root1 = trailer.get_key(b"/Root");
-    let root2 = root_handle(pdf);
+    let root2 = pdf.root_handle()?;
     assert!(root1.is_same_object_as(&root2));
 
     let oh1 = ObjectHandle::parse(b"<< /One /Two >>")?;
@@ -502,7 +500,7 @@ pub(crate) fn run_test_94<R: Read + Seek>(
     // PageObjectHelper methods below preserve the same live identity and
     // copy-on-fallback semantics as qpdf; the numeric PageBox convenience
     // methods are intentionally not used here.
-    let root = root_handle(pdf);
+    let root = pdf.root_handle()?;
     let pages_root = resolved_key(pdf, &root, b"/Pages")?;
     let root_media = resolved_key(pdf, &pages_root, b"/MediaBox")?;
     let root_media_unparse = root_media.unparse();
@@ -859,8 +857,22 @@ mod test_92_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_88, run_test_89};
-    use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+    use super::{run_test_88, run_test_89, run_test_93};
+    use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+
+    fn non_dictionary_root_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let options = PdfOpenOptions {
+            description: "bad-root.pdf".to_owned(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
+        Pdf::open_mem_owned_with_options(
+            b"%PDF-1.3\n1 0 obj\n7\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"
+                .to_vec(),
+            options,
+        )
+        .expect("malformed root fixture should be recoverable")
+    }
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let options = PdfOpenOptions {
@@ -921,6 +933,31 @@ mod tests {
             &mut diagnostics_written,
         )
         .expect("run test 89");
+    }
+
+    #[test]
+    fn test_93_rejects_a_non_dictionary_root_like_qpdf() {
+        let mut pdf = non_dictionary_root_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        let error = run_test_93(
+            &mut pdf,
+            b"bad-root.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect_err("qpdf getRoot must reject a non-dictionary root");
+
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "unable to find /Root dictionary"
+        ));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
     }
 }
 

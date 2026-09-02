@@ -1296,3 +1296,14 @@ missing として傘で数えていたが、個々の `Pl_*` は下の各行で 
 canonical type-warning boundary として利用し、qtest driver は警告を再生成せず
 捕捉だけを行う。Pinned qpdf 11.9.0 の `test_driver 81 -` は exit 0、stdout
 `test 81 done`、stderr空を返す。
+
+### `QPDF::getRoot` の test_driver consumer
+
+`libqpdf/QPDF.cc:2355-2368` の `QPDF::getRoot` は trailer の `/Root` を
+解決し、dictionaryでなければ `unable to find /Root dictionary` を投げる。
+`test_driver.cc:3155-3159,3252,3285` のtest88/93/94はこの検証を通過して
+から後続操作へ進むため、qtest driverも`Pdf::root_handle()`を使う。公開APIの
+document-neutralなエラーを、qpdfの`QPDFExc::createWhat`
+（`libqpdf/QPDFExc.cc:19-51`）と同じfilename付きbyte表示へ戻す処理は、driver
+boundaryに限定している。Pinned qpdfで非dictionary `/Root`を与えたtest93は、
+修復警告3行の後に`<filename>: unable to find /Root dictionary`を返す。
