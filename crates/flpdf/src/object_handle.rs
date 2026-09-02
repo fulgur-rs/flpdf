@@ -2737,23 +2737,13 @@ impl ObjectHandle {
             current = ObjectHandle(parent);
         }
 
-        // qpdf's literal `QPDFObjectHandle::newNull()` carries neither a
-        // QPDF* nor a resolver, even when it is nested below a document-owned
-        // array, dictionary, or stream dictionary
-        // (`libqpdf/QPDF_Null.cc:12-15`, `QPDFParser.cc:397-410`). Do not lend
-        // it the parent's context through our containment back-links: a
-        // contextless null must take qpdf's exception path. Non-null direct
-        // children still use the containment-parent fallback below, and
-        // indirect nulls retain their own resolver above.
-        let slot = self.0.borrow();
-        if matches!(&*slot.state.borrow(), ObjectValue::Null) {
-            return None;
-        }
-        slot.containment_parents.iter().find_map(|parent| {
-            parent
-                .upgrade()
-                .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
-        })
+        // Containment links are ownership/traversal metadata, not qpdf object
+        // context. `QPDF_Dictionary::replaceKey` and `QPDF_Array::push_back`
+        // never call `setChildDescription` or assign the parent QPDF to a
+        // programmatic direct child (`QPDF_Dictionary.cc:135-146`,
+        // `QPDF_Array.cc:276-285`). Only the child's own resolver or an
+        // explicit child-description chain above can supply context.
+        None
     }
 
     pub(crate) fn set_description_json(&self, input: String, object: String, offset: i64) {
@@ -19138,6 +19128,21 @@ pub(crate) mod warning_emission_tests {
     }
 
     #[test]
+    fn programmatic_non_null_child_does_not_borrow_containment_context() {
+        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let child = ObjectHandle::integer(10);
+        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
+
+        assert!(child.context().is_none());
+        let (result, captured) =
+            with_captured_default_error(|| child.warn_if_possible("programmatic child warning"));
+
+        result.unwrap();
+        assert!(warnings(&recorder).is_empty());
+        assert!(captured.contains("programmatic child warning\n"));
+    }
+
+    #[test]
     fn object_description_json_and_negative_offset_and_unresolved() {
         let handle1 = ObjectHandle::null();
         handle1.set_description_json("input.pdf".to_owned(), "".to_owned(), 123);
@@ -19161,18 +19166,20 @@ pub(crate) mod warning_emission_tests {
     }
 
     #[test]
-    fn object_context_traverses_containment_parents() {
+    fn programmatic_non_null_child_keeps_a_contextless_type_warning_route() {
         let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
         ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
-        child
+        let error = child
             .type_warning("dictionary", "treating as empty")
-            .unwrap();
-        assert_eq!(
-            warnings(&recorder),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
-        );
+            .expect_err("qpdf does not lend a containment parent to a direct value");
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "operation for dictionary attempted on object of type integer: treating as empty"
+        ));
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]
@@ -19241,38 +19248,51 @@ pub(crate) mod warning_emission_tests {
             .try_array_item(0)
             .unwrap()
             .expect("array contains the integer");
-        assert!(non_null_child.try_get_keys().unwrap().is_empty());
-        assert_eq!(
-            warnings(&non_null_recorder),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
-        );
+        let error = non_null_child
+            .try_get_keys()
+            .expect_err("a programmatic direct child must remain contextless");
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "operation for dictionary attempted on object of type integer: treating as empty"
+        ));
+        assert!(non_null_child.context().is_none());
+        assert!(warnings(&non_null_recorder).is_empty());
     }
 
     #[test]
-    fn dictionary_accessors_warn_through_a_direct_child_context() {
+    fn dictionary_accessors_keep_a_programmatic_direct_child_contextless() {
         let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
         ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
-        assert!(child.try_get_keys().unwrap().is_empty());
-        assert_eq!(
-            warnings(&recorder),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
-        );
+        let error = child
+            .try_get_keys()
+            .expect_err("qpdf typeWarning must stay on the contextless route");
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "operation for dictionary attempted on object of type integer: treating as empty"
+        ));
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]
-    fn warn_if_possible_through_a_context_with_no_description_omits_the_prefix() {
-        // A live context found only via containment (no description of its
-        // own) must still emit the bare warning, matching `desc.is_empty()`
-        // in `warnIfPossible`'s own branch (`libqpdf/QPDFObjectHandle.cc:2196-2199`).
+    fn warn_if_possible_through_a_programmatic_child_uses_the_default_logger() {
+        // A direct value inserted into a qpdf container has no owning QPDF, so
+        // `warnIfPossible` must use the process-global default error logger
+        // (`libqpdf/QPDFObjectHandle.cc:2196-2199`) rather than a containment
+        // parent that was never assigned to the value.
         let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
         let child = ObjectHandle::integer(10);
         ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
 
-        child.warn_if_possible("treating as empty").unwrap();
+        let (result, captured) =
+            with_captured_default_error(|| child.warn_if_possible("treating as empty"));
 
-        assert_eq!(warnings(&recorder), ["treating as empty"]);
+        result.unwrap();
+        assert!(warnings(&recorder).is_empty());
+        assert!(captured.contains("treating as empty\n"));
     }
 
     #[test]

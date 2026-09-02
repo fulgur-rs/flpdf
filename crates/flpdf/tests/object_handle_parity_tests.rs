@@ -186,22 +186,9 @@ fn integer_width_accessors_are_public_and_match_qpdf_boundaries() {
     assert_eq!(q3_handle.try_get_int_value_as_int().unwrap(), i32::MAX);
     assert_eq!(q3_handle.try_get_uint_value_as_uint().unwrap(), u32::MAX);
 
-    let diagnostics = pdf.repair_diagnostics();
-    let messages: Vec<_> = diagnostics
-        .entries()
-        .iter()
-        .map(|entry| entry.message.as_str())
-        .collect();
-    assert_eq!(
-        messages,
-        [
-            "requested value of integer is too big; returning INT_MAX",
-            "requested value of unsigned integer is too big; returning UINT_MAX",
-            "unsigned value request for negative number; returning 0",
-            "requested value of integer is too small; returning INT_MIN",
-            "unsigned integer value request for negative number; returning 0",
-            "requested value of integer is too big; returning INT_MAX",
-        ]
+    assert!(
+        pdf.repair_diagnostics().entries().is_empty(),
+        "programmatic direct values must not route warnIfPossible through the document diagnostics"
     );
 }
 

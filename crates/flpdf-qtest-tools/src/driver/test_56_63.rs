@@ -1,10 +1,11 @@
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use flpdf::{
     EncryptParams, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions,
-    PdfWriter,
+    PdfWriter, Pipeline, PipelineError, PipelineHandle, PipelineResult, QPDFLogger,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -433,51 +434,92 @@ pub(crate) fn run_test_62<R: Read + Seek>(
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    diagnostics_written: &mut usize,
+    _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let _ = (filename, stdout); // test_62 writes only its qpdf warning lines.
 
-    let t = pdf.trailer();
-    // `QIntC::to_ulonglong(INT_MAX)`/`to_longlong(INT_MIN)`/`to_longlong(UINT_MAX)`
-    // (test_driver.cc:2268-2273) are lossless casts here: every product below fits
-    // comfortably inside i64/u64, so no `QIntC` narrowing check can fire.
-    let q1_l: u64 = 3_u64 * u64::from(u32::try_from(i32::MAX).expect("i32::MAX fits in u32"));
-    let q1: i64 = i64::try_from(q1_l).expect("q1_l fits in i64");
-    let q2_l: i64 = 3_i64 * i64::from(i32::MIN);
-    let q2: i64 = q2_l;
-    let q3_i: u32 = u32::MAX;
-    let q3: i64 = i64::from(q3_i);
+    with_default_error_capture(stderr, || {
+        let t = pdf.trailer();
+        // `QIntC::to_ulonglong(INT_MAX)`/`to_longlong(INT_MIN)`/`to_longlong(UINT_MAX)`
+        // (test_driver.cc:2268-2273) are lossless casts here: every product below fits
+        // comfortably inside i64/u64, so no `QIntC` narrowing check can fire.
+        let q1_l: u64 = 3_u64 * u64::from(u32::try_from(i32::MAX).expect("i32::MAX fits in u32"));
+        let q1: i64 = i64::try_from(q1_l).expect("q1_l fits in i64");
+        let q2_l: i64 = 3_i64 * i64::from(i32::MIN);
+        let q2: i64 = q2_l;
+        let q3_i: u32 = u32::MAX;
+        let q3: i64 = i64::from(q3_i);
 
-    t.replace_key(b"/Q1", ObjectHandle::integer(q1))?;
-    t.replace_key(b"/Q2", ObjectHandle::integer(q2))?;
-    t.replace_key(b"/Q3", ObjectHandle::integer(q3))?;
+        t.replace_key(b"/Q1", ObjectHandle::integer(q1))?;
+        t.replace_key(b"/Q2", ObjectHandle::integer(q2))?;
+        t.replace_key(b"/Q3", ObjectHandle::integer(q3))?;
 
-    // qpdf: `assert_compare_numbers(q1, t.getKey("/Q1").getIntValue());` (test_driver.cc:2277).
-    assert_eq!(t.get_key(b"/Q1").try_get_int_value()?, q1);
-    assert_eq!(t.get_key(b"/Q1").try_get_uint_value()?, q1_l);
-    assert_eq!(t.get_key(b"/Q1").try_get_int_value_as_int()?, i32::MAX);
-    assert_eq!(t.get_key(b"/Q1").try_get_uint_value_as_uint()?, u32::MAX);
-    assert_eq!(t.get_key(b"/Q2").try_get_int_value()?, q2_l);
-    assert_eq!(t.get_key(b"/Q2").try_get_uint_value()?, 0);
-    assert_eq!(t.get_key(b"/Q2").try_get_int_value_as_int()?, i32::MIN);
-    assert_eq!(t.get_key(b"/Q2").try_get_uint_value_as_uint()?, 0);
-    assert_eq!(t.get_key(b"/Q3").try_get_int_value_as_int()?, i32::MAX);
-    assert_eq!(t.get_key(b"/Q3").try_get_uint_value_as_uint()?, u32::MAX);
+        // qpdf: `assert_compare_numbers(q1, t.getKey("/Q1").getIntValue());` (test_driver.cc:2277).
+        assert_eq!(t.get_key(b"/Q1").try_get_int_value()?, q1);
+        assert_eq!(t.get_key(b"/Q1").try_get_uint_value()?, q1_l);
+        assert_eq!(t.get_key(b"/Q1").try_get_int_value_as_int()?, i32::MAX);
+        assert_eq!(t.get_key(b"/Q1").try_get_uint_value_as_uint()?, u32::MAX);
+        assert_eq!(t.get_key(b"/Q2").try_get_int_value()?, q2_l);
+        assert_eq!(t.get_key(b"/Q2").try_get_uint_value()?, 0);
+        assert_eq!(t.get_key(b"/Q2").try_get_int_value_as_int()?, i32::MIN);
+        assert_eq!(t.get_key(b"/Q2").try_get_uint_value_as_uint()?, 0);
+        assert_eq!(t.get_key(b"/Q3").try_get_int_value_as_int()?, i32::MAX);
+        assert_eq!(t.get_key(b"/Q3").try_get_uint_value_as_uint()?, u32::MAX);
 
-    // qpdf's programmatic integers have no owning QPDF, so warnIfPossible
-    // writes the six range warnings directly to the default error logger.
-    // flpdf's inserted direct children retain the trailer resolver and queue
-    // the same messages as object diagnostics; replay those new diagnostics
-    // through the driver stderr boundary without adding the ordinary
-    // `WARNING: <filename>:` input prefix.
-    let diagnostics = pdf.repair_diagnostics();
-    for diagnostic in &diagnostics.entries()[*diagnostics_written..] {
-        if diagnostic.is_object_warning() {
-            writeln!(stderr, "{}", diagnostic.message)?;
-        }
+        // qpdf's programmatic integers have no owning QPDF, so warnIfPossible
+        // writes the six range warnings directly to the default error logger.
+        // Capture that process-global sink only at this library boundary so
+        // the caller-owned stderr writer receives the same bytes in unit tests
+        // and in the actual test-driver binary; no document-diagnostic replay
+        // or semantic adapter is involved.
+        Ok(())
+    })
+}
+
+struct DefaultErrorCaptureSink(Arc<Mutex<Vec<u8>>>);
+
+impl Pipeline for DefaultErrorCaptureSink {
+    fn identifier(&self) -> &str {
+        "test driver default error capture"
     }
-    *diagnostics_written = diagnostics.entries().len();
-    Ok(())
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.0
+            .lock()
+            .map_err(|_| PipelineError::runtime("default error capture mutex poisoned"))?
+            .extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+fn with_default_error_capture(
+    stderr: &mut dyn Write,
+    body: impl FnOnce() -> flpdf::Result<()>,
+) -> flpdf::Result<()> {
+    static DEFAULT_ERROR_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    let _guard = DEFAULT_ERROR_CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let logger = QPDFLogger::default_logger();
+    let restore = logger.get_error()?;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    logger.set_error(Some(PipelineHandle::new(DefaultErrorCaptureSink(
+        Arc::clone(&captured),
+    ))));
+
+    let result = body();
+    logger.set_error(Some(restore));
+    let captured = captured
+        .lock()
+        .map_err(|_| PipelineError::runtime("default error capture mutex poisoned"))?
+        .clone();
+    stderr.write_all(&captured)?;
+    result
 }
 
 /// test_63 (test_driver.cc:2289-2301): set R6 (AES-256) encryption
@@ -518,8 +560,9 @@ pub(crate) fn run_test_63<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::test_56_59_body;
-    use flpdf::Pdf;
+    use super::{test_56_59_body, DefaultErrorCaptureSink};
+    use flpdf::{Pdf, Pipeline};
+    use std::sync::{Arc, Mutex};
 
     struct CurrentDirGuard(std::path::PathBuf);
 
@@ -569,5 +612,16 @@ mod tests {
         assert_eq!(stdout, b"");
         assert!(stderr.is_empty());
         assert!(directory.path().join("a.pdf").is_file());
+    }
+
+    #[test]
+    fn default_error_capture_sink_forwards_bytes() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = DefaultErrorCaptureSink(Arc::clone(&captured));
+
+        assert_eq!(sink.identifier(), "test driver default error capture");
+        sink.write(b"warning\n").expect("capture sink write");
+        sink.finish().expect("capture sink finish");
+        assert_eq!(&*captured.lock().unwrap(), b"warning\n");
     }
 }

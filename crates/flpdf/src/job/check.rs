@@ -1965,10 +1965,10 @@ mod tests {
         let report_logger = logger_with_capture(Arc::clone(&report_output));
         let result = check_document(&mut pdf, &report_logger, "qpdf", "content.pdf");
 
-        assert!(matches!(
-            &result,
-            Err(CheckError::Operation(Error::System(message)))
-                if message == "sink write failure 1"
+        assert!(matches!(&result, Err(CheckError::ErrorsDetected)));
+        let report = String::from_utf8(report_output.lock().unwrap().clone()).unwrap();
+        assert!(report.contains(
+            "ERROR: page 1: page object 3 0:  object is supposed to be a stream or an array of streams but is neither"
         ));
     }
 
