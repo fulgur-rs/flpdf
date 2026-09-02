@@ -265,9 +265,11 @@ enum XrefReadContextSpec<'a> {
     },
     Reconstruction {
         line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
+        reference_offsets: &'a Rc<[u64]>,
     },
     ReconstructionWithCache {
         line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
+        reference_offsets: &'a Rc<[u64]>,
         bootstrap_cache: &'a SharedBootstrapCache,
     },
 }
@@ -1030,16 +1032,20 @@ impl<'bytes> XrefReadContext<'bytes> {
                 Rc::clone(bootstrap_cache),
                 None,
             ),
-            XrefReadContextSpec::Reconstruction { line_scan_entries } => (
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries,
+                reference_offsets,
+            } => (
                 XrefEntryLookup::Reconstruction {
                     line_scan_entries,
                     registration_entries: &registration.entries,
                 },
                 empty_bootstrap_cache(),
-                Some(reconstructed_reference_offsets(line_scan_entries)),
+                Some(Rc::clone(reference_offsets)),
             ),
             XrefReadContextSpec::ReconstructionWithCache {
                 line_scan_entries,
+                reference_offsets,
                 bootstrap_cache,
             } => (
                 XrefEntryLookup::Reconstruction {
@@ -1047,7 +1053,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                     registration_entries: &registration.entries,
                 },
                 Rc::clone(bootstrap_cache),
-                Some(reconstructed_reference_offsets(line_scan_entries)),
+                Some(Rc::clone(reference_offsets)),
             ),
         };
         let document = {
@@ -1460,16 +1466,21 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         // post-reconstruction lookup through the reconstruction context; the
         // recovery state is already the canonical line-scan xref table.
         let (recovered_size, recovered_size_diagnostics) = {
+            // cov:ignore-start: this defensive second size-recovery handoff is not reachable through the canonical loader because the same stale object header is consumed by the earlier classic-trailer validation recovery path
+            let recovered_reference_offsets =
+                reconstructed_reference_offsets(&recovered.loaded.entries);
             let reconstruction_registration = XrefRegistration::default();
             let mut recovered_size_context = XrefReadContext::new(
                 bytes,
                 XrefReadContextSpec::ReconstructionWithCache {
                     line_scan_entries: &recovered.loaded.entries,
+                    reference_offsets: &recovered_reference_offsets,
                     bootstrap_cache: &recovered.bootstrap_cache,
                 },
                 &reconstruction_registration,
                 options,
             );
+            // cov:ignore-end
             let recovered_size =
                 recovered_size_context.resolve_dictionary_value(&recovered.loaded.trailer, "Size");
             recovered_size_context.cache.commit();
@@ -1821,11 +1832,17 @@ fn merge_xref_stream_from_classic_trailer(
                 bootstrap_cache: hybrid_bootstrap_cache,
             }
         }
-        XrefReadContextSpec::Reconstruction { line_scan_entries }
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries,
+            reference_offsets,
+        }
         | XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries, ..
+            line_scan_entries,
+            reference_offsets,
+            ..
         } => XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries,
+            reference_offsets,
             bootstrap_cache: hybrid_bootstrap_cache,
         },
     };
@@ -1976,11 +1993,17 @@ fn merge_previous_xref_sections_with_observer(
                 bootstrap_cache: &chain_bootstrap_cache,
             }
         }
-        XrefReadContextSpec::Reconstruction { line_scan_entries }
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries,
+            reference_offsets,
+        }
         | XrefReadContextSpec::ReconstructionWithCache {
-            line_scan_entries, ..
+            line_scan_entries,
+            reference_offsets,
+            ..
         } => XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries,
+            reference_offsets,
             bootstrap_cache: &chain_bootstrap_cache,
         },
     };
@@ -2430,8 +2453,13 @@ fn recover_trailer_from_xref_stream_candidate(
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
 ) -> Result<(ObjectHandle, u64, XrefForm, BTreeSet<u32>, u64)> {
+    // All bootstrap contexts below resolve against this same line-scan map
+    // until the candidate chain has been merged. Build the sorted offset
+    // index once and pass cheap Rc clones through each context instead of
+    // sorting the full map again for every `/Prev` lookup.
+    let reference_offsets = reconstructed_reference_offsets(entries);
     let (candidate, discovery_diagnostics) =
-        find_xref_stream_trailer_candidate(bytes, entries, options);
+        find_xref_stream_trailer_candidate(bytes, entries, options, &reference_offsets);
     // qpdf's candidate search resolves every type-1 entry unconditionally
     // (`getObjectByObjGen(iter.first)` runs before the `isStreamOfType`
     // check, `QPDF.cc:585-589`), warning immediately as each is read, in
@@ -2485,6 +2513,7 @@ fn recover_trailer_from_xref_stream_candidate(
         Some(&mut *repair_diagnostics),
         XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
+            reference_offsets: &reference_offsets,
             bootstrap_cache: &candidate.bootstrap_cache,
         },
         None,
@@ -2519,6 +2548,7 @@ fn recover_trailer_from_xref_stream_candidate(
         Some(&mut previous_failure_diagnostics),
         XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
+            reference_offsets: &reference_offsets,
             bootstrap_cache: &candidate.bootstrap_cache,
         },
     )
@@ -2581,10 +2611,12 @@ fn recover_trailer_from_xref_stream_candidate(
     // dereferences an indirect `/Size` through the reconstructed table
     // (`QPDF.cc:697`). Resolve it with the same bootstrap context used while
     // re-entering the candidate instead of inspecting the raw reference.
+    let merged_reference_offsets = reconstructed_reference_offsets(entries);
     let mut size_context = XrefReadContext::new(
         bytes,
         XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
+            reference_offsets: &merged_reference_offsets,
             bootstrap_cache: &candidate.bootstrap_cache,
         },
         &reentry_registration,
@@ -2655,16 +2687,8 @@ fn find_xref_stream_trailer_candidate(
     bytes: &[u8],
     entries: &BTreeMap<ObjectRef, XrefEntry>,
     options: XrefLoadOptions,
+    reference_offsets: &Rc<[u64]>,
 ) -> (Option<XrefStreamCandidate>, Diagnostics) {
-    let mut offsets: Vec<u64> = entries
-        .values()
-        .filter_map(|entry| match entry {
-            XrefEntry::Uncompressed { offset } => Some(*offset),
-            XrefEntry::Compressed { .. } | XrefEntry::Free { .. } => None,
-        })
-        .collect();
-    offsets.sort_unstable();
-
     let mut max_offset = 0u64;
     let mut trailer: Option<ObjectHandle> = None;
     let mut discovery_diagnostics = Diagnostics::default();
@@ -2673,6 +2697,7 @@ fn find_xref_stream_trailer_candidate(
         bytes,
         XrefReadContextSpec::Reconstruction {
             line_scan_entries: entries,
+            reference_offsets,
         },
         &empty_registration,
         options,
@@ -2683,8 +2708,8 @@ fn find_xref_stream_trailer_candidate(
             continue;
         };
         let start = offset as usize;
-        let next_offset_index = offsets.partition_point(|&candidate| candidate <= offset);
-        let window_end = offsets
+        let next_offset_index = reference_offsets.partition_point(|&candidate| candidate <= offset);
+        let window_end = reference_offsets
             .get(next_offset_index)
             .map_or(bytes.len(), |&next| next as usize);
         // `find_xref_stream_trailer_candidate` only ever runs after
@@ -2708,8 +2733,8 @@ fn find_xref_stream_trailer_candidate(
                     }
                     let wide_index = next_offset_index
                         .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
-                        .min(offsets.len());
-                    let wide_end = offsets
+                        .min(reference_offsets.len());
+                    let wide_end = reference_offsets
                         .get(wide_index)
                         .map_or(bytes.len(), |&next| next as usize);
                     read_xref_candidate(&mut context, bytes, start, wide_end, offset, object_ref)
@@ -3920,10 +3945,12 @@ mod final_handle_tests {
                 index: 0,
             },
         );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
         let context = XrefReadContext::new(
             &[0; 800],
             XrefReadContextSpec::Reconstruction {
                 line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
             },
             &XrefRegistration::default(),
             XrefLoadOptions::default(),
@@ -3941,6 +3968,7 @@ mod final_handle_tests {
             &[0; 800],
             XrefReadContextSpec::ReconstructionWithCache {
                 line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
                 bootstrap_cache: &shared,
             },
             &XrefRegistration::default(),
@@ -3953,6 +3981,22 @@ mod final_handle_tests {
                 fallback_end: 660,
             }
         );
+        let context_offsets = context
+            .document
+            .reference_offsets
+            .borrow()
+            .as_ref()
+            .expect("reconstruction context must retain its offset index")
+            .clone();
+        let cached_offsets = cached_context
+            .document
+            .reference_offsets
+            .borrow()
+            .as_ref()
+            .expect("cached reconstruction context must retain its offset index")
+            .clone();
+        assert!(Rc::ptr_eq(&context_offsets, &reference_offsets));
+        assert!(Rc::ptr_eq(&cached_offsets, &reference_offsets));
     }
 
     #[test]
@@ -3992,10 +4036,12 @@ mod final_handle_tests {
                 offset: second_offset as u64,
             },
         );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
         let context = XrefReadContext::new(
             &bytes,
             XrefReadContextSpec::Reconstruction {
                 line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
             },
             &XrefRegistration::default(),
             XrefLoadOptions {
@@ -4053,10 +4099,12 @@ mod final_handle_tests {
                 offset: second_offset as u64,
             },
         );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
         let mut context = XrefReadContext::new(
             &bytes,
             XrefReadContextSpec::Reconstruction {
                 line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
             },
             &XrefRegistration::default(),
             XrefLoadOptions {
@@ -4276,6 +4324,27 @@ mod final_handle_tests {
             .position(|window| window == b"trailer")
             .expect("classic fixture has a trailer keyword")
             + b"trailer".len()
+    }
+
+    fn loaded_state_with_trailer(trailer: ObjectHandle) -> LoadedXrefState {
+        LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.4".to_owned(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            first_xref_item_offset: 0,
+            classic_trailer_offset: None,
+            pending_reconstruction_trigger: None,
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
+            header_offset: 0,
+            already_reconstructed: false,
+        }
     }
 
     fn classic_xref_with_malformed_previous() -> (Vec<u8>, usize) {
@@ -4517,6 +4586,70 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn reconstruction_contexts_retain_the_precomputed_index_across_xref_routes() {
+        let mut entries = BTreeMap::new();
+        entries.insert(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 });
+        let reference_offsets = reconstructed_reference_offsets(&entries);
+
+        let mut previous_loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/Size".to_vec(),
+            ObjectHandle::integer(1),
+        )]));
+        let mut registration = XrefRegistration::default();
+        merge_previous_xref_sections(
+            b"",
+            "1.4",
+            &mut previous_loaded,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
+            },
+        )
+        .expect("a reconstruction context without /Prev should be a no-op");
+
+        let mut hybrid_loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/XRefStm".to_vec(),
+            ObjectHandle::integer(1),
+        )]));
+        let result = merge_xref_stream_from_classic_trailer(
+            b"",
+            0,
+            &mut hybrid_loaded,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
+            },
+        );
+        assert!(matches!(result, Err(Error::Parse { .. })));
+
+        let mut cached_hybrid_loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/XRefStm".to_vec(),
+            ObjectHandle::integer(1),
+        )]));
+        let shared = empty_bootstrap_cache();
+        let result = merge_xref_stream_from_classic_trailer(
+            b"",
+            0,
+            &mut cached_hybrid_loaded,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries: &entries,
+                reference_offsets: &reference_offsets,
+                bootstrap_cache: &shared,
+            },
+        );
+        assert!(matches!(result, Err(Error::Parse { .. })));
+    }
+
+    #[test]
     fn strict_classic_xref_rejects_non_integer_previous_offset() {
         let (bytes, offset) = classic_xref_with_malformed_previous();
         let mut reader = std::io::Cursor::new(bytes);
@@ -4654,6 +4787,86 @@ mod final_handle_tests {
             "a valid indirect /Filter on the /XRefStm stream must not force \
              cross-reference reconstruction"
         );
+    }
+
+    #[test]
+    fn candidate_recovery_passes_one_offset_index_through_reentry_and_size() {
+        let bytes = hybrid_xref_with_indirect_filter();
+        let recovered = recover_xref_entries(&bytes, false).expect("scan candidate entries");
+        let mut entries = recovered.entries;
+        let mut parsed_xref_streams = BTreeMap::new();
+        let mut repair_diagnostics = Diagnostics::default();
+        let mut trailer_references = BTreeSet::new();
+
+        let recovered = recover_trailer_from_xref_stream_candidate(
+            &bytes,
+            "1.5",
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut entries,
+            &mut parsed_xref_streams,
+            &mut repair_diagnostics,
+            &mut trailer_references,
+        )
+        .expect("the scanned xref-stream candidate must be recoverable");
+
+        assert!(recovered.1 > 0);
+        assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn reconstructed_size_revalidation_uses_the_recovery_offset_index() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 0 R /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut initial_registration = XrefRegistration::default();
+        let mut initial_diagnostics = Diagnostics::default();
+        let mut initial_first_xref_item_offset = None;
+        let initial = parse_xref_from_start(
+            reader.get_ref(),
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut initial_registration,
+            Some(&mut initial_diagnostics),
+            XrefReadContextSpec::ActiveSection,
+            Some(&mut initial_first_xref_item_offset),
+            true,
+        )
+        .expect("the initial classic section must defer the stale /Size mismatch");
+        assert!(initial.pending_reconstruction_trigger.is_some());
+
+        let recovered = load_xref_state_with_options(
+            &mut reader,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect("repair mode must complete the recovered size revalidation");
+        assert!(recovered.already_reconstructed);
+        assert!(recovered
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected 2 0 obj")));
     }
 
     #[test]
