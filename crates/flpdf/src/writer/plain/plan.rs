@@ -136,14 +136,14 @@ impl PlainWritePlan {
         let stream_parameters_removed = |handle: &crate::ObjectHandle| {
             let Some(source) = handle.object_ref() else {
                 return if handle.is_data_modified() {
-                    Ok(false) // cov:ignore: direct token-filtered streams have no source identity to cache
+                    Ok(false)
                 } else {
                     body::canonical_stream_will_be_refiltered(handle, options)
                 };
             };
             if let Some(cached) = cached_stream_outputs.borrow().get(&source) {
                 if cached.fingerprint == stream_cache_fingerprint(handle)? {
-                    return Ok(cached.parameters_removed); // cov:ignore: the canonical walk probes each source object once; emission reads this cache directly, so a repeated probe is defensive only
+                    return Ok(cached.parameters_removed);
                 }
             }
 
