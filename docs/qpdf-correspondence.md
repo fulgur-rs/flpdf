@@ -356,6 +356,8 @@ mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObjec
 
 `flpdf-qwh0` では、qpdf 11.9.0 が `reconstruct_xref` の候補ごとに参照 object を offset から EOF まで読む (`QPDF.cc:585-589,1542-1697`) のに対し、flpdf の reconstruction bootstrap contextだけは line-scan で既知になった次の uncompressed offsetまで参照先 readを制限する。候補自身の隣接 windowと同じ64 offset-position fallbackで、実在 objectが候補境界にまたがる場合だけ再試行する。これはqpdfに対応物のないflpdf固有の malformed-input 性能/DoS hardeningであり、`xref.rs` の `qpdf-deviation` markerに記録する。通常のactive xref sectionはqpdfと同じunbounded source viewを維持する。
 
+`flpdf-ag95` では、qpdf 11.9.0 の `QPDF::resolve` が `m->resolving` による cycle 検出だけを行い、indirect-reference chain の深さ上限を持たない (`QPDF.cc:1699-1753`) ことに合わせ、bootstrap の recursive hub を `stacker::maybe_grow` で実行する。qpdfに対応物のないRust側stack policyであり、任意のdepth capやnull化によってqpdfが処理できるchainを拒否しない。stream `/Length` の再入前にも同じstack-growth boundaryを置き、既存のxref lookup・cycle/null fallback・diagnostic順序は維持する。`xref.rs` の `qpdf-deviation` markerに記録する。
+
 ## 3. 書き込み — 最大の smear
 
 | qpdf | 行 | flpdf | 状態 |
@@ -786,6 +788,8 @@ cargo test -p flpdf-cli --test cli_json --quiet
 `checkLinearization` も生成 handler (`auto_job_json_init.hh:217-219`)、Config (`QPDFJob_config.cc:80-85`)、inspection順序 (`QPDFJob.cc:1646-1666`) に対応し、既存の `QPDFJob::check_linearization` を job JSON の `checkLinearization` option から呼ぶ。Config と同じく output file を要求しない inspection-only route とし、linearized check の warning/status は共有 completion へ渡す。
 
 `flpdf-egzr.8.10` では、残る generated job-JSON handlers も同じ lifecycleへ接続した。`showLinearization`、`showXref`、`showObject`、`filteredStreamData`、`rawStreamData`、`listAttachments`、`showAttachment` は `QPDFJob::doInspection` の順序 (`QPDFJob.cc:1646-1689`) で既存の inspection/attachment primitiveへ委譲する。`copyEncryption` / `encryptionFilePassword` は認証済み donor の `writer_copy_encryption_source` を `PdfWriter`へ渡し、`compressionLevel` は `QPDFJob.cc:2847-2851` と同じ writer 開始境界で適用する。`passwordMode`、`passwordIsHexKey`、`ignoreXrefStreams`、`suppressPasswordRecovery`、`suppressRecovery` は全 job-owned input source の `PdfOpenOptions`へ伝播し、`allowInsecure` は256-bit encryptionの nested handlerで検査する。`isEncrypted` / `requiresPassword` は `QPDFJob.cc:535-557` の0/2/3を job statusへ写像し、`reportMemoryUsage` は `QUtil::get_max_memory_usage` (`QUtil.cc:1941-2002`) 相当を completion 後に stderrへ出力する。`jobJsonFile` は同じ `JobConfiguration` へ `partial=true` の再帰 dispatch を行い、各 JSON dictionary を qpdf と同じキー順で適用する。したがって添付・collate・overlay などの追記型設定は両方の文書から残り、`pages` の重複指定や入力・出力設定の重複は qpdf と同じ usage error になる。include cycle はスタック枯渇を避ける既存のRust側防御として拒否する。
+
+`flpdf-nv86` では、`--empty --is-encrypted` / `--empty --requires-password` を qpdf 11.9.0 と同じく「空 document は unencrypted」として無言の exit 2 にする。`run_encryption_status` は input filename を要求する前に empty-input の status resultを返し、通常の file-backed status queryの open/error/report境界は変更しない (`QPDFJob.cc:429-456,535-557`)。
 
 `testJsonSchema` の schema 不一致は、qpdf の `doJSON` (`QPDFJob.cc:1631-1642`) と同じく、生成済みJSONを出力へ流し終えた後に固定ヘッダーと各エラーを `QPDFLogger` の error pipeline へ書き出し、ジョブを失敗させずに戻る。flpdfの `job/json.rs::validate_json_schema` はこの責務を `QPDFJob` の logger から受け取り、JSON parse / 出力 pipeline の実障害だけをエラーとして返す。
 
