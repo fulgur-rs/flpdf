@@ -28,7 +28,7 @@ use crate::{
     UsageError, WriterConfiguration,
 };
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -141,7 +141,10 @@ struct JobConfiguration {
     keep_files_open: Option<bool>,
     /// qpdf's automatic source-count threshold (`200` by default).
     keep_files_open_threshold: Option<usize>,
-    rotations: Vec<RotateSpec>,
+    /// qpdf stores rotations in a map keyed by the original page-range
+    /// string (`QPDFJob.cc:369-415`); assigning the same range replaces the
+    /// earlier rotation and iteration is lexical by range.
+    rotations: BTreeMap<String, RotateSpec>,
     remove_restrictions: bool,
     coalesce_contents: bool,
     /// qpdf's image transformation toggles and thresholds. The actual image
@@ -174,6 +177,7 @@ struct JobConfiguration {
     json_keys: Vec<JsonKey>,
     json_objects: Vec<JsonObjectSelector>,
     json_stream_data: JsonStreamData,
+    json_stream_data_set: bool,
     json_stream_prefix: Option<String>,
     test_json_schema: bool,
     show_encryption_key: bool,
@@ -463,75 +467,18 @@ fn validate_job_json_schema(value: &crate::json::Json) -> Result<()> {
     Err(Error::Usage(UsageError::new(message)))
 }
 
-fn expand_job_json_files(value: &crate::json::Json) -> Result<crate::json::Json> {
-    fn expand(
-        value: &crate::json::Json,
-        active: &mut BTreeSet<PathBuf>,
-    ) -> Result<crate::json::Json> {
-        if !value.is_dictionary() {
-            return Err(Error::Usage(UsageError::new(
-                "top-level object is supposed to be a dictionary",
-            )));
-        }
-        let members = job_json_members(value);
-        let Some(path_bytes) = job_json_string(&members, b"jobJsonFile")? else {
-            return Ok(value.clone());
-        };
-        let path = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
-        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        // qpdf recursively re-enters `initializeFromJson` without a cycle
-        // guard. Keep the Rust job boundary finite for a hostile include
-        // graph; this input shape has no successful qpdf output to preserve.
-        // qpdf-deviation-start: reject recursive jobJsonFile includes instead of recursing until stack exhaustion
-        if !active.insert(identity.clone()) {
-            return Err(Error::Usage(UsageError::new(format!(
-                "recursive jobJsonFile reference: {}",
-                path.display()
-            ))));
-        }
-        // qpdf-deviation-end
-        let nested_result = (|| {
-            let bytes = std::fs::read(&path)
-                .map_err(|error| Error::file_io("read job-json file", path.clone(), error))?;
-            let nested = crate::json::Json::parse(&bytes)
-                .map_err(|error| Error::System(error.to_string()))?;
-            if !nested.is_dictionary() {
-                return Err(Error::Usage(UsageError::new(
-                    "top-level object is supposed to be a dictionary",
-                )));
-            }
-            validate_job_json_schema(&nested)?;
-            let nested = expand(&nested, active)?;
-            let nested_members = job_json_members(&nested);
-            let merged = crate::json::Json::make_dictionary();
-            for (key, item) in &nested_members {
-                merged
-                    .add_dictionary_member(key, item.clone())
-                    .map_err(|error| Error::System(error.to_string()))?;
-            }
-            for (key, item) in members {
-                if key == b"jobJsonFile" {
-                    continue;
-                }
-                // JSON dictionaries are stored in qpdf's ordered map. The
-                // nested file is applied at the `jobJsonFile` key's position:
-                // keys before it are overwritten by the nested handler, and
-                // keys after it overwrite nested settings.
-                // cov:ignore-start: the merged value is always a dictionary, so its insertion type error is unreachable
-                if !nested_members.contains_key(&key) || key.as_slice() > b"jobJsonFile" {
-                    merged
-                        .add_dictionary_member(key, item)
-                        .map_err(|error| Error::System(error.to_string()))?;
-                }
-                // cov:ignore-end
-            }
-            Ok(merged)
-        })();
-        active.remove(&identity);
-        nested_result
+fn read_job_json_file(path: &Path) -> Result<crate::json::Json> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| Error::file_io("read job-json file", path.to_owned(), error))?;
+    let value =
+        crate::json::Json::parse(&bytes).map_err(|error| Error::System(error.to_string()))?;
+    if !value.is_dictionary() {
+        return Err(Error::Usage(UsageError::new(
+            "top-level object is supposed to be a dictionary",
+        )));
     }
-
-    expand(value, &mut BTreeSet::new())
+    validate_job_json_schema(&value)?;
+    Ok(value)
 }
 
 fn job_json_members(
@@ -641,6 +588,18 @@ fn job_json_yn(
     key: &[u8],
 ) -> Result<Option<bool>> {
     Ok(job_json_choice(members, key, &["y", "n"], true)?.map(|value| value == "y"))
+}
+
+fn job_json_rotate_range(value: &[u8]) -> String {
+    let value = String::from_utf8_lossy(value);
+    let Some((_, range)) = value.split_once(':') else {
+        return "1-z".to_owned();
+    };
+    if range.is_empty() {
+        "1-z".to_owned()
+    } else {
+        range.to_owned()
+    }
 }
 
 fn job_json_modify_permission(
@@ -1634,15 +1593,88 @@ impl QPDFJob {
         // configuration mutation so a schema failure cannot leave a partially
         // initialized job behind.
         validate_job_json_schema(&value)?;
-        let value = expand_job_json_files(&value)?;
-        let members = job_json_members(&value);
         let mut configuration = JobConfiguration {
             require_output: true,
             json_decode_level: crate::writer::DecodeLevel::Generalized,
             ..JobConfiguration::default()
         };
+        self.dispatch_job_json_document(&mut configuration, &value, &mut BTreeSet::new())?;
 
+        self.configuration = configuration;
+        self.input_name = self
+            .configuration
+            .input_file
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string());
+        self.warnings = false;
+        if !partial {
+            self.check_configuration()?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_job_json_document(
+        &mut self,
+        configuration: &mut JobConfiguration,
+        value: &crate::json::Json,
+        active: &mut BTreeSet<PathBuf>,
+    ) -> Result<()> {
+        // qpdf validates every document before invoking its generated
+        // handlers, including documents reached through jobJsonFile
+        // (`QPDFJob_json.cc:611-625`, `QPDFJob_config.cc:774-784`).
+        validate_job_json_schema(value)?;
+        for (key, item) in job_json_members(value) {
+            if key == b"jobJsonFile" {
+                let mut members = std::collections::BTreeMap::new();
+                members.insert(key.clone(), item);
+                let path_bytes = job_json_string(&members, b"jobJsonFile")?
+                    .expect("jobJsonFile member is present in the one-member dictionary");
+                let path = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
+                let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                // qpdf recursively re-enters `initializeFromJson` without a
+                // cycle guard. Keep the Rust job boundary finite for a
+                // hostile include graph; this input shape has no successful
+                // qpdf output to preserve.
+                // qpdf-deviation-start: reject recursive jobJsonFile includes instead of recursing until stack exhaustion
+                if !active.insert(identity.clone()) {
+                    return Err(Error::Usage(UsageError::new(format!(
+                        "recursive jobJsonFile reference: {}",
+                        path.display()
+                    ))));
+                }
+                // qpdf-deviation-end
+                let nested_result = (|| {
+                    let nested = read_job_json_file(&path)?;
+                    self.dispatch_job_json_document(configuration, &nested, active)
+                })();
+                active.remove(&identity);
+                nested_result.map_err(|error| {
+                    Error::System(format!(
+                        "error with job-json file {}: {error}\nRun {} --job-json-help for information on the file format.",
+                        path.display(),
+                        self.message_prefix
+                    ))
+                })?;
+            } else {
+                let mut members = std::collections::BTreeMap::new();
+                members.insert(key, item);
+                self.apply_job_json_members(configuration, members)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_job_json_members(
+        &mut self,
+        configuration: &mut JobConfiguration,
+        members: std::collections::BTreeMap<Vec<u8>, crate::json::Json>,
+    ) -> Result<()> {
         if let Some(input) = job_json_string(&members, b"inputFile")? {
+            if configuration.input_file.is_some() || configuration.empty_input {
+                return Err(Error::Usage(UsageError::new(
+                    "input file has already been given",
+                )));
+            }
             if input.is_empty() {
                 configuration.empty_input = true;
             } else {
@@ -1659,6 +1691,11 @@ impl QPDFJob {
             configuration.empty_input = true;
         }
         if let Some(output) = job_json_string(&members, b"outputFile")? {
+            if configuration.output_file.is_some() || configuration.replace_input {
+                return Err(Error::Usage(UsageError::new(
+                    "output file has already been given",
+                )));
+            }
             configuration.output_file =
                 Some(PathBuf::from(String::from_utf8_lossy(&output).into_owned()));
         }
@@ -1666,11 +1703,23 @@ impl QPDFJob {
             configuration.copy_encryption = Some(PathBuf::from(
                 String::from_utf8_lossy(&copy_encryption).into_owned(),
             ));
+            configuration.writer.clear_encryption_parameters();
         }
-        configuration.encryption_file_password =
-            job_json_string(&members, b"encryptionFilePassword")?.unwrap_or_default();
-        configuration.replace_input = job_json_bare(&members, b"replaceInput")?;
-        configuration.password = job_json_string(&members, b"password")?.unwrap_or_default();
+        if members.contains_key(b"encryptionFilePassword".as_slice()) {
+            configuration.encryption_file_password =
+                job_json_string(&members, b"encryptionFilePassword")?.unwrap_or_default();
+        }
+        if job_json_bare(&members, b"replaceInput")? {
+            if configuration.output_file.is_some() || configuration.replace_input {
+                return Err(Error::Usage(UsageError::new(
+                    "replace-input can't be used since output file has already been given",
+                )));
+            }
+            configuration.replace_input = true;
+        }
+        if members.contains_key(b"password".as_slice()) {
+            configuration.password = job_json_string(&members, b"password")?.unwrap_or_default();
+        }
         if let Some(password_file) = job_json_string(&members, b"passwordFile")? {
             let path = PathBuf::from(String::from_utf8_lossy(&password_file).into_owned());
             // Byte-preserving, first-line-only contract, matching qpdf's
@@ -1694,11 +1743,18 @@ impl QPDFJob {
             }
             configuration.password = first_line;
         }
-        configuration.ignore_xref_streams = job_json_bare(&members, b"ignoreXrefStreams")?;
-        configuration.password_is_hex_key = job_json_bare(&members, b"passwordIsHexKey")?;
-        configuration.suppress_password_recovery =
-            job_json_bare(&members, b"suppressPasswordRecovery")?;
-        configuration.suppress_recovery = job_json_bare(&members, b"suppressRecovery")?;
+        if job_json_bare(&members, b"ignoreXrefStreams")? {
+            configuration.ignore_xref_streams = true;
+        }
+        if job_json_bare(&members, b"passwordIsHexKey")? {
+            configuration.password_is_hex_key = true;
+        }
+        if job_json_bare(&members, b"suppressPasswordRecovery")? {
+            configuration.suppress_password_recovery = true;
+        }
+        if job_json_bare(&members, b"suppressRecovery")? {
+            configuration.suppress_recovery = true;
+        }
         if let Some(value) = job_json_choice(
             &members,
             b"passwordMode",
@@ -1713,7 +1769,9 @@ impl QPDFJob {
                 _ => unreachable!("passwordMode was validated above"), // cov:ignore: passwordMode comes only from the validated qpdf job schema choices
             };
         }
-        configuration.json_input = job_json_bare(&members, b"jsonInput")?;
+        if job_json_bare(&members, b"jsonInput")? {
+            configuration.json_input = true;
+        }
 
         if job_json_bare(&members, b"qdf")? {
             configuration.writer.set_qdf_mode(true);
@@ -1768,6 +1826,8 @@ impl QPDFJob {
         }
         if job_json_bare(&members, b"decrypt")? {
             configuration.writer.set_preserve_encryption(false);
+            configuration.writer.clear_encryption_parameters();
+            configuration.copy_encryption = None;
         }
         if job_json_bare(&members, b"deterministicId")? {
             configuration.writer.set_deterministic_id(true);
@@ -1781,10 +1841,18 @@ impl QPDFJob {
         if job_json_bare(&members, b"noOriginalObjectIds")? {
             configuration.writer.set_suppress_original_object_ids(true);
         }
-        configuration.allow_weak_crypto = job_json_bare(&members, b"allowWeakCrypto")?;
-        configuration.progress = job_json_bare(&members, b"progress")?;
-        configuration.verbose = job_json_bare(&members, b"verbose")?;
-        configuration.keep_files_open = job_json_yn(&members, b"keepFilesOpen")?;
+        if job_json_bare(&members, b"allowWeakCrypto")? {
+            configuration.allow_weak_crypto = true;
+        }
+        if job_json_bare(&members, b"progress")? {
+            configuration.progress = true;
+        }
+        if job_json_bare(&members, b"verbose")? {
+            configuration.verbose = true;
+        }
+        if let Some(value) = job_json_yn(&members, b"keepFilesOpen")? {
+            configuration.keep_files_open = Some(value);
+        }
         if let Some(value) = job_json_string(&members, b"keepFilesOpenThreshold")? {
             configuration.keep_files_open_threshold = Some(parse_qpdf_collate_uint(&value)?);
         }
@@ -1795,15 +1863,25 @@ impl QPDFJob {
             let value = String::from_utf8_lossy(&value);
             let rotation = RotateSpec::parse(&value)
                 .map_err(|error| Error::Usage(UsageError::new(format!(".rotate: {error}"))))?;
-            configuration.rotations.push(rotation);
+            configuration
+                .rotations
+                .insert(job_json_rotate_range(value.as_bytes()), rotation);
         }
-        configuration.remove_restrictions = job_json_bare(&members, b"removeRestrictions")?;
-        configuration.coalesce_contents = job_json_bare(&members, b"coalesceContents")?;
-        configuration.externalize_inline_images =
-            job_json_bare(&members, b"externalizeInlineImages")?;
-        configuration.image_options.keep_inline_images =
-            job_json_bare(&members, b"keepInlineImages")?;
-        configuration.optimize_images = job_json_bare(&members, b"optimizeImages")?;
+        if job_json_bare(&members, b"removeRestrictions")? {
+            configuration.remove_restrictions = true;
+        }
+        if job_json_bare(&members, b"coalesceContents")? {
+            configuration.coalesce_contents = true;
+        }
+        if job_json_bare(&members, b"externalizeInlineImages")? {
+            configuration.externalize_inline_images = true;
+        }
+        if job_json_bare(&members, b"keepInlineImages")? {
+            configuration.image_options.keep_inline_images = true;
+        }
+        if job_json_bare(&members, b"optimizeImages")? {
+            configuration.optimize_images = true;
+        }
         if let Some(value) = job_json_string(&members, b"iiMinBytes")? {
             configuration.image_options.inline_min_bytes =
                 parse_qpdf_collate_uint(&value)? as usize;
@@ -1833,8 +1911,12 @@ impl QPDFJob {
                 _ => unreachable!("flattenAnnotations was validated above"), // cov:ignore: flattenAnnotations comes only from the validated qpdf job schema choices
             });
         }
-        configuration.flatten_rotation = job_json_bare(&members, b"flattenRotation")?;
-        configuration.generate_appearances = job_json_bare(&members, b"generateAppearances")?;
+        if job_json_bare(&members, b"flattenRotation")? {
+            configuration.flatten_rotation = true;
+        }
+        if job_json_bare(&members, b"generateAppearances")? {
+            configuration.generate_appearances = true;
+        }
         if let Some(value) = job_json_choice(
             &members,
             b"objectStreams",
@@ -1861,14 +1943,19 @@ impl QPDFJob {
             configuration.linearize_pass1 =
                 Some(PathBuf::from(String::from_utf8_lossy(&value).into_owned()));
         }
-        configuration.linearize = job_json_bare(&members, b"linearize")?;
+        if job_json_bare(&members, b"linearize")? {
+            configuration.linearize = true;
+        }
         if let Some(value) = job_json_string(&members, b"updateFromJson")? {
             configuration.update_from_json =
                 Some(PathBuf::from(String::from_utf8_lossy(&value).into_owned()));
         }
         if let Some(value) = job_json_string(&members, b"collate")? {
             let value = String::from_utf8_lossy(&value);
-            configuration.collate = Some(Self::parse_collate(&value)?);
+            configuration
+                .collate
+                .get_or_insert_with(Vec::new)
+                .extend(Self::parse_collate(&value)?);
         }
 
         if let Some(value) = job_json_choice(&members, b"json", &["1", "2", "latest"], false)? {
@@ -1878,7 +1965,9 @@ impl QPDFJob {
         if let Some(value) = job_json_choice(&members, b"jsonOutput", &["2", "latest"], false)? {
             configuration.json_output = true;
             configuration.json_version = Some(parse_json_version(&value));
-            configuration.json_stream_data = JsonStreamData::Inline;
+            if !configuration.json_stream_data_set {
+                configuration.json_stream_data = JsonStreamData::Inline;
+            }
             if !configuration.json_decode_level_set {
                 configuration.json_decode_level = crate::writer::DecodeLevel::None;
             }
@@ -1902,6 +1991,7 @@ impl QPDFJob {
                 "file" => JsonStreamData::File,
                 _ => unreachable!("jsonStreamData was validated above"), // cov:ignore: jsonStreamData comes only from the validated qpdf job schema choices
             };
+            configuration.json_stream_data_set = true;
         }
         if let Some(value) = members.get(b"jsonKey".as_slice()) {
             for item in job_json_items(value) {
@@ -1931,8 +2021,12 @@ impl QPDFJob {
                 configuration.json_objects.push(selector);
             }
         }
-        configuration.test_json_schema = job_json_bare(&members, b"testJsonSchema")?;
-        configuration.show_encryption_key = job_json_bare(&members, b"showEncryptionKey")?;
+        if job_json_bare(&members, b"testJsonSchema")? {
+            configuration.test_json_schema = true;
+        }
+        if job_json_bare(&members, b"showEncryptionKey")? {
+            configuration.show_encryption_key = true;
+        }
         if job_json_bare(&members, b"noWarn")? {
             self.suppress_warnings = true;
         }
@@ -1975,8 +2069,12 @@ impl QPDFJob {
             configuration.show_linearization = true;
             configuration.require_output = false;
         }
-        configuration.show_filtered_stream_data = job_json_bare(&members, b"filteredStreamData")?;
-        configuration.show_raw_stream_data = job_json_bare(&members, b"rawStreamData")?;
+        if job_json_bare(&members, b"filteredStreamData")? {
+            configuration.show_filtered_stream_data = true;
+        }
+        if job_json_bare(&members, b"rawStreamData")? {
+            configuration.show_raw_stream_data = true;
+        }
         if let Some(value) = job_json_string(&members, b"showObject")? {
             configuration.show_object = Some(parse_job_object_selector(&value)?);
             configuration.require_output = false;
@@ -1989,8 +2087,12 @@ impl QPDFJob {
             configuration.show_attachment = Some(value);
             configuration.require_output = false;
         }
-        configuration.show_page_images = job_json_bare(&members, b"withImages")?;
-        configuration.report_memory_usage = job_json_bare(&members, b"reportMemoryUsage")?;
+        if job_json_bare(&members, b"withImages")? {
+            configuration.show_page_images = true;
+        }
+        if job_json_bare(&members, b"reportMemoryUsage")? {
+            configuration.report_memory_usage = true;
+        }
 
         if let Some(value) = members.get(b"encrypt".as_slice()) {
             // qpdf's `EncConfig::endEncrypt` clears copy-encryption and
@@ -2007,7 +2109,18 @@ impl QPDFJob {
         }
 
         if let Some(value) = members.get(b"pages".as_slice()) {
-            for (index, item) in job_json_items(value).into_iter().enumerate() {
+            if !configuration.page_specs.is_empty() {
+                return Err(Error::Usage(UsageError::new(
+                    "--pages may only be specified one time",
+                )));
+            }
+            let items = job_json_items(value);
+            if items.is_empty() {
+                return Err(Error::Usage(UsageError::new(
+                    "--pages: no page specifications given",
+                )));
+            }
+            for (index, item) in items.into_iter().enumerate() {
                 let item_members = job_json_members(&item);
                 let file = job_json_string(&item_members, b"file")?.ok_or_else(|| {
                     Error::Usage(UsageError::new("file is required in page specification"))
@@ -2095,16 +2208,6 @@ impl QPDFJob {
             configuration.remove_unreferenced_resources = RemoveUnreferencedResources::No;
         }
 
-        self.configuration = configuration;
-        self.input_name = self
-            .configuration
-            .input_file
-            .as_ref()
-            .map_or_else(String::new, |path| path.display().to_string());
-        self.warnings = false;
-        if !partial {
-            self.check_configuration()?;
-        }
         Ok(())
     }
 
@@ -2537,7 +2640,7 @@ impl QPDFJob {
         }
         let page_count = u32::try_from(page_refs.len())
             .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
-        for rotation in &configuration.rotations {
+        for rotation in configuration.rotations.values() {
             let selected = rotation.range.resolve(page_count)?;
             let selected_refs = selected
                 .into_iter()
@@ -4156,6 +4259,9 @@ mod tests {
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"pages":{"file":"page.pdf","range":"1-2"}}"#)
             .unwrap();
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(r#"{"pages":[]}"#)
+            .expect_err("an empty pages array must finish with qpdf's no-specification error");
 
         let mut job = QPDFJob::new();
         job.initialize_from_json_partial(r#"{"jsonKey":[1]}"#)
@@ -4205,18 +4311,115 @@ mod tests {
             .to_string()
             .contains("recursive jobJsonFile reference"));
 
-        assert!(
-            expand_job_json_files(&crate::json::Json::make_string("not-a-dictionary")).is_err()
-        );
+        let mut non_dictionary_job = QPDFJob::new();
+        assert!(non_dictionary_job
+            .initialize_from_json_partial("[]")
+            .is_err());
         let scalar_file = tempdir.path().join("scalar.json");
         std::fs::write(&scalar_file, b"[]").unwrap();
-        let scalar_json = crate::json::Json::parse(
-            serde_json::json!({"jobJsonFile": scalar_file.display().to_string()})
+        let mut scalar_job = QPDFJob::new();
+        assert!(scalar_job
+            .initialize_from_json_partial(
+                &serde_json::json!({
+                    "jobJsonFile": scalar_file.display().to_string()
+                })
                 .to_string()
-                .as_bytes(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn job_json_nested_dispatch_keeps_qpdf_shared_state_and_key_order() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let nested = tempdir.path().join("nested.json");
+        std::fs::write(
+            &nested,
+            serde_json::json!({
+                "collate": "2,3",
+                "jsonStreamData": "file",
+                "rotate": "90:1"
+            })
+            .to_string(),
         )
         .unwrap();
-        assert!(expand_job_json_files(&scalar_json).is_err());
+        let json = serde_json::json!({
+            "collate": "4",
+            "jobJsonFile": nested.display().to_string(),
+            "jsonOutput": "2",
+            "rotate": "180:1"
+        })
+        .to_string();
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(&json).unwrap();
+
+        assert_eq!(job.configuration.collate, Some(vec![4, 2, 3]));
+        assert_eq!(job.configuration.json_stream_data, JsonStreamData::File);
+        assert!(job.configuration.json_stream_data_set);
+        assert_eq!(job.configuration.rotations.len(), 1);
+        assert_eq!(job.configuration.rotations["1"].op.degrees, 180);
+    }
+
+    #[test]
+    fn job_json_nested_dispatch_appends_attachment_operations() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let nested = tempdir.path().join("nested.json");
+        std::fs::write(
+            &nested,
+            serde_json::json!({
+                "copyAttachmentsFrom": [{"file": "inner.pdf", "prefix": "inner-"}],
+                "removeAttachment": ["inner-key"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let json = serde_json::json!({
+            "copyAttachmentsFrom": [{"file": "outer.pdf", "prefix": "outer-"}],
+            "jobJsonFile": nested.display().to_string(),
+            "removeAttachment": ["outer-key"]
+        })
+        .to_string();
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(&json).unwrap();
+
+        assert_eq!(
+            job.configuration
+                .attachments_to_copy
+                .iter()
+                .map(|entry| entry.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("outer.pdf"), Path::new("inner.pdf")]
+        );
+        assert_eq!(
+            job.configuration.attachments_to_remove,
+            [b"inner-key".to_vec(), b"outer-key".to_vec()]
+        );
+    }
+
+    #[test]
+    fn job_json_nested_dispatch_rejects_duplicate_output_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let nested = tempdir.path().join("nested.json");
+        std::fs::write(
+            &nested,
+            serde_json::json!({"outputFile": "inner.pdf"}).to_string(),
+        )
+        .unwrap();
+        let json = serde_json::json!({
+            "jobJsonFile": nested.display().to_string(),
+            "outputFile": "outer.pdf"
+        })
+        .to_string();
+
+        let mut job = QPDFJob::new();
+        let error = job
+            .initialize_from_json_partial(&json)
+            .expect_err("qpdf accepts only one output file");
+        assert!(matches!(
+            error,
+            Error::Usage(usage) if usage.to_string() == "output file has already been given"
+        ));
     }
 
     #[test]

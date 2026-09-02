@@ -406,6 +406,80 @@ fn json_job_run_applies_pages_and_attachments() {
         .is_some());
 }
 
+#[test]
+fn json_job_nested_job_json_file_retains_outer_and_inner_attachments() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let nested = tempdir.path().join("nested.json");
+    let output = tempdir.path().join("nested-attachments.pdf");
+    std::fs::write(
+        &nested,
+        serde_json::json!({
+            "addAttachment": [{"file": fixture, "key": "inner-key"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "staticId": "",
+        "jobJsonFile": nested,
+        "addAttachment": [{"file": fixture, "key": "outer-key"}]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_file(b"inner-key")
+        .unwrap()
+        .is_some());
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_file(b"outer-key")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn json_job_nested_job_json_file_rejects_repeated_pages() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let nested = tempdir.path().join("nested-pages.json");
+    let output = tempdir.path().join("nested-pages.pdf");
+    std::fs::write(
+        &nested,
+        serde_json::json!({
+            "pages": [{"file": fixture}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "jobJsonFile": nested,
+        "pages": [{"file": fixture}]
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    let error = job
+        .initialize_from_json(&json)
+        .expect_err("qpdf allows --pages only once across nested job JSON");
+    assert!(matches!(
+        error,
+        Error::Usage(usage) if usage.to_string() == "--pages may only be specified one time"
+    ));
+}
+
 /// qpdf's `handleRotations` resolves each `--rotate` range against the real
 /// page count and then filters `0 <= pageno < npages` before touching
 /// `pages`, so a `--collate=0`-produced empty document rotates nothing
