@@ -5016,9 +5016,14 @@ impl ObjectHandle {
     ///
     /// This is crate-private because it is not a general-purpose ownership or
     /// value-copy API. The writer is its only consumer, and the method keeps
-    /// qpdf's own stream, unresolved, and destroyed copy errors at this exact
-    /// boundary.
+    /// qpdf's own uninitialized, stream, unresolved, and destroyed copy errors
+    /// at this exact boundary.
     pub(crate) fn unsafe_shallow_copy(&self) -> Result<ObjectHandle> {
+        if !self.is_initialized() {
+            return Err(Error::Internal(
+                "operation attempted on uninitialized QPDFObjectHandle".to_owned(),
+            ));
+        }
         if self.is_reserved() {
             return Ok(ObjectHandle::new_reserved_direct());
         }
@@ -17015,6 +17020,13 @@ mod mutation_tests {
             .unsafe_shallow_copy()
             .expect("unsafe scalar copy");
         assert_eq!(scalar_copy.as_integer(), Some(7));
+
+        let uninitialized = ObjectHandle::uninitialized();
+        assert!(matches!(
+            uninitialized.unsafe_shallow_copy(),
+            Err(Error::Internal(message))
+                if message == "operation attempted on uninitialized QPDFObjectHandle"
+        ));
 
         let reserved = ObjectHandle::new_reserved_direct();
         let reserved_copy = reserved
