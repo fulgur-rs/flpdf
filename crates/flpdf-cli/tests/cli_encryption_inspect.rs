@@ -40,9 +40,9 @@ use predicates::prelude::*;
 use std::io::Write;
 use std::process::{Command as ShellCommand, Stdio};
 
-#[path = "support/text.rs"]
-mod text;
-use text::platform_text;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 /// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
 /// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
@@ -317,7 +317,7 @@ fn show_encryption_key_v4_aes_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v4-aes", V4_AES])
         .assert()
         .success()
-        .stdout(platform_text("5042ec4efa389ea32a149ab2a34e84fc\n"));
+        .stdout(format!("5042ec4efa389ea32a149ab2a34e84fc{EOL}"));
 }
 
 #[test]
@@ -326,8 +326,8 @@ fn show_encryption_key_v5_r6_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v5-r6", V5_R6])
         .assert()
         .success()
-        .stdout(platform_text(
-            "fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290\n",
+        .stdout(format!(
+            "fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290{EOL}"
         ));
 }
 
@@ -415,7 +415,7 @@ fn show_encryption_key_weak_rc4_correct_password_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v2", V2_RC4])
         .assert()
         .success()
-        .stdout(platform_text("09d56583e16481df964f95df779c97d4\n"));
+        .stdout(format!("09d56583e16481df964f95df779c97d4{EOL}"));
 }
 
 #[test]
@@ -424,8 +424,8 @@ fn show_encryption_key_weak_r5_correct_password_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v5-r5", V5_R5])
         .assert()
         .success()
-        .stdout(platform_text(
-            "c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614\n",
+        .stdout(format!(
+            "c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614{EOL}"
         ));
 }
 
@@ -455,7 +455,7 @@ fn show_encryption_key_weak_with_allow_weak_crypto_emits_no_warning() {
         ])
         .assert()
         .success()
-        .stdout(platform_text("09d56583e16481df964f95df779c97d4\n"))
+        .stdout(format!("09d56583e16481df964f95df779c97d4{EOL}"))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 

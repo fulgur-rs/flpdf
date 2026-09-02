@@ -5,9 +5,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command as ShellCommand;
 
-#[path = "support/text.rs"]
-mod text;
-use text::EOL;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
 const REPAIRABLE_PDF: &str = "../../tests/fixtures/test_driver/repairable_input.pdf";

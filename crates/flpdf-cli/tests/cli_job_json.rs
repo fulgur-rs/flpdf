@@ -5,16 +5,16 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
-#[path = "support/text.rs"]
-mod text;
-use text::{platform_text, EOL};
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 fn expected_usage(message: &str) -> String {
-    platform_text(&format!(
-        "\nflpdf: {message}\n\nFor help:\n  flpdf --help=usage       usage information\n  \
-flpdf --help=topic       help on a topic\n  flpdf --help=--option    help on an option\n  \
-flpdf --help             general help and a topic list\n\n"
-    ))
+    format!(
+        "{EOL}flpdf: {message}{EOL}{EOL}For help:{EOL}  flpdf --help=usage       usage information{EOL}  \
+flpdf --help=topic       help on a topic{EOL}  flpdf --help=--option    help on an option{EOL}  \
+flpdf --help             general help and a topic list{EOL}{EOL}"
+    )
 }
 
 fn qpdf_available() -> bool {

@@ -4,9 +4,9 @@ use assert_cmd::Command;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Output};
 
-#[path = "support/text.rs"]
-mod text;
-use text::EOL;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 const MINIMAL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

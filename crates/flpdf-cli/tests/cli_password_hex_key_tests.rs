@@ -17,9 +17,9 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 
-#[path = "support/text.rs"]
-mod text;
-use text::platform_text;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 /// V=5 R=6 AES-256 fixture, user password `user-v5-r6`. Reference key
 /// captured from qpdf 11.9.0 (see cli_encryption_inspect.rs module header).
@@ -79,11 +79,11 @@ fn hex_key_v5_r6_check_succeeds_with_recovered_key() {
         .success()
         // The recovered key opens the encrypted file, so the check block emits
         // qpdf's detailed encryption report.
-        .stdout(predicates::str::contains(platform_text("R = 6\n")))
+        .stdout(predicates::str::contains(format!("R = 6{EOL}")))
         // This AES-256 fixture declares Adobe extension level 8 in its catalog;
         // the version banner must match qpdf byte-for-byte.
-        .stdout(predicates::str::contains(platform_text(
-            "PDF Version: 1.7 extension level 8\n",
+        .stdout(predicates::str::contains(format!(
+            "PDF Version: 1.7 extension level 8{EOL}"
         )))
         // A hex-key open never sets the password-matched flags qpdf uses to
         // decide password authentication succeeded, but the recovered key
@@ -147,7 +147,7 @@ fn hex_key_v5_r6_decrypts_equivalently_to_password() {
         "password path should report a password match"
     );
     assert!(
-        pw_stdout.contains(&platform_text("User password = user-v5-r6\n")),
+        pw_stdout.contains(&format!("User password = user-v5-r6{EOL}")),
         "password path should report the supplied user password"
     );
     assert!(
@@ -155,7 +155,7 @@ fn hex_key_v5_r6_decrypts_equivalently_to_password() {
         "hex-key path must NOT report a password match (raw key auths nothing)"
     );
     assert!(
-        hex_stdout.contains(&platform_text("User password = \n")),
+        hex_stdout.contains(&format!("User password = {EOL}")),
         "hex-key path must not report a user password"
     );
 }

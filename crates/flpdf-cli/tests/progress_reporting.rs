@@ -3,9 +3,9 @@
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 
-#[path = "support/text.rs"]
-mod text;
-use text::{platform_text, EOL};
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -84,7 +84,7 @@ fn progress_reaches_the_attachment_writer() {
         "{stdout}"
     );
     assert!(
-        stdout.contains(&platform_text("write progress: 100%\n")),
+        stdout.contains(&format!("write progress: 100%{EOL}")),
         "{stdout}"
     );
     assert!(stdout
@@ -229,15 +229,13 @@ fn progress_reports_each_split_writer_once() {
     );
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert_eq!(
-        stdout
-            .matches(&platform_text("write progress: 0%\n"))
-            .count(),
+        stdout.matches(&format!("write progress: 0%{EOL}")).count(),
         2,
         "{stdout}"
     );
     assert_eq!(
         stdout
-            .matches(&platform_text("write progress: 100%\n"))
+            .matches(&format!("write progress: 100%{EOL}"))
             .count(),
         2,
         "{stdout}"
@@ -273,15 +271,13 @@ fn progress_reports_each_pages_split_writer_once() {
     );
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert_eq!(
-        stdout
-            .matches(&platform_text("write progress: 0%\n"))
-            .count(),
+        stdout.matches(&format!("write progress: 0%{EOL}")).count(),
         2,
         "{stdout}"
     );
     assert_eq!(
         stdout
-            .matches(&platform_text("write progress: 100%\n"))
+            .matches(&format!("write progress: 100%{EOL}"))
             .count(),
         2,
         "{stdout}"
@@ -436,7 +432,7 @@ fn remove_attachment_stdout_output_omits_the_resulting_file_warning_suffix() {
     assert!(stdout_output.stdout.starts_with(b"%PDF-1.3\n"));
     let stdout_stderr = String::from_utf8(stdout_output.stderr).expect("diagnostics are UTF-8");
     assert!(
-        stdout_stderr.contains(&platform_text("operation succeeded with warnings\n")),
+        stdout_stderr.contains(&format!("operation succeeded with warnings{EOL}")),
         "stderr: {stdout_stderr}"
     );
     assert!(

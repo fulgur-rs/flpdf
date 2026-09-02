@@ -2,9 +2,9 @@ use assert_cmd::Command;
 use std::io::Write;
 use std::process::{Command as ProcessCommand, Output, Stdio};
 
-#[path = "support/text.rs"]
-mod text;
-use text::EOL;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 fn run(binary: &str, args: &[&str], input: &[u8]) -> Output {
     Command::cargo_bin(binary)

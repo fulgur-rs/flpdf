@@ -3,9 +3,9 @@
 use assert_cmd::Command;
 use std::process::Output;
 
-#[path = "support/text.rs"]
-mod text;
-use text::platform_text;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 const MINIMAL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -31,15 +31,15 @@ fn flpdf(args: &[&str]) -> Output {
 #[test]
 fn show_object_accepts_qpdf_selector_forms() {
     for (selector, expected) in [
-        ("1", "<< /Pages 2 0 R /Type /Catalog >>\n"),
-        ("1,0", "<< /Pages 2 0 R /Type /Catalog >>\n"),
-        ("trailer", "<< /Root 1 0 R /Size 3 >>\n"),
+        ("1", "<< /Pages 2 0 R /Type /Catalog >>"),
+        ("1,0", "<< /Pages 2 0 R /Type /Catalog >>"),
+        ("trailer", "<< /Root 1 0 R /Size 3 >>"),
     ] {
         let output = flpdf(&[&format!("--show-object={selector}"), MINIMAL]);
         assert!(output.status.success(), "{selector}: {:?}", output.stderr);
         assert_eq!(
             output.stdout,
-            platform_text(expected).into_bytes(),
+            format!("{expected}{EOL}").into_bytes(),
             "{selector}"
         );
         assert!(output.stderr.is_empty(), "{selector}: {:?}", output.stderr);
@@ -51,7 +51,7 @@ fn show_object_missing_selector_emits_qpdf_null() {
     let output = flpdf(&["--show-object=99,0", MINIMAL]);
 
     assert!(output.status.success(), "{:?}", output.stderr);
-    assert_eq!(output.stdout, platform_text("null\n").into_bytes());
+    assert_eq!(output.stdout, format!("null{EOL}").into_bytes());
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }
 
@@ -63,7 +63,7 @@ fn show_object_out_of_range_generation_emits_qpdf_null() {
         assert!(output.status.success(), "{selector}: {:?}", output.stderr);
         assert_eq!(
             output.stdout,
-            platform_text("null\n").into_bytes(),
+            format!("null{EOL}").into_bytes(),
             "{selector}"
         );
         assert!(output.stderr.is_empty(), "{selector}: {:?}", output.stderr);
@@ -83,7 +83,7 @@ fn show_object_keeps_qpdf_zero_object_no_output_behavior() {
     assert!(generation_fallback.status.success());
     assert_eq!(
         generation_fallback.stdout,
-        platform_text("<< /Pages 2 0 R /Type /Catalog >>\n").into_bytes()
+        format!("<< /Pages 2 0 R /Type /Catalog >>{EOL}").into_bytes()
     );
 }
 
@@ -93,7 +93,7 @@ fn show_object_stream_matches_qpdf_default_raw_and_filtered_modes() {
     assert!(dictionary.status.success(), "{:?}", dictionary.stderr);
     assert_eq!(
         dictionary.stdout,
-        platform_text("Object is stream.  Dictionary:\n<< /Filter /FlateDecode /Length 18 >>\n")
+        format!("Object is stream.  Dictionary:{EOL}<< /Filter /FlateDecode /Length 18 >>{EOL}")
             .into_bytes()
     );
 

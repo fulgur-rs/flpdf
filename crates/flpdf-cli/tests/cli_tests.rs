@@ -12,9 +12,9 @@ mod common;
 use common::PdfCanonicalTestExt;
 use common::{first_widget_ref, page_annotation_handles};
 
-#[path = "support/text.rs"]
-mod text;
-use text::platform_text;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 /// `true` when `needle` appears as a contiguous byte subslice of `hay`.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -40,8 +40,8 @@ fn check_valid_fixture_exits_successfully() {
     cmd.args(["--check", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(platform_text(
-            "File is not encrypted\n",
+        .stdout(predicate::str::contains(format!(
+            "File is not encrypted{EOL}"
         )));
 }
 
@@ -56,8 +56,8 @@ fn check_accepts_ignore_xref_streams_on_a_clean_pdf() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(platform_text(
-            "File is not encrypted\n",
+        .stdout(predicate::str::contains(format!(
+            "File is not encrypted{EOL}"
         )));
 }
 
@@ -331,8 +331,8 @@ fn check_accepts_qpdf_bare_flag_with_discarded_equals_value() {
     cmd.args(["--check=ignored", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(platform_text(
-            "File is not encrypted\n",
+        .stdout(predicate::str::contains(format!(
+            "File is not encrypted{EOL}"
         )));
 }
 
@@ -389,7 +389,7 @@ fn check_encrypted_fixture_accepts_correct_empty_password_flag() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains(platform_text("R = 4\n")));
+    .stdout(predicate::str::contains(format!("R = 4{EOL}")));
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn check_inspects_rc4_encrypted_input_by_default() {
         .arg(&input)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(platform_text("R = 2\n")))
+        .stdout(predicate::str::contains(format!("R = 2{EOL}")))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 
@@ -439,7 +439,7 @@ fn check_rc4_with_allow_weak_crypto_still_clean_no_warning() {
         .arg(&input)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(platform_text("R = 2\n")))
+        .stdout(predicate::str::contains(format!("R = 2{EOL}")))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 
@@ -475,7 +475,7 @@ fn rewrite_encrypted_fixture_preserves_encryption_by_default() {
         .args(["--check", output.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains(platform_text("R = 4\n")));
+        .stdout(predicate::str::contains(format!("R = 4{EOL}")));
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn check_encrypted_fixture_uses_empty_default_password() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains(platform_text("R = 4\n")));
+    .stdout(predicate::str::contains(format!("R = 4{EOL}")));
 }
 
 #[test]
@@ -502,7 +502,7 @@ fn check_encrypted_fixture_reads_password_file_and_strips_newline() {
         .arg("../../tests/fixtures/compat/encrypted-r4-three-page.pdf")
         .assert()
         .success()
-        .stdout(predicate::str::contains(platform_text("R = 4\n")));
+        .stdout(predicate::str::contains(format!("R = 4{EOL}")));
 }
 
 #[test]
@@ -858,8 +858,8 @@ fn check_subcommand_succeeds() {
     cmd.args(["check", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(platform_text(
-            "File is not encrypted\n",
+        .stdout(predicate::str::contains(format!(
+            "File is not encrypted{EOL}"
         )));
 }
 
@@ -1922,8 +1922,8 @@ fn check_repairs_corrupt_xref_by_default() {
     cmd.args(["--check", input.to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains(platform_text(
-            "File is not encrypted\n",
+        .stdout(predicate::str::contains(format!(
+            "File is not encrypted{EOL}"
         )));
 }
 
@@ -1939,8 +1939,8 @@ fn check_with_repair_accepts_corrupt_xref() {
     cmd.args(["--repair", "--check", input.to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains(platform_text(
-            "File is not encrypted\n",
+        .stdout(predicate::str::contains(format!(
+            "File is not encrypted{EOL}"
         )));
 }
 
@@ -2899,7 +2899,7 @@ fn json_qpdf_preparation_keeps_historical_refs_when_repair_stops_a_prev_cycle() 
     assert_eq!(repaired.status.code(), Some(3));
     let stderr = String::from_utf8_lossy(&repaired.stderr);
     assert_eq!(stderr.matches("WARNING:").count(), 3, "{stderr}");
-    assert!(stderr.ends_with(&platform_text("flpdf: operation succeeded with warnings\n")));
+    assert!(stderr.ends_with(&format!("flpdf: operation succeeded with warnings{EOL}")));
     let json: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
     assert_eq!(json_qpdf_metadata(&json)["maxobjectid"], 99);
     assert_eq!(
@@ -2925,7 +2925,7 @@ fn json_repair_preserves_refs_and_xref_stream_after_a_late_malformed_prev() {
     assert_eq!(output.status.code(), Some(3));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("WARNING:").count(), 3, "{stderr}");
-    assert!(stderr.ends_with(&platform_text("flpdf: operation succeeded with warnings\n")));
+    assert!(stderr.ends_with(&format!("flpdf: operation succeeded with warnings{EOL}")));
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let objects = json["qpdf"][1].as_object().unwrap();
     for key in ["obj:99 0 R", "obj:88 4 R", "obj:70 3 R", "obj:50 2 R"] {
@@ -3756,7 +3756,7 @@ fn show_pages_lists_each_page() {
         .success()
         .stdout(predicate::str::contains("page 1: 3 0 R"))
         .stdout(predicate::str::contains("page 2: 6 0 R"))
-        .stdout(predicate::str::contains(platform_text("  content:\n")))
+        .stdout(predicate::str::contains(format!("  content:{EOL}")))
         .stdout(predicate::str::contains("    5 0 R"))
         .stdout(predicate::str::contains("    7 0 R"));
 }
@@ -3768,15 +3768,15 @@ fn show_xref_prints_qpdf_effective_table() {
         .args(["--show-xref", "../../tests/fixtures/compat/one-page.pdf"])
         .assert()
         .success()
-        .stdout(platform_text(concat!(
-            "1/0: uncompressed; offset = 61\n",
-            "2/0: uncompressed; offset = 92\n",
-            "3/0: uncompressed; offset = 199\n",
-            "4/0: uncompressed; offset = 392\n",
-            "5/0: uncompressed; offset = 460\n",
-            "6/0: uncompressed; offset = 721\n",
-            "7/0: uncompressed; offset = 780\n",
-        )));
+        .stdout(format!(
+            "1/0: uncompressed; offset = 61{EOL}\
+             2/0: uncompressed; offset = 92{EOL}\
+             3/0: uncompressed; offset = 199{EOL}\
+             4/0: uncompressed; offset = 392{EOL}\
+             5/0: uncompressed; offset = 460{EOL}\
+             6/0: uncompressed; offset = 721{EOL}\
+             7/0: uncompressed; offset = 780{EOL}"
+        ));
 
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -3786,21 +3786,21 @@ fn show_xref_prints_qpdf_effective_table() {
         ])
         .assert()
         .success()
-        .stdout(platform_text(concat!(
-            "1/0: uncompressed; offset = 15\n",
-            "2/0: compressed; stream = 1, index = 0\n",
-            "3/0: compressed; stream = 1, index = 1\n",
-            "4/0: compressed; stream = 1, index = 2\n",
-            "5/0: compressed; stream = 1, index = 3\n",
-            "6/0: compressed; stream = 1, index = 4\n",
-            "7/0: compressed; stream = 1, index = 5\n",
-            "8/0: compressed; stream = 1, index = 6\n",
-            "9/0: compressed; stream = 1, index = 7\n",
-            "10/0: uncompressed; offset = 532\n",
-            "11/0: uncompressed; offset = 685\n",
-            "12/0: uncompressed; offset = 838\n",
-            "13/0: uncompressed; offset = 991\n",
-        )));
+        .stdout(format!(
+            "1/0: uncompressed; offset = 15{EOL}\
+             2/0: compressed; stream = 1, index = 0{EOL}\
+             3/0: compressed; stream = 1, index = 1{EOL}\
+             4/0: compressed; stream = 1, index = 2{EOL}\
+             5/0: compressed; stream = 1, index = 3{EOL}\
+             6/0: compressed; stream = 1, index = 4{EOL}\
+             7/0: compressed; stream = 1, index = 5{EOL}\
+             8/0: compressed; stream = 1, index = 6{EOL}\
+             9/0: compressed; stream = 1, index = 7{EOL}\
+             10/0: uncompressed; offset = 532{EOL}\
+             11/0: uncompressed; offset = 685{EOL}\
+             12/0: uncompressed; offset = 838{EOL}\
+             13/0: uncompressed; offset = 991{EOL}"
+        ));
 }
 
 fn fixture_with_short_first_name_tree_pair() -> tempfile::NamedTempFile {
@@ -7606,10 +7606,10 @@ fn list_attachments_empty_document() {
         .args(["--list-attachments", input.path().to_str().unwrap()])
         .assert()
         .success()
-        .stdout(platform_text(&format!(
-            "{} has no embedded files\n",
+        .stdout(format!(
+            "{} has no embedded files{EOL}",
             input.path().display()
-        )));
+        ));
 }
 
 #[test]
@@ -8056,8 +8056,8 @@ fn copy_attachments_from_verbose_prints_progress_and_wrote_file() {
             "copying attachments from {}",
             source.display()
         )))
-        .stdout(predicate::str::contains(platform_text(
-            "  original -> original\n",
+        .stdout(predicate::str::contains(format!(
+            "  original -> original{EOL}"
         )))
         .stdout(predicate::str::contains(format!(
             "wrote file {}",

@@ -22,9 +22,9 @@
 #[allow(dead_code, unused_imports)]
 mod support;
 
-#[path = "support/text.rs"]
-mod text;
-use text::platform_text;
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
 
 use assert_cmd::Command as CargoCommand;
 use std::io::Write;
@@ -510,16 +510,14 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         .map(|b| format!("{b:02x}"))
         .collect();
     assert!(
-        verbose.contains(
-            platform_text(&format!("      checksum: {expected_checksum_hex}\n")).as_str()
-        ),
+        verbose.contains(format!("      checksum: {expected_checksum_hex}{EOL}").as_str()),
         "copy: verbose listing must preserve /CheckSum={expected_checksum_hex}; got: {verbose}"
     );
 
     // /Desc survives too (roborev #936 follow-up — the test set these flags
     // but never asserted their survival).
     assert!(
-        verbose.contains(platform_text("  description: Copy test image\n").as_str()),
+        verbose.contains(format!("  description: Copy test image{EOL}").as_str()),
         "copy: verbose listing must preserve /Desc 'Copy test image'; got: {verbose}"
     );
 
