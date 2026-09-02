@@ -38,6 +38,14 @@ fn flpdf() -> Command {
     Command::cargo_bin("flpdf").unwrap()
 }
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 /// Run `show-encryption-key` to recover the hex key, asserting it matches the
 /// qpdf reference, then return it (proves the layer-4 dependency live).
 fn recover_key(file: &str, password: &str, expected: &str) -> String {
@@ -75,12 +83,12 @@ fn hex_key_v5_r6_check_succeeds_with_recovered_key() {
         .success()
         // The recovered key opens the encrypted file, so the check block emits
         // qpdf's detailed encryption report.
-        .stdout(predicates::str::contains("R = 6\n"))
+        .stdout(predicates::str::contains(platform_text("R = 6\n")))
         // This AES-256 fixture declares Adobe extension level 8 in its catalog;
         // the version banner must match qpdf byte-for-byte.
-        .stdout(predicates::str::contains(
+        .stdout(predicates::str::contains(platform_text(
             "PDF Version: 1.7 extension level 8\n",
-        ))
+        )))
         // A hex-key open never sets the password-matched flags qpdf uses to
         // decide password authentication succeeded, but the recovered key
         // DID authenticate the document (it opened). qpdf never reports
@@ -143,7 +151,7 @@ fn hex_key_v5_r6_decrypts_equivalently_to_password() {
         "password path should report a password match"
     );
     assert!(
-        pw_stdout.contains("User password = user-v5-r6\n"),
+        pw_stdout.contains(&platform_text("User password = user-v5-r6\n")),
         "password path should report the supplied user password"
     );
     assert!(
@@ -151,7 +159,7 @@ fn hex_key_v5_r6_decrypts_equivalently_to_password() {
         "hex-key path must NOT report a password match (raw key auths nothing)"
     );
     assert!(
-        hex_stdout.contains("User password = \n"),
+        hex_stdout.contains(&platform_text("User password = \n")),
         "hex-key path must not report a user password"
     );
 }

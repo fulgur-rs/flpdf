@@ -320,11 +320,14 @@ fn ordinary_show_pages_omits_effective_inherited_attributes_like_qpdf() {
     std::fs::write(temp.path(), &bytes).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
     cmd.args(["--show-pages"])
         .arg(temp.path())
         .assert()
         .success()
-        .stdout("page 1: 3 0 R\n  content:\n    4 0 R\n");
+        .stdout(format!(
+            "page 1: 3 0 R{line_ending}  content:{line_ending}    4 0 R{line_ending}"
+        ));
 }
 
 #[test]

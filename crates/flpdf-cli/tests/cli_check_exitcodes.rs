@@ -19,6 +19,14 @@ use flpdf::ObjectHandle;
 use predicates::prelude::*;
 use std::io::Write;
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture builders
 // ---------------------------------------------------------------------------
@@ -344,7 +352,9 @@ fn check_clean_pdf_exits_0() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
         .stdout(predicate::str::contains("PDF check succeeded").not())
         .stderr(predicate::str::is_empty());
 }
@@ -358,7 +368,9 @@ fn check_subcommand_clean_pdf_exits_0() {
     cmd.args(["check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
         .stdout(predicate::str::contains("PDF check succeeded").not())
         .stderr(predicate::str::is_empty());
 }
@@ -381,12 +393,20 @@ fn check_clean_pdf_emits_qpdf_block() {
         .args(["--check", &path])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(format!("checking {path}\n")))
-        .stdout(predicate::str::contains("PDF Version: 1.4\n"))
-        .stdout(predicate::str::contains("File is not encrypted\n"))
-        .stdout(predicate::str::contains("File is not linearized\n"))
+        .stdout(predicate::str::contains(platform_text(&format!(
+            "checking {path}\n"
+        ))))
+        .stdout(predicate::str::contains(platform_text("PDF Version: 1.4\n")))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not linearized\n",
+        )))
         .stdout(predicate::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            platform_text(
+                "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            ),
         ))
         .stdout(predicate::str::contains("PDF check succeeded").not());
 }
@@ -403,8 +423,12 @@ fn check_warnings_emit_block_without_trailing_line() {
         .args(["--check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("File is not encrypted\n"))
-        .stdout(predicate::str::contains("File is not linearized\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not linearized\n",
+        )))
         .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
         .stdout(predicate::str::contains("PDF check succeeded").not());
 }
@@ -421,9 +445,9 @@ fn check_appends_adobe_extension_level_to_version() {
         .args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(
+        .stdout(predicate::str::contains(platform_text(
             "PDF Version: 1.7 extension level 8\n",
-        ));
+        )));
 }
 
 #[test]
@@ -437,9 +461,9 @@ fn check_reports_late_extension_warning_and_exits_3() {
         .args(["--check", &path])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains(
+        .stdout(predicate::str::contains(platform_text(
             "PDF Version: 1.7 extension level 8\n",
-        ))
+        )))
         .stderr(predicate::str::contains("expected endobj"));
 }
 
@@ -459,10 +483,14 @@ fn check_linearized_pdf_reports_linearized_line() {
         .args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("File is linearized\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is linearized\n",
+        )))
         .stdout(predicate::str::contains("File is not linearized").not())
         .stdout(predicate::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            platform_text(
+                "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            ),
         ))
         .stderr(predicate::str::is_empty());
 }
@@ -486,13 +514,13 @@ fn check_linearized_o_mismatch_uses_qpdf_warning() {
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8(output.stdout)
         .unwrap()
-        .contains("File is linearized\n"));
+        .contains(&platform_text("File is linearized\n")));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        format!(
+        platform_text(&format!(
             "WARNING: {path}: first page object (/O) mismatch\n\
              flpdf: operation succeeded with warnings\n"
-        )
+        ))
     );
 }
 
@@ -515,14 +543,14 @@ fn check_linearized_n_mismatch_uses_qpdf_warning() {
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8(output.stdout)
         .unwrap()
-        .contains("File is linearized\n"));
+        .contains(&platform_text("File is linearized\n")));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        format!(
+        platform_text(&format!(
             "WARNING: {path}: error encountered while checking linearization data: \
              {path} (linearization hint table, offset 908): /N does not match number of pages\n\
              flpdf: operation succeeded with warnings\n"
-        )
+        ))
     );
 }
 
@@ -547,14 +575,14 @@ fn check_linearized_p_wrong_type_uses_qpdf_warning() {
     assert_eq!(output.status.code(), Some(3));
     assert!(String::from_utf8(output.stdout)
         .unwrap()
-        .contains("File is linearized\n"));
+        .contains(&platform_text("File is linearized\n")));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        format!(
+        platform_text(&format!(
             "WARNING: {path}: error encountered while checking linearization data: \
              {path} (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type\n\
              flpdf: operation succeeded with warnings\n"
-        )
+        ))
     );
 }
 
@@ -573,7 +601,9 @@ fn check_warnings_only_pdf_exits_3() {
     cmd.args(["--check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
         .stderr(predicate::str::contains("WARNING: "));
 }
 
@@ -604,7 +634,9 @@ fn check_subcommand_warnings_only_pdf_exits_3() {
     cmd.args(["check", "--repair", f.path().to_str().unwrap()])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
         .stderr(predicate::str::contains("WARNING: "));
 }
 
@@ -619,18 +651,20 @@ fn check_warnings_use_qpdf_stderr_format() {
         .args(["--check", "--repair", &path])
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("File is not encrypted\n"))
+        .stdout(predicate::str::contains(platform_text(
+            "File is not encrypted\n",
+        )))
         // qpdf shape: WARNING: <file>: <msg>, surrounding warnings without
         // offset, then the trailing summary line.
-        .stderr(predicate::str::contains(format!(
+        .stderr(predicate::str::contains(platform_text(&format!(
             "WARNING: {path}: file is damaged\n"
-        )))
-        .stderr(predicate::str::contains(
+        ))))
+        .stderr(predicate::str::contains(platform_text(
             "Attempting to reconstruct cross-reference table\n",
-        ))
-        .stderr(predicate::str::contains(
+        )))
+        .stderr(predicate::str::contains(platform_text(
             "flpdf: operation succeeded with warnings\n",
-        ))
+        )))
         // The old lowercase `warning: <msg>` prefix must be gone.
         .stderr(predicate::str::contains("warning: ").not());
 }
@@ -659,11 +693,13 @@ fn check_object_warning_uses_qpdf_space_before_object_context() {
         .args(["--check", input])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains(format!(
+        .stderr(predicate::str::contains(platform_text(&format!(
             "WARNING: {input} (object 5 0, offset 232): expected endobj\n"
-        )))
+        ))))
         .stderr(predicate::str::contains(
-            "WARNING: page object 3 0:  object is supposed to be a stream or an array of streams but is neither\n"
+            platform_text(
+                "WARNING: page object 3 0:  object is supposed to be a stream or an array of streams but is neither\n",
+            ),
         ))
         .stderr(
             predicate::str::contains(format!(
@@ -735,12 +771,12 @@ fn check_terminal_open_failure_prints_repair_warnings_before_error_once() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        format!(
+        platform_text(&format!(
             "WARNING: {input}: file is damaged\n\
              WARNING: {input}: can't find startxref\n\
              WARNING: {input}: Attempting to reconstruct cross-reference table\n\
              flpdf: {input}: parse error at byte 0: unable to find trailer dictionary while recovering damaged file\n"
-        )
+        ))
     );
 }
 
@@ -801,9 +837,9 @@ fn check_error_diagnostics_use_qpdf_stderr_format() {
         .args(["--check", &path])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(format!(
+        .stderr(predicate::str::contains(platform_text(&format!(
             "flpdf: {path}: unable to find /Root dictionary\n"
-        )))
+        ))))
         .stderr(predicate::str::contains("PDF check failed").not())
         .stderr(predicate::str::contains("error: ").not())
         // exit 2 emits no stdout block at all: qpdf throws during document init
@@ -865,9 +901,9 @@ fn flpdf_progname_env_swaps_prefix() {
         .args(["--check", "--repair", &path])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains(
+        .stderr(predicate::str::contains(platform_text(
             "qpdf: operation succeeded with warnings\n",
-        ))
+        )))
         .stderr(predicate::str::contains("flpdf:").not());
 }
 
@@ -884,9 +920,9 @@ fn flpdf_progname_empty_env_falls_back_to_default() {
         .args(["--check", "--repair", &path])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains(
+        .stderr(predicate::str::contains(platform_text(
             "flpdf: operation succeeded with warnings\n",
-        ));
+        )));
 }
 
 /// Same prefix swap on the fatal-open-error path, which is rendered by

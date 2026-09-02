@@ -98,6 +98,14 @@ fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
+fn platform_line_ending() -> &'static str {
+    if cfg!(windows) {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 fn assert_observables_equal(label: &str, qpdf: &Output, flpdf: &Output, text_output: bool) {
     assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}: status");
     if cfg!(windows) && text_output {
@@ -132,6 +140,32 @@ fn qpdf_logger_oracle_version_gate_accepts_only_11_9_0() {
     ));
     assert!(!qpdf_version_is_expected(b"qpdf version 12.0.0\n"));
     assert!(!qpdf_version_is_expected(b"qpdf version 11.9.0-custom\n"));
+}
+
+#[test]
+fn text_logger_uses_qpdf_platform_line_endings() {
+    let version = flpdf().args(["--version"]).output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        version.stdout,
+        format!(
+            "qpdf version 11.9.0\nRun qpdf --copyright to see copyright and license information.{}",
+            platform_line_ending()
+        )
+        .into_bytes()
+    );
+
+    let check = flpdf()
+        .args(["--repair", "--check", WARNING_PDF])
+        .output()
+        .unwrap();
+    assert_eq!(check.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&check.stdout)
+        .contains(&format!("checking {WARNING_PDF}{}", platform_line_ending())));
+    assert!(String::from_utf8_lossy(&check.stderr).ends_with(&format!(
+        "flpdf: operation succeeded with warnings{}",
+        platform_line_ending()
+    )));
 }
 
 #[test]
@@ -426,7 +460,11 @@ fn text_rewrite_verbose_uses_info_route_for_file_output() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("flpdf: wrote file {}\n", output_path.display())
+        format!(
+            "flpdf: wrote file {}{}",
+            output_path.display(),
+            platform_line_ending()
+        )
     );
     assert!(output.stderr.is_empty());
 }
@@ -447,8 +485,11 @@ fn text_check_success_stays_on_info_route() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.starts_with(&format!("checking {MINIMAL}\n")));
-    assert!(stdout.ends_with("errors that qpdf cannot detect\n"));
+    assert!(stdout.starts_with(&format!("checking {MINIMAL}{}", platform_line_ending())));
+    assert!(stdout.ends_with(&format!(
+        "errors that qpdf cannot detect{}",
+        platform_line_ending()
+    )));
 }
 
 #[test]

@@ -21,6 +21,14 @@ of version 2.0 of the Artistic License. At your option, you may\n\
 continue to consider qpdf to be licensed under those terms. Please\n\
 see the manual for additional information.\n";
 
+fn platform_text(output: &str) -> String {
+    if cfg!(windows) {
+        output.replace('\n', "\r\n")
+    } else {
+        output.to_owned()
+    }
+}
+
 #[test]
 fn qpdf_version_prints_the_pinned_qpdf_version_without_opening_input() {
     Command::cargo_bin("flpdf")
@@ -28,7 +36,7 @@ fn qpdf_version_prints_the_pinned_qpdf_version_without_opening_input() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(QPDF_VERSION_OUTPUT)
+        .stdout(platform_text(QPDF_VERSION_OUTPUT))
         .stderr("");
 }
 
@@ -39,6 +47,6 @@ fn qpdf_copyright_prints_the_pinned_license_text_without_opening_input() {
         .arg("--copyright")
         .assert()
         .success()
-        .stdout(QPDF_COPYRIGHT_OUTPUT)
+        .stdout(platform_text(QPDF_COPYRIGHT_OUTPUT))
         .stderr("");
 }

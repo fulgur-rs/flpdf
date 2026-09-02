@@ -38,6 +38,14 @@ use flpdf::{pages, Pdf};
 
 const FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -208,9 +216,11 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
         .args(["check", out.to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicates::str::contains("File is linearized\n"))
+        .stdout(predicates::str::contains("File is linearized"))
         .stdout(predicates::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            platform_text(
+                "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            ),
         ))
         .stderr(predicates::str::is_empty());
 }

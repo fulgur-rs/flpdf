@@ -20,6 +20,14 @@ fn fixture(name: &str) -> String {
     fixtures_dir().join(name).to_str().unwrap().to_string()
 }
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 #[test]
 fn verbose_overlay_prints_processing_header_and_per_page_mapping() {
     let dest = fixture("two-page.pdf");
@@ -41,15 +49,18 @@ fn verbose_overlay_prints_processing_header_and_per_page_mapping() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
+        .stdout(predicate::str::contains(platform_text(
             "flpdf: processing underlay/overlay\n",
-        ))
-        .stdout(predicate::str::contains("  page 1\n"))
+        )))
+        .stdout(predicate::str::contains(platform_text("  page 1\n")))
         // The src fixture path is absolute; qpdf/flpdf verbose emits the raw
         // CLI-supplied filename. Assert the raw path + " overlay 1" appears
         // under page 1.
-        .stdout(predicate::str::contains(format!("    {} overlay 1\n", src)))
-        .stdout(predicate::str::contains("  page 2\n"))
+        .stdout(predicate::str::contains(platform_text(&format!(
+            "    {} overlay 1\n",
+            src
+        ))))
+        .stdout(predicate::str::contains(platform_text("  page 2\n")))
         .stderr(predicate::str::is_empty());
 }
 
@@ -74,10 +85,10 @@ fn verbose_underlay_prints_underlay_kind_string() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(format!(
+        .stdout(predicate::str::contains(platform_text(&format!(
             "    {} underlay 1\n",
             src
-        )))
+        ))))
         .stderr(predicate::str::is_empty());
 }
 
@@ -111,9 +122,15 @@ fn verbose_overlay_repeated_to_slots_emit_one_line_per_slot() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("  page 1\n"))
-        .stdout(predicate::str::contains(format!("    {} overlay 1\n", src)))
-        .stdout(predicate::str::contains(format!("    {} overlay 2\n", src)))
+        .stdout(predicate::str::contains(platform_text("  page 1\n")))
+        .stdout(predicate::str::contains(platform_text(&format!(
+            "    {} overlay 1\n",
+            src
+        ))))
+        .stdout(predicate::str::contains(platform_text(&format!(
+            "    {} overlay 2\n",
+            src
+        ))))
         .stderr(predicate::str::is_empty());
 }
 

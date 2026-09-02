@@ -14,6 +14,14 @@ const UPDATE_JSON: &str = "../../tests/fixtures/compat/json-input/update.json";
 const MINIMAL_PDF: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 fn skip_if_qpdf_missing() -> bool {
     let version = ShellCommand::new("qpdf")
         .arg("--version")
@@ -130,7 +138,8 @@ fn json_input_inspection_modes_match_qpdf_11_9() {
                 "{option}"
             ),
             "--show-pages" => assert!(
-                String::from_utf8_lossy(&flpdf.stdout).starts_with("page 1: 3 0 R\n"),
+                String::from_utf8_lossy(&flpdf.stdout)
+                    .starts_with(&platform_text("page 1: 3 0 R\n")),
                 "show-pages must inspect the JSON-created page tree: {:?}",
                 flpdf.stdout
             ),
@@ -498,7 +507,7 @@ fn json_input_reaches_page_tree_selection() {
         .arg(&output)
         .assert()
         .success()
-        .stdout(predicate::str::diff("1\n"));
+        .stdout(predicate::str::diff(platform_text("1\n")));
 }
 
 #[test]
@@ -694,7 +703,7 @@ fn update_from_json_check_inspects_rc4_encrypted_input_by_default() {
         ])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("R = 2\n"))
+        .stdout(predicate::str::contains(platform_text("R = 2\n")))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 

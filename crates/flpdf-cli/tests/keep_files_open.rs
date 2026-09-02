@@ -16,6 +16,14 @@ fn minimal_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf")
 }
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 #[cfg(unix)]
 fn qpdf_available() -> bool {
     std::process::Command::new("qpdf")
@@ -104,7 +112,7 @@ fn run_keep_files_open_case(
     match expected_selection {
         Some(expected_selection) => {
             assert!(
-                stdout.contains(expected_selection),
+                stdout.contains(platform_text(expected_selection).as_str()),
                 "missing selection line {expected_selection:?} in:\n{stdout}"
             );
             assert!(

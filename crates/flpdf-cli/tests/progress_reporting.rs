@@ -9,10 +9,19 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 fn progress_lines(output_name: &str, percentages: &[u8]) -> String {
+    let line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
     percentages
         .iter()
-        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%\n"))
+        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%{line_ending}"))
         .collect()
 }
 
@@ -79,7 +88,10 @@ fn progress_reaches_the_attachment_writer() {
         )),
         "{stdout}"
     );
-    assert!(stdout.contains("write progress: 100%\n"), "{stdout}");
+    assert!(
+        stdout.contains(&platform_text("write progress: 100%\n")),
+        "{stdout}"
+    );
     assert!(stdout
         .lines()
         .all(|line| line.contains(&output_path.display().to_string())));
@@ -222,12 +234,16 @@ fn progress_reports_each_split_writer_once() {
     );
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert_eq!(
-        stdout.matches("write progress: 0%\n").count(),
+        stdout
+            .matches(&platform_text("write progress: 0%\n"))
+            .count(),
         2,
         "{stdout}"
     );
     assert_eq!(
-        stdout.matches("write progress: 100%\n").count(),
+        stdout
+            .matches(&platform_text("write progress: 100%\n"))
+            .count(),
         2,
         "{stdout}"
     );
@@ -262,12 +278,16 @@ fn progress_reports_each_pages_split_writer_once() {
     );
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert_eq!(
-        stdout.matches("write progress: 0%\n").count(),
+        stdout
+            .matches(&platform_text("write progress: 0%\n"))
+            .count(),
         2,
         "{stdout}"
     );
     assert_eq!(
-        stdout.matches("write progress: 100%\n").count(),
+        stdout
+            .matches(&platform_text("write progress: 100%\n"))
+            .count(),
         2,
         "{stdout}"
     );
@@ -421,7 +441,7 @@ fn remove_attachment_stdout_output_omits_the_resulting_file_warning_suffix() {
     assert!(stdout_output.stdout.starts_with(b"%PDF-1.3\n"));
     let stdout_stderr = String::from_utf8(stdout_output.stderr).expect("diagnostics are UTF-8");
     assert!(
-        stdout_stderr.contains("operation succeeded with warnings\n"),
+        stdout_stderr.contains(&platform_text("operation succeeded with warnings\n")),
         "stderr: {stdout_stderr}"
     );
     assert!(

@@ -42,11 +42,10 @@ use std::process::{Command as ShellCommand, Stdio};
 
 /// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
 /// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
-/// translates every `\n` write to `\r\n`; flpdf's CLI writes plain `\n`
-/// everywhere, matching qpdf's C++ source (`cout << "...\n"`) rather than
-/// that platform-specific translation. Comparing raw bytes on Windows would
-/// therefore flag a line-ending artifact of the oracle process, not a real
-/// content difference (same pattern as `cli_logger_routing.rs`/
+/// translates every `\n` write to `\r\n`; flpdf's shared CLI logger applies
+/// the same platform conversion for text output. Comparing raw bytes remains
+/// safe for the qpdf differential checks, while the helper also documents the
+/// platform boundary (same pattern as `cli_logger_routing.rs`/
 /// `cli_attachment_lifecycle.rs`/`encrypt_cli_tests.rs`).
 fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
@@ -63,6 +62,14 @@ fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     }
 
     normalized
+}
+
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
 }
 
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
@@ -314,7 +321,7 @@ fn show_encryption_key_v4_aes_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v4-aes", V4_AES])
         .assert()
         .success()
-        .stdout("5042ec4efa389ea32a149ab2a34e84fc\n");
+        .stdout(platform_text("5042ec4efa389ea32a149ab2a34e84fc\n"));
 }
 
 #[test]
@@ -323,7 +330,9 @@ fn show_encryption_key_v5_r6_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v5-r6", V5_R6])
         .assert()
         .success()
-        .stdout("fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290\n");
+        .stdout(platform_text(
+            "fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290\n",
+        ));
 }
 
 /// Skip the live qpdf-oracle comparison when `qpdf` is not installed locally
@@ -410,7 +419,7 @@ fn show_encryption_key_weak_rc4_correct_password_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v2", V2_RC4])
         .assert()
         .success()
-        .stdout("09d56583e16481df964f95df779c97d4\n");
+        .stdout(platform_text("09d56583e16481df964f95df779c97d4\n"));
 }
 
 #[test]
@@ -419,7 +428,9 @@ fn show_encryption_key_weak_r5_correct_password_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v5-r5", V5_R5])
         .assert()
         .success()
-        .stdout("c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614\n");
+        .stdout(platform_text(
+            "c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614\n",
+        ));
 }
 
 #[test]
@@ -448,7 +459,7 @@ fn show_encryption_key_weak_with_allow_weak_crypto_emits_no_warning() {
         ])
         .assert()
         .success()
-        .stdout("09d56583e16481df964f95df779c97d4\n")
+        .stdout(platform_text("09d56583e16481df964f95df779c97d4\n"))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 

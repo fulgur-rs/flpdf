@@ -1,6 +1,14 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+fn platform_text(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_owned()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: build a minimal in-memory PDF with one stream object (obj 3).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -345,7 +353,7 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
         .arg(temp.path())
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("stream\npayload"))
+        .stdout(predicate::str::contains(platform_text("stream\npayload")))
         .stderr(predicate::str::contains("expected endstream"))
         .stderr(predicate::str::contains(
             "flpdf: operation succeeded with warnings",

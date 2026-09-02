@@ -2096,9 +2096,8 @@ fn warn_if_static_id(args: &Cli) {
     if std::env::var_os(STATIC_ID_QUIET_ENV).is_some() {
         return;
     }
-    eprintln!(
-        "flpdf: warning: --static-id is for testing only and must not be \
-         used for production output"
+    emit_logger_error(
+        "flpdf: warning: --static-id is for testing only and must not be used for production output\n",
     );
 }
 
@@ -2154,15 +2153,15 @@ fn cli_parse_from(args: Vec<String>) -> Cli {
 
 /// Print qpdf's sole-option version response (`QPDFJob_argv.cc:99-105`).
 fn print_qpdf_version() {
-    println!(
-        "qpdf version {}\nRun qpdf --copyright to see copyright and license information.",
+    emit_logger_info(format!(
+        "qpdf version {}\nRun qpdf --copyright to see copyright and license information.\n",
         flpdf::qpdf_version()
-    );
+    ));
 }
 
 /// Print qpdf's sole-option copyright response (`QPDFJob_argv.cc:108-135`).
 fn print_qpdf_copyright() {
-    println!(
+    emit_logger_info(format!(
         "qpdf version {}\n\n\
 Copyright (c) 2005-2024 Jay Berkenbilt\n\
 QPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n\
@@ -2176,9 +2175,9 @@ limitations under the License.\n\n\
 Versions of qpdf prior to version 7 were released under the terms\n\
 of version 2.0 of the Artistic License. At your option, you may\n\
 continue to consider qpdf to be licensed under those terms. Please\n\
-see the manual for additional information.",
+        see the manual for additional information.\n",
         flpdf::qpdf_version()
-    );
+    ));
 }
 
 fn main() {
@@ -2223,14 +2222,14 @@ fn main() {
     } = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!("flpdf: {error}");
+            emit_logger_error(format!("flpdf: {error}\n"));
             std::process::exit(2);
         }
     };
     let args = cli_parse_from(residual_args);
     validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
-        eprintln!("flpdf: {error}");
+        emit_logger_error(format!("flpdf: {error}\n"));
         std::process::exit(2);
     }
     let top_level_version_options =
@@ -2238,7 +2237,7 @@ fn main() {
         {
             Ok(options) => options,
             Err(error) => {
-                eprintln!("flpdf: {error}");
+                emit_logger_error(format!("flpdf: {error}\n"));
                 std::process::exit(1);
             }
         };
@@ -2246,7 +2245,7 @@ fn main() {
         match parse_compression_level(args.compression_level.as_deref()) {
             Ok(level) => level,
             Err(error) => {
-                eprintln!("flpdf: {error}");
+                emit_logger_error(format!("flpdf: {error}\n"));
                 std::process::exit(2);
             }
         };
@@ -2259,7 +2258,7 @@ fn main() {
     ) {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("flpdf: {error}");
+            emit_logger_error(format!("flpdf: {error}\n"));
             std::process::exit(2);
         }
     };
@@ -2282,7 +2281,7 @@ fn main() {
     // (The `Commands::Rewrite` arm performs the
     // equivalent check for the subcommand form.)
     if args.qdf && args.linearize {
-        eprintln!("flpdf: --qdf and --linearize cannot be used together");
+        emit_logger_error("flpdf: --qdf and --linearize cannot be used together\n");
         std::process::exit(1);
     }
 
@@ -2297,9 +2296,9 @@ fn main() {
             || !args.add_attachment.is_empty()
             || !args.copy_attachments_from.is_empty())
     {
-        eprintln!(
+        emit_logger_error(
             "flpdf: --normalize-content is not applied by attachment mutation operations; \
-             rerun with --normalize-content=n or without the attachment operation"
+             rerun with --normalize-content=n or without the attachment operation\n",
         );
         std::process::exit(1);
     }
@@ -2313,9 +2312,9 @@ fn main() {
             || !args.add_attachment.is_empty()
             || !args.copy_attachments_from.is_empty())
     {
-        eprintln!(
+        emit_logger_error(
             "flpdf: --decode-level is not applied by attachment mutation operations; \
-             rerun with --decode-level=none or without the attachment operation"
+             rerun with --decode-level=none or without the attachment operation\n",
         );
         std::process::exit(1);
     }
@@ -2353,9 +2352,9 @@ fn main() {
             }
         };
         if !target_is_rewrite {
-            eprintln!(
+            emit_logger_error(
                 "flpdf: --overlay/--underlay can only be used with rewrite output, \
-                 not with inspection or other commands"
+                 not with inspection or other commands\n",
             );
             std::process::exit(2);
         }
@@ -2494,7 +2493,9 @@ fn main() {
         // diagnostic). Mirror the same rejection the `rewrite` subcommand
         // performs.
         if page_ops_active(&args.page_ops) {
-            eprintln!("flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages");
+            emit_logger_error(
+                "flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages\n",
+            );
             std::process::exit(1);
         }
         let mut options = WriterOptions {
@@ -2521,7 +2522,10 @@ fn main() {
                 "y" => options.compress_streams = Some(CompressStreams::Yes),
                 "n" => options.compress_streams = Some(CompressStreams::No),
                 other => {
-                    eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
+                    emit_logger_error(format!(
+                        "flpdf: --compress-streams must be y or n, got: {:?}\n",
+                        other
+                    ));
                     std::process::exit(2);
                 }
             }
@@ -2578,18 +2582,18 @@ fn main() {
         // rejection in the subcommand surface). Wiring encryption
         // through the page-op pipeline is a flpdf-9hc.4.9 follow-up.
         if args.encrypt.is_some() {
-            eprintln!(
+            emit_logger_error(
                 "flpdf: --encrypt is not applied in the \
                  --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without --encrypt or without the page operation"
+                 rerun without --encrypt or without the page operation\n",
             );
             std::process::exit(1);
         }
         if args.copy_encryption.is_some() {
-            eprintln!(
+            emit_logger_error(
                 "flpdf: --copy-encryption is not applied in the \
                  --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without --copy-encryption or without the page operation"
+                 rerun without --copy-encryption or without the page operation\n",
             );
             std::process::exit(1);
         }
@@ -2616,7 +2620,10 @@ fn main() {
                 "y" => options.compress_streams = Some(CompressStreams::Yes),
                 "n" => options.compress_streams = Some(CompressStreams::No),
                 other => {
-                    eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
+                    emit_logger_error(format!(
+                        "flpdf: --compress-streams must be y or n, got: {:?}\n",
+                        other
+                    ));
                     std::process::exit(2);
                 }
             }
@@ -2655,10 +2662,10 @@ fn main() {
                     )
                 } else {
                     if !overlay_specs.is_empty() {
-                        eprintln!(
+                        emit_logger_error(
                             "flpdf: --overlay/--underlay is not applied with \
                              --rotate/--split-pages alone (no --pages); \
-                             rerun with --pages or without the overlay"
+                             rerun with --pages or without the overlay\n",
                         );
                         std::process::exit(1);
                     }
@@ -2709,7 +2716,10 @@ fn main() {
                 "y" => options.compress_streams = Some(CompressStreams::Yes),
                 "n" => options.compress_streams = Some(CompressStreams::No),
                 other => {
-                    eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
+                    emit_logger_error(format!(
+                        "flpdf: --compress-streams must be y or n, got: {:?}\n",
+                        other
+                    ));
                     std::process::exit(2);
                 }
             }
@@ -2880,27 +2890,31 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
     let mut json_keys: Vec<JsonKey> = Vec::new();
     for raw in &cli.json_key {
         if json_version != 1 && matches!(raw.as_str(), "objects" | "objectinfo") {
-            eprintln!(
+            emit_logger_error(
                 "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1"
+                    .to_owned()
+                    + "\n",
             );
             std::process::exit(2);
         }
         if json_version == 1 && raw == "qpdf" {
-            eprintln!("flpdf: json key \"qpdf\" is only valid for json version > 1");
+            emit_logger_error("flpdf: json key \"qpdf\" is only valid for json version > 1\n");
             std::process::exit(2);
         }
         match JsonKey::from_str(raw.as_str()) {
             Some(k) => json_keys.push(k),
             None => {
                 let names = QPDF_JSON_KEY_NAMES.join(",");
-                eprintln!("flpdf: --json-key must be given as --json-key={{{names}}}");
+                emit_logger_error(format!(
+                    "flpdf: --json-key must be given as --json-key={{{names}}}\n"
+                ));
                 std::process::exit(2);
             }
         }
     }
     if json_output_mode {
         if json_version == 1 {
-            eprintln!("flpdf: --json-output requires JSON version 2");
+            emit_logger_error("flpdf: --json-output requires JSON version 2\n");
             std::process::exit(2);
         }
         // qpdf's json-output mode always selects the qpdf key in addition to
@@ -2916,9 +2930,9 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
         match JsonObjectSelector::from_str(raw.as_str()) {
             Some(s) => json_objects.push(s),
             None => {
-                eprintln!(
-                    "flpdf: --json-object selector \"{raw}\" must be 'trailer', 'N', or 'N,G'"
-                );
+                emit_logger_error(format!(
+                    "flpdf: --json-object selector \"{raw}\" must be 'trailer', 'N', or 'N,G'\n"
+                ));
                 std::process::exit(2);
             }
         }
@@ -2938,7 +2952,9 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
         "inline" => JsonStreamData::Inline,
         "file" => JsonStreamData::File,
         other => {
-            eprintln!("flpdf: --json-stream-data must be none, inline, or file; got: {other}");
+            emit_logger_error(format!(
+                "flpdf: --json-stream-data must be none, inline, or file; got: {other}\n"
+            ));
             std::process::exit(2);
         }
     };
@@ -3274,7 +3290,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             ) {
                 Ok(options) => options,
                 Err(error) => {
-                    eprintln!("flpdf: {error}");
+                    emit_logger_error(format!("flpdf: {error}\n"));
                     std::process::exit(1);
                 }
             };
@@ -3284,7 +3300,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // rejected earlier in main(), before the linearize branch wins
             // the dispatch chain.)
             if cmd.qdf && cmd.linearize {
-                eprintln!("flpdf: --qdf and --linearize cannot be used together");
+                emit_logger_error("flpdf: --qdf and --linearize cannot be used together\n");
                 std::process::exit(1);
             }
             let mut options = WriterOptions {
@@ -3347,7 +3363,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // qpdf accepts --generate-appearances before its linearized writer
             // and the shared run_rewrite route now preserves that ordering.
             if cmd.linearize && cmd.flatten_rotation {
-                eprintln!("flpdf: --linearize cannot be combined with --flatten-rotation");
+                emit_logger_error(
+                    "flpdf: --linearize cannot be combined with --flatten-rotation\n",
+                );
                 std::process::exit(1);
             }
 
@@ -3358,18 +3376,18 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // non-linearized document).
             if page_ops_active(&cmd.page_ops) {
                 if cmd.linearize {
-                    eprintln!(
-                        "flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages"
+                    emit_logger_error(
+                        "flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages\n",
                     );
                     std::process::exit(1);
                 }
                 // The --rotate/--split-pages-only path does not run overlay
                 // stacking; only --pages does (via run_page_extraction below).
                 if cmd.page_ops.pages.is_empty() && !overlay_specs.is_empty() {
-                    eprintln!(
+                    emit_logger_error(
                         "flpdf: --overlay/--underlay is not applied with \
                          --rotate/--split-pages alone (no --pages); \
-                         rerun with --pages or without the overlay"
+                         rerun with --pages or without the overlay\n",
                     );
                     std::process::exit(1);
                 }
@@ -3402,13 +3420,13 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     || cmd.flatten_annotations.is_some()
                     || cmd.flatten_rotation
                 {
-                    eprintln!(
+                    emit_logger_error(
                         "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / --encrypt / \
                          --copy-encryption / --flatten-annotations / \
                          --generate-appearances / --flatten-rotation are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
-                         the page operation"
+                         the page operation\n",
                     );
                     std::process::exit(1);
                 }
@@ -3419,10 +3437,10 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 if cmd.page_ops.pages.is_empty()
                     && remove_unref != CliRemoveUnreferencedResources::Auto
                 {
-                    eprintln!(
+                    emit_logger_error(
                         "flpdf: --remove-unreferenced-resources is not applied \
                          with --rotate/--split-pages alone; rerun without it \
-                         or add --pages"
+                         or add --pages\n",
                     );
                     std::process::exit(1);
                 }
@@ -3575,7 +3593,7 @@ fn apply_encryption_options(
                 options.encrypt = Some(parsed.params);
             }
             Err(e) => {
-                eprintln!("flpdf: {e}");
+                emit_logger_error(format!("flpdf: {e}\n"));
                 std::process::exit(2);
             }
         }
@@ -3586,7 +3604,7 @@ fn apply_encryption_options(
                 options.copy_encryption = Some(src);
             }
             Err(e) => {
-                eprintln!("flpdf: {e}");
+                emit_logger_error(format!("flpdf: {e}\n"));
                 std::process::exit(2);
             }
         }
@@ -4477,7 +4495,9 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
         if remove_restrictions && was_encrypted {
-            eprintln!("flpdf: removed restrictions (digital-signature restrictions stripped)");
+            emit_logger_error(
+                "flpdf: removed restrictions (digital-signature restrictions stripped)\n",
+            );
         }
         if had_signatures {
             logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
@@ -6284,12 +6304,12 @@ fn is_zlib_flate_program(program: &str) -> bool {
 }
 
 fn zlib_flate_usage(usage_name: &str) -> CliResult<()> {
-    eprintln!(
+    emit_logger_error(format!(
         "Usage: {usage_name} {{ -uncompress | -compress[=n] }}\n\
 If n is specified with -compress, it is a zlib compression level from\n\
 1 to 9 where lower numbers are faster and less compressed and higher\n\
-numbers are slower and more compressed"
-    );
+numbers are slower and more compressed\n"
+    ));
     Err(Box::new(CliExitError {
         code: ExitCode::Errors,
         message: String::new(),
@@ -6297,7 +6317,7 @@ numbers are slower and more compressed"
 }
 
 fn zlib_flate_failure(whoami: &str, error: impl std::fmt::Display) -> CliResult<()> {
-    eprintln!("{whoami}: {error}");
+    emit_logger_error(format!("{whoami}: {error}\n"));
     Err(Box::new(CliExitError {
         code: ExitCode::Errors,
         message: String::new(),
@@ -6307,7 +6327,10 @@ fn zlib_flate_failure(whoami: &str, error: impl std::fmt::Display) -> CliResult<
 /// Run qpdf's raw zlib stdin/stdout utility over the canonical Flate pipeline.
 fn run_zlib_flate(args: &[String], whoami: &str, usage_name: &str) -> CliResult<()> {
     if args.len() == 1 && args[0] == "--version" {
-        println!("{whoami} from qpdf version {}", flpdf::qpdf_version());
+        emit_logger_info(format!(
+            "{whoami} from qpdf version {}\n",
+            flpdf::qpdf_version()
+        ));
         return Ok(());
     }
     if args.len() != 1 {
@@ -6349,7 +6372,9 @@ fn run_zlib_flate(args: &[String], whoami: &str, usage_name: &str) -> CliResult<
     let warning_whoami = whoami.to_owned();
     flate.set_warn_callback(move |message, code| {
         warned_for_callback.set(true);
-        eprintln!("{warning_whoami}: WARNING: zlib code {code}, msg = {message}");
+        emit_logger_error(format!(
+            "{warning_whoami}: WARNING: zlib code {code}, msg = {message}\n"
+        ));
         Ok(())
     });
 
@@ -7206,6 +7231,10 @@ fn logger_info(data: impl AsRef<[u8]>) -> CliResult<()> {
 fn logger_warn(data: impl AsRef<[u8]>) -> CliResult<()> {
     cli_logger().warn(data)?;
     Ok(())
+}
+
+fn emit_logger_info(data: impl AsRef<[u8]>) {
+    let _ = logger_info(data);
 }
 
 fn emit_logger_error(data: impl AsRef<[u8]>) {
