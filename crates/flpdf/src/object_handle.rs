@@ -1871,6 +1871,86 @@ impl ObjectHandle {
         old_state
     }
 
+    /// Swap the value allocations of two distinct indirect object slots while
+    /// retaining each slot's object identity.
+    ///
+    /// qpdf's `QPDF::swapObjects` resolves both cache entries and calls
+    /// `QPDFObject::swapWith` (`libqpdf/QPDF.cc:2279-2289`). `swapWith`
+    /// exchanges the `QPDFValue` pointers and then restores each value's
+    /// object generation, so aliases of the first object continue to observe
+    /// the first object number while seeing the second object's value. In
+    /// flpdf the object reference is slot metadata and the value is a shared
+    /// `Rc`; swapping only the value-side fields is the corresponding
+    /// representation.
+    ///
+    /// State-owner and direct-child containment bookkeeping moves with the
+    /// value allocation. Object references, document ownership, and
+    /// containment parents remain attached to their original slots.
+    pub(crate) fn swap_value_state_with(&self, other: &Self) {
+        if Rc::ptr_eq(&self.0, &other.0) {
+            return;
+        }
+
+        let (left_state_owners, left_children, right_state_owners, right_children) = {
+            let left = self.0.borrow();
+            let right = other.0.borrow();
+            let left_state = left.state.clone();
+            let right_state = right.state.clone();
+            if Rc::ptr_eq(&left_state, &right_state) {
+                return;
+            }
+            let left_children = Self::state_children(&left_state.borrow());
+            let right_children = Self::state_children(&right_state.borrow());
+            (
+                left.state_owners.clone(),
+                left_children,
+                right.state_owners.clone(),
+                right_children,
+            )
+        };
+
+        let left_parent = self.containment_parent();
+        let right_parent = other.containment_parent();
+        Self::remove_state_owner(&left_state_owners, &self.0);
+        Self::remove_state_owner(&right_state_owners, &other.0);
+        for child in &left_children {
+            Self::detach_child_from_parent(child, &left_parent);
+        }
+        for child in &right_children {
+            Self::detach_child_from_parent(child, &right_parent);
+        }
+
+        {
+            let mut left = self.0.borrow_mut();
+            let mut right = other.0.borrow_mut();
+            std::mem::swap(&mut left.state, &mut right.state);
+            std::mem::swap(&mut left.state_owners, &mut right.state_owners);
+            std::mem::swap(&mut left.parsed_offset, &mut right.parsed_offset);
+            std::mem::swap(&mut left.description, &mut right.description);
+            std::mem::swap(
+                &mut left.stream_token_filters,
+                &mut right.stream_token_filters,
+            );
+            std::mem::swap(
+                &mut left.content_normalization_applied,
+                &mut right.content_normalization_applied,
+            );
+            std::mem::swap(
+                &mut left.mutation_generation,
+                &mut right.mutation_generation,
+            );
+        }
+
+        self.register_state_owner();
+        other.register_state_owner();
+        for child in &right_children {
+            Self::attach_child_to_parent(child, &left_parent);
+        }
+        for child in &left_children {
+            Self::attach_child_to_parent(child, &right_parent);
+        }
+    }
+
     /// Replace only this slot's whole-object state, leaving other slots that
     /// currently share its payload untouched. qpdf's remove/disconnect
     /// transitions rebind the departing `QPDFObject`; they do not mutate the

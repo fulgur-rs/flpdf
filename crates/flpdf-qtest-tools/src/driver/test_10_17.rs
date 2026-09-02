@@ -263,30 +263,15 @@ pub(crate) fn run_test_13<R: Read + Seek>(
 /// qpdf source: `qpdf/test_driver.cc:591-658` (`test_14`).
 ///
 /// Exercises `QPDF::swapObjects` and `QPDF::replaceObject` on a specific
-/// 4-page fixture. This function ports only the portion before the first
-/// call with no flpdf equivalent: the page-count check (qpdf's `throw
-/// std::logic_error` maps to `Err(Error::Internal(..))`, not `assert!` — an
-/// escaped, uncaught exception in qpdf's driver is caught by `main`'s own
-/// broad `catch (std::exception&)` at `qpdf/test_driver.cc:3590`, exactly
-/// the role `mod.rs::run`'s `Err` handling plays here) and the two
-/// `/OrigPage` value assertions, which use only already-available
-/// primitives.
-///
-/// GAP(`QPDF::swapObjects`): no flpdf primitive exchanges the object bodies
-/// at two object references while leaving every existing reference to either
-/// number pointing at the other's (now-swapped) content
-/// (`libqpdf/QPDF.cc`'s `swapObjects`/`swapObjGen`). Everything from this
-/// call onward in `test_14` — the six printed lines, the caught-logic-error
-/// branch around a second GAP (`QPDF::replaceObject`; the crate's own
-/// `replace_object` exists but is `pub(crate)`, unreachable from this
-/// crate), the array/dictionary shallow-copy exercises, and both memory-write
-/// passes to `a.pdf`/`b.pdf` — depends on the swap having actually happened,
-/// so none of it can be honestly ported here.
+/// 4-page fixture, preserving the live handle identities and qpdf's two
+/// memory-output passes (`qpdf/test_driver.cc:591-658`). The document-level
+/// swap is delegated to [`Pdf::swap_objects`]; the driver owns only the same
+/// call order, assertions, output formatting, and file adapter as qpdf.
 pub(crate) fn run_test_14<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
-    _stdout: &mut dyn Write,
+    stdout: &mut dyn Write,
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
@@ -303,9 +288,74 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     assert_eq!(orig_page2.get_key(b"/OrigPage").as_integer(), Some(2));
     assert_eq!(orig_page3.get_key(b"/OrigPage").as_integer(), Some(3));
 
-    // GAP(QPDF::swapObjects): see this function's own doc above. Everything
-    // qpdf does past this point in test_14 depends on the swap; nothing
-    // further is honestly portable.
+    pdf.swap_objects(orig_page2_ref, orig_page3_ref)?;
+    assert_eq!(orig_page2.get_key(b"/OrigPage").as_integer(), Some(3));
+    assert_eq!(orig_page3.get_key(b"/OrigPage").as_integer(), Some(2));
+
+    let trailer = pdf.trailer();
+    let qdict = trailer.get_key(b"/QDict");
+    let qarray = trailer.get_key(b"/QArray");
+    let qdict_ref = qdict
+        .object_ref()
+        .ok_or_else(|| Error::Internal("test 14 /QDict is not indirect".to_owned()))?;
+    let qarray_ref = qarray
+        .object_ref()
+        .ok_or_else(|| Error::Internal("test 14 /QArray is not indirect".to_owned()))?;
+
+    // Force qdict but not qarray to resolve, matching qpdf's source order.
+    qdict.try_is_dictionary()?;
+    let new_dict = ObjectHandle::dictionary(Vec::new());
+    new_dict.replace_key(b"/NewDict", ObjectHandle::integer(2))?;
+    if pdf.replace_object(qdict_ref, qdict.clone()).is_err() {
+        writeln!(stdout, "caught logic error as expected")?;
+    }
+    pdf.replace_object(qdict_ref, new_dict)?;
+    writeln!(
+        stdout,
+        "old dict: {}",
+        qdict.get_key(b"/NewDict").try_get_int_value()?
+    )?;
+
+    pdf.swap_objects(qdict_ref, qarray_ref)?;
+    let swapped_array = qdict.try_get_array_item(0)?.try_get_name()?;
+    writeln!(
+        stdout,
+        "swapped array: {}",
+        String::from_utf8_lossy(&swapped_array)
+    )?;
+    writeln!(
+        stdout,
+        "new dict: {}",
+        qarray.get_key(b"/NewDict").try_get_int_value()?
+    )?;
+
+    let qdict = pdf.get_object_handle(qdict_ref);
+    let swapped_array = qdict.try_get_array_item(0)?.try_get_name()?;
+    writeln!(
+        stdout,
+        "swapped array: {}",
+        String::from_utf8_lossy(&swapped_array)
+    )?;
+    let array_elements = qdict.try_get_array_as_vector()?;
+    let dict_items = qarray.try_get_dict_as_map()?;
+    if array_elements.len() == 1
+        && array_elements[0].try_get_name()? == b"/Array"
+        && dict_items.len() == 1
+        && dict_items
+            .get(b"/NewDict".as_slice())
+            .is_some_and(|value| value.as_integer() == Some(2))
+    {
+        writeln!(stdout, "array and dictionary contents are correct")?;
+    }
+
+    for (static_id, filename) in [(true, "a.pdf"), (false, "b.pdf")] {
+        let mut writer = PdfWriter::new(pdf);
+        writer.set_output_memory()?;
+        writer.set_static_id(static_id);
+        writer.set_stream_data_mode(StreamDataMode::Preserve);
+        writer.write()?;
+        std::fs::write(filename, writer.get_buffer()?)?;
+    }
     Ok(())
 }
 

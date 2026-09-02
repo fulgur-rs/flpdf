@@ -1590,6 +1590,32 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(target)
     }
 
+    /// Swap the live values of two object generations while preserving each
+    /// generation's canonical [`ObjectHandle`] identity.
+    ///
+    /// This is qpdf's public `QPDF::swapObjects` operation
+    /// (`include/qpdf/QPDF.hh:396-399`; `libqpdf/QPDF.cc:2279-2289`). qpdf
+    /// resolves both cache entries before exchanging their `QPDFValue`
+    /// allocations, so outstanding handles continue to refer to their
+    /// original object numbers while observing the swapped values. Unknown
+    /// generations resolve to qpdf's ordinary null object before the swap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates source resolution, recovery, and warning-delivery failures
+    /// from either object.
+    pub fn swap_objects(&mut self, first: ObjectRef, second: ObjectRef) -> Result<()> {
+        self.synchronize_cache_with_resolver_xref();
+        self.resolver.swap_objects(first, second)?;
+        for object_ref in [first, second] {
+            self.qpdf_removed_refs.remove(&object_ref);
+            self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
+            self.qpdf_dangling_refs.remove(&object_ref);
+            self.mark_object_handle_mutated(object_ref);
+        }
+        Ok(())
+    }
+
     /// Remove a canonical object from the resolver's xref/cache view and
     /// leave outstanding handles as floating null values. The legacy snapshot
     /// metadata is maintained separately by the `Pdf` facade. This is qpdf

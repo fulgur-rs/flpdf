@@ -39,6 +39,54 @@ fn missing_mediabox_fixture() -> &'static str {
     )
 }
 
+fn swap_replace_fixture() -> Vec<u8> {
+    let objects = [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>".as_slice(),
+        ),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 1 >>".as_slice(),
+        ),
+        (
+            4,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 2 >>".as_slice(),
+        ),
+        (
+            5,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 3 >>".as_slice(),
+        ),
+        (
+            6,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 4 >>".as_slice(),
+        ),
+        (7, b"<< >>".as_slice()),
+        (8, b"[ /Array ]".as_slice()),
+    ];
+    let mut bytes = b"%PDF-1.3\n".to_vec();
+    let mut offsets = vec![0usize; objects.len() + 1];
+    for (number, body) in objects {
+        offsets[number] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 9 /Root 1 0 R /QDict 7 0 R /QArray 8 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 fn repairable_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -396,6 +444,33 @@ fn test_53_emits_all_objects_and_writes_dangling_output() {
         directory.path().join("a.pdf").is_file(),
         "test 53 must write the preserve-unreferenced output"
     );
+}
+
+#[test]
+fn test_14_matches_qpdf_swap_and_replace_sequence() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test14-in.pdf");
+    fs::write(&input, swap_replace_fixture()).expect("write test 14 fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["14", input])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout(
+            "caught logic error as expected\n\
+             old dict: 2\n\
+             swapped array: /Array\n\
+             new dict: 2\n\
+             swapped array: /Array\n\
+             array and dictionary contents are correct\n\
+             test 14 done\n",
+        )
+        .stderr("");
+
+    assert!(directory.path().join("a.pdf").is_file());
+    assert!(directory.path().join("b.pdf").is_file());
 }
 
 #[test]
