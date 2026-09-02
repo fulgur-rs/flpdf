@@ -334,6 +334,19 @@ impl XrefEntryLookup<'_> {
     }
 }
 
+fn reconstructed_reference_offsets(entries: &BTreeMap<ObjectRef, XrefEntry>) -> Rc<[u64]> {
+    let mut offsets: Vec<u64> = entries
+        .values()
+        .filter_map(|entry| match entry {
+            XrefEntry::Uncompressed { offset } => Some(*offset),
+            XrefEntry::Compressed { .. } | XrefEntry::Free { .. } => None,
+        })
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    Rc::from(offsets)
+}
+
 /// The short-lived document context used while qpdf is reading an xref
 /// stream. It exists before the post-open `ResolverCore`, but it still gives
 /// every parsed direct child the same weak `DocumentResolver` and gives every
@@ -346,9 +359,19 @@ struct BootstrapHandleDocument {
     /// values and shared diagnostics do not require the full input buffer.
     bytes: OnceCell<Rc<[u8]>>,
     entry_lookup: RefCell<BTreeMap<ObjectRef, XrefEntry>>,
+    /// Sorted reconstructed object offsets used only to bound bootstrap
+    /// reference reads during recovery. Normal active-section reads leave
+    /// this unset and retain qpdf's unbounded source view.
+    reference_offsets: RefCell<Option<Rc<[u64]>>>,
     options: XrefLoadOptions,
     state: Rc<RefCell<BootstrapHandleState>>,
     resolver: RefCell<Option<Weak<dyn DocumentResolver>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceReadWindow {
+    end: usize,
+    fallback_end: usize,
 }
 
 impl std::fmt::Debug for BootstrapHandleDocument {
@@ -374,6 +397,7 @@ impl BootstrapHandleDocument {
         let document = Rc::new(Self {
             bytes: source_bytes,
             entry_lookup: RefCell::new(entry_lookup.owned_entries()),
+            reference_offsets: RefCell::new(None),
             options,
             state,
             resolver: RefCell::new(None),
@@ -389,6 +413,34 @@ impl BootstrapHandleDocument {
 
     fn refresh_entry_lookup(&self, entry_lookup: XrefEntryLookup<'_>) {
         *self.entry_lookup.borrow_mut() = entry_lookup.owned_entries();
+    }
+
+    fn set_reference_offsets(&self, reference_offsets: Option<Rc<[u64]>>) {
+        *self.reference_offsets.borrow_mut() = reference_offsets;
+    }
+
+    fn reference_read_window(&self, offset: u64, source_len: usize) -> ReferenceReadWindow {
+        let Some(offsets) = self.reference_offsets.borrow().as_ref().cloned() else {
+            return ReferenceReadWindow {
+                end: source_len,
+                fallback_end: source_len,
+            };
+        };
+        let next_offset_index = offsets.partition_point(|candidate| *candidate <= offset);
+        let end = offsets
+            .get(next_offset_index)
+            .and_then(|offset| usize::try_from(*offset).ok())
+            .unwrap_or(source_len)
+            .min(source_len);
+        let fallback_index = next_offset_index
+            .saturating_add(XREF_CANDIDATE_FALLBACK_SPAN)
+            .min(offsets.len());
+        let fallback_end = offsets
+            .get(fallback_index)
+            .and_then(|offset| usize::try_from(*offset).ok())
+            .unwrap_or(source_len)
+            .min(source_len);
+        ReferenceReadWindow { end, fallback_end }
     }
 
     fn resolver_weak(&self) -> Weak<dyn DocumentResolver> {
@@ -478,6 +530,7 @@ impl BootstrapHandleDocument {
         }
     }
 
+    // qpdf-deviation-start: qpdf 11.9.0 reads referenced bootstrap objects to EOF; reconstruction-only windows bound flpdf recovery work
     fn read_uncompressed_object(
         &self,
         object_ref: ObjectRef,
@@ -486,11 +539,42 @@ impl BootstrapHandleDocument {
         let start = usize::try_from(offset)
             .ok()
             .ok_or_else(|| Error::parse(0, "object offset does not fit usize"))?;
-        let source_bytes = self.bytes.get().ok_or_else(|| {
+        let source_bytes = Rc::clone(self.bytes.get().ok_or_else(|| {
             Error::Internal("bootstrap resolver source bytes were not initialized".to_owned())
-        })?;
+        })?);
+        let window = self.reference_read_window(offset, source_bytes.len());
+        let result = self.read_uncompressed_object_with_end(
+            object_ref,
+            offset,
+            start,
+            window.end,
+            &source_bytes,
+        );
+        let should_retry =
+            matches!(&result, Err(Error::Parse { .. })) && window.fallback_end > window.end;
+        if should_retry {
+            self.read_uncompressed_object_with_end(
+                object_ref,
+                offset,
+                start,
+                window.fallback_end,
+                &source_bytes,
+            )
+        } else {
+            result
+        }
+    }
+
+    fn read_uncompressed_object_with_end(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        start: usize,
+        end: usize,
+        source_bytes: &[u8],
+    ) -> Result<(ObjectValue, i64)> {
         let input = source_bytes
-            .get(start..)
+            .get(start..end)
             .ok_or_else(|| Error::parse(start, "object is beyond the end of the file"))?;
         let policy = self.object_policy();
         let actual_object_ref =
@@ -553,6 +637,7 @@ impl BootstrapHandleDocument {
         // cov:ignore-end
         Ok((value.0, parsed_offset))
     }
+    // qpdf-deviation-end
 
     fn resolve_objects_in_stream(&self, stream_number: u32) -> Result<()> {
         if !self
@@ -859,14 +944,16 @@ impl<'bytes> XrefReadContext<'bytes> {
         registration: &XrefRegistration,
         options: XrefLoadOptions,
     ) -> Self {
-        let (entry_lookup, shared) = match spec {
+        let (entry_lookup, shared, reference_offsets) = match spec {
             XrefReadContextSpec::ActiveSection => (
                 XrefEntryLookup::Registration(&registration.entries),
                 empty_bootstrap_cache(),
+                None,
             ),
             XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache } => (
                 XrefEntryLookup::Registration(&registration.entries),
                 Rc::clone(bootstrap_cache),
+                None,
             ),
             XrefReadContextSpec::Reconstruction { line_scan_entries } => (
                 XrefEntryLookup::Reconstruction {
@@ -874,6 +961,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                     registration_entries: &registration.entries,
                 },
                 empty_bootstrap_cache(),
+                Some(reconstructed_reference_offsets(line_scan_entries)),
             ),
             XrefReadContextSpec::ReconstructionWithCache {
                 line_scan_entries,
@@ -884,6 +972,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                     registration_entries: &registration.entries,
                 },
                 Rc::clone(bootstrap_cache),
+                Some(reconstructed_reference_offsets(line_scan_entries)),
             ),
         };
         let document = {
@@ -902,6 +991,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                 document
             }
         };
+        document.set_reference_offsets(reference_offsets);
         let handle_diagnostics_len = shared
             .borrow()
             .handle_state
@@ -3592,6 +3682,28 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 #[cfg(test)]
 mod final_handle_tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    fn malformed_candidate_fixture(count: usize) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        for index in 1..=count {
+            let target = count + index;
+            bytes.extend_from_slice(
+                format!(
+                    "{index} 0 obj\n<< /Type {target} 0 R /Length 0 /W [1 1 1] /Size 0 >>\nstream\nendstream\nendobj\n"
+                )
+                .as_bytes(),
+            );
+        }
+        for index in 1..=count {
+            let target = count + index;
+            bytes.extend_from_slice(
+                format!("{target} 0 obj\n(unterminated target {target} ").as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(b"\nstartxref\n999999\n%%EOF\n");
+        bytes
+    }
 
     #[test]
     fn bootstrap_document_construction_defers_the_source_snapshot() {
@@ -3607,6 +3719,106 @@ mod final_handle_tests {
             document.bytes.get().is_none(),
             "constructing the bootstrap owner must not copy the complete input"
         );
+    }
+
+    #[test]
+    fn reconstruction_bounds_referenced_reads_for_malformed_candidates() {
+        let bytes = malformed_candidate_fixture(5_000);
+        let started = Instant::now();
+        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(&bytes), true)
+            .expect_err("the fixture has no trailer dictionary");
+        assert!(error
+            .to_string()
+            .contains("unable to find trailer dictionary while recovering damaged file"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "malformed candidate reconstruction must remain bounded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn reconstruction_reference_read_window_uses_adjacent_offset_and_fallback_positions() {
+        let mut entries = BTreeMap::new();
+        for index in 0..=70 {
+            let object_ref = ObjectRef::new(index + 1, 0);
+            entries.insert(
+                object_ref,
+                XrefEntry::Uncompressed {
+                    offset: u64::from(index) * 10,
+                },
+            );
+        }
+        let context = XrefReadContext::new(
+            &[0; 800],
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.document.reference_read_window(10, 800),
+            ReferenceReadWindow {
+                end: 20,
+                fallback_end: 660,
+            }
+        );
+    }
+
+    #[test]
+    fn active_reference_read_window_keeps_qpdf_unbounded_view() {
+        let context = XrefReadContext::new(
+            &[0; 800],
+            XrefReadContextSpec::ActiveSection,
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.document.reference_read_window(10, 800),
+            ReferenceReadWindow {
+                end: 800,
+                fallback_end: 800,
+            }
+        );
+    }
+
+    #[test]
+    fn reconstruction_reference_read_retries_with_the_controlled_fallback_window() {
+        let mut bytes = b"1 0 obj\n<< /Length 27 >>\nstream\n".to_vec();
+        bytes.extend_from_slice(b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n");
+        let stream_length = b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n".len();
+        bytes.extend_from_slice(b"endstream\nendobj\n");
+        assert_eq!(stream_length, 27);
+
+        let first_ref = ObjectRef::new(1, 0);
+        let second_ref = ObjectRef::new(2, 0);
+        let second_offset = b"1 0 obj\n<< /Length 27 >>\nstream\n".len() + b"aaaa\n".len();
+        let mut entries = BTreeMap::new();
+        entries.insert(first_ref, XrefEntry::Uncompressed { offset: 0 });
+        entries.insert(
+            second_ref,
+            XrefEntry::Uncompressed {
+                offset: second_offset as u64,
+            },
+        );
+        let context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (value, _) = context
+            .document
+            .read_uncompressed_object(first_ref, 0)
+            .expect("the fallback window must recover a valid stream");
+        assert!(matches!(value, ObjectValue::Stream { .. }));
     }
 
     #[test]
