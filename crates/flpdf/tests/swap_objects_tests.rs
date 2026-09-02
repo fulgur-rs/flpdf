@@ -162,3 +162,32 @@ fn swapping_two_slots_with_one_shared_value_is_a_noop() {
         Some(7)
     );
 }
+
+#[test]
+fn swap_objects_resurrects_a_deleted_slot_for_live_object_refs() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let deleted = indirect_marker(&pdf, 1);
+    let deleted_ref = deleted.object_ref().expect("indirect marker has a ref");
+    pdf.delete_object(deleted_ref);
+    assert!(
+        !pdf.live_object_refs().contains(&deleted_ref),
+        "delete_object must remove the ref from live_object_refs"
+    );
+
+    let source = indirect_marker(&pdf, 9);
+    let source_ref = source.object_ref().expect("indirect marker has a ref");
+
+    pdf.swap_objects(deleted_ref, source_ref)
+        .expect("swap a live value into a previously deleted slot");
+
+    assert!(
+        pdf.live_object_refs().contains(&deleted_ref),
+        "a swap that resolves a live value into a deleted slot must resurrect it"
+    );
+    assert_eq!(
+        pdf.get_object_handle(deleted_ref)
+            .get_key(b"/Marker")
+            .as_integer(),
+        Some(9)
+    );
+}

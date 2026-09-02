@@ -2,6 +2,7 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use super::emit_new_diagnostics;
 use flpdf::{
     linearization::show_linearization_pdf_with_warnings, DecodeLevel, Error, ObjectHandle,
     ObjectRef, PageDocumentHelper, PageInput, Pdf, PdfWriter, Pipeline, PipelineHandle,
@@ -267,13 +268,16 @@ pub(crate) fn run_test_13<R: Read + Seek>(
 /// memory-output passes (`qpdf/test_driver.cc:591-658`). The document-level
 /// swap is delegated to [`Pdf::swap_objects`]; the driver owns only the same
 /// call order, assertions, output formatting, and file adapter as qpdf.
+/// qpdf's `QPDF::warn` prints each repair warning synchronously as it is
+/// generated (`libqpdf/QPDF.cc:488-495`), so the driver drains any
+/// diagnostics accumulated by the resolutions above and by each write pass.
 pub(crate) fn run_test_14<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     if pages.len() != 4 {
@@ -348,13 +352,16 @@ pub(crate) fn run_test_14<R: Read + Seek>(
         writeln!(stdout, "array and dictionary contents are correct")?;
     }
 
-    for (static_id, filename) in [(true, "a.pdf"), (false, "b.pdf")] {
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    for (static_id, output_name) in [(true, "a.pdf"), (false, "b.pdf")] {
         let mut writer = PdfWriter::new(pdf);
         writer.set_output_memory()?;
         writer.set_static_id(static_id);
         writer.set_stream_data_mode(StreamDataMode::Preserve);
         writer.write()?;
-        std::fs::write(filename, writer.get_buffer()?)?;
+        std::fs::write(output_name, writer.get_buffer()?)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
     Ok(())
 }

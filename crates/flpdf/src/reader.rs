@@ -1612,6 +1612,21 @@ impl<R: Read + Seek> Pdf<R> {
             self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
             self.qpdf_dangling_refs.remove(&object_ref);
             self.mark_object_handle_mutated(object_ref);
+            // qpdf's `removeObject` erases the object cache cell outright
+            // (`QPDF.cc:1996-2005`); qpdf has no persistent "deleted" or
+            // "missing" tombstone that a later resolve must clear. flpdf's
+            // legacy `CacheEntry::Deleted`/`Missing` sentinel is scaffolding
+            // this facade owns alone, so a swap that resolves a non-null
+            // value into a previously deleted/missing/reserved slot must
+            // clear that sentinel itself, or `live_object_refs()` keeps
+            // filtering out a ref that the canonical handle now resolves.
+            if matches!(
+                self.cache.entry(object_ref),
+                Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
+            ) {
+                let handle = self.get_object_handle(object_ref);
+                self.cache.set_resolved(object_ref, handle);
+            }
         }
         Ok(())
     }

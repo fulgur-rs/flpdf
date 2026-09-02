@@ -40,6 +40,10 @@ fn missing_mediabox_fixture() -> &'static str {
 }
 
 fn swap_replace_fixture() -> Vec<u8> {
+    swap_replace_fixture_with_qdict_body(b"<< >>")
+}
+
+fn swap_replace_fixture_with_qdict_body(qdict_body: &[u8]) -> Vec<u8> {
     let objects = [
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
         (
@@ -62,7 +66,7 @@ fn swap_replace_fixture() -> Vec<u8> {
             6,
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /OrigPage 4 >>".as_slice(),
         ),
-        (7, b"<< >>".as_slice()),
+        (7, qdict_body),
         (8, b"[ /Array ]".as_slice()),
     ];
     let mut bytes = b"%PDF-1.3\n".to_vec();
@@ -471,6 +475,27 @@ fn test_14_matches_qpdf_swap_and_replace_sequence() {
 
     assert!(directory.path().join("a.pdf").is_file());
     assert!(directory.path().join("b.pdf").is_file());
+}
+
+#[test]
+fn test_14_drains_the_repair_warning_from_resolving_qdict() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test14-damaged-qdict.pdf");
+    fs::write(&input, swap_replace_fixture_with_qdict_body(b"<< >>\njunk"))
+        .expect("write damaged /QDict fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["14", input])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout(predicates::str::contains(
+            "array and dictionary contents are correct\ntest 14 done\n",
+        ))
+        .stderr(predicates::str::contains(
+            "(object 7 0, offset 479): expected endobj",
+        ));
 }
 
 #[test]
