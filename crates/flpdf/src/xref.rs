@@ -3884,7 +3884,7 @@ mod final_handle_tests {
             .read_uncompressed_object(first_ref, 0)
             .expect("the fallback window must recover a valid stream");
         let ObjectValue::Stream { stream_data, .. } = value else {
-            panic!("expected a recovered stream, got {value:?}");
+            panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
         };
         // The narrow window truncates before `endstream`, which
         // `RecoveryPolicy::Bounded` accepts as a *successful* empty stream
