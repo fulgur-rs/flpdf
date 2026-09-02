@@ -1909,6 +1909,12 @@ fn resolve_previous_xref_offset(
 ) -> Result<(Option<u64>, Diagnostics, Option<Error>)> {
     let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
     context.ensure_source_for_resolution(trailer);
+    if let Some(previous) = trailer
+        .as_dictionary()
+        .and_then(|entries| entries.get(b"/Prev".as_slice()).cloned())
+    {
+        context.ensure_source_for_resolution(&previous);
+    }
     let has_previous = trailer.try_has_key(b"/Prev")?;
     context.sync_handle_diagnostics();
     let previous = has_previous
@@ -3839,6 +3845,24 @@ mod final_handle_tests {
                 .any(|diagnostic| diagnostic.message.contains("dictionary ended prematurely")),
             "strict validation must forward parser diagnostics collected before the error"
         );
+
+        let mut registration = XrefRegistration::default();
+        let error = parse_xref_from_start(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+            true,
+        )
+        .expect_err("the same validation error must not require a diagnostic sink");
+        assert!(error
+            .to_string()
+            .contains("trailer dictionary lacks /Size key"));
     }
 
     #[test]
@@ -3864,6 +3888,41 @@ mod final_handle_tests {
             error.is_none(),
             "xref-stream trailers have no classic trailer error context"
         );
+    }
+
+    #[test]
+    fn previous_xref_merge_propagates_an_uninitialized_trailer_error() {
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.4".to_owned(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer: ObjectHandle::uninitialized(),
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            first_xref_item_offset: 0,
+            classic_trailer_offset: None,
+            pending_reconstruction_trigger: None,
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+        let mut registration = XrefRegistration::default();
+
+        let error = merge_previous_xref_sections(
+            b"",
+            "1.4",
+            &mut loaded,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("an uninitialized trailer must fail at the dictionary boundary");
+        assert!(matches!(error, Error::Internal(message) if message.contains("uninitialized")));
     }
 
     #[test]
