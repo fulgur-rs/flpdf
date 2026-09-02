@@ -2387,14 +2387,22 @@ fn main() {
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
     } else if args.is_encrypted {
-        match args.input.as_ref() {
-            Some(input) => run_is_encrypted(input, args.repair, &args.password),
-            None => Err("--is-encrypted requires an input file".into()),
+        if args.page_ops.empty {
+            run_empty_document_encryption_status()
+        } else {
+            match args.input.as_ref() {
+                Some(input) => run_is_encrypted(input, args.repair, &args.password),
+                None => Err("--is-encrypted requires an input file".into()),
+            }
         }
     } else if args.requires_password {
-        match args.input.as_ref() {
-            Some(input) => run_requires_password(input, args.repair, &args.password),
-            None => Err("--requires-password requires an input file".into()),
+        if args.page_ops.empty {
+            run_empty_document_encryption_status()
+        } else {
+            match args.input.as_ref() {
+                Some(input) => run_requires_password(input, args.repair, &args.password),
+                None => Err("--requires-password requires an input file".into()),
+            }
         }
     } else if let Some(object_ref) = args.show_object.as_deref() {
         run_show_object(
@@ -6790,6 +6798,19 @@ fn is_bad_password_error(error: &flpdf::Error) -> bool {
         source,
         flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
     )
+}
+
+/// `--empty --is-encrypted`/`--empty --requires-password`: silently exit 2.
+///
+/// qpdf's `createQPDF` still builds an empty document for `--empty` before
+/// the encryption-status early return (`QPDFJob.cc:429-456,535-557`); an
+/// empty document is necessarily unencrypted, so both flags exit 2 without
+/// opening any file.
+fn run_empty_document_encryption_status() -> CliResult<()> {
+    Err(Box::new(CliExitError {
+        code: ExitCode::Errors,
+        message: String::new(),
+    }))
 }
 
 /// `is-encrypted FILE`: exit 0 if encrypted, exit 2 if not.

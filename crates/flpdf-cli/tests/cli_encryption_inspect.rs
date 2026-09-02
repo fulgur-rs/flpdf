@@ -148,6 +148,48 @@ fn top_level_requires_password_matches_qpdf() {
 }
 
 #[test]
+fn top_level_empty_is_encrypted_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--empty", "--is-encrypted"])
+        .output()
+        .unwrap();
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert!(qpdf.stdout.is_empty());
+    assert!(qpdf.stderr.is_empty());
+
+    flpdf()
+        .args(["--empty", "--is-encrypted"])
+        .assert()
+        .code(2)
+        .stdout(predicate::eq(""))
+        .stderr(predicate::eq(""));
+}
+
+#[test]
+fn top_level_empty_requires_password_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--empty", "--requires-password"])
+        .output()
+        .unwrap();
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert!(qpdf.stdout.is_empty());
+    assert!(qpdf.stderr.is_empty());
+
+    flpdf()
+        .args(["--empty", "--requires-password"])
+        .assert()
+        .code(2)
+        .stdout(predicate::eq(""))
+        .stderr(predicate::eq(""));
+}
+
+#[test]
 fn top_level_is_encrypted_requires_an_input() {
     flpdf()
         .arg("--is-encrypted")
