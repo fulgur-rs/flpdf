@@ -1428,10 +1428,10 @@ fn top_level_linearize_normalize_content_preserves_warning_exit() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
-             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
-             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens{EOL}\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents{EOL}\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.{EOL}\
+             flpdf: operation succeeded with warnings; resulting file may have some problems{EOL}",
             input.display(),
             input.display(),
             input.display(),
@@ -5098,10 +5098,10 @@ fn rewrite_normalize_content_follows_indirect_contents_array() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
-             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
-             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens{EOL}\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents{EOL}\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.{EOL}\
+             flpdf: operation succeeded with warnings; resulting file may have some problems{EOL}",
             input.display(),
             input.display(),
             input.display(),
@@ -5256,10 +5256,10 @@ fn rewrite_normalize_content_duplicate_array_stream_warns_once() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
-             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
-             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens{EOL}\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents{EOL}\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.{EOL}\
+             flpdf: operation succeeded with warnings; resulting file may have some problems{EOL}",
             input.display(),
             input.display(),
             input.display(),
@@ -5289,10 +5289,10 @@ fn rewrite_normalize_content_deduplicates_terminal_stream_aliases() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
-             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
-             flpdf: operation succeeded with warnings; resulting file may have some problems\n",
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens{EOL}\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents{EOL}\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.{EOL}\
+             flpdf: operation succeeded with warnings; resulting file may have some problems{EOL}",
             input.display(),
             input.display(),
             input.display(),
@@ -7623,9 +7623,9 @@ fn list_attachments_repaired_input_exits_three_with_inspection_summary() {
         ])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains(
-            "flpdf: operation succeeded with warnings\n",
-        ))
+        .stderr(predicate::str::contains(format!(
+            "flpdf: operation succeeded with warnings{EOL}"
+        )))
         .stderr(predicate::str::contains("resulting file may have some problems").not())
         .stdout(predicate::str::contains("has no embedded files"));
 }

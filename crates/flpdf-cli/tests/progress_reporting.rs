@@ -78,7 +78,7 @@ fn progress_reaches_the_attachment_writer() {
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert!(
         stdout.starts_with(&format!(
-            "flpdf: {}: write progress: 0%\n",
+            "flpdf: {}: write progress: 0%{EOL}",
             output_path.display()
         )),
         "{stdout}"
