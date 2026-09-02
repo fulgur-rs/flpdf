@@ -135,11 +135,10 @@ impl<'a> Flate<'a> {
     }
 
     pub(crate) fn set_compression_level(level: i32) -> PipelineResult<()> {
-        if level != -1 && !(0..=9).contains(&level) {
-            return Err(PipelineError::runtime(
-                "Pl_Flate: compression level must be -1 or between 0 and 9",
-            ));
-        }
+        // qpdf's Pl_Flate::setCompressionLevel only stores the value
+        // (`libqpdf/Pl_Flate.cc:221-224`). zlib validates it lazily at
+        // deflateInit time, where the owning stream's retry boundary can
+        // report the failure and fall back to unfiltered bytes.
         COMPRESSION_LEVEL.store(level, Ordering::Relaxed);
         Ok(())
     }
@@ -707,8 +706,8 @@ mod tests {
         Flate::set_compression_level(0).unwrap();
         Flate::set_compression_level(1).unwrap();
         Flate::set_compression_level(9).unwrap();
-        assert!(Flate::set_compression_level(-2).is_err());
-        assert!(Flate::set_compression_level(10).is_err());
+        assert!(Flate::set_compression_level(-2).is_ok());
+        assert!(Flate::set_compression_level(10).is_ok());
         Flate::set_compression_level(-1).unwrap();
     }
 

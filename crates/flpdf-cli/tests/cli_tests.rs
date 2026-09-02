@@ -7,6 +7,7 @@ use predicates::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
+use std::process::Command as ProcessCommand;
 
 mod common;
 use common::PdfCanonicalTestExt;
@@ -826,6 +827,55 @@ fn rewrite_default_is_qpdf_equivalent_full_rewrite() {
     assert_ne!(
         default_bytes, nocomp_bytes,
         "default rewrite (compress=y) must differ from --compress-streams=n output"
+    );
+}
+
+#[test]
+fn invalid_compression_level_retries_each_stream_like_qpdf() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = "../../tests/fixtures/compat/one-page.pdf";
+    let qpdf_output = temp.path().join("qpdf-invalid-level.pdf");
+    let flpdf_output = temp.path().join("flpdf-invalid-level.pdf");
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(["--recompress-flate", "--compression-level=10", input])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert_eq!(qpdf.status.code(), Some(3));
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--recompress-flate", "--compression-level=10", input])
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+    assert_eq!(flpdf.status.code(), Some(3));
+    assert!(
+        contains(
+            &qpdf.stderr,
+            b"stream will be re-processed without filtering"
+        ) && contains(
+            &flpdf.stderr,
+            b"stream will be re-processed without filtering"
+        ),
+        "both writers must report the per-stream raw retry"
+    );
+    assert!(
+        flpdf_output.exists(),
+        "the recovered output must be retained"
+    );
+
+    let check = ProcessCommand::new("qpdf")
+        .args(["--check"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("qpdf --check");
+    assert!(
+        check.status.success(),
+        "the per-stream fallback must leave a valid PDF: {}",
+        String::from_utf8_lossy(&check.stderr)
     );
 }
 
