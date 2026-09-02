@@ -5072,12 +5072,16 @@ impl ObjectHandle {
         mut conflicts: Option<&mut ResourceConflicts>,
     ) -> Result<()> {
         self.try_dereference()?;
+        if self.as_dictionary().is_none() {
+            return Ok(());
+        }
         other.try_dereference()?;
-        let (Some(_), Some(other_entries)) = (self.as_dictionary(), other.as_dictionary()) else {
+        let Some(other_entries) = other.as_dictionary() else {
             return Ok(());
         };
         for (rtype, other_val) in other_entries {
             if !self.try_has_key(&rtype)? {
+                other_val.try_dereference()?;
                 self.replace_key(&rtype, other_val.shallow_copy()?)?;
                 continue;
             }
@@ -16066,6 +16070,51 @@ mod mutation_tests {
             .expect_err("category resolution failure must propagate");
         assert!(matches!(error, Error::System(message) if message == "resolver failed"));
         drop(category_resolver);
+    }
+
+    #[test]
+    fn merge_resources_resolves_an_unresolved_missing_category_before_shallow_copy() {
+        // qpdf's `shallowCopy` always dereferences before copying
+        // (`QPDFObjectHandle.cc:2073-2079`), so the missing-category branch
+        // (`replaceKey(rtype, other_val.shallowCopy())`,
+        // `QPDFObjectHandle.cc:1150-1152`) never installs an unresolved
+        // placeholder. flpdf's non-forcing `shallow_copy` must resolve
+        // `other_val` itself first to match.
+        let destination = ObjectHandle::dictionary(vec![]);
+        let (other_font, other_font_resolver) =
+            identity_tests::resolver_bearing_handle(ObjectValue::Dictionary(
+                [(b"F1".to_vec(), ObjectHandle::integer(1))]
+                    .into_iter()
+                    .collect(),
+            ));
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+
+        destination
+            .merge_resources(&other, None)
+            .expect("an unresolved missing category must still merge");
+
+        assert_eq!(
+            destination.get_key(b"/Font").get_key(b"/F1").as_integer(),
+            Some(1),
+            "shallow-copying an unresolved category must not install a direct null"
+        );
+        drop(other_font_resolver);
+    }
+
+    #[test]
+    fn merge_resources_short_circuits_other_when_the_receiver_is_not_a_dictionary() {
+        // qpdf's outer guard is `isDictionary() && other.isDictionary()`
+        // (`QPDFObjectHandle.cc:1066`): a short-circuiting `&&` that never
+        // evaluates `other.isDictionary()` -- and so never dereferences
+        // `other` -- once `self` fails the check.
+        let destination = ObjectHandle::integer(1);
+        let (other, other_resolver) = identity_tests::error_resolving_handle(ObjectRef::new(93, 0));
+
+        destination
+            .merge_resources(&other, None)
+            .expect("a non-dictionary receiver must no-op without touching other");
+
+        drop(other_resolver);
     }
 
     #[test]
