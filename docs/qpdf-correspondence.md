@@ -250,6 +250,13 @@ eight-case qpdf 11.9.0 helper differential.
 | `QPDFObjectHandle::mergeResources` / `shallowCopy` | `QPDFObjectHandle.cc:1063-1147,2072-2079` | `object_handle.rs:3692` + `page_annotation_flatten.rs:666-740`（widget appearance の既定リソース consumer） | ✅ live `ObjectHandle::merge_resources` を使用。missing category は top-level が direct の shallow copy になり、nested indirect child は handle を保持する。array の `isScalar` 判定と unique-name pool の second-level dictionary 判定は qpdf と同じく各 nested handle を解決し、解決エラーを伝播する。`acroform_document_helper.rs` の `DrMap` と `overlay_appearance_stream.rs` が name-conflict overlay merge を担う |
 | `QPDFObjectHandle::getResourceNames` | `QPDFObjectHandle.hh:831-835`; `QPDFObjectHandle.cc:1156-1170` | `object_handle.rs::ObjectHandle::get_resource_names` + `try_get_resource_names` | ✅ second-level keys from every dictionary-valued resource category are collected through the canonical handle resolver; the public facade is available to `flpdf-qtest-tools`, and resolver failures remain a `Result` at the Rust boundary. |
 
+`qpdf/test_driver.cc:2139-2213` の test 60 は、`ObjectHandle::make_resources_indirect`、
+`merge_resources`、`get_unique_resource_name` とlive `Pdf::trailer`を通るqtest consumerとして
+実装済みである。4回のconflict merge結果とQDF/static-ID `a.pdf`をpinned qpdf 11.9.0の
+`test60.out` / `unique-resources.pdf`と比較し、対応する `merge-dictionary 2,3` の
+同一run結果を `harness.log` と `qtest-results.xml` で確認する。driver独自のresource
+traversal・allocation・trailer snapshotは追加していない。
+
 `flpdf-tcfj` では、qpdf 11.9.0 の `QPDF::resolve` が `isUnresolved` を確認して永続 `m->obj_cache` を一度だけ更新する責務（`QPDF.cc:1700-1753`）に合わせ、xref bootstrap の raw object view と handle-native view を `SharedBootstrapCache` の同一状態へ束ねる。`BootstrapHandleDocument`、再帰ガード、ObjStm の解決済み集合、診断、reconstruction trigger は xref-loading operation 全体で共有し、`read_uncompressed_object` の `FileObjectDiagnostic` は一度だけ転送する。raw view が先に materialize した値は handle slot へ seed し、handle view が先に解決した値は raw lookup から再利用するため、同じ bootstrap object の再パースと警告の二重出力を避ける。
 
 `flpdf-uwn0` では qpdf の `makeIndirectFromQPDFObject` (`QPDF.cc:1882-1894`) / `replaceObject` (`QPDF.cc:1986-1993`) が source xref と別に `m->obj_cache` へ登録する allocation と、参照解決で同じ cache に入る dangling null を object-ref view で区別する。qpdf の `getAllObjects` は `fixDanglingReferences` 後の `m->obj_cache` 全体 (`QPDF.cc:1258-1294`) を列挙し、live probe でも `newIndirectNull()` は列挙される。flpdf の `ResolverCore::allocated_object_refs` はこの provenance だけを canonical allocation 境界で記録し、`object_refs()` / `live_object_refs()` が allocated indirect null を落とさないようにする。legacy cache/memo の互換 bridge や qpdf-deviation marker は追加しない。
