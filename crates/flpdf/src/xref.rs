@@ -550,8 +550,20 @@ impl BootstrapHandleDocument {
             window.end,
             &source_bytes,
         );
-        let should_retry =
-            matches!(&result, Err(Error::Parse { .. })) && window.fallback_end > window.end;
+        // A truncated window can also make `read_uncompressed_object_with_end`
+        // *succeed* with a bogus result instead of failing: under
+        // `RecoveryPolicy::Bounded`, a stream whose real `endstream`/`endobj`
+        // terminator lies beyond `window.end` falls through
+        // `complete_handle_stream`'s no-terminator-found arm, which returns
+        // `Ok` with an empty recovered stream rather than `Err`. Detect that
+        // truncation artifact too, so a real referenced stream is retried
+        // through the wider fallback window instead of being cached empty.
+        let recovered_as_truncated_stream = matches!(
+            &result,
+            Ok((ObjectValue::Stream { stream_data: Some(data), .. }, _)) if data.is_empty()
+        );
+        let should_retry = window.fallback_end > window.end
+            && (matches!(&result, Err(Error::Parse { .. })) || recovered_as_truncated_stream);
         if should_retry {
             self.read_uncompressed_object_with_end(
                 object_ref,
@@ -3697,8 +3709,14 @@ mod final_handle_tests {
         }
         for index in 1..=count {
             let target = count + index;
+            // Each generated target must end its own line: the reconstruction
+            // line scan only recognizes an "N G obj" header as the *first*
+            // token of a physical line, so a trailing space here (rather than
+            // a newline) would concatenate the next target's header onto this
+            // one's unterminated literal, leaving every target after the
+            // first unreachable by the line scan.
             bytes.extend_from_slice(
-                format!("{target} 0 obj\n(unterminated target {target} ").as_bytes(),
+                format!("{target} 0 obj\n(unterminated target {target}\n").as_bytes(),
             );
         }
         bytes.extend_from_slice(b"\nstartxref\n999999\n%%EOF\n");
@@ -3721,16 +3739,39 @@ mod final_handle_tests {
         );
     }
 
-    #[test]
-    fn reconstruction_bounds_referenced_reads_for_malformed_candidates() {
-        let bytes = malformed_candidate_fixture(5_000);
+    /// Builds and recovers a [`malformed_candidate_fixture`] of `count`
+    /// candidates, asserting the expected recovery failure, and returns the
+    /// elapsed wall-clock time.
+    fn timed_malformed_candidate_recovery(count: usize) -> Duration {
+        let bytes = malformed_candidate_fixture(count);
         let started = Instant::now();
         let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(&bytes), true)
             .expect_err("the fixture has no trailer dictionary");
         assert!(error
             .to_string()
             .contains("unable to find trailer dictionary while recovering damaged file"));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        started.elapsed()
+    }
+
+    #[test]
+    fn reconstruction_bounds_referenced_reads_for_malformed_candidates() {
+        // Compare a 10x candidate-count increase's elapsed time against a
+        // small baseline rather than asserting an absolute wall-clock
+        // ceiling: an absolute deadline is indistinguishable from a slow or
+        // instrumented CI runner (e.g. under `cargo llvm-cov`), while an
+        // O(n^2) regression -- the failure mode this test guards against --
+        // would scale roughly 100x over this 10x input increase, far past
+        // any noise an absolute ceiling would otherwise need to tolerate.
+        // The `+ 200ms` floor absorbs fixed overhead the ratio alone can't,
+        // since `small` can be small enough for noise to dominate a pure
+        // multiple.
+        let small = timed_malformed_candidate_recovery(500);
+        let large = timed_malformed_candidate_recovery(5_000);
+        assert!(
+            large < small * 20 + Duration::from_millis(200),
+            "elapsed time scaled worse than the bounded-window guard allows: \
+             small (500 candidates) = {small:?}, large (5,000 candidates) = {large:?}"
+        );
     }
 
     #[test]
@@ -3831,7 +3872,10 @@ mod final_handle_tests {
                 line_scan_entries: &entries,
             },
             &XrefRegistration::default(),
-            XrefLoadOptions::default(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
         );
         context.document.ensure_source_bytes(&bytes);
 
@@ -3839,7 +3883,19 @@ mod final_handle_tests {
             .document
             .read_uncompressed_object(first_ref, 0)
             .expect("the fallback window must recover a valid stream");
-        assert!(matches!(value, ObjectValue::Stream { .. }));
+        let ObjectValue::Stream { stream_data, .. } = value else {
+            panic!("expected a recovered stream, got {value:?}");
+        };
+        // The narrow window truncates before `endstream`, which
+        // `RecoveryPolicy::Bounded` accepts as a *successful* empty stream
+        // rather than an `Err`, so a weaker `matches!(.., Stream { .. })`
+        // check alone would pass even if the retry never widened the
+        // window. Assert the full 27-byte payload was actually recovered.
+        assert_eq!(
+            stream_data.as_deref().map(Vec::len),
+            Some(stream_length),
+            "the fallback window must recover the stream's real content, not an empty placeholder"
+        );
     }
 
     #[test]
