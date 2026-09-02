@@ -213,9 +213,10 @@ reader.rs に残す）とは移動の種類が異なる。本設計もこれに�
 
 **lib.rs の配線変更**（`flpdf-0b12` で実施済み）: `pub mod pdf;` を追加、
 `pub use pdf::Pdf;` を追加、既存の
-`pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};` から
-`Pdf` を除去（`EncryptionInfo`/`PdfOpenOptions`/`Permissions` は
-reader.rs に残ったまま）。
+`pub use reader::{Pdf, PdfOpenOptions, Permissions};` から `Pdf` を除去
+（`PdfOpenOptions`/`Permissions` は reader.rs に残ったまま）。現在の
+reader API は qpdf の個別 encryption projection を公開し、flpdf 固有の
+集約 `EncryptionInfo` は公開しない。
 
 **`encryption.rs`/`encryption/{state,standard,permissions}.rs`/
 `object_copy.rs` も同じ解決法をそのまま使える**: `is_encrypted`

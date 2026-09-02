@@ -25,13 +25,11 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone)]
 pub(crate) struct EncryptionState {
     pub(crate) file_key: Vec<u8>,
-    /// qpdf `encryption_V` / `encryption_R`.
+    /// qpdf `encryption_V`.
     pub(crate) encryption_v: i64,
-    pub(crate) encryption_r: i64,
-    /// qpdf `cf_stream` / `cf_string` / `cf_file`.
+    /// qpdf `cf_stream` / `cf_string`.
     pub(crate) cf_stream: EncryptionMode,
     pub(crate) cf_string: EncryptionMode,
-    pub(crate) cf_file: EncryptionMode,
     pub(crate) crypt_filters: BTreeMap<Vec<u8>, EncryptionMode>,
     pub(crate) encrypt_metadata: bool,
     pub(crate) encrypt_ref: Option<ObjectRef>,
@@ -236,17 +234,13 @@ pub(crate) struct EncryptionInspectionState {
     pub(crate) v: i64,
     pub(crate) r: i64,
     pub(crate) length_bits: i64,
-    pub(crate) filter: String,
     pub(crate) permissions: Permissions,
-    pub(crate) encrypt_metadata: bool,
     pub(crate) cf_stream: EncryptionMode,
     pub(crate) cf_string: EncryptionMode,
-    pub(crate) cf_file: EncryptionMode,
     pub(crate) crypt_filters: BTreeMap<Vec<u8>, EncryptionMode>,
     pub(crate) stream_method: &'static str,
     pub(crate) string_method: &'static str,
     pub(crate) eff_method: &'static str,
-    pub(crate) named_crypt_filters: Vec<(String, &'static str)>,
     pub(crate) user_password: Vec<u8>,
     pub(crate) user_password_matched: bool,
     pub(crate) owner_password_matched: bool,
@@ -307,10 +301,10 @@ pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<Encryptio
     let v = required_version_from_handle(encrypt)?;
     let r = required_revision_from_handle(encrypt)?;
     let permissions = Permissions::new(required_permissions_from_handle(encrypt)?);
-    let filter = required_name_from_handle(encrypt, "Filter")?;
+    required_name_from_handle(encrypt, "Filter")?;
     let length = encrypt.try_get_key(b"/Length")?;
     let length_bits = effective_length_bits(v, &length)?;
-    let encrypt_metadata = encrypt_metadata_flag_from_handle(encrypt)?;
+    encrypt_metadata_flag_from_handle(encrypt)?;
     let crypt_filters = crypt_filter_modes_from_handle(encrypt, v)?;
     let (cf_stream, cf_string, cf_file) = if matches!(v, 4 | 5) {
         let stream =
@@ -331,24 +325,14 @@ pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<Encryptio
             EncryptionMode::Identity,
         )
     };
-    let (stream_method, string_method, eff_method, named_crypt_filters) = if matches!(v, 4 | 5) {
-        let named = crypt_filters
-            .iter()
-            .map(|(name, method)| {
-                (
-                    String::from_utf8_lossy(name).into_owned(),
-                    method.qpdf_name(),
-                )
-            })
-            .collect();
+    let (stream_method, string_method, eff_method) = if matches!(v, 4 | 5) {
         (
             cf_stream.qpdf_name(),
             cf_string.qpdf_name(),
             cf_file.qpdf_name(),
-            named,
         )
     } else {
-        ("none", "none", "none", Vec::new())
+        ("none", "none", "none")
     };
     // Same classification `authenticate` computes per revision branch
     // (`weak_crypto = revision == 5 || rc4_in_use()` for R5/R6, otherwise
@@ -376,47 +360,18 @@ pub(crate) fn parse_inspection_state(encrypt: &ObjectHandle) -> Result<Encryptio
         v,
         r,
         length_bits,
-        filter,
         permissions,
-        encrypt_metadata,
         cf_stream,
         cf_string,
-        cf_file,
         crypt_filters,
         stream_method,
         string_method,
         eff_method,
-        named_crypt_filters,
         user_password: Vec::new(),
         user_password_matched: false,
         owner_password_matched: false,
         weak_crypto,
     })
-}
-
-/// Read-only snapshot of an encrypted document's `/Encrypt` parameters.
-///
-/// The snapshot is also available from the dedicated encryption-inspection
-/// open path after password authentication fails; the match flags and
-/// password bytes then retain qpdf's partial-initialization semantics.
-#[derive(Debug, Clone)]
-pub struct EncryptionInfo {
-    pub v: i64,
-    pub r: i64,
-    pub length_bits: i64,
-    pub filter: String,
-    pub permissions: Permissions,
-    pub encrypt_metadata: bool,
-    /// qpdf `getTrimmedUserPassword()` bytes for the authenticated document.
-    /// Empty means no recoverable/displayable user password (for example a
-    /// V>=5 owner-password authentication).
-    pub user_password: Vec<u8>,
-    pub user_password_matched: bool,
-    pub owner_password_matched: bool,
-    pub stream_method: &'static str,
-    pub string_method: &'static str,
-    pub eff_method: &'static str,
-    pub named_crypt_filters: Vec<(String, &'static str)>,
 }
 
 /// Result of qpdf's `initializeEncryption` plus password authentication.
@@ -444,7 +399,6 @@ pub(crate) fn authenticate(
     let permissions = parsed.permissions;
     let cf_stream = parsed.cf_stream;
     let cf_string = parsed.cf_string;
-    let cf_file = parsed.cf_file;
     let crypt_filters = parsed.crypt_filters.clone();
 
     let effective = |cf: EncryptionMode| {
@@ -613,10 +567,8 @@ pub(crate) fn authenticate(
         state: EncryptionState {
             file_key,
             encryption_v: version,
-            encryption_r: revision,
             cf_stream,
             cf_string,
-            cf_file,
             crypt_filters,
             encrypt_metadata,
             encrypt_ref,

@@ -203,10 +203,7 @@ fn assert_qdf_encrypted_output(output: &Path, password: &str) {
     )
     .expect("flpdf must reopen and authenticate encrypted QDF output");
     assert!(
-        reopened
-            .encryption_info()
-            .expect("read encryption information")
-            .is_some(),
+        reopened.is_encrypted(),
         "reopened QDF output must remain encrypted"
     );
     let root_ref = reopened.root_ref().expect("encrypted QDF output has /Root");
