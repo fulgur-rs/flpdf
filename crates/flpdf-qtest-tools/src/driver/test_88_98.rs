@@ -151,8 +151,9 @@ pub(crate) fn run_test_88<R: Read + Seek>(
     );
 
     // Test errors (test_driver.cc:3155-3159).
-    let root = pdf.root_handle()?;
+    let root_result = pdf.root_handle();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let root = root_result?;
     let arr2 = root.replace_key_and_get_new(b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
     arr2.set_object_description(pdf, "test array")?;
     assert!(arr2.erase_array_item_and_get_old(50)?.is_null());
@@ -448,11 +449,11 @@ pub(crate) fn run_test_92<R: Read + Seek>(
 /// the same underlying object.
 pub(crate) fn run_test_93<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // An indirect JSON/PDF value resolves through `Pdf::get_object_handle`'s
     // own canonical registry entry, so `root1`
@@ -460,7 +461,9 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     // `Rc` -- `is_same_object_as` needs no resolution to observe that.
     let trailer = pdf.trailer();
     let root1 = trailer.get_key(b"/Root");
-    let root2 = pdf.root_handle()?;
+    let root2_result = pdf.root_handle();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let root2 = root2_result?;
     assert!(root1.is_same_object_as(&root2));
 
     let oh1 = ObjectHandle::parse(b"<< /One /Two >>")?;
@@ -490,17 +493,19 @@ pub(crate) fn run_test_93<R: Read + Seek>(
 /// Exercise methods to get page boxes. Built for `boxes2.pdf`.
 pub(crate) fn run_test_94<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // qpdf 11.9.0 qpdf/test_driver.cc:3271-3371. The handle-returning
     // PageObjectHelper methods below preserve the same live identity and
     // copy-on-fallback semantics as qpdf; the numeric PageBox convenience
     // methods are intentionally not used here.
-    let root = pdf.root_handle()?;
+    let root_result = pdf.root_handle();
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let root = root_result?;
     let pages_root = resolved_key(pdf, &root, b"/Pages")?;
     let root_media = resolved_key(pdf, &pages_root, b"/MediaBox")?;
     let root_media_unparse = root_media.unparse();
@@ -957,7 +962,16 @@ mod tests {
             Error::System(message) if message == "unable to find /Root dictionary"
         ));
         assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: bad-root.pdf: file is damaged\n\
+              WARNING: bad-root.pdf: can't find startxref\n\
+              WARNING: bad-root.pdf: Attempting to reconstruct cross-reference table\n"
+                .to_vec(),
+            "the recovery warnings accumulated at open time (suppressed only from \
+             printing, not from `Pdf::repair_diagnostics`) must drain before the \
+             terminal root error propagates"
+        );
     }
 }
 
