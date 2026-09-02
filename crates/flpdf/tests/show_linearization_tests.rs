@@ -105,6 +105,29 @@ fn soft_linearization_warnings_are_returned_without_dropping_the_dump() {
     );
 }
 
+/// A hint dictionary's `/O` (Outlines Hint Table offset) is decoded through
+/// the same path as `/S` (Shared Objects). `objstm-lin-outlines-80-80`'s
+/// classic golden carries a real Outlines hint table (qpdf
+/// `--show-linearization` on this fixture prints an "Outlines Hint Table"
+/// section with `first_object: 4`), unlike the smaller one/two/three-page
+/// goldens used above, none of which have a catalog `/Outlines` entry.
+#[test]
+fn outlines_hint_table_decodes_from_a_fixture_that_has_one() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references/objstm-lin-outlines-80-80/linearize-classic.pdf");
+    let bytes = std::fs::read(&path).expect("read outlines golden");
+    let dump = show_linearization_bytes(&bytes, "FIXTURE")
+        .expect("a fixture with a real Outlines hint table must decode cleanly");
+    assert!(
+        dump.contains("Outlines Hint Table"),
+        "decoding a hint dict with /O must produce the Outlines Hint Table section: {dump}"
+    );
+    assert!(
+        dump.contains("first_object: 4"),
+        "the decoded outline table's first_object must match qpdf --show-linearization: {dump}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live qpdf byte-for-byte parity (gated on qpdf-zlib-compat so the CI image
 // that runs the gated suite is the one with qpdf 11.9.0 on PATH).

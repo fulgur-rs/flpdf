@@ -22,10 +22,12 @@
 
 use flpdf::{
     delete_embedded_file, insert_embedded_file, list_embedded_files, EmbeddedFileDocumentHelper,
-    EmbeddedFileStream, Error, FileSpec, ObjectHandle, ObjectRef, Pdf, LEAF_MAX,
+    EmbeddedFileStream, Error, FileSpec, ObjectHandle, ObjectRef, Pdf, Pipeline, Result,
+    StreamDataProvider, LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::rc::Rc;
 
 // ── PDF byte builder helpers ──────────────────────────────────────────────────
 
@@ -1871,4 +1873,41 @@ fn helper_replace_keeps_direct_filespec_handle_live() {
             .expect("description"),
         b"live"
     );
+}
+
+struct ConstantProvider(&'static [u8]);
+
+impl StreamDataProvider for ConstantProvider {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        pipeline.write(self.0).map_err(Error::from)?;
+        pipeline.finish().map_err(Error::from)
+    }
+}
+
+/// `EmbeddedFileStream::create_ef_stream_from_provider` -- qpdf's provider
+/// overload of `createEFStream` (`QPDFEFStreamObjectHelper.cc:102-107`) --
+/// had no caller anywhere in the crate or its tests. Exercise it directly
+/// and confirm the deferred provider's bytes reach the same finalization
+/// (`/Params /Size`, decoded payload) as the eager `create_ef_stream`.
+#[test]
+fn create_ef_stream_from_provider_finalizes_the_deferred_payload() {
+    let mut pdf = open(build_no_names_pdf());
+
+    let stream = EmbeddedFileStream::create_ef_stream_from_provider(
+        &mut pdf,
+        Rc::new(ConstantProvider(b"deferred payload")),
+    )
+    .expect("create_ef_stream_from_provider");
+
+    let wrapper = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+    assert_eq!(
+        wrapper.payload().expect("decode payload"),
+        b"deferred payload"
+    );
+    assert_eq!(wrapper.get_size().expect("computed /Params /Size"), 16);
 }

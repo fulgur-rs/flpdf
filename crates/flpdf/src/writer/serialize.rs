@@ -382,9 +382,7 @@ pub(crate) mod xref_stream {
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         for (key, value) in entries {
             if qdf {
-                // cov:ignore-start: QDF xref emission normally supplies canonical trailer entries
                 out.extend_from_slice(b"\n  ");
-                // cov:ignore-end
             } else {
                 out.push(b' ');
             }

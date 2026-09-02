@@ -891,9 +891,6 @@ fn show_with_pdf<R: Read + Seek>(
             let page_offset = read_h_page_offset(&decompressed, params.npages)?;
             let shared_object = read_h_shared_object(&decompressed[s_offset..])?;
             let outline = match outline_offset {
-                // cov:ignore-start: Outlines hint table — flpdf never emits /O on the
-                // hint dict and no fixture has one, so this arm is unreachable through
-                // flpdf's output (read_h_generic itself is unit-tested directly).
                 Some(off) => {
                     if off >= decompressed.len() {
                         return Err(ShowTablesError::QpdfDamage {
@@ -904,7 +901,6 @@ fn show_with_pdf<R: Read + Seek>(
                     }
                     Some(read_h_generic(&decompressed[off..])?)
                 }
-                // cov:ignore-end
                 None => None,
             };
 

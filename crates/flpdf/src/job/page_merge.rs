@@ -312,7 +312,7 @@ fn resolve_field_partial_name<R: Read + Seek>(
     let field_handle = source.get_object_handle(field_ref);
     let field = source.resolve_handle(&field_handle)?;
     if field.try_as_dictionary()?.is_none() {
-        return Ok(None); // cov:ignore: a top-level field ref always resolves to a dictionary
+        return Ok(None);
     }
     let t_value = field.try_get_key(b"/T")?;
     if t_value.is_null() {
@@ -447,7 +447,7 @@ fn field_kid_refs<R: Read + Seek>(
     let field_handle = source.get_object_handle(field_ref);
     let field = source.resolve_handle(&field_handle)?;
     if field.try_as_dictionary()?.is_none() {
-        return Ok(None); // cov:ignore: a field ref always resolves to a dictionary
+        return Ok(None);
     }
     let kids_value = field.try_get_key(b"/Kids")?;
     if kids_value.is_null() {
@@ -525,7 +525,7 @@ fn widget_page_ref<R: Read + Seek>(
     let widget_handle = source.get_object_handle(widget_ref);
     let widget = source.resolve_handle(&widget_handle)?;
     if widget.try_as_dictionary()?.is_none() {
-        return Ok(None); // cov:ignore: a widget ref always resolves to a dictionary
+        return Ok(None);
     }
     let p_value = widget.try_get_key(b"/P")?;
     if p_value.is_null() {
@@ -578,15 +578,13 @@ fn trim_field_kids<R: Read + Seek>(
     depth: usize,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<Option<Vec<ObjectRef>>> {
-    // cov:ignore-start: depth guard against a hostile >100-deep field tree (matches the acroform helper's depth caps); not driven by well-formed input
     if depth > DEFAULT_MAX_ACROFORM_DEPTH {
         return Err(Error::Unsupported(format!(
             "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
         )));
     }
-    // cov:ignore-end
     if !visited.insert(field_ref) {
-        return Ok(Some(Vec::new())); // cov:ignore: a /Kids cycle is malformed; treat as no survivors
+        return Ok(Some(Vec::new()));
     }
     let Some(kids) = field_kid_refs(source, field_ref)? else {
         return Ok(None); // terminal field — nothing to trim
@@ -604,7 +602,7 @@ fn trim_field_kids<R: Read + Seek>(
             orphan_pages,
             depth + 1,
             visited,
-        )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
+        )?;
         match kid_kind {
             // The kid is itself a non-terminal sub-field.
             Some(sub_survivors) => {
@@ -635,7 +633,7 @@ fn trim_field_kids<R: Read + Seek>(
                         Some(page_ref) => {
                             orphan_pages.insert(page_ref);
                         }
-                        None => {} // cov:ignore: a dropped widget that also omits /P carries no page to null
+                        None => {}
                     }
                 }
             }
@@ -1232,7 +1230,8 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 mod tests {
     use super::{
         collect_retained_widget_refs, discover_primary_acroform, field_kid_refs, merge_documents,
-        rewrite_field_kids, unique_field_name, widget_page_ref, MergeInput,
+        resolve_field_partial_name, rewrite_field_kids, trim_field_kids, unique_field_name,
+        widget_page_ref, MergeInput, DEFAULT_MAX_ACROFORM_DEPTH,
     };
     use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1598,6 +1597,150 @@ mod tests {
                 .expect("kids array")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn field_helpers_return_none_for_a_non_dictionary_reference() {
+        let mut source = Pdf::empty().expect("empty source");
+        let non_dict = source
+            .make_indirect_object_handle(ObjectHandle::integer(42))
+            .expect("non-dictionary indirect object");
+        let non_dict_ref = non_dict.object_ref().expect("non-dictionary ref");
+
+        assert_eq!(
+            resolve_field_partial_name(&mut source, non_dict_ref).unwrap(),
+            None,
+            "a field ref that resolves to a non-dictionary must yield no /T"
+        );
+        assert_eq!(
+            field_kid_refs(&mut source, non_dict_ref).unwrap(),
+            None,
+            "a field ref that resolves to a non-dictionary must yield no kids"
+        );
+        assert_eq!(
+            widget_page_ref(&mut source, non_dict_ref).unwrap(),
+            None,
+            "a widget ref that resolves to a non-dictionary must yield no page"
+        );
+    }
+
+    #[test]
+    fn trim_field_kids_propagates_the_depth_guard_through_recursion() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (4, "<< /Fields [5 0 R] >>"),
+                (5, "<< /FT /Tx /T (Parent) /Kids [6 0 R] >>"),
+                (6, "<< /FT /Tx /T (Child) >>"),
+            ],
+            1,
+        );
+        let mut source = Pdf::open_mem_owned(bytes).expect("open source");
+        let mut target = Pdf::empty().expect("empty target");
+        let mut orphan_pages = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+
+        // Starting at the cap itself so the single recursive step into the
+        // child (5's only /Kids entry) lands one level past it.
+        let err = trim_field_kids(
+            &mut source,
+            &mut target,
+            ObjectRef::new(5, 0),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut orphan_pages,
+            DEFAULT_MAX_ACROFORM_DEPTH,
+            &mut visited,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref message)
+                if message.contains("AcroForm field tree depth exceeds maximum")),
+            "recursing past the depth cap must surface the guard's error, not swallow it: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trim_field_kids_treats_a_kids_cycle_as_no_survivors() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (4, "<< /Fields [5 0 R] >>"),
+                (5, "<< /FT /Tx /T (Cyclic) /Kids [5 0 R] >>"),
+            ],
+            1,
+        );
+        let mut source = Pdf::open_mem_owned(bytes).expect("open source");
+        let mut target = Pdf::empty().expect("empty target");
+        let mut orphan_pages = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+
+        let survivors = trim_field_kids(
+            &mut source,
+            &mut target,
+            ObjectRef::new(5, 0),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut orphan_pages,
+            0,
+            &mut visited,
+        )
+        .expect("a self-referential /Kids must not hang or error");
+
+        assert_eq!(
+            survivors,
+            Some(Vec::new()),
+            "the cyclic re-entry must be treated as a childless sub-field, not retried"
+        );
+    }
+
+    #[test]
+    fn trim_field_kids_drops_a_dangling_widget_without_a_page_to_null() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (4, "<< /Fields [5 0 R] >>"),
+                (5, "<< /FT /Tx /T (Field) /Kids [6 0 R] >>"),
+                (6, "<< /Subtype /Widget >>"),
+            ],
+            1,
+        );
+        let mut source = Pdf::open_mem_owned(bytes).expect("open source");
+        let mut target = Pdf::empty().expect("empty target");
+        let mut orphan_pages = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+
+        let survivors = trim_field_kids(
+            &mut source,
+            &mut target,
+            ObjectRef::new(5, 0),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut orphan_pages,
+            0,
+            &mut visited,
+        )
+        .expect("trim must not error");
+
+        assert_eq!(
+            survivors,
+            Some(Vec::new()),
+            "a widget with no /P and no /Annots retention must not survive"
+        );
+        assert!(
+            orphan_pages.is_empty(),
+            "a /P-less dropped widget carries no page to null"
         );
     }
 }
