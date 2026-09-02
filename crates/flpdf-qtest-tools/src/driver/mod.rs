@@ -1364,7 +1364,7 @@ fn write_stderr_bytes(
 mod tests {
     use super::{
         crt_open_error_message, format_nntree_exception, has_interior_nul, open_error_bytes,
-        open_pdf_error_bytes, run, write_error_bytes, write_warning,
+        open_pdf_error_bytes, run, run_test_89_from_json, write_error_bytes, write_warning,
     };
     use flpdf::Diagnostic;
     use std::{
@@ -1723,5 +1723,68 @@ requested value of integer is too big; returning INT_MAX\n"
         assert!(stderr.is_empty());
         assert!(stdout.bytes.ends_with(b"unparseResolved: null\n"));
         stdout.flush().expect("flush footer writer");
+    }
+
+    fn complete_json_for_test_89() -> &'static [u8] {
+        br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {"value": {"/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": 0},
+      "obj:3 0 R": {"value": 0},
+      "obj:4 0 R": {"value": 0},
+      "obj:5 0 R": {"value": ["/NotADictionary"]},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 6}}
+    }
+  ]
+}"#
+    }
+
+    #[test]
+    fn json_test_89_open_failure_uses_the_qpdf_open_error_boundary() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let missing = directory.path().join("missing.json");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_test_89_from_json(missing.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+        assert!(stderr.starts_with(b"open "));
+    }
+
+    #[test]
+    fn json_test_89_create_failure_is_reported_before_body_dispatch() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("malformed.json");
+        std::fs::write(&input, b"not JSON").expect("write malformed JSON");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn json_test_89_footer_failure_is_reported_after_body_success() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("test-89.json");
+        std::fs::write(&input, complete_json_for_test_89()).expect("write JSON fixture");
+        let mut stdout = FooterFailure::default();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stderr.len() >= 4);
+        stdout.flush().expect("flush footer failure writer");
     }
 }
