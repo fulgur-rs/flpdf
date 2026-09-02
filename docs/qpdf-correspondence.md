@@ -1301,6 +1301,19 @@ warning と `test 17 done` の組合せになる。`run_test_17` は最初の
 排出する。Pinned qpdf と Rust driver は `page-api 5` で exit 0、stdout/stderrを
 結合した出力まで一致する。
 
+### `test_driver` test 69
+
+`qpdf/test_driver.cc:2388-2402` は `setImmediateCopyFrom(true)` の後に
+`getAllPages()` を呼び、各ページを新しいPDFへforeign copyして
+`auto-<i>.pdf`へ書き出す。`issue-449.pdf`ではページ修復が
+`object 3 0 at offset 139` と `object 4 0 at offset 211` の
+`MediaBox is undefined; setting to letter / ANSI A` warningをこの最初の
+page-list operationで記録し、`test 69 done`の前に2行を出力する。
+`run_test_69`はcanonical `PageDocumentHelper::get_all_pages()`直後に
+`emit_new_diagnostics`を一度だけ呼び、foreign copy/writerの実装順と警告順を
+分離する。Pinned qpdfとRust driverは `copy-foreign-objects 11` の
+stdout/stderr/exitを一致させる。
+
 ### `test_driver` test 81
 
 `qpdf/test_driver.cc:2807-2817` の ownerless `newNull().getIntValue()` は、
