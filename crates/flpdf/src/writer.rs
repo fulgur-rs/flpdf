@@ -1741,15 +1741,11 @@ pub(crate) fn effective_pdf_version<'a>(
         }
     }
     // Encryption floor matched — return a static string for the emitted version.
-    // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts;
-    // the `return` inside is exercised by
-    // effective_pdf_version_folds_each_encryption_floor_arm.
     if let Some(encryption_floor) = enc_floor {
         if encryption_floor == best {
             return best.static_version_str().unwrap_or("1.7");
-        }
+        } // cov:ignore: inner-if closing brace is an llvm-cov region artifact; the `return` above is exercised by the encrypt CLI byte-identical gates
     }
-    // cov:ignore-end
     // Object-stream floor "1.5" — reached when best == (1,5) and neither source
     // nor min_version nor encryption floor matched.
     if best == PDF_1_5 {
@@ -5263,7 +5259,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                             det_id_source_id0.as_deref(),
                         )
                     };
-                    // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
                     trailer.write_trailer_with_ref_map(
                         &mut bytes,
                         false,
@@ -5273,7 +5268,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         &skip_ref_set,
                         suppress_null_values,
                     )?;
-                    // cov:ignore-end
                 } else {
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
                     trailer.write_trailer_with_ref_map(

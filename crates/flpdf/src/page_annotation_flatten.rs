@@ -637,7 +637,7 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
     };
     let acroform = pdf.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
     if acroform.as_dictionary().is_none() {
-        return Ok(None); // cov:ignore: malformed AcroForm is ignored like qpdf
+        return Ok(None);
     }
     let resources = acroform.try_get_key(b"/DR")?;
     Ok((!resources.is_null()).then_some(resources))
@@ -717,7 +717,7 @@ fn resolve_matched_category_handles<R: Read + Seek>(
             default_resources.replace_key(&category, source_terminal.clone())?;
         }
         let Some(dest_value) = dest_entries.get(&category) else {
-            continue; // cov:ignore: qpdf's merge never inspects a destination-only category
+            continue;
         };
         let dest_was_indirect = dest_value.is_indirect();
         let dest_terminal = pdf.resolve_handle(dest_value)?;
@@ -790,11 +790,11 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         let mut annotation_object_helper =
             AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
         if annotation_object_helper.get_subtype()? != b"Widget" {
-            continue; // cov:ignore: non-widget annotations do not merge default resources
+            continue;
         }
         let appearance = annotation_object_helper.get_appearance_stream(b"N", None)?;
         if appearance.is_null() {
-            continue; // cov:ignore: widget without selected appearance has no merge target
+            continue;
         }
         if !field_annotation_ids.contains(&annotation.identity_key()) {
             // qpdf still obtains the appearance stream before asking the null
@@ -839,7 +839,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
             resources
         };
         if resources.as_dictionary().is_none() {
-            continue; // cov:ignore: malformed appearance resources are ignored
+            continue;
         }
         // Lazy: qpdf only ever reads /DR from inside this same per-widget
         // merge path (see acroform_default_resources's doc), so resolving

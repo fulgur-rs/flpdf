@@ -57,7 +57,7 @@ pub(crate) fn push<R: Read + Seek>(
                 &mut visited,
                 allow_changes,
                 warn_skipped_keys,
-            )? // cov:ignore: direct-root integration tests exercise this generic dispatch; llvm maps its counter to the callee
+            )? // cov:ignore: llvm-cov attributes this covered multi-line DirectCatalog branch terminator to the call setup
         }
     }
     debug_assert!(
@@ -557,5 +557,28 @@ mod tests {
 
         assert!(matches!(error, Error::Unsupported(ref message)
                 if message.contains("page tree depth exceeds maximum")));
+    }
+
+    /// `direct-root-adbe.pdf`'s trailer `/Root` is an inline Catalog dict
+    /// whose `/Pages` is also inline, so `prepare_for_optimization` selects
+    /// `PageTreeRoot::DirectCatalog` — the one `push()` dispatch arm that had
+    /// no covering test (unlike `PageTreeRoot::Indirect` above and
+    /// `PageTreeRoot::Direct`, exercised through `direct_root_writer_tests.rs`).
+    #[test]
+    fn direct_catalog_root_dispatches_through_push_direct_root() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-root-adbe.pdf");
+        let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists"))
+            .expect("fixture opens");
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .expect("prepare_for_optimization")
+            .expect("page tree resolves");
+        assert!(
+            matches!(prepared.root, PageTreeRoot::DirectCatalog),
+            "fixture must select the DirectCatalog dispatch arm: {:?}",
+            prepared.root
+        );
+
+        push(&mut pdf, &prepared, true, false).expect("push over a direct Catalog root");
     }
 }

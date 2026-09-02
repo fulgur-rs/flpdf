@@ -361,7 +361,11 @@ where
         let mut source_page = PageObjectHelper::new(page_ref, source);
         let source_form = source_page.get_form_xobject_for_page(true)?;
         let imported = dest.copy_foreign_object(&source_form)?;
-        // cov:ignore-start: copy_foreign_object always returns an indirect destination object; this is an invariant guard for a malformed allocator result.
+        // cov:ignore-start: `copy_foreign_object` only returns a non-indirect
+        // handle when the source it copies is the source document's own
+        // `/Pages` boundary node (object_copy.rs); `source_form` here is
+        // always a per-page Form XObject wrapper synthesized by
+        // `get_form_xobject_for_page`, which can never be that node.
         imported_xobject_refs.push(imported.object_ref().ok_or_else(|| {
             Error::Unsupported("imported Form XObject is not indirect".to_string())
         })?);
@@ -864,9 +868,10 @@ fn overlay_page_handle<R: Read + Seek>(
 // orthogonal source version-floor limitation does not perturb the bytes.
 //
 // Source version-floor + Adobe extension_level propagation (pure header
-// bump AND AES-256 /Extensions/ADBE injection) is now covered here by
-// `overlay_pure_source_version_floor_bytes` and
-// `overlay_encrypted_source_extension_level_bytes` (below).
+// bump AND AES-256 /Extensions/ADBE injection) is covered by
+// `overlay_bumps_header_from_non_encrypted_higher_version_source` and
+// `overlay_bumps_header_and_injects_adbe_from_encrypted_source` in
+// `crates/flpdf-cli/tests/cli_overlay.rs`.
 //
 // CLI-level overlay byte-identity coverage lives in
 // `crates/flpdf-cli/tests/cli_byte_identical_overlay.rs` (gated on

@@ -2278,7 +2278,7 @@ impl QPDFJob {
             self.logger.error(format!(
                 "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
                 self.message_prefix
-            ))?; // cov:ignore: custom error-sink failure is an injected logger edge; the warning emission path is covered by the differential CLI test
+            ))?;
         }
         writer_configuration.set_linearization(self.configuration.linearize);
         if let Some(path) = self.configuration.linearize_pass1.as_deref() {
