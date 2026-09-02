@@ -81,6 +81,34 @@ fn malformed_recovery_pdf() -> Vec<u8> {
     pdf
 }
 
+fn complete_json_for_test_89() -> &'static str {
+    r#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {"value": {"/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": 0},
+      "obj:3 0 R": {"value": 0},
+      "obj:4 0 R": {"value": 0},
+      "obj:5 0 R": {"value": ["/NotADictionary"]},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 6}}
+    }
+  ]
+}"#
+}
+
+fn partial_json_for_test_90() -> &'static str {
+    r#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {
+      "obj:7 0 R": {"value": {"/strings": []}},
+      "trailer": {"value": {"/QTest": "7 0 R"}}
+    }
+  ]
+}"#
+}
+
 const TEST_0_OUTPUT: &str = concat!(
     "/QTest is implicit\n",
     "/QTest is direct and has type null (2)\n",
@@ -156,6 +184,50 @@ fn malformed_pdf_error_precedes_unsupported_test_lookup() {
         .code(2)
         .stdout("")
         .stderr(expected);
+}
+
+#[test]
+fn test_89_accepts_complete_json_input_and_emits_the_mutation_warnings() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test-89.json");
+    fs::write(&input, complete_json_for_test_89()).expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["89", input])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 89");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"test 89 done\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("operation for ").count(), 4);
+}
+
+#[test]
+fn test_90_applies_the_json_update_before_type_mismatch_mutations() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test-90.json");
+    fs::write(&input, partial_json_for_test_90()).expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["90", minimal_pdf(), input])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 90");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"test 90 done\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("operation for array attempted on object of type dictionary")
+            .count(),
+        2
+    );
+    assert!(stderr.contains("operation for integer attempted on object of type array"));
 }
 
 #[test]

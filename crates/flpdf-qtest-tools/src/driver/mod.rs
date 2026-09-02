@@ -49,25 +49,15 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         Ok(n) => n,
         Err(error) => return write_error_bytes(stdout, stderr, &error),
     };
-    // qpdf's test 89 builds `pdf` from a JSON export via
-    // QPDF::createFromJSON(filename1) (test_driver.cc:3522-3523) instead of
-    // parsing a PDF at all -- filename1 is a .json file for this test
-    // number, so the ordinary open path below cannot be used.
-    // GAP(QPDF::createFromJSON): flpdf has no constructor for building a Pdf
-    // from a QPDF JSON export (`document_json.rs`'s own module doc: the
-    // input side "has no counterpart here"). `test_88_98::run_test_89`
-    // exists, assuming an already-open `pdf`, for when this primitive
-    // lands.
-    if n == 89 {
-        return write_error(
-            stdout,
-            stderr,
-            "test 89 requires QPDF::createFromJSON, which is not implemented in flpdf",
-        );
-    }
-
     let filename = args[2].as_os_str();
     let arg2 = args.get(3).map(OsString::as_os_str);
+
+    // qpdf's test 89 calls QPDF::createFromJSON(filename1) instead of
+    // opening filename1 as a PDF (`test_driver.cc:3522-3523`). Keep that
+    // document-construction boundary before the ordinary PDF input path.
+    if n == 89 {
+        return run_test_89_from_json(filename, stdout, stderr);
+    }
 
     // qpdf's runtest() (test_driver.cc:3463-3538) picks how to load
     // filename1 based on n:
@@ -82,7 +72,6 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     //    opens its own file(s) via arg2 where relevant) instead. The empty
     //    Pdf used below is the Rust equivalent of qpdf's default-constructed
     //    QPDF for these tests; it must be created without touching filename1.
-    //  - n==89: QPDF::createFromJSON -- handled above, before this point.
     //  - everything else: read filename1 into memory. qpdf's n%2/n%4
     //    branching there (processFile(name) vs processFile(FILE*) vs
     //    processMemoryFile) only selects which overload to exercise for its
@@ -969,6 +958,50 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     // ordinary driver footer is not appended to the binary comparison stream
     // (`qpdf/test_driver.cc:368-372`).
     if n != 4 && writeln!(stdout, "test {n} done").is_err() {
+        return 2;
+    }
+    0
+}
+
+/// Run qpdf's JSON-input-only test 89 without constructing an intermediate PDF
+/// from the filename. The complete JSON document boundary returns the same
+/// live handle graph that the ordinary driver dispatch consumes.
+fn run_test_89_from_json(filename: &OsStr, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let filename_diagnostic = os_str_diagnostic_bytes(filename);
+    let source = match std::fs::File::open(filename) {
+        Ok(source) => std::io::BufReader::new(source),
+        Err(error) => {
+            return write_error_bytes(
+                stdout,
+                stderr,
+                &open_error_bytes(&filename_diagnostic, None, &error),
+            );
+        }
+    };
+    let input_name = String::from_utf8_lossy(filename_diagnostic.as_ref()).into_owned();
+    let mut pdf = match Pdf::create_from_json_with_options(
+        source,
+        input_name,
+        PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(pdf) => pdf,
+        Err(error) => return write_error(stdout, stderr, &error.to_string()),
+    };
+    let mut diagnostics_written = 0;
+    if let Err(error) = test_88_98::run_test_89(
+        &mut pdf,
+        &filename_diagnostic,
+        None,
+        stdout,
+        stderr,
+        &mut diagnostics_written,
+    ) {
+        return write_error(stdout, stderr, &error.to_string());
+    }
+    if writeln!(stdout, "test 89 done").is_err() {
         return 2;
     }
     0

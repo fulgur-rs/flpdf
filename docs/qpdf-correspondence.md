@@ -603,6 +603,12 @@ qpdfのwarn()コールバックはwrite()実行中も同期的に出力するた
 | `QPDFObjectHandle::getJSON` / `QPDFObjectHandle::writeJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::get_json` / `ObjectHandle::write_json`（`QPDFObjectHandle.cc:1613-1647` の外側 dispatch と `qpdf/JSON_writer.hh:16-135` の pipeline 境界）、`json_inspect.rs` の `pdf_object_to_json`（getJSON false の consumer） | 🔀 canonical ObjectHandle writer は移送済み。`false` は間接 identity を先に検査して `"N G R"` を出力し、array/dictionary child は非再帰の reference dispatch、stream は `QPDF_Stream::writeJSON` と同じく dictionary のみを出力する。`true` の一段解決 primitive も writer に実装済みで、document-level `QPDF::writeJSON` の object-map は `flpdf-25kg.3.37` で cutover 済み。`.3` では `json_inspect.rs::qpdf_resolve_top_level_object` と historical stream payload が canonical handle を直接返す。`ordered_qpdf_*` は本番 bridge ではなく、既存の pipeline-write 境界テスト専用で保持する |
 | `QPDF_Stream::writeStreamJSON`（行数は §1 の `QPDF_Stream.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::write_stream_json`（`QPDF_Stream.cc:207-295` の mode validation、`no_data_key`、二重試行、dict normalization、payload routing、effective decode level） + `document_json.rs` の object-map framing / side-file ownership。`json_inspect.rs` の `stream_payload_with_decode_status` は既存の公開 raw-payload helper とテスト oracle に限定 | ✅ `flpdf-3yn9.9` で qpdf の 1 関数責務へ統合。旧 `Object/Stream` payload/dict bridge は本番経路から外し、`QPDF_json.cc:917-925` 相当の consumer は canonical handle を呼ぶ。非 file entry は既存 flpdf の変換失敗時接頭辞を保つため canonical 結果を先に buffer 化する |
 
+`qpdf/test_driver.cc:3162-3185` の test 89/90 は、qpdf JSON入力境界の下流consumerとして
+`Pdf::create_from_json_file` / `Pdf::update_from_json_file` とlive ObjectHandle mutationへ
+接続済みである。test 89はfilenameをPDFとして開かずrootless JSON documentを作成し、test 90は
+通常PDFへpartial updateを適用する。各type-mismatch warningはqpdfの発生順にdrainされ、
+qpdf-json比較行111/112の同一run結果を `harness.log` と `qtest-results.xml` の両方で確認する。
+
 ### `flpdf-25kg.3.37` bounded consumer cutover (2026-08-15)
 
 `document_json.rs` の object-map enumeration は `Pdf::get_all_objects()` に、通常の

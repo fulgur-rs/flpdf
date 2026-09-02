@@ -12,14 +12,12 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::json_inspect::{DecodeLevel, StreamDataMode};
-#[cfg(test)]
-use flpdf::ObjectRef;
 use flpdf::{
-    document_json, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, Pipeline,
-    PipelineError, PipelineResult,
+    document_json, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf,
+    Pipeline, PipelineError, PipelineResult,
 };
 
-use super::emit_new_diagnostics;
+use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -168,17 +166,10 @@ pub(crate) fn run_test_88<R: Read + Seek>(
 // test_89 (test_driver.cc:3162-3172)
 // ---------------------------------------------------------------------------
 
-/// Generate object warnings via type-mismatched mutations. Crafted to work
-/// with `manual-qpdf-json.json` -- object 5 is not assumed to genuinely be
-/// a dictionary/array at either mutation site below, matching qpdf's own
-/// point of exercising the mismatch-warning path.
-///
-/// Not wired into `driver::run`'s dispatch: qpdf builds test 89's `pdf` via
-/// `QPDF::createFromJSON`, which has no flpdf equivalent (`driver::run`
-/// short-circuits `n == 89` before it would ever reach a dispatch call).
-/// The body remains available to the unit test below so its covered mutation
-/// behavior stays explicit without adding an unreachable production entry.
-#[cfg(test)]
+/// Generate object warnings via type-mismatched mutations after qpdf's
+/// `QPDF::createFromJSON` document construction (`qpdf/test_driver.cc:3162-3172`).
+/// The caller supplies the newly-created live JSON document, so all mutation
+/// and warning operations remain on the canonical ObjectHandle graph.
 pub(crate) fn run_test_89<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
@@ -213,21 +204,14 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     let object5 = object5_ref.clone();
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     object5.replace_key(b"/X", null.clone())?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    // GAP(QPDFObjectHandle::getArrayItem): no public flpdf accessor reads a
-    // single array item by index with qpdf's own dereference-then-
-    // `typeWarning("array", ...)`-on-mismatch contract; `ObjectHandle::as_array`
-    // never dereferences and never warns on a type mismatch (its own doc:
-    // "never performs resolution itself"). Re-resolving `object5` above
-    // covers the dereference half; the read below substitutes
-    // `as_array().first()` for the index read itself, but a genuinely
-    // non-array object 5 here falls back to a direct null instead of also
-    // raising qpdf's warning the way the three mutations above do.
-    let item0 = object5
-        .as_array()
-        .and_then(|items| items.first().cloned())
-        .unwrap_or_else(ObjectHandle::null);
+    // qpdf's getArrayItem(0) dereferences the receiver and uses its warning
+    // boundary on a non-array or invalid index. The canonical signed-index
+    // accessor has the same contract and returns the live child handle.
+    let item0 = object5.try_get_array_item(0)?;
     item0.replace_key(b"/X", null)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 
@@ -238,24 +222,37 @@ pub(crate) fn run_test_89<R: Read + Seek>(
 /// Generate an object warning via `QPDF::updateFromJSON`. Crafted to work
 /// with `good13.pdf` and `various-updates.json` (the JSON file is `arg2`).
 pub(crate) fn run_test_90<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
     arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let _ = arg2;
-    // GAP(QPDF::updateFromJSON): test_90's entire body
-    // (test_driver.cc:3179-3184) opens with `pdf.updateFromJSON(arg2)`,
-    // applying a qpdf-JSON-v2 update document (`arg2` is its path) to the
-    // live object graph. flpdf has no JSON-update entry point anywhere in
-    // `crates/flpdf/src/` -- `document_json.rs`'s own module doc states
-    // plainly: "the input side (JSONReactor, createFromJSON,
-    // updateFromJSON, importJSON) has no counterpart here" -- so nothing in
-    // this body, including the two unconditional trailer mutations and the
-    // `/QTest/strings` integer read that follow the JSON update in qpdf's
-    // own source, can be attempted.
+    let arg2 = arg2.expect("test 90 requires an update JSON filename");
+    let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
+    pdf.update_from_json_file(std::path::Path::new(arg2))?;
+
+    // Keep the update source as the diagnostic name for mutations whose live
+    // values were installed by JSON; qpdf's final root mutation belongs to
+    // the original PDF and uses filename instead.
+    let null = ObjectHandle::null();
+    let trailer = pdf.trailer();
+    trailer.append_array_item(null.clone())?;
+    emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+
+    let qtest = resolved_key(pdf, &trailer, b"/QTest")?;
+    qtest.append_array_item(null.clone())?;
+    emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+
+    let strings = resolved_key(pdf, &qtest, b"/strings")?;
+    strings.try_get_int_value()?;
+    emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+
+    let root = root_handle(pdf);
+    pdf.resolve(&root)?;
+    root.append_array_item(null)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 
