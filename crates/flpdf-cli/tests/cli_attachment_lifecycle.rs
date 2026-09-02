@@ -907,7 +907,7 @@ fn listing_reports_documents_with_no_embedded_files() {
     assert!(out.status.success(), "listing must exit 0");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("{} has no embedded files\n", input.path().display()),
+        format!("{} has no embedded files{EOL}", input.path().display()),
         "qpdf names the input file when there is no /Names /EmbeddedFiles tree",
     );
 
