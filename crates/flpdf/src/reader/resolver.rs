@@ -1373,6 +1373,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(target)
     }
 
+    /// Swap two canonical object values while retaining their object
+    /// generations and every outstanding handle identity.
+    ///
+    /// This is qpdf's `QPDF::swapObjects` (`libqpdf/QPDF.cc:2279-2289`):
+    /// both cache entries are resolved before `QPDFObject::swapWith` exchanges
+    /// their value allocations. Unknown object generations therefore resolve
+    /// to qpdf's ordinary null object before the swap.
+    pub(crate) fn swap_objects(&self, first: ObjectRef, second: ObjectRef) -> Result<()> {
+        let first_handle = self.get_object_handle(first);
+        let second_handle = self.get_object_handle(second);
+        first_handle.try_dereference()?;
+        second_handle.try_dereference()?;
+        first_handle.swap_value_state_with(&second_handle);
+        Ok(())
+    }
+
     /// Remove an object from the canonical xref/cache view and leave any
     /// outstanding handle as a floating null value.
     ///
