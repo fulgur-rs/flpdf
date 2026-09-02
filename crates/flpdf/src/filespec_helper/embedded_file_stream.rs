@@ -66,7 +66,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             provider,
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        )?; // cov:ignore: Pdf::new_stream guarantees a stream handle here
+        )?; // cov:ignore: exercised by create_ef_stream_from_provider_finalizes_the_deferred_payload; llvm-cov attributes the successful multiline call to its argument lines, not this terminator
         Self::new_from_stream(pdf, stream)
     }
 
