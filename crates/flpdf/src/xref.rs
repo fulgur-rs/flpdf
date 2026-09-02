@@ -584,7 +584,7 @@ impl BootstrapHandleDocument {
             && match &narrow {
                 Err(Error::Parse { .. }) => true,
                 Ok(read) => read.used_heuristic_recovery,
-                Err(_) => false,
+                Err(_) => false, // cov:ignore: the only non-Parse error this attempt can return is the already-defensive "did not produce a direct value" Internal error below, which the parser's own contract makes unreachable
             };
         let accepted = if should_retry {
             self.read_uncompressed_object_with_end(
@@ -4001,13 +4001,13 @@ mod final_handle_tests {
 
         let mut collected = Diagnostics::default();
         context.append_diagnostics_to(&mut collected);
+        // The wider window resolves the declared 40-byte /Length exactly, so
+        // a single unbounded qpdf-style read would produce no diagnostics at
+        // all here. Any entry at all would mean the discarded narrow
+        // attempt's "expected endstream"/"attempting to recover stream
+        // length" warnings leaked through instead of being dropped with it.
         assert!(
-            collected.entries().iter().all(|diagnostic| {
-                !diagnostic
-                    .message
-                    .contains("attempting to recover stream length")
-                    && !diagnostic.message.contains("expected endstream")
-            }),
+            collected.entries().is_empty(),
             "the discarded narrow attempt's recovery diagnostics must not leak \
              once the wider retry recovers the stream cleanly: {collected:?}"
         );
