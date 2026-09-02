@@ -553,6 +553,38 @@ fn job_json_file_encryption_status_matches_qpdf() {
 }
 
 #[test]
+fn job_json_file_empty_encryption_status_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    for option in ["isEncrypted", "requiresPassword"] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("job.json"),
+            format!(r#"{{"empty":"","{option}":""}}"#),
+        )
+        .unwrap();
+
+        let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg("--job-json-file=job.json")
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), Some(2), "qpdf probe: {qpdf:?}");
+        assert_eq!(flpdf.status.code(), Some(2), "flpdf probe: {flpdf:?}");
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
+}
+
+#[test]
 fn job_json_file_show_encryption_honors_raw_key_and_key_output() {
     if !qpdf_available() {
         return;

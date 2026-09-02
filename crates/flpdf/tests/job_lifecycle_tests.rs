@@ -316,6 +316,21 @@ fn json_job_empty_input_uses_the_job_document_boundary() {
 }
 
 #[test]
+fn json_job_empty_encryption_status_returns_qpdf_exit_code() {
+    for option in ["isEncrypted", "requiresPassword"] {
+        let json = serde_json::json!({
+            "empty": "",
+            option: ""
+        })
+        .to_string();
+        let mut job = QPDFJob::new();
+        job.initialize_from_json(&json).unwrap();
+
+        assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    }
+}
+
+#[test]
 fn argv_job_run_returns_warning_status_for_repairable_input() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/test_driver/repairable_input.pdf");

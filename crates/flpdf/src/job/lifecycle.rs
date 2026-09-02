@@ -2480,6 +2480,14 @@ impl QPDFJob {
 
     fn run_encryption_status(&mut self) -> Result<JobExitCode> {
         self.check_configuration()?;
+        // qpdf's `createQPDF` still creates an empty document for `--empty`
+        // before the encryption-status early return (`QPDFJob.cc:429-456,
+        // 1699-1708`). An empty document is necessarily unencrypted, so both
+        // `isEncrypted` and `requiresPassword` return EXIT_IS_NOT_ENCRYPTED
+        // (2) without attempting to open an input file.
+        if self.configuration.empty_input {
+            return Ok(JobExitCode::Error);
+        }
         let Some(input) = self.configuration.input_file.clone() else {
             // cov:ignore-start: `check_configuration` rejects status queries without an input before this defensive guard
             return Err(UsageError::new("an input file name is required").into());
