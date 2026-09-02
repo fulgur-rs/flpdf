@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
-use flpdf::{Error, ObjectHandle, Pdf};
+use flpdf::{job::QPDFJob, Error, ObjectHandle, Pdf};
 
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
 /// `QPDFAcroFormDocumentHelper::transformAnnotations` (transform the main
@@ -100,20 +100,24 @@ pub(crate) fn run_test_82<R: Read + Seek>(
 pub(crate) fn run_test_83<R: Read + Seek>(
     _pdf: &mut Pdf<R>,
     _filename: &[u8],
-    _arg2: Option<&OsStr>,
+    arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
+    stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
+    let path = arg2
+        .map(std::path::Path::new)
+        .ok_or_else(|| Error::Internal("test 83 requires a job JSON path".to_owned()))?;
+    let bytes = std::fs::read(path).map_err(Error::from)?;
+    let json = String::from_utf8(bytes).map_err(|error| Error::System(error.to_string()))?;
+
     writeln!(stdout, "calling initializeFromJson")?;
-    // GAP(QPDFJob::initializeFromJson): flpdf's `job` module
-    // (crates/flpdf/src/job/mod.rs) exposes only `write_json` (the
-    // `QPDFJob::writeJSON` output-selection slice); there is no port --
-    // public or private -- of QPDFJob's job-config *input* parsing
-    // (`initializeFromJson`/its `Config` builder), so the remainder of this
-    // test (parsing `arg2`'s contents as a job-config JSON document and
-    // reporting "called initializeFromJson" or a caught usage/exception
-    // message) cannot be reproduced.
+    let mut job = QPDFJob::new();
+    match job.initialize_from_json(&json) {
+        Ok(()) => writeln!(stdout, "called initializeFromJson")?,
+        Err(Error::Usage(error)) => writeln!(stderr, "usage: {error}")?,
+        Err(error) => writeln!(stderr, "exception: {error}")?,
+    }
     Ok(())
 }
 

@@ -492,6 +492,55 @@ fn test_53_flushes_repair_diagnostics_before_object_output() {
 }
 
 #[test]
+fn test_83_initializes_a_complete_json_job() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("job.json");
+    fs::write(
+        &json,
+        br#"{
+  "inputFile": "minimal.pdf",
+  "outputFile": "a.pdf"
+}"#,
+    )
+    .expect("write job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("calling initializeFromJson\ncalled initializeFromJson\ntest 83 done\n")
+        .stderr("");
+}
+
+#[test]
+fn test_83_reports_non_partial_json_configuration_usage() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("job-partial.json");
+    fs::write(
+        &json,
+        br#"{
+  "encrypt": {
+    "userPassword": "",
+    "ownerPassword": "",
+    "256bit": {}
+  }
+}"#,
+    )
+    .expect("write partial job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("calling initializeFromJson\ntest 83 done\n")
+        .stderr("usage: an input file name is required\n");
+}
+
+#[test]
 fn test_60_completes_all_resource_merges_and_writes_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 
