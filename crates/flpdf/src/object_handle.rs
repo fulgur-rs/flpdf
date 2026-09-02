@@ -4011,16 +4011,17 @@ impl ObjectHandle {
     /// document than the dictionary receiver, matching [`Self::replace_key`]'s
     /// ownership boundary.
     pub(crate) fn restore_key_raw(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
-        // cov:ignore-start: `restore_catalog_extensions` is this method's
-        // only caller and always invokes it on an already-resolved Catalog
-        // dictionary, so the non-dictionary guard below is defensive, not
-        // reachable from that call site.
+        // cov:ignore-start: both callers (`restore_catalog_extensions` and
+        // `emit_canonical_pdf`'s direct-root path, writer.rs) invoke this
+        // only on a handle already confirmed to be a dictionary via
+        // `try_as_dictionary()`, so the non-dictionary guard below is
+        // defensive, not reachable from either call site.
         if !self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
             return Ok(());
         }
         // cov:ignore-end
         self.check_key_value_ownership(&value)?;
-        // cov:ignore-start: the same caller only ever restores a snapshot
+        // cov:ignore-start: both callers only ever restore a snapshot
         // captured from this very dictionary's own child, which can never be
         // a direct alias of the dictionary itself.
         if self.is_direct_value_alias(&value) {
@@ -4503,16 +4504,16 @@ impl ObjectHandle {
             .iter()
             .any(|item| self.would_create_direct_cycle(item))
         {
-            return false; // cov:ignore: internal callers only replay materialized child arrays
+            return false;
         }
         let old_items = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(current_items)) = current else {
-                return None; // cov:ignore: internal callers confirm the array type first
+                return None;
             };
             Some(std::mem::replace(current_items, items.clone()))
         });
         let Some(old_items) = old_items else {
-            return false; // cov:ignore: internal callers confirm the array type first
+            return false;
         };
         for item in old_items {
             self.detach_child_from_state_owners(&item);
@@ -15567,6 +15568,11 @@ mod mutation_tests {
 
         assert!(!target.replace_array_items(vec![replacement.clone()]));
         assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(3));
+    }
+
+    #[test]
+    fn replace_array_items_rejects_a_non_array_handle() {
+        assert!(!ObjectHandle::integer(1).replace_array_items(vec![ObjectHandle::integer(2)]));
     }
 
     #[test]

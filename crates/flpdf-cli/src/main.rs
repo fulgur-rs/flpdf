@@ -2763,9 +2763,7 @@ fn main() {
             // exit-2 path passes an empty message because the error diagnostics
             // were already printed in qpdf shape).
             if !exit_err.message.is_empty() {
-                // cov:ignore-start: no production CliExitError currently carries a non-empty message
                 emit_logger_error(format!("\n{}: {}\n", progname(), exit_err.message));
-                // cov:ignore-end
             }
             std::process::exit(exit_err.code.as_i32());
         }

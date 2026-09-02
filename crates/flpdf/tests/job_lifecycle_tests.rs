@@ -1329,6 +1329,59 @@ fn show_linearization_propagates_custom_warning_sink_failure() {
     ));
 }
 
+/// `write_qpdf` emits the "supplied password looks like a Unicode password"
+/// warning through the custom *error* sink (qpdf's `--password-mode=auto`
+/// warning, `QPDF_encryption.cc`), not the warning sink used by the tests
+/// above. This pins that its `?` propagates a custom error-sink failure the
+/// same way.
+#[test]
+fn write_qpdf_propagates_custom_error_sink_failure_for_auto_password_warning() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.pdf");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+    let output = directory.path().join("output.pdf");
+
+    let logger = QPDFLogger::create();
+    logger.set_info(Some(logger.discard()));
+    logger.set_warn(Some(logger.discard()));
+    logger.set_error(Some(PipelineHandle::new(FailingSink)));
+
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "passwordMode": "auto",
+        "encrypt": {
+            "userPassword": "😀",
+            "ownerPassword": "owner",
+            "128bit": {"useAes": "y"}
+        }
+    })
+    .to_string();
+    job.initialize_from_json_partial(&json).unwrap();
+
+    let mut pdf = job
+        .open(
+            BufReader::new(File::open(&input).unwrap()),
+            input.display().to_string(),
+            PdfOpenOptions::default(),
+        )
+        .unwrap();
+
+    let error = job
+        .write_qpdf(&mut pdf)
+        .expect_err("custom error sink failure must propagate");
+    assert!(matches!(
+        error,
+        Error::System(message) if message == "warning sink failed"
+    ));
+}
+
 #[test]
 fn document_repair_warnings_feed_the_shared_completion_state() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

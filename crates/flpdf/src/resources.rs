@@ -284,7 +284,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             if let Some(resources) = resources.as_ref() {
                 pending.extend(form_xobjects_in_resources(pdf, resources)?);
             } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
-            continue; // cov:ignore: malformed Form regression exercises this path; llvm maps the parser failure to collect_used_names_for_form
+            continue;
         };
         let local_unresolved = unresolved_resource_names(resources.as_ref(), &used)?;
         unresolved.extend(local_unresolved.iter().cloned());
@@ -402,7 +402,7 @@ fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
         record_direct_names(&mut used, finder.names_by_resource_type(), true);
         Some(used)
     } else {
-        None // cov:ignore: unit regression asserts malformed Form streams return None
+        None
     }
 }
 
@@ -556,5 +556,113 @@ mod final_handle_tests {
                 .expect("form resource prepass");
         assert!(unresolved.is_empty());
         assert!(!failures);
+    }
+
+    #[test]
+    fn collect_used_names_for_form_returns_none_for_malformed_content() {
+        assert!(super::collect_used_names_for_form(b"<0g>").is_none());
+    }
+
+    /// Build a page whose single declared Form XObject is malformed (either
+    /// undecodable or unparseable, per `outer_stream`/`outer_filter`) but
+    /// still declares a nested child Form. `remove_unreferenced_resources_in_form_xobjects`
+    /// must record the failure and keep walking into that child rather than
+    /// aborting — the child's own content references a resource name absent
+    /// from its own `/Resources`, so seeing that name surface in the
+    /// returned unresolved set is an externally observable proof the walk
+    /// descended past the malformed parent.
+    fn page_with_malformed_form_and_child(
+        outer_stream: &[u8],
+        outer_filter: Option<&[u8]>,
+    ) -> (Pdf<std::io::Cursor<Vec<u8>>>, crate::ObjectRef) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
+        let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists"))
+            .expect("fixture opens");
+        let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
+        let page_handle = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page_handle).expect("page resolves");
+        let replacement = page_handle.shallow_copy().expect("page is copyable");
+
+        let child_form = pdf
+            .new_stream_with_data(Rc::new(b"/Ghost Do".to_vec()))
+            .expect("child form stream");
+        let child_dict = child_form.as_stream_dict().expect("child form dictionary");
+        child_dict
+            .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+            .expect("child form type");
+        child_dict
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+            .expect("child form subtype");
+        child_dict
+            .replace_key(b"/Resources", ObjectHandle::dictionary(vec![]))
+            .expect("child form resources");
+
+        let outer_form = pdf
+            .new_stream_with_data(Rc::new(outer_stream.to_vec()))
+            .expect("outer form stream");
+        let outer_dict = outer_form.as_stream_dict().expect("outer form dictionary");
+        outer_dict
+            .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+            .expect("outer form type");
+        outer_dict
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+            .expect("outer form subtype");
+        if let Some(filter) = outer_filter {
+            outer_dict
+                .replace_key(b"/Filter", ObjectHandle::name(filter.to_vec()))
+                .expect("outer form filter");
+        }
+        outer_dict
+            .replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(
+                    b"/XObject".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/FmChild".to_vec(), child_form)]),
+                )]),
+            )
+            .expect("outer form resources");
+
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Fm0".to_vec(), outer_form)]),
+        )]);
+        replacement
+            .replace_key(b"/Resources", resources)
+            .expect("page resources");
+        pdf.replace_object(page_ref, replacement)
+            .expect("replace page");
+        (pdf, page_ref)
+    }
+
+    #[test]
+    fn form_walk_continues_into_declared_children_after_a_decode_failure() {
+        let (mut pdf, page_ref) =
+            page_with_malformed_form_and_child(b"not-flate", Some(b"FlateDecode"));
+
+        let (unresolved, failures) =
+            remove_unreferenced_resources_in_form_xobjects(&mut pdf, page_ref)
+                .expect("form resource prepass tolerates an undecodable Form");
+        assert!(failures, "the undecodable outer Form must set any_failures");
+        assert!(
+            unresolved.contains(b"Ghost".as_slice()),
+            "the child Form's own unresolved /Ghost use must surface, proving \
+             the walk descended past the undecodable parent: {unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn form_walk_continues_into_declared_children_after_a_parse_failure() {
+        let (mut pdf, page_ref) = page_with_malformed_form_and_child(b"<0g>", None);
+
+        let (unresolved, failures) =
+            remove_unreferenced_resources_in_form_xobjects(&mut pdf, page_ref)
+                .expect("form resource prepass tolerates an unparseable Form");
+        assert!(failures, "the unparseable outer Form must set any_failures");
+        assert!(
+            unresolved.contains(b"Ghost".as_slice()),
+            "the child Form's own unresolved /Ghost use must surface, proving \
+             the walk descended past the unparseable parent: {unresolved:?}"
+        );
     }
 }

@@ -1395,6 +1395,93 @@ fn writer_indirect_length_qdf_round_trips() {
     );
 }
 
+/// The QDF trailer serializer (writer.rs) branches on
+/// `options.deterministic_id` inside the `options.qdf` arm; that combination
+/// (unlike `qdf` alone or `deterministic_id` alone, each covered elsewhere)
+/// had no covering test. Pins the QDF trailer layout, a well-formed
+/// content-derived `/ID`, self-stability across repeat writes, and
+/// `qpdf --check` acceptance.
+#[test]
+fn writer_qdf_and_deterministic_id_combine() {
+    use flpdf::Pdf;
+    use std::io::Cursor;
+
+    let source = read("../compat/three-page.pdf");
+    let opts = WriterTestSettings {
+        qdf: true,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+    let mut first = Vec::new();
+    write_with_settings(&mut pdf, &mut first, &opts).unwrap();
+
+    // QDF trailer shape: "trailer <<" on its own line (not the classic
+    // single-space "trailer <<...>>" form).
+    assert!(
+        find(&first, b"\ntrailer <<\n").is_some(),
+        "qdf output must use the QDF trailer layout"
+    );
+
+    // The deterministic /ID is content-derived: two 32-hex-digit strings,
+    // neither of which is the all-zero static-id constant.
+    let id_kw = find(&first, b"/ID").expect("/ID entry in QDF trailer");
+    let after = &first[id_kw + 3..];
+    let open = after
+        .iter()
+        .position(|&b| b == b'[')
+        .expect("/ID array open");
+    let close = after[open..]
+        .iter()
+        .position(|&b| b == b']')
+        .map(|i| open + i)
+        .expect("/ID array close");
+    let body = std::str::from_utf8(&after[open + 1..close]).expect("ascii /ID body");
+    let hex_pairs: Vec<&str> = body
+        .split('<')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('>'))
+        .collect();
+    assert_eq!(hex_pairs.len(), 2, "/ID must carry two hex strings: {body}");
+    for id in &hex_pairs {
+        assert_eq!(id.len(), 32, "/ID element must be 32 hex digits: {id}");
+        assert_ne!(
+            *id,
+            "0".repeat(32),
+            "deterministic /ID must not be the static-id constant"
+        );
+    }
+
+    // Self-stable: a second write of the same source produces byte-identical
+    // output, matching --deterministic-id's contract in the qdf branch too.
+    let mut pdf2 = Pdf::open(Cursor::new(source)).unwrap();
+    let mut second = Vec::new();
+    write_with_settings(&mut pdf2, &mut second, &opts).unwrap();
+    assert_eq!(
+        first, second,
+        "deterministic /ID must be self-stable across identical writes"
+    );
+
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tmp = dir.path().join("qdf-deterministic-id.pdf");
+        fs::write(&tmp, &first).unwrap();
+        let out = Command::new("qpdf")
+            .arg("--check")
+            .arg(&tmp)
+            .output()
+            .expect("run qpdf --check");
+        assert!(
+            out.status.success(),
+            "qpdf --check failed on qdf+deterministic-id output:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    } else {
+        eprintln!("qpdf not available; skipping qpdf --check in qdf+deterministic-id test");
+    }
+}
+
 mod common;
 #[allow(unused_imports)]
 use common::{write_default, write_with_settings, WriterTestSettings};

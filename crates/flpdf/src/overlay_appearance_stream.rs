@@ -86,7 +86,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     };
     let resources_value = stream_dict.try_get_key(b"/Resources")?;
     if resources_value.try_is_null()? {
-        return Ok(()); // cov:ignore: caller gates on an existing /Resources entry
+        return Ok(());
     }
     let resources_terminal = pdf.resolve_handle(&resources_value)?;
     if resources_terminal.as_dictionary().is_none() {

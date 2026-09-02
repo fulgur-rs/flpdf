@@ -81,6 +81,36 @@ fn job_json_file_runs_through_the_production_qpdf_job() {
     assert!(directory.path().join("output.pdf").is_file());
 }
 
+/// A syntactically invalid job-json file fails during
+/// `initialize_from_json_partial`, which carries a non-empty
+/// `CliExitError::message` (unlike every other production `CliExitError`
+/// site, which passes an empty message because the diagnostics were already
+/// printed). This pins that the message-printing branch in `main`'s error
+/// handler is reachable and formatted as documented.
+#[test]
+fn job_json_file_with_malformed_json_prints_error_and_exits_2() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("job.json"), b"{ not valid json").unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error with job-json file job.json:"),
+        "stderr must carry the job-json error prefix, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--job-json-help"),
+        "stderr must point at --job-json-help, got:\n{stderr}"
+    );
+}
+
 #[test]
 fn job_json_file_show_npages_matches_qpdf_without_output_file() {
     if !qpdf_available() {
