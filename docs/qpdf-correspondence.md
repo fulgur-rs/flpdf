@@ -1286,3 +1286,13 @@ ObjectHandle 移行という**実装手段**が完了していても、qpdf 側�
 missing として傘で数えていたが、個々の `Pl_*` は下の各行で 境界一致 / smeared /
 逸脱候補として個別に分類されており**二重計上**だった。傘の行を `Pipeline.cc`
 本体（114 行）に限定し、真に未マップな qpdf 行だけを ❌ に数えるよう改めた。
+
+### `test_driver` test 81
+
+`qpdf/test_driver.cc:2807-2817` の ownerless `newNull().getIntValue()` は、
+`libqpdf/QPDFObjectHandle.cc:502-513,2168-2189` の
+`QPDFExc(qpdf_e_object)` を consumer が捕捉して正常終了する。flpdf は
+`ObjectHandle::try_get_int_value` の no-context `Error::System` を同じ
+canonical type-warning boundary として利用し、qtest driver は警告を再生成せず
+捕捉だけを行う。Pinned qpdf 11.9.0 の `test_driver 81 -` は exit 0、stdout
+`test 81 done`、stderr空を返す。

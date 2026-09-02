@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use flpdf::{ObjectHandle, Pdf};
+use flpdf::{Error, ObjectHandle, Pdf};
 
 #[test]
 fn qpdf_object_handle_primitives_are_available_to_external_crates() {
@@ -57,6 +57,19 @@ fn qpdf_stream_type_predicate_is_available_to_external_crates() {
     assert!(!ObjectHandle::dictionary(Vec::new())
         .try_is_stream_of_type(b"ObjStm", b"")
         .unwrap());
+}
+
+#[test]
+fn ownerless_integer_type_error_uses_qpdf_object_error_boundary() {
+    let error = ObjectHandle::null()
+        .try_get_int_value()
+        .expect_err("a null handle without a document must raise the object error");
+
+    assert!(matches!(
+        error,
+        Error::System(message)
+            if message == "operation for integer attempted on object of type null: returning 0"
+    ));
 }
 
 #[test]

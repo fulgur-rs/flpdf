@@ -83,16 +83,15 @@ pub(crate) fn run_test_81<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDFObjectHandle::getIntValue): flpdf already ports this exact
-    // no-document-throws rule -- `ObjectHandle::try_get_int_value`
-    // (object_handle.rs:2430) returns `Err` via `Self::type_warning`
-    // specifically "for a receiver with no reachable document", matching
-    // qpdf's throw -- but the method is `pub(crate)`-only. The public
-    // `ObjectHandle::as_integer` accessor this crate does expose has no
-    // fallible/document-aware counterpart: it silently returns `None` for
-    // any type mismatch, with no way to distinguish "warned" from "would
-    // have thrown". This test cannot be reproduced without a public
-    // `try_get_int_value` (or equivalent).
+    // qpdf 11.9.0 `test_driver.cc:2807-2817`: a type error on a direct
+    // handle with no owning document is caught as `QPDFExc(qpdf_e_object)`.
+    // `try_get_int_value` is the canonical fallible Rust boundary for that
+    // same qpdf type-warning operation; do not print or synthesize the
+    // warning because qpdf catches it before the driver footer is emitted.
+    let error = ObjectHandle::null()
+        .try_get_int_value()
+        .expect_err("test 81 integer accessor must raise the qpdf object error");
+    assert!(matches!(error, Error::System(_)));
     Ok(())
 }
 
