@@ -522,6 +522,21 @@ fn test_82_matches_qpdf_compound_type_predicates() {
 }
 
 #[test]
+fn test_81_catches_ownerless_type_error_without_opening_input() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing.pdf");
+    let input = missing.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["81", input])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 81 done\n")
+        .stderr("");
+}
+
+#[test]
 fn test_14_drains_the_repair_warning_from_resolving_qdict() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("test14-damaged-qdict.pdf");
