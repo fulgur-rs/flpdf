@@ -670,7 +670,7 @@ fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) 
     // Best-effort, matching parse_default_appearance's own "skip malformed,
     // last wins" recovery: a parse error partway through still leaves
     // whatever valid Tf occurrence was already found in place.
-    let _ = parse_content_stream_handles(default_appearance, None, &mut finder);
+    let _ = parse_content_stream_handles(default_appearance, None, "", &mut finder);
 
     let Some((offset, length, raw_value)) = finder.tf_size_span else {
         return default_appearance.to_vec();

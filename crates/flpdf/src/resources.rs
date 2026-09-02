@@ -395,7 +395,7 @@ fn form_xobjects_in_resources<R: Read + Seek>(
 fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
     let mut used = BTreeMap::new();
     let mut finder = ResourceFinder::default();
-    let complete = parse_content_stream_handles(stream_bytes, None, &mut finder).is_ok()
+    let complete = parse_content_stream_handles(stream_bytes, None, "", &mut finder).is_ok()
         && !finder.had_diagnostics()
         && !finder.has_pending_operands();
     if complete {

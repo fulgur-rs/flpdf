@@ -537,9 +537,6 @@ pub(crate) fn run_test_36<R: Read + Seek>(
 struct ContentParserCallbacks<'a> {
     stdout: &'a mut dyn Write,
     stderr: &'a mut dyn Write,
-    /// qpdf's own content-stream input-source name, `"page object N G"`
-    /// (`QPDFObjectHandle::parsePageContents`, `libqpdf/QPDFObjectHandle.cc:1740-1743`).
-    description: String,
 }
 
 impl<'a> flpdf::ObjectHandleParserCallbacks for ContentParserCallbacks<'a> {
@@ -548,52 +545,28 @@ impl<'a> flpdf::ObjectHandleParserCallbacks for ContentParserCallbacks<'a> {
         Ok(())
     }
 
-    // Content-stream parser-recovery diagnostics never reach
-    // `Pdf::repair_diagnostics()` -- `ContentHandleParser`'s own
-    // `take_diagnostics()` is a channel local to this callback boundary
-    // (`content_stream.rs`'s `parse_content_stream_handles`), unlike every
-    // other diagnostic source this driver drains via
-    // `emit_new_diagnostics`. Silently accepting the trait's no-op default
-    // here would drop warnings qpdf's own driver prints. qpdf's real
-    // dispatch is two different `QPDFExc` shapes reaching the same
-    // `context->warn(...)` sink:
-    // - `QPDFParser`'s own internal recovery warnings use
-    //   `object_description = "content"` (the literal string
-    //   `QPDFObjectHandle.cc:1812` passes as the `QPDFParser` constructor's
-    //   second argument, stored as `QPDFParser::object_description`,
-    //   `libqpdf/qpdf/QPDFParser.hh:14-27`, and read back by
-    //   `QPDFParser::warn(offset, msg)`, `libqpdf/QPDFParser.cc:510-513`).
-    // - The one inline-image-EOF diagnostic is instead constructed directly
-    //   in `QPDFObjectHandle::parseContentStream_data` with the literal
-    //   object description `"stream data"` (`libqpdf/QPDFObjectHandle.cc:1831-1838`).
-    // This trait's `handle_diagnostic(offset, message)` carries no flag
-    // distinguishing the two call sites, so the fixed, only-ever-used-there
-    // message text from the second case (`content_stream.rs`'s own two
-    // `"EOF found while reading inline image"` literals, matching
-    // `libqpdf/QPDFObjectHandle.cc:1838,1848` verbatim) is used as the
-    // discriminator instead. UNVERIFIED against real qpdf output -- flagged
-    // in this file's own top-level caveats.
-    fn handle_diagnostic(&mut self, offset: usize, message: &str) -> flpdf::Result<()> {
-        let object = if message == "EOF found while reading inline image" {
-            "stream data"
-        } else {
-            "content"
-        };
-        // `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:18-51`), with
-        // `filename` = `self.description` (qpdf's `input->getName()`, *not*
-        // this driver's own PDF file path -- content-stream diagnostics
-        // have no document-file offset at all, only a position within the
-        // concatenated content-stream buffer), printed by qpdf's default
-        // warning callback as `"WARNING: " + exc.what()`.
-        let mut what = self.description.clone();
+    // The canonical parser supplies qpdf's source and object descriptions
+    // directly, so the driver does not reconstruct diagnostic context from
+    // message text.
+    fn handle_diagnostic(
+        &mut self,
+        source_description: &str,
+        object_description: &str,
+        offset: usize,
+        message: &str,
+    ) -> flpdf::Result<()> {
+        // QPDFExc::createWhat (libqpdf/QPDFExc.cc:18-51) formats the
+        // source/object/offset fields exactly as qpdf's warning callback:
+        // "WARNING: " followed by exc.what().
+        let mut what = source_description.to_owned();
         if !what.is_empty() {
             what.push_str(" (");
         }
-        what.push_str(object);
+        what.push_str(object_description);
         if offset > 0 {
             what.push_str(&format!(", offset {offset}"));
         }
-        if !self.description.is_empty() {
+        if !source_description.is_empty() {
             what.push(')');
         }
         what.push_str(": ");
@@ -652,12 +625,7 @@ pub(crate) fn run_test_37<R: Read + Seek>(
     let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
     for page_ref in page_refs {
         let page = pdf.get_object_handle(page_ref);
-        let description = format!("page object {} {}", page_ref.number, page_ref.generation);
-        let mut callbacks = ContentParserCallbacks {
-            stdout,
-            stderr,
-            description,
-        };
+        let mut callbacks = ContentParserCallbacks { stdout, stderr };
         page.parse_page_contents(&mut callbacks)?;
     }
     Ok(())
@@ -845,7 +813,7 @@ pub(crate) fn run_test_41<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolved_terminal, run_test_39};
+    use super::{resolved_terminal, run_test_37, run_test_39};
     use flpdf::{Pdf, PdfOpenOptions};
 
     fn pdf_with_image_xobject() -> Vec<u8> {
@@ -878,6 +846,43 @@ mod tests {
         }
         bytes.extend_from_slice(
             format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    fn pdf_with_content_stream(data: &[u8]) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 612 792] >>"
+                    .as_slice(),
+            ),
+        ];
+        let mut offsets = [0usize; 5];
+        for &(number, body) in &objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        offsets[4] = bytes.len();
+        bytes.extend_from_slice(b"4 0 obj\n<< /Length ");
+        bytes.extend_from_slice(data.len().to_string().as_bytes());
+        bytes.extend_from_slice(b" >>\nstream\n");
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
                 .as_bytes(),
         );
         bytes
@@ -931,5 +936,38 @@ mod tests {
 
         assert_eq!(stdout, b"page 1\nfilter: null, color space: /DeviceRGB\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_37_inline_image_eof_keeps_qpdf_stream_context_and_end_offset() {
+        let content = b"BI /W 1 ID \0";
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_content_stream(content),
+            PdfOpenOptions::default(),
+        )
+        .expect("open inline-image EOF fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_37(
+            &mut pdf,
+            b"inline-image-eof.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 37");
+
+        assert_eq!(
+            stderr,
+            format!(
+                "WARNING: page object 3 0 stream 4 0 (stream data, offset {}): \
+                 EOF found while reading inline image\n",
+                content.len()
+            )
+            .as_bytes()
+        );
     }
 }

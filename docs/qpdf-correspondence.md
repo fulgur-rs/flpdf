@@ -291,6 +291,17 @@ Rust unit test と qtest の `error-condition 45`
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除 |
 | `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替。所有者は `reader/resolver.rs` の `ResolverCore`（`m->file` 相当）。`ResolverCore` のメソッドは `InputSource` の 3 操作 `seek`/`tell`/`read`（`InputSource.hh:71-74`）に限定し、`OffsetInputSource`（`QPDF.cc:406`）が担う header shift は `seek`/`tell` が適用する。例外は `rewind_underlying_source` 1 つで、これは wrapper が持つ `proxied`（`libqpdf/qpdf/OffsetInputSource.hh:24`）に相当する — `OffsetInputSource::rewind` は logical 0 に行く（`OffsetInputSource.cc:55-59`）ため `m->file` では表現できない。owned-window 系の legacy helper（`read_window` / `read_physical_input`）は `ResolverHandle` 側の `qpdf-legacy-tenant` で、`ResolverCore` の面には置かない | ⚪ |
 
+`QPDFObjectHandle::parsePageContents` keeps the `all_description` produced by
+`arrayOrStreamToStreamArray` when it enters `parseContentStream_data`
+(`libqpdf/QPDFObjectHandle.cc:1438-1485,1740-1850`). The canonical flpdf
+content-parser callback carries that source description together with qpdf's
+`content` or `stream data` object description and the parser offset. In
+particular, an EOF inside an inline image uses the end position returned after
+the tokenizer consumes the truncated image, matching qpdf's `input->tell()`.
+The qtest `parsing 10` regression pins this complete diagnostic context; the
+other test-37 parsing rows retain their existing object spans and `handleEOF`
+output.
+
 pre-`Pdf` の xref bootstrap も qpdf の `QPDF::Members::file` / `InputSource`
 の遅延 read 境界（`QPDF.hh:67-97,1453-1457`、`QPDF.cc:245-275`）を保つ。
 `BootstrapHandleDocument` は handle state と diagnostics を先に共有するが、

@@ -47,7 +47,18 @@ pub trait ObjectHandleParserCallbacks {
     ) -> Result<ParseControl>;
 
     /// Receive a non-fatal parser recovery diagnostic.
-    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+    ///
+    /// source_description and object_description correspond to qpdf's
+    /// QPDFExc filename and object fields. Keeping them at this boundary
+    /// lets consumers reproduce qpdf's diagnostic context without
+    /// reconstructing it from the message text.
+    fn handle_diagnostic(
+        &mut self,
+        _source_description: &str,
+        _object_description: &str,
+        _offset: usize,
+        _message: &str,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -61,6 +72,7 @@ pub trait ObjectHandleParserCallbacks {
 pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
     input: &[u8],
     context: Option<Rc<dyn DocumentResolver>>,
+    source_description: &str,
     callbacks: &mut C,
 ) -> Result<()> {
     callbacks.content_size(input.len())?;
@@ -84,7 +96,12 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
             (object, length, diagnostics)
         };
         for diagnostic in diagnostics {
-            callbacks.handle_diagnostic(diagnostic.relative_offset, &diagnostic.message)?;
+            callbacks.handle_diagnostic(
+                source_description,
+                "content",
+                diagnostic.relative_offset,
+                &diagnostic.message,
+            )?;
         }
         let is_id = object.as_operator().as_deref() == Some(b"ID");
 
@@ -97,7 +114,12 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
             // exception; the subsequent inline-image token read reports the
             // warning-only EOF case (QPDFObjectHandle.cc:1820-1848).
             if tokenizer.consume_one_byte().is_err() {
-                callbacks.handle_diagnostic(input.len(), "EOF found while reading inline image")?;
+                callbacks.handle_diagnostic(
+                    source_description,
+                    "stream data",
+                    input.len(),
+                    "EOF found while reading inline image",
+                )?;
                 break;
             }
             let inline_offset = tokenizer.position();
@@ -123,7 +145,12 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 // an incomplete inline image is not a parser exception on this
                 // owning ObjectHandle route (QPDFObjectHandle.cc:1826-1848).
                 let diagnostic = "EOF found while reading inline image";
-                callbacks.handle_diagnostic(image.error_offset, diagnostic)?;
+                callbacks.handle_diagnostic(
+                    source_description,
+                    "stream data",
+                    image.end,
+                    diagnostic,
+                )?;
                 break;
             }
             let image_offset = image.start;
@@ -197,5 +224,5 @@ where
         operands: Vec::new(),
         on_operation,
     };
-    parse_content_stream_handles(input, None, &mut callbacks)
+    parse_content_stream_handles(input, None, "", &mut callbacks)
 }

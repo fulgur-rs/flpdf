@@ -42,9 +42,11 @@ struct RecordingCallbacks {
     size: Option<usize>,
     objects: Vec<(ObjectHandle, usize, usize)>,
     diagnostics: Vec<(usize, String)>,
+    diagnostic_contexts: Vec<(String, String)>,
     eof_calls: usize,
     stop_after: Option<usize>,
     fail: bool,
+    fail_diagnostic: bool,
 }
 
 #[derive(Default)]
@@ -93,8 +95,21 @@ impl ObjectHandleParserCallbacks for RecordingCallbacks {
         })
     }
 
-    fn handle_diagnostic(&mut self, offset: usize, message: &str) -> flpdf::Result<()> {
+    fn handle_diagnostic(
+        &mut self,
+        source_description: &str,
+        object_description: &str,
+        offset: usize,
+        message: &str,
+    ) -> flpdf::Result<()> {
+        if self.fail_diagnostic {
+            return Err(flpdf::Error::System(
+                "diagnostic callback failed".to_owned(),
+            ));
+        }
         self.diagnostics.push((offset, message.to_owned()));
+        self.diagnostic_contexts
+            .push((source_description.to_owned(), object_description.to_owned()));
         Ok(())
     }
 
@@ -379,6 +394,54 @@ fn parse_page_contents_forwards_recovery_diagnostics_before_eof() {
     assert!(!callbacks.diagnostics.is_empty());
     assert_eq!(callbacks.diagnostics[0].0, 2);
     assert_eq!(callbacks.eof_calls, 1);
+}
+
+#[test]
+fn parse_page_contents_forwards_qpdf_stream_diagnostic_context_in_order() {
+    let mut pdf = Pdf::open_mem_owned(indirect_content_shape_pdf()).unwrap();
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    let first = pdf
+        .new_stream_with_data(Rc::new(b"<< /A >> cm".to_vec()))
+        .unwrap();
+    let second = pdf
+        .new_stream_with_data(Rc::new(b"1 2 cm".to_vec()))
+        .unwrap();
+    let first_ref = first.object_ref().expect("first stream is indirect");
+    let second_ref = second.object_ref().expect("second stream is indirect");
+    page.replace_key(
+        b"/Contents",
+        ObjectHandle::array(vec![first.clone(), second.clone()]),
+    )
+    .unwrap();
+    let mut callbacks = RecordingCallbacks::default();
+
+    page.parse_page_contents(&mut callbacks).unwrap();
+
+    assert_eq!(
+        callbacks.diagnostic_contexts,
+        vec![(
+            format!(
+                "page object 3 0 stream {} {}, stream {} {}",
+                first_ref.number, first_ref.generation, second_ref.number, second_ref.generation
+            ),
+            "content".to_owned(),
+        )]
+    );
+}
+
+#[test]
+fn parse_page_contents_propagates_diagnostic_callback_errors_for_each_shape() {
+    for input in [b"<< /A >> cm".as_slice(), b"ID", b"BI /W 1 ID \0"] {
+        let mut callbacks = RecordingCallbacks {
+            fail_diagnostic: true,
+            ..RecordingCallbacks::default()
+        };
+        let error = page_with_contents(stream(input))
+            .parse_page_contents(&mut callbacks)
+            .expect_err("diagnostic callback errors must cross the parser boundary");
+        assert_eq!(error.to_string(), "diagnostic callback failed");
+        assert_eq!(callbacks.eof_calls, 0);
+    }
 }
 
 #[derive(Default)]
