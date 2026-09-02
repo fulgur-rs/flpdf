@@ -433,7 +433,7 @@ impl BootstrapHandleDocument {
             .unwrap_or(source_len)
             .min(source_len);
         let fallback_index = next_offset_index
-            .saturating_add(XREF_CANDIDATE_FALLBACK_SPAN)
+            .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
             .min(offsets.len());
         let fallback_end = offsets
             .get(fallback_index)
@@ -2312,17 +2312,17 @@ pub(crate) fn recover_xref_entries(bytes: &[u8], capture_trailer: bool) -> Resul
     })
 }
 
-/// How many further offset-*positions* (not bytes) a truncated candidate's
-/// window may extend into on a fallback retry, independent of every other
+/// How many further offset-*positions* (not bytes) a truncated reconstruction
+/// read window may extend into on a fallback retry, independent of every other
 /// entry's own retries. Bounding by position rather than sharing a global
 /// retry budget across the whole scan means no fixed number of unrelated,
 /// individually-truncated entries earlier in the (ascending object-number)
-/// scan can ever deny a later, genuine candidate its own retry -- qpdf's
-/// per-object recovery has no shared budget at all. Total work stays
-/// O(file size): at most this many *additional* candidates are examined per
+/// scan can ever deny a later, genuine candidate or referenced object its own
+/// retry. qpdf's per-object recovery has no shared budget at all. Total work
+/// stays O(file size): at most this many additional offsets are examined per
 /// retry, and only entries within this many positions of the end of the
 /// offset-sorted list can ever have their retry reach all the way to EOF.
-const XREF_CANDIDATE_FALLBACK_SPAN: usize = 64;
+const XREF_RECONSTRUCTION_FALLBACK_SPAN: usize = 64;
 
 /// qpdf's second trailer-recovery fallback (`reconstruct_xref`, `QPDF.cc:577-608`,
 /// qpdf 11.9.0): entered only when the line scan found no usable trailer dictionary.
@@ -2571,7 +2571,7 @@ struct XrefStreamCandidate {
 /// the offset of its byte-adjacent neighbor, retrying with a wider window
 /// when that truncates a real object (a header-like line recorded inside an
 /// object's own payload can become a bogus next offset). That retry extends
-/// by [`XREF_CANDIDATE_FALLBACK_SPAN`] further offset-*positions* rather
+/// by [`XREF_RECONSTRUCTION_FALLBACK_SPAN`] further offset-*positions* rather
 /// than sharing one global attempt-count budget across the whole scan:
 /// a shared budget lets enough earlier, unrelated truncated entries deny a
 /// later, genuine candidate its own retry, which qpdf's per-object recovery
@@ -2632,7 +2632,7 @@ fn find_xref_stream_trailer_candidate(
                         return None;
                     }
                     let wide_index = next_offset_index
-                        .saturating_add(XREF_CANDIDATE_FALLBACK_SPAN)
+                        .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
                         .min(offsets.len());
                     let wide_end = offsets
                         .get(wide_index)
@@ -3730,11 +3730,7 @@ mod final_handle_tests {
         assert!(error
             .to_string()
             .contains("unable to find trailer dictionary while recovering damaged file"));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "malformed candidate reconstruction must remain bounded: {:?}",
-            started.elapsed()
-        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -3749,6 +3745,14 @@ mod final_handle_tests {
                 },
             );
         }
+        entries.insert(ObjectRef::new(100, 0), XrefEntry::Free { next: 0 });
+        entries.insert(
+            ObjectRef::new(101, 0),
+            XrefEntry::Compressed {
+                stream: 1,
+                index: 0,
+            },
+        );
         let context = XrefReadContext::new(
             &[0; 800],
             XrefReadContextSpec::Reconstruction {
@@ -3760,6 +3764,23 @@ mod final_handle_tests {
 
         assert_eq!(
             context.document.reference_read_window(10, 800),
+            ReferenceReadWindow {
+                end: 20,
+                fallback_end: 660,
+            }
+        );
+        let shared = empty_bootstrap_cache();
+        let cached_context = XrefReadContext::new(
+            &[0; 800],
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries: &entries,
+                bootstrap_cache: &shared,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+        assert_eq!(
+            cached_context.document.reference_read_window(10, 800),
             ReferenceReadWindow {
                 end: 20,
                 fallback_end: 660,
