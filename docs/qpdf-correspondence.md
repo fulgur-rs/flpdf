@@ -414,6 +414,11 @@ compression levelへ適用され、`recompressFlate` (`QPDFJob_config.cc:498-503
 flpdfは `WriterSettings`/`WriterOptions` の `compression_level` と
 `pipeline/flate.rs::Flate::set_compression_level` で同じ設定順を保持し、
 CLIのtop-levelとnative rewriteの両方をcanonical `PdfWriter`へ接続する。
+`Pl_Flate::setCompressionLevel` (`Pl_Flate.cc:221-224`) 自体は範囲検証せず、
+zlibの `deflateInit` 失敗を `QPDF::pipeStreamData` (`QPDF.cc:2477-2538`) が
+stream単位のwarningへ変換して `QPDFWriter` (`QPDFWriter.cc:1287-1314`) の
+unfiltered retryへ渡す。flpdfも同じlazy failure/retry境界を使い、範囲外levelで
+write全体を使用法エラーにしない。
 
 進捗計測の準備境界は `writer.rs:538-563` に固定する。QDF/content-normalization
 または non-none decode level の `PageDocumentHelper::get_all_pages()` による page-tree

@@ -264,9 +264,10 @@ impl WriterConfiguration {
     /// Set qpdf's Flate compression level for subsequently-created streams.
     ///
     /// The value is passed to the underlying qpdf-shaped Flate codec when it
-    /// is non-negative. `0..=9` are the zlib compression levels; values above
-    /// 9 are rejected when the writer is prepared for output. Negative values
-    /// retain the codec default, matching qpdf's `>= 0` setup guard.
+    /// is non-negative. `0..=9` are the zlib compression levels. Values outside
+    /// that range are retained and rejected lazily by zlib at stream
+    /// initialization, where qpdf's writer can retry that stream unfiltered.
+    /// Negative values select the codec default.
     pub fn set_compression_level(&mut self, level: i32) {
         self.settings.compression_level = Some(level);
     }
@@ -580,9 +581,10 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
     /// Set qpdf's Flate compression level for subsequently-created streams.
     ///
     /// The value is passed to the underlying qpdf-shaped Flate codec when it
-    /// is non-negative. `0..=9` are the zlib compression levels; values above
-    /// 9 are rejected when the writer is prepared for output. Negative values
-    /// retain the codec default, matching qpdf's `>= 0` setup guard.
+    /// is non-negative. `0..=9` are the zlib compression levels. Values outside
+    /// that range are retained and rejected lazily by zlib at stream
+    /// initialization, where qpdf's writer can retry that stream unfiltered.
+    /// Negative values select the codec default.
     pub fn set_compression_level(&mut self, level: i32) {
         self.settings.compression_level = Some(level);
     }
@@ -5955,15 +5957,23 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn pdf_writer_rejects_an_invalid_compression_level_on_write() {
+    fn pdf_writer_reprocesses_an_invalid_compression_level_without_filtering() {
         let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
             .lock()
             .unwrap();
+        struct CompressionLevelReset;
+        impl Drop for CompressionLevelReset {
+            fn drop(&mut self) {
+                let _ = crate::pipeline::flate::Flate::set_compression_level(-1);
+            }
+        }
+        let _reset = CompressionLevelReset;
         let mut pdf = Pdf::open(Cursor::new(
-            include_bytes!("../../../tests/fixtures/compat/lone-flate-l9.pdf").to_vec(),
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         ))
         .expect("fixture must open");
         let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_recompress_flate(true);
         writer.set_compression_level(10);
         // get_final_version is a read-only query (no /Version dependency on
         // compression) and must not validate or mutate Flate codec state.
@@ -5972,9 +5982,36 @@ mod final_handle_writer_tests {
             "get_final_version must not evaluate the configured compression level"
         );
         writer.set_output_memory().expect("memory output");
+        writer
+            .write()
+            .expect("qpdf retries an invalid level with an unfiltered stream");
+        let output = writer.get_buffer().expect("memory output buffer");
         assert!(
-            writer.write().is_err(),
-            "an invalid zlib compression level must fail once emission actually starts"
+            !output.is_empty(),
+            "the recovered writer must produce output"
+        );
+        assert!(
+            !output
+                .windows(b"/Filter /FlateDecode".len())
+                .any(|window| window == b"/Filter /FlateDecode"),
+            "the failed compression attempt must leave the stream unfiltered"
+        );
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|entry| {
+                entry
+                    .message
+                    .contains("error decoding stream data for object")
+                    && entry.message.contains("zlib stream error")
+            }),
+            "qpdf reports the invalid deflate initialization as a stream warning"
+        );
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|entry| {
+                entry
+                    .message
+                    .contains("stream will be re-processed without filtering")
+            }),
+            "qpdf reports the raw retry after the invalid compression level"
         );
     }
 

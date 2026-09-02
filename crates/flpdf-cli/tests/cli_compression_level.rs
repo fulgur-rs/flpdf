@@ -8,6 +8,7 @@
 
 use assert_cmd::Command;
 use flpdf::{filters, ObjectHandle};
+use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "qpdf-zlib-compat")]
 use std::process::Command as ProcessCommand;
@@ -134,7 +135,7 @@ fn top_level_compression_level_zero_matches_qpdfs_accepted_boundary() {
 }
 
 #[test]
-fn top_level_compression_level_above_zlib_domain_is_a_cli_error() {
+fn top_level_compression_level_above_zlib_domain_is_a_recoverable_stream_warning() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
@@ -148,8 +149,14 @@ fn top_level_compression_level_above_zlib_domain_is_a_cli_error() {
         .arg(fixture_path())
         .arg(&output)
         .assert()
-        .failure()
-        .code(2);
+        .code(3)
+        .stderr(predicate::str::contains(
+            "stream will be re-processed without filtering",
+        ));
+    assert!(
+        output.exists(),
+        "the stream fallback must retain the output"
+    );
 }
 
 #[test]
