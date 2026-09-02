@@ -559,6 +559,28 @@ fn test_83_reports_json_parse_errors_as_exceptions() {
 }
 
 #[test]
+fn test_83_reports_invalid_utf8_through_the_exception_path() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("invalid-utf8.json");
+    // qpdf reads the job file as raw bytes with no UTF-8 validation
+    // (`QUtil::read_file_into_memory`, `test_driver.cc:2871-2873`) and only
+    // ever reports failures through the caught-exception path, after
+    // printing "calling initializeFromJson".
+    fs::write(&json, [b'{', 0xff, b'}']).expect("write invalid-utf8 job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 83");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"calling initializeFromJson\ntest 83 done\n");
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("exception: "));
+}
+
+#[test]
 fn test_60_completes_all_resource_merges_and_writes_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 

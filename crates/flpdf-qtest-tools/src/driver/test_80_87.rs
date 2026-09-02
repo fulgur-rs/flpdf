@@ -109,11 +109,19 @@ pub(crate) fn run_test_83<R: Read + Seek>(
         .map(std::path::Path::new)
         .ok_or_else(|| Error::Internal("test 83 requires a job JSON path".to_owned()))?;
     let bytes = std::fs::read(path).map_err(Error::from)?;
-    let json = String::from_utf8(bytes).map_err(|error| Error::System(error.to_string()))?;
 
     writeln!(stdout, "calling initializeFromJson")?;
-    let mut job = QPDFJob::new();
-    match job.initialize_from_json(&json) {
+    // qpdf reads the file into a raw `std::string` (`QUtil::read_file_into_memory`,
+    // `test_driver.cc:2871-2873`) with no UTF-8 validation, so a byte sequence that
+    // is not valid UTF-8 still reaches `initializeFromJson` and is reported through
+    // the same caught-exception path as any other malformed job JSON. flpdf's
+    // `initialize_from_json` takes `&str`, so the UTF-8 decode failure is folded
+    // into the same `exception:` arm rather than short-circuiting before the
+    // "calling initializeFromJson" line is printed.
+    let result = String::from_utf8(bytes)
+        .map_err(|error| Error::System(error.to_string()))
+        .and_then(|json| QPDFJob::new().initialize_from_json(&json));
+    match result {
         Ok(()) => writeln!(stdout, "called initializeFromJson")?,
         Err(Error::Usage(error)) => writeln!(stderr, "usage: {error}")?,
         Err(error) => writeln!(stderr, "exception: {error}")?,
