@@ -4,8 +4,8 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf, PdfOpenOptions,
-    PdfWriter, Pipeline, PipelineResult, StreamDataMode,
+    DecodeLevel, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf,
+    PdfOpenOptions, PdfWriter, Pipeline, PipelineResult, StreamDataMode,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -389,15 +389,9 @@ pub(crate) fn run_test_30<R: Read + Seek>(
 
 /// test_31 (test_driver.cc:1173-1212): `QPDFObjectHandle::parse` coverage.
 ///
-/// `pdf`, `filename`, `stderr`, and `diagnostics_written` are unused here:
-/// every real qpdf line past the first two parses needs either
-/// `QPDFObjectHandle::parse(string, description)` (a two-argument,
-/// still-context-less overload that embeds `description` into its thrown
-/// message text) or `QPDFObjectHandle::parse(&pdf, string[, description])`
-/// (the context-taking overload that allows indirect references). flpdf's
-/// public `ObjectHandle::parse(&[u8])` has neither a description parameter
-/// nor a document-context form, so this file stops at the first line that
-/// needs either.
+/// The two Rust parse entry points below are thin consumers of the canonical
+/// object parser. qpdf's parse overloads use the same `QPDFParser` and differ
+/// only in their description and owning-document context.
 pub(crate) fn run_test_31<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filename: &[u8],
@@ -406,8 +400,6 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let _ = (pdf, filename, stderr, diagnostics_written);
-
     // qpdf: `auto o1 = "..."_qpdf;` (test_driver.cc:1176-1177). The
     // `_qpdf` literal is `QPDFObjectHandle::parse(str, "QPDFObjectHandle
     // literal")` (`QPDFObjectHandle.cc:2597-2601`); the description is
@@ -427,19 +419,77 @@ pub(crate) fn run_test_31<R: Read + Seek>(
     let o2 = ObjectHandle::parse(b"   12345 \x0c  ")?;
     assert_eq!(o2.as_integer(), Some(12345));
 
-    // GAP(QPDFObjectHandle::parse(std::string const&, std::string const&)):
-    // qpdf's next line, `QPDFObjectHandle::parse("[1 0 R]", "indirect
-    // test")`, is expected to throw a `std::logic_error` whose message
-    // embeds the literal description "indirect test" (no context is passed,
-    // so an indirect reference cannot be canonicalized --
-    // `QPDFObjectHandle::parse(nullptr, ...)`,
-    // `QPDFObjectHandle.cc:1672-1699`). flpdf's `ObjectHandle::parse` takes
-    // no description parameter, so this exact message cannot be reproduced,
-    // and every subsequent line in this test needs either that description
-    // parameter or the context-taking `QPDFObjectHandle::parse(&pdf, ...)`
-    // overload (to parse `[5 0 R]`, `[1 0 R]`, etc. with real indirect
-    // references) -- neither exists in flpdf's public API. The remainder of
-    // this test (through test_driver.cc:1211) is not attempted.
+    // qpdf's context-free overload throws a logic error for a nested indirect
+    // reference. Its context-free description overload throws the trailing
+    // QPDFExc with `parsed object` as the input-source name.
+    let error = ObjectHandle::parse_with_description(b"[1 0 R]", "indirect test")
+        .expect_err("context-free parsing must reject an indirect reference");
+    let Error::Internal(message) = error else {
+        return Err(Error::Internal(
+            "context-free indirect parse returned the wrong error category".to_owned(),
+        ));
+    };
+    writeln!(stdout, "logic error parsing indirect: {message}")?;
+
+    let error = ObjectHandle::parse_with_description(b"0 trailing", "trailing test")
+        .expect_err("context-free parsing must reject trailing data");
+    let Error::Parse { offset, message } = error else {
+        return Err(Error::Internal(
+            "context-free trailing parse returned the wrong error category".to_owned(),
+        ));
+    };
+    let mut exception = String::from("parsed object");
+    exception.push_str(" (trailing test");
+    assert_eq!(offset, 0);
+    exception.push(')');
+    exception.push_str(": ");
+    exception.push_str(&message);
+    writeln!(stdout, "trailing data: {exception}")?;
+
+    // qpdf's context-taking overload inserts unresolved references into the
+    // owning canonical cache. `try_is_integer` and `resolve` reproduce the
+    // following qpdf type/null predicates at their normal lazy boundary.
+    let first = ObjectHandle::parse_with_context(pdf, b"[5 0 R]", "")?;
+    let first_item = first.try_get_array_item(0)?;
+    assert!(first_item.try_is_integer()?);
+    assert!(!first_item.is_direct());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    let second = ObjectHandle::parse_with_context(pdf, b"[5 0 R]", "")?;
+    let second_item = second.try_get_array_item(0)?;
+    assert!(first_item.is_same_object_as(&second_item));
+    assert!(!second_item.is_direct());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    let mixed = ObjectHandle::parse_with_context(pdf, b"[5 0 R 0 R /X]", "")?;
+    assert_eq!(mixed.unparse(), b"[ 5 0 R 0 (R) /X ]");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    let described = ObjectHandle::parse_with_context(pdf, b"[1 0 R]", "indirect test")?;
+    assert_eq!(described.unparse(), b"[ 1 0 R ]");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    for input in [b"}".as_slice(), b"{".as_slice(), b">>".as_slice()] {
+        let recovered = ObjectHandle::parse_with_context(pdf, input, "")?;
+        assert!(recovered.is_null());
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    }
+
+    let null_reference = ObjectHandle::parse_with_context(pdf, b"[7 0 R]", "")?;
+    let null_item = null_reference.try_get_array_item(0)?;
+    pdf.resolve(&null_item)?;
+    assert!(null_item.is_null());
+    assert!(!null_item.is_direct());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    let direct_null = ObjectHandle::parse_with_context(pdf, b"null", "")?;
+    assert!(direct_null.is_null());
+    assert!(direct_null.is_direct());
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    let invalid_objgen =
+        ObjectHandle::parse_with_context(pdf, b"[0 0 R -1 0 R 1 65535 R 1 100000 R 1 -1 R]", "")?;
+    assert_eq!(invalid_objgen.unparse(), b"[ null null null null null ]");
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 
@@ -516,8 +566,8 @@ pub(crate) fn run_test_33<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_secondary_pdf, run_test_30};
-    use flpdf::{EncryptParams, Pdf, PdfWriter};
+    use super::{open_secondary_pdf, run_test_30, run_test_31};
+    use flpdf::{EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -527,6 +577,30 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_current_dir(&self.0).expect("restore test current directory");
         }
+    }
+
+    fn pdf_with_integer_object() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = [0usize; 6];
+        offsets[1] = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        offsets[5] = bytes.len();
+        bytes.extend_from_slice(b"5 0 obj\n16059\nendobj\n");
+
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets.into_iter().skip(1) {
+            if offset == 0 {
+                bytes.extend_from_slice(b"0000000000 00000 f \n");
+            } else {
+                bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
     }
 
     #[test]
@@ -606,6 +680,45 @@ mod tests {
         assert!(
             copied.user_password_matched(),
             "the donor's user password must still authenticate the copied output"
+        );
+    }
+
+    #[test]
+    fn test_31_matches_qpdf_parse_object_output_for_a_clean_context() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_integer_object(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open clean PDF context");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_31(
+            &mut pdf,
+            b"one-page.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 31");
+
+        assert_eq!(
+            stdout,
+            b"[ /name 16059 3.14159 false << /key true /other [ (string1) (string2) ] >> null ]\n\
+logic error parsing indirect: QPDFParser::parse called without context on an object with indirect references\n\
+trailing data: parsed object (trailing test): trailing data found parsing object from string\n"
+        );
+        assert_eq!(
+            stderr,
+            b"WARNING: parsed object (offset 9): unknown token while reading object; treating as string\n\
+WARNING: parsed object: treating unexpected brace token as null\n\
+WARNING: parsed object: treating unexpected brace token as null\n\
+WARNING: parsed object: unexpected dictionary close token\n"
         );
     }
 }

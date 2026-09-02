@@ -88,8 +88,9 @@ use crate::encryption::crypt_filters::interpret_cf_from_handle;
 use crate::encryption::state::{EncryptionMode, EncryptionState};
 use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, NO_PARSED_OFFSET};
 use crate::parser::{
-    parse_live_file_object_with_decrypter, parse_qpdf_direct_object_handle_with_diagnostics,
-    LiveInput, LiveTokenSource, StringDecrypter,
+    parse_live_file_object_with_decrypter, parse_object_handle_with_context,
+    parse_qpdf_direct_object_handle_with_diagnostics, trailing_data_error, LiveInput,
+    LiveTokenSource, StringDecrypter,
 };
 use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::rc4::PlRc4;
@@ -1104,6 +1105,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn parsed_direct_object_handle(&self, value: ObjectValue) -> ObjectHandle {
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         ObjectHandle::from_parsed_value_with_resolver(value, resolver)
+    }
+
+    /// Parse a caller-provided object string against this document's canonical
+    /// object cache, matching `QPDFObjectHandle::parse(QPDF*, ...)`.
+    pub(crate) fn parse_object_handle_from_bytes(
+        &self,
+        input: &[u8],
+        object_description: &str,
+    ) -> Result<ObjectHandle> {
+        let mut handles = ChildHandles {
+            resolver: self,
+            description_template: format!("parsed object, {object_description} at offset $PO"),
+        };
+        let parsed = parse_object_handle_with_context(input, &mut handles)?;
+        for diagnostic in &parsed.diagnostics {
+            self.push_object_warning(qpdf_exception_what(
+                "parsed object",
+                object_description,
+                diagnostic.relative_offset,
+                &diagnostic.message,
+            ))?;
+        }
+        if let Some(error) = trailing_data_error(input, parsed.next_offset, parsed.last_offset) {
+            return Err(error);
+        }
+        Ok(parsed.value)
     }
 
     pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> String {
@@ -2198,6 +2225,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn push_caught_resolution_warning(&self, error: Error) -> Result<()> {
         match error {
             Error::Parse { offset, message } => {
+                let object = self.core.borrow().last_object_description.clone();
+                let message = if object.is_empty() {
+                    message
+                } else if offset > 0 {
+                    format!("({object}, offset {offset}): {message}")
+                } else {
+                    format!("({object}): {message}")
+                };
                 self.push_warning_at(u64::try_from(offset).unwrap_or(u64::MAX), message)
             }
             error => self.push_warning(error.to_string()),
@@ -3958,6 +3993,35 @@ fn stream_copy_dictionary_value(dictionary: &ObjectHandle, key: &[u8]) -> Result
 struct ChildHandles<'a, R: Read + Seek + 'static> {
     resolver: &'a ResolverHandle<R>,
     description_template: String,
+}
+
+fn qpdf_exception_what(filename: &str, object: &str, offset: usize, message: &str) -> String {
+    let mut result = String::new();
+    if !filename.is_empty() {
+        result.push_str(filename);
+    }
+    if !(object.is_empty() && offset == 0) {
+        if !filename.is_empty() {
+            result.push_str(" (");
+        }
+        if !object.is_empty() {
+            result.push_str(object);
+            if offset > 0 {
+                result.push_str(", ");
+            }
+        }
+        if offset > 0 {
+            result.push_str(&format!("offset {offset}"));
+        }
+        if !filename.is_empty() {
+            result.push(')');
+        }
+    }
+    if !result.is_empty() {
+        result.push_str(": ");
+    }
+    result.push_str(message);
+    result
 }
 
 impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
@@ -10707,7 +10771,10 @@ mod tests {
 
             let diagnostics = pdf.repair_diagnostics();
             assert_eq!(diagnostics.entries().len(), 1);
-            assert_eq!(diagnostics.entries()[0].message, expected_message);
+            assert_eq!(
+                diagnostics.entries()[0].message,
+                format!("(object 2 0, offset {header_offset}): {expected_message}")
+            );
             assert_eq!(diagnostics.entries()[0].offset, Some(header_offset));
         }
     }
