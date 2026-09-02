@@ -624,6 +624,34 @@ fn test_83_translates_a_missing_job_file_through_the_crt_open_boundary() {
 }
 
 #[test]
+fn test_84_exercises_the_qpdf_job_api_and_output_capture() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    fs::copy(minimal_pdf(), directory.path().join("minimal.pdf")).expect("copy minimal input");
+    fs::copy(minimal_pdf(), directory.path().join("bad2.pdf")).expect("copy inspection input");
+
+    let output = driver()
+        .args(["84", "-"])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 84");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for marker in [
+        "normal\n",
+        "custom progress reporter\n",
+        "error caught by check\n",
+        "error caught by run\n",
+        "output capture\n",
+        "captured stdout\n",
+        "captured stderr\n",
+    ] {
+        assert!(stdout.contains(marker), "test 84 output lacks {marker:?}");
+    }
+    assert!(directory.path().join("a.pdf").is_file());
+}
+
+#[test]
 fn test_60_completes_all_resource_merges_and_writes_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 

@@ -635,6 +635,16 @@ dispatchも維持する。`job-partial.json`の実機出力は`usage: an input f
 となる（`QPDFJob.cc:567-637`, `QPDFJob_config.cc:774-784`）。test 84のfluent Config/API
 surfaceはこのconsumerの範囲外で、別sliceに残す。
 
+`qpdf/test_driver.cc:2884-2971` の test 84 は、`QPDFJob::Config` の fluent setter、
+`checkConfiguration`/`run`、custom progress reporter、private loggerへの
+`setOutputStreams`を5つのscenarioで検証する。`job/lifecycle.rs` はこれらを
+`QPDFJobConfig`のborrowed proxy、既存の`QPDFJob::run`/`check_configuration`、
+`register_progress_reporter`、および`QPDFLogger::set_output_streams`へ接続し、driverは
+qpdfのシナリオ順とcapture出力を保つ。qpdf 11.9.0の`test_driver 84 -`とRust driverは
+`filter-progress.pl`適用後のstdout/stderrが一致し、`a.pdf`も同じwriter設定で生成される。
+Clapのcommand/parse stack guardはPR #1409の`stacker::maybe_grow`が所有し、このJob API
+sliceでは再実装しない。
+
 ### `flpdf-25kg.3.37` bounded consumer cutover (2026-08-15)
 
 `document_json.rs` の object-map enumeration は `Pdf::get_all_objects()` に、通常の
