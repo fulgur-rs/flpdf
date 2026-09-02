@@ -28,10 +28,10 @@
 //! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
 //! state-sensitive value.
 //!
-//! `QPDFObjectHandle.cc:456-466,759-785,869-955,1027-1039` supplies the
-//! name/dictionary/array inspection and live array mutation mirrored by
-//! `try_is_name_and_equals`, `try_is_dictionary_of_type`, `try_array_len`,
-//! `try_array_item`, `set_array_item`, `set_array_items`,
+//! `QPDFObjectHandle.cc:456-471,759-785,869-955,1027-1039` supplies the
+//! name/dictionary/stream/array inspection and live array mutation mirrored
+//! by `try_is_name_and_equals`, `try_is_dictionary_of_type`,
+//! `try_is_stream_of_type`, `try_array_len`, `try_array_item`, `set_array_item`, `set_array_items`,
 //! `insert_array_item`, `append_array_item`, and `erase_array_item`.
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
@@ -2918,11 +2918,7 @@ impl ObjectHandle {
     /// dictionary value, this matches a stream's *nested* dictionary --
     /// the shape every `/Type /ObjStm` or `/Type /XRef` object actually
     /// has, since both are required to carry stream data.
-    pub(crate) fn try_is_stream_of_type(
-        &self,
-        type_name: &[u8],
-        subtype_name: &[u8],
-    ) -> Result<bool> {
+    pub fn try_is_stream_of_type(&self, type_name: &[u8], subtype_name: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         let Some(stream_dict) = self.as_stream_dict() else {
             return Ok(false);
