@@ -1807,6 +1807,33 @@ requested value of integer is too big; returning INT_MAX\n"
     }
 
     #[test]
+    fn json_test_89_create_diagnostic_drain_stops_on_a_write_failure() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("test-89-semantic.json");
+        std::fs::write(
+            &input,
+            br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {},
+      "trailer": {"value": {}}
+    }
+  ]
+}"#,
+        )
+        .expect("write semantically invalid JSON fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = WriteFailure;
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
     fn json_test_89_footer_failure_is_reported_after_body_success() {
         let directory = tempfile::tempdir().expect("create test directory");
         let input = directory.path().join("test-89.json");
