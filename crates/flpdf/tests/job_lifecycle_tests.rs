@@ -10,6 +10,13 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::path::PathBuf;
+
 const COMPLETE_JSON: &[u8] = br#"{
   "qpdf": [
     {"jsonversion": 2, "pdfversion": "1.3"},
@@ -100,6 +107,24 @@ fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
         state: Arc::clone(&state),
     })));
     (logger, state)
+}
+
+#[cfg(unix)]
+fn non_utf8_path(directory: &Path, filename: &[u8]) -> PathBuf {
+    let mut bytes = directory.as_os_str().as_bytes().to_vec();
+    bytes.push(b'/');
+    bytes.extend_from_slice(filename);
+    PathBuf::from(OsString::from_vec(bytes))
+}
+
+#[cfg(unix)]
+fn job_json_with_paths(input: &Path, output: &Path) -> Vec<u8> {
+    let mut json = b"{\"inputFile\":\"".to_vec();
+    json.extend_from_slice(input.as_os_str().as_bytes());
+    json.extend_from_slice(b"\",\"outputFile\":\"");
+    json.extend_from_slice(output.as_os_str().as_bytes());
+    json.extend_from_slice(b"\"}");
+    json
 }
 
 fn xref_stream_with_extra_data() -> Vec<u8> {
@@ -2175,4 +2200,68 @@ fn json_job_replace_input_keeps_original_when_input_has_warnings() {
     assert_eq!(job.run().unwrap(), JobExitCode::Warning);
     assert!(input.exists());
     assert!(Path::new(&format!("{}.~qpdf-orig", input.display())).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn job_json_input_file_opens_a_literal_non_utf8_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = non_utf8_path(directory.path(), b"input-\x80.pdf");
+    let output = directory.path().join("output.pdf");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_bytes(&job_json_with_paths(&input, &output))
+        .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.exists(), "qpdf job must open the exact input path");
+}
+
+#[cfg(unix)]
+#[test]
+fn job_json_output_file_creates_a_literal_non_utf8_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.pdf");
+    let output = non_utf8_path(directory.path(), b"output-\x80.pdf");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        &input,
+    )
+    .unwrap();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_bytes(&job_json_with_paths(&input, &output))
+        .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(
+        output.exists(),
+        "qpdf job must create the exact output path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn job_json_replace_input_preserves_non_utf8_derived_backup_path() {
+    let repairable = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let directory = tempfile::tempdir().unwrap();
+    let input = non_utf8_path(directory.path(), b"warning-replace-\x80.pdf");
+    std::fs::copy(repairable, &input).unwrap();
+
+    let mut job = QPDFJob::new();
+    let mut json = b"{\"inputFile\":\"".to_vec();
+    json.extend_from_slice(input.as_os_str().as_bytes());
+    json.extend_from_slice(b"\",\"replaceInput\":\"\"}");
+    job.initialize_from_json_bytes(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    let mut backup = input.as_os_str().to_os_string();
+    backup.push(".~qpdf-orig");
+    assert!(PathBuf::from(backup).exists());
 }

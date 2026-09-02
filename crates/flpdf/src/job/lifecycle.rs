@@ -68,6 +68,60 @@ impl FlattenAnnotationsMode {
 /// (`include/qpdf/QPDFJob.hh:579`).
 const DEFAULT_KEEP_FILES_OPEN_THRESHOLD: usize = 200;
 
+/// Convert a qpdf job-JSON string value to the platform path representation
+/// used at the filesystem boundary.
+///
+/// qpdf keeps filenames in `std::string` and passes their bytes to POSIX
+/// `fopen` (`libqpdf/QUtil.cc:489-517`). On Windows, qpdf treats the same
+/// value as UTF-8 and converts it to UTF-16, replacing malformed sequences
+/// with U+FFFD (`libqpdf/QUtil.cc:467-485,1622-1625`). Do not route Unix
+/// values through a Rust `String`: a literal non-UTF-8 filename byte is a
+/// valid filesystem name there and must survive unchanged.
+fn path_from_qpdf_json_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+
+    #[cfg(windows)]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn path_component_to_qpdf_bytes(component: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        component.as_bytes().to_vec()
+    }
+
+    #[cfg(windows)]
+    {
+        component.to_string_lossy().into_owned().into_bytes()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        component.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 /// The single document type owned by a qpdf job.
 ///
 /// The erased reader preserves lazy file/JSON reads while allowing qpdf's
@@ -975,19 +1029,18 @@ fn parse_job_selector_integer(value: &str) -> Result<i32> {
 fn parse_job_attachment(value: &crate::json::Json, path: &str) -> Result<AttachmentAddOptions> {
     let members = job_json_members(value);
     let file = job_json_required_string(&members, b"file", &format!("{path}.file"))?;
-    let path = PathBuf::from(String::from_utf8_lossy(&file).into_owned());
+    let path = path_from_qpdf_json_bytes(&file);
     let basename = path
         .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
+        .map(path_component_to_qpdf_bytes)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             Error::Usage(UsageError::new(
                 "file for --add-attachment may not be empty",
             ))
         })?;
-    let filename =
-        job_json_string(&members, b"filename")?.unwrap_or_else(|| basename.as_bytes().to_vec());
-    let key = job_json_string(&members, b"key")?.unwrap_or_else(|| basename.as_bytes().to_vec());
+    let filename = job_json_string(&members, b"filename")?.unwrap_or_else(|| basename.clone());
+    let key = job_json_string(&members, b"key")?.unwrap_or(basename);
     let creation_date = job_json_string(&members, b"creationdate")?;
     let modification_date = job_json_string(&members, b"moddate")?;
     Ok(AttachmentAddOptions {
@@ -1040,7 +1093,7 @@ fn parse_job_overlay_specs(
             .map(|value| job_json_range(Some(value), "underlay/overlay repeat"))
             .transpose()?;
         destination.push(JobOverlayConfig {
-            path: PathBuf::from(String::from_utf8_lossy(&file).into_owned()),
+            path: path_from_qpdf_json_bytes(&file),
             password: job_json_string(&members, b"password")?.unwrap_or_default(),
             from,
             to,
@@ -1662,7 +1715,7 @@ impl QPDFJob {
                 members.insert(key.clone(), item);
                 let path_bytes = job_json_string(&members, b"jobJsonFile")?
                     .expect("jobJsonFile member is present in the one-member dictionary");
-                let path = PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned());
+                let path = path_from_qpdf_json_bytes(&path_bytes);
                 let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 // qpdf recursively re-enters `initializeFromJson` without a
                 // cycle guard. Keep the Rust job boundary finite for a
@@ -1711,8 +1764,7 @@ impl QPDFJob {
             if input.is_empty() {
                 configuration.empty_input = true;
             } else {
-                configuration.input_file =
-                    Some(PathBuf::from(String::from_utf8_lossy(&input).into_owned()));
+                configuration.input_file = Some(path_from_qpdf_json_bytes(&input));
             }
         }
         if job_json_bare(&members, b"empty")? {
@@ -1729,13 +1781,10 @@ impl QPDFJob {
                     "output file has already been given",
                 )));
             }
-            configuration.output_file =
-                Some(PathBuf::from(String::from_utf8_lossy(&output).into_owned()));
+            configuration.output_file = Some(path_from_qpdf_json_bytes(&output));
         }
         if let Some(copy_encryption) = job_json_string(&members, b"copyEncryption")? {
-            configuration.copy_encryption = Some(PathBuf::from(
-                String::from_utf8_lossy(&copy_encryption).into_owned(),
-            ));
+            configuration.copy_encryption = Some(path_from_qpdf_json_bytes(&copy_encryption));
             configuration.writer.clear_encryption_parameters();
         }
         if members.contains_key(b"encryptionFilePassword".as_slice()) {
@@ -1754,7 +1803,7 @@ impl QPDFJob {
             configuration.password = job_json_string(&members, b"password")?.unwrap_or_default();
         }
         if let Some(password_file) = job_json_string(&members, b"passwordFile")? {
-            let path = PathBuf::from(String::from_utf8_lossy(&password_file).into_owned());
+            let path = path_from_qpdf_json_bytes(&password_file);
             // Byte-preserving, first-line-only contract, matching qpdf's
             // `QUtil::read_lines_from_file` + `lines.front()`
             // (`QUtil.cc:1231-1286`, `QPDFJob_config.cc:661-679`): split on
@@ -1973,15 +2022,13 @@ impl QPDFJob {
             configuration.writer.force_pdf_version(version, extension);
         }
         if let Some(value) = job_json_string(&members, b"linearizePass1")? {
-            configuration.linearize_pass1 =
-                Some(PathBuf::from(String::from_utf8_lossy(&value).into_owned()));
+            configuration.linearize_pass1 = Some(path_from_qpdf_json_bytes(&value));
         }
         if job_json_bare(&members, b"linearize")? {
             configuration.linearize = true;
         }
         if let Some(value) = job_json_string(&members, b"updateFromJson")? {
-            configuration.update_from_json =
-                Some(PathBuf::from(String::from_utf8_lossy(&value).into_owned()));
+            configuration.update_from_json = Some(path_from_qpdf_json_bytes(&value));
         }
         if let Some(value) = job_json_string(&members, b"collate")? {
             let value = String::from_utf8_lossy(&value);
@@ -2163,7 +2210,7 @@ impl QPDFJob {
                     &format!(".pages[{index}].range"),
                 )?; // cov:ignore: llvm-cov attributes this successful page range conversion to the opening call lines
                 configuration.page_specs.push(JobPageConfig {
-                    path: PathBuf::from(String::from_utf8_lossy(&file).into_owned()),
+                    path: path_from_qpdf_json_bytes(&file),
                     password: job_json_string(&item_members, b"password")?.unwrap_or_default(),
                     range,
                 }); // cov:ignore: llvm-cov attributes this successful page configuration to its field expressions
@@ -2194,7 +2241,7 @@ impl QPDFJob {
                 configuration
                     .attachments_to_copy
                     .push(JobCopyAttachmentsConfig {
-                        path: PathBuf::from(String::from_utf8_lossy(&file).into_owned()),
+                        path: path_from_qpdf_json_bytes(&file),
                         password: job_json_string(&item_members, b"password")?.unwrap_or_default(),
                         prefix: job_json_string(&item_members, b"prefix")?.unwrap_or_default(),
                     }); // cov:ignore: llvm-cov attributes this successful attachment configuration to its field expressions
@@ -3109,7 +3156,7 @@ impl QPDFJob {
         self.configuration
             .input_file
             .as_ref()
-            .map(|path| PathBuf::from(format!("{}.~qpdf-temp#", path.display())))
+            .map(|path| path_with_suffix(path, ".~qpdf-temp#"))
     }
 
     fn remove_replace_input_temp(&self) {
@@ -3127,11 +3174,10 @@ impl QPDFJob {
         let temp = self
             .replace_input_path()
             .ok_or_else(|| Error::System("replace-input temporary path is missing".to_owned()))?;
-        let backup = PathBuf::from(format!(
-            "{}.~qpdf-orig{}",
-            input.display(),
-            if self.warnings { "" } else { "#" }
-        ));
+        let mut backup = path_with_suffix(input, ".~qpdf-orig");
+        if !self.warnings {
+            backup = path_with_suffix(&backup, "#");
+        }
         std::fs::rename(input, &backup)
             .map_err(|error| Error::file_io("rename original input", input.clone(), error))?;
         if let Err(error) = std::fs::rename(&temp, input) {
@@ -4687,5 +4733,131 @@ mod tests {
             .initialize_from_json_partial(r#"{"replaceInput":""}"#)
             .unwrap();
         assert!(replace_job.set_output_file("output.pdf").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_default_names_preserve_non_utf8_basename_bytes() {
+        let mut json = b"{\"file\":\"attachment-".to_vec();
+        json.push(0x80);
+        json.extend_from_slice(b".bin\"}");
+        let value = crate::json::Json::parse(&json).unwrap();
+
+        let options = parse_job_attachment(&value, ".addAttachment[0]").unwrap();
+
+        assert_eq!(options.key, b"attachment-\x80.bin");
+        assert_eq!(options.filename, b"attachment-\x80.bin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_json_path_fields_preserve_non_utf8_bytes_in_configuration() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::path::PathBuf;
+
+        fn non_utf8_path(directory: &std::path::Path, name: &[u8]) -> PathBuf {
+            let mut bytes = directory.as_os_str().as_bytes().to_vec();
+            bytes.push(b'/');
+            bytes.extend_from_slice(name);
+            PathBuf::from(OsString::from_vec(bytes))
+        }
+
+        fn append_member(json: &mut Vec<u8>, first: &mut bool, key: &[u8], value: &[u8]) {
+            if !*first {
+                json.push(b',');
+            }
+            *first = false;
+            json.push(b'"');
+            json.extend_from_slice(key);
+            json.extend_from_slice(b"\":\"");
+            json.extend_from_slice(value);
+            json.push(b'"');
+        }
+
+        fn append_file_object(
+            json: &mut Vec<u8>,
+            first: &mut bool,
+            key: &[u8],
+            path: &[u8],
+            suffix: &[u8],
+        ) {
+            if !*first {
+                json.push(b',');
+            }
+            *first = false;
+            json.push(b'"');
+            json.extend_from_slice(key);
+            json.extend_from_slice(b"\":{\"file\":\"");
+            json.extend_from_slice(path);
+            json.extend_from_slice(b"\"");
+            json.extend_from_slice(suffix);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let input = non_utf8_path(directory.path(), b"input-\x80.pdf");
+        let output = non_utf8_path(directory.path(), b"output-\x80.pdf");
+        let password_file = non_utf8_path(directory.path(), b"password-\x80.txt");
+        let linearize_pass1 = non_utf8_path(directory.path(), b"pass1-\x80.tmp");
+        let update = non_utf8_path(directory.path(), b"update-\x80.json");
+        let nested = non_utf8_path(directory.path(), b"nested-\x80.json");
+        std::fs::write(&password_file, b"password\nignored\n").unwrap();
+        std::fs::write(&nested, b"{}").unwrap();
+
+        let input_bytes = input.as_os_str().as_bytes();
+        let output_bytes = output.as_os_str().as_bytes();
+        let password_file_bytes = password_file.as_os_str().as_bytes();
+        let linearize_pass1_bytes = linearize_pass1.as_os_str().as_bytes();
+        let update_bytes = update.as_os_str().as_bytes();
+        let nested_bytes = nested.as_os_str().as_bytes();
+
+        let mut json = b"{".to_vec();
+        let mut first = true;
+        append_member(&mut json, &mut first, b"inputFile", input_bytes);
+        append_member(&mut json, &mut first, b"outputFile", output_bytes);
+        append_member(&mut json, &mut first, b"copyEncryption", input_bytes);
+        append_member(&mut json, &mut first, b"passwordFile", password_file_bytes);
+        append_member(
+            &mut json,
+            &mut first,
+            b"linearizePass1",
+            linearize_pass1_bytes,
+        );
+        append_member(&mut json, &mut first, b"updateFromJson", update_bytes);
+        append_file_object(
+            &mut json,
+            &mut first,
+            b"pages",
+            input_bytes,
+            b",\"range\":\"1\"}",
+        );
+        append_file_object(&mut json, &mut first, b"overlay", input_bytes, b"}");
+        append_file_object(&mut json, &mut first, b"addAttachment", input_bytes, b"}");
+        append_file_object(
+            &mut json,
+            &mut first,
+            b"copyAttachmentsFrom",
+            input_bytes,
+            b"}",
+        );
+        append_member(&mut json, &mut first, b"jobJsonFile", nested_bytes);
+        json.push(b'}');
+
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial_bytes(&json).unwrap();
+
+        assert_eq!(job.configuration.input_file.as_ref(), Some(&input));
+        assert_eq!(job.configuration.output_file.as_ref(), Some(&output));
+        assert_eq!(job.configuration.copy_encryption.as_ref(), Some(&input));
+        assert_eq!(job.configuration.password, b"password");
+        assert_eq!(
+            job.configuration.linearize_pass1.as_ref(),
+            Some(&linearize_pass1)
+        );
+        assert_eq!(job.configuration.update_from_json.as_ref(), Some(&update));
+        assert_eq!(job.configuration.page_specs[0].path, input);
+        assert_eq!(job.configuration.overlays[0].path, input);
+        assert_eq!(job.configuration.attachments_to_add[0].path, input);
+        assert_eq!(job.configuration.attachments_to_copy[0].path, input);
     }
 }
