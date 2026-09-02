@@ -356,6 +356,8 @@ mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObjec
 
 `flpdf-qwh0` では、qpdf 11.9.0 が `reconstruct_xref` の候補ごとに参照 object を offset から EOF まで読む (`QPDF.cc:585-589,1542-1697`) のに対し、flpdf の reconstruction bootstrap contextだけは line-scan で既知になった次の uncompressed offsetまで参照先 readを制限する。候補自身の隣接 windowと同じ64 offset-position fallbackで、実在 objectが候補境界にまたがる場合だけ再試行する。これはqpdfに対応物のないflpdf固有の malformed-input 性能/DoS hardeningであり、`xref.rs` の `qpdf-deviation` markerに記録する。通常のactive xref sectionはqpdfと同じunbounded source viewを維持する。
 
+`flpdf-ag95` では、qpdf 11.9.0 の `QPDF::resolve` が `m->resolving` による cycle 検出だけを行い、indirect-reference chain の深さ上限を持たない (`QPDF.cc:1699-1753`) ことに合わせ、bootstrap の recursive hub を `stacker::maybe_grow` で実行する。qpdfに対応物のないRust側stack policyであり、任意のdepth capやnull化によってqpdfが処理できるchainを拒否しない。stream `/Length` の再入前にも同じstack-growth boundaryを置き、既存のxref lookup・cycle/null fallback・diagnostic順序は維持する。`xref.rs` の `qpdf-deviation` markerに記録する。
+
 ## 3. 書き込み — 最大の smear
 
 | qpdf | 行 | flpdf | 状態 |

@@ -33,6 +33,12 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
 
+// The bootstrap resolver can re-enter once per indirect reference in a
+// stream's /Length or xref metadata. Keep the stack-growth values aligned with
+// the post-open resolver's measured frame layout.
+const XREF_STACK_RED_ZONE: usize = 128 * 1024;
+const XREF_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct LoadedXref {
     pub version: String,
@@ -515,7 +521,9 @@ impl BootstrapHandleDocument {
         let pending = parse_file_object_handle_syntax(input, &mut parser)?;
         let resolved_length = pending.indirect_length_ref().map(|object_ref| {
             self.ensure_source_bytes(source_bytes);
-            self.resolve_length(object_ref)
+            stacker::maybe_grow(XREF_STACK_RED_ZONE, XREF_STACK_GROWTH_SIZE, || {
+                self.resolve_length(object_ref)
+            })
         });
         let _ = (absolute_offset, description);
         finish_file_object_handle(input, pending, resolved_length, policy)
@@ -860,7 +868,17 @@ impl HandleResolver for BootstrapHandleParser<'_> {
 }
 
 impl DocumentResolver for BootstrapHandleDocument {
+    // qpdf-deviation: qpdf has no stack-growth policy; grow the Rust bootstrap resolver stack instead of imposing an arbitrary depth cap
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+        stacker::maybe_grow(XREF_STACK_RED_ZONE, XREF_STACK_GROWTH_SIZE, || {
+            self.resolve_indirect_inner(object_ref, handle)
+        })
+    }
+}
+
+impl BootstrapHandleDocument {
+    #[inline(never)]
+    fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         if handle.is_resolved() {
             return Ok(());
         }
@@ -3766,6 +3784,69 @@ mod final_handle_tests {
         }
         bytes.extend_from_slice(b"\nstartxref\n999999\n%%EOF\n");
         bytes
+    }
+
+    fn chained_indirect_length_bootstrap_fixture(
+        links: u32,
+    ) -> (Vec<u8>, BTreeMap<ObjectRef, XrefEntry>) {
+        let mut bytes = Vec::from(*b"%PDF-1.4\n");
+        let mut entries = BTreeMap::new();
+        for number in 1..=links {
+            entries.insert(
+                ObjectRef::new(number, 0),
+                XrefEntry::Uncompressed {
+                    offset: bytes.len() as u64,
+                },
+            );
+            bytes.extend_from_slice(
+                format!(
+                    "{number} 0 obj\n<< /Length {} 0 R >>\nstream\n\nendstream\nendobj\n",
+                    number + 1
+                )
+                .as_bytes(),
+            );
+        }
+        entries.insert(
+            ObjectRef::new(links + 1, 0),
+            XrefEntry::Uncompressed {
+                offset: bytes.len() as u64,
+            },
+        );
+        bytes.extend_from_slice(format!("{} 0 obj\n0\nendobj\n", links + 1).as_bytes());
+        (bytes, entries)
+    }
+
+    #[test]
+    fn bootstrap_long_indirect_length_chain_grows_the_stack_instead_of_aborting() {
+        #[cfg(windows)]
+        let stack_size = 32 * 1024 * 1024;
+        #[cfg(not(windows))]
+        let stack_size = 256 * 1024;
+        std::thread::Builder::new()
+            .stack_size(stack_size)
+            .spawn(|| {
+                let (bytes, entries) = chained_indirect_length_bootstrap_fixture(4_000);
+                let mut context = XrefReadContext::new(
+                    &bytes,
+                    XrefReadContextSpec::ActiveSection,
+                    &XrefRegistration {
+                        entries,
+                        ..XrefRegistration::default()
+                    },
+                    XrefLoadOptions::default(),
+                );
+                let indirect = context.document.handle_for_reference(ObjectRef::new(1, 0));
+                let dictionary = ObjectHandle::dictionary(vec![(b"/Size".to_vec(), indirect)]);
+
+                let value = context
+                    .resolve_dictionary_value(&dictionary, "Size")
+                    .expect("the chained reference must be resolved");
+                assert!(value.is_resolved());
+                assert!(value.as_stream_dict().is_some());
+            })
+            .expect("spawn")
+            .join()
+            .expect("a 4,000-link bootstrap chain must not overflow a small stack");
     }
 
     #[test]
