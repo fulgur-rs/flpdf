@@ -1288,6 +1288,19 @@ missing として傘で数えていたが、個々の `Pl_*` は下の各行で 
 逸脱候補として個別に分類されており**二重計上**だった。傘の行を `Pipeline.cc`
 本体（114 行）に限定し、真に未マップな qpdf 行だけを ❌ に数えるよう改めた。
 
+### `test_driver` test 17
+
+`qpdf/test_driver.cc:776-793` は重複した `/Pages /Kids` を含む
+`page_api_2.pdf` に対して `getAllPages()` を呼び、後続のページ削除と内容検査を
+行う。qpdf 11.9.0 の成功出力は明示的な stdout ではなく、canonical page-tree
+repair (`pages/repair.rs:297-302`) が記録する
+`kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy`
+warning と `test 17 done` の組合せになる。`run_test_17` は最初の
+`PageDocumentHelper::get_all_pages()` 直後に `emit_new_diagnostics` を一度だけ
+呼び、filename/object/offset を保持したqpdfのwarning順序をdriver側で再生成せず
+排出する。Pinned qpdf と Rust driver は `page-api 5` で exit 0、stdout/stderrを
+結合した出力まで一致する。
+
 ### `test_driver` test 81
 
 `qpdf/test_driver.cc:2807-2817` の ownerless `newNull().getIntValue()` は、

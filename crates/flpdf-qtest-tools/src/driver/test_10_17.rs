@@ -639,14 +639,15 @@ pub(crate) fn run_test_16<R: Read + Seek>(
 /// distinct leaves (a shallow copy for the second occurrence). This checks
 /// that duplication, removes the first of the two, and confirms the
 /// remaining page's content is the original "page 0" content -- matching
-/// qpdf, which has no printed output in this test at all, only asserts.
+/// qpdf, whose test body has no explicit stdout but whose page-tree repair
+/// emits the duplicate-page warning through the document diagnostic sink.
 pub(crate) fn run_test_17<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let root_ref = pdf
         .root_ref()
@@ -666,6 +667,7 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     assert_eq!(kid0.object_ref(), kid1.object_ref());
 
     let mut pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(pages.len(), 3);
     assert_ne!(pages[0], pages[1]);
 
@@ -692,7 +694,7 @@ pub(crate) fn run_test_17<R: Read + Seek>(
 mod tests {
     use super::{
         append_show_warnings, captured_bytes, captured_logger, run_test_12, run_test_13,
-        run_test_16, CapturedPipeline,
+        run_test_16, run_test_17, CapturedPipeline,
     };
     use flpdf::{
         linearization::show_linearization_bytes, DecodeLevel, PageDocumentHelper, Pdf,
@@ -888,6 +890,78 @@ mod tests {
         );
         bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
         bytes
+    }
+
+    fn duplicate_page_pdf() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R 3 0 R 4 0 R] /Count 3 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>",
+            ),
+            (5, b"<< /Length 7 >>\nstream\npage 0\nendstream"),
+            (6, b"<< /Length 7 >>\nstream\npage 2\nendstream"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (number, body) in objects {
+            offsets.insert(*number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for number in 1..=6 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_17_reports_the_canonical_duplicate_page_warning() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            duplicate_page_pdf(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                description: "page_api_2.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open duplicate-page fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_17(
+            &mut pdf,
+            b"page_api_2.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 17");
+
+        assert!(stdout.is_empty());
+        let warning = String::from_utf8(stderr).expect("warning is UTF-8");
+        assert_eq!(warning.matches("appears more than once").count(), 1);
+        assert!(
+            warning.starts_with("WARNING: page_api_2.pdf, object 2 0 at offset "),
+            "unexpected warning: {warning:?}"
+        );
+        assert!(warning.ends_with(
+            ": kid 1 (from 0) appears more than once in the pages tree; creating a new page object as a copy\n"
+        ));
     }
 
     /// Regression for the slashless-key bug this file's `replace_key` calls
