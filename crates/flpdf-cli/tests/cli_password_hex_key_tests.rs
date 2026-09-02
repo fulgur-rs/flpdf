@@ -17,6 +17,10 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 /// V=5 R=6 AES-256 fixture, user password `user-v5-r6`. Reference key
 /// captured from qpdf 11.9.0 (see cli_encryption_inspect.rs module header).
 const V5_R6: &str = "../../tests/fixtures/encrypted/v5-aes-256-r6.pdf";
@@ -36,14 +40,6 @@ const V2_RC4: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
 
 fn flpdf() -> Command {
     Command::cargo_bin("flpdf").unwrap()
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 /// Run `show-encryption-key` to recover the hex key, asserting it matches the

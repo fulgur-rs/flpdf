@@ -28,6 +28,10 @@
 mod common;
 use common::PdfCanonicalTestExt;
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -37,14 +41,6 @@ use assert_cmd::Command;
 use flpdf::{pages, Pdf};
 
 const FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
-}
 
 fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

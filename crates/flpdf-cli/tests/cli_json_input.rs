@@ -14,13 +14,9 @@ const UPDATE_JSON: &str = "../../tests/fixtures/compat/json-input/update.json";
 const MINIMAL_PDF: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
 
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
-}
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
 
 fn skip_if_qpdf_missing() -> bool {
     let version = ShellCommand::new("qpdf")

@@ -12,17 +12,13 @@ mod common;
 use common::PdfCanonicalTestExt;
 use common::{first_widget_ref, page_annotation_handles};
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 /// `true` when `needle` appears as a contiguous byte subslice of `hay`.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 fn normalized_os_message(error: &std::io::Error) -> String {

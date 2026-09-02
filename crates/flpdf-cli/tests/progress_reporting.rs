@@ -3,25 +3,20 @@
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 
+#[path = "support/text.rs"]
+mod text;
+use text::{platform_text, EOL};
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(name)
 }
 
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
-}
-
 fn progress_lines(output_name: &str, percentages: &[u8]) -> String {
-    let line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
     percentages
         .iter()
-        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%{line_ending}"))
+        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%{EOL}"))
         .collect()
 }
 

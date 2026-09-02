@@ -4,6 +4,10 @@ use assert_cmd::Command;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Output};
 
+#[path = "support/text.rs"]
+mod text;
+use text::EOL;
+
 const MINIMAL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/minimal.pdf"
@@ -98,14 +102,6 @@ fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
-fn platform_line_ending() -> &'static str {
-    if cfg!(windows) {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 fn assert_observables_equal(label: &str, qpdf: &Output, flpdf: &Output, text_output: bool) {
     assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}: status");
     if cfg!(windows) && text_output {
@@ -150,7 +146,7 @@ fn text_logger_uses_qpdf_platform_line_endings() {
         version.stdout,
         format!(
             "qpdf version 11.9.0\nRun qpdf --copyright to see copyright and license information.{}",
-            platform_line_ending()
+            EOL
         )
         .into_bytes()
     );
@@ -160,12 +156,11 @@ fn text_logger_uses_qpdf_platform_line_endings() {
         .output()
         .unwrap();
     assert_eq!(check.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&check.stdout)
-        .contains(&format!("checking {WARNING_PDF}{}", platform_line_ending())));
-    assert!(String::from_utf8_lossy(&check.stderr).ends_with(&format!(
-        "flpdf: operation succeeded with warnings{}",
-        platform_line_ending()
-    )));
+    assert!(
+        String::from_utf8_lossy(&check.stdout).contains(&format!("checking {WARNING_PDF}{EOL}"))
+    );
+    assert!(String::from_utf8_lossy(&check.stderr)
+        .ends_with(&format!("flpdf: operation succeeded with warnings{}", EOL)));
 }
 
 #[test]
@@ -460,11 +455,7 @@ fn text_rewrite_verbose_uses_info_route_for_file_output() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!(
-            "flpdf: wrote file {}{}",
-            output_path.display(),
-            platform_line_ending()
-        )
+        format!("flpdf: wrote file {}{}", output_path.display(), EOL)
     );
     assert!(output.stderr.is_empty());
 }
@@ -485,11 +476,8 @@ fn text_check_success_stays_on_info_route() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.starts_with(&format!("checking {MINIMAL}{}", platform_line_ending())));
-    assert!(stdout.ends_with(&format!(
-        "errors that qpdf cannot detect{}",
-        platform_line_ending()
-    )));
+    assert!(stdout.starts_with(&format!("checking {MINIMAL}{EOL}")));
+    assert!(stdout.ends_with(&format!("errors that qpdf cannot detect{}", EOL)));
 }
 
 #[test]

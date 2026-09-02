@@ -12,16 +12,12 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Output;
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 fn minimal_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf")
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 #[cfg(unix)]

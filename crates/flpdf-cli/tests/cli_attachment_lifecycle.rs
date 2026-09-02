@@ -22,6 +22,10 @@
 #[allow(dead_code, unused_imports)]
 mod support;
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 use assert_cmd::Command as CargoCommand;
 use std::io::Write;
 use std::path::Path;
@@ -53,14 +57,6 @@ fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
         }
     }
     normalized
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 /// A minimal PNG-like binary payload (valid PNG header + 1×1 RGBA).

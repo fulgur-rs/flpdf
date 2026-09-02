@@ -5,6 +5,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command as ShellCommand;
 
+#[path = "support/text.rs"]
+mod text;
+use text::EOL;
+
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
 const REPAIRABLE_PDF: &str = "../../tests/fixtures/test_driver/repairable_input.pdf";
 const WEAK_RC4_PDF: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
@@ -320,14 +324,11 @@ fn ordinary_show_pages_omits_effective_inherited_attributes_like_qpdf() {
     std::fs::write(temp.path(), &bytes).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    let line_ending = if cfg!(windows) { "\r\n" } else { "\n" };
     cmd.args(["--show-pages"])
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(format!(
-            "page 1: 3 0 R{line_ending}  content:{line_ending}    4 0 R{line_ending}"
-        ));
+        .stdout(format!("page 1: 3 0 R{EOL}  content:{EOL}    4 0 R{EOL}"));
 }
 
 #[test]

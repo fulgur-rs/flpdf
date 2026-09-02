@@ -5,20 +5,16 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
+#[path = "support/text.rs"]
+mod text;
+use text::{platform_text, EOL};
+
 fn expected_usage(message: &str) -> String {
     platform_text(&format!(
         "\nflpdf: {message}\n\nFor help:\n  flpdf --help=usage       usage information\n  \
 flpdf --help=topic       help on a topic\n  flpdf --help=--option    help on an option\n  \
 flpdf --help             general help and a topic list\n\n"
     ))
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 fn qpdf_available() -> bool {
@@ -702,9 +698,7 @@ fn job_json_file_show_npages_preserves_qpdf_inspection_order() {
     assert!(flpdf.status.success(), "flpdf job JSON failed: {flpdf:?}");
     assert_eq!(flpdf.stdout, qpdf.stdout);
     assert_eq!(flpdf.stderr, qpdf.stderr);
-    assert!(flpdf
-        .stdout
-        .ends_with(format!("0{}", if cfg!(windows) { "\r\n" } else { "\n" }).as_bytes()));
+    assert!(flpdf.stdout.ends_with(format!("0{EOL}").as_bytes()));
 }
 
 #[test]
@@ -751,10 +745,7 @@ fn job_json_file_show_npages_preserves_qpdf_malformed_count_fallback() {
         Some(3),
         "flpdf job JSON failed: {flpdf:?}"
     );
-    assert_eq!(
-        flpdf.stdout,
-        format!("0{}", if cfg!(windows) { "\r\n" } else { "\n" }).into_bytes()
-    );
+    assert_eq!(flpdf.stdout, format!("0{EOL}").into_bytes());
     assert_eq!(flpdf.stdout, qpdf.stdout);
     let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("qpdf:", "flpdf:");
     assert_eq!(flpdf.stderr, qpdf_stderr.as_bytes());

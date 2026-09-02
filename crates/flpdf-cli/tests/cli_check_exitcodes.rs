@@ -19,13 +19,9 @@ use flpdf::ObjectHandle;
 use predicates::prelude::*;
 use std::io::Write;
 
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
-}
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
 
 // ---------------------------------------------------------------------------
 // Fixture builders

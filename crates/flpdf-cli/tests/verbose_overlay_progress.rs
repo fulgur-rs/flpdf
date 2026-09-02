@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -18,14 +22,6 @@ fn fixtures_dir() -> PathBuf {
 
 fn fixture(name: &str) -> String {
     fixtures_dir().join(name).to_str().unwrap().to_string()
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 #[test]

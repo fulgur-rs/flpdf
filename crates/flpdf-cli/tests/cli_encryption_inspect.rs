@@ -40,6 +40,10 @@ use predicates::prelude::*;
 use std::io::Write;
 use std::process::{Command as ShellCommand, Stdio};
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 /// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
 /// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
 /// translates every `\n` write to `\r\n`; flpdf's shared CLI logger applies
@@ -62,14 +66,6 @@ fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     }
 
     normalized
-}
-
-fn platform_text(text: &str) -> String {
-    if cfg!(windows) {
-        text.replace('\n', "\r\n")
-    } else {
-        text.to_owned()
-    }
 }
 
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";

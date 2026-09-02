@@ -1,5 +1,9 @@
 use assert_cmd::Command;
 
+#[path = "support/text.rs"]
+mod text;
+use text::platform_text;
+
 const QPDF_VERSION_OUTPUT: &str =
     "qpdf version 11.9.0\nRun qpdf --copyright to see copyright and license information.\n";
 
@@ -20,14 +24,6 @@ Versions of qpdf prior to version 7 were released under the terms\n\
 of version 2.0 of the Artistic License. At your option, you may\n\
 continue to consider qpdf to be licensed under those terms. Please\n\
 see the manual for additional information.\n";
-
-fn platform_text(output: &str) -> String {
-    if cfg!(windows) {
-        output.replace('\n', "\r\n")
-    } else {
-        output.to_owned()
-    }
-}
 
 #[test]
 fn qpdf_version_prints_the_pinned_qpdf_version_without_opening_input() {
