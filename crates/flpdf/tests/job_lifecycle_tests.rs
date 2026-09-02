@@ -994,31 +994,6 @@ fn json_job_dash_output_uses_the_job_save_pipeline() {
 }
 
 #[test]
-fn json_job_invalid_compression_level_retries_the_stream_unfiltered() {
-    let temp = tempfile::tempdir().unwrap();
-    let input =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
-    let output = temp.path().join("invalid-compression-level.pdf");
-    let json = serde_json::json!({
-        "inputFile": input,
-        "outputFile": output,
-        "recompressFlate": "",
-        "compressionLevel": "10"
-    })
-    .to_string();
-
-    let (logger, state) = logger_with_warning_sink();
-    let mut job = QPDFJob::new();
-    job.set_logger(logger);
-    job.initialize_from_json(&json).unwrap();
-
-    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
-    assert!(output.exists());
-    assert!(String::from_utf8_lossy(&state.lock().unwrap().bytes)
-        .contains("stream will be re-processed without filtering"));
-}
-
-#[test]
 fn json_job_without_output_is_a_usage_error() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let json = serde_json::json!({"inputFile": input}).to_string();

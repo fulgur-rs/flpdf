@@ -5961,6 +5961,13 @@ mod final_handle_writer_tests {
         let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
             .lock()
             .unwrap();
+        struct CompressionLevelReset;
+        impl Drop for CompressionLevelReset {
+            fn drop(&mut self) {
+                let _ = crate::pipeline::flate::Flate::set_compression_level(-1);
+            }
+        }
+        let _reset = CompressionLevelReset;
         let mut pdf = Pdf::open(Cursor::new(
             include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         ))
