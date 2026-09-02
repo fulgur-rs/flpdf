@@ -361,8 +361,10 @@ mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObjec
 | `QPDFWriter.cc` | 3044 | `writer.rs`(4494) + `writer/serialize.rs`(1008) + `writer/object_streams/{eligibility,planning,emission}.rs`(739) + `writer/encryption_state.rs`(258) + `writer/encrypted_strings.rs`(213) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(3603) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `writer/rewrite_renumber.rs`(893) = **13,650 行 / 13 ファイル**。加えて `object.rs`(650: `write_pdf` = `unparseObject` / 768: `write_pdf_qdf` / 910-: trailer `/ID` = `writeTrailer`。`writer.rs` と `linearization/writer.rs` が委譲) と `writer/object.rs::visible_dict_entries`（canonical `ObjectHandle` 境界） + `writer/rewrite_renumber.rs::visible_raw_dict_entries`（raw `Object` 境界） = `QPDFWriter.cc:1490-1491` の null 値 dict キー抑制。さらに `writer/object.rs` に qpdf の writer-owned live-handle emission trait/walkers（`unparseObject`/`unparseChild`/`writeTrailer`、`QPDFWriter.cc:1072-1810,2236-2376,2907-3035`）を集約し、`object_handle.rs` は graph identity・payload・mutation・JSON の責務だけを保持する。旧 handle-owned emission implementationは削除し、production/test caller は writer boundary の canonical surface を直接利用する。`write_stream_body_qdf` は最終レビューで見つかったギャップの修正（Task 9）: `write_pdf_stream_qdf`(`object.rs:1036`、real production callsite は `writer.rs:4437`)に対応する QDF+stream 形の primitive が欠けていた。`Dictionary::write_pdf_stream_qdf` 自身に `refiltered` 概念が無いため（唯一の呼び出し元 `write_stream_to_buf_qdf` は既に確定済みの `/Filter`/`/Length` を持つ dict しか渡さない）、`write_stream_body`（compact 版）と異なりこちらも `refiltered` パラメータを持たない。null 値 dict キー抑制(`:1490-1491`)は `try_is_null` 経由で `write_object`/`write_object_qdf`/`write_stream_body`/`write_stream_body_qdf` の4つに適用し、`write_trailer` は `writeTrailer` 自身と同様に無抑制。`writer/encryption_state.rs` の `WriterEncryptionState` は `QPDFWriter::Members` の暗号 state (`QPDFWriter.hh:641-663`)、`set_data_key` は `setDataKey` (`QPDFWriter.cc:842-847`) と `compute_data_key` (`QPDF_encryption.cc:325-356`)、`with_object_data_key` は非 ObjStm member の set/unparse/clear (`QPDFWriter.cc:1761-1796`) に対応する。source ID ではなく emitted ID と generation 0 を使い、`Option<u32>` が qpdf の `-1` sentinel を置換する。qpdf の明示 clear は正常系だけだが、Rust callback の `Err` 後にも clear するのは出力 byte を変えず stale state を残さない内部代替である。全て `pub(crate)`・`#[allow(dead_code)]`。`flpdf-a32l` は AES で暗号化済みの文字列を full / linearized writer の共通 serializer context で強制 hex 化し、RC4・非暗号化・ObjStm member は既存の heuristic を維持する（`QPDFWriter.cc:1567-1592`）。既存 primitive の production consumer 移行（`flpdf-egzr.3.2.5` + 子 `.5.1`〜`.5.4`）と暗号 state の consumer 移行（`flpdf-3yn9.11`/`.12`）はいずれも close 済みで、`PlAesPdf`/`PlRc4`/`run_writer_pipeline`/`adjust_aes_stream_length` は production コードで実使用されている。`flpdf-25kg.3.48.4` では、qpdf `QPDFWriter.cc:1072-1157,1334-1360,1488-1505,2907-2925` の writer-owned live-handle boundary に合わせ、full-rewrite Catalog の output-only `/Extensions` 復元を `CatalogExtensionsSnapshot`/`restore_catalog_extensions` に統合し、linearization の pass-1/final `/ID` 構築を `generate_id_handle` と `ObjectHandle` へ移した。`QPDFObjectHandle.cc:1575-1642` の unparse 契約、`QPDF_Stream.cc:571-620,640-685` の stream/provider 契約は既存の canonical emission surface として利用する。writer donor-copy の raw `Object` 境界は後続 slice に残す。既存 primitive の production consumer 移行（`flpdf-egzr.3.2.5` + 子 `.5.1`〜`.5.4`）と暗号 state の consumer 移行（`flpdf-3yn9.11`/`.12`）はいずれも close 済みで、`PlAesPdf`/`PlRc4`/`run_writer_pipeline`/`adjust_aes_stream_length` は production コードで実使用されている。🔀 の根拠は ObjectHandle 移行の未完了ではなく、下記の「xref 出力が 3 箇所に分かれる」構造的 smear が独立に残っていること | 🔀 |
 | `QPDFJob.cc:2833-2925` / `QPDFWriter.cc:217-265,1356-1435,2176-2182` | qpdf job version-spec parsing, writer version/extension pair selection, and Catalog `/Extensions /ADBE` reconciliation | `pdf_version.rs::parse_pdf_version_spec` + `flpdf-cli/src/main.rs::CliVersionOptions`/`parse_cli_version_options`/`apply_cli_version_options` + `writer.rs::effective_pdf_version_and_ext`/`inject_adbe_extension`/`strip_adbe_extension` | ✅ qtest `extensions-dictionary.test` 156/156 (qpdf 11.9.0; `test_driver 34` and force-1.8.5 QDF/non-QDF checks) |
 
-`QPDFWriter::getTrimmedTrailer` (`QPDFWriter.cc:2009-2031`) returns a shallow
-copy before `enqueueObjectsStandard` and `writeTrailer`; the subsequent
+`QPDFWriter::getTrimmedTrailer` (`QPDFWriter.cc:2009-2031`) returns an
+`unsafeShallowCopy` before `enqueueObjectsStandard` and `writeTrailer`; the
+copy keeps the immediate child handles intact because the writer only mutates
+top-level trailer keys. The subsequent
 `getKeys()` traversal therefore applies null-valued dictionary-key visibility
 in plain, QDF, and encrypted writer modes alike. `writeTrailer`'s own loop
 does not repeat the `isNull()` check because it receives that already-trimmed
@@ -370,6 +372,29 @@ view. The canonical flpdf writer keeps the same separation: `suppress_null_value
 is mode-independent, while `removed_refs` separately excludes explicitly
 deleted identities. The regression and qpdf 11.9.0 probe are tracked in
 `flpdf-9hc.42`.
+
+### `test_driver` test 29
+
+`qpdf/test_driver.cc:1096-1145` deliberately constructs a mixed-ownership
+graph that ordinary `replaceKey` does not reject: a foreign `/QTest` handle is
+placed in an ownerless direct dictionary, and that dictionary is then attached
+to the secondary PDF's live trailer. `QPDFWriter` catches the resulting
+write-time logic error (`QPDFWriter.cc:1072-1155`). It then repeats the setup
+with an indirect root whose source `QPDF` is destroyed before writing, so the
+retained child reaches `QPDF_Destroyed::unparse` rather than being silently
+converted to null (`QPDF.cc:215-236`, `QPDF_Destroyed.cc:18-29`). The final
+direct foreign-root insertion exercises `QPDFObjectHandle::checkOwnership`
+(`QPDFObjectHandle.cc:2355-2365`).
+
+flpdf's `run_test_29` now constructs both live-trailer graphs through
+`ObjectHandle::replace_key` and feeds them to the real `PdfWriter`. The writer
+owner boundary reports qpdf's full mixed-object message, while
+`ObjectHandle::unsafe_shallow_copy` mirrors
+`QPDFObjectHandle::unsafeShallowCopy` (`QPDFObjectHandle.cc:2082-2088`) and
+`QPDF_Dictionary::copy(true)` (`QPDF_Dictionary.cc:36-47`), preserving the
+destroyed child until the canonical writer unparse emits qpdf's destroyed
+handle message. The driver-level regression asserts the three logic-error
+lines and keeps the common `test 29 done` footer at `driver::run`'s boundary.
 
 `flpdf-egzr.3.2.20` で、`QPDF::getTrailer` (`QPDF.hh:311`, `QPDF.cc:2349-2352`)
 に対応する production caller は `Pdf::trailer` / `Pdf::trailer_key_handle` へ移行した。

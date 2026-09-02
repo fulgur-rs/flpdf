@@ -354,8 +354,9 @@ fn ensure_canonical_owner<R: Read + Seek>(
     handle: &crate::ObjectHandle,
 ) -> crate::Result<()> {
     if !pdf.is_canonical_object_handle(handle) {
-        return Err(Error::Unsupported(
-            "QPDFObjectHandle from different QPDF found while writing".to_string(),
+        return Err(Error::Internal(
+            "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
+                .to_string(),
         ));
     }
     Ok(())
@@ -949,4 +950,26 @@ fn enqueue(
     old_to_new.insert(original, new_ref);
     order.push(original);
     queue.push_back(original);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_canonical_owner;
+    use crate::{Error, Pdf};
+
+    #[test]
+    fn writer_foreign_owner_is_a_qpdf_logic_error() {
+        let mut first = Pdf::empty().expect("create first empty PDF");
+        let second = Pdf::empty().expect("create second empty PDF");
+        let root_ref = first.root_ref().expect("first PDF has a root");
+        let foreign_root = first.get_object_handle(root_ref);
+
+        let error = ensure_canonical_owner(&second, &foreign_root)
+            .expect_err("a foreign object must be rejected by the writer");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
+        ));
+    }
 }
