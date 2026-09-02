@@ -81,6 +81,51 @@ fn malformed_recovery_pdf() -> Vec<u8> {
     pdf
 }
 
+fn complete_json_for_test_89() -> &'static str {
+    r#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {"value": {"/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": 0},
+      "obj:3 0 R": {"value": 0},
+      "obj:4 0 R": {"value": 0},
+      "obj:5 0 R": {"value": ["/NotADictionary"]},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 6}}
+    }
+  ]
+}"#
+}
+
+fn semantically_invalid_json_for_test_89() -> &'static str {
+    r#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {},
+      "trailer": {"value": {}}
+    }
+  ]
+}"#
+}
+
+fn partial_json_for_test_90() -> &'static str {
+    // qpdf's `updateFromJSON` replaces the entire trailer object wholesale
+    // rather than merging keys into the existing one (`QPDF_json.cc:611`,
+    // `this->pdf.m->trailer = makeObject(value);`), so a partial update must
+    // re-specify `/Root` to keep pointing at the destination PDF's existing
+    // catalog (`minimal.pdf`'s `1 0 R`) or the document becomes rootless.
+    r#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {
+      "obj:7 0 R": {"value": {"/strings": []}},
+      "trailer": {"value": {"/Root": "1 0 R", "/QTest": "7 0 R"}}
+    }
+  ]
+}"#
+}
+
 const TEST_0_OUTPUT: &str = concat!(
     "/QTest is implicit\n",
     "/QTest is direct and has type null (2)\n",
@@ -156,6 +201,121 @@ fn malformed_pdf_error_precedes_unsupported_test_lookup() {
         .code(2)
         .stdout("")
         .stderr(expected);
+}
+
+#[test]
+fn test_89_accepts_complete_json_input_and_emits_the_mutation_warnings() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test-89.json");
+    fs::write(&input, complete_json_for_test_89()).expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["89", input])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 89");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"test 89 done\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("operation for ").count(), 4);
+}
+
+#[test]
+fn test_89_drains_accumulated_warnings_before_the_terminal_json_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test-89-bad.json");
+    fs::write(&input, semantically_invalid_json_for_test_89()).expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["89", input])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 89");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("object must have exactly one of \"value\" or \"stream\""));
+    assert!(stderr.trim_end().ends_with("errors found in JSON"));
+}
+
+#[test]
+fn test_90_applies_the_json_update_before_type_mismatch_mutations() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test-90.json");
+    fs::write(&input, partial_json_for_test_90()).expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["90", minimal_pdf(), input])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 90");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"test 90 done\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // 3 dictionary-typed `appendItem` mismatches: the update's own trailer,
+    // "obj:7 0 R", and the final `pdf.getRoot().appendItem(null)`
+    // (test_driver.cc:3184) against the destination PDF's actual Catalog.
+    assert_eq!(
+        stderr
+            .matches("operation for array attempted on object of type dictionary")
+            .count(),
+        3
+    );
+    assert!(stderr.contains("operation for integer attempted on object of type array"));
+}
+
+#[test]
+fn test_90_translates_a_missing_update_file_through_the_crt_open_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing-update.json");
+    let missing = missing.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["90", minimal_pdf(), missing])
+        .output()
+        .expect("run test 90");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("open "));
+    assert!(!stderr.contains("os error"));
+}
+
+#[test]
+fn test_90_drains_accumulated_warnings_before_a_terminal_update_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad-update.json");
+    fs::write(
+        &input,
+        r#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {
+      "obj:1 0 R": {}
+    }
+  ]
+}"#,
+    )
+    .expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["90", minimal_pdf(), input])
+        .output()
+        .expect("run test 90");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("object must have exactly one of \"value\" or \"stream\""));
+    assert!(stderr.trim_end().ends_with("errors found in JSON"));
 }
 
 #[test]
@@ -254,6 +414,23 @@ fn test_53_flushes_repair_diagnostics_before_object_output() {
         .stderr(predicates::str::contains(
             "Attempting to reconstruct cross-reference table",
         ));
+}
+
+#[test]
+fn test_60_completes_all_resource_merges_and_writes_output() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    let output = driver()
+        .args(["60", minimal_pdf()])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 60");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("third merge\n"));
+    assert!(stdout.contains("fourth merge\n"));
+    assert!(directory.path().join("a.pdf").is_file());
 }
 
 #[test]

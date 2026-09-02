@@ -49,25 +49,15 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         Ok(n) => n,
         Err(error) => return write_error_bytes(stdout, stderr, &error),
     };
-    // qpdf's test 89 builds `pdf` from a JSON export via
-    // QPDF::createFromJSON(filename1) (test_driver.cc:3522-3523) instead of
-    // parsing a PDF at all -- filename1 is a .json file for this test
-    // number, so the ordinary open path below cannot be used.
-    // GAP(QPDF::createFromJSON): flpdf has no constructor for building a Pdf
-    // from a QPDF JSON export (`document_json.rs`'s own module doc: the
-    // input side "has no counterpart here"). `test_88_98::run_test_89`
-    // exists, assuming an already-open `pdf`, for when this primitive
-    // lands.
-    if n == 89 {
-        return write_error(
-            stdout,
-            stderr,
-            "test 89 requires QPDF::createFromJSON, which is not implemented in flpdf",
-        );
-    }
-
     let filename = args[2].as_os_str();
     let arg2 = args.get(3).map(OsString::as_os_str);
+
+    // qpdf's test 89 calls QPDF::createFromJSON(filename1) instead of
+    // opening filename1 as a PDF (`test_driver.cc:3522-3523`). Keep that
+    // document-construction boundary before the ordinary PDF input path.
+    if n == 89 {
+        return run_test_89_from_json(filename, stdout, stderr);
+    }
 
     // qpdf's runtest() (test_driver.cc:3463-3538) picks how to load
     // filename1 based on n:
@@ -82,7 +72,6 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     //    opens its own file(s) via arg2 where relevant) instead. The empty
     //    Pdf used below is the Rust equivalent of qpdf's default-constructed
     //    QPDF for these tests; it must be created without touching filename1.
-    //  - n==89: QPDF::createFromJSON -- handled above, before this point.
     //  - everything else: read filename1 into memory. qpdf's n%2/n%4
     //    branching there (processFile(name) vs processFile(FILE*) vs
     //    processMemoryFile) only selects which overload to exercise for its
@@ -974,6 +963,69 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     0
 }
 
+/// Run qpdf's JSON-input-only test 89 without constructing an intermediate PDF
+/// from the filename. The complete JSON document boundary returns the same
+/// live handle graph that the ordinary driver dispatch consumes.
+fn run_test_89_from_json(filename: &OsStr, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
+    let filename_diagnostic = os_str_diagnostic_bytes(filename);
+    let source = match std::fs::File::open(filename) {
+        Ok(source) => std::io::BufReader::new(source),
+        Err(error) => {
+            let crt_message = crt_open_error_message(filename);
+            return write_error_bytes(
+                stdout,
+                stderr,
+                &open_error_bytes(&filename_diagnostic, crt_message.as_deref(), &error),
+            );
+        }
+    };
+    let input_name = String::from_utf8_lossy(filename_diagnostic.as_ref()).into_owned();
+    let mut pdf = match Pdf::create_from_json_with_options(
+        source,
+        input_name,
+        PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(pdf) => pdf,
+        Err(error) => {
+            // qpdf's own warning callback prints each JSON validation warning
+            // synchronously as the reactor records it, before the terminal
+            // "errors found in JSON" exception unwinds. Drain the retained
+            // diagnostics through the same open-failure route the ordinary
+            // PDF open path uses (`write_open_failure`) before the terminal
+            // message, rather than losing them with the dropped `Pdf`.
+            let source = if let Some((source, diagnostics)) = error.open_failure() {
+                for diagnostic in diagnostics.entries() {
+                    if write_warning(&filename_diagnostic, diagnostic, stdout, stderr).is_err() {
+                        return 2;
+                    }
+                }
+                source
+            } else {
+                &error
+            };
+            return write_error(stdout, stderr, &source.to_string());
+        }
+    };
+    let mut diagnostics_written = 0;
+    if let Err(error) = test_88_98::run_test_89(
+        &mut pdf,
+        &filename_diagnostic,
+        None,
+        stdout,
+        stderr,
+        &mut diagnostics_written,
+    ) {
+        return write_error(stdout, stderr, &error.to_string());
+    }
+    if writeln!(stdout, "test 89 done").is_err() {
+        return 2;
+    }
+    0
+}
+
 /// qpdf's `runtest` input dispatch skips `filename1` for these test numbers
 /// (`qpdf/test_driver.cc:3463-3490`). Keep this list at the driver boundary so
 /// ignored tests do not acquire accidental filesystem or recovery behavior
@@ -1331,7 +1383,7 @@ fn write_stderr_bytes(
 mod tests {
     use super::{
         crt_open_error_message, format_nntree_exception, has_interior_nul, open_error_bytes,
-        open_pdf_error_bytes, run, write_error_bytes, write_warning,
+        open_pdf_error_bytes, run, run_test_89_from_json, write_error_bytes, write_warning,
     };
     use flpdf::Diagnostic;
     use std::{
@@ -1690,5 +1742,110 @@ requested value of integer is too big; returning INT_MAX\n"
         assert!(stderr.is_empty());
         assert!(stdout.bytes.ends_with(b"unparseResolved: null\n"));
         stdout.flush().expect("flush footer writer");
+    }
+
+    fn complete_json_for_test_89() -> &'static [u8] {
+        br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {"value": {"/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": 0},
+      "obj:3 0 R": {"value": 0},
+      "obj:4 0 R": {"value": 0},
+      "obj:5 0 R": {"value": ["/NotADictionary"]},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 6}}
+    }
+  ]
+}"#
+    }
+
+    #[test]
+    fn json_test_89_open_failure_uses_the_qpdf_open_error_boundary() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let missing = directory.path().join("missing.json");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_test_89_from_json(missing.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+        assert!(stderr.starts_with(b"open "));
+    }
+
+    #[test]
+    fn json_test_89_create_failure_is_reported_before_body_dispatch() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("malformed.json");
+        std::fs::write(&input, b"not JSON").expect("write malformed JSON");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn json_test_89_body_failure_is_reported_after_document_creation() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("test-89.json");
+        std::fs::write(&input, complete_json_for_test_89()).expect("write JSON fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = WriteFailure;
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn json_test_89_create_diagnostic_drain_stops_on_a_write_failure() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("test-89-semantic.json");
+        std::fs::write(
+            &input,
+            br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {},
+      "trailer": {"value": {}}
+    }
+  ]
+}"#,
+        )
+        .expect("write semantically invalid JSON fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = WriteFailure;
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn json_test_89_footer_failure_is_reported_after_body_success() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("test-89.json");
+        std::fs::write(&input, complete_json_for_test_89()).expect("write JSON fixture");
+        let mut stdout = FooterFailure::default();
+        let mut stderr = Vec::new();
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stderr.len() >= 4);
+        stdout.flush().expect("flush footer failure writer");
     }
 }

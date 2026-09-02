@@ -404,3 +404,32 @@ fn import_aggregates_semantic_errors_after_incremental_parsing() {
         .iter()
         .any(|diagnostic| diagnostic.message.contains("exactly one of")));
 }
+
+#[test]
+fn create_from_json_wraps_a_semantic_failure_with_its_accumulated_diagnostics() {
+    let input: &[u8] = br#"{
+      "qpdf": [
+        {"jsonversion": 2, "pdfversion": "1.3"},
+        {
+          "obj:1 0 R": {},
+          "trailer": {"value": {}}
+        }
+      ]
+    }"#;
+
+    let error = match Pdf::create_from_json(Cursor::new(input), "semantic.json") {
+        Ok(_) => panic!("object without value or stream must fail"),
+        Err(error) => error,
+    };
+
+    let (source, diagnostics) = error
+        .open_failure()
+        .expect("a semantic import failure with recorded warnings wraps as OpenFailure");
+    assert!(
+        matches!(source, Error::System(message) if message == "semantic.json: errors found in JSON")
+    );
+    assert!(diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("exactly one of")));
+}
