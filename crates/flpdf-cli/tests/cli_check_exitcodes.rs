@@ -958,7 +958,7 @@ fn rewrite_repair_warnings_use_qpdf_stderr_format() {
         .assert()
         .code(3)
         .stderr(predicate::str::contains(format!(
-            "WARNING: {path}: file is damaged\n"
+            "WARNING: {path}: file is damaged{EOL}"
         )))
         .stderr(predicate::str::contains("warning: ").not())
         .stderr(predicate::str::contains(
