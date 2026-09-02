@@ -128,7 +128,13 @@ impl ObjectHandleParserCallbacks for ResourceFinder {
         self.handle_object_handle(&object, offset, length)
     }
 
-    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+    fn handle_diagnostic(
+        &mut self,
+        _source_description: &str,
+        _object_description: &str,
+        _offset: usize,
+        _message: &str,
+    ) -> Result<()> {
         self.had_diagnostics = true;
         Ok(())
     }
@@ -151,7 +157,7 @@ mod tests {
 
     fn find(input: &[u8]) -> Result<ResourceFinder> {
         let mut finder = ResourceFinder::default();
-        parse_content_stream_handles(input, None, &mut finder)?;
+        parse_content_stream_handles(input, None, "", &mut finder)?;
         Ok(finder)
     }
 
@@ -179,7 +185,7 @@ mod tests {
                 .unwrap(),
             ParseControl::Continue
         );
-        ObjectHandleParserCallbacks::handle_diagnostic(&mut finder, 2, "recovered")
+        ObjectHandleParserCallbacks::handle_diagnostic(&mut finder, "", "content", 2, "recovered")
             .expect("diagnostics are warning-only");
 
         assert!(finder.had_diagnostics());
@@ -199,7 +205,7 @@ mod tests {
 
     fn dump_flpdf_resource_finder(input: &[u8]) -> String {
         let mut finder = ResourceFinder::default();
-        parse_content_stream_handles(input, None, &mut finder).unwrap();
+        parse_content_stream_handles(input, None, "", &mut finder).unwrap();
         let mut records = String::new();
         for name in finder.names() {
             writeln!(records, "name\t{}", qpdf_name_hex(name)).unwrap();

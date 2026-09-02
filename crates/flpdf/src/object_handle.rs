@@ -5535,6 +5535,7 @@ impl ObjectHandle {
         parse_content_stream_handles(
             &data,
             contents.context().or_else(|| self.context()),
+            &all_description,
             callbacks,
         )
     }

@@ -97,7 +97,7 @@ pub(crate) fn replace_resource_names(
     }
 
     let mut finder = ResourceFinder::default();
-    if parse_content_stream_handles(input, None, &mut finder).is_err() {
+    if parse_content_stream_handles(input, None, "", &mut finder).is_err() {
         return Ok(None);
     }
 
