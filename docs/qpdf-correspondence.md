@@ -1288,6 +1288,41 @@ missing として傘で数えていたが、個々の `Pl_*` は下の各行で 
 逸脱候補として個別に分類されており**二重計上**だった。傘の行を `Pipeline.cc`
 本体（114 行）に限定し、真に未マップな qpdf 行だけを ❌ に数えるよう改めた。
 
+### `test_driver` test 50
+
+`qpdf/test_driver.cc:1940-1953` は trailer の `/Dict1` と `/Dict2` を live handle として
+取得し、`mergeResources` 後の `d1.getJSON(JSON::LATEST)`を出力する。続く
+`mergeResources(d2.getKey("/k1"))` は top-level type mismatch の no-op であり、その後
+`d1.getResourceNames()`が返す resource dictionary の二段目のキーを sorted set の順に
+`std::cout`へ出力する。`getResourceNames`の公開契約は
+`include/qpdf/QPDFObjectHandle.hh:831-835`、実装は
+`libqpdf/QPDFObjectHandle.cc:1156-1170`で、receiver と各top-level valueのdictionary
+判定を行い、dictionary-valued entryのキーをunionする。
+
+flpdfは既存の canonical `ObjectHandle::merge_resources` と
+`ObjectHandle::get_resource_names`を使い、driverは返されたname bytesをそのまま
+stdoutへ書く。警告は既存の`emit_new_diagnostics`でconsumer出力前に排出し、resource
+traversalやwarning formatterをdriverへ複製しない。Pinned qpdf 11.9.0の
+`merge-dict.pdf`における該当出力は次の10行と`test 50 done`（exit 0）である。
+
+```text
+/A
+/B
+/C
+/a
+/b
+/c
+/d
+/e
+/indirect2
+/recursive
+test 50 done
+```
+
+qtestの`merge-dictionary 1`はこのdriver consumerを比較し、JSONのmerged body、nameの
+順序、footer、exit 0を同一runで検証する。qpdfの`test_50`本体は`QPDFWriter`を呼ばず、
+`test 50 done`は共通driver boundaryが出力する。
+
 ### `test_driver` test 17
 
 `qpdf/test_driver.cc:776-793` は重複した `/Pages /Kids` を含む
