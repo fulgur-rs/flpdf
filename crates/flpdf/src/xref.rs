@@ -23,7 +23,8 @@ use crate::parser::{
 };
 use crate::reader::file_object::{
     finish_file_object_handle, parse_file_object_handle_syntax, parse_file_object_header,
-    FileObjectDiagnostic, HandleFileObjectRead, RecoveryPolicy, ResolvedStreamLength,
+    FileObjectDiagnostic, FileObjectDiagnosticKind, HandleFileObjectRead, RecoveryPolicy,
+    ResolvedStreamLength,
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
@@ -334,6 +335,19 @@ impl XrefEntryLookup<'_> {
     }
 }
 
+fn reconstructed_reference_offsets(entries: &BTreeMap<ObjectRef, XrefEntry>) -> Rc<[u64]> {
+    let mut offsets: Vec<u64> = entries
+        .values()
+        .filter_map(|entry| match entry {
+            XrefEntry::Uncompressed { offset } => Some(*offset),
+            XrefEntry::Compressed { .. } | XrefEntry::Free { .. } => None,
+        })
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    Rc::from(offsets)
+}
+
 /// The short-lived document context used while qpdf is reading an xref
 /// stream. It exists before the post-open `ResolverCore`, but it still gives
 /// every parsed direct child the same weak `DocumentResolver` and gives every
@@ -346,9 +360,37 @@ struct BootstrapHandleDocument {
     /// values and shared diagnostics do not require the full input buffer.
     bytes: OnceCell<Rc<[u8]>>,
     entry_lookup: RefCell<BTreeMap<ObjectRef, XrefEntry>>,
+    /// Sorted reconstructed object offsets used only to bound bootstrap
+    /// reference reads during recovery. Normal active-section reads leave
+    /// this unset and retain qpdf's unbounded source view.
+    reference_offsets: RefCell<Option<Rc<[u64]>>>,
     options: XrefLoadOptions,
     state: Rc<RefCell<BootstrapHandleState>>,
     resolver: RefCell<Option<Weak<dyn DocumentResolver>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceReadWindow {
+    end: usize,
+    fallback_end: usize,
+}
+
+/// A single attempt to read an uncompressed bootstrap object at a bounded
+/// `end`, with its diagnostics held back (rather than pushed immediately)
+/// until the caller decides whether this attempt or a wider retry wins.
+struct UncompressedObjectRead {
+    value: ObjectValue,
+    parsed_offset: i64,
+    /// Whether `complete_handle_stream` fell back to
+    /// `recover_stream_boundary`'s heuristic `endstream`/`endobj` search
+    /// (signaled by `FileObjectDiagnosticKind::AttemptingStreamLengthRecovery`)
+    /// rather than validating the declared `/Length` boundary exactly. A
+    /// truncated window can make that heuristic search accept a terminator
+    /// -- empty or not -- that only exists because the real one lies beyond
+    /// `end`, so this is the caller's signal to retry through the wider
+    /// fallback window rather than trusting this attempt's result.
+    used_heuristic_recovery: bool,
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl std::fmt::Debug for BootstrapHandleDocument {
@@ -374,6 +416,7 @@ impl BootstrapHandleDocument {
         let document = Rc::new(Self {
             bytes: source_bytes,
             entry_lookup: RefCell::new(entry_lookup.owned_entries()),
+            reference_offsets: RefCell::new(None),
             options,
             state,
             resolver: RefCell::new(None),
@@ -389,6 +432,34 @@ impl BootstrapHandleDocument {
 
     fn refresh_entry_lookup(&self, entry_lookup: XrefEntryLookup<'_>) {
         *self.entry_lookup.borrow_mut() = entry_lookup.owned_entries();
+    }
+
+    fn set_reference_offsets(&self, reference_offsets: Option<Rc<[u64]>>) {
+        *self.reference_offsets.borrow_mut() = reference_offsets;
+    }
+
+    fn reference_read_window(&self, offset: u64, source_len: usize) -> ReferenceReadWindow {
+        let Some(offsets) = self.reference_offsets.borrow().as_ref().cloned() else {
+            return ReferenceReadWindow {
+                end: source_len,
+                fallback_end: source_len,
+            };
+        };
+        let next_offset_index = offsets.partition_point(|candidate| *candidate <= offset);
+        let end = offsets
+            .get(next_offset_index)
+            .and_then(|offset| usize::try_from(*offset).ok())
+            .unwrap_or(source_len)
+            .min(source_len);
+        let fallback_index = next_offset_index
+            .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
+            .min(offsets.len());
+        let fallback_end = offsets
+            .get(fallback_index)
+            .and_then(|offset| usize::try_from(*offset).ok())
+            .unwrap_or(source_len)
+            .min(source_len);
+        ReferenceReadWindow { end, fallback_end }
     }
 
     fn resolver_weak(&self) -> Weak<dyn DocumentResolver> {
@@ -478,6 +549,7 @@ impl BootstrapHandleDocument {
         }
     }
 
+    // qpdf-deviation-start: qpdf 11.9.0 reads referenced bootstrap objects to EOF; reconstruction-only windows bound flpdf recovery work
     fn read_uncompressed_object(
         &self,
         object_ref: ObjectRef,
@@ -486,11 +558,65 @@ impl BootstrapHandleDocument {
         let start = usize::try_from(offset)
             .ok()
             .ok_or_else(|| Error::parse(0, "object offset does not fit usize"))?;
-        let source_bytes = self.bytes.get().ok_or_else(|| {
+        let source_bytes = Rc::clone(self.bytes.get().ok_or_else(|| {
             Error::Internal("bootstrap resolver source bytes were not initialized".to_owned())
-        })?;
+        })?);
+        let window = self.reference_read_window(offset, source_bytes.len());
+        let narrow = self.read_uncompressed_object_with_end(
+            object_ref,
+            offset,
+            start,
+            window.end,
+            &source_bytes,
+        );
+        // A truncated window can also make `read_uncompressed_object_with_end`
+        // *succeed* with a bogus result instead of failing: under
+        // `RecoveryPolicy::Bounded`, a stream whose real `endstream`/`endobj`
+        // terminator lies beyond `window.end` makes `complete_handle_stream`
+        // fall back to `recover_stream_boundary`'s heuristic search, which can
+        // accept a terminator -- empty recovered data, or a real but earlier
+        // `endobj`/`endstream` match, either way short of the true boundary --
+        // purely because the window cut off what lies past it. Retry through
+        // the wider fallback window whenever that heuristic path was taken,
+        // not only when the narrow attempt's result happened to come back
+        // empty or an outright `Err`.
+        let should_retry = window.fallback_end > window.end
+            && match &narrow {
+                Err(Error::Parse { .. }) => true,
+                Ok(read) => read.used_heuristic_recovery,
+                Err(_) => false, // cov:ignore: the only non-Parse error this attempt can return is the already-defensive "did not produce a direct value" Internal error below, which the parser's own contract makes unreachable
+            };
+        let accepted = if should_retry {
+            self.read_uncompressed_object_with_end(
+                object_ref,
+                offset,
+                start,
+                window.fallback_end,
+                &source_bytes,
+            )
+        } else {
+            narrow
+        }?;
+        // Discard whichever attempt was not accepted rather than pushing its
+        // diagnostics too: a document qpdf could read with a single unbounded
+        // pass must not surface warnings from a speculative narrow read this
+        // window-bounding mechanism alone introduced.
+        for diagnostic in accepted.diagnostics {
+            self.push_diagnostic(diagnostic);
+        }
+        Ok((accepted.value, accepted.parsed_offset))
+    }
+
+    fn read_uncompressed_object_with_end(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        start: usize,
+        end: usize,
+        source_bytes: &[u8],
+    ) -> Result<UncompressedObjectRead> {
         let input = source_bytes
-            .get(start..)
+            .get(start..end)
             .ok_or_else(|| Error::parse(start, "object is beyond the end of the file"))?;
         let policy = self.object_policy();
         let actual_object_ref =
@@ -533,14 +659,24 @@ impl BootstrapHandleDocument {
                 source_bytes,
             )
             .map_err(|error| error.rebase_offset(start))?;
-        for diagnostic in &completed.diagnostics {
-            self.push_diagnostic(xref_file_object_diagnostic(
-                XrefObjectDescription::Ordinary,
-                completed.object_ref,
-                offset,
-                diagnostic.clone(),
-            ));
-        }
+        let used_heuristic_recovery = completed.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                FileObjectDiagnosticKind::AttemptingStreamLengthRecovery
+            )
+        });
+        let diagnostics = completed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                xref_file_object_diagnostic(
+                    XrefObjectDescription::Ordinary,
+                    completed.object_ref,
+                    offset,
+                    diagnostic.clone(),
+                )
+            })
+            .collect();
         let parsed_offset = completed.object.get_parsed_offset();
         let _ = completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
@@ -551,8 +687,14 @@ impl BootstrapHandleDocument {
             ))
         })?;
         // cov:ignore-end
-        Ok((value.0, parsed_offset))
+        Ok(UncompressedObjectRead {
+            value: value.0,
+            parsed_offset,
+            used_heuristic_recovery,
+            diagnostics,
+        })
     }
+    // qpdf-deviation-end
 
     fn resolve_objects_in_stream(&self, stream_number: u32) -> Result<()> {
         if !self
@@ -859,14 +1001,16 @@ impl<'bytes> XrefReadContext<'bytes> {
         registration: &XrefRegistration,
         options: XrefLoadOptions,
     ) -> Self {
-        let (entry_lookup, shared) = match spec {
+        let (entry_lookup, shared, reference_offsets) = match spec {
             XrefReadContextSpec::ActiveSection => (
                 XrefEntryLookup::Registration(&registration.entries),
                 empty_bootstrap_cache(),
+                None,
             ),
             XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache } => (
                 XrefEntryLookup::Registration(&registration.entries),
                 Rc::clone(bootstrap_cache),
+                None,
             ),
             XrefReadContextSpec::Reconstruction { line_scan_entries } => (
                 XrefEntryLookup::Reconstruction {
@@ -874,6 +1018,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                     registration_entries: &registration.entries,
                 },
                 empty_bootstrap_cache(),
+                Some(reconstructed_reference_offsets(line_scan_entries)),
             ),
             XrefReadContextSpec::ReconstructionWithCache {
                 line_scan_entries,
@@ -884,6 +1029,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                     registration_entries: &registration.entries,
                 },
                 Rc::clone(bootstrap_cache),
+                Some(reconstructed_reference_offsets(line_scan_entries)),
             ),
         };
         let document = {
@@ -902,6 +1048,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                 document
             }
         };
+        document.set_reference_offsets(reference_offsets);
         let handle_diagnostics_len = shared
             .borrow()
             .handle_state
@@ -2222,17 +2369,17 @@ pub(crate) fn recover_xref_entries(bytes: &[u8], capture_trailer: bool) -> Resul
     })
 }
 
-/// How many further offset-*positions* (not bytes) a truncated candidate's
-/// window may extend into on a fallback retry, independent of every other
+/// How many further offset-*positions* (not bytes) a truncated reconstruction
+/// read window may extend into on a fallback retry, independent of every other
 /// entry's own retries. Bounding by position rather than sharing a global
 /// retry budget across the whole scan means no fixed number of unrelated,
 /// individually-truncated entries earlier in the (ascending object-number)
-/// scan can ever deny a later, genuine candidate its own retry -- qpdf's
-/// per-object recovery has no shared budget at all. Total work stays
-/// O(file size): at most this many *additional* candidates are examined per
+/// scan can ever deny a later, genuine candidate or referenced object its own
+/// retry. qpdf's per-object recovery has no shared budget at all. Total work
+/// stays O(file size): at most this many additional offsets are examined per
 /// retry, and only entries within this many positions of the end of the
 /// offset-sorted list can ever have their retry reach all the way to EOF.
-const XREF_CANDIDATE_FALLBACK_SPAN: usize = 64;
+const XREF_RECONSTRUCTION_FALLBACK_SPAN: usize = 64;
 
 /// qpdf's second trailer-recovery fallback (`reconstruct_xref`, `QPDF.cc:577-608`,
 /// qpdf 11.9.0): entered only when the line scan found no usable trailer dictionary.
@@ -2481,7 +2628,7 @@ struct XrefStreamCandidate {
 /// the offset of its byte-adjacent neighbor, retrying with a wider window
 /// when that truncates a real object (a header-like line recorded inside an
 /// object's own payload can become a bogus next offset). That retry extends
-/// by [`XREF_CANDIDATE_FALLBACK_SPAN`] further offset-*positions* rather
+/// by [`XREF_RECONSTRUCTION_FALLBACK_SPAN`] further offset-*positions* rather
 /// than sharing one global attempt-count budget across the whole scan:
 /// a shared budget lets enough earlier, unrelated truncated entries deny a
 /// later, genuine candidate its own retry, which qpdf's per-object recovery
@@ -2542,7 +2689,7 @@ fn find_xref_stream_trailer_candidate(
                         return None;
                     }
                     let wide_index = next_offset_index
-                        .saturating_add(XREF_CANDIDATE_FALLBACK_SPAN)
+                        .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
                         .min(offsets.len());
                     let wide_end = offsets
                         .get(wide_index)
@@ -3592,6 +3739,34 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 #[cfg(test)]
 mod final_handle_tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    fn malformed_candidate_fixture(count: usize) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        for index in 1..=count {
+            let target = count + index;
+            bytes.extend_from_slice(
+                format!(
+                    "{index} 0 obj\n<< /Type {target} 0 R /Length 0 /W [1 1 1] /Size 0 >>\nstream\nendstream\nendobj\n"
+                )
+                .as_bytes(),
+            );
+        }
+        for index in 1..=count {
+            let target = count + index;
+            // Each generated target must end its own line: the reconstruction
+            // line scan only recognizes an "N G obj" header as the *first*
+            // token of a physical line, so a trailing space here (rather than
+            // a newline) would concatenate the next target's header onto this
+            // one's unterminated literal, leaving every target after the
+            // first unreachable by the line scan.
+            bytes.extend_from_slice(
+                format!("{target} 0 obj\n(unterminated target {target}\n").as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(b"\nstartxref\n999999\n%%EOF\n");
+        bytes
+    }
 
     #[test]
     fn bootstrap_document_construction_defers_the_source_snapshot() {
@@ -3606,6 +3781,273 @@ mod final_handle_tests {
         assert!(
             document.bytes.get().is_none(),
             "constructing the bootstrap owner must not copy the complete input"
+        );
+    }
+
+    /// Builds and recovers a [`malformed_candidate_fixture`] of `count`
+    /// candidates, asserting the expected recovery failure, and returns the
+    /// elapsed wall-clock time.
+    fn timed_malformed_candidate_recovery(count: usize) -> Duration {
+        let bytes = malformed_candidate_fixture(count);
+        let started = Instant::now();
+        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(&bytes), true)
+            .expect_err("the fixture has no trailer dictionary");
+        assert!(error
+            .to_string()
+            .contains("unable to find trailer dictionary while recovering damaged file"));
+        started.elapsed()
+    }
+
+    #[test]
+    fn reconstruction_bounds_referenced_reads_for_malformed_candidates() {
+        // Compare a 10x candidate-count increase's elapsed time against a
+        // small baseline rather than asserting an absolute wall-clock
+        // ceiling: an absolute deadline is indistinguishable from a slow or
+        // instrumented CI runner (e.g. under `cargo llvm-cov`), while an
+        // O(n^2) regression -- the failure mode this test guards against --
+        // would scale roughly 100x over this 10x input increase, far past
+        // any noise an absolute ceiling would otherwise need to tolerate.
+        // The `+ 200ms` floor absorbs fixed overhead the ratio alone can't,
+        // since `small` can be small enough for noise to dominate a pure
+        // multiple.
+        let small = timed_malformed_candidate_recovery(500);
+        let large = timed_malformed_candidate_recovery(5_000);
+        assert!(
+            large < small * 20 + Duration::from_millis(200),
+            "elapsed time scaled worse than the bounded-window guard allows: \
+             small (500 candidates) = {small:?}, large (5,000 candidates) = {large:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruction_reference_read_window_uses_adjacent_offset_and_fallback_positions() {
+        let mut entries = BTreeMap::new();
+        for index in 0..=70 {
+            let object_ref = ObjectRef::new(index + 1, 0);
+            entries.insert(
+                object_ref,
+                XrefEntry::Uncompressed {
+                    offset: u64::from(index) * 10,
+                },
+            );
+        }
+        entries.insert(ObjectRef::new(100, 0), XrefEntry::Free { next: 0 });
+        entries.insert(
+            ObjectRef::new(101, 0),
+            XrefEntry::Compressed {
+                stream: 1,
+                index: 0,
+            },
+        );
+        let context = XrefReadContext::new(
+            &[0; 800],
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.document.reference_read_window(10, 800),
+            ReferenceReadWindow {
+                end: 20,
+                fallback_end: 660,
+            }
+        );
+        let shared = empty_bootstrap_cache();
+        let cached_context = XrefReadContext::new(
+            &[0; 800],
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries: &entries,
+                bootstrap_cache: &shared,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+        assert_eq!(
+            cached_context.document.reference_read_window(10, 800),
+            ReferenceReadWindow {
+                end: 20,
+                fallback_end: 660,
+            }
+        );
+    }
+
+    #[test]
+    fn active_reference_read_window_keeps_qpdf_unbounded_view() {
+        let context = XrefReadContext::new(
+            &[0; 800],
+            XrefReadContextSpec::ActiveSection,
+            &XrefRegistration::default(),
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.document.reference_read_window(10, 800),
+            ReferenceReadWindow {
+                end: 800,
+                fallback_end: 800,
+            }
+        );
+    }
+
+    #[test]
+    fn reconstruction_reference_read_retries_with_the_controlled_fallback_window() {
+        let mut bytes = b"1 0 obj\n<< /Length 27 >>\nstream\n".to_vec();
+        bytes.extend_from_slice(b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n");
+        let stream_length = b"aaaa\n2 0 obj\nbbbbbbbbbbbbb\n".len();
+        bytes.extend_from_slice(b"endstream\nendobj\n");
+        assert_eq!(stream_length, 27);
+
+        let first_ref = ObjectRef::new(1, 0);
+        let second_ref = ObjectRef::new(2, 0);
+        let second_offset = b"1 0 obj\n<< /Length 27 >>\nstream\n".len() + b"aaaa\n".len();
+        let mut entries = BTreeMap::new();
+        entries.insert(first_ref, XrefEntry::Uncompressed { offset: 0 });
+        entries.insert(
+            second_ref,
+            XrefEntry::Uncompressed {
+                offset: second_offset as u64,
+            },
+        );
+        let context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (value, _) = context
+            .document
+            .read_uncompressed_object(first_ref, 0)
+            .expect("the fallback window must recover a valid stream");
+        let ObjectValue::Stream { stream_data, .. } = value else {
+            panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
+        };
+        // The narrow window truncates before `endstream`, which
+        // `RecoveryPolicy::Bounded` accepts as a *successful* empty stream
+        // rather than an `Err`, so a weaker `matches!(.., Stream { .. })`
+        // check alone would pass even if the retry never widened the
+        // window. Assert the full 27-byte payload was actually recovered.
+        assert_eq!(
+            stream_data.as_deref().map(Vec::len),
+            Some(stream_length),
+            "the fallback window must recover the stream's real content, not an empty placeholder"
+        );
+    }
+
+    #[test]
+    fn reconstruction_reference_read_retries_a_narrow_window_that_recovers_nonempty_but_truncated_data(
+    ) {
+        // A narrow window's heuristic search can accept a *non-empty* but
+        // still wrong terminator: an `endobj` keyword embedded inside the
+        // real stream payload, found only because the window happens to end
+        // right after it, well before the declared `/Length` boundary.
+        let mut bytes = b"1 0 obj\n<< /Length 40 >>\nstream\n".to_vec();
+        let header_len = bytes.len();
+        let embedded_false_terminator = b"AAAAAAAAAendobj ";
+        let mut payload = embedded_false_terminator.to_vec();
+        payload.resize(40, b'B');
+        assert_eq!(payload.len(), 40);
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let first_ref = ObjectRef::new(1, 0);
+        let second_ref = ObjectRef::new(2, 0);
+        // Land the narrow window's end right after the embedded "endobj ",
+        // inside the payload and well short of its real 40-byte length.
+        let second_offset = header_len + embedded_false_terminator.len();
+        let mut entries = BTreeMap::new();
+        entries.insert(first_ref, XrefEntry::Uncompressed { offset: 0 });
+        entries.insert(
+            second_ref,
+            XrefEntry::Uncompressed {
+                offset: second_offset as u64,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (value, _) = context
+            .document
+            .read_uncompressed_object(first_ref, 0)
+            .expect("the fallback window must recover a valid stream");
+        let ObjectValue::Stream { stream_data, .. } = value else {
+            panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
+        };
+        assert_eq!(
+            stream_data.as_deref().map(Vec::len),
+            Some(payload.len()),
+            "a narrow window's false, non-empty terminator match must not be \
+             accepted over the wider window's real declared-length boundary"
+        );
+
+        let mut collected = Diagnostics::default();
+        context.append_diagnostics_to(&mut collected);
+        // The wider window resolves the declared 40-byte /Length exactly, so
+        // a single unbounded qpdf-style read would produce no diagnostics at
+        // all here. Any entry at all would mean the discarded narrow
+        // attempt's "expected endstream"/"attempting to recover stream
+        // length" warnings leaked through instead of being dropped with it.
+        assert!(
+            collected.entries().is_empty(),
+            "the discarded narrow attempt's recovery diagnostics must not leak \
+             once the wider retry recovers the stream cleanly: {collected:?}"
+        );
+    }
+
+    #[test]
+    fn read_uncompressed_object_pushes_the_accepted_read_s_own_diagnostics() {
+        // No `/Length` at all, so recovery is unavoidable even without any
+        // window truncation (`ActiveSection` never bounds the window, so
+        // there is nothing to retry here) -- this attempt's diagnostics are
+        // the only ones that can ever exist, and they must still reach the
+        // shared diagnostics list once accepted.
+        let bytes = b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n".to_vec();
+        let object_ref = ObjectRef::new(1, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 0 });
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &XrefRegistration::default(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (value, _) = context
+            .document
+            .read_uncompressed_object(object_ref, 0)
+            .expect("a missing /Length recovers through the endstream scan");
+        assert!(matches!(value, ObjectValue::Stream { .. }));
+
+        let mut collected = Diagnostics::default();
+        context.append_diagnostics_to(&mut collected);
+        assert!(
+            collected.entries().iter().any(|diagnostic| diagnostic
+                .message
+                .contains("stream dictionary lacks /Length key")),
+            "the accepted read's own diagnostics must reach the shared list: {collected:?}"
         );
     }
 

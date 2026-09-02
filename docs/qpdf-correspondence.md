@@ -354,6 +354,8 @@ mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObjec
 
 | `QPDF::resolve` / `QPDF::resolveObjectsInStream`（bootstrap cache completion） | `QPDF.cc:1700-1857` | `xref.rs::parse_xref_stream` は xref stream の file-object を `read_file_object_handle` で一度だけ parse し、`parser.rs` の ObjStm member と同じ canonical `ObjectHandle` graphへ installする。 | 🔀 `.2` で raw+handle の二重 parse と live parser の finished-tree conversion を除去。`.3` では post-open `ObjectCache::Resolved` と ObjStm reconciliation を handle identity に切り替えた。pre-`Pdf` bootstrap と `LoadedXref` の raw trailer boundary は後続の writer/final route に残る |
 
+`flpdf-qwh0` では、qpdf 11.9.0 が `reconstruct_xref` の候補ごとに参照 object を offset から EOF まで読む (`QPDF.cc:585-589,1542-1697`) のに対し、flpdf の reconstruction bootstrap contextだけは line-scan で既知になった次の uncompressed offsetまで参照先 readを制限する。候補自身の隣接 windowと同じ64 offset-position fallbackで、実在 objectが候補境界にまたがる場合だけ再試行する。これはqpdfに対応物のないflpdf固有の malformed-input 性能/DoS hardeningであり、`xref.rs` の `qpdf-deviation` markerに記録する。通常のactive xref sectionはqpdfと同じunbounded source viewを維持する。
+
 ## 3. 書き込み — 最大の smear
 
 | qpdf | 行 | flpdf | 状態 |
