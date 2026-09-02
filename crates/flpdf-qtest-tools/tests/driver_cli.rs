@@ -617,6 +617,51 @@ fn test_80_writes_both_annotation_outputs() {
 }
 
 #[test]
+fn test_80_secondary_open_warnings_are_emitted_once_with_secondary_filename() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let assertion = driver()
+        .args([
+            "80",
+            form_fields_and_annotations_fixture(),
+            missing_mediabox_fixture(),
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 80 done\n");
+
+    let expected = format!(
+        "WARNING: {}, object 3 0 at offset 131: kid 0 (from 0) MediaBox is undefined; setting to letter / ANSI A\n",
+        missing_mediabox_fixture()
+    );
+    assert_eq!(assertion.get_output().stderr, expected.as_bytes());
+}
+
+#[test]
+fn test_80_secondary_open_failure_uses_qpdf_open_wording() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing_test80_secondary.pdf");
+    let native_error = fs::read(&missing).expect_err("arg2 fixture must not exist");
+    let error_code = native_error.raw_os_error().expect("native error code");
+    let native_message = unsafe { CStr::from_ptr(libc::strerror(error_code)) }
+        .to_string_lossy()
+        .into_owned();
+    let expected = format!("open {}: {native_message}\n", missing.display());
+
+    driver()
+        .args([
+            "80",
+            form_fields_and_annotations_fixture(),
+            missing.to_str().expect("utf-8 temporary path"),
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
+}
+
+#[test]
 fn test_81_catches_ownerless_type_error_without_opening_input() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let missing = directory.path().join("missing.pdf");

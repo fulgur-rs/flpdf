@@ -11,7 +11,8 @@ use super::{
 use flpdf::{
     job::{JobExitCode, QPDFJob},
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfWriter, Pipeline, PipelineError, PipelineHandle, PipelineResult,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle,
+    PipelineResult,
 };
 
 struct CapturedPipeline {
@@ -35,6 +36,42 @@ impl Pipeline for CapturedPipeline {
         Ok(())
     }
 }
+
+/// Open test 80's second document through qpdf's `processFile(path)` boundary.
+/// Keep warnings suppressed during parsing so the driver can emit the retained
+/// diagnostics exactly once with `arg2`'s filename, and translate a file-open
+/// failure through qpdf's path-aware `QPDFSystemError` wording.
+fn open_test_80_secondary(
+    path: &OsStr,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> flpdf::Result<Pdf<std::fs::File>> {
+    let path_bytes = os_str_diagnostic_bytes(path).into_owned();
+    let file = std::fs::File::open(path).map_err(|error| {
+        let crt_message = crt_open_error_message(path);
+        let message = open_error_bytes(&path_bytes, crt_message.as_deref(), &error);
+        Error::System(String::from_utf8_lossy(&message).into_owned())
+    })?;
+    let secondary = Pdf::open_with_options(
+        file,
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: String::from_utf8_lossy(&path_bytes).into_owned(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut diagnostics_written = 0;
+    emit_new_diagnostics(
+        &secondary,
+        &mut diagnostics_written,
+        &path_bytes,
+        stdout,
+        stderr,
+    )?;
+    Ok(secondary)
+}
+
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
 /// `QPDFAcroFormDocumentHelper::transformAnnotations` (transform the main
 /// file's page-1 annotations in place and add the resulting form fields via
@@ -82,15 +119,8 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let secondary_filename = os_str_diagnostic_bytes(arg2).into_owned();
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(std::fs::File::open(arg2)?))?;
-    let mut secondary_diagnostics = 0;
-    emit_new_diagnostics(
-        &pdf2,
-        &mut secondary_diagnostics,
-        &secondary_filename,
-        stdout,
-        stderr,
-    )?;
+    let mut pdf2 = open_test_80_secondary(arg2, stdout, stderr)?;
+    let mut secondary_diagnostics = pdf2.repair_diagnostics().entries().len();
     let page2_ref = PageDocumentHelper::new(&mut pdf2)
         .get_all_pages()?
         .into_iter()
