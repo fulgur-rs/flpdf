@@ -5024,15 +5024,14 @@ impl ObjectHandle {
     /// - any other existing-`rtype` shape combination (mismatched types,
     ///   or neither dictionary nor array) leaves that entry untouched.
     ///
-    /// # Preconditions
+    /// # Resolution
     ///
-    /// The receiver, `other`, and the top-level resource-category handles
-    /// still use this port's intentionally non-fallible shape accessors, so
-    /// callers must resolve those handles before calling this method. This
-    /// preserves the existing precondition for `as_dictionary` and `as_array`,
-    /// which do not perform hidden I/O and determine the outer merge shape.
-    /// Dictionary key lookup inside a confirmed category uses the fallible
-    /// qpdf-shaped accessors and propagates resolution errors. Nested type
+    /// The receiver, `other`, and each top-level resource-category handle are
+    /// resolved here before the non-fallible `as_dictionary`/`as_array` shape
+    /// accessors inspect them. This mirrors qpdf's `isDictionary`/`isArray`
+    /// calls, which dereference on every invocation. Dictionary key lookup
+    /// inside a confirmed category uses the fallible qpdf-shaped accessors and
+    /// propagates resolution errors. Nested type
     /// inspection follows qpdf: `isScalar()` resolves
     /// every array item (`QPDFObjectHandle.cc:449-452`, with the scalar
     /// accessors following the same `dereference() && ...` pattern, e.g.
@@ -5072,6 +5071,8 @@ impl ObjectHandle {
         other: &ObjectHandle,
         mut conflicts: Option<&mut ResourceConflicts>,
     ) -> Result<()> {
+        self.try_dereference()?;
+        other.try_dereference()?;
         let (Some(_), Some(other_entries)) = (self.as_dictionary(), other.as_dictionary()) else {
             return Ok(());
         };
@@ -5081,6 +5082,8 @@ impl ObjectHandle {
                 continue;
             }
             let mut this_val = self.try_get_key(&rtype)?;
+            this_val.try_dereference()?;
+            other_val.try_dereference()?;
             if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
                 if this_val.is_indirect() {
                     let privatized = this_val.shallow_copy()?;
@@ -15964,6 +15967,105 @@ mod mutation_tests {
         dict.merge_resources(&scalar, None).expect("merge");
         assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
         assert!(dict.get_key(b"/B").is_null());
+    }
+
+    #[test]
+    fn merge_resources_resolves_outer_operands_and_category_dictionaries_like_qpdf() {
+        // qpdf's mergeResources calls isDictionary() on the receiver, other,
+        // and each top-level category, and each call dereferences first
+        // (`QPDFObjectHandle.cc:431-434,1063-1087`). The merge-dict fixture
+        // relies on this for Dict2/k3 -> 8 0 R.
+        let destination_font =
+            ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
+        let (destination, destination_resolver) = identity_tests::resolver_bearing_handle(
+            ObjectValue::Dictionary([(b"Font".to_vec(), destination_font)].into_iter().collect()),
+        );
+        let (other_font, other_font_resolver) =
+            identity_tests::resolver_bearing_handle(ObjectValue::Dictionary(
+                [(b"F2".to_vec(), ObjectHandle::integer(2))]
+                    .into_iter()
+                    .collect(),
+            ));
+        let (other, other_resolver) =
+            identity_tests::resolver_bearing_handle(ObjectValue::Dictionary(
+                [(b"Font".to_vec(), other_font.clone())]
+                    .into_iter()
+                    .collect(),
+            ));
+
+        destination
+            .merge_resources(&other, None)
+            .expect("unresolved qpdf resource operands must merge");
+
+        assert_eq!(
+            destination.get_key(b"/Font").get_key(b"/F2").as_integer(),
+            Some(2)
+        );
+        assert!(destination.is_resolved());
+        assert!(other.is_resolved());
+        assert!(other_font.is_resolved());
+        drop(destination_resolver);
+        drop(other_font_resolver);
+        drop(other_resolver);
+    }
+
+    #[test]
+    fn merge_resources_resolves_an_indirect_top_level_category_array() {
+        let destination = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
+        let (other_procset, resolver) = identity_tests::resolver_bearing_handle(
+            ObjectValue::Array(vec![ObjectHandle::name(b"Text".to_vec())]),
+        );
+        let other = ObjectHandle::dictionary(vec![(b"ProcSet".to_vec(), other_procset)]);
+
+        destination
+            .merge_resources(&other, None)
+            .expect("an unresolved array category must merge");
+
+        let values: Vec<_> = destination
+            .get_key(b"/ProcSet")
+            .as_array()
+            .expect("merged ProcSet array")
+            .into_iter()
+            .filter_map(|value| value.as_name())
+            .collect();
+        assert_eq!(values, vec![b"PDF".to_vec(), b"Text".to_vec()]);
+        assert!(other.get_key(b"/ProcSet").is_resolved());
+        drop(resolver);
+    }
+
+    #[test]
+    fn merge_resources_propagates_outer_and_category_resolution_errors() {
+        let (unresolved_destination, destination_resolver) =
+            identity_tests::error_resolving_handle(ObjectRef::new(90, 0));
+        let other = ObjectHandle::dictionary(vec![]);
+        let error = unresolved_destination
+            .merge_resources(&other, None)
+            .expect_err("receiver resolution failure must propagate");
+        assert!(matches!(error, Error::System(message) if message == "resolver failed"));
+        drop(destination_resolver);
+
+        let destination = ObjectHandle::dictionary(vec![]);
+        let (unresolved_other, other_resolver) =
+            identity_tests::error_resolving_handle(ObjectRef::new(91, 0));
+        let error = destination
+            .merge_resources(&unresolved_other, None)
+            .expect_err("other resolution failure must propagate");
+        assert!(matches!(error, Error::System(message) if message == "resolver failed"));
+        drop(other_resolver);
+
+        let destination =
+            ObjectHandle::dictionary(vec![(b"Font".to_vec(), ObjectHandle::dictionary(vec![]))]);
+        let (unresolved_category, category_resolver) =
+            identity_tests::error_resolving_handle(ObjectRef::new(92, 0));
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), unresolved_category)]);
+        let error = destination
+            .merge_resources(&other, None)
+            .expect_err("category resolution failure must propagate");
+        assert!(matches!(error, Error::System(message) if message == "resolver failed"));
+        drop(category_resolver);
     }
 
     #[test]
