@@ -116,6 +116,11 @@ pub(crate) struct LoadedXrefState {
     /// qpdf's `m->first_xref_item_offset`, populated while reading the xref
     /// section and consumed later by `checkLinearizationInternal`.
     pub(crate) first_xref_item_offset: u64,
+    /// Byte position qpdf's `readTrailer` records for a classic trailer
+    /// keyword. `None` identifies an xref-stream dictionary, whose `/Prev`
+    /// diagnostics have a different qpdf description and remain on that
+    /// existing path.
+    pub(crate) classic_trailer_offset: Option<usize>,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
     /// Objects resolved while reading xref streams stay available to the
@@ -988,7 +993,8 @@ impl<'bytes> XrefReadContext<'bytes> {
 /// - [`Error::Io`] when reading the input fails.
 /// - [`Error::Parse`] when the PDF header, `startxref`, or a cross-reference
 ///   section is malformed (including a `startxref`/`/Prev` offset that does not
-///   fit `usize` and a circular `/Prev` chain).
+///   fit `usize` and a circular `/Prev` chain), or when qpdf's classic trailer
+///   validation rejects `/Size` or `/Prev`.
 /// - [`Error::Missing`] when a required cross-reference stream entry (such as
 ///   `/Size` or `/W`) is absent.
 /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
@@ -1006,7 +1012,8 @@ pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXre
 /// - [`Error::Parse`] when `allow_repair` is `false` and the PDF header is
 ///   missing or its version is not UTF-8, or when `startxref`, a
 ///   cross-reference table or stream, or a `/Prev` chain is malformed
-///   (including offsets that do not fit `usize` and a circular `/Prev` chain).
+///   (including offsets that do not fit `usize` and a circular `/Prev` chain),
+///   or when a classic trailer fails qpdf's `/Size` or `/Prev` validation.
 /// - [`Error::OpenFailure`] when `allow_repair` is `true`, repair diagnostics
 ///   were accumulated, and the linear scan still cannot recover a trailer.
 ///   [`Error::open_failure`] exposes both the terminal source error and the
@@ -1137,6 +1144,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         Some(&mut initial_parse_diagnostics),
         XrefReadContextSpec::ActiveSection,
         Some(&mut observed_first_xref_item_offset),
+        true,
     ) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
@@ -1327,6 +1335,7 @@ fn parse_xref_from_start(
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
     first_xref_item_offset_sink: Option<&mut Option<u64>>,
+    validate_current_classic_trailer: bool,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -1399,6 +1408,7 @@ fn parse_xref_from_start(
                 repair_diagnostics: Diagnostics::default(),
             },
             first_xref_item_offset,
+            classic_trailer_offset: Some(trailer_start),
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache,
@@ -1414,6 +1424,16 @@ fn parse_xref_from_start(
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
         // cov:ignore-end
+        if validate_current_classic_trailer {
+            if let Err(error) = validate_classic_trailer(&loaded.loaded.trailer, trailer_start) {
+                if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                    for diagnostic in loaded.loaded.repair_diagnostics.entries() {
+                        sink.push(diagnostic.clone());
+                    }
+                }
+                return Err(error);
+            }
+        }
         merge_xref_stream_from_classic_trailer(
             bytes,
             xref_pos,
@@ -1440,6 +1460,27 @@ fn parse_xref_from_start(
         error_diagnostics_sink,
         context_spec,
     )
+}
+
+/// Validate the first classic trailer exactly where qpdf's
+/// `QPDF::read_xrefTable` does (`QPDF.cc:902-912`). The trailer offset is the
+/// position immediately after the `trailer` keyword, which is the location
+/// `QPDF::readTrailer` restores on its `InputSource` before constructing the
+/// `QPDFExc` (`QPDF.cc:1313-1327`).
+fn validate_classic_trailer(trailer: &ObjectHandle, trailer_offset: usize) -> Result<()> {
+    if !trailer.try_has_key(b"/Size")? {
+        return Err(Error::parse(
+            trailer_offset,
+            "trailer dictionary lacks /Size key",
+        ));
+    }
+    if !trailer.try_get_key(b"/Size")?.try_is_integer()? {
+        return Err(Error::parse(
+            trailer_offset,
+            "/Size key in trailer dictionary is not an integer",
+        ));
+    }
+    Ok(())
 }
 
 fn merge_bootstrap_handle_state_prefer_source(
@@ -1712,7 +1753,8 @@ fn merge_previous_xref_sections_with_observer(
             registration,
             section_context_spec,
             &loaded.loaded.trailer,
-        );
+            loaded.classic_trailer_offset,
+        )?;
     for diagnostic in previous_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
     }
@@ -1738,6 +1780,7 @@ fn merge_previous_xref_sections_with_observer(
             error_diagnostics_sink.as_deref_mut(),
             section_context_spec,
             first_xref_item_offset_sink.as_deref_mut(),
+            false,
         )?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -1767,7 +1810,8 @@ fn merge_previous_xref_sections_with_observer(
                 registration,
                 section_context_spec,
                 &previous.loaded.trailer,
-            );
+                previous.classic_trailer_offset,
+            )?;
         for diagnostic in previous_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
@@ -1788,16 +1832,37 @@ fn resolve_previous_xref_offset(
     registration: &XrefRegistration,
     context_spec: XrefReadContextSpec<'_>,
     trailer: &ObjectHandle,
-) -> (Option<u64>, Diagnostics, Option<Error>) {
+    trailer_offset: Option<usize>,
+) -> Result<(Option<u64>, Diagnostics, Option<Error>)> {
     let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-    let offset = context
-        .resolve_dictionary_value(trailer, "Prev")
-        .and_then(|offset| parse_non_negative_u64_handle(&offset, "/Prev").ok())
-        .filter(|&offset| offset != 0);
+    context.ensure_source_for_resolution(trailer);
+    let has_previous = trailer.try_has_key(b"/Prev")?;
+    context.sync_handle_diagnostics();
+    let previous = has_previous
+        .then(|| context.resolve_dictionary_value(trailer, "Prev"))
+        .flatten();
+    let (offset, validation_error) = match previous {
+        Some(offset) => match parse_non_negative_u64_handle(&offset, "/Prev") {
+            Ok(offset) => (Some(offset).filter(|&offset| offset != 0), None),
+            Err(_) if trailer_offset.is_some() => (
+                None,
+                Some(Error::parse(
+                    trailer_offset.expect("classic trailer offset is present"),
+                    "/Prev key in trailer dictionary is not an integer",
+                )),
+            ),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
     let reconstruction_trigger = context.take_reconstruction_trigger();
     context.cache.commit();
     let diagnostics = context.diagnostics.clone();
-    (offset, diagnostics, reconstruction_trigger)
+    Ok((
+        offset,
+        diagnostics,
+        reconstruction_trigger.or(validation_error),
+    ))
 }
 
 fn collect_trailer_references(trailer: &ObjectHandle) -> BTreeSet<ObjectRef> {
@@ -1938,6 +2003,7 @@ fn recover_xref_from_linear_scan(
             repair_diagnostics,
         },
         first_xref_item_offset: recovered_first_xref_item_offset,
+        classic_trailer_offset: None,
         trailer_references,
         parsed_xref_streams,
         bootstrap_cache: empty_bootstrap_cache(),
@@ -1976,6 +2042,9 @@ fn merge_recovered_qpdf_state(
     if recovered.first_xref_item_offset == 0 {
         recovered.first_xref_item_offset = accumulated.first_xref_item_offset;
     }
+    recovered.classic_trailer_offset = accumulated
+        .classic_trailer_offset
+        .or(recovered.classic_trailer_offset);
     // qpdf `reconstruct_xref` removes existing type-1 entries before scanning,
     // and `insertReconstructedXrefEntry` suppresses object numbers in that
     // scan's local filter (`QPDF.cc:516-575`, `:1194-1210`). It clears the
@@ -2174,6 +2243,7 @@ fn recover_trailer_from_xref_stream_candidate(
             bootstrap_cache: &candidate.bootstrap_cache,
         },
         None,
+        false,
     ) {
         Ok(reentry) => reentry,
         Err(_) => {
@@ -2533,6 +2603,9 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
         Error::Parse { message, .. } if message == "loop detected following xref tables" => {
             (message.clone(), None)
         }
+        Error::Parse { offset, message } if is_classic_trailer_validation_message(message) => {
+            (format!("(trailer, offset {offset}): {message}"), None)
+        }
         Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
         // qpdf's outer `parse` catches non-QPDF exceptions raised by
         // `read_xref` and turns them into a damaged-PDF exception with the
@@ -2547,6 +2620,15 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
         "Attempting to reconstruct cross-reference table",
         None,
     ));
+}
+
+fn is_classic_trailer_validation_message(message: &str) -> bool {
+    matches!(
+        message,
+        "trailer dictionary lacks /Size key"
+            | "/Size key in trailer dictionary is not an integer"
+            | "/Prev key in trailer dictionary is not an integer"
+    )
 }
 
 fn parse_trailer_candidate(bytes: &[u8], start: usize) -> (Option<ObjectHandle>, Vec<Diagnostic>) {
@@ -3006,6 +3088,7 @@ fn parse_xref_stream(
         } else {
             0
         },
+        classic_trailer_offset: None,
         trailer_references,
         parsed_xref_streams,
         bootstrap_cache,
@@ -3583,6 +3666,108 @@ mod final_handle_tests {
         (bytes, xref)
     }
 
+    fn trailer_value_offset(bytes: &[u8]) -> usize {
+        bytes
+            .windows(b"trailer".len())
+            .position(|window| window == b"trailer")
+            .expect("classic fixture has a trailer keyword")
+            + b"trailer".len()
+    }
+
+    fn classic_xref_with_malformed_previous() -> (Vec<u8>, usize) {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let previous_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R /Prev (bad) >>\n");
+        let previous_trailer = trailer_value_offset(&bytes);
+
+        let current_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R /Prev {previous_xref} >>\n").as_bytes(),
+        );
+        bytes.extend_from_slice(format!("startxref\n{current_xref}\n%%EOF\n").as_bytes());
+        (bytes, previous_trailer)
+    }
+
+    fn assert_strict_classic_trailer_error(trailer: &str, message: &str) {
+        let (bytes, _) = classic_xref_with_trailer(trailer);
+        let offset = trailer_value_offset(&bytes);
+        let mut reader = std::io::Cursor::new(bytes);
+        let error = load_xref_and_trailer(&mut reader)
+            .expect_err("strict classic trailer validation must reject the fixture");
+
+        assert!(matches!(
+            error,
+            Error::Parse {
+                offset: actual_offset,
+                message: actual_message,
+            } if actual_offset == offset && actual_message == message
+        ));
+    }
+
+    #[test]
+    fn strict_classic_xref_rejects_missing_trailer_size() {
+        assert_strict_classic_trailer_error(
+            "<< /Root 1 0 R >>",
+            "trailer dictionary lacks /Size key",
+        );
+    }
+
+    #[test]
+    fn strict_classic_xref_rejects_non_integer_trailer_size() {
+        assert_strict_classic_trailer_error(
+            "<< /Size (bad) /Root 1 0 R >>",
+            "/Size key in trailer dictionary is not an integer",
+        );
+    }
+
+    #[test]
+    fn strict_classic_xref_rejects_non_integer_previous_offset() {
+        let (bytes, offset) = classic_xref_with_malformed_previous();
+        let mut reader = std::io::Cursor::new(bytes);
+        let error = load_xref_and_trailer(&mut reader)
+            .expect_err("strict xref chain validation must reject malformed /Prev");
+
+        assert!(matches!(
+            error,
+            Error::Parse {
+                offset: actual_offset,
+                message,
+            } if actual_offset == offset
+                && message == "/Prev key in trailer dictionary is not an integer"
+        ));
+    }
+
+    #[test]
+    fn repair_mode_reports_classic_trailer_validation_before_recovery() {
+        let (bytes, _) = classic_xref_with_trailer("<< /Root 1 0 R >>");
+        let offset = trailer_value_offset(&bytes);
+        let mut reader = std::io::Cursor::new(bytes);
+        let loaded = load_xref_and_trailer_with_repair(&mut reader, true)
+            .expect("repair mode must recover a trailer missing /Size");
+        let messages: Vec<_> = loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert_eq!(
+            messages,
+            vec![
+                "file is damaged",
+                &format!("(trailer, offset {offset}): trailer dictionary lacks /Size key"),
+                "Attempting to reconstruct cross-reference table",
+            ]
+        );
+    }
+
     #[test]
     fn ordinary_classic_xref_loading_keeps_the_bootstrap_source_lazy() {
         let (bytes, _) = classic_xref_with_trailer("<< /Size 1 /Root 1 0 R >>");
@@ -3733,6 +3918,7 @@ mod final_handle_tests {
             None,
             XrefReadContextSpec::ActiveSection,
             None,
+            true,
         )
         .expect_err("classic trailer must be a dictionary");
         assert!(error.to_string().contains("trailer is not a dictionary"));
@@ -3749,6 +3935,7 @@ mod final_handle_tests {
             None,
             XrefReadContextSpec::ActiveSection,
             None,
+            true,
         )
         .expect_err("a non-integer hybrid offset is invalid");
         assert!(error.to_string().contains("invalid /XRefStm"));

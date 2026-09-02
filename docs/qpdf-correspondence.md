@@ -181,6 +181,18 @@ Phase 2 進行に伴う新規モジュール分割（`job/`, `document_json.rs`,
 
 ---
 
+### Classic xref trailer validation (2026-09-02)
+
+qpdf's `QPDF::read_xrefTable` validates the first classic trailer's visible
+`/Size` and every classic section's `/Prev` before the xref load completes
+(`libqpdf/QPDF.cc:846-945`). The `readTrailer` source position is restored
+before qpdf constructs the `QPDFExc` (`QPDF.cc:1313-1327`), so
+`xref.rs::validate_classic_trailer` and its `classic_trailer_offset` preserve
+the same byte location. Strict `repair=false` opens propagate the detail to
+the qtest driver's `QPDFExc::createWhat` boundary; repair-enabled opens retain
+the qpdf warning sequence before reconstruction. `error-condition 9-11` is the
+consumer coverage for these three paths.
+
 ### qtest metadata consumers (2026-08-12)
 
 `crates/flpdf-qtest-tools/src/metadata.rs` ports the pinned qpdf 11.9.0

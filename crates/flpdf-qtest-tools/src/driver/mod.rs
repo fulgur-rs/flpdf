@@ -1036,6 +1036,23 @@ fn qpdf_ignores_filename(n: i32) -> bool {
 }
 
 fn open_pdf_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
+    if n == 0 {
+        if let Error::Parse { offset, message } = error {
+            if is_classic_trailer_validation_message(message) {
+                let mut output = filename.to_vec();
+                if filename.is_empty() {
+                    output.extend_from_slice(
+                        format!("trailer, offset {offset}: {message}").as_bytes(),
+                    );
+                } else {
+                    output.extend_from_slice(
+                        format!(" (trailer, offset {offset}): {message}").as_bytes(),
+                    );
+                }
+                return output;
+            }
+        }
+    }
     let suffix: Option<Cow<str>> = match error {
         Error::Parse { message, .. } if n == 0 && message == "xref not found" => {
             Some(Cow::Borrowed(": can't find startxref"))
@@ -1063,6 +1080,15 @@ fn open_pdf_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
     } else {
         error.to_string().into_bytes()
     }
+}
+
+fn is_classic_trailer_validation_message(message: &str) -> bool {
+    matches!(
+        message,
+        "trailer dictionary lacks /Size key"
+            | "/Size key in trailer dictionary is not an integer"
+            | "/Prev key in trailer dictionary is not an integer"
+    )
 }
 
 fn write_open_failure(
@@ -1611,6 +1637,16 @@ requested value of integer is too big; returning INT_MAX\n"
         assert_eq!(
             open_pdf_error_bytes(1, b"input.pdf", &error),
             b"input.pdf: error decoding candidate xref stream while recovering damaged file"
+        );
+    }
+
+    #[test]
+    fn strict_trailer_validation_error_gets_qpdf_exception_format() {
+        let error = flpdf::Error::parse(712, "trailer dictionary lacks /Size key");
+
+        assert_eq!(
+            open_pdf_error_bytes(0, b"bad9.pdf", &error),
+            b"bad9.pdf (trailer, offset 712): trailer dictionary lacks /Size key"
         );
     }
 
