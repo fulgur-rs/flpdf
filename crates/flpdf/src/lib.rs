@@ -166,7 +166,6 @@ pub use embedded_files::{
 pub use encryption::permissions::{
     Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig,
 };
-pub use encryption::EncryptionInfo;
 pub use encryption::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, ObjectKeyAlg, PasswordMode,
 };

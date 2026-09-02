@@ -205,8 +205,7 @@ Add a real fixture test:
 fn v2_missing_length_uses_qpdf_128_bit_fallback() {
     let mut pdf = open_fixture("bad-encryption-length.pdf");
     assert!(pdf.is_encrypted());
-    let info = pdf.encryption_info().expect("encryption info").expect("encrypted");
-    assert_eq!(info.length_bits, 128);
+    assert_eq!(pdf.encryption_length_bits(), Some(128));
 }
 ~~~
 

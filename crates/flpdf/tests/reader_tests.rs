@@ -1008,7 +1008,7 @@ fn encryption_inspection_retains_parameters_after_bad_password_without_key() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
     let bytes = std::fs::read(path).expect("encrypted fixture");
-    let mut pdf = Pdf::open_for_encryption_inspection(
+    let pdf = Pdf::open_for_encryption_inspection(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
             password: b"wrong".to_vec(),
@@ -1017,17 +1017,34 @@ fn encryption_inspection_retains_parameters_after_bad_password_without_key() {
     )
     .expect("inspection must retain qpdf's parsed state after BadPassword");
 
-    let info = pdf
-        .encryption_info()
-        .expect("encryption inspection info")
-        .expect("fixture is encrypted");
     assert!(pdf.is_encrypted());
-    assert_eq!(info.r, 3);
-    assert_eq!(info.v, 2);
-    assert!(!info.user_password_matched);
-    assert!(!info.owner_password_matched);
-    assert!(info.user_password.is_empty());
+    assert_eq!(pdf.encryption_revision(), Some(3));
+    assert_eq!(pdf.encryption_version(), Some(2));
+    assert!(!pdf.user_password_matched());
+    assert!(!pdf.owner_password_matched());
+    assert!(pdf
+        .trimmed_user_password()
+        .is_some_and(|password| password.is_empty()));
     assert!(pdf.encryption_file_key().is_none());
+}
+
+#[test]
+fn encryption_parameters_are_exposed_as_qpdf_individual_accessors() {
+    let bytes = committed_encrypted_fixture("v2-rc4-128-r3.pdf");
+    let pdf = Pdf::open_for_encryption_inspection(
+        std::io::Cursor::new(bytes),
+        PdfOpenOptions {
+            password: b"wrong".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("inspection must retain qpdf's parsed state after BadPassword");
+
+    assert_eq!(pdf.encryption_version(), Some(2));
+    assert_eq!(pdf.encryption_revision(), Some(3));
+    assert_eq!(pdf.encryption_length_bits(), Some(128));
+    assert_eq!(pdf.trimmed_user_password(), Some(Vec::new()));
+    assert_eq!(pdf.encryption_methods(), Some(("none", "none", "none")));
 }
 
 /// `uses_weak_crypto()` must still classify a document as weak (RC4) after a
@@ -1078,7 +1095,7 @@ fn uses_weak_crypto_reports_rc4_after_bad_password_inspection_open() {
 #[test]
 fn r5_and_r6_accept_an_rc4_crypt_filter_method() {
     for revision in [5, 6] {
-        let mut pdf = Pdf::open_with_options(
+        let pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_r5_or_r6_unsupported_cf_minimal_pdf(revision)),
             PdfOpenOptions {
                 password: b"userpass".to_vec(),
@@ -1087,17 +1104,15 @@ fn r5_and_r6_accept_an_rc4_crypt_filter_method() {
         )
         .unwrap_or_else(|err| panic!("qpdf opens this document; R={revision} got {err:?}"));
 
-        let info = pdf
-            .encryption_info()
-            .expect("encryption info")
-            .expect("document is encrypted");
-        assert_eq!(info.r, revision);
+        assert_eq!(pdf.encryption_revision(), Some(revision));
         // `/StmF /StdCF` resolves through `/CF` to the RC4 method; `/StrF` is
         // the built-in `/Identity`, i.e. qpdf's `e_none`.
-        assert_eq!(info.stream_method, "RC4", "R={revision}");
-        assert_eq!(info.string_method, "none", "R={revision}");
+        let (stream_method, string_method, file_method) =
+            pdf.encryption_methods().expect("document is encrypted");
+        assert_eq!(stream_method, "RC4", "R={revision}");
+        assert_eq!(string_method, "none", "R={revision}");
         // No `/EFF`, so qpdf mirrors the stream method into the file method.
-        assert_eq!(info.eff_method, "RC4", "R={revision}");
+        assert_eq!(file_method, "RC4", "R={revision}");
         // An R=6 document actively using an RC4 crypt filter is weak crypto
         // too, not just R=5: `uses_weak_crypto()` must look at the effective
         // crypt-filter methods, not only the revision number.
@@ -1859,16 +1874,13 @@ fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
 /// ```
 #[test]
 fn an_unknown_crypt_filter_is_reported_as_unknown() {
-    let mut pdf = Pdf::open(std::io::Cursor::new(encrypted_v4_unknown_cfm_fixture()))
+    let pdf = Pdf::open(std::io::Cursor::new(encrypted_v4_unknown_cfm_fixture()))
         .expect("qpdf opens a document with an unknown /CFM");
 
-    let info = pdf
-        .encryption_info()
-        .expect("encryption info")
-        .expect("document is encrypted");
-    assert_eq!(info.stream_method, "unknown");
-    assert_eq!(info.string_method, "unknown");
-    assert_eq!(info.eff_method, "unknown");
+    assert_eq!(
+        pdf.encryption_methods(),
+        Some(("unknown", "unknown", "unknown"))
+    );
 }
 
 fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate: bool) -> Vec<u8> {
@@ -2442,7 +2454,7 @@ fn pre_v4_documents_still_decrypt_their_streams_with_rc4() {
 #[test]
 fn pre_v4_documents_report_no_crypt_filter_methods() {
     for version in [1, 2] {
-        let mut pdf = Pdf::open_with_options(
+        let pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_legacy_rc4_stream_fixture(version)),
             PdfOpenOptions {
                 ..PdfOpenOptions::default()
@@ -2450,14 +2462,8 @@ fn pre_v4_documents_report_no_crypt_filter_methods() {
         )
         .expect("fixture must authenticate");
 
-        let info = pdf
-            .encryption_info()
-            .expect("encryption info")
-            .expect("document is encrypted");
-        assert_eq!(info.v, version);
-        assert_eq!(info.stream_method, "none");
-        assert_eq!(info.string_method, "none");
-        assert_eq!(info.eff_method, "none");
+        assert_eq!(pdf.encryption_version(), Some(version));
+        assert_eq!(pdf.encryption_methods(), Some(("none", "none", "none")));
     }
 }
 

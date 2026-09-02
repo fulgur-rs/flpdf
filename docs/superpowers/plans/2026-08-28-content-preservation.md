@@ -85,7 +85,7 @@ Expected: the new encrypted assertion fails because the current check output con
 
 - [ ] **Step 3: Extract the qpdf report into the job-owned canonical renderer**
 
-Move the byte-oriented report construction currently duplicated in `flpdf-cli` to the job/inspection boundary. Preserve qpdf’s report order from `QPDFJob.cc:700-742`, use the existing `EncryptionInfo` fields and revision-dependent permission logic, and make `QPDFJob::check` invoke it immediately after the encryption state line and before linearization inspection as in `QPDFJob.cc:744-765`. Keep warning suppression and completion outside the report body.
+Move the byte-oriented report construction currently duplicated in `flpdf-cli` to the job/inspection boundary. Preserve qpdf’s report order from `QPDFJob.cc:700-742`, use qpdf-shaped individual `Pdf` encryption projections and revision-dependent permission logic, and make `QPDFJob::check` invoke it immediately after the encryption state line and before linearization inspection as in `QPDFJob.cc:744-765`. Keep warning suppression and completion outside the report body.
 
 - [ ] **Step 4: Make CLI show-encryption delegate to the shared renderer**
 

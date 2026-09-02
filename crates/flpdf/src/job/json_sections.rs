@@ -1181,16 +1181,12 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
                 .unwrap_or_else(ObjectHandle::null);
             pdf.resolve(&length_handle)?;
             let dictionary_bits = effective_length_bits(v, &length_handle)?;
-            let encryption_info = pdf.encryption_info()?;
             // qpdf reports the derived file-key length, not a raw `/Length`
             // spelling. The initialized encryption snapshot is therefore the
-            // authority after authentication; the dictionary projection is a
-            // defensive fallback for an encrypted inspection object without
-            // an authenticated state.
-            let bits = encryption_info
-                .as_ref()
-                .map(|info| info.length_bits)
-                .unwrap_or(dictionary_bits);
+            // authority after authentication. The dictionary projection is a
+            // defensive fallback for a caller that supplies an encrypted
+            // inspection object without initialized state.
+            let bits = pdf.encryption_length_bits().unwrap_or(dictionary_bits);
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
             let stmf = dict_name_str(pdf, enc, "StmF")?;
@@ -1233,33 +1229,26 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
             // qpdf only exposes a recovered user password when the owner
             // password matched on a V<5 document and the user password did
             // not also match (`QPDFJob.cc:1208-1217`).
-            let recovered_user_password = encryption_info
-                .as_ref()
-                .filter(|info| {
-                    info.v < 5 && info.owner_password_matched && !info.user_password_matched
-                })
-                .map(|info| Json::make_string(&info.user_password))
-                .unwrap_or_else(Json::make_null);
+            let recovered_user_password =
+                if v < 5 && pdf.owner_password_matched() && !pdf.user_password_matched() {
+                    pdf.trimmed_user_password()
+                        .map(|password| Json::make_string(&password))
+                        .unwrap_or_else(Json::make_null)
+                } else {
+                    Json::make_null()
+                };
             json_dictionary([
                 ("capabilities", capabilities),
                 ("encrypted", Json::make_bool(is_encrypted)),
                 (
                     "ownerpasswordmatched",
-                    Json::make_bool(
-                        encryption_info
-                            .as_ref()
-                            .is_some_and(|info| info.owner_password_matched),
-                    ),
+                    Json::make_bool(pdf.owner_password_matched()),
                 ),
                 ("parameters", parameters),
                 ("recovereduserpassword", recovered_user_password),
                 (
                     "userpasswordmatched",
-                    Json::make_bool(
-                        encryption_info
-                            .as_ref()
-                            .is_some_and(|info| info.user_password_matched),
-                    ),
+                    Json::make_bool(pdf.user_password_matched()),
                 ),
             ])
         }

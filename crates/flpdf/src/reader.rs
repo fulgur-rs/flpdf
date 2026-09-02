@@ -9,7 +9,6 @@ use crate::cache::CacheEntry;
 use crate::encryption::password::{password_candidates_for_read, PasswordMode};
 use crate::encryption::permissions::Permissions;
 use crate::encryption::standard::ObjectKeyAlg;
-use crate::encryption::state::{effective_length_bits, EncryptionInfo, EncryptionInspectionState};
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
@@ -258,26 +257,6 @@ const READER_STACK_RED_ZONE: usize = 128 * 1024;
 // supported platform.
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
-fn encryption_info_from_inspection(inspection: &EncryptionInspectionState) -> EncryptionInfo {
-    let mut named_crypt_filters = inspection.named_crypt_filters.clone();
-    named_crypt_filters.sort();
-    EncryptionInfo {
-        v: inspection.v,
-        r: inspection.r,
-        length_bits: inspection.length_bits,
-        filter: inspection.filter.clone(),
-        permissions: inspection.permissions,
-        encrypt_metadata: inspection.encrypt_metadata,
-        user_password: crate::encryption::standard::trim_user_password(&inspection.user_password),
-        user_password_matched: inspection.user_password_matched,
-        owner_password_matched: inspection.owner_password_matched,
-        stream_method: inspection.stream_method,
-        string_method: inspection.string_method,
-        eff_method: inspection.eff_method,
-        named_crypt_filters,
-    }
-}
-
 impl<R: Read + Seek> Pdf<R> {
     /// Return this document's current shared logger.
     pub fn logger(&self) -> crate::QPDFLogger {
@@ -381,6 +360,60 @@ impl<R: Read + Seek> Pdf<R> {
             .borrow()
             .as_ref()
             .and_then(|encryption| encryption.encrypt_ref)
+    }
+
+    /// Return qpdf `isEncrypted`'s `/V` projection, if the document is encrypted.
+    pub fn encryption_version(&self) -> Option<i64> {
+        self.encryption_inspection
+            .borrow()
+            .as_ref()
+            .map(|inspection| inspection.v)
+    }
+
+    /// Return qpdf `isEncrypted`'s `/R` projection, if the document is encrypted.
+    pub fn encryption_revision(&self) -> Option<i64> {
+        self.encryption_inspection
+            .borrow()
+            .as_ref()
+            .map(|inspection| inspection.r)
+    }
+
+    /// Return the initialized encryption key length in bits.
+    ///
+    /// The inspection state provides qpdf's revision-aware length selection
+    /// before authentication and remains available after authentication. This
+    /// is the same key length qpdf uses for its JSON encryption section.
+    pub fn encryption_length_bits(&self) -> Option<i64> {
+        self.encryption_inspection
+            .borrow()
+            .as_ref()
+            .map(|inspection| inspection.length_bits)
+    }
+
+    /// Return qpdf `getTrimmedUserPassword()` bytes, if the document is encrypted.
+    pub fn trimmed_user_password(&self) -> Option<Vec<u8>> {
+        let user_password = self
+            .encryption_inspection
+            .borrow()
+            .as_ref()
+            .map(|inspection| inspection.user_password.clone())?;
+        Some(crate::encryption::standard::trim_user_password(
+            &user_password,
+        ))
+    }
+
+    /// Return qpdf `isEncrypted`'s stream, string, and file encryption methods.
+    pub fn encryption_methods(&self) -> Option<(&'static str, &'static str, &'static str)> {
+        self.encryption_inspection
+            .borrow()
+            .as_ref()
+            .map(|inspection| {
+                (
+                    inspection.stream_method,
+                    inspection.string_method,
+                    inspection.eff_method,
+                )
+            })
     }
 
     /// Whether the document uses a weak encryption method such as RC4 or R=5.
@@ -523,103 +556,6 @@ impl<R: Read + Seek> Pdf<R> {
             } else {
                 ObjectKeyAlg::Rc4
             },
-        }))
-    }
-
-    /// Read-only snapshot of the `/Encrypt` parameters for the
-    /// `show-encryption` inspection route. The snapshot is available after
-    /// successful authentication and through the dedicated inspection-open
-    /// path after `BadPassword`.
-    ///
-    /// Returns `None` for plaintext PDFs. Parsed fields come from the
-    /// qpdf-shaped inspection state; authenticated fields are filled in when
-    /// authentication succeeds. This does NOT re-run or alter authentication
-    /// (layer-2 owns that ordering).
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Encrypted`] ([`EncryptedError::Malformed`]) when the re-read
-    ///   `/Encrypt` dictionary is missing or has the wrong type for `/Filter`.
-    ///   Returns `Ok(None)` for a plaintext document rather than an error.
-    /// - [`Error::Io`] / [`Error::Parse`] when the `/Encrypt` entry is an indirect
-    ///   reference whose resolution fails.
-    pub fn encryption_info(&mut self) -> Result<Option<EncryptionInfo>> {
-        if let Some(inspection) = self.encryption_inspection.borrow().as_ref().cloned() {
-            return Ok(Some(encryption_info_from_inspection(&inspection)));
-        }
-        if self.encryption.borrow().is_none() {
-            return Ok(None);
-        }
-        let Some(encrypt) = self.encrypt_dictionary_handle()? else {
-            return Ok(None);
-        };
-        // qpdf: "After we initialize encryption parameters, we must use stored
-        // key information and never look at /Encrypt again"
-        // (`libqpdf/QPDF_encryption.cc:727-729`).
-        let (v, r) = {
-            let guard = self.encryption.borrow();
-            let encryption = guard
-                .as_ref()
-                .expect("checked is_some above; authenticate_if_encrypted set it");
-            (encryption.encryption_v, encryption.encryption_r)
-        };
-        let filter_handle = encrypt.try_get_key(b"/Filter")?;
-        let filter = match filter_handle.try_as_name()? {
-            Some(name) => String::from_utf8(name).map_err(|_| EncryptedError::Malformed {
-                reason: "/Filter entry is not valid UTF-8".into(),
-            })?,
-            None => {
-                return Err(EncryptedError::Malformed {
-                    reason: if filter_handle.is_null() {
-                        "missing /Filter entry".into()
-                    } else {
-                        "/Filter entry is not a name".into()
-                    },
-                }
-                .into())
-            }
-        };
-        // Keep the reported key length on qpdf's initialized encryption state,
-        // including its 128-bit guess for an invalid/missing V=2/V=3
-        // `/Length` (`QPDF_encryption.cc:835-853`).
-        let length_handle = encrypt.try_get_key(b"/Length")?;
-        let length_bits = effective_length_bits(v, &length_handle)?; // cov:ignore: unreachable through any public path -- open_with_repair_mode calls initialize_encryption_inspection() unconditionally before authenticate_if_encrypted(), so encryption_inspection is already Some whenever self.encryption can become Some, and the cache check above always short-circuits first (pre-existing on origin/main, not introduced by this change; tracked in flpdf-z03g)
-
-        let encryption_guard = self.encryption.borrow();
-        let encryption = encryption_guard
-            .as_ref()
-            .expect("checked is_some above; authenticate_if_encrypted set it");
-        let permissions = encryption.permissions;
-        let encrypt_metadata = encryption.encrypt_metadata;
-        let user_password =
-            crate::encryption::standard::trim_user_password(&encryption.user_password);
-        // qpdf reports the stored crypt filter methods rather than re-reading
-        // `/Encrypt`: "After we initialize encryption parameters, we must use
-        // stored key information and never look at /Encrypt again"
-        // (`libqpdf/QPDF_encryption.cc:727-729`).
-        let stream_method = encryption.cf_stream.qpdf_name();
-        let string_method = encryption.cf_string.qpdf_name();
-        let eff_method = encryption.cf_file.qpdf_name();
-        let named_crypt_filters = encryption
-            .crypt_filters
-            .iter()
-            .map(|(name, mode)| (String::from_utf8_lossy(name).into_owned(), mode.qpdf_name()))
-            .collect();
-
-        Ok(Some(EncryptionInfo {
-            v,
-            r,
-            length_bits,
-            filter,
-            permissions,
-            encrypt_metadata,
-            user_password,
-            user_password_matched: encryption.user_password_matched,
-            owner_password_matched: encryption.owner_password_matched,
-            stream_method,
-            string_method,
-            eff_method,
-            named_crypt_filters,
         }))
     }
 

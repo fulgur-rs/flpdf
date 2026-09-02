@@ -3642,23 +3642,33 @@ fn build_copy_encryption_source(
         .root_handle()
         .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
 
-    // Validate the donor is encrypted.
-    let info = donor
-        .encryption_info()
-        .map_err(|e| format!("--copy-encryption: failed to read encryption info: {e}"))?
+    // Validate the donor is encrypted using qpdf's individual encryption
+    // projections rather than a flpdf-only aggregate information object.
+    let version = donor
+        .encryption_version()
         .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
+    let length_bits = donor.encryption_length_bits().ok_or_else(|| {
+        format!(
+            "--copy-encryption: donor {:?} has no encryption key length",
+            path
+        )
+    })?;
+    let (stream_method, string_method, _) = donor.encryption_methods().ok_or_else(|| {
+        format!(
+            "--copy-encryption: donor {:?} has no crypt-filter methods",
+            path
+        )
+    })?;
 
     // Walking-skeleton scope: only V=4 AES-128 (StmF=AESV2 / StrF=AESV2).
-    // Note: encryption_info uses qpdf_name() which returns "AESv2" (lowercase v).
-    let is_v4_aes128 = info.v == 4
-        && info.length_bits == 128
-        && info.stream_method == "AESv2"
-        && info.string_method == "AESv2";
+    // The method accessors use qpdf's spelling "AESv2" (lowercase v).
+    let is_v4_aes128 =
+        version == 4 && length_bits == 128 && stream_method == "AESv2" && string_method == "AESv2";
     if !is_v4_aes128 {
         return Err(format!(
             "--copy-encryption: donor {:?} uses V={} length={} \
              stream={} string={} — only V=4 AES-128 donors are accepted",
-            path, info.v, info.length_bits, info.stream_method, info.string_method,
+            path, version, length_bits, stream_method, string_method,
         )
         .into());
     }

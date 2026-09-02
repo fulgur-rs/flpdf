@@ -12,7 +12,7 @@ use crate::linearization::{
 };
 use crate::pipeline::Discard;
 use crate::{DecodeLevel, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter};
-use crate::{EncryptionInfo, ObjectHandle, QPDFLogger, Result, Severity};
+use crate::{ObjectHandle, Permissions, QPDFLogger, Result, Severity};
 use std::fmt;
 use std::io::{Read, Seek};
 
@@ -495,22 +495,31 @@ fn render_encryption_report<R: Read + Seek>(
     suppress_password_mismatch_notice: bool,
     show_encryption_key: bool,
 ) -> Result<Vec<u8>> {
-    let Some(info) = pdf.encryption_info()? else {
+    if !pdf.is_encrypted() {
         return Ok(b"File is not encrypted\n".to_vec());
-    };
+    }
+    let revision = pdf
+        .encryption_revision()
+        .ok_or_else(|| crate::Error::Internal("encrypted PDF has no encryption revision".into()))?;
+    let version = pdf
+        .encryption_version()
+        .ok_or_else(|| crate::Error::Internal("encrypted PDF has no encryption version".into()))?;
+    let permissions = pdf
+        .permissions()
+        .ok_or_else(|| crate::Error::Internal("encrypted PDF has no permissions".into()))?;
+    let user_password = pdf.trimmed_user_password().unwrap_or_default();
+    let user_password_matched = pdf.user_password_matched();
+    let owner_password_matched = pdf.owner_password_matched();
 
     let mut output = Vec::new();
-    if !info.user_password_matched
-        && !info.owner_password_matched
-        && !suppress_password_mismatch_notice
-    {
+    if !user_password_matched && !owner_password_matched && !suppress_password_mismatch_notice {
         output.extend_from_slice(b"Incorrect password supplied\n");
     }
 
-    output.extend_from_slice(format!("R = {}\n", info.r).as_bytes());
-    output.extend_from_slice(format!("P = {}\n", info.permissions.raw()).as_bytes());
+    output.extend_from_slice(format!("R = {revision}\n").as_bytes());
+    output.extend_from_slice(format!("P = {}\n", permissions.raw()).as_bytes());
     output.extend_from_slice(b"User password = ");
-    output.extend_from_slice(&info.user_password);
+    output.extend_from_slice(&user_password);
     output.push(b'\n');
     if show_encryption_key {
         let key = pdf.encryption_file_key().unwrap_or_default();
@@ -518,14 +527,14 @@ fn render_encryption_report<R: Read + Seek>(
         output.extend_from_slice(hex::encode(key).as_bytes());
         output.push(b'\n');
     }
-    if info.owner_password_matched {
+    if owner_password_matched {
         output.extend_from_slice(b"Supplied password is owner password\n");
     }
-    if info.user_password_matched {
+    if user_password_matched {
         output.extend_from_slice(b"Supplied password is user password\n");
     }
 
-    let permissions = permission_report(&info);
+    let permissions = permission_report(revision, permissions);
     for (label, allowed) in [
         ("extract for accessibility", permissions.accessibility),
         ("extract for any purpose", permissions.extract_all),
@@ -540,15 +549,13 @@ fn render_encryption_report<R: Read + Seek>(
         output.extend_from_slice(format!("{label}: {}\n", show_bool(allowed)).as_bytes());
     }
 
-    if info.v >= 4 {
-        output.extend_from_slice(
-            format!("stream encryption method: {}\n", info.stream_method).as_bytes(),
-        );
-        output.extend_from_slice(
-            format!("string encryption method: {}\n", info.string_method).as_bytes(),
-        );
-        output
-            .extend_from_slice(format!("file encryption method: {}\n", info.eff_method).as_bytes());
+    if version >= 4 {
+        let (stream_method, string_method, file_method) = pdf
+            .encryption_methods()
+            .expect("encrypted PDF inspection state has no crypt-filter methods");
+        output.extend_from_slice(format!("stream encryption method: {stream_method}\n").as_bytes());
+        output.extend_from_slice(format!("string encryption method: {string_method}\n").as_bytes());
+        output.extend_from_slice(format!("file encryption method: {file_method}\n").as_bytes());
     }
     Ok(output)
 }
@@ -565,27 +572,27 @@ struct PermissionReport {
     modify_all: bool,
 }
 
-fn permission_report(info: &EncryptionInfo) -> PermissionReport {
-    let raw = info.permissions.raw() as u32;
+fn permission_report(revision: i64, permissions: Permissions) -> PermissionReport {
+    let raw = permissions.raw() as u32;
     let bit = |number: u32| raw & (1u32 << (number - 1)) != 0;
     let print_low = bit(3);
-    let modify_assembly = if info.r < 3 { bit(4) } else { bit(11) };
-    let modify_form = if info.r < 3 { bit(6) } else { bit(9) };
+    let modify_assembly = if revision < 3 { bit(4) } else { bit(11) };
+    let modify_form = if revision < 3 { bit(6) } else { bit(9) };
     let modify_annotation = bit(6);
     let modify_other = bit(4);
 
     PermissionReport {
-        accessibility: if info.r < 3 { bit(5) } else { bit(10) },
+        accessibility: if revision < 3 { bit(5) } else { bit(10) },
         extract_all: bit(5),
         print_low,
-        print_high: print_low && (info.r < 3 || bit(12)),
+        print_high: print_low && (revision < 3 || bit(12)),
         modify_assembly,
         modify_form,
         modify_annotation,
         modify_other,
         modify_all: modify_annotation
             && modify_other
-            && (info.r < 3 || (modify_form && modify_assembly)),
+            && (revision < 3 || (modify_form && modify_assembly)),
     }
 }
 

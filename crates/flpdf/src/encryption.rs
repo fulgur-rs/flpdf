@@ -42,7 +42,6 @@ pub(crate) mod state;
 pub use keys::ObjectKeyAlg;
 pub use password::PasswordMode;
 pub use permissions::{Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig};
-pub use state::EncryptionInfo;
 
 /// Encryption method to apply at write time.
 ///

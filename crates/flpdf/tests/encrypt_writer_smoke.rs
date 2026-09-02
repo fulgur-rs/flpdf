@@ -399,7 +399,7 @@ fn indirect_object_numbers(bytes: &[u8]) -> Vec<u32> {
 /// Encrypting `minimal.pdf` (no strings / no streams) must still produce
 /// a structurally valid encrypted file: `/Encrypt` present in the
 /// trailer, the password authenticates as a user password, and the
-/// resulting reader-side `EncryptionInfo` reports V=4 R=4 AESv2.
+/// resulting reader-side qpdf encryption accessors report V=4 R=4 AESv2.
 #[test]
 fn v4_aes128_encrypts_minimal_fixture_and_authenticates_user_password() {
     let input = fixture("tests/fixtures/minimal.pdf");
@@ -417,22 +417,16 @@ fn v4_aes128_encrypts_minimal_fixture_and_authenticates_user_password() {
     );
 
     // Open with the user password and verify the reader-side view.
-    let mut pdf = open_encrypted(&encrypted, b"user-pw");
+    let pdf = open_encrypted(&encrypted, b"user-pw");
     assert!(pdf.is_encrypted(), "reader must report is_encrypted=true");
     assert!(
         pdf.user_password_matched(),
         "user password should authenticate"
     );
-    let info = pdf
-        .encryption_info()
-        .expect("encryption_info ok")
-        .expect("encrypted document yields Some(EncryptionInfo)");
-    assert_eq!(info.v, 4);
-    assert_eq!(info.r, 4);
-    assert_eq!(info.length_bits, 128);
-    assert_eq!(info.filter, "Standard");
-    assert_eq!(info.stream_method, "AESv2");
-    assert_eq!(info.string_method, "AESv2");
+    assert_eq!(pdf.encryption_version(), Some(4));
+    assert_eq!(pdf.encryption_revision(), Some(4));
+    assert_eq!(pdf.encryption_length_bits(), Some(128));
+    assert_eq!(pdf.encryption_methods(), Some(("AESv2", "AESv2", "AESv2")));
 }
 
 /// Owner password also authenticates against the same encrypted output —
@@ -912,15 +906,13 @@ fn v1_r2_writer_uses_the_separate_r2_permission_bits() {
     };
 
     let bytes = encrypt_to_bytes(&fixture("tests/fixtures/compat/one-page.pdf"), params);
-    let mut pdf = open_encrypted(&bytes, b"user");
-    let info = pdf
-        .encryption_info()
-        .expect("read R=2 encryption info")
-        .expect("R=2 output is encrypted");
-
-    assert_eq!(info.v, 1);
-    assert_eq!(info.r, 2);
-    assert_eq!(info.permissions.raw(), -8);
+    let pdf = open_encrypted(&bytes, b"user");
+    assert_eq!(pdf.encryption_version(), Some(1));
+    assert_eq!(pdf.encryption_revision(), Some(2));
+    assert_eq!(
+        pdf.permissions().expect("R=2 output is encrypted").raw(),
+        -8
+    );
 }
 
 mod common;

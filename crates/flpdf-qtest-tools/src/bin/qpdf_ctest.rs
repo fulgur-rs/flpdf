@@ -7,8 +7,8 @@
 //! `flpdf::Pdf` and `flpdf::PdfWriter` APIs.
 
 use flpdf::{
-    DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, EncryptionInfo, Error, Pdf,
-    PdfOpenOptions, PdfWriter, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
+    DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf, PdfOpenOptions,
+    PdfWriter, Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
 };
 use std::env;
 use std::fs::File;
@@ -245,13 +245,13 @@ fn run_test13(
     output_arg: &std::ffi::OsStr,
 ) -> Result<()> {
     let mut pdf = open_input(input_arg, password_arg)?;
-    let info = pdf
-        .encryption_info()?
+    let user_password = pdf
+        .trimmed_user_password()
         .ok_or_else(|| Error::Internal("test13 input is not encrypted".to_owned()))?;
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     stdout.write_all(b"user password: ")?;
-    stdout.write_all(&info.user_password)?;
+    stdout.write_all(&user_password)?;
     stdout.write_all(b"\n")?;
     drop(stdout);
 
@@ -351,13 +351,27 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
     let extension_level = pdf.adobe_extension_level()?;
     let linearized = pdf.is_linearized()?;
     let encrypted = pdf.is_encrypted();
-    let encryption_info = if encrypted {
-        Some(pdf.encryption_info()?.ok_or_else(|| {
-            flpdf::Error::Internal("encrypted PDF has no encryption info".to_owned())
-        })?)
-    } else {
-        None
-    };
+    let encryption_revision = encrypted
+        .then(|| {
+            pdf.encryption_revision().ok_or_else(|| {
+                flpdf::Error::Internal("encrypted PDF has no encryption revision".to_owned())
+            })
+        })
+        .transpose()?;
+    let user_password = encrypted
+        .then(|| {
+            pdf.trimmed_user_password().ok_or_else(|| {
+                flpdf::Error::Internal("encrypted PDF has no user password state".to_owned())
+            })
+        })
+        .transpose()?;
+    let permissions = encrypted
+        .then(|| {
+            pdf.permissions().ok_or_else(|| {
+                flpdf::Error::Internal("encrypted PDF has no permissions".to_owned())
+            })
+        })
+        .transpose()?;
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
@@ -368,30 +382,37 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
     writeln!(stdout, "linearized: {}", u8::from(linearized))?;
     writeln!(stdout, "encrypted: {}", u8::from(encrypted))?;
 
-    if let Some(info) = encryption_info.as_ref() {
-        write_encrypted_observations(&mut stdout, info)?;
+    if let (Some(revision), Some(user_password), Some(permissions)) =
+        (encryption_revision, user_password, permissions)
+    {
+        write_encrypted_observations(&mut stdout, revision, &user_password, &permissions)?;
     }
     writeln!(stdout, "C test 1 done")?;
     Ok(())
 }
 
-fn write_encrypted_observations(output: &mut impl Write, info: &EncryptionInfo) -> Result<()> {
+fn write_encrypted_observations(
+    output: &mut impl Write,
+    revision: i64,
+    user_password: &[u8],
+    permissions: &Permissions,
+) -> Result<()> {
     output.write_all(b"user password: ")?;
-    output.write_all(&info.user_password)?;
+    output.write_all(user_password)?;
     output.write_all(b"\n")?;
 
-    let raw = info.permissions.raw();
+    let raw = permissions.raw();
     let bit = |number: u32| (raw as u32) & (1u32 << (number - 1)) != 0;
-    let accessibility = if info.r < 3 { bit(5) } else { bit(10) };
+    let accessibility = if revision < 3 { bit(5) } else { bit(10) };
     let extract_all = bit(5);
     let print_low = bit(3);
-    let print_high = print_low && (info.r < 3 || bit(12));
-    let modify_assembly = if info.r < 3 { bit(4) } else { bit(11) };
-    let modify_forms = if info.r < 3 { bit(6) } else { bit(9) };
+    let print_high = print_low && (revision < 3 || bit(12));
+    let modify_assembly = if revision < 3 { bit(4) } else { bit(11) };
+    let modify_forms = if revision < 3 { bit(6) } else { bit(9) };
     let modify_annotations = bit(6);
     let modify_other = bit(4);
     let modify_all =
-        modify_other && modify_annotations && (info.r < 3 || (modify_forms && modify_assembly));
+        modify_other && modify_annotations && (revision < 3 || (modify_forms && modify_assembly));
 
     for (label, value) in [
         ("extract for accessibility", accessibility),
