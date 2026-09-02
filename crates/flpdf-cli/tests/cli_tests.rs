@@ -7731,7 +7731,10 @@ fn list_attachments_missing_ef_exits_three_with_two_type_warnings() {
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output.stdout,
-        b"c.txt -> 0,0\n  preferred name: c.txt\n  all names:\n    /F -> c.txt\n  all data streams:\n"
+        format!(
+            "c.txt -> 0,0{EOL}  preferred name: c.txt{EOL}  all names:{EOL}    /F -> c.txt{EOL}  all data streams:{EOL}"
+        )
+        .into_bytes()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
@@ -7763,7 +7766,10 @@ fn list_attachments_non_dictionary_filespec_exits_three_with_constructor_warning
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output.stdout,
-        b"k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n"
+        format!(
+            "k.txt -> 0,0{EOL}  preferred name: {EOL}  all names:{EOL}  all data streams:{EOL}"
+        )
+        .into_bytes()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Embedded file object is not a dictionary"));
@@ -7794,7 +7800,10 @@ fn list_attachments_non_stream_ef_exits_two_with_stream_error() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         output.stdout,
-        b"g.txt -> 0,0\n  preferred name: g.txt\n  all names:\n    /F -> g.txt\n  all data streams:\n    /F -> 7,0\n      creation date: "
+        format!(
+            "g.txt -> 0,0{EOL}  preferred name: g.txt{EOL}  all names:{EOL}    /F -> g.txt{EOL}  all data streams:{EOL}    /F -> 7,0{EOL}      creation date: "
+        )
+        .into_bytes()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("operation for stream attempted on object of type dictionary"));
