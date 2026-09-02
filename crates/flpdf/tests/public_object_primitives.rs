@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use flpdf::{ObjectHandle, Pdf};
 
@@ -39,6 +40,23 @@ fn qpdf_object_handle_primitives_are_available_to_external_crates() {
     ]);
     let expected: BTreeSet<Vec<u8>> = [b"/F1".to_vec(), b"/Im0".to_vec()].into_iter().collect();
     assert_eq!(resources.get_resource_names().unwrap(), expected);
+}
+
+#[test]
+fn qpdf_stream_type_predicate_is_available_to_external_crates() {
+    let stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Member".to_vec())),
+        ]),
+        Rc::new(Vec::new()),
+    );
+
+    assert!(stream.try_is_stream_of_type(b"ObjStm", b"Member").unwrap());
+    assert!(!stream.try_is_stream_of_type(b"XRef", b"Member").unwrap());
+    assert!(!ObjectHandle::dictionary(Vec::new())
+        .try_is_stream_of_type(b"ObjStm", b"")
+        .unwrap());
 }
 
 #[test]

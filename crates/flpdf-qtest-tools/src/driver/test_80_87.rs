@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use super::{crt_open_error_message, open_error_bytes, os_str_diagnostic_bytes};
 use flpdf::{
     job::{JobExitCode, QPDFJob},
-    Error, ObjectHandle, Pdf, Pipeline, PipelineError, PipelineHandle, PipelineResult,
+    Error, ObjectHandle, ObjectRef, Pdf, Pipeline, PipelineError, PipelineHandle, PipelineResult,
 };
 
 struct CapturedPipeline {
@@ -32,7 +32,6 @@ impl Pipeline for CapturedPipeline {
         Ok(())
     }
 }
-
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
 /// `QPDFAcroFormDocumentHelper::transformAnnotations` (transform the main
 /// file's page-1 annotations in place and add the resulting form fields via
@@ -103,21 +102,59 @@ pub(crate) fn run_test_81<R: Read + Seek>(
 /// assertions, all of which need one of these predicates from their very
 /// first line.
 pub(crate) fn run_test_82<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+    pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&OsStr>,
     _stdout: &mut dyn Write,
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDFObjectHandle::isNameAndEquals / isDictionaryOfType /
-    // isStreamOfType / isOrHasName): flpdf ports `isNameAndEquals`
-    // (`try_is_name_and_equals`, object_handle.rs:2274), `isOrHasName`
-    // (`try_is_or_has_name`, :2289), and `isDictionaryOfType`
-    // (`try_is_dictionary_of_type`, :2318), but all three are
-    // `pub(crate)`-only. `isStreamOfType` has no port at any visibility.
-    // None of the four are reachable from this crate, so no part of this
-    // test can be reproduced.
+    // qpdf 11.9.0 `test_driver.cc:2819-2861`. Keep the consumer's
+    // assertion order and let the canonical ObjectHandle methods perform
+    // lazy resolution; qpdf's C++ methods return bool while flpdf exposes
+    // the same operation through its fallible resolver boundary.
+    let name = ObjectHandle::name(b"Marvin".to_vec());
+    let string = ObjectHandle::string(b"/Marvin".to_vec());
+    assert!(name.try_is_name_and_equals(b"Marvin")?);
+    assert!(!name.try_is_name_and_equals(b"/Marvin")?);
+    assert!(!string.try_is_name_and_equals(b"Marvin")?);
+
+    let mut dictionary = ObjectHandle::parse(b"<</A 1 /Type /Test /Subtype /Marvin>>")?;
+    assert!(dictionary.try_is_dictionary_of_type(b"Test", b"")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"Test", b"")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"Test", b"Marvin")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"", b"Marvin")?);
+    assert!(dictionary.try_is_dictionary_of_type(b"", b"")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test2", b"")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test2", b"Marvin")?);
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test", b"M")?);
+    assert!(!name.try_is_dictionary_of_type(b"", b"")?);
+
+    dictionary = ObjectHandle::parse(b"<</A 1 /Type null /Subtype /Marvin>>")?;
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test", b"")?);
+    dictionary = ObjectHandle::parse(b"<</A 1 /Type (Test) /Subtype /Marvin>>")?;
+    assert!(!dictionary.try_is_dictionary_of_type(b"/Test", b"")?);
+    dictionary = ObjectHandle::parse(b"<</A 1 /Type /Test /Subtype (Marvin)>>")?;
+    assert!(!dictionary.try_is_dictionary_of_type(b"/Test", b"")?);
+    dictionary = ObjectHandle::parse(b"<</A 1 /Subtype /Marvin>>")?;
+    assert!(!dictionary.try_is_dictionary_of_type(b"Test", b"/Marvin")?);
+
+    let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
+    assert!(stream.try_is_stream_of_type(b"ObjStm", b"")?);
+    assert!(!stream.try_is_stream_of_type(b"Test", b"")?);
+    assert!(!pdf
+        .get_object_handle(ObjectRef::new(2, 0))
+        .try_is_stream_of_type(b"Pages", b"")?);
+
+    let mut array = ObjectHandle::parse(b"[/Blah /Blaah /Blaaah]")?;
+    assert!(array.try_is_or_has_name(b"Blah")?);
+    assert!(array.try_is_or_has_name(b"Blaaah")?);
+    assert!(!array.try_is_or_has_name(b"Blaaaah")?);
+    assert!(array.try_get_array_item(0)?.try_is_or_has_name(b"Blah")?);
+    assert!(!array.try_get_array_item(1)?.try_is_or_has_name(b"Blah")?);
+    array = ObjectHandle::parse(b"[]")?;
+    assert!(!array.try_is_or_has_name(b"Blah")?);
+    assert!(!string.try_is_or_has_name(b"Marvin")?);
     Ok(())
 }
 

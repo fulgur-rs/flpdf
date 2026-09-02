@@ -91,6 +91,34 @@ fn swap_replace_fixture_with_qdict_body(qdict_body: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn compound_type_check_fixture() -> Vec<u8> {
+    let objects = [
+        (
+            1,
+            b"<< /Type /ObjStm /Length 0 >>\nstream\nendstream".as_slice(),
+        ),
+        (2, b"<< /Type /Pages >>".as_slice()),
+        (3, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+    ];
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = vec![0usize; objects.len() + 1];
+    for (number, body) in objects {
+        offsets[number] = bytes.len();
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets.into_iter().skip(1) {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 3 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn repairable_pdf() -> &'static str {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -475,6 +503,22 @@ fn test_14_matches_qpdf_swap_and_replace_sequence() {
 
     assert!(directory.path().join("a.pdf").is_file());
     assert!(directory.path().join("b.pdf").is_file());
+}
+
+#[test]
+fn test_82_matches_qpdf_compound_type_predicates() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("type-checks.pdf");
+    fs::write(&input, compound_type_check_fixture()).expect("write type-check fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["82", input])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 82 done\n")
+        .stderr("");
 }
 
 #[test]
