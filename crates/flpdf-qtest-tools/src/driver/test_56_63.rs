@@ -150,6 +150,12 @@ fn test_56_59_body<R: Read + Seek>(
     writer.set_qdf_mode(true);
     writer.set_static_id(true);
     writer.write()?;
+    // `QPDFWriter::write()` can resolve objects that were never touched by
+    // the loop above (e.g. while renumbering the full object graph), and
+    // that resolution can append new repair diagnostics. qpdf's own warning
+    // callback prints synchronously as `write()` runs, so a final drain here
+    // is required to keep this driver's stdout/stderr in the same order.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 

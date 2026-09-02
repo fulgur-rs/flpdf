@@ -145,14 +145,26 @@ fn test_64_67_body<R: Read + Seek>(
         let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
         destination_page.add_page_contents(q_stream, true)?;
         destination_page.add_page_contents(placed_stream, false)?;
+
+        // Drain the primary document's diagnostics once per iteration, as
+        // test_56_59_body does, so warnings from this page's placement
+        // interleave with the secondary document's per-iteration drain in
+        // the same page order qpdf's own synchronous warn() calls would
+        // produce.
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     }
 
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let mut writer = PdfWriter::new(pdf);
     writer.set_output_file("a.pdf")?;
     writer.set_qdf_mode(true);
     writer.set_static_id(true);
     writer.write()?;
+    // `QPDFWriter::write()` can resolve objects that were never touched by
+    // the loop above (e.g. while renumbering the full object graph), and
+    // that resolution can append new repair diagnostics. qpdf's own warning
+    // callback prints synchronously as `write()` runs, so a final drain here
+    // is required to keep this driver's stdout/stderr in the same order.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 

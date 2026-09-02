@@ -586,7 +586,11 @@ V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invo
 qtest consumerとして実装済みである。pinned qpdf 11.9.0との同一fixture比較で8件の
 `a.pdf`出力が一致し、対応するqtest比較行は `form-xobject 4,6,8,10,12,14,16,18`
 へ昇格した。driver側にForm XObjectの独自traversal・allocation・compatibility bridgeは
-追加していない。
+追加していない。両関数とも `PdfWriter::write()` 実行後に診断drain呼び出しを追加した
+（write中に到達する未resolveオブジェクトが新規repair diagnosticを生む可能性があり、
+qpdfのwarn()コールバックはwrite()実行中も同期的に出力するため）。`test_64_67_body`は
+さらに主文書側の診断drainをループ末尾からループ内（各ページの`add_page_contents`直後）
+へ移し、`test_56_59_body`と同じper-iteration順序に揃えた。
 
 ## 8. JSON
 
