@@ -98,12 +98,17 @@ fn complete_json_for_test_89() -> &'static str {
 }
 
 fn partial_json_for_test_90() -> &'static str {
+    // qpdf's `updateFromJSON` replaces the entire trailer object wholesale
+    // rather than merging keys into the existing one (`QPDF_json.cc:611`,
+    // `this->pdf.m->trailer = makeObject(value);`), so a partial update must
+    // re-specify `/Root` to keep pointing at the destination PDF's existing
+    // catalog (`minimal.pdf`'s `1 0 R`) or the document becomes rootless.
     r#"{
   "qpdf": [
     {"jsonversion": 2},
     {
       "obj:7 0 R": {"value": {"/strings": []}},
-      "trailer": {"value": {"/QTest": "7 0 R"}}
+      "trailer": {"value": {"/Root": "1 0 R", "/QTest": "7 0 R"}}
     }
   ]
 }"#
@@ -221,11 +226,14 @@ fn test_90_applies_the_json_update_before_type_mismatch_mutations() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(output.stdout, b"test 90 done\n");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // 3 dictionary-typed `appendItem` mismatches: the update's own trailer,
+    // "obj:7 0 R", and the final `pdf.getRoot().appendItem(null)`
+    // (test_driver.cc:3184) against the destination PDF's actual Catalog.
     assert_eq!(
         stderr
             .matches("operation for array attempted on object of type dictionary")
             .count(),
-        2
+        3
     );
     assert!(stderr.contains("operation for integer attempted on object of type array"));
 }

@@ -62,6 +62,13 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// This mirrors `QPDF::createFromJSON(std::shared_ptr<InputSource>)` and
     /// therefore accepts arbitrarily large seekable JSON without first loading
     /// it into a second buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OpenFailure`] wrapping the terminal error when the
+    /// JSON reactor recorded warnings before the import failed; the caller
+    /// can drain those warnings through [`Error::open_failure`] the same way
+    /// it drains a failed permissive PDF open.
     pub fn create_from_json<S>(source: S, input_name: impl Into<String>) -> Result<Self>
     where
         S: Read + Seek + 'static,
@@ -76,6 +83,13 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// it observes warnings from later object resolution. This is the
     /// document half of `QPDFJob::createQPDF` (`QPDFJob.cc:429-462`,
     /// `QPDFJob.cc:1708`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OpenFailure`] wrapping the terminal error when the
+    /// JSON reactor recorded warnings before the import failed; the caller
+    /// can drain those warnings through [`Error::open_failure`] the same way
+    /// it drains a failed permissive PDF open.
     pub fn create_from_json_with_options<S>(
         source: S,
         input_name: impl Into<String>,
@@ -87,7 +101,10 @@ impl Pdf<Cursor<Vec<u8>>> {
         let input_name = input_name.into();
         options.description = input_name.clone();
         let mut pdf = Self::open_mem_owned_with_options(JSON_PDF.to_vec(), options)?; // cov:ignore: the qpdf rootless seed is a fixed, valid in-memory PDF
-        pdf.import_json(source, input_name, true)?;
+        if let Err(error) = pdf.import_json(source, input_name, true) {
+            let diagnostics = pdf.repair_diagnostics();
+            return Err(Error::with_open_diagnostics(error, diagnostics));
+        }
         Ok(pdf)
     }
 

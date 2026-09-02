@@ -17,7 +17,9 @@ use flpdf::{
     Pipeline, PipelineError, PipelineResult,
 };
 
-use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
+use super::{
+    crt_open_error_message, emit_new_diagnostics, open_error_bytes, os_str_diagnostic_bytes,
+};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -192,9 +194,7 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     trailer.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    let root = root_handle(pdf);
-    pdf.resolve(&root)?;
-    let root = root.clone();
+    let root = pdf.root_handle()?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     root.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -231,7 +231,32 @@ pub(crate) fn run_test_90<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let arg2 = arg2.expect("test 90 requires an update JSON filename");
     let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
-    pdf.update_from_json_file(std::path::Path::new(arg2))?;
+
+    // qpdf's `FileInputSource(arg2)` (behind `updateFromJSON(std::string
+    // const&)`, `QPDF.cc:809-811`) reports a failed open as
+    // `"open " + filename + ": " + strerror(errno)`
+    // (`QUtil::safe_fopen`/`QPDFSystemError::createWhat`,
+    // `QUtil.cc:490-518`, `QPDFSystemError.cc:12-28`). Open the file at this
+    // driver boundary and translate through the same CRT-message route the
+    // ordinary driver file opens use, instead of surfacing
+    // `update_from_json_file`'s own `Error::FileIo` text verbatim.
+    let source = std::fs::File::open(arg2).map_err(|error| {
+        let crt_message = crt_open_error_message(arg2);
+        let message = open_error_bytes(&arg2_diagnostic, crt_message.as_deref(), &error);
+        Error::System(String::from_utf8_lossy(&message).into_owned())
+    })?;
+    let input_name = String::from_utf8_lossy(arg2_diagnostic.as_ref()).into_owned();
+    // qpdf's own warning callback prints each `importJSON` validation
+    // warning synchronously as the reactor records it, before the
+    // "errors found in JSON" exception unwinds (`QPDF_json.cc`). Drain the
+    // retained diagnostics before propagating a soft-validation failure so
+    // this driver does not silently drop them behind the generic terminal
+    // message.
+    if let Err(error) = pdf.update_from_json(source, input_name) {
+        emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
+        return Err(error);
+    }
+    emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
 
     // Keep the update source as the diagnostic name for mutations whose live
     // values were installed by JSON; qpdf's final root mutation belongs to
@@ -249,8 +274,7 @@ pub(crate) fn run_test_90<R: Read + Seek>(
     strings.try_get_int_value()?;
     emit_new_diagnostics(pdf, diagnostics_written, &arg2_diagnostic, stdout, stderr)?;
 
-    let root = root_handle(pdf);
-    pdf.resolve(&root)?;
+    let root = pdf.root_handle()?;
     root.append_array_item(null)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())

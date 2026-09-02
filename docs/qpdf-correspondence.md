@@ -604,10 +604,20 @@ qpdfのwarn()コールバックはwrite()実行中も同期的に出力するた
 | `QPDF_Stream::writeStreamJSON`（行数は §1 の `QPDF_Stream.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::write_stream_json`（`QPDF_Stream.cc:207-295` の mode validation、`no_data_key`、二重試行、dict normalization、payload routing、effective decode level） + `document_json.rs` の object-map framing / side-file ownership。`json_inspect.rs` の `stream_payload_with_decode_status` は既存の公開 raw-payload helper とテスト oracle に限定 | ✅ `flpdf-3yn9.9` で qpdf の 1 関数責務へ統合。旧 `Object/Stream` payload/dict bridge は本番経路から外し、`QPDF_json.cc:917-925` 相当の consumer は canonical handle を呼ぶ。非 file entry は既存 flpdf の変換失敗時接頭辞を保つため canonical 結果を先に buffer 化する |
 
 `qpdf/test_driver.cc:3162-3185` の test 89/90 は、qpdf JSON入力境界の下流consumerとして
-`Pdf::create_from_json_file` / `Pdf::update_from_json_file` とlive ObjectHandle mutationへ
+`Pdf::create_from_json_with_options` / `Pdf::update_from_json` とlive ObjectHandle mutationへ
 接続済みである。test 89はfilenameをPDFとして開かずrootless JSON documentを作成し、test 90は
 通常PDFへpartial updateを適用する。各type-mismatch warningはqpdfの発生順にdrainされ、
 qpdf-json比較行111/112の同一run結果を `harness.log` と `qtest-results.xml` の両方で確認する。
+両テストとも file-open 自体はドライバ境界で行い（`crt_open_error_message`/`open_error_bytes`
+経由でqpdfの`QUtil::safe_fopen`/`QPDFSystemError`相当のCRTテキストへ翻訳、
+`QUtil.cc:490-518`/`QPDFSystemError.cc:12-28`）、`Pdf`側のsource-basedオーバーロードへ
+既にopenした`File`を渡す。`create_from_json_with_options`は`import_json`失敗時に
+`pdf.repair_diagnostics()`を`Error::with_open_diagnostics`で終端エラーへ付帯する
+（既存の`load_xref_and_trailer_with_repair`と同じ`Error::OpenFailure`パターン）。
+test 90はupdate失敗時（`import_json`はupdateでは`&mut self`のPDFを保持したまま返す）に
+先に診断をdrainしてから終端エラーを伝播し、最終`/Root`変異は`root_handle`ローカルヘルパー
+ではなく`Pdf::root_handle()`（qpdfの`getRoot()`のdictionary検証を保持、`QPDF.cc:2355-2368`）
+を経由する。
 
 ### `flpdf-25kg.3.37` bounded consumer cutover (2026-08-15)
 

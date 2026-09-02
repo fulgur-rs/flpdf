@@ -971,10 +971,11 @@ fn run_test_89_from_json(filename: &OsStr, stdout: &mut dyn Write, stderr: &mut 
     let source = match std::fs::File::open(filename) {
         Ok(source) => std::io::BufReader::new(source),
         Err(error) => {
+            let crt_message = crt_open_error_message(filename);
             return write_error_bytes(
                 stdout,
                 stderr,
-                &open_error_bytes(&filename_diagnostic, None, &error),
+                &open_error_bytes(&filename_diagnostic, crt_message.as_deref(), &error),
             );
         }
     };
@@ -988,7 +989,25 @@ fn run_test_89_from_json(filename: &OsStr, stdout: &mut dyn Write, stderr: &mut 
         },
     ) {
         Ok(pdf) => pdf,
-        Err(error) => return write_error(stdout, stderr, &error.to_string()),
+        Err(error) => {
+            // qpdf's own warning callback prints each JSON validation warning
+            // synchronously as the reactor records it, before the terminal
+            // "errors found in JSON" exception unwinds. Drain the retained
+            // diagnostics through the same open-failure route the ordinary
+            // PDF open path uses (`write_open_failure`) before the terminal
+            // message, rather than losing them with the dropped `Pdf`.
+            let source = if let Some((source, diagnostics)) = error.open_failure() {
+                for diagnostic in diagnostics.entries() {
+                    if write_warning(&filename_diagnostic, diagnostic, stdout, stderr).is_err() {
+                        return 2;
+                    }
+                }
+                source
+            } else {
+                &error
+            };
+            return write_error(stdout, stderr, &source.to_string());
+        }
     };
     let mut diagnostics_written = 0;
     if let Err(error) = test_88_98::run_test_89(
