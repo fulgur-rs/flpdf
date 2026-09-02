@@ -291,8 +291,7 @@ pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) 
     Ok(())
 }
 
-/// The same read as `decode_filter_specs_from_object`, entered through the
-/// resolving `try_*` accessors.
+/// Read `/Filter` and `/DecodeParms` through the resolving `try_*` accessors.
 ///
 /// `QPDF_Stream::filterable` reaches `/Filter` and `/DecodeParms` through
 /// `stream_dict.getKey` (`libqpdf/QPDF_Stream.cc:386`, `:441`) and their
@@ -313,11 +312,11 @@ pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) 
 /// back (`libqpdf/QPDFObjectHandle.cc:979-988`), so absent and null share the
 /// `isNull` branch just as they do in qpdf.
 ///
-/// This deliberately does not share a body with the `Object` reader: the two
-/// differ only in *how* a value is inspected, and hiding that behind a trait
-/// would reintroduce the shape wrapper this seam exists to avoid. Everything
-/// downstream of [`FilterSpec`] — the codec stack, predictor geometry, limits,
-/// and warning ordering — stays a single copy.
+/// This is the canonical production reader for filter metadata. The former
+/// Dictionary/value adapters and object-shaped production reader were removed
+/// with the legacy object-model route (`d18ce346`). Everything downstream of
+/// [`FilterSpec`] — the codec stack, predictor geometry, limits, and warning
+/// ordering — stays a single copy.
 pub(crate) fn decode_filter_specs_from_handle(
     filter: &ObjectHandle,
     decode_params: &ObjectHandle,
