@@ -1199,7 +1199,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             options,
             diagnostics,
             Some(loaded.first_xref_item_offset),
-        )?;
+        )?; // cov:ignore: a pending trigger always carries a parsed fallback trailer
         let deleted_objects = std::mem::take(&mut registration.deleted_objects);
         loaded = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
         registration.entries = loaded.loaded.entries.clone();
@@ -1460,7 +1460,9 @@ fn parse_xref_from_start(
                 Ok(ClassicTrailerValidation::Valid) => {}
                 Ok(ClassicTrailerValidation::NeedsReconstruction(error)) => {
                     let Error::Parse { offset, message } = error else {
+                        // cov:ignore-start: only Error::Parse creates a bootstrap reconstruction trigger
                         unreachable!("classic trailer reconstruction trigger is a parse error")
+                        // cov:ignore-end
                     };
                     loaded.pending_reconstruction_trigger = Some((offset as u64, message));
                 }
@@ -3797,6 +3799,70 @@ mod final_handle_tests {
         assert_strict_classic_trailer_error(
             "<< /Size (bad) /Root 1 0 R >>",
             "/Size key in trailer dictionary is not an integer",
+        );
+    }
+
+    #[test]
+    fn strict_classic_xref_rejects_null_trailer_size() {
+        assert_strict_classic_trailer_error(
+            "<< /Size null /Root 1 0 R >>",
+            "trailer dictionary lacks /Size key",
+        );
+    }
+
+    #[test]
+    fn strict_classic_validation_forwards_trailer_parser_diagnostics() {
+        let (bytes, xref) = classic_xref_with_trailer("<< /Root 1 0 R /Broken >>");
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+        let error = parse_xref_from_start(
+            &bytes,
+            xref,
+            xref as u64,
+            "1.4",
+            XrefLoadOptions::default(),
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+            None,
+            true,
+        )
+        .expect_err("missing /Size must remain a strict validation error");
+
+        assert!(error
+            .to_string()
+            .contains("trailer dictionary lacks /Size key"));
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("dictionary ended prematurely")),
+            "strict validation must forward parser diagnostics collected before the error"
+        );
+    }
+
+    #[test]
+    fn xref_stream_previous_offset_validation_ignores_non_integer_prev() {
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/Prev".to_vec(),
+            ObjectHandle::string(b"bad".to_vec()),
+        )]);
+        let registration = XrefRegistration::default();
+        let (offset, diagnostics, error) = resolve_previous_xref_offset(
+            b"",
+            XrefLoadOptions::default(),
+            &registration,
+            XrefReadContextSpec::ActiveSection,
+            &trailer,
+            None,
+        )
+        .expect("xref-stream /Prev validation should be non-fatal");
+
+        assert_eq!(offset, None);
+        assert!(diagnostics.entries().is_empty());
+        assert!(
+            error.is_none(),
+            "xref-stream trailers have no classic trailer error context"
         );
     }
 
