@@ -70,6 +70,7 @@
 //! | qpdf 11.9.0 declaration/implementation | flpdf entry point | regression evidence |
 //! | --- | --- | --- |
 //! | `QPDFObjectHandle::TokenFilter`, `QPDFObjectHandle::ParserCallbacks` (`include/qpdf/QPDFObjectHandle.hh:129-227`) | [`crate::token_filter::TokenFilter`], [`crate::content_stream::ObjectHandleParserCallbacks`], [`crate::content_stream::ParseControl`] | `object_handle_content_parser_tests.rs`: token-filter output/discard/EOF and parser callback lifecycle tests |
+//! | `QPDFObjectHandle::parse` overloads (`include/qpdf/QPDFObjectHandle.hh:382-413`; `libqpdf/QPDFObjectHandle.cc:1672-1699`) | [`ObjectHandle::parse`], [`ObjectHandle::parse_with_description`], [`ObjectHandle::parse_with_context`] | `object_handle.rs::parse_tests` and `flpdf-qtest-tools` test 31: described errors, canonical unresolved references, warning order, and trailing-data checks |
 //! | `parseContentStream`, `pipeContentStreams`, `addTokenFilter`, `parsePageContents`, `filterPageContents`, `pipePageContents`, `addContentTokenFilter`, `filterAsContents`, `parseAsContents` (`include/qpdf/QPDFObjectHandle.hh:421-473`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`], [`ObjectHandle::add_token_filter`], [`ObjectHandle::add_content_token_filter`], `ObjectHandle::parse_content_stream_handles` (private orchestration for `parseContentStream`) | `object_handle_content_parser_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
 //! | `makeResourcesIndirect` (`include/qpdf/QPDFObjectHandle.hh:789-793`; `libqpdf/QPDFObjectHandle.cc:1042-1060`) | [`ObjectHandle::make_resources_indirect`] | `object_handle::mutation_tests::make_resources_indirect_promotes_direct_second_level_values_only` and `acroform_document_helper::tests::prepare_foreign_resource_plan_indirectizes_both_dr_second_level_values` |
 //! | `getResourceNames` (`include/qpdf/QPDFObjectHandle.hh:831-835`; `libqpdf/QPDFObjectHandle.cc:1156-1170`) | [`ObjectHandle::get_resource_names`] | `public_object_primitives.rs::qpdf_object_handle_primitives_are_available_to_external_crates` |
@@ -82,15 +83,16 @@
 //! | `parsePageContents`, `parseAsContents`, `filterPageContents`, `filterAsContents`, `parseContentStream_internal`, inline-image recovery, `addContentTokenFilter`, `addTokenFilter` (`libqpdf/QPDFObjectHandle.cc:1740-1859`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::add_content_token_filter`], [`ObjectHandle::add_token_filter`], [`crate::content_stream::parse_content_stream_handles`] | `object_handle_content_parser_tests.rs` callback identity/span/diagnostic/early-stop/inline-image/filter tests |
 //! | `isFormXObject`, `isImage` (`libqpdf/QPDFObjectHandle.cc:2340-2352`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | direct/indirect subtype and ImageMask exclusion tests |
 //!
-//! `QPDFParser::parseRemainder` and the tokenizer dispatch that backs the
+//! `QPDFObjectHandle::parse` overloads, `QPDFParser::parseRemainder`, and the tokenizer dispatch that backs the
 //! ObjectHandle callbacks remain in [`crate::parser`] and
 //! `crate::pipeline::qpdf_tokenizer::QpdfTokenizer`; their qpdf source
 //! correspondence is documented at
 //! `libqpdf/QPDFParser.cc:135-176,221-223,266-274,408-444,456-469` and
 //! `libqpdf/Pl_QPDFTokenizer.cc:36-65`. This module owns the handle identity,
 //! stream normalization, provider/filter dispatch, and public consumer
-//! boundary; PageObjectHelper and page-tree orchestration are intentionally
-//! outside this table and tracked separately.
+//! boundary. The context-taking parse route uses the canonical resolver's
+//! object cache and warning sink; PageObjectHelper and page-tree orchestration
+//! are intentionally outside this table and tracked separately.
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
@@ -510,6 +512,34 @@ pub(crate) trait DocumentResolver {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+    use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
+
+    struct FailingWarningSink;
+
+    impl Pipeline for FailingWarningSink {
+        fn identifier(&self) -> &str {
+            "failing parse warning sink"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(PipelineError::runtime("parse warning sink failed"))
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    fn quiet_context() -> crate::Pdf<std::io::Cursor<Vec<u8>>> {
+        crate::Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+            crate::PdfOpenOptions {
+                suppress_warnings: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("minimal PDF context")
+    }
 
     #[test]
     fn parse_without_context_rejects_a_nested_indirect_reference() {
@@ -655,10 +685,122 @@ mod parse_tests {
         assert!(matches!(
             error,
             crate::Error::Parse {
-                offset: 1,
+                offset: 0,
                 ref message,
             } if message == "trailing data found parsing object from string"
         ));
+    }
+
+    #[test]
+    fn parse_with_description_preserves_qpdf_trailing_exception_offset() {
+        let error = ObjectHandle::parse_with_description(b"0 trailing", "trailing test")
+            .expect_err("qpdf must reject non-whitespace trailing data");
+
+        assert!(matches!(
+            error,
+            crate::Error::Parse {
+                offset: 0,
+                ref message,
+            } if message == "trailing data found parsing object from string"
+        ));
+    }
+
+    #[test]
+    fn parse_with_context_keeps_canonical_unresolved_indirect_handles() {
+        let mut pdf = quiet_context();
+        let parsed = ObjectHandle::parse_with_context(&pdf, b"[5 0 R 5 0 R]", "indirect test")
+            .expect("context permits indirect references");
+        let items = parsed.as_array().expect("parsed array");
+        let first = items.first().expect("first indirect reference");
+        let second = items.get(1).expect("second indirect reference");
+        assert_eq!(first.object_ref(), Some(crate::ObjectRef::new(5, 0)));
+        assert!(first.is_same_object_as(second));
+        assert!(!first.is_resolved());
+
+        let canonical = pdf.get_object_handle(crate::ObjectRef::new(5, 0));
+        assert!(first.is_same_object_as(&canonical));
+        assert!(!canonical.is_resolved());
+    }
+
+    #[test]
+    fn parse_with_context_records_qpdf_described_recovery_warnings() {
+        let pdf = quiet_context();
+        let parsed = ObjectHandle::parse_with_context(&pdf, b"}", "brace test")
+            .expect("qpdf recovers a brace as null in document context");
+
+        assert!(parsed.is_null());
+        let diagnostics = pdf.repair_diagnostics();
+        assert_eq!(
+            diagnostics
+                .entries()
+                .first()
+                .map(|entry| entry.message.as_str()),
+            Some("parsed object (brace test): treating unexpected brace token as null")
+        );
+        assert!(diagnostics
+            .entries()
+            .first()
+            .is_some_and(crate::Diagnostic::is_object_warning));
+    }
+
+    #[test]
+    fn parse_with_context_routes_recovery_before_trailing_data_error() {
+        let pdf = quiet_context();
+        let error = ObjectHandle::parse_with_context(&pdf, b"} trailing", "context test")
+            .expect_err("qpdf throws after recording parser warnings");
+
+        assert!(matches!(
+            error,
+            crate::Error::Parse {
+                offset: 0,
+                ref message,
+            } if message == "trailing data found parsing object from string"
+        ));
+        let diagnostics = pdf.repair_diagnostics();
+        assert_eq!(
+            diagnostics
+                .entries()
+                .first()
+                .map(|entry| entry.message.as_str()),
+            Some("parsed object (context test): treating unexpected brace token as null")
+        );
+    }
+
+    #[test]
+    fn parse_with_context_formats_nonzero_described_warning_offsets() {
+        let pdf = quiet_context();
+        let parsed =
+            ObjectHandle::parse_with_context(&pdf, b"<< /QPDFFake1 1 2 >>", "dictionary test")
+                .expect("qpdf recovers a missing dictionary key");
+
+        assert!(parsed.as_dictionary().is_some());
+        let diagnostics = pdf.repair_diagnostics();
+        assert_eq!(
+            diagnostics.entries().first().map(|entry| entry.message.as_str()),
+            Some(
+                "parsed object (dictionary test, offset 2): expected dictionary key but found non-name object; inserting key /QPDFFake2"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_with_context_propagates_warning_sink_failures_after_recording() {
+        let mut pdf = quiet_context();
+        let mut sink = FailingWarningSink;
+        assert_eq!(sink.identifier(), "failing parse warning sink");
+        sink.finish().expect("the test sink finish is infallible");
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(sink)));
+        pdf.set_logger(logger);
+        pdf.set_suppress_warnings(false);
+
+        let error = ObjectHandle::parse_with_context(&pdf, b"}", "brace test")
+            .expect_err("warning sink failure must cross the parse boundary");
+        assert!(matches!(
+            error,
+            crate::Error::System(message) if message == "parse warning sink failed"
+        ));
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 }
 
@@ -1486,6 +1628,40 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFParser.cc:135-176`).
     pub fn parse(input: &[u8]) -> Result<Self> {
         crate::parser::parse_explicit_object_handle(input)
+    }
+
+    /// Parse one standalone PDF object with qpdf's object description.
+    ///
+    /// This is the Rust spelling of the public qpdf overload
+    /// `QPDFObjectHandle::parse(string, object_description)`. The input has no
+    /// owning document, so recoverable parser warnings remain errors and
+    /// nested indirect references return the qpdf logic-error equivalent.
+    ///
+    /// qpdf correspondence: `QPDFObjectHandle::parse`
+    /// (`libqpdf/QPDFObjectHandle.cc:1672-1698`) and the `QPDFParser` warning
+    /// boundary (`libqpdf/QPDFParser.cc:488-518`).
+    pub fn parse_with_description(input: &[u8], object_description: &str) -> Result<Self> {
+        crate::parser::parse_explicit_object_handle_with_description(input, object_description)
+    }
+
+    /// Parse one PDF object with a document-owned qpdf context.
+    ///
+    /// Indirect references are inserted into the document's canonical object
+    /// cache without being resolved, and parser recovery warnings are recorded
+    /// on that document in qpdf order. This is the Rust spelling of
+    /// `QPDFObjectHandle::parse(QPDF*, string, object_description)`.
+    ///
+    /// qpdf correspondence: `QPDFObjectHandle::parse`
+    /// (`libqpdf/QPDFObjectHandle.cc:1678-1698`),
+    /// `QPDFParser::parseRemainder` (`libqpdf/QPDFParser.cc:135-176`), and
+    /// `QPDF::getObject` (`libqpdf/QPDF.cc:1952-1959`).
+    pub fn parse_with_context<R: std::io::Read + std::io::Seek + 'static>(
+        pdf: &crate::Pdf<R>,
+        input: &[u8],
+        object_description: &str,
+    ) -> Result<Self> {
+        pdf.resolver
+            .parse_object_handle_from_bytes(input, object_description)
     }
 
     /// True if this handle wraps a value constructed directly, without an

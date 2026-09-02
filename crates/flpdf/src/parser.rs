@@ -167,6 +167,7 @@ impl HandleResolver for DetachedHandles {
 pub(crate) struct LiveTokenSource<'input, I: LiveInput> {
     input: &'input mut I,
     tokenizer: Tokenizer<'static>,
+    last_offset: usize,
 }
 
 impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
@@ -177,11 +178,19 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
         // flpdf too; retain the policy here so this adapter remains the live
         // equivalent of that shared tokenizer.
         tokenizer.allow_eof();
-        Self { input, tokenizer }
+        Self {
+            input,
+            tokenizer,
+            last_offset: 0,
+        }
     }
 
     pub(crate) fn tell(&mut self) -> Result<u64> {
         self.input.tell()
+    }
+
+    pub(crate) fn last_offset(&self) -> usize {
+        self.last_offset
     }
 
     fn seek(&mut self, offset: u64) -> Result<()> {
@@ -216,6 +225,7 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
             token.start = start;
             token.error_offset = start;
             token.end = end;
+            self.last_offset = start;
             return Ok(token);
         }
     }
@@ -229,6 +239,13 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
 pub(crate) struct LiveParsedObject {
     pub(crate) value: ObjectHandle,
     pub(crate) parsed_offset: i64,
+    /// The qpdf `InputSource::getLastOffset()` value after parsing this
+    /// object. This is the parser token start, not the current cursor after
+    /// the terminating delimiter has been unread.
+    pub(crate) last_offset: usize,
+    /// The qpdf `InputSource::tell()` position after parsing this object.
+    /// This is where the public parse overload begins its trailing-data scan.
+    pub(crate) next_offset: usize,
     /// `Some(endobj_offset)` when qpdf recovered an empty indirect-object
     /// body. It leaves that `endobj` unread and reports its offset in the
     /// enclosing `empty object treated as null` warning.
@@ -268,29 +285,60 @@ pub(crate) fn parse_live_file_object_with_decrypter<I: LiveInput>(
 /// (`libqpdf/QPDFObjectHandle.cc:1672-1698`) and `QPDFParser::parseRemainder`
 /// (`libqpdf/QPDFParser.cc:135-176`).
 pub(crate) fn parse_explicit_object_handle(input: &[u8]) -> Result<ObjectHandle> {
+    parse_explicit_object_handle_with_description(input, "")
+}
+
+/// Parse one standalone object string with qpdf's caller-supplied object
+/// description. The description affects parser-created value descriptions;
+/// recoverable warnings still become errors because there is no owning
+/// document context.
+pub(crate) fn parse_explicit_object_handle_with_description(
+    input: &[u8],
+    object_description: &str,
+) -> Result<ObjectHandle> {
     let mut input_source = SliceLiveInput::new(input);
     let mut detached_handles = DetachedHandles {
-        description_template: Some("parsed object,  at offset $PO".to_owned()),
+        description_template: Some(format!("parsed object, {object_description} at offset $PO")),
     };
     let parsed =
         parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false, None)?;
 
-    let trailing_offset = input_source.position();
-    if input[trailing_offset..]
-        .iter()
-        .any(|byte| !is_c_whitespace(*byte))
-    {
-        return Err(Error::parse(
-            trailing_offset,
-            "trailing data found parsing object from string",
-        ));
+    if let Some(error) = trailing_data_error(input, parsed.next_offset, parsed.last_offset) {
+        return Err(error);
     }
 
     Ok(parsed.value)
 }
 
+/// Parse one object string with an owning document parser context. The caller
+/// receives parser recovery diagnostics so the document owner can route them
+/// through its qpdf warning sink after the input borrow is released.
+pub(crate) fn parse_object_handle_with_context(
+    input: &[u8],
+    resolver: &mut dyn HandleResolver,
+) -> Result<LiveParsedObject> {
+    let mut input_source = SliceLiveInput::new(input);
+    parse_live_file_object_with_context(&mut input_source, resolver, true, None)
+}
+
 fn is_c_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+pub(crate) fn trailing_data_error(
+    input: &[u8],
+    next_offset: usize,
+    last_offset: usize,
+) -> Option<Error> {
+    input
+        .get(next_offset..)
+        .filter(|trailing| trailing.iter().any(|byte| !is_c_whitespace(*byte)))
+        .map(|_| {
+            Error::parse(
+                last_offset,
+                "trailing data found parsing object from string",
+            )
+        })
 }
 
 fn parse_live_file_object_with_context<I: LiveInput>(
@@ -360,6 +408,8 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             return Ok(LiveParsedObject {
                 value: ObjectHandle::null(),
                 parsed_offset: NO_PARSED_OFFSET,
+                last_offset: self.tokens.last_offset(),
+                next_offset: token.start,
                 empty: Some(token.start as u64),
                 diagnostics: std::mem::take(&mut self.diagnostics),
             });
@@ -374,9 +424,12 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             _ => self.parse_scalar_token(token, start_offset, true)?,
         };
         let parsed_offset = value.get_parsed_offset();
+        let next_offset = usize::try_from(self.tokens.tell()?).unwrap_or(usize::MAX);
         Ok(LiveParsedObject {
             value,
             parsed_offset,
+            last_offset: self.tokens.last_offset(),
+            next_offset,
             empty: None,
             diagnostics: std::mem::take(&mut self.diagnostics),
         })
