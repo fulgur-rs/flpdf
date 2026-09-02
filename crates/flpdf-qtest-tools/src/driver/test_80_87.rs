@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
+use super::{crt_open_error_message, open_error_bytes, os_str_diagnostic_bytes};
 use flpdf::{job::QPDFJob, Error, ObjectHandle, Pdf};
 
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
@@ -105,10 +106,20 @@ pub(crate) fn run_test_83<R: Read + Seek>(
     stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let path = arg2
-        .map(std::path::Path::new)
-        .ok_or_else(|| Error::Internal("test 83 requires a job JSON path".to_owned()))?;
-    let bytes = std::fs::read(path).map_err(Error::from)?;
+    let arg2 =
+        arg2.ok_or_else(|| Error::Internal("test 83 requires a job JSON path".to_owned()))?;
+    let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
+    // qpdf's `QUtil::read_file_into_memory` (`test_driver.cc:2871-2873`) opens
+    // through `safe_fopen`, the same CRT-backed open path `FileInputSource`
+    // uses, and reports a failed open as `"open " + filename + ": " +
+    // strerror(errno)` (`QUtil.cc:490-518`). Translate through the same
+    // CRT-message route the other driver file opens use (test 90's update-JSON
+    // open, `test_88_98.rs::run_test_90`) instead of a bare `Error::Io`.
+    let bytes = std::fs::read(arg2).map_err(|error| {
+        let crt_message = crt_open_error_message(arg2);
+        let message = open_error_bytes(&arg2_diagnostic, crt_message.as_deref(), &error);
+        Error::System(String::from_utf8_lossy(&message).into_owned())
+    })?;
 
     writeln!(stdout, "calling initializeFromJson")?;
     // qpdf reads the file into a raw `std::string` (`QUtil::read_file_into_memory`,

@@ -581,6 +581,24 @@ fn test_83_reports_invalid_utf8_through_the_exception_path() {
 }
 
 #[test]
+fn test_83_translates_a_missing_job_file_through_the_crt_open_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing-job.json");
+    let missing = missing.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["83", "-", missing])
+        .output()
+        .expect("run test 83");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("open "));
+    assert!(!stderr.contains("os error"));
+}
+
+#[test]
 fn test_60_completes_all_resource_merges_and_writes_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 
