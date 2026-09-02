@@ -739,6 +739,25 @@ fn test_83_initializes_a_complete_json_job() {
 }
 
 #[test]
+fn test_83_accepts_literal_high_bit_bytes_in_a_valid_json_job() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("high-bit-password.json");
+    let mut contents =
+        br#"{"inputFile":"minimal.pdf","outputFile":"a.pdf","password":""}"#.to_vec();
+    contents.insert(contents.len() - 2, 0x80);
+    fs::write(&json, contents).expect("write high-bit job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("calling initializeFromJson\ncalled initializeFromJson\ntest 83 done\n")
+        .stderr("");
+}
+
+#[test]
 fn test_83_reports_non_partial_json_configuration_usage() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let json = directory.path().join("job-partial.json");

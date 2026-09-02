@@ -145,6 +145,24 @@ fn new_job_matches_qpdf_defaults() {
 }
 
 #[test]
+fn job_json_byte_entry_point_accepts_literal_high_bit_password_bytes() {
+    let mut json = br#"{"inputFile":"input.pdf","outputFile":"output.pdf","password":""}"#.to_vec();
+    let password_end = json.len() - 2;
+    json.insert(password_end, 0x80);
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_bytes(&json)
+        .expect("qpdf accepts raw high-bit bytes in a JSON string");
+
+    let mut partial_json = br#"{"password":""}"#.to_vec();
+    partial_json.insert(partial_json.len() - 2, 0x80);
+    let mut partial_job = QPDFJob::new();
+    partial_job
+        .initialize_from_json_partial_bytes(&partial_json)
+        .expect("partial byte entry point must preserve raw JSON bytes");
+}
+
+#[test]
 fn qpdfjob_error_report_matches_the_qpdf_c_wrapper_boundary() {
     let (logger, state) = logger_with_error_sink();
     let mut job = QPDFJob::new();
