@@ -161,6 +161,33 @@ fn malformed_recovery_pdf() -> Vec<u8> {
     pdf
 }
 
+fn non_dictionary_root_pdf() -> Vec<u8> {
+    b"%PDF-1.3\n1 0 obj\n7\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"
+        .to_vec()
+}
+
+/// A well-formed xref table (so no whole-file reconstruction runs) whose
+/// `/Root` object body is itself locally malformed: a value followed by
+/// junk before `endobj` (`libqpdf/QPDF.cc:1352-1355`, `damagedPDF("expected
+/// endobj")`). The object still resolves (to the integer `7`), so the
+/// recoverable "expected endobj" warning and the terminal `getRoot`
+/// dictionary-type failure both surface from the same `root_handle()` call.
+fn recoverable_non_dictionary_root_pdf() -> Vec<u8> {
+    let body = b"7\njunk".as_slice();
+    let mut bytes = b"%PDF-1.3\n".to_vec();
+    let offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n");
+    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(b"\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn complete_json_for_test_89() -> &'static str {
     r#"{
   "qpdf": [
@@ -451,6 +478,47 @@ fn object_handle_api_test_93_uses_canonical_promotion_route() {
         !source.contains("GAP(QPDF::makeIndirectObject)"),
         "test 93 must not leave the qpdf promotion assertions as a GAP"
     );
+}
+
+#[test]
+fn test_93_reports_a_non_dictionary_root_like_qpdf() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad-root.pdf");
+    fs::write(&input, non_dictionary_root_pdf()).expect("write malformed root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+    let expected = format!(
+        "WARNING: {input}: file is damaged\n\
+         WARNING: {input}: can't find startxref\n\
+         WARNING: {input}: Attempting to reconstruct cross-reference table\n\
+         {input}: unable to find /Root dictionary\n"
+    );
+
+    driver()
+        .args(["93", input, "-"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
+}
+
+#[test]
+fn test_93_drains_the_repair_warning_from_resolving_a_malformed_root() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("recoverable-bad-root.pdf");
+    fs::write(&input, recoverable_non_dictionary_root_pdf())
+        .expect("write recoverable malformed root fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+    let expected = format!(
+        "WARNING: {input} (object 1 0, offset 19): expected endobj\n\
+         {input}: unable to find /Root dictionary\n"
+    );
+
+    driver()
+        .args(["93", input, "-"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
 }
 
 #[test]

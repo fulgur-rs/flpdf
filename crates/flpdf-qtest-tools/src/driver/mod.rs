@@ -952,7 +952,8 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         _ => return write_error(stdout, stderr, &format!("invalid test {n}")),
     };
     if let Err(error) = result {
-        return write_error(stdout, stderr, &error.to_string());
+        let message = driver_error_bytes(n, &filename_diagnostic, &error);
+        return write_error_bytes(stdout, stderr, &message);
     }
     // qpdf's test_4 exits immediately after writing its QDF output so the
     // ordinary driver footer is not appended to the binary comparison stream
@@ -1369,6 +1370,26 @@ fn write_error_bytes(stdout: &mut dyn Write, stderr: &mut dyn Write, message: &[
     2
 }
 
+/// Preserve qpdf's filename-bearing `QPDFExc::what()` for the document-root
+/// gate. `Pdf::root_handle` deliberately exposes the public, document-neutral
+/// `Error::System` message, while qpdf's `QPDFExc::createWhat`
+/// (`libqpdf/QPDFExc.cc:19-51`) adds the input description at the driver
+/// boundary. Limit this adaptation to the three `getRoot` consumers covered
+/// by on19; unrelated driver errors retain their existing display.
+fn driver_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
+    if matches!(n, 88 | 93 | 94) {
+        if let Error::System(message) = error {
+            if message == "unable to find /Root dictionary" {
+                let mut result = filename.to_vec();
+                result.extend_from_slice(b": ");
+                result.extend_from_slice(message.as_bytes());
+                return result;
+            }
+        }
+    }
+    error.to_string().into_bytes()
+}
+
 fn write_stderr_bytes(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -1382,14 +1403,30 @@ fn write_stderr_bytes(
 #[cfg(test)]
 mod tests {
     use super::{
-        crt_open_error_message, format_nntree_exception, has_interior_nul, open_error_bytes,
-        open_pdf_error_bytes, run, run_test_89_from_json, write_error_bytes, write_warning,
+        crt_open_error_message, driver_error_bytes, format_nntree_exception, has_interior_nul,
+        open_error_bytes, open_pdf_error_bytes, run, run_test_89_from_json, write_error_bytes,
+        write_warning,
     };
-    use flpdf::Diagnostic;
+    use flpdf::{Diagnostic, Error};
     use std::{
         ffi::{OsStr, OsString},
         io::{self, Write},
     };
+
+    #[test]
+    fn driver_error_bytes_only_prefixes_the_qpdf_root_error() {
+        let other_system = Error::System("other error".to_owned());
+        assert_eq!(
+            driver_error_bytes(93, b"input.pdf", &other_system),
+            b"other error"
+        );
+
+        let other_category = Error::Internal("other category".to_owned());
+        assert_eq!(
+            driver_error_bytes(93, b"input.pdf", &other_category),
+            b"other category"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
