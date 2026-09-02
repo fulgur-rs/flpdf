@@ -38,6 +38,15 @@ use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
+const NON_NAME_CHECKBOX_WARNING: &str =
+    "ignoring attempt to set a checkbox field to a value whose type is not name";
+const NON_NAME_RADIO_WARNING: &str =
+    "ignoring attempt to set a radio button field to an object that is not a name";
+const RADIO_BUTTON_SHAPE_WARNING: &str =
+    "don't know how to set the value of this field as a radio button";
+const BROKEN_RADIO_BUTTON_WARNING: &str = "unable to set the value of this radio button";
+const BROKEN_CHECKBOX_WARNING: &str = "unable to set the value of this checkbox";
+
 #[path = "form_field_object_helper/rendering.rs"]
 mod rendering;
 
@@ -445,14 +454,22 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     pub fn set_value(&mut self, value: ObjectHandle, need_appearances: bool) -> Result<()> {
         let value = self.resolved(value)?;
         if self.field_type()?.as_deref() == Some(b"/Btn") {
-            if let Some(name) = value.as_name() {
-                if self.is_checkbox()? {
+            if self.is_checkbox()? {
+                if let Some(name) = value.as_name() {
                     self.set_checkbox_value(name != b"Off")?;
-                } else if self.is_radio_button()? {
-                    self.set_radio_button_value(self.field.clone(), &name)?;
+                } else {
+                    self.field.warn_if_possible(NON_NAME_CHECKBOX_WARNING)?;
                 }
+            } else if self.is_radio_button()? {
+                if let Some(name) = value.as_name() {
+                    self.set_radio_button_value(self.field.clone(), &name)?;
+                } else {
+                    self.field.warn_if_possible(NON_NAME_RADIO_WARNING)?;
+                }
+            } else if self.is_pushbutton()? {
+                self.field
+                    .warn_if_possible("ignoring attempt set the value of a pushbutton field")?;
             }
-            // qpdf ignores invalid button input and pushbutton values.
             return Ok(());
         }
 
@@ -537,6 +554,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         self.set_field_attribute(b"/V", value.clone())?;
         if let Some(annotation) = annotation {
             self.set_direct_attribute(&annotation, b"/AS", value)?;
+        } else {
+            self.field.warn_if_possible(BROKEN_CHECKBOX_WARNING)?;
         }
         Ok(())
     }
@@ -571,29 +590,42 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
         let parent_is_null = parent.is_null();
         let kids = self.resolved(field.get_key(b"/Kids"))?;
-        if kids.as_array().is_none() || !parent_is_null {
+        if !parent_is_null {
+            field.warn_if_possible(RADIO_BUTTON_SHAPE_WARNING)?;
             return Ok(());
         }
 
-        self.set_direct_attribute(&field, b"/V", ObjectHandle::name(value.to_vec()))?;
         let Some(items) = kids.as_array() else {
+            field.warn_if_possible(RADIO_BUTTON_SHAPE_WARNING)?;
             return Ok(());
         };
-        self.update_radio_kids(items, value)
+        self.set_direct_attribute(&field, b"/V", ObjectHandle::name(value.to_vec()))?;
+        self.update_radio_kids(items, value, &field)
     }
 
-    fn update_radio_kids(&mut self, kids: Vec<ObjectHandle>, value: &[u8]) -> Result<()> {
+    fn update_radio_kids(
+        &mut self,
+        kids: Vec<ObjectHandle>,
+        value: &[u8],
+        warning_handle: &ObjectHandle,
+    ) -> Result<()> {
         for kid in kids {
-            self.update_radio_kid(kid, value)?;
+            self.update_radio_kid(kid, value, warning_handle)?;
         }
         Ok(())
     }
 
     /// qpdf looks one level below a radio child that has no `/AP`; it does
     /// not recurse beyond that child field.
-    fn update_radio_kid(&mut self, kid: ObjectHandle, value: &[u8]) -> Result<()> {
+    fn update_radio_kid(
+        &mut self,
+        kid: ObjectHandle,
+        value: &[u8],
+        warning_handle: &ObjectHandle,
+    ) -> Result<()> {
         let kid = self.resolved(kid)?;
         if kid.as_dictionary().is_none() {
+            warning_handle.warn_if_possible(BROKEN_RADIO_BUTTON_WARNING)?;
             return Ok(());
         }
         if self.has_non_null_appearance(&kid)? {
@@ -604,7 +636,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
         let grandkids = self.resolved(kid.get_key(b"/Kids"))?;
         if let Some(items) = grandkids.as_array() {
-            self.update_first_radio_widget(items, value)?;
+            if !self.update_first_radio_widget(items, value)? {
+                warning_handle.warn_if_possible(BROKEN_RADIO_BUTTON_WARNING)?;
+            }
+        } else {
+            warning_handle.warn_if_possible(BROKEN_RADIO_BUTTON_WARNING)?;
         }
         Ok(())
     }
@@ -942,5 +978,190 @@ mod tests {
             Some(b"Chosen".to_vec()),
             "a direct merged field/widget checkbox must have /AS synced, not just /V"
         );
+    }
+
+    #[test]
+    fn broken_radio_button_set_value_records_qpdf_warning() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let field = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/Ff".to_vec(), ObjectHandle::integer(1 << 15)),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
+                ),
+            ]))
+            .expect("allocate broken radio field");
+        let field_ref = field.object_ref().expect("radio field reference");
+
+        {
+            let mut helper = super::FormFieldObjectHelper::new(field_ref, &mut pdf);
+            helper
+                .set_value(ObjectHandle::name(b"2".to_vec()), true)
+                .expect("set broken radio value");
+        }
+
+        let diagnostics = pdf.repair_diagnostics();
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            ["object 3 0: unable to set the value of this radio button"]
+        );
+    }
+
+    #[test]
+    fn broken_checkbox_set_value_records_qpdf_warning() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let field = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/FT".to_vec(),
+                ObjectHandle::name(b"Btn".to_vec()),
+            )]))
+            .expect("allocate broken checkbox field");
+        let field_ref = field.object_ref().expect("checkbox field reference");
+
+        {
+            let mut helper = super::FormFieldObjectHelper::new(field_ref, &mut pdf);
+            helper
+                .set_value(ObjectHandle::name(b"Sure".to_vec()), true)
+                .expect("set broken checkbox value");
+        }
+
+        let diagnostics = pdf.repair_diagnostics();
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            ["object 3 0: unable to set the value of this checkbox"]
+        );
+    }
+
+    #[test]
+    fn button_set_value_type_and_pushbutton_warnings_follow_qpdf() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+            crate::PdfOpenOptions {
+                suppress_warnings: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open minimal PDF");
+        let checkbox = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/FT".to_vec(),
+                ObjectHandle::name(b"Btn".to_vec()),
+            )]))
+            .expect("allocate checkbox");
+        let radio = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/Ff".to_vec(), ObjectHandle::integer(1 << 15)),
+            ]))
+            .expect("allocate radio");
+        let pushbutton = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/Ff".to_vec(), ObjectHandle::integer(1 << 16)),
+            ]))
+            .expect("allocate pushbutton");
+
+        {
+            let mut helper = super::FormFieldObjectHelper::new(
+                checkbox.object_ref().expect("checkbox reference"),
+                &mut pdf,
+            );
+            helper
+                .set_value(ObjectHandle::integer(1), true)
+                .expect("set checkbox with invalid value type");
+        }
+        {
+            let mut helper = super::FormFieldObjectHelper::new(
+                radio.object_ref().expect("radio reference"),
+                &mut pdf,
+            );
+            helper
+                .set_value(ObjectHandle::integer(1), true)
+                .expect("set radio with invalid value type");
+        }
+        {
+            let mut helper = super::FormFieldObjectHelper::new(
+                pushbutton.object_ref().expect("pushbutton reference"),
+                &mut pdf,
+            );
+            helper
+                .set_value(ObjectHandle::name(b"On".to_vec()), true)
+                .expect("set pushbutton value");
+        }
+
+        let diagnostics = pdf.repair_diagnostics();
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(messages.iter().any(|message| message.contains(
+            "ignoring attempt to set a checkbox field to a value whose type is not name"
+        )));
+        assert!(messages.iter().any(|message| message.contains(
+            "ignoring attempt to set a radio button field to an object that is not a name"
+        )));
+        assert!(messages.iter().any(
+            |message| message.contains("ignoring attempt set the value of a pushbutton field")
+        ));
+    }
+
+    #[test]
+    fn radio_button_shape_failures_warn_once_per_missing_widget() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+            crate::PdfOpenOptions {
+                suppress_warnings: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open minimal PDF");
+        let field = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/Ff".to_vec(), ObjectHandle::integer(1 << 15)),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(1),
+                        ObjectHandle::dictionary(vec![(
+                            b"/Kids".to_vec(),
+                            ObjectHandle::array(Vec::new()),
+                        )]),
+                    ]),
+                ),
+            ]))
+            .expect("allocate malformed radio field");
+
+        {
+            let mut helper = super::FormFieldObjectHelper::new(
+                field.object_ref().expect("radio reference"),
+                &mut pdf,
+            );
+            helper
+                .set_value(ObjectHandle::name(b"On".to_vec()), true)
+                .expect("set malformed radio value");
+        }
+
+        let diagnostics = pdf.repair_diagnostics();
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .filter(|message| message.contains("unable to set the value of this radio button"))
+            .collect();
+        assert_eq!(messages.len(), 2);
     }
 }
