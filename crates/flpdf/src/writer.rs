@@ -350,6 +350,11 @@ impl WriterConfiguration {
         self.settings.copy_encryption = None;
     }
 
+    pub(crate) fn clear_encryption_parameters(&mut self) {
+        self.settings.encryption_parameters = None;
+        self.settings.copy_encryption = None;
+    }
+
     pub(crate) fn normalize_encryption_passwords(
         &mut self,
         password_mode: PasswordMode,
