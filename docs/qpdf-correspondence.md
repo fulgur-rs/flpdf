@@ -578,6 +578,20 @@ V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invo
 | `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `acroform_document_helper.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
 
+`qpdf/test_driver.cc:2073-2137` の `test_56`–`test_59` と `:2303-2364` の
+`test_64`–`test_67` は、`PageObjectHelper::get_form_xobject_for_page`、
+`Pdf::copy_foreign_object`、`PageObjectHelper::get_resources`/
+`ObjectHandle::merge_resources`、`PageObjectHelper::place_form_xobject`、
+`PageObjectHelper::add_page_contents`、`PdfWriter` のQDF/static-ID経路を通る
+qtest consumerとして実装済みである。pinned qpdf 11.9.0との同一fixture比較で8件の
+`a.pdf`出力が一致し、対応するqtest比較行は `form-xobject 4,6,8,10,12,14,16,18`
+へ昇格した。driver側にForm XObjectの独自traversal・allocation・compatibility bridgeは
+追加していない。両関数とも `PdfWriter::write()` 実行後に診断drain呼び出しを追加した
+（write中に到達する未resolveオブジェクトが新規repair diagnosticを生む可能性があり、
+qpdfのwarn()コールバックはwrite()実行中も同期的に出力するため）。`test_64_67_body`は
+さらに主文書側の診断drainをループ末尾からループ内（各ページの`add_page_contents`直後）
+へ移し、`test_56_59_body`と同じper-iteration順序に揃えた。
+
 ## 8. JSON
 
 | qpdf | 行 | flpdf | 状態 |

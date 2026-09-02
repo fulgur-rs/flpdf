@@ -1,7 +1,11 @@
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
+use std::rc::Rc;
 
-use flpdf::{EncryptParams, ObjectHandle, PageDocumentHelper, Pdf, PdfOpenOptions, PdfWriter};
+use flpdf::{
+    EncryptParams, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions,
+    PdfWriter,
+};
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
 use crate::output::write_bytes;
@@ -50,11 +54,10 @@ fn open_secondary_pdf(
 /// rotation-handling combinations `test_56`..`test_59` each exercise
 /// (test_driver.cc:2077-2082).
 ///
-/// The loop's very first statement
-/// (`pdf.copyForeignObject(ph2.getFormXObjectForPage(handle_from_transformation))`,
-/// test_driver.cc:2096) already needs three primitives with no public flpdf
-/// equivalent, so nothing past computing `pages1`/`pages2`/`npages` can be
-/// attempted; see the `GAP` comment below for the full accounting.
+/// The loop below follows qpdf's live page-helper route: source pages become
+/// document-owned Form XObjects, those handles are copied into the destination
+/// document, and the destination page receives the resource and content-stream
+/// mutations before the QDF/static-ID write.
 #[allow(clippy::too_many_arguments)]
 fn test_56_59_body<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -69,34 +72,90 @@ fn test_56_59_body<R: Read + Seek>(
     // qpdf: `assert(arg2);` (test_driver.cc:2085).
     let arg2 = arg2.expect("test 56-59 requires arg2, matching qpdf's own assert(arg2 != nullptr)");
     let mut pdf2 = open_secondary_pdf(arg2, stdout, stderr)?;
+    let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
+    let mut secondary_diagnostics_written = pdf2.repair_diagnostics().entries().len();
 
     // `QPDFPageDocumentHelper(pdf).getAllPages()` / `QPDFPageDocumentHelper(pdf2).getAllPages()`
-    // (test_driver.cc:2089-2091). Computed for real — this reflects qpdf's own values and
-    // triggers whatever page-tree-walk diagnostics either document would surface — but
-    // `npages` itself is only ever consumed by the loop body the GAP below stops before.
+    // (test_driver.cc:2089-2091).
     let pages1 = PageDocumentHelper::new(pdf).get_all_pages()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let pages2 = PageDocumentHelper::new(&mut pdf2).get_all_pages()?;
+    emit_new_diagnostics(
+        &pdf2,
+        &mut secondary_diagnostics_written,
+        &arg2_diagnostic,
+        stdout,
+        stderr,
+    )?; // cov:ignore: diagnostic sink failures are covered by the shared driver flush tests; this terminator has no separate qpdf behavior
     let npages = pages1.len().min(pages2.len());
-    let _ = (
-        handle_from_transformation,
-        invert_to_transformation,
-        npages,
-        filename,
-        &diagnostics_written,
-    );
 
-    // GAP(QPDFPageObjectHelper::getFormXObjectForPage / QPDFObjectHandle::getAttribute /
-    // QPDFPageObjectHelper::placeFormXObject): the per-page loop's first statement
-    // (test_driver.cc:2095-2107) needs the page-to-Form-XObject conversion (mirrored by
-    // `flpdf::page_form_xobject::get_form_xobject_for_page`, `page_form_xobject.rs:72`), the
-    // inheritable-attribute lookup-with-create-if-missing used for `ph1.getAttribute("/Resources",
-    // true)`, and the content-fragment placement helper (mirrored by `flpdf::job::overlay::place_form_xobject`,
-    // `job/overlay.rs:139`). `get_form_xobject_for_page` is `pub(crate)` and `place_form_xobject` is not
-    // even `pub(crate)`-reachable outside `job/overlay.rs`; no `getAttribute`-with-create equivalent
-    // exists at any visibility. None of the three is exposed to this separate crate, so no
-    // iteration of the loop can be attempted, and the `QPDFWriter` write of `a.pdf` at the end of
-    // qpdf's `test_56_59` (test_driver.cc:2109-2112) — which depends entirely on the loop's page
-    // mutations — is not attempted either.
+    for index in 0..npages {
+        // qpdf first creates the Form XObject in the source document, then
+        // imports that live indirect handle into the destination
+        // (`test_driver.cc:2095-2096`).
+        let source_form = {
+            let mut source_page = PageObjectHelper::new(pages2[index], &mut pdf2);
+            source_page.get_form_xobject_for_page(handle_from_transformation)?
+        };
+        emit_new_diagnostics(
+            &pdf2,
+            &mut secondary_diagnostics_written,
+            &arg2_diagnostic,
+            stdout,
+            stderr,
+        )?; // cov:ignore: diagnostic sink failures are covered by the shared driver flush tests; this terminator has no separate qpdf behavior
+        let form = pdf.copy_foreign_object(&source_form)?;
+
+        // qpdf's getAttribute("/Resources", true) makes an inherited or
+        // indirect resource dictionary private before the XObject entry is
+        // installed. The live PageObjectHelper and ObjectHandle routes do the
+        // same work here.
+        let content = {
+            let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
+            let resources = destination_page.get_resources(true)?;
+            let mut min_suffix = 1;
+            let name = resources.get_unique_resource_name(b"/Fx", &mut min_suffix, None)?;
+            let rect = destination_page
+                .get_trim_box(false, false)?
+                .try_get_array_as_rectangle()?;
+            let name_text = String::from_utf8(name.clone())
+                .expect("qpdf-generated Fx resource names are ASCII");
+            let (content, _matrix) = destination_page.place_form_xobject(
+                form.clone(),
+                &name_text,
+                rect,
+                invert_to_transformation,
+                true,
+                false,
+            )?; // cov:ignore: valid qpdf fixtures cover placement success; this is only the defensive Result propagation edge
+            resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?, None)?;
+            resources.get_key(b"/XObject").replace_key(&name, form)?;
+            content
+        };
+
+        // qpdf adds these streams after the resource mutation, in this exact
+        // order: a leading `q\n`, then `\nQ\n` plus the placement fragment.
+        let q_stream = pdf.new_stream_with_data(Rc::new(b"q\n".to_vec()))?;
+        let placed_stream =
+            pdf.new_stream_with_data(Rc::new(format!("\nQ\n{content}").into_bytes()))?;
+        let mut destination_page = PageObjectHelper::new(pages1[index], pdf);
+        destination_page.add_page_contents(q_stream, true)?;
+        destination_page.add_page_contents(placed_stream, false)?;
+
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    }
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.write()?;
+    // `QPDFWriter::write()` can resolve objects that were never touched by
+    // the loop above (e.g. while renumbering the full object graph), and
+    // that resolution can append new repair diagnostics. qpdf's own warning
+    // callback prints synchronously as `write()` runs, so a final drain here
+    // is required to keep this driver's stdout/stderr in the same order.
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(())
 }
 
@@ -449,4 +508,60 @@ pub(crate) fn run_test_63<R: Read + Seek>(
     w.set_output_file("a.pdf")?;
     w.write()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_56_59_body;
+    use flpdf::Pdf;
+
+    struct CurrentDirGuard(std::path::PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    #[test]
+    fn test_56_59_body_runs_the_canonical_overlay_route() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let source = directory.path().join("source.pdf");
+        std::fs::write(
+            &source,
+            include_bytes!("../../../../tests/fixtures/compat/fxo-red.pdf"),
+        )
+        .expect("write source fixture");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/fxo-red.pdf").to_vec(),
+        )
+        .expect("open destination fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        test_56_59_body(
+            &mut pdf,
+            b"destination.pdf",
+            Some(source.as_os_str()),
+            false,
+            false,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 56 body");
+
+        assert_eq!(stdout, b"");
+        assert!(stderr.is_empty());
+        assert!(directory.path().join("a.pdf").is_file());
+    }
 }
