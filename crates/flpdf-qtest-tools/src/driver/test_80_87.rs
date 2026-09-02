@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
-use flpdf::{Error, ObjectHandle, Pdf};
+use super::{crt_open_error_message, open_error_bytes, os_str_diagnostic_bytes};
+use flpdf::{job::QPDFJob, Error, ObjectHandle, Pdf};
 
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
 /// `QPDFAcroFormDocumentHelper::transformAnnotations` (transform the main
@@ -100,20 +101,42 @@ pub(crate) fn run_test_82<R: Read + Seek>(
 pub(crate) fn run_test_83<R: Read + Seek>(
     _pdf: &mut Pdf<R>,
     _filename: &[u8],
-    _arg2: Option<&OsStr>,
+    arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
+    stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
+    let arg2 =
+        arg2.ok_or_else(|| Error::Internal("test 83 requires a job JSON path".to_owned()))?;
+    let arg2_diagnostic = os_str_diagnostic_bytes(arg2);
+    // qpdf's `QUtil::read_file_into_memory` (`test_driver.cc:2871-2873`) opens
+    // through `safe_fopen`, the same CRT-backed open path `FileInputSource`
+    // uses, and reports a failed open as `"open " + filename + ": " +
+    // strerror(errno)` (`QUtil.cc:490-518`). Translate through the same
+    // CRT-message route the other driver file opens use (test 90's update-JSON
+    // open, `test_88_98.rs::run_test_90`) instead of a bare `Error::Io`.
+    let bytes = std::fs::read(arg2).map_err(|error| {
+        let crt_message = crt_open_error_message(arg2);
+        let message = open_error_bytes(&arg2_diagnostic, crt_message.as_deref(), &error);
+        Error::System(String::from_utf8_lossy(&message).into_owned())
+    })?;
+
     writeln!(stdout, "calling initializeFromJson")?;
-    // GAP(QPDFJob::initializeFromJson): flpdf's `job` module
-    // (crates/flpdf/src/job/mod.rs) exposes only `write_json` (the
-    // `QPDFJob::writeJSON` output-selection slice); there is no port --
-    // public or private -- of QPDFJob's job-config *input* parsing
-    // (`initializeFromJson`/its `Config` builder), so the remainder of this
-    // test (parsing `arg2`'s contents as a job-config JSON document and
-    // reporting "called initializeFromJson" or a caught usage/exception
-    // message) cannot be reproduced.
+    // qpdf reads the file into a raw `std::string` (`QUtil::read_file_into_memory`,
+    // `test_driver.cc:2871-2873`) with no UTF-8 validation, so a byte sequence that
+    // is not valid UTF-8 still reaches `initializeFromJson` and is reported through
+    // the same caught-exception path as any other malformed job JSON. flpdf's
+    // `initialize_from_json` takes `&str`, so the UTF-8 decode failure is folded
+    // into the same `exception:` arm rather than short-circuiting before the
+    // "calling initializeFromJson" line is printed.
+    let result = String::from_utf8(bytes)
+        .map_err(|error| Error::System(error.to_string()))
+        .and_then(|json| QPDFJob::new().initialize_from_json(&json));
+    match result {
+        Ok(()) => writeln!(stdout, "called initializeFromJson")?,
+        Err(Error::Usage(error)) => writeln!(stderr, "usage: {error}")?,
+        Err(error) => writeln!(stderr, "exception: {error}")?,
+    }
     Ok(())
 }
 

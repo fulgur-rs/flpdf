@@ -517,6 +517,113 @@ fn test_53_flushes_repair_diagnostics_before_object_output() {
 }
 
 #[test]
+fn test_83_initializes_a_complete_json_job() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("job.json");
+    fs::write(
+        &json,
+        br#"{
+  "inputFile": "minimal.pdf",
+  "outputFile": "a.pdf"
+}"#,
+    )
+    .expect("write job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("calling initializeFromJson\ncalled initializeFromJson\ntest 83 done\n")
+        .stderr("");
+}
+
+#[test]
+fn test_83_reports_non_partial_json_configuration_usage() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("job-partial.json");
+    fs::write(
+        &json,
+        br#"{
+  "encrypt": {
+    "userPassword": "",
+    "ownerPassword": "",
+    "256bit": {}
+  }
+}"#,
+    )
+    .expect("write partial job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("calling initializeFromJson\ntest 83 done\n")
+        .stderr("usage: an input file name is required\n");
+}
+
+#[test]
+fn test_83_reports_json_parse_errors_as_exceptions() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("malformed.json");
+    fs::write(&json, b"not-json").expect("write malformed job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 83");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"calling initializeFromJson\ntest 83 done\n");
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("exception: "));
+}
+
+#[test]
+fn test_83_reports_invalid_utf8_through_the_exception_path() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("invalid-utf8.json");
+    // qpdf reads the job file as raw bytes with no UTF-8 validation
+    // (`QUtil::read_file_into_memory`, `test_driver.cc:2871-2873`) and only
+    // ever reports failures through the caught-exception path, after
+    // printing "calling initializeFromJson".
+    fs::write(&json, [b'{', 0xff, b'}']).expect("write invalid-utf8 job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 83");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"calling initializeFromJson\ntest 83 done\n");
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("exception: "));
+}
+
+#[test]
+fn test_83_translates_a_missing_job_file_through_the_crt_open_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing-job.json");
+    let missing = missing.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["83", "-", missing])
+        .output()
+        .expect("run test 83");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("open "));
+    assert!(!stderr.contains("os error"));
+}
+
+#[test]
 fn test_60_completes_all_resource_merges_and_writes_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 

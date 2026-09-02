@@ -626,6 +626,15 @@ test 90はupdate失敗時（`import_json`はupdateでは`&mut self`のPDFを保�
 ではなく`Pdf::root_handle()`（qpdfの`getRoot()`のdictionary検証を保持、`QPDF.cc:2355-2368`）
 を経由する。
 
+`qpdf/test_driver.cc:2864-2882` の test 83 は、qpdf の `QPDFJob::initializeFromJson` を
+完全初期化（`partial=false`）で呼び出すconsumerとして `test_80_87.rs::run_test_83` に
+接続した。driverは`arg2`をbyte readしてから`calling initializeFromJson`を出力し、既存の
+`job/lifecycle.rs::QPDFJob::initialize_from_json`へ委譲する。`Error::Usage`はqpdfの
+`usage:`、その他のエラーは`exception:`としてstderrへ流し、主入力PDFのopenを行わない
+dispatchも維持する。`job-partial.json`の実機出力は`usage: an input file name is required`
+となる（`QPDFJob.cc:567-637`, `QPDFJob_config.cc:774-784`）。test 84のfluent Config/API
+surfaceはこのconsumerの範囲外で、別sliceに残す。
+
 ### `flpdf-25kg.3.37` bounded consumer cutover (2026-08-15)
 
 `document_json.rs` の object-map enumeration は `Pdf::get_all_objects()` に、通常の
