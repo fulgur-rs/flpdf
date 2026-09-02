@@ -121,6 +121,12 @@ pub(crate) struct LoadedXrefState {
     /// diagnostics have a different qpdf description and remain on that
     /// existing path.
     pub(crate) classic_trailer_offset: Option<usize>,
+    /// A bootstrap `/Size` lookup can request qpdf-style xref reconstruction
+    /// while the classic trailer is being validated. Keep that trigger on the
+    /// partially loaded state so the outer loader can reconstruct and then
+    /// continue with the post-chain `/Size` consistency check, rather than
+    /// treating the resolver handoff as a terminal xref parse failure.
+    pub(crate) pending_reconstruction_trigger: Option<(u64, String)>,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, ObjectHandle>,
     /// Objects resolved while reading xref streams stay available to the
@@ -1181,6 +1187,25 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
+    if let Some((offset, message)) = loaded.pending_reconstruction_trigger.take() {
+        let trigger = Error::parse(offset as usize, message);
+        let diagnostics = std::mem::take(&mut loaded.loaded.repair_diagnostics);
+        let recovered = recover_xref_from_linear_scan(
+            bytes,
+            version.clone(),
+            startxref,
+            trigger,
+            Some(&loaded.loaded.trailer),
+            options,
+            diagnostics,
+            Some(loaded.first_xref_item_offset),
+        )?;
+        let deleted_objects = std::mem::take(&mut registration.deleted_objects);
+        loaded = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
+        registration.entries = loaded.loaded.entries.clone();
+        registration.deleted_objects.clear();
+    }
+
     let mut previous_parse_diagnostics = Diagnostics::default();
     if let Err(error) = merge_previous_xref_sections_with_observer(
         bytes,
@@ -1409,6 +1434,7 @@ fn parse_xref_from_start(
             },
             first_xref_item_offset,
             classic_trailer_offset: Some(trailer_start),
+            pending_reconstruction_trigger: None,
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache,
@@ -1425,13 +1451,27 @@ fn parse_xref_from_start(
         }
         // cov:ignore-end
         if validate_current_classic_trailer {
-            if let Err(error) = validate_classic_trailer(&loaded.loaded.trailer, trailer_start) {
-                if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
-                    for diagnostic in loaded.loaded.repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
+            let validation = validate_classic_trailer(
+                &mut trailer_context,
+                &loaded.loaded.trailer,
+                trailer_start,
+            );
+            match validation {
+                Ok(ClassicTrailerValidation::Valid) => {}
+                Ok(ClassicTrailerValidation::NeedsReconstruction(error)) => {
+                    let Error::Parse { offset, message } = error else {
+                        unreachable!("classic trailer reconstruction trigger is a parse error")
+                    };
+                    loaded.pending_reconstruction_trigger = Some((offset as u64, message));
                 }
-                return Err(error);
+                Err(error) => {
+                    if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                        for diagnostic in loaded.loaded.repair_diagnostics.entries() {
+                            sink.push(diagnostic.clone());
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
         merge_xref_stream_from_classic_trailer(
@@ -1467,20 +1507,51 @@ fn parse_xref_from_start(
 /// position immediately after the `trailer` keyword, which is the location
 /// `QPDF::readTrailer` restores on its `InputSource` before constructing the
 /// `QPDFExc` (`QPDF.cc:1313-1327`).
-fn validate_classic_trailer(trailer: &ObjectHandle, trailer_offset: usize) -> Result<()> {
-    if !trailer.try_has_key(b"/Size")? {
+enum ClassicTrailerValidation {
+    Valid,
+    NeedsReconstruction(Error),
+}
+
+fn validate_classic_trailer(
+    context: &mut XrefReadContext<'_>,
+    trailer: &ObjectHandle,
+    trailer_offset: usize,
+) -> Result<ClassicTrailerValidation> {
+    // qpdf's QPDF_Dictionary::hasKey checks the dictionary's raw child slot
+    // before the subsequent getKey("/Size").isInteger() call resolves that
+    // child.  Do not use ObjectHandle::try_has_key here: its public
+    // qpdf-compatible visible-key operation resolves a child while deciding
+    // whether it is null, which changes the recovery handoff for an indirect
+    // /Size whose stale xref row points at another object.
+    let size = trailer
+        .as_dictionary()
+        .and_then(|entries| entries.get(b"/Size".as_slice()).cloned());
+    let Some(size) = size else {
+        return Err(Error::parse(
+            trailer_offset,
+            "trailer dictionary lacks /Size key",
+        ));
+    };
+    if size.is_null() {
         return Err(Error::parse(
             trailer_offset,
             "trailer dictionary lacks /Size key",
         ));
     }
-    if !trailer.try_get_key(b"/Size")?.try_is_integer()? {
+
+    context.ensure_source_for_resolution(&size);
+    let is_integer = size.try_is_integer();
+    context.sync_handle_diagnostics();
+    if let Some(error) = context.take_reconstruction_trigger() {
+        return Ok(ClassicTrailerValidation::NeedsReconstruction(error));
+    }
+    if !is_integer? {
         return Err(Error::parse(
             trailer_offset,
             "/Size key in trailer dictionary is not an integer",
         ));
     }
-    Ok(())
+    Ok(ClassicTrailerValidation::Valid)
 }
 
 fn merge_bootstrap_handle_state_prefer_source(
@@ -2004,6 +2075,7 @@ fn recover_xref_from_linear_scan(
         },
         first_xref_item_offset: recovered_first_xref_item_offset,
         classic_trailer_offset: None,
+        pending_reconstruction_trigger: None,
         trailer_references,
         parsed_xref_streams,
         bootstrap_cache: empty_bootstrap_cache(),
@@ -3089,6 +3161,7 @@ fn parse_xref_stream(
             0
         },
         classic_trailer_offset: None,
+        pending_reconstruction_trigger: None,
         trailer_references,
         parsed_xref_streams,
         bootstrap_cache,
