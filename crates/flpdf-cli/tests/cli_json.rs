@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Command as ShellCommand;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
@@ -750,7 +754,9 @@ fn json_v2_rejects_v1_only_object_keys_before_input_io() {
         assert!(output.stdout.is_empty(), "{key}");
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1\n",
+            format!(
+                "flpdf: json keys \"objects\" and \"objectinfo\" are only valid for json version 1{EOL}"
+            ),
             "{key}"
         );
     }
@@ -900,9 +906,11 @@ fn json_stream_data_file_to_stdout_requires_explicit_prefix() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "\nqpdf: please specify --json-stream-prefix since the input file name is unknown\n\n\
-For help:\n  qpdf --help=usage       usage information\n  qpdf --help=topic       help on a topic\n  \
-qpdf --help=--option    help on an option\n  qpdf --help             general help and a topic list\n\n"
+        format!(
+            "{EOL}qpdf: please specify --json-stream-prefix since the input file name is unknown{EOL}{EOL}\
+             For help:{EOL}  qpdf --help=usage       usage information{EOL}  qpdf --help=topic       help on a topic{EOL}  \
+             qpdf --help=--option    help on an option{EOL}  qpdf --help             general help and a topic list{EOL}{EOL}"
+        )
     );
     assert!(!temp.path().join("stream-4").exists());
 }
@@ -930,9 +938,11 @@ fn json_stream_data_file_to_stdout_empty_prefix_requires_explicit_prefix() {
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "\nqpdf: please specify --json-stream-prefix since the input file name is unknown\n\n\
-For help:\n  qpdf --help=usage       usage information\n  qpdf --help=topic       help on a topic\n  \
-qpdf --help=--option    help on an option\n  qpdf --help             general help and a topic list\n\n"
+        format!(
+            "{EOL}qpdf: please specify --json-stream-prefix since the input file name is unknown{EOL}{EOL}\
+             For help:{EOL}  qpdf --help=usage       usage information{EOL}  qpdf --help=topic       help on a topic{EOL}  \
+             qpdf --help=--option    help on an option{EOL}  qpdf --help             general help and a topic list{EOL}{EOL}"
+        )
     );
     assert!(!temp.path().join("-4").exists());
 }
