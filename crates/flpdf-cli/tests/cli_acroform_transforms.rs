@@ -615,7 +615,11 @@ fn generate_appearances_routes_checkbox_without_ap_through_set_value() {
         .arg(&input)
         .arg(&output)
         .assert()
-        .success();
+        .failure()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "unable to set the value of this checkbox",
+        ));
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
@@ -699,7 +703,11 @@ fn generate_appearances_direct_radio_with_ap_leaves_as_unchanged() {
         .arg(&input)
         .arg(&output)
         .assert()
-        .success();
+        .failure()
+        .code(3)
+        .stderr(predicates::str::contains(
+            "don't know how to set the value of this field as a radio button",
+        ));
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);

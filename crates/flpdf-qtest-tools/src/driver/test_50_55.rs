@@ -175,8 +175,11 @@ pub(crate) fn run_test_51<R: Read + Seek>(
             writeln!(stdout, "setting r1 via parent")?;
             let field_ref =
                 field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
-            foh.set_value(ObjectHandle::name(b"2".to_vec()), true)?;
+            {
+                let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+                foh.set_value(ObjectHandle::name(b"2".to_vec()), true)?;
+            }
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"r2" {
             writeln!(stdout, "setting r2 via child")?;
             let kids_handle = field.get_key(b"/Kids");
@@ -212,23 +215,32 @@ pub(crate) fn run_test_51<R: Read + Seek>(
             )?;
             let kid_ref =
                 kid_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            let mut foh = FormFieldObjectHelper::new(kid_ref, pdf);
-            foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
+            {
+                let mut foh = FormFieldObjectHelper::new(kid_ref, pdf);
+                foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
+            }
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"checkbox1" {
             writeln!(stdout, "turning checkbox1 on")?;
             let field_ref =
                 field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
-            // The value that eventually gets set is based on what's allowed
-            // in /N and may not match this value (matches qpdf's own
-            // comment: `set_value` maps any non-`/Off` name to "checked").
-            foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true)?;
+            {
+                let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+                // The value that eventually gets set is based on what's
+                // allowed in /N and may not match this value (matches qpdf's
+                // own comment: `setV` maps any non-`/Off` name to "checked").
+                foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true)?;
+            }
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         } else if utf8 == b"checkbox2" {
             writeln!(stdout, "turning checkbox2 off")?;
             let field_ref =
                 field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
-            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
-            foh.set_value(ObjectHandle::name(b"Off".to_vec()), true)?;
+            {
+                let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+                foh.set_value(ObjectHandle::name(b"Off".to_vec()), true)?;
+            }
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         }
     }
 
@@ -440,8 +452,149 @@ pub(crate) fn run_test_55<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_and_drain, run_test_50};
-    use flpdf::{Pdf, PdfOpenOptions};
+    use super::{resolve_and_drain, run_test_50, run_test_51};
+    use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+    use std::path::PathBuf;
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    fn radio_widget_with_appearance() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::dictionary(vec![
+                        (b"/Off".to_vec(), ObjectHandle::null()),
+                        (b"/3".to_vec(), ObjectHandle::null()),
+                    ]),
+                )]),
+            ),
+            (b"/AS".to_vec(), ObjectHandle::name(b"Off".to_vec())),
+        ])
+    }
+
+    fn broken_button_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
+            PdfOpenOptions {
+                description: "button-set-broken.pdf".to_owned(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open minimal PDF");
+        let radio = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/Ff".to_vec(), ObjectHandle::integer(1 << 15)),
+                (b"/T".to_vec(), ObjectHandle::string(b"r1".to_vec())),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
+                ),
+            ]))
+            .expect("allocate broken radio field");
+        let checkbox = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"checkbox1".to_vec())),
+            ]))
+            .expect("allocate broken checkbox field");
+        let checkbox2 = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/T".to_vec(), ObjectHandle::string(b"checkbox2".to_vec())),
+                (
+                    b"/AP".to_vec(),
+                    ObjectHandle::dictionary(vec![(
+                        b"/N".to_vec(),
+                        ObjectHandle::dictionary(vec![
+                            (b"/Off".to_vec(), ObjectHandle::null()),
+                            (b"/Yes".to_vec(), ObjectHandle::null()),
+                        ]),
+                    )]),
+                ),
+                (b"/AS".to_vec(), ObjectHandle::name(b"Yes".to_vec())),
+            ]))
+            .expect("allocate intact checkbox field");
+        let radio_kid1 = pdf
+            .make_indirect_object_handle(radio_widget_with_appearance())
+            .expect("allocate first radio widget");
+        let radio_kid2 = pdf
+            .make_indirect_object_handle(radio_widget_with_appearance())
+            .expect("allocate second radio widget");
+        let radio2 = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+                (b"/Ff".to_vec(), ObjectHandle::integer(1 << 15)),
+                (b"/T".to_vec(), ObjectHandle::string(b"r2".to_vec())),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![radio_kid1.clone(), radio_kid2.clone()]),
+                ),
+            ]))
+            .expect("allocate intact radio field");
+        for kid in [&radio_kid1, &radio_kid2] {
+            kid.replace_key(b"/Parent", radio2.clone())
+                .expect("link radio widget to parent");
+            pdf.mark_object_handle_dirty(kid)
+                .expect("mark radio widget dirty");
+        }
+        let acroform = ObjectHandle::dictionary(vec![(
+            b"/Fields".to_vec(),
+            ObjectHandle::array(vec![radio, checkbox, checkbox2, radio2]),
+        )]);
+        let root = pdf.root_handle().expect("root");
+        root.replace_key(b"/AcroForm", acroform)
+            .expect("install AcroForm");
+        pdf.mark_object_handle_dirty(&root)
+            .expect("mark catalog dirty");
+        pdf
+    }
+
+    #[test]
+    fn test_51_drains_each_broken_button_warning_after_its_operation() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = broken_button_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_51(
+            &mut pdf,
+            b"button-set-broken.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 51");
+
+        assert_eq!(
+            stdout,
+            b"setting r1 via parent\nturning checkbox1 on\nturning checkbox2 off\nsetting r2 via child\n"
+        );
+        let warning = String::from_utf8(stderr).expect("warnings are UTF-8");
+        assert_eq!(warning.matches("unable to set the value").count(), 2);
+        assert!(warning.contains("unable to set the value of this radio button"));
+        assert!(warning.contains("unable to set the value of this checkbox"));
+        assert!(directory.path().join("a.pdf").is_file());
+    }
 
     fn pdf_with_merge_dictionaries() -> Vec<u8> {
         let objects: &[(u32, &[u8])] = &[

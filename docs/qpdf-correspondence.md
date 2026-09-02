@@ -1314,6 +1314,36 @@ page-list operationで記録し、`test 69 done`の前に2行を出力する。
 分離する。Pinned qpdfとRust driverは `copy-foreign-objects 11` の
 stdout/stderr/exitを一致させる。
 
+### `test_driver` test 51
+
+`qpdf/test_driver.cc:1955-1997` は `r1`、`checkbox1`、`checkbox2`、`r2` の順に
+操作名を出力し、`QPDFFormFieldObjectHelper::setV`を呼ぶ。buttonの値処理は
+`libqpdf/QPDFFormFieldObjectHelper.cc:300-326`で分岐し、radioのwidgetが見つからない
+場合は同ファイル`348-412`の`unable to set the value of this radio button`、checkboxの
+annotationが見つからない場合は`416-469`の`unable to set the value of this checkbox`を
+公開API `QPDFObjectHandle::warnIfPossible`（`include/qpdf/QPDFObjectHandle.hh:1257-1263`）
+へ記録する。flpdfはこの責務を`FormFieldObjectHelper::set_value`と
+`set_radio_button_value`/`set_checkbox_value`へ置き、driver固有のwarning formatterは
+追加しない。
+
+`run_test_51`は各`setV`相当の操作直後に既存の`emit_new_diagnostics`を呼ぶ。これにより
+qpdf 11.9.0の`button-set-broken.pdf`で得られる、操作名とwarningの順序を保った次の
+combined output（exit 0）になる。
+
+```text
+setting r1 via parent
+WARNING: button-set-broken.pdf, object 5 0 at offset 995: unable to set the value of this radio button
+turning checkbox1 on
+turning checkbox2 off
+WARNING: button-set-broken.pdf, object 7 0 at offset 1354: unable to set the value of this checkbox
+setting r2 via child
+test 51 done
+```
+
+Pinned qpdfとの同一run比較で`interactive-form 12`のstdout/stderr/exitを一致させ、
+qtestのXMLでも同行をpassingへ移す。writerは従来どおりQDF出力を完了し、warningの
+filename/object/offsetは既存のObjectHandle warning sinkから排出する。
+
 ### `test_driver` test 81
 
 `qpdf/test_driver.cc:2807-2817` の ownerless `newNull().getIntValue()` は、
