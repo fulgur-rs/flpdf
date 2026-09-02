@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -33,7 +37,7 @@ fn verbose_prints_wrote_file_line() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "flpdf: wrote file {}\n",
+            "flpdf: wrote file {}{EOL}",
             out_path
         )))
         .stderr(predicate::str::is_empty());
@@ -62,7 +66,7 @@ fn verbose_prints_wrote_file_line_after_linearized_rewrite() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "flpdf: wrote file {}\n",
+            "flpdf: wrote file {}{EOL}",
             out_path
         )))
         .stderr(predicate::str::is_empty());
