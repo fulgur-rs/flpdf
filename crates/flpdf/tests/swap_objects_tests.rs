@@ -120,3 +120,45 @@ fn swap_objects_resolves_an_unknown_generation_to_null() {
         Some(1)
     );
 }
+
+#[test]
+fn swapping_an_object_with_itself_still_resolves_the_canonical_slot() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let object_ref = ObjectRef::new(1, 0);
+    let object = pdf.get_object_handle(object_ref);
+    assert!(!object.is_resolved());
+
+    pdf.swap_objects(object_ref, object_ref)
+        .expect("self-swap resolves successfully");
+
+    assert!(object.is_resolved());
+    assert!(object.as_dictionary().is_some());
+}
+
+#[test]
+fn swapping_two_slots_with_one_shared_value_is_a_noop() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let source = ObjectHandle::dictionary(vec![(b"/Marker".to_vec(), ObjectHandle::integer(7))]);
+    let root_ref = ObjectRef::new(1, 0);
+    let pages_ref = ObjectRef::new(2, 0);
+    pdf.replace_object(root_ref, source.clone())
+        .expect("replace root with direct value");
+    pdf.replace_object(pages_ref, source)
+        .expect("replace pages with the same direct value");
+
+    pdf.swap_objects(root_ref, pages_ref)
+        .expect("swap shared value slots");
+
+    assert_eq!(
+        pdf.get_object_handle(root_ref)
+            .get_key(b"/Marker")
+            .as_integer(),
+        Some(7)
+    );
+    assert_eq!(
+        pdf.get_object_handle(pages_ref)
+            .get_key(b"/Marker")
+            .as_integer(),
+        Some(7)
+    );
+}
