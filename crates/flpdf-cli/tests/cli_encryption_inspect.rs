@@ -153,9 +153,9 @@ fn top_level_is_encrypted_requires_an_input() {
         .arg("--is-encrypted")
         .assert()
         .code(2)
-        .stderr(predicate::eq(
-            "flpdf: --is-encrypted requires an input file\n",
-        ));
+        .stderr(predicate::eq(format!(
+            "flpdf: --is-encrypted requires an input file{EOL}"
+        )));
 }
 
 #[test]
@@ -164,9 +164,9 @@ fn top_level_requires_password_requires_an_input() {
         .arg("--requires-password")
         .assert()
         .code(2)
-        .stderr(predicate::eq(
-            "flpdf: --requires-password requires an input file\n",
-        ));
+        .stderr(predicate::eq(format!(
+            "flpdf: --requires-password requires an input file{EOL}"
+        )));
 }
 
 #[test]
@@ -192,7 +192,8 @@ fn password_file_uses_only_the_first_line() {
     assert!(flpdf.status.success());
     assert_eq!(
         flpdf.stderr,
-        b"flpdf: WARNING: all but the first line of the password file are ignored\n"
+        format!("flpdf: WARNING: all but the first line of the password file are ignored{EOL}")
+            .into_bytes()
     );
 }
 
@@ -516,24 +517,24 @@ fn show_encryption_qpdf_lines_match_qpdf_verbatim() {
     // byte so scripts grepping qpdf output keep working. Hard-coded from
     // qpdf 11.9.0:
     //   qpdf --show-encryption --password=user-v4-aes v4-aes-128-r4.pdf
-    let expected_qpdf_block = "\
-R = 4
-P = -4
-User password = user-v4-aes
-Supplied password is user password
-extract for accessibility: allowed
-extract for any purpose: allowed
-print low resolution: allowed
-print high resolution: allowed
-modify document assembly: allowed
-modify forms: allowed
-modify annotations: allowed
-modify other: allowed
-modify anything: allowed
-stream encryption method: AESv2
-string encryption method: AESv2
-file encryption method: AESv2
-";
+    let expected_qpdf_block = format!(
+        "R = 4{EOL}\
+         P = -4{EOL}\
+         User password = user-v4-aes{EOL}\
+         Supplied password is user password{EOL}\
+         extract for accessibility: allowed{EOL}\
+         extract for any purpose: allowed{EOL}\
+         print low resolution: allowed{EOL}\
+         print high resolution: allowed{EOL}\
+         modify document assembly: allowed{EOL}\
+         modify forms: allowed{EOL}\
+         modify annotations: allowed{EOL}\
+         modify other: allowed{EOL}\
+         modify anything: allowed{EOL}\
+         stream encryption method: AESv2{EOL}\
+         string encryption method: AESv2{EOL}\
+         file encryption method: AESv2{EOL}"
+    );
     let out = flpdf()
         .args(["show-encryption", "--password=user-v4-aes", V4_AES])
         .assert()
