@@ -1158,24 +1158,68 @@ fn encrypt_128_force_v4_no_aes_is_v4_rc4() {
 /// `--encrypt … 40 --use-aes=y` would write RC4 while the user expected AES.
 #[test]
 fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
-    // (args-after-`--encrypt` excluding the `--` terminator, expected substring)
+    // (args-after-`--encrypt` excluding the `--` terminator, expected qpdf
+    // diagnostic substring)
     let cases: &[(&[&str], &str)] = &[
-        (&["u", "o", "40", "--use-aes=y"], "unrecognized argument"),
-        (&["u", "o", "40", "--force-V4"], "unrecognized argument"),
+        (
+            &["u", "o", "40", "--use-aes=y"],
+            "unrecognized argument --use-aes=y (40-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "40", "--force-V4"],
+            "unrecognized argument --force-V4 (40-bit encryption options must be terminated with --)",
+        ),
         (
             &["u", "o", "40", "--allow-insecure"],
-            "unrecognized argument",
+            "unrecognized argument --allow-insecure (40-bit encryption options must be terminated with --)",
         ),
-        (&["u", "o", "256", "--use-aes=y"], "unrecognized argument"),
-        (&["u", "o", "256", "--force-V4"], "unrecognized argument"),
+        (
+            &["u", "o", "40", "--cleartext-metadata"],
+            "unrecognized argument --cleartext-metadata (40-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "40", "--form=y"],
+            "unrecognized argument --form=y (40-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "40", "--assemble=y"],
+            "unrecognized argument --assemble=y (40-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "40", "--accessibility=y"],
+            "unrecognized argument --accessibility=y (40-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "40", "--modify-other=y"],
+            "unrecognized argument --modify-other=y (40-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "128", "--force-R5"],
+            "unrecognized argument --force-R5 (128-bit encryption options must be terminated with --)",
+        ),
         (
             &["u", "", "128", "--allow-insecure"],
-            "unrecognized argument",
+            "unrecognized argument --allow-insecure (128-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "256", "--use-aes=y"],
+            "unrecognized argument --use-aes=y (256-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "256", "--force-V4"],
+            "unrecognized argument --force-V4 (256-bit encryption options must be terminated with --)",
+        ),
+        (
+            &["u", "o", "256", "--potato"],
+            "unrecognized argument --potato (256-bit encryption options must be terminated with --)",
         ),
         // A sub-flag missing its leading `-` must not be silently reinterpreted
         // as the corresponding named flag (qpdf rejects it as an unrecognized
         // positional argument, not as `--force-R5`).
-        (&["u", "o", "256", "force-R5"], "unrecognized argument"),
+        (
+            &["u", "o", "256", "force-R5"],
+            "unrecognized argument force-R5 (256-bit encryption options must be terminated with --)",
+        ),
         // In the dashed `--user-password=`/`--bits=` form, qpdf stays in its
         // password-argument table (no named options recognized) until `--bits`
         // selects the key-length-specific table.
