@@ -1043,9 +1043,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     // object-ID comments.
                     let copied_top = self
                         .copy_transform_object(&copied_source_top, &mut orig_to_copy)?
-                        .ok_or_else(|| {
-                            Error::Unsupported("AcroForm top-level field is a stream".into())
-                        })?;
+                        .expect("copy_transform_object always returns a non-stream clone");
                     if foreign_resources.is_none() {
                         foreign_resources = Some(
                             self.prepare_foreign_resource_plan(copied_source_resources.clone())?,
