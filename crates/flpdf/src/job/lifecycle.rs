@@ -1217,6 +1217,16 @@ pub struct QPDFJob {
     configuration: JobConfiguration,
 }
 
+/// Fluent configuration proxy for the qpdf `QPDFJob::Config` surface.
+///
+/// qpdf returns a shared Config object whose setters mutate the owning job and
+/// return the same proxy (`include/qpdf/QPDFJob.hh:317-375`). Rust expresses
+/// that lifetime as a mutable borrow, so the proxy cannot outlive the
+/// `QPDFJob` it configures and every setter remains on the canonical job state.
+pub struct QPDFJobConfig<'a> {
+    job: &'a mut QPDFJob,
+}
+
 impl Default for QPDFJob {
     fn default() -> Self {
         Self::new()
@@ -1224,6 +1234,13 @@ impl Default for QPDFJob {
 }
 
 impl QPDFJob {
+    /// Return a fluent proxy for the qpdf job configuration subset used by
+    /// direct API consumers.
+    #[must_use]
+    pub fn config(&mut self) -> QPDFJobConfig<'_> {
+        QPDFJobConfig { job: self }
+    }
+
     /// Parse one qpdf `--collate` parameter into its ordered group sizes.
     ///
     /// This is the shared job configuration entry point for the CLI and JSON
@@ -1276,6 +1293,22 @@ impl QPDFJob {
 
     /// Replace the logger used for subsequent job and document output.
     pub fn set_logger(&mut self, logger: QPDFLogger) {
+        self.logger = logger;
+    }
+
+    /// Replace the job's logger with a private qpdf-style logger configured
+    /// for the supplied output and error pipelines.
+    ///
+    /// This is the Rust pipeline equivalent of qpdf's deprecated
+    /// `QPDFJob::setOutputStreams` (`libqpdf/QPDFJob.cc:327-333`), which
+    /// creates a private logger before assigning the two streams.
+    pub fn set_output_streams(
+        &mut self,
+        output: Option<PipelineHandle>,
+        error: Option<PipelineHandle>,
+    ) {
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(output, error);
         self.logger = logger;
     }
 
@@ -3002,7 +3035,7 @@ impl QPDFJob {
     /// (`libqpdf/QPDFJob.cc:567-631`): stdout is reserved before the input is
     /// opened, and `QUtil::same_file` rejects destructive aliases before the
     /// writer can truncate them.
-    fn check_configuration(&self) -> Result<()> {
+    pub fn check_configuration(&self) -> Result<()> {
         if self.configuration.input_file.is_none()
             && !self.configuration.empty_input
             && (self.configuration.require_output
@@ -3431,6 +3464,59 @@ impl QPDFJob {
         } else {
             Ok(JobExitCode::Success)
         }
+    }
+}
+
+impl QPDFJobConfig<'_> {
+    /// Set the primary input filename, rejecting duplicate input selection.
+    pub fn input_file(&mut self, input_file: impl Into<PathBuf>) -> Result<&mut Self> {
+        self.job.set_input_file(input_file)?;
+        Ok(self)
+    }
+
+    /// Set the output filename, rejecting duplicate output selection.
+    pub fn output_file(&mut self, output_file: impl Into<PathBuf>) -> Result<&mut Self> {
+        self.job.set_output_file(output_file)?;
+        Ok(self)
+    }
+
+    /// Request qpdf QDF output.
+    pub fn qdf(&mut self) -> &mut Self {
+        self.job.configuration.writer.set_qdf_mode(true);
+        self
+    }
+
+    /// Request qpdf deterministic trailer identifiers.
+    pub fn deterministic_id(&mut self) -> &mut Self {
+        self.job.configuration.writer.set_deterministic_id(true);
+        self
+    }
+
+    /// Select qpdf's object-stream policy.
+    pub fn object_streams(&mut self, mode: &str) -> Result<&mut Self> {
+        self.job
+            .configuration
+            .writer
+            .set_object_stream_mode(parse_object_stream_mode(mode)?);
+        Ok(self)
+    }
+
+    /// Request qpdf writer progress reporting.
+    pub fn progress(&mut self) -> &mut Self {
+        self.job.set_progress(true);
+        self
+    }
+
+    /// Select the qpdf object inspection target and make output optional.
+    pub fn show_object(&mut self, selector: &str) -> Result<&mut Self> {
+        self.job.configuration.show_object = Some(parse_job_object_selector(selector.as_bytes())?);
+        self.job.configuration.require_output = false;
+        Ok(self)
+    }
+
+    /// Run the owning job's qpdf configuration consistency checks.
+    pub fn check_configuration(&mut self) -> Result<()> {
+        self.job.check_configuration()
     }
 }
 

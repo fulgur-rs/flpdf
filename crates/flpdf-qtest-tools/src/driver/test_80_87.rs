@@ -1,9 +1,37 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use super::{crt_open_error_message, open_error_bytes, os_str_diagnostic_bytes};
-use flpdf::{job::QPDFJob, Error, ObjectHandle, Pdf};
+use flpdf::{
+    job::{JobExitCode, QPDFJob},
+    Error, ObjectHandle, Pdf, Pipeline, PipelineError, PipelineHandle, PipelineResult,
+};
+
+struct CapturedPipeline {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Pipeline for CapturedPipeline {
+    fn identifier(&self) -> &str {
+        "qpdf job test capture"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes
+            .lock()
+            .map_err(|_| PipelineError::runtime("qpdf job capture mutex poisoned"))?
+            .extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
 
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
 /// `QPDFAcroFormDocumentHelper::transformAnnotations` (transform the main
@@ -154,15 +182,114 @@ pub(crate) fn run_test_84<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     writeln!(stdout, "normal")?;
-    // GAP(QPDFJob::config / QPDFJob::run / QPDFJob::checkConfiguration /
-    // QPDFJob::registerProgressReporter / QPDFJob::setOutputStreams): flpdf's
-    // `job` module (crates/flpdf/src/job/mod.rs) exposes only `write_json`
-    // (the `QPDFJob::writeJSON` output-selection slice); none of the
-    // job-orchestration surface this test exercises -- the fluent `Config`
-    // builder, `run()`, `checkConfiguration()`, `registerProgressReporter()`,
-    // or `setOutputStreams()` -- has any port, public or private. The
-    // remaining four scenarios ("custom progress reporter", "error caught by
-    // check", "error caught by run", "output capture") cannot be reproduced.
+
+    {
+        let mut job = QPDFJob::new();
+        let mut config = job.config();
+        config.input_file("minimal.pdf")?;
+        config.output_file("a.pdf")?;
+        config.qdf().deterministic_id();
+        config.object_streams("preserve")?.progress();
+        config.check_configuration()?;
+        drop(config);
+        let status = job.run()?;
+        assert_eq!(status, JobExitCode::Success);
+        assert!(!job.has_warnings());
+    }
+
+    writeln!(stdout, "custom progress reporter")?;
+    {
+        let progress = Rc::new(RefCell::new(Vec::new()));
+        let progress_for_job = Rc::clone(&progress);
+        let mut job = QPDFJob::new();
+        job.register_progress_reporter(move |percent| {
+            progress_for_job
+                .borrow_mut()
+                .extend_from_slice(format!("custom write progress: {percent}%\n").as_bytes());
+            Ok(())
+        });
+        let mut config = job.config();
+        config.input_file("minimal.pdf")?;
+        config.output_file("a.pdf")?;
+        config.qdf().deterministic_id();
+        config.object_streams("preserve")?.progress();
+        config.check_configuration()?;
+        drop(config);
+        let status = job.run()?;
+        assert_eq!(status, JobExitCode::Success);
+        assert!(!job.has_warnings());
+        stdout.write_all(&progress.borrow())?;
+    }
+
+    writeln!(stdout, "error caught by check")?;
+    {
+        let mut job = QPDFJob::new();
+        let mut config = job.config();
+        config.output_file("a.pdf")?;
+        config.qdf();
+        drop(config);
+        writeln!(stdout, "finished config")?;
+        match job.check_configuration() {
+            Ok(()) => {
+                return Err(Error::Internal(
+                    "test 84 check unexpectedly succeeded".to_owned(),
+                ))
+            }
+            Err(Error::Usage(error)) => writeln!(stdout, "usage: {error}")?,
+            Err(error) => return Err(error),
+        }
+    }
+
+    writeln!(stdout, "error caught by run")?;
+    {
+        let mut job = QPDFJob::new();
+        let mut config = job.config();
+        config.output_file("a.pdf")?;
+        config.qdf();
+        drop(config);
+        writeln!(stdout, "finished config")?;
+        match job.run() {
+            Ok(_) => {
+                return Err(Error::Internal(
+                    "test 84 run unexpectedly succeeded".to_owned(),
+                ))
+            }
+            Err(Error::Usage(error)) => writeln!(stdout, "usage: {error}")?,
+            Err(error) => return Err(error),
+        }
+    }
+
+    writeln!(stdout, "output capture")?;
+    {
+        let captured_stdout = Arc::new(Mutex::new(Vec::new()));
+        let captured_stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut job = QPDFJob::new();
+        job.set_output_streams(
+            Some(PipelineHandle::new(CapturedPipeline {
+                bytes: Arc::clone(&captured_stdout),
+            })),
+            Some(PipelineHandle::new(CapturedPipeline {
+                bytes: Arc::clone(&captured_stderr),
+            })),
+        );
+        let mut config = job.config();
+        config.input_file("bad2.pdf")?;
+        config.show_object("4,0")?;
+        config.check_configuration()?;
+        drop(config);
+        writeln!(stdout, "calling run")?;
+        let _ = job.run()?;
+        writeln!(stdout, "captured stdout")?;
+        let captured_stdout = captured_stdout
+            .lock()
+            .map_err(|_| PipelineError::runtime("qpdf job stdout capture mutex poisoned"))?;
+        stdout.write_all(&captured_stdout)?;
+        writeln!(stdout, "captured stderr")?;
+        let captured_stderr = captured_stderr
+            .lock()
+            .map_err(|_| PipelineError::runtime("qpdf job stderr capture mutex poisoned"))?;
+        stdout.write_all(&captured_stderr)?;
+    }
     Ok(())
 }
 
