@@ -23,7 +23,8 @@ use crate::parser::{
 };
 use crate::reader::file_object::{
     finish_file_object_handle, parse_file_object_handle_syntax, parse_file_object_header,
-    FileObjectDiagnostic, HandleFileObjectRead, RecoveryPolicy, ResolvedStreamLength,
+    FileObjectDiagnostic, FileObjectDiagnosticKind, HandleFileObjectRead, RecoveryPolicy,
+    ResolvedStreamLength,
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
@@ -374,6 +375,24 @@ struct ReferenceReadWindow {
     fallback_end: usize,
 }
 
+/// A single attempt to read an uncompressed bootstrap object at a bounded
+/// `end`, with its diagnostics held back (rather than pushed immediately)
+/// until the caller decides whether this attempt or a wider retry wins.
+struct UncompressedObjectRead {
+    value: ObjectValue,
+    parsed_offset: i64,
+    /// Whether `complete_handle_stream` fell back to
+    /// `recover_stream_boundary`'s heuristic `endstream`/`endobj` search
+    /// (signaled by `FileObjectDiagnosticKind::AttemptingStreamLengthRecovery`)
+    /// rather than validating the declared `/Length` boundary exactly. A
+    /// truncated window can make that heuristic search accept a terminator
+    /// -- empty or not -- that only exists because the real one lies beyond
+    /// `end`, so this is the caller's signal to retry through the wider
+    /// fallback window rather than trusting this attempt's result.
+    used_heuristic_recovery: bool,
+    diagnostics: Vec<Diagnostic>,
+}
+
 impl std::fmt::Debug for BootstrapHandleDocument {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BootstrapHandleDocument")
@@ -543,7 +562,7 @@ impl BootstrapHandleDocument {
             Error::Internal("bootstrap resolver source bytes were not initialized".to_owned())
         })?);
         let window = self.reference_read_window(offset, source_bytes.len());
-        let result = self.read_uncompressed_object_with_end(
+        let narrow = self.read_uncompressed_object_with_end(
             object_ref,
             offset,
             start,
@@ -553,18 +572,21 @@ impl BootstrapHandleDocument {
         // A truncated window can also make `read_uncompressed_object_with_end`
         // *succeed* with a bogus result instead of failing: under
         // `RecoveryPolicy::Bounded`, a stream whose real `endstream`/`endobj`
-        // terminator lies beyond `window.end` falls through
-        // `complete_handle_stream`'s no-terminator-found arm, which returns
-        // `Ok` with an empty recovered stream rather than `Err`. Detect that
-        // truncation artifact too, so a real referenced stream is retried
-        // through the wider fallback window instead of being cached empty.
-        let recovered_as_truncated_stream = matches!(
-            &result,
-            Ok((ObjectValue::Stream { stream_data: Some(data), .. }, _)) if data.is_empty()
-        );
+        // terminator lies beyond `window.end` makes `complete_handle_stream`
+        // fall back to `recover_stream_boundary`'s heuristic search, which can
+        // accept a terminator -- empty recovered data, or a real but earlier
+        // `endobj`/`endstream` match, either way short of the true boundary --
+        // purely because the window cut off what lies past it. Retry through
+        // the wider fallback window whenever that heuristic path was taken,
+        // not only when the narrow attempt's result happened to come back
+        // empty or an outright `Err`.
         let should_retry = window.fallback_end > window.end
-            && (matches!(&result, Err(Error::Parse { .. })) || recovered_as_truncated_stream);
-        if should_retry {
+            && match &narrow {
+                Err(Error::Parse { .. }) => true,
+                Ok(read) => read.used_heuristic_recovery,
+                Err(_) => false,
+            };
+        let accepted = if should_retry {
             self.read_uncompressed_object_with_end(
                 object_ref,
                 offset,
@@ -573,8 +595,16 @@ impl BootstrapHandleDocument {
                 &source_bytes,
             )
         } else {
-            result
+            narrow
+        }?;
+        // Discard whichever attempt was not accepted rather than pushing its
+        // diagnostics too: a document qpdf could read with a single unbounded
+        // pass must not surface warnings from a speculative narrow read this
+        // window-bounding mechanism alone introduced.
+        for diagnostic in accepted.diagnostics {
+            self.push_diagnostic(diagnostic);
         }
+        Ok((accepted.value, accepted.parsed_offset))
     }
 
     fn read_uncompressed_object_with_end(
@@ -584,7 +614,7 @@ impl BootstrapHandleDocument {
         start: usize,
         end: usize,
         source_bytes: &[u8],
-    ) -> Result<(ObjectValue, i64)> {
+    ) -> Result<UncompressedObjectRead> {
         let input = source_bytes
             .get(start..end)
             .ok_or_else(|| Error::parse(start, "object is beyond the end of the file"))?;
@@ -629,14 +659,24 @@ impl BootstrapHandleDocument {
                 source_bytes,
             )
             .map_err(|error| error.rebase_offset(start))?;
-        for diagnostic in &completed.diagnostics {
-            self.push_diagnostic(xref_file_object_diagnostic(
-                XrefObjectDescription::Ordinary,
-                completed.object_ref,
-                offset,
-                diagnostic.clone(),
-            ));
-        }
+        let used_heuristic_recovery = completed.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                FileObjectDiagnosticKind::AttemptingStreamLengthRecovery
+            )
+        });
+        let diagnostics = completed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                xref_file_object_diagnostic(
+                    XrefObjectDescription::Ordinary,
+                    completed.object_ref,
+                    offset,
+                    diagnostic.clone(),
+                )
+            })
+            .collect();
         let parsed_offset = completed.object.get_parsed_offset();
         let _ = completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
@@ -647,7 +687,12 @@ impl BootstrapHandleDocument {
             ))
         })?;
         // cov:ignore-end
-        Ok((value.0, parsed_offset))
+        Ok(UncompressedObjectRead {
+            value: value.0,
+            parsed_offset,
+            used_heuristic_recovery,
+            diagnostics,
+        })
     }
     // qpdf-deviation-end
 
@@ -3895,6 +3940,76 @@ mod final_handle_tests {
             stream_data.as_deref().map(Vec::len),
             Some(stream_length),
             "the fallback window must recover the stream's real content, not an empty placeholder"
+        );
+    }
+
+    #[test]
+    fn reconstruction_reference_read_retries_a_narrow_window_that_recovers_nonempty_but_truncated_data(
+    ) {
+        // A narrow window's heuristic search can accept a *non-empty* but
+        // still wrong terminator: an `endobj` keyword embedded inside the
+        // real stream payload, found only because the window happens to end
+        // right after it, well before the declared `/Length` boundary.
+        let mut bytes = b"1 0 obj\n<< /Length 40 >>\nstream\n".to_vec();
+        let header_len = bytes.len();
+        let embedded_false_terminator = b"AAAAAAAAAendobj ";
+        let mut payload = embedded_false_terminator.to_vec();
+        payload.resize(40, b'B');
+        assert_eq!(payload.len(), 40);
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let first_ref = ObjectRef::new(1, 0);
+        let second_ref = ObjectRef::new(2, 0);
+        // Land the narrow window's end right after the embedded "endobj ",
+        // inside the payload and well short of its real 40-byte length.
+        let second_offset = header_len + embedded_false_terminator.len();
+        let mut entries = BTreeMap::new();
+        entries.insert(first_ref, XrefEntry::Uncompressed { offset: 0 });
+        entries.insert(
+            second_ref,
+            XrefEntry::Uncompressed {
+                offset: second_offset as u64,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &entries,
+            },
+            &XrefRegistration::default(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+        context.document.ensure_source_bytes(&bytes);
+
+        let (value, _) = context
+            .document
+            .read_uncompressed_object(first_ref, 0)
+            .expect("the fallback window must recover a valid stream");
+        let ObjectValue::Stream { stream_data, .. } = value else {
+            panic!("expected a recovered stream, got {value:?}"); // cov:ignore: the preceding expect already guarantees a Stream value from this fixture
+        };
+        assert_eq!(
+            stream_data.as_deref().map(Vec::len),
+            Some(payload.len()),
+            "a narrow window's false, non-empty terminator match must not be \
+             accepted over the wider window's real declared-length boundary"
+        );
+
+        let mut collected = Diagnostics::default();
+        context.append_diagnostics_to(&mut collected);
+        assert!(
+            collected.entries().iter().all(|diagnostic| {
+                !diagnostic
+                    .message
+                    .contains("attempting to recover stream length")
+                    && !diagnostic.message.contains("expected endstream")
+            }),
+            "the discarded narrow attempt's recovery diagnostics must not leak \
+             once the wider retry recovers the stream cleanly: {collected:?}"
         );
     }
 
