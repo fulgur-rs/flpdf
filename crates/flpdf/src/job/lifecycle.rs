@@ -4749,7 +4749,7 @@ mod tests {
         assert_eq!(options.filename, b"attachment-\x80.bin");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn job_json_path_fields_preserve_non_utf8_bytes_in_configuration() {
         use std::ffi::OsString;
