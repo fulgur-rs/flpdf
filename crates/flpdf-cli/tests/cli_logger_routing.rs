@@ -144,10 +144,7 @@ fn text_logger_uses_qpdf_platform_line_endings() {
     assert!(version.status.success());
     assert_eq!(
         version.stdout,
-        format!(
-            "qpdf version 11.9.0\nRun qpdf --copyright to see copyright and license information.{}",
-            EOL
-        )
+        format!("qpdf version 11.9.0{EOL}Run qpdf --copyright to see copyright and license information.{EOL}")
         .into_bytes()
     );
 
