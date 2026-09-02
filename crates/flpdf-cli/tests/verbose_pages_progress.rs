@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -48,21 +52,21 @@ fn verbose_pages_alone_emits_qpdf_parity_progress_block() {
         .arg(out.to_str().unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "flpdf: selecting --keep-open-files=y\n",
-        ))
-        .stdout(predicate::str::contains(
-            "two-page.pdf: checking for shared resources\n",
-        ))
-        .stdout(predicate::str::contains(
-            "flpdf: no shared resources found\n",
-        ))
-        .stdout(predicate::str::contains(
-            "flpdf: removing unreferenced pages from primary input\n",
-        ))
-        .stdout(predicate::str::contains(
-            "flpdf: adding pages from two-page.pdf\n",
-        ))
+        .stdout(predicate::str::contains(format!(
+            "flpdf: selecting --keep-open-files=y{EOL}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "two-page.pdf: checking for shared resources{EOL}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "flpdf: no shared resources found{EOL}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "flpdf: removing unreferenced pages from primary input{EOL}"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "flpdf: adding pages from two-page.pdf{EOL}"
+        )))
         .stdout(predicate::str::contains("flpdf: wrote file"))
         .stderr(predicate::str::is_empty());
 }
