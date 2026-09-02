@@ -1227,6 +1227,10 @@ fn encrypt_incompatible_subflags_for_key_len_are_rejected() {
             &["--user-password=u", "--allow-insecure", "--bits=256"],
             "unrecognized argument",
         ),
+        (
+            &["--user-password=u", "--bits=256", "--bits=128"],
+            "unrecognized argument --bits=128 (256-bit encryption options must be terminated with --)",
+        ),
     ];
     for (enc_args, needle) in cases {
         let tmp = tempfile::tempdir().unwrap();
