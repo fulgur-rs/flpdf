@@ -39,6 +39,13 @@ fn missing_mediabox_fixture() -> &'static str {
     )
 }
 
+fn form_fields_and_annotations_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/form-fields-and-annotations.pdf"
+    )
+}
+
 fn swap_replace_fixture() -> Vec<u8> {
     swap_replace_fixture_with_qdict_body(b"<< >>")
 }
@@ -587,6 +594,71 @@ fn test_82_matches_qpdf_compound_type_predicates() {
         .code(0)
         .stdout("test 82 done\n")
         .stderr("");
+}
+
+#[test]
+fn test_80_writes_both_annotation_outputs() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    driver()
+        .args([
+            "80",
+            form_fields_and_annotations_fixture(),
+            form_fields_and_annotations_fixture(),
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 80 done\n")
+        .stderr("");
+
+    assert!(directory.path().join("a.pdf").is_file());
+    assert!(directory.path().join("b.pdf").is_file());
+}
+
+#[test]
+fn test_80_secondary_open_warnings_are_emitted_once_with_secondary_filename() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let assertion = driver()
+        .args([
+            "80",
+            form_fields_and_annotations_fixture(),
+            missing_mediabox_fixture(),
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 80 done\n");
+
+    let expected = format!(
+        "WARNING: {}, object 3 0 at offset 131: kid 0 (from 0) MediaBox is undefined; setting to letter / ANSI A\n",
+        missing_mediabox_fixture()
+    );
+    assert_eq!(assertion.get_output().stderr, expected.as_bytes());
+}
+
+#[test]
+fn test_80_secondary_open_failure_uses_qpdf_open_wording() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing_test80_secondary.pdf");
+    let native_error = fs::read(&missing).expect_err("arg2 fixture must not exist");
+    let error_code = native_error.raw_os_error().expect("native error code");
+    let native_message = unsafe { CStr::from_ptr(libc::strerror(error_code)) }
+        .to_string_lossy()
+        .into_owned();
+    let expected = format!("open {}: {native_message}\n", missing.display());
+
+    driver()
+        .args([
+            "80",
+            form_fields_and_annotations_fixture(),
+            missing.to_str().expect("utf-8 temporary path"),
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
 }
 
 #[test]

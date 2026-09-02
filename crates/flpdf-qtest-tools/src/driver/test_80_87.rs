@@ -5,10 +5,14 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use super::{crt_open_error_message, open_error_bytes, os_str_diagnostic_bytes};
+use super::{
+    crt_open_error_message, emit_new_diagnostics, open_error_bytes, os_str_diagnostic_bytes,
+};
 use flpdf::{
     job::{JobExitCode, QPDFJob},
-    Error, ObjectHandle, ObjectRef, Pdf, Pipeline, PipelineError, PipelineHandle, PipelineResult,
+    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageDocumentHelper,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle,
+    PipelineResult,
 };
 
 struct CapturedPipeline {
@@ -32,6 +36,42 @@ impl Pipeline for CapturedPipeline {
         Ok(())
     }
 }
+
+/// Open test 80's second document through qpdf's `processFile(path)` boundary.
+/// Keep warnings suppressed during parsing so the driver can emit the retained
+/// diagnostics exactly once with `arg2`'s filename, and translate a file-open
+/// failure through qpdf's path-aware `QPDFSystemError` wording.
+fn open_test_80_secondary(
+    path: &OsStr,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> flpdf::Result<Pdf<std::fs::File>> {
+    let path_bytes = os_str_diagnostic_bytes(path).into_owned();
+    let file = std::fs::File::open(path).map_err(|error| {
+        let crt_message = crt_open_error_message(path);
+        let message = open_error_bytes(&path_bytes, crt_message.as_deref(), &error);
+        Error::System(String::from_utf8_lossy(&message).into_owned())
+    })?;
+    let secondary = Pdf::open_with_options(
+        file,
+        PdfOpenOptions {
+            repair: true,
+            suppress_warnings: true,
+            description: String::from_utf8_lossy(&path_bytes).into_owned(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut diagnostics_written = 0;
+    emit_new_diagnostics(
+        &secondary,
+        &mut diagnostics_written,
+        &path_bytes,
+        stdout,
+        stderr,
+    )?;
+    Ok(secondary)
+}
+
 /// qpdf's test_80 (`test_driver.cc:2761-2805`) exercises
 /// `QPDFAcroFormDocumentHelper::transformAnnotations` (transform the main
 /// file's page-1 annotations in place and add the resulting form fields via
@@ -42,29 +82,87 @@ impl Pipeline for CapturedPipeline {
 /// stdout is printed by this test; its only externally observable effect is
 /// those two written files.
 pub(crate) fn run_test_80<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
-    _filename: &[u8],
-    _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
+    arg2: Option<&OsStr>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDFAcroFormDocumentHelper::transformAnnotations /
-    // QPDFAcroFormDocumentHelper::addAndRenameFormFields /
-    // QPDFPageObjectHelper::copyAnnotations): flpdf's own faithful port of
-    // this exact machinery lives in the canonical AcroForm and page helpers
-    // (`AcroFormDocumentHelper::transform_annotations`,
-    // `PageObjectHelper::copy_annotations_from`,
-    // `add_and_rename_form_fields`, ...), but the standalone sequence is
-    // `pub(crate)`, reachable only from inside the `flpdf` crate through the
-    // single public `apply_overlay_specs` pipeline (`overlay.rs`) -- a
-    // whole-document overlay/underlay operation, not the standalone
-    // "transform this page's annotations with an arbitrary matrix, then copy
-    // them onto a page in a different document" sequence this test performs
-    // directly. `PdfWriter` (writer.rs) already supports QDF
-    // mode, static IDs, and file output, but there is nothing correct to
-    // feed it here: writing the *un*transformed documents would not be
-    // qpdf's actual output, so no output files are produced.
+    // qpdf 11.9.0 `test_driver.cc:2761-2805`. The qpdf public
+    // `transformAnnotations` and `addAndRenameFormFields` responsibilities
+    // remain in AcroFormDocumentHelper; this driver only sequences their live
+    // handles and delegates the foreign-page copy to PageObjectHelper.
+    let arg2 = arg2.ok_or_else(|| Error::Internal("test 80 requires arg2".to_owned()))?;
+    let page1_ref = PageDocumentHelper::new(pdf)
+        .get_all_pages()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Internal("test 80 requires a first page".to_owned()))?;
+    let page1 = pdf.get_object_handle(page1_ref);
+    pdf.resolve(&page1)?;
+    let old_annots = page1.try_get_key(b"/Annots")?;
+    pdf.resolve(&old_annots)?;
+
+    let mut first_matrix = Matrix::default();
+    first_matrix.translate(306.0, 396.0);
+    first_matrix.scale(0.4, 0.4);
+    {
+        let mut acroform = AcroFormDocumentHelper::new(pdf)?;
+        let transformed = acroform.transform_annotations(old_annots.clone(), first_matrix)?;
+        for annotation in &transformed.new_annotations {
+            old_annots.append_array_item(annotation.clone())?;
+        }
+        acroform.add_and_rename_form_fields(transformed.new_fields.clone())?;
+    }
+    pdf.mark_object_handle_dirty(&old_annots)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    let secondary_filename = os_str_diagnostic_bytes(arg2).into_owned();
+    let mut pdf2 = open_test_80_secondary(arg2, stdout, stderr)?;
+    let mut secondary_diagnostics = pdf2.repair_diagnostics().entries().len();
+    let page2_ref = PageDocumentHelper::new(&mut pdf2)
+        .get_all_pages()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Internal("test 80 requires a second page".to_owned()))?;
+    let mut second_matrix = Matrix::default();
+    second_matrix.translate(612.0, 0.0);
+    second_matrix.scale(-1.0, 1.0);
+    {
+        let mut page2 = PageObjectHelper::new(page2_ref, &mut pdf2);
+        page2.copy_annotations_from(page1.clone(), second_matrix, pdf)?;
+    }
+    emit_new_diagnostics(
+        &pdf2,
+        &mut secondary_diagnostics,
+        &secondary_filename,
+        stdout,
+        stderr,
+    )?;
+
+    {
+        let mut writer = PdfWriter::new(pdf);
+        writer.set_output_file("a.pdf")?;
+        writer.set_static_id(true);
+        writer.set_qdf_mode(true);
+        writer.write()?;
+    }
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    {
+        let mut writer = PdfWriter::new(&mut pdf2);
+        writer.set_output_file("b.pdf")?;
+        writer.set_static_id(true);
+        writer.set_qdf_mode(true);
+        writer.write()?;
+    }
+    emit_new_diagnostics(
+        &pdf2,
+        &mut secondary_diagnostics,
+        &secondary_filename,
+        stdout,
+        stderr,
+    )?;
     Ok(())
 }
 
