@@ -185,13 +185,14 @@ pub(crate) fn run_test_84<R: Read + Seek>(
 
     {
         let mut job = QPDFJob::new();
-        let mut config = job.config();
-        config.input_file("minimal.pdf")?;
-        config.output_file("a.pdf")?;
-        config.qdf().deterministic_id();
-        config.object_streams("preserve")?.progress();
-        config.check_configuration()?;
-        drop(config);
+        {
+            let mut config = job.config();
+            config.input_file("minimal.pdf")?;
+            config.output_file("a.pdf")?;
+            config.qdf().deterministic_id();
+            config.object_streams("preserve")?.progress();
+            config.check_configuration()?;
+        }
         let status = job.run()?;
         assert_eq!(status, JobExitCode::Success);
         assert!(!job.has_warnings());
@@ -208,13 +209,14 @@ pub(crate) fn run_test_84<R: Read + Seek>(
                 .extend_from_slice(format!("custom write progress: {percent}%\n").as_bytes());
             Ok(())
         });
-        let mut config = job.config();
-        config.input_file("minimal.pdf")?;
-        config.output_file("a.pdf")?;
-        config.qdf().deterministic_id();
-        config.object_streams("preserve")?.progress();
-        config.check_configuration()?;
-        drop(config);
+        {
+            let mut config = job.config();
+            config.input_file("minimal.pdf")?;
+            config.output_file("a.pdf")?;
+            config.qdf().deterministic_id();
+            config.object_streams("preserve")?.progress();
+            config.check_configuration()?;
+        }
         let status = job.run()?;
         assert_eq!(status, JobExitCode::Success);
         assert!(!job.has_warnings());
@@ -224,10 +226,11 @@ pub(crate) fn run_test_84<R: Read + Seek>(
     writeln!(stdout, "error caught by check")?;
     {
         let mut job = QPDFJob::new();
-        let mut config = job.config();
-        config.output_file("a.pdf")?;
-        config.qdf();
-        drop(config);
+        {
+            let mut config = job.config();
+            config.output_file("a.pdf")?;
+            config.qdf();
+        }
         writeln!(stdout, "finished config")?;
         match job.check_configuration() {
             Ok(()) => {
@@ -243,10 +246,11 @@ pub(crate) fn run_test_84<R: Read + Seek>(
     writeln!(stdout, "error caught by run")?;
     {
         let mut job = QPDFJob::new();
-        let mut config = job.config();
-        config.output_file("a.pdf")?;
-        config.qdf();
-        drop(config);
+        {
+            let mut config = job.config();
+            config.output_file("a.pdf")?;
+            config.qdf();
+        }
         writeln!(stdout, "finished config")?;
         match job.run() {
             Ok(_) => {
@@ -272,11 +276,12 @@ pub(crate) fn run_test_84<R: Read + Seek>(
                 bytes: Arc::clone(&captured_stderr),
             })),
         );
-        let mut config = job.config();
-        config.input_file("bad2.pdf")?;
-        config.show_object("4,0")?;
-        config.check_configuration()?;
-        drop(config);
+        {
+            let mut config = job.config();
+            config.input_file("bad2.pdf")?;
+            config.show_object("4,0")?;
+            config.check_configuration()?;
+        }
         writeln!(stdout, "calling run")?;
         let _ = job.run()?;
         writeln!(stdout, "captured stdout")?;
