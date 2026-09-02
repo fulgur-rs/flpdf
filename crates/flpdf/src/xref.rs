@@ -3776,6 +3776,27 @@ mod final_handle_tests {
         (bytes, previous_trailer)
     }
 
+    fn classic_xref_with_indirect_previous_in_older_section() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let previous_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R /Prev 2 0 R >>\n");
+
+        let current_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R /Prev {previous_xref} >>\n").as_bytes(),
+        );
+        bytes.extend_from_slice(format!("startxref\n{current_xref}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
     fn assert_strict_classic_trailer_error(trailer: &str, message: &str) {
         let (bytes, _) = classic_xref_with_trailer(trailer);
         let offset = trailer_value_offset(&bytes);
@@ -3923,6 +3944,53 @@ mod final_handle_tests {
         )
         .expect_err("an uninitialized trailer must fail at the dictionary boundary");
         assert!(matches!(error, Error::Internal(message) if message.contains("uninitialized")));
+    }
+
+    #[test]
+    fn previous_xref_merge_propagates_an_indirect_prev_resolution_error() {
+        let bytes = classic_xref_with_indirect_previous_in_older_section();
+        let current_xref = bytes
+            .windows(b"startxref\n".len())
+            .position(|window| window == b"startxref\n")
+            .expect("current xref has a startxref marker");
+        let startxref = bytes[current_xref + b"startxref\n".len()..]
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("startxref contains the current xref offset");
+        let mut registration = XrefRegistration::default();
+        let mut loaded = parse_xref_from_start(
+            &bytes,
+            startxref,
+            startxref as u64,
+            "1.4",
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+            None,
+            true,
+        )
+        .expect("current xref section should parse before walking /Prev");
+
+        let error = merge_previous_xref_sections(
+            &bytes,
+            "1.4",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("an indirect /Prev with a stale xref row must propagate its trigger");
+        assert!(matches!(error, Error::Parse { message, .. } if message == "expected 2 0 obj"));
     }
 
     #[test]
