@@ -2,6 +2,10 @@ use assert_cmd::Command;
 use std::io::Write;
 use std::process::{Command as ProcessCommand, Output, Stdio};
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn run(binary: &str, args: &[&str], input: &[u8]) -> Output {
     Command::cargo_bin(binary)
         .unwrap()
@@ -57,7 +61,10 @@ fn zlib_flate_standalone_alias_uses_the_same_handler() {
 fn zlib_flate_version_and_usage_match_qpdf_shape() {
     let version = run("zlib-flate", &["--version"], b"");
     assert_eq!(version.status.code(), Some(0));
-    assert_eq!(version.stdout, b"zlib-flate from qpdf version 11.9.0\n");
+    assert_eq!(
+        version.stdout,
+        format!("zlib-flate from qpdf version 11.9.0{EOL}").into_bytes()
+    );
 
     let usage = run("flpdf", &["zlib-flate"], b"");
     assert_eq!(usage.status.code(), Some(2));

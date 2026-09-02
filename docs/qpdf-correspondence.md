@@ -831,10 +831,11 @@ loggerで再openする経路はtop-level CLIから除去し、`--show-linearizat
 - `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
   unfilterable stream を同じ marker へ変換しない
 - native `rewrite --static-id` warning、`--remove-restrictions` intent diagnostic:
-  flpdf-only surface
-- clap 前後の immediate option-validation diagnostics: production `QPDFJob` aggregation
-  (`flpdf-25kg.5.2`) より前の CLI shell responsibility。最終 dispatch error と usage result
-  は logger 済みだが、この validation 群は同 downstream cutover まで direct stderr を維持する
+  flpdf-only surface（出力先は qpdf-compatible logger error route）
+- clap 自身が parse/usage のために直接終了する help・構文エラー、および logger の
+  stderr sink 自体が失敗した場合の last-resort diagnostic: qpdf job logger の
+  command-boundary より前後にある irreducible CLI fallback。その他の CLI text
+  diagnostics は `QPDFLogger` の platform-aware text route を通る
 
 ### `QPDFJob.cc` の `doJSON*` 族 — job 層への段階移設
 

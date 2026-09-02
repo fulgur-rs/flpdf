@@ -28,6 +28,10 @@
 mod common;
 use common::PdfCanonicalTestExt;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -208,9 +212,11 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
         .args(["check", out.to_str().unwrap()])
         .assert()
         .code(0)
-        .stdout(predicates::str::contains("File is linearized\n"))
+        .stdout(predicates::str::contains("File is linearized"))
         .stdout(predicates::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+            format!(
+                "No syntax or stream encoding errors found; the file may still contain{EOL}errors that qpdf cannot detect{EOL}"
+            ),
         ))
         .stderr(predicates::str::is_empty());
 }

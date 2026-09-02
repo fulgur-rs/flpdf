@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -41,15 +45,18 @@ fn verbose_overlay_prints_processing_header_and_per_page_mapping() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "flpdf: processing underlay/overlay\n",
-        ))
-        .stdout(predicate::str::contains("  page 1\n"))
+        .stdout(predicate::str::contains(format!(
+            "flpdf: processing underlay/overlay{EOL}"
+        )))
+        .stdout(predicate::str::contains(format!("  page 1{EOL}")))
         // The src fixture path is absolute; qpdf/flpdf verbose emits the raw
         // CLI-supplied filename. Assert the raw path + " overlay 1" appears
         // under page 1.
-        .stdout(predicate::str::contains(format!("    {} overlay 1\n", src)))
-        .stdout(predicate::str::contains("  page 2\n"))
+        .stdout(predicate::str::contains(format!(
+            "    {} overlay 1{EOL}",
+            src
+        )))
+        .stdout(predicate::str::contains(format!("  page 2{EOL}")))
         .stderr(predicate::str::is_empty());
 }
 
@@ -75,7 +82,7 @@ fn verbose_underlay_prints_underlay_kind_string() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "    {} underlay 1\n",
+            "    {} underlay 1{EOL}",
             src
         )))
         .stderr(predicate::str::is_empty());
@@ -111,9 +118,15 @@ fn verbose_overlay_repeated_to_slots_emit_one_line_per_slot() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("  page 1\n"))
-        .stdout(predicate::str::contains(format!("    {} overlay 1\n", src)))
-        .stdout(predicate::str::contains(format!("    {} overlay 2\n", src)))
+        .stdout(predicate::str::contains(format!("  page 1{EOL}")))
+        .stdout(predicate::str::contains(format!(
+            "    {} overlay 1{EOL}",
+            src
+        )))
+        .stdout(predicate::str::contains(format!(
+            "    {} overlay 2{EOL}",
+            src
+        )))
         .stderr(predicate::str::is_empty());
 }
 

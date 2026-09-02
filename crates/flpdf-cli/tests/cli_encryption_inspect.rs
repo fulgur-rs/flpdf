@@ -40,13 +40,16 @@ use predicates::prelude::*;
 use std::io::Write;
 use std::process::{Command as ShellCommand, Stdio};
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 /// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
 /// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
-/// translates every `\n` write to `\r\n`; flpdf's CLI writes plain `\n`
-/// everywhere, matching qpdf's C++ source (`cout << "...\n"`) rather than
-/// that platform-specific translation. Comparing raw bytes on Windows would
-/// therefore flag a line-ending artifact of the oracle process, not a real
-/// content difference (same pattern as `cli_logger_routing.rs`/
+/// translates every `\n` write to `\r\n`; flpdf's shared CLI logger applies
+/// the same platform conversion for text output. Comparing raw bytes remains
+/// safe for the qpdf differential checks, while the helper also documents the
+/// platform boundary (same pattern as `cli_logger_routing.rs`/
 /// `cli_attachment_lifecycle.rs`/`encrypt_cli_tests.rs`).
 fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
@@ -150,9 +153,9 @@ fn top_level_is_encrypted_requires_an_input() {
         .arg("--is-encrypted")
         .assert()
         .code(2)
-        .stderr(predicate::eq(
-            "flpdf: --is-encrypted requires an input file\n",
-        ));
+        .stderr(predicate::eq(format!(
+            "flpdf: --is-encrypted requires an input file{EOL}"
+        )));
 }
 
 #[test]
@@ -161,9 +164,9 @@ fn top_level_requires_password_requires_an_input() {
         .arg("--requires-password")
         .assert()
         .code(2)
-        .stderr(predicate::eq(
-            "flpdf: --requires-password requires an input file\n",
-        ));
+        .stderr(predicate::eq(format!(
+            "flpdf: --requires-password requires an input file{EOL}"
+        )));
 }
 
 #[test]
@@ -189,7 +192,8 @@ fn password_file_uses_only_the_first_line() {
     assert!(flpdf.status.success());
     assert_eq!(
         flpdf.stderr,
-        b"flpdf: WARNING: all but the first line of the password file are ignored\n"
+        format!("flpdf: WARNING: all but the first line of the password file are ignored{EOL}")
+            .into_bytes()
     );
 }
 
@@ -314,7 +318,7 @@ fn show_encryption_key_v4_aes_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v4-aes", V4_AES])
         .assert()
         .success()
-        .stdout("5042ec4efa389ea32a149ab2a34e84fc\n");
+        .stdout(format!("5042ec4efa389ea32a149ab2a34e84fc{EOL}"));
 }
 
 #[test]
@@ -323,7 +327,9 @@ fn show_encryption_key_v5_r6_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v5-r6", V5_R6])
         .assert()
         .success()
-        .stdout("fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290\n");
+        .stdout(format!(
+            "fc459408a5282b7c59daa5162f860e82315679cc04942ef57993bfd287f30290{EOL}"
+        ));
 }
 
 /// Skip the live qpdf-oracle comparison when `qpdf` is not installed locally
@@ -410,7 +416,7 @@ fn show_encryption_key_weak_rc4_correct_password_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v2", V2_RC4])
         .assert()
         .success()
-        .stdout("09d56583e16481df964f95df779c97d4\n");
+        .stdout(format!("09d56583e16481df964f95df779c97d4{EOL}"));
 }
 
 #[test]
@@ -419,7 +425,9 @@ fn show_encryption_key_weak_r5_correct_password_matches_qpdf() {
         .args(["show-encryption-key", "--password=user-v5-r5", V5_R5])
         .assert()
         .success()
-        .stdout("c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614\n");
+        .stdout(format!(
+            "c3d812902c9433c0cc9648e00ccf66c205b6b1563feb7d5d31a66bd762ed8614{EOL}"
+        ));
 }
 
 #[test]
@@ -448,7 +456,7 @@ fn show_encryption_key_weak_with_allow_weak_crypto_emits_no_warning() {
         ])
         .assert()
         .success()
-        .stdout("09d56583e16481df964f95df779c97d4\n")
+        .stdout(format!("09d56583e16481df964f95df779c97d4{EOL}"))
         .stderr(predicate::str::contains("weak crypto").not());
 }
 
@@ -509,24 +517,24 @@ fn show_encryption_qpdf_lines_match_qpdf_verbatim() {
     // byte so scripts grepping qpdf output keep working. Hard-coded from
     // qpdf 11.9.0:
     //   qpdf --show-encryption --password=user-v4-aes v4-aes-128-r4.pdf
-    let expected_qpdf_block = "\
-R = 4
-P = -4
-User password = user-v4-aes
-Supplied password is user password
-extract for accessibility: allowed
-extract for any purpose: allowed
-print low resolution: allowed
-print high resolution: allowed
-modify document assembly: allowed
-modify forms: allowed
-modify annotations: allowed
-modify other: allowed
-modify anything: allowed
-stream encryption method: AESv2
-string encryption method: AESv2
-file encryption method: AESv2
-";
+    let expected_qpdf_block = format!(
+        "R = 4{EOL}\
+         P = -4{EOL}\
+         User password = user-v4-aes{EOL}\
+         Supplied password is user password{EOL}\
+         extract for accessibility: allowed{EOL}\
+         extract for any purpose: allowed{EOL}\
+         print low resolution: allowed{EOL}\
+         print high resolution: allowed{EOL}\
+         modify document assembly: allowed{EOL}\
+         modify forms: allowed{EOL}\
+         modify annotations: allowed{EOL}\
+         modify other: allowed{EOL}\
+         modify anything: allowed{EOL}\
+         stream encryption method: AESv2{EOL}\
+         string encryption method: AESv2{EOL}\
+         file encryption method: AESv2{EOL}"
+    );
     let out = flpdf()
         .args(["show-encryption", "--password=user-v4-aes", V4_AES])
         .assert()

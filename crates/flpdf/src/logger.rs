@@ -1,8 +1,14 @@
 //! qpdf correspondence: QPDFLogger.cc shared info, warning, error, and binary-save pipeline routing.
+//!
+//! qpdf's standard output and error logger sinks use C++ text streams
+//! (`QPDFLogger.cc:43-50`). `QPDFLogger::setSave` calls
+//! `QUtil::binary_stdout` only when standard output becomes the save sink
+//! (`QPDFLogger.cc:197-208`; `QUtil.cc:759-767`).
 
 use crate::pipeline::{Discard, Pipeline, PipelineHandle, PipelineResult, PlOStream};
 use crate::{Error, Result};
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -10,6 +16,47 @@ const NULL_PIPELINE_MESSAGE: &str =
     "QPDFLogger: requested a null pipeline without null_okay == true";
 const STDOUT_ALREADY_USED_MESSAGE: &str =
     "QPDFLogger: called setSave on standard output after standard output has already been used";
+
+/// Reproduce the C runtime's text-mode newline conversion for logger output.
+///
+/// qpdf keeps stdout and stderr in text mode for diagnostics, but switches
+/// stdout to binary mode when it becomes the save destination. Rust's standard
+/// streams do not perform that Windows conversion, so the logger owns the
+/// conversion state and turns it off when `set_save` selects standard output.
+struct TextModeWriter<W> {
+    writer: W,
+    text_mode: Arc<AtomicBool>,
+}
+
+impl<W> TextModeWriter<W> {
+    fn new(writer: W, text_mode: Arc<AtomicBool>) -> Self {
+        Self { writer, text_mode }
+    }
+}
+
+impl<W: Write> Write for TextModeWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if !self.text_mode.load(Ordering::Relaxed) || !data.contains(&b'\n') {
+            return self.writer.write(data);
+        }
+
+        let mut converted =
+            Vec::with_capacity(data.len() + data.iter().filter(|&&b| b == b'\n').count());
+        for &byte in data {
+            if byte == b'\n' {
+                converted.extend_from_slice(b"\r\n");
+            } else {
+                converted.push(byte);
+            }
+        }
+        self.writer.write_all(&converted)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
 
 struct PlTrack {
     next: PipelineHandle,
@@ -40,6 +87,7 @@ struct LoggerState {
     error: PipelineHandle,
     save: Option<PipelineHandle>,
     stdout_used: Arc<AtomicBool>,
+    stdout_text_mode: Arc<AtomicBool>,
 }
 
 struct LoggerShared {
@@ -76,13 +124,20 @@ pub struct QPDFLogger {
 
 impl QPDFLogger {
     pub fn create() -> Self {
-        let real_stdout = PipelineHandle::new(PlOStream::new("standard output", std::io::stdout()));
+        let stdout_text_mode = Arc::new(AtomicBool::new(cfg!(windows)));
+        let real_stdout = PipelineHandle::new(PlOStream::new(
+            "standard output",
+            TextModeWriter::new(std::io::stdout(), Arc::clone(&stdout_text_mode)),
+        ));
         let stdout_used = Arc::new(AtomicBool::new(false));
         let stdout = PipelineHandle::new(PlTrack {
             next: real_stdout,
             used: Arc::clone(&stdout_used),
         });
-        let stderr = PipelineHandle::new(PlOStream::new("standard error", std::io::stderr()));
+        let stderr = PipelineHandle::new(PlOStream::new(
+            "standard error",
+            TextModeWriter::new(std::io::stderr(), Arc::new(AtomicBool::new(cfg!(windows)))),
+        ));
         let discard = PipelineHandle::new(Discard);
         let state = LoggerState {
             discard,
@@ -93,6 +148,7 @@ impl QPDFLogger {
             error: stderr,
             save: None,
             stdout_used,
+            stdout_text_mode,
         };
         Self {
             shared: Arc::new(LoggerShared {
@@ -194,6 +250,7 @@ impl QPDFLogger {
             if state.info.is_same(&state.stdout) {
                 state.info = state.stderr.clone();
             }
+            state.stdout_text_mode.store(false, Ordering::Relaxed);
         }
         state.save = pipeline;
         Ok(())
@@ -251,3 +308,40 @@ impl PartialEq for QPDFLogger {
 }
 
 impl Eq for QPDFLogger {}
+
+#[cfg(test)]
+mod tests {
+    use super::TextModeWriter;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn text_mode_writer_converts_text_lines_but_preserves_binary_save_data() {
+        let text_mode = Arc::new(AtomicBool::new(true));
+        let mut output = Vec::new();
+
+        {
+            let mut writer = TextModeWriter::new(&mut output, Arc::clone(&text_mode));
+            writer.write_all(b"first\nsecond\n").unwrap();
+        }
+        assert_eq!(output, b"first\r\nsecond\r\n");
+
+        text_mode.store(false, Ordering::Relaxed);
+        {
+            let mut writer = TextModeWriter::new(&mut output, Arc::clone(&text_mode));
+            writer.write_all(b"%PDF-1.7\nraw\r\n").unwrap();
+        }
+        assert_eq!(output, b"first\r\nsecond\r\n%PDF-1.7\nraw\r\n");
+    }
+
+    #[test]
+    fn save_to_standard_output_switches_the_logger_to_binary_mode() {
+        let logger = super::QPDFLogger::create();
+        let text_mode = logger.shared.lock().stdout_text_mode.clone();
+
+        assert_eq!(text_mode.load(Ordering::Relaxed), cfg!(windows));
+        logger.save_to_standard_output(false).unwrap();
+        assert!(!text_mode.load(Ordering::Relaxed));
+    }
+}

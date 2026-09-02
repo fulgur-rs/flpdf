@@ -3,6 +3,10 @@
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
@@ -12,7 +16,7 @@ fn fixture(name: &str) -> PathBuf {
 fn progress_lines(output_name: &str, percentages: &[u8]) -> String {
     percentages
         .iter()
-        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%\n"))
+        .map(|percent| format!("flpdf: {output_name}: write progress: {percent}%{EOL}"))
         .collect()
 }
 
@@ -74,12 +78,15 @@ fn progress_reaches_the_attachment_writer() {
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert!(
         stdout.starts_with(&format!(
-            "flpdf: {}: write progress: 0%\n",
+            "flpdf: {}: write progress: 0%{EOL}",
             output_path.display()
         )),
         "{stdout}"
     );
-    assert!(stdout.contains("write progress: 100%\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("write progress: 100%{EOL}")),
+        "{stdout}"
+    );
     assert!(stdout
         .lines()
         .all(|line| line.contains(&output_path.display().to_string())));
@@ -222,12 +229,14 @@ fn progress_reports_each_split_writer_once() {
     );
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert_eq!(
-        stdout.matches("write progress: 0%\n").count(),
+        stdout.matches(&format!("write progress: 0%{EOL}")).count(),
         2,
         "{stdout}"
     );
     assert_eq!(
-        stdout.matches("write progress: 100%\n").count(),
+        stdout
+            .matches(&format!("write progress: 100%{EOL}"))
+            .count(),
         2,
         "{stdout}"
     );
@@ -262,12 +271,14 @@ fn progress_reports_each_pages_split_writer_once() {
     );
     let stdout = String::from_utf8(output.stdout).expect("progress output is UTF-8");
     assert_eq!(
-        stdout.matches("write progress: 0%\n").count(),
+        stdout.matches(&format!("write progress: 0%{EOL}")).count(),
         2,
         "{stdout}"
     );
     assert_eq!(
-        stdout.matches("write progress: 100%\n").count(),
+        stdout
+            .matches(&format!("write progress: 100%{EOL}"))
+            .count(),
         2,
         "{stdout}"
     );
@@ -421,7 +432,7 @@ fn remove_attachment_stdout_output_omits_the_resulting_file_warning_suffix() {
     assert!(stdout_output.stdout.starts_with(b"%PDF-1.3\n"));
     let stdout_stderr = String::from_utf8(stdout_output.stderr).expect("diagnostics are UTF-8");
     assert!(
-        stdout_stderr.contains("operation succeeded with warnings\n"),
+        stdout_stderr.contains(&format!("operation succeeded with warnings{EOL}")),
         "stderr: {stdout_stderr}"
     );
     assert!(

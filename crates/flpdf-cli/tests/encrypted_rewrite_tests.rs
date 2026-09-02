@@ -327,7 +327,7 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
         .arg(&output)
         .assert()
         .success()
-        .stdout(predicates::str::contains("File is not encrypted\n"));
+        .stdout(predicates::str::contains("File is not encrypted"));
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +418,7 @@ fn decrypt_on_unencrypted_input_is_a_silent_noop_rewrite() {
         .arg(&output)
         .assert()
         .success()
-        .stdout(predicates::str::contains("File is not encrypted\n"));
+        .stdout(predicates::str::contains("File is not encrypted"));
 }
 
 #[test]

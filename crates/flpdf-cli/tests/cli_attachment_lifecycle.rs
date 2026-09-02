@@ -22,6 +22,10 @@
 #[allow(dead_code, unused_imports)]
 mod support;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 use assert_cmd::Command as CargoCommand;
 use std::io::Write;
 use std::path::Path;
@@ -506,14 +510,14 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         .map(|b| format!("{b:02x}"))
         .collect();
     assert!(
-        verbose.contains(&format!("      checksum: {expected_checksum_hex}\n")),
+        verbose.contains(format!("      checksum: {expected_checksum_hex}{EOL}").as_str()),
         "copy: verbose listing must preserve /CheckSum={expected_checksum_hex}; got: {verbose}"
     );
 
     // /Desc survives too (roborev #936 follow-up — the test set these flags
     // but never asserted their survival).
     assert!(
-        verbose.contains("  description: Copy test image\n"),
+        verbose.contains(format!("  description: Copy test image{EOL}").as_str()),
         "copy: verbose listing must preserve /Desc 'Copy test image'; got: {verbose}"
     );
 
@@ -861,10 +865,10 @@ fn lifecycle_7_add_success_and_duplicate_diagnostics_match_qpdf() {
 /// Run both tools with the same argv and require identical stdout.
 ///
 /// Line endings are normalized first: on Windows qpdf writes its info log
-/// through a text-mode stdout, so every line arrives CRLF-terminated, while
-/// flpdf writes LF on every platform. That difference spans the whole flpdf
-/// CLI rather than the listing, so it is normalized here instead of being
-/// asserted; everything else must match byte for byte.
+/// through a text-mode stdout, so every line arrives CRLF-terminated. flpdf's
+/// shared logger now follows that platform behavior; normalization keeps this
+/// helper independent of the host while everything else must match byte for
+/// byte.
 ///
 /// Skips (and says so) when qpdf is absent, like the other cross-checks here.
 fn assert_listing_matches_qpdf(pdf_path: &Path, args: &[&str]) -> Option<String> {
@@ -903,7 +907,7 @@ fn listing_reports_documents_with_no_embedded_files() {
     assert!(out.status.success(), "listing must exit 0");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        format!("{} has no embedded files\n", input.path().display()),
+        format!("{} has no embedded files{EOL}", input.path().display()),
         "qpdf names the input file when there is no /Names /EmbeddedFiles tree",
     );
 

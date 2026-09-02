@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Output;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn minimal_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf")
 }
@@ -104,11 +108,11 @@ fn run_keep_files_open_case(
     match expected_selection {
         Some(expected_selection) => {
             assert!(
-                stdout.contains(expected_selection),
+                stdout.contains(format!("{expected_selection}{EOL}").as_str()),
                 "missing selection line {expected_selection:?} in:\n{stdout}"
             );
             assert!(
-                !stdout.contains(if expected_selection.ends_with("=y\n") {
+                !stdout.contains(if expected_selection.ends_with("=y") {
                     "selecting --keep-open-files=n"
                 } else {
                     "selecting --keep-open-files=y"
@@ -147,13 +151,13 @@ fn automatic_threshold_disables_keep_files_open_above_boundary() {
     run_keep_files_open_case(
         51,
         &["--keep-files-open-threshold=50"],
-        Some("flpdf: selecting --keep-open-files=n\n"),
+        Some("flpdf: selecting --keep-open-files=n"),
     );
 }
 
 #[test]
 fn automatic_threshold_keeps_files_open_within_boundary() {
-    run_keep_files_open_case(10, &[], Some("flpdf: selecting --keep-open-files=y\n"));
+    run_keep_files_open_case(10, &[], Some("flpdf: selecting --keep-open-files=y"));
 }
 
 #[test]
@@ -161,7 +165,7 @@ fn threshold_accepts_qpdf_numeric_prefix_conversion() {
     run_keep_files_open_case(
         1,
         &["--keep-files-open-threshold=50junk"],
-        Some("flpdf: selecting --keep-open-files=y\n"),
+        Some("flpdf: selecting --keep-open-files=y"),
     );
 }
 

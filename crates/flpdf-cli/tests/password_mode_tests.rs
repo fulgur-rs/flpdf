@@ -4,6 +4,10 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/encrypted")
@@ -90,7 +94,8 @@ fn top_level_show_encryption_preserves_non_utf8_password_bytes() {
         "show-encryption must succeed with the correct (non-UTF8) password: {:?}",
         output.status
     );
-    let needle = b"User password = \xff\xfeA\n";
+    let mut needle = b"User password = \xff\xfeA".to_vec();
+    needle.extend_from_slice(EOL.as_bytes());
     assert!(
         output
             .stdout

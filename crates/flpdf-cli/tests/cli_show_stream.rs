@@ -1,6 +1,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: build a minimal in-memory PDF with one stream object (obj 3).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -345,7 +349,7 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
         .arg(temp.path())
         .assert()
         .code(3)
-        .stdout(predicate::str::contains("stream\npayload"))
+        .stdout(predicate::str::contains(format!("stream{EOL}payload")))
         .stderr(predicate::str::contains("expected endstream"))
         .stderr(predicate::str::contains(
             "flpdf: operation succeeded with warnings",

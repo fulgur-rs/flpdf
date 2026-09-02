@@ -3,6 +3,10 @@
 use assert_cmd::Command;
 use std::process::Output;
 
+#[path = "support/eol.rs"]
+mod eol;
+use eol::EOL;
+
 const MINIMAL: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/minimal.pdf"
@@ -27,13 +31,17 @@ fn flpdf(args: &[&str]) -> Output {
 #[test]
 fn show_object_accepts_qpdf_selector_forms() {
     for (selector, expected) in [
-        ("1", b"<< /Pages 2 0 R /Type /Catalog >>\n".as_slice()),
-        ("1,0", b"<< /Pages 2 0 R /Type /Catalog >>\n".as_slice()),
-        ("trailer", b"<< /Root 1 0 R /Size 3 >>\n".as_slice()),
+        ("1", "<< /Pages 2 0 R /Type /Catalog >>"),
+        ("1,0", "<< /Pages 2 0 R /Type /Catalog >>"),
+        ("trailer", "<< /Root 1 0 R /Size 3 >>"),
     ] {
         let output = flpdf(&[&format!("--show-object={selector}"), MINIMAL]);
         assert!(output.status.success(), "{selector}: {:?}", output.stderr);
-        assert_eq!(output.stdout, expected, "{selector}");
+        assert_eq!(
+            output.stdout,
+            format!("{expected}{EOL}").into_bytes(),
+            "{selector}"
+        );
         assert!(output.stderr.is_empty(), "{selector}: {:?}", output.stderr);
     }
 }
@@ -43,7 +51,7 @@ fn show_object_missing_selector_emits_qpdf_null() {
     let output = flpdf(&["--show-object=99,0", MINIMAL]);
 
     assert!(output.status.success(), "{:?}", output.stderr);
-    assert_eq!(output.stdout, b"null\n");
+    assert_eq!(output.stdout, format!("null{EOL}").into_bytes());
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }
 
@@ -53,7 +61,11 @@ fn show_object_out_of_range_generation_emits_qpdf_null() {
         let output = flpdf(&[&format!("--show-object={selector}"), MINIMAL]);
 
         assert!(output.status.success(), "{selector}: {:?}", output.stderr);
-        assert_eq!(output.stdout, b"null\n", "{selector}");
+        assert_eq!(
+            output.stdout,
+            format!("null{EOL}").into_bytes(),
+            "{selector}"
+        );
         assert!(output.stderr.is_empty(), "{selector}: {:?}", output.stderr);
     }
 }
@@ -71,7 +83,7 @@ fn show_object_keeps_qpdf_zero_object_no_output_behavior() {
     assert!(generation_fallback.status.success());
     assert_eq!(
         generation_fallback.stdout,
-        b"<< /Pages 2 0 R /Type /Catalog >>\n"
+        format!("<< /Pages 2 0 R /Type /Catalog >>{EOL}").into_bytes()
     );
 }
 
@@ -81,7 +93,8 @@ fn show_object_stream_matches_qpdf_default_raw_and_filtered_modes() {
     assert!(dictionary.status.success(), "{:?}", dictionary.stderr);
     assert_eq!(
         dictionary.stdout,
-        b"Object is stream.  Dictionary:\n<< /Filter /FlateDecode /Length 18 >>\n"
+        format!("Object is stream.  Dictionary:{EOL}<< /Filter /FlateDecode /Length 18 >>{EOL}")
+            .into_bytes()
     );
 
     let raw = flpdf(&["--show-object=4", "--raw-stream-data", MULTI_STREAM]);
