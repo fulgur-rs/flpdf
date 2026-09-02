@@ -1352,12 +1352,18 @@ fn write_qpdf_propagates_custom_error_sink_failure_for_auto_password_warning() {
 
     let mut job = QPDFJob::new();
     job.set_logger(logger);
-    job.initialize_from_json_partial(&format!(
-        r#"{{"inputFile":"{}","outputFile":"{}","passwordMode":"auto","encrypt":{{"userPassword":"😀","ownerPassword":"owner","128bit":{{"useAes":"y"}}}}}}"#,
-        input.display(),
-        output.display(),
-    ))
-    .unwrap();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "passwordMode": "auto",
+        "encrypt": {
+            "userPassword": "😀",
+            "ownerPassword": "owner",
+            "128bit": {"useAes": "y"}
+        }
+    })
+    .to_string();
+    job.initialize_from_json_partial(&json).unwrap();
 
     let mut pdf = job
         .open(
