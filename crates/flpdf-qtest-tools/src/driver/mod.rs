@@ -1773,6 +1773,21 @@ requested value of integer is too big; returning INT_MAX\n"
     }
 
     #[test]
+    fn json_test_89_body_failure_is_reported_after_document_creation() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let input = directory.path().join("test-89.json");
+        std::fs::write(&input, complete_json_for_test_89()).expect("write JSON fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = WriteFailure;
+
+        assert_eq!(
+            run_test_89_from_json(input.as_os_str(), &mut stdout, &mut stderr),
+            2
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
     fn json_test_89_footer_failure_is_reported_after_body_success() {
         let directory = tempfile::tempdir().expect("create test directory");
         let input = directory.path().join("test-89.json");
