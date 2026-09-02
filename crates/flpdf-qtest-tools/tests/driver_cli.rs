@@ -97,6 +97,18 @@ fn complete_json_for_test_89() -> &'static str {
 }"#
 }
 
+fn semantically_invalid_json_for_test_89() -> &'static str {
+    r#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {},
+      "trailer": {"value": {}}
+    }
+  ]
+}"#
+}
+
 fn partial_json_for_test_90() -> &'static str {
     // qpdf's `updateFromJSON` replaces the entire trailer object wholesale
     // rather than merging keys into the existing one (`QPDF_json.cc:611`,
@@ -211,6 +223,26 @@ fn test_89_accepts_complete_json_input_and_emits_the_mutation_warnings() {
 }
 
 #[test]
+fn test_89_drains_accumulated_warnings_before_the_terminal_json_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("test-89-bad.json");
+    fs::write(&input, semantically_invalid_json_for_test_89()).expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["89", input])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 89");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("object must have exactly one of \"value\" or \"stream\""));
+    assert!(stderr.trim_end().ends_with("errors found in JSON"));
+}
+
+#[test]
 fn test_90_applies_the_json_update_before_type_mismatch_mutations() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = directory.path().join("test-90.json");
@@ -236,6 +268,54 @@ fn test_90_applies_the_json_update_before_type_mismatch_mutations() {
         3
     );
     assert!(stderr.contains("operation for integer attempted on object of type array"));
+}
+
+#[test]
+fn test_90_translates_a_missing_update_file_through_the_crt_open_boundary() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing-update.json");
+    let missing = missing.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["90", minimal_pdf(), missing])
+        .output()
+        .expect("run test 90");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("open "));
+    assert!(!stderr.contains("os error"));
+}
+
+#[test]
+fn test_90_drains_accumulated_warnings_before_a_terminal_update_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("bad-update.json");
+    fs::write(
+        &input,
+        r#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {
+      "obj:1 0 R": {}
+    }
+  ]
+}"#,
+    )
+    .expect("write JSON fixture");
+    let input = input.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["90", minimal_pdf(), input])
+        .output()
+        .expect("run test 90");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("object must have exactly one of \"value\" or \"stream\""));
+    assert!(stderr.trim_end().ends_with("errors found in JSON"));
 }
 
 #[test]
