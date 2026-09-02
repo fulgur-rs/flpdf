@@ -319,17 +319,19 @@ pub(crate) fn run_test_68<R: Read + Seek>(
 /// fresh empty document and write it out as `auto-<i>.pdf` with a static
 /// `/ID`. No missing primitive: [`Pdf::set_immediate_copy_from`],
 /// [`Pdf::empty`], [`PageInput::foreign`] + [`PageDocumentHelper::add_page`],
-/// and [`PdfWriter`] cover every step.
+/// and [`PdfWriter`] cover every step. The page-list repair diagnostics are
+/// drained before the first foreign copy, matching qpdf's warning order.
 pub(crate) fn run_test_69<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
-    _stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     pdf.set_immediate_copy_from(true);
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     for (index, page_ref) in pages.into_iter().enumerate() {
         let mut out = Pdf::empty()?;
         PageDocumentHelper::new(&mut out).add_page(PageInput::foreign(pdf, page_ref), false)?;
@@ -520,9 +522,96 @@ pub(crate) fn run_test_71<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_68, run_test_71};
+    use super::{run_test_68, run_test_69, run_test_71};
     use flpdf::{Error, Pdf, PdfOpenOptions};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
+
+    fn page_tree_without_media_boxes() -> Vec<u8> {
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (3, b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>"),
+            (4, b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>"),
+            (5, b"<< /Length 0 >>\nstream\n\nendstream"),
+            (6, b"<< /Length 0 >>\nstream\n\nendstream"),
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (number, body) in objects {
+            offsets.insert(*number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for number in 1..=6 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_69_reports_page_repair_warnings_before_foreign_copy() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            page_tree_without_media_boxes(),
+            PdfOpenOptions {
+                description: "issue-449.pdf".to_owned(),
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open issue-449-shaped fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_69(
+            &mut pdf,
+            b"issue-449.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 69");
+
+        assert!(stdout.is_empty());
+        let warning = String::from_utf8(stderr).expect("warnings are UTF-8");
+        assert_eq!(warning.matches("MediaBox is undefined").count(), 2);
+        assert!(warning.starts_with("WARNING: issue-449.pdf, object 3 0 at offset "));
+        assert!(warning.contains("WARNING: issue-449.pdf, object 4 0 at offset "));
+        assert!(
+            warning.contains("kid 0 (from 0) MediaBox is undefined; setting to letter / ANSI A")
+        );
+        assert!(
+            warning.contains("kid 1 (from 0) MediaBox is undefined; setting to letter / ANSI A")
+        );
+        assert!(directory.path().join("auto-0.pdf").is_file());
+        assert!(directory.path().join("auto-1.pdf").is_file());
+    }
 
     fn dct_qstream_pdf() -> Vec<u8> {
         let mut bytes =
