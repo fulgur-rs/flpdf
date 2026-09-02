@@ -3024,7 +3024,7 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     deterministic_id: bool,
     generated_id: Option<&ObjectHandle>,
 ) -> Result<ObjectHandle> {
-    let trailer = pdf.trailer().shallow_copy()?;
+    let trailer = pdf.trailer().unsafe_shallow_copy()?;
     for key in [b"/ID".as_slice(), b"/Encrypt", b"/Prev"] {
         trailer.remove_key(key);
     }

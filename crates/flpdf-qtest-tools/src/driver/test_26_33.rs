@@ -291,22 +291,47 @@ pub(crate) fn run_test_29<R: Read + Seek>(
     let arg2 = arg2.expect("test 29 requires arg2, matching qpdf's own assert(arg2 != nullptr)");
     let mut other = open_secondary_pdf(arg2, b"", stdout, stderr)?;
 
-    // GAP(QPDFObjectHandle::replaceKey on a foreign trailer): qpdf's first
-    // scenario sneaks `pdf`'s own `/QTest` value into a fresh direct
-    // dictionary, then attaches that dictionary to `other`'s trailer via
-    // `other->getTrailer().replaceKey("/QTest", dict)` to build a
-    // mixed-ownership object graph, writes it, and expects `QPDFWriter`'s
-    // ownership check to reject it (test_driver.cc:1110-1120). flpdf has no
-    // public API to mutate a `Pdf`'s trailer after open (same missing
-    // primitive as `run_test_26`'s GAP), so the mixed-ownership state cannot
-    // be constructed and this scenario's "logic error: ..." / "oops --
-    // didn't throw" line is not attempted.
+    // qpdf's first scenario places the primary document's foreign /QTest
+    // inside an ownerless direct dictionary, then attaches that dictionary to
+    // the secondary document's live trailer before writing it
+    // (test_driver.cc:1102-1120). `replace_key` intentionally performs the
+    // same shallow ownership check as qpdf, so the foreign descendant remains
+    // available for QPDFWriter's write-time ownership check.
+    let qtest = pdf.trailer_key_handle(b"QTest");
+    let dictionary = ObjectHandle::dictionary(Vec::new());
+    dictionary.replace_key(b"/QTest", qtest)?;
+    other.trailer().replace_key(b"/QTest", dictionary)?;
+    let first_write = {
+        let mut writer = PdfWriter::new(&mut other);
+        writer.set_output_file("a.pdf")?;
+        writer.write()
+    };
+    match first_write {
+        Ok(()) => writeln!(stdout, "oops -- didn't throw")?,
+        Err(Error::Internal(message)) => writeln!(stdout, "logic error: {message}")?,
+        Err(error) => return Err(error),
+    }
 
-    // GAP(QPDFObjectHandle::replaceKey on a foreign trailer): qpdf's second
-    // scenario repeats the construction with a dangling source document
-    // (`other2`, freed before the write) to prove deletion does not defeat
-    // the ownership check (test_driver.cc:1123-1135). Same missing
-    // primitive as above; not attempted.
+    // qpdf repeats the same graph construction with an object from a second
+    // document that is destroyed before the writer runs
+    // (test_driver.cc:1123-1135). Pdf teardown turns the retained canonical
+    // handle into the writer's distinct destroyed-object error.
+    let mut other2 = Pdf::empty()?;
+    let root2 = other2.root_handle()?;
+    let dictionary = ObjectHandle::dictionary(Vec::new());
+    dictionary.replace_key(b"/QTest", root2)?;
+    other.trailer().replace_key(b"/QTest", dictionary)?;
+    drop(other2);
+    let second_write = {
+        let mut writer = PdfWriter::new(&mut other);
+        writer.set_output_file("a.pdf")?;
+        writer.write()
+    };
+    match second_write {
+        Ok(()) => writeln!(stdout, "oops -- didn't throw")?,
+        Err(Error::Internal(message)) => writeln!(stdout, "logic error: {message}")?,
+        Err(error) => return Err(error),
+    }
 
     // The third scenario is real: attaching another document's root
     // directly is `ObjectHandle::replace_key`'s own documented ownership
@@ -566,7 +591,7 @@ pub(crate) fn run_test_33<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{open_secondary_pdf, run_test_30, run_test_31};
+    use super::{open_secondary_pdf, run_test_29, run_test_30, run_test_31};
     use flpdf::{EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -601,6 +626,72 @@ mod tests {
                 .as_bytes(),
         );
         bytes
+    }
+
+    fn pdf_with_qtest_object() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let qtest_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Marker true >>\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{catalog_offset:010} 00000 n \n{qtest_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 3 /Root 1 0 R /QTest 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_29_matches_qpdf_mixed_ownership_output() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let secondary = directory.path().join("minimal.pdf");
+        std::fs::write(
+            &secondary,
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf"),
+        )
+        .expect("write secondary PDF");
+
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned(pdf_with_qtest_object()).expect("open qtest PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_29(
+            &mut pdf,
+            b"copy-foreign-objects-in.pdf",
+            Some(secondary.as_os_str()),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 29 should complete after reporting writer logic errors");
+
+        assert_eq!(
+            stdout,
+            b"logic error: QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file.\n\
+logic error: attempted to unparse a QPDFObjectHandle from a destroyed QPDF\n\
+logic error: Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.\n"
+        );
+        assert!(
+            stderr.is_empty(),
+            "test 29 should not emit stderr: {stderr:?}"
+        );
     }
 
     #[test]

@@ -5005,6 +5005,32 @@ impl ObjectHandle {
         })
     }
 
+    /// Create qpdf's writer-internal `unsafeShallowCopy` form
+    /// (`libqpdf/QPDFObjectHandle.cc:2082-2088`). Unlike [`Self::shallow_copy`],
+    /// this copies only the immediate container, retaining every child handle
+    /// as-is. qpdf uses this when it will remove or replace only top-level
+    /// dictionary keys (`libqpdf/QPDFWriter.cc:1346-1352,2009-2013`); in
+    /// particular, a direct child that became `QPDF_Destroyed` must survive
+    /// this copy so the later writer unparse reports qpdf's destroyed-object
+    /// error instead of failing while copying the child.
+    ///
+    /// This is crate-private because it is not a general-purpose ownership or
+    /// value-copy API. The writer is its only consumer, and the method keeps
+    /// qpdf's own stream, unresolved, and destroyed copy errors at this exact
+    /// boundary.
+    pub(crate) fn unsafe_shallow_copy(&self) -> Result<ObjectHandle> {
+        if self.is_reserved() {
+            return Ok(ObjectHandle::new_reserved_direct());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            Ok(ObjectHandle::new_direct_preserving_dictionary_keys(
+                unsafe_shallow_copy_value(value.expect("resolved ObjectHandle has a value"))?,
+                NO_PARSED_OFFSET,
+            ))
+        })
+    }
+
     /// Convert this handle to a direct copy of its reachable object graph,
     /// mirroring qpdf's `QPDFObjectHandle::makeDirect`
     /// (`libqpdf/QPDFObjectHandle.cc:2091-2133,2154-2157`). The receiver is
@@ -8367,6 +8393,24 @@ fn shallow_copy_child(child: &ObjectHandle) -> Result<ObjectHandle> {
     } else {
         child.shallow_copy()
     }
+}
+
+// `ObjectHandle::unsafe_shallow_copy`'s per-variant dispatch mirrors
+// `QPDFObject::copy(true)`: container values clone only their immediate
+// handle collection, so direct descendants (including destroyed ones) remain
+// the same object handles. Streams and terminal error sentinels retain their
+// qpdf copy behavior at this boundary.
+fn unsafe_shallow_copy_value(value: &ObjectValue) -> Result<ObjectValue> {
+    Ok(match value {
+        ObjectValue::Unresolved => return Err(unresolved_copy_error()),
+        ObjectValue::Destroyed => return Err(destroyed_copy_error()),
+        ObjectValue::Stream { .. } => {
+            return Err(Error::System("stream objects cannot be cloned".to_string()))
+        }
+        ObjectValue::Array(items) => ObjectValue::Array(items.clone()),
+        ObjectValue::Dictionary(entries) => ObjectValue::Dictionary(entries.clone()),
+        other => other.clone(),
+    })
 }
 
 // `ObjectHandle::merge_resources`'s per-rtype dictionary merge (the
@@ -16946,6 +16990,58 @@ mod mutation_tests {
             copy.as_array().unwrap()[0].as_array().unwrap()[0].as_integer(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn unsafe_shallow_copy_keeps_immediate_handles_and_qpdf_copy_errors() {
+        let array_child = ObjectHandle::dictionary(vec![]);
+        let array = ObjectHandle::array(vec![array_child.clone()]);
+        let array_copy = array
+            .unsafe_shallow_copy()
+            .expect("unsafe array copy keeps child handles");
+        assert!(array_copy.as_array().unwrap()[0].is_same_object_as(&array_child));
+
+        let dictionary_child = ObjectHandle::integer(7);
+        let dictionary =
+            ObjectHandle::dictionary(vec![(b"Child".to_vec(), dictionary_child.clone())]);
+        let dictionary_copy = dictionary
+            .unsafe_shallow_copy()
+            .expect("unsafe dictionary copy keeps child handles");
+        assert!(dictionary_copy
+            .get_key(b"/Child")
+            .is_same_object_as(&dictionary_child));
+
+        let scalar_copy = ObjectHandle::integer(7)
+            .unsafe_shallow_copy()
+            .expect("unsafe scalar copy");
+        assert_eq!(scalar_copy.as_integer(), Some(7));
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let reserved_copy = reserved
+            .unsafe_shallow_copy()
+            .expect("reserved values create a fresh reserved value");
+        assert!(reserved_copy.is_reserved());
+        assert!(!reserved_copy.is_same_object_as(&reserved));
+
+        let unresolved = ObjectHandle::from_value(ObjectValue::Unresolved);
+        assert!(matches!(
+            unresolved.unsafe_shallow_copy(),
+            Err(Error::Internal(message))
+                if message == "attempted to shallow copy an unresolved QPDFObjectHandle"
+        ));
+
+        let destroyed = ObjectHandle::from_value(ObjectValue::Destroyed);
+        assert!(matches!(
+            destroyed.unsafe_shallow_copy(),
+            Err(Error::Internal(message))
+                if message == "attempted to shallow copy QPDFObjectHandle from destroyed QPDF"
+        ));
+
+        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        assert!(matches!(
+            stream.unsafe_shallow_copy(),
+            Err(Error::System(message)) if message == "stream objects cannot be cloned"
+        ));
     }
 
     #[test]
