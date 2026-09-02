@@ -541,6 +541,24 @@ fn test_83_reports_non_partial_json_configuration_usage() {
 }
 
 #[test]
+fn test_83_reports_json_parse_errors_as_exceptions() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let json = directory.path().join("malformed.json");
+    fs::write(&json, b"not-json").expect("write malformed job JSON");
+    let json = json.to_str().expect("utf-8 temporary path");
+
+    let output = driver()
+        .args(["83", "-", json])
+        .current_dir(directory.path())
+        .output()
+        .expect("run test 83");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"calling initializeFromJson\ntest 83 done\n");
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("exception: "));
+}
+
+#[test]
 fn test_60_completes_all_resource_merges_and_writes_output() {
     let directory = tempfile::tempdir().expect("temporary directory");
 
