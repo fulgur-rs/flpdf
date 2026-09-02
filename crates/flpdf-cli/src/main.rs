@@ -3741,6 +3741,27 @@ struct ParsedEncryptSegment {
     accessibility_warning: bool,
 }
 
+/// Return qpdf's active option-table name for an encryption segment.
+///
+/// qpdf selects the key-length-specific table as soon as it consumes the
+/// third positional argument or `--bits`; `QPDFArgParser` includes that table
+/// name in unknown-argument diagnostics (`QPDFArgParser.cc:496-502`).
+fn encrypt_option_table_name(key_len: Option<u32>) -> &'static str {
+    match key_len {
+        Some(40) => "40-bit encryption",
+        Some(128) => "128-bit encryption",
+        Some(256) => "256-bit encryption",
+        None | Some(_) => "encryption",
+    }
+}
+
+fn unrecognized_encrypt_argument(token: &str, key_len: Option<u32>) -> String {
+    format!(
+        "unrecognized argument {token} ({} options must be terminated with --)",
+        encrypt_option_table_name(key_len)
+    )
+}
+
 fn parse_encrypt_segment(
     tokens: &[String],
     allow_weak_crypto: bool,
@@ -3777,10 +3798,7 @@ fn parse_encrypt_segment(
                 return Err("positional and dashed encryption arguments may not be mixed".into());
             }
             if key_len_seen {
-                return Err(format!(
-                    "unrecognized argument {token} (encryption options must be terminated with --)"
-                )
-                .into());
+                return Err(unrecognized_encrypt_argument(token, key_len).into());
             }
             dashed_mode = true;
             let value = if let Some(value) = attached {
@@ -3813,27 +3831,21 @@ fn parse_encrypt_segment(
             // `--bits` must select the key-length-specific table before any
             // other named option is recognized.
             if !key_len_seen {
-                return Err(format!(
-                    "unrecognized argument {token} (encryption options must be terminated with --)"
-                )
-                .into());
+                return Err(unrecognized_encrypt_argument(token, key_len).into());
             }
             subflags.push(token.clone());
         } else if positional.len() < 3 {
             if token.starts_with('-') && token != "-" {
-                return Err(format!(
-                    "unrecognized argument {token} (encryption options must be terminated with --)"
-                )
-                .into());
+                return Err(unrecognized_encrypt_argument(token, None).into());
             }
             positional_mode = true;
             positional.push(token.clone());
+            if positional.len() == 3 {
+                key_len = Some(parse_encrypt_key_len(token)?);
+            }
         } else {
             if !token.starts_with('-') || token == "-" {
-                return Err(format!(
-                    "unrecognized argument {token} (encryption options must be terminated with --)"
-                )
-                .into());
+                return Err(unrecognized_encrypt_argument(token, key_len).into());
             }
             subflags.push(token.clone());
         }
@@ -3857,7 +3869,7 @@ fn parse_encrypt_segment(
             )
             .into());
         }
-        let key_len = parse_encrypt_key_len(&positional[2])?;
+        let key_len = key_len.ok_or("--encrypt key length is required")?;
         (
             positional[0].as_bytes().to_vec(),
             positional[1].as_bytes().to_vec(),
@@ -3885,46 +3897,31 @@ fn parse_encrypt_segment(
         match flag {
             "use-aes" => {
                 if key_len != 128 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 use_aes = Some(parse_perm_yn(flag, value)?);
             }
             "force-V4" => {
                 if key_len != 128 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 force_v4 = true;
             }
             "force-R5" => {
                 if key_len != 256 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 force_r5 = true;
             }
             "allow-insecure" => {
                 if key_len != 256 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 allow_insecure = true;
             }
             "cleartext-metadata" => {
                 if !matches!(key_len, 128 | 256) {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 cleartext_metadata = true;
             }
@@ -3986,49 +3983,31 @@ fn parse_encrypt_segment(
             }
             "form" => {
                 if key_len == 40 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 perms.fill_forms = parse_perm_yn(flag, value)?;
             }
             "assemble" => {
                 if key_len == 40 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 perms.assemble = parse_perm_yn(flag, value)?;
             }
             "accessibility" => {
                 if key_len == 40 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 perms.accessibility = parse_perm_yn(flag, value)?;
                 accessibility_explicitly_disabled = value == "n";
             }
             "modify-other" => {
                 if key_len == 40 {
-                    return Err(format!(
-                        "unrecognized argument {token} (encryption options must be terminated with --)"
-                    )
-                    .into());
+                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
                 }
                 perms.modify_contents = parse_perm_yn(flag, value)?;
             }
-            other => {
-                return Err(format!(
-                    "unknown --encrypt sub-flag {other:?}; supported in this release: \
-                     --use-aes=y|n, --force-V4, --force-R5, --allow-insecure, --print, --modify, \
-                     --extract, --annotate, --form, --assemble, --accessibility, \
-                     --modify-other, --cleartext-metadata"
-                )
-                .into());
+            _other => {
+                return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
             }
         }
     }
