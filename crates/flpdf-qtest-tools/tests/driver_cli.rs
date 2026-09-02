@@ -39,6 +39,13 @@ fn missing_mediabox_fixture() -> &'static str {
     )
 }
 
+fn form_fields_and_annotations_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/form-fields-and-annotations.pdf"
+    )
+}
+
 fn swap_replace_fixture() -> Vec<u8> {
     swap_replace_fixture_with_qdict_body(b"<< >>")
 }
@@ -587,6 +594,26 @@ fn test_82_matches_qpdf_compound_type_predicates() {
         .code(0)
         .stdout("test 82 done\n")
         .stderr("");
+}
+
+#[test]
+fn test_80_writes_both_annotation_outputs() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+
+    driver()
+        .args([
+            "80",
+            form_fields_and_annotations_fixture(),
+            form_fields_and_annotations_fixture(),
+        ])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 80 done\n")
+        .stderr("");
+
+    assert!(directory.path().join("a.pdf").is_file());
+    assert!(directory.path().join("b.pdf").is_file());
 }
 
 #[test]

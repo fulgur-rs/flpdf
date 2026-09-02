@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use flpdf::{Error, ObjectHandle, Pdf};
+use flpdf::{AcroFormDocumentHelper, Error, Matrix, ObjectHandle, Pdf};
 
 #[test]
 fn qpdf_object_handle_primitives_are_available_to_external_crates() {
@@ -70,6 +70,22 @@ fn ownerless_integer_type_error_uses_qpdf_object_error_boundary() {
         Error::System(message)
             if message == "operation for integer attempted on object of type null: returning 0"
     ));
+}
+
+#[test]
+fn acroform_transform_and_rename_boundaries_are_public() {
+    let mut pdf = Pdf::empty().unwrap();
+    let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+    let transformed = helper
+        .transform_annotations(ObjectHandle::array(Vec::new()), Matrix::default())
+        .unwrap();
+
+    assert!(transformed.new_annotations.is_empty());
+    assert!(transformed.new_fields.is_empty());
+    assert!(transformed.old_fields.is_empty());
+    helper
+        .add_and_rename_form_fields(transformed.new_fields)
+        .unwrap();
 }
 
 #[test]

@@ -199,10 +199,15 @@ pub(crate) struct AcroFormCache {
 /// annotation vector is kept separate because qpdf installs it on the page
 /// independently of the field-tree update.
 #[derive(Debug, Default)]
-pub(crate) struct AnnotationTransformResult {
-    pub(crate) new_annotations: Vec<ObjectHandle>,
-    pub(crate) new_fields: Vec<ObjectHandle>,
-    pub(crate) old_fields: BTreeSet<ObjectRef>,
+pub struct AnnotationTransformResult {
+    /// Newly copied and transformed annotation handles to append to a page.
+    pub new_annotations: Vec<ObjectHandle>,
+    /// Newly copied top-level field handles to register in the destination
+    /// AcroForm field tree.
+    pub new_fields: Vec<ObjectHandle>,
+    /// Source top-level field identities to remove when replacing annotations
+    /// in the same document.
+    pub old_fields: BTreeSet<ObjectRef>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -891,7 +896,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// This path covers same-document field-tree and appearance-stream
     /// copying; the page-level facade calls it through the canonical helper.
     #[allow(clippy::mutable_key_type)]
-    pub(crate) fn transform_annotations(
+    pub fn transform_annotations(
         &mut self,
         old_annots: ObjectHandle,
         cm: Matrix,
@@ -992,19 +997,22 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         // qpdf copies the source `/DR` unconditionally up front, before the
         // annotation loop, whenever the source is foreign
-        // (`QPDFAcroFormDocumentHelper.cc:729-737`); only the *merge* into
-        // the destination `/AcroForm`/`/DR` (`init_dr_map`,
+        // (`QPDFAcroFormDocumentHelper.cc:729-737`). Preserve that ordering:
+        // `copyForeignObject` allocates destination identities in this phase,
+        // and QDF exposes those identities through its
+        // `%% Original object ID` comments. Only the *merge* into the
+        // destination `/AcroForm`/`/DR` (`init_dr_map`,
         // `QPDFAcroFormDocumentHelper.cc:772-800`) is lazy, deferred until
         // the first field is actually copied, so an annotation-only
         // (no-field) transform never creates a destination `/AcroForm`.
-        // flpdf defers the whole resource plan -- including the `/DR` copy
-        // -- to that same first-field point instead of copying `/DR` eagerly
-        // like qpdf does; this is an object-allocation-order divergence
-        // (qpdf allocates the copied `/DR` before any field, flpdf after),
-        // not a byte-identical one: object numbers are reassigned by the
-        // writer's own BFS-from-root traversal (`QPDFWriter.cc:1097-1119`),
-        // not by allocation order, so this timing difference does not change
-        // written output.
+        let copied_source_resources = source_defaults
+            .resources
+            .clone()
+            .map(|resources| {
+                let resources = ensure_foreign_indirect(source_helper.pdf, resources)?;
+                self.pdf.copy_foreign_object(&resources)
+            })
+            .transpose()?;
         let mut foreign_resources = None;
 
         let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();
@@ -1027,14 +1035,25 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     ensure_foreign_indirect(source_helper.pdf, source_top_field)?;
                 let copied_source_top = self.pdf.copy_foreign_object(&source_top_field)?;
                 if copied_field_trees.insert(copied_source_top.identity_key()) {
+                    // qpdf's `maybe_copy_object(top_field)` allocates the
+                    // mutable field clone before the first field walk lazily
+                    // initializes the destination `/AcroForm` and `/DR`
+                    // (`QPDFAcroFormDocumentHelper.cc:811-823,914-917`).
+                    // Keep that allocation order visible to QDF's original
+                    // object-ID comments.
+                    let copied_top = self
+                        .copy_transform_object(&copied_source_top, &mut orig_to_copy)?
+                        .ok_or_else(|| {
+                            Error::Unsupported("AcroForm top-level field is a stream".into())
+                        })?;
                     if foreign_resources.is_none() {
-                        foreign_resources = Some(self.prepare_foreign_resource_plan(
-                            source_defaults.resources.clone(),
-                            source_helper.pdf,
-                        )?); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
+                        foreign_resources = Some(
+                            self.prepare_foreign_resource_plan(copied_source_resources.clone())?,
+                        ); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
                     }
-                    let copied_top = self.copy_field_tree_with_overrides(
+                    let copied_top = self.copy_field_tree_with_copied_top(
                         &copied_source_top,
+                        copied_top,
                         &mut orig_to_copy,
                         Some(&inherited_overrides),
                         foreign_resources.as_ref(),
@@ -1135,6 +1154,24 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let copied_top = self
             .copy_transform_object(top_field, orig_to_copy)?
             .ok_or_else(|| Error::Unsupported("AcroForm top-level field is a stream".into()))?;
+        self.copy_field_tree_with_copied_top(
+            top_field,
+            copied_top,
+            orig_to_copy,
+            inherited_overrides,
+            foreign_resources,
+        )
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn copy_field_tree_with_copied_top(
+        &mut self,
+        top_field: &ObjectHandle,
+        copied_top: ObjectHandle,
+        orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+        inherited_overrides: Option<&InheritedFieldOverrides>,
+        foreign_resources: Option<&ForeignResourcePlan>,
+    ) -> Result<ObjectHandle> {
         let mut queue = VecDeque::from([(top_field.clone(), copied_top.clone())]);
         let mut seen = HashSet::new();
 
@@ -1425,6 +1462,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(())
     }
 
+    /// Append copied top-level fields and rename conflicting qualified names.
+    ///
+    /// This is qpdf's public `addAndRenameFormFields` API
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:62-115`). The reserved-name
+    /// variant remains an internal page-selection route because qpdf's live
+    /// primary-name reservation is owned by `QPDFJob::handlePageSpecs`, not by
+    /// this public helper boundary.
+    #[allow(clippy::mutable_key_type)]
+    pub fn add_and_rename_form_fields(&mut self, fields: Vec<ObjectHandle>) -> Result<()> {
+        self.add_and_rename_form_fields_with_reserved_names(fields, &BTreeSet::new())
+    }
+
     /// Append copied top-level fields without renaming them, mirroring qpdf's
     /// `addFormField` (`QPDFAcroFormDocumentHelper.cc:49-59`). The
     /// `flattenRotation` caller has already removed the original field tree,
@@ -1491,10 +1540,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(created)
     }
 
-    fn prepare_foreign_resource_plan<RS: Read + Seek>(
+    fn prepare_foreign_resource_plan(
         &mut self,
         source_resources: Option<ObjectHandle>,
-        source: &mut Pdf<RS>,
     ) -> Result<ForeignResourcePlan> {
         let destination_resources = self.canonical_get_or_create_acroform_resources()?;
         let mut conflicts = ResourceConflicts::new();
@@ -1503,8 +1551,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // (`QPDFAcroFormDocumentHelper.cc:730-732`): the destination `/DR`
         // still gets created/promoted above, but there is nothing to merge.
         if let Some(source_resources) = source_resources {
-            let source_resources = ensure_foreign_indirect(source, source_resources)?;
-            let source_resources = self.pdf.copy_foreign_object(&source_resources)?;
             source_resources.make_resources_indirect(self.pdf)?;
             destination_resources.merge_resources(&source_resources, Some(&mut conflicts))?;
         }
