@@ -81,14 +81,19 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     d1.merge_resources(&d2_k1, None)?;
     pdf.mark_object_handle_dirty(&d1)?;
 
-    // GAP(QPDFObjectHandle::getResourceNames): qpdf iterates `d1`'s
-    // top-level keys whose already-merged value is itself a dictionary,
-    // printing each name (`for (auto const& name: d1.getResourceNames())
-    // std::cout << name << std::endl;`,
-    // `libqpdf/QPDFObjectHandle.cc:1156-1174`). flpdf's equivalent,
-    // `get_resource_names` in `object_handle.rs`, is a private `fn` with no
-    // public accessor -- there is nothing this driver can call to reproduce
-    // the printed name list.
+    // qpdf iterates `d1`'s top-level keys whose already-merged value is itself
+    // a dictionary, printing the sorted names returned by
+    // `getResourceNames` (`qpdf/test_driver.cc:1940-1953`,
+    // `libqpdf/QPDFObjectHandle.cc:1156-1170`). The canonical Rust primitive
+    // owns the same receiver/value resolution boundary and returns the raw
+    // dictionary keys, so the driver only performs the qpdf consumer's byte
+    // output step here.
+    let resource_names = d1.get_resource_names()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    for name in resource_names {
+        stdout.write_all(&name)?;
+        stdout.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -454,7 +459,29 @@ pub(crate) fn run_test_55<R: Read + Seek>(
 mod tests {
     use super::{resolve_and_drain, run_test_50, run_test_51};
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
+    use std::io;
     use std::path::PathBuf;
+
+    struct FailAfterWrites {
+        remaining: usize,
+    }
+
+    impl io::Write for FailAfterWrites {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test output failure",
+                ));
+            }
+            self.remaining -= 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     struct CurrentDirGuard(PathBuf);
 
@@ -649,7 +676,37 @@ mod tests {
         .expect("run test 50");
 
         assert!(stderr.is_empty());
-        assert!(!stdout.is_empty());
+        assert!(
+            stdout.ends_with(b"/F1\n/F2\n"),
+            "test 50 must emit the merged resource names in sorted order: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn dictionary_merge_propagates_a_resource_name_output_failure() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            pdf_with_merge_dictionaries(),
+            PdfOpenOptions::default(),
+        )
+        .expect("open merge dictionary fixture");
+        let mut stdout = FailAfterWrites { remaining: 2 };
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        let result = run_test_50(
+            &mut pdf,
+            b"merge-dict.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        );
+
+        assert!(
+            result.is_err(),
+            "resource-name output failure must propagate"
+        );
+        assert!(stderr.is_empty());
     }
 
     #[test]
