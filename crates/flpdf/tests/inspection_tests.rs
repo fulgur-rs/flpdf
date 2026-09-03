@@ -1,4 +1,4 @@
-use flpdf::{pages, ObjectRef, Pdf};
+use flpdf::{pages, Error, ObjectRef, Pdf};
 use std::io::Cursor;
 use std::io::Write;
 
@@ -95,6 +95,31 @@ fn outline_tree_uses_empty_title_for_non_string_value() {
     assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
 }
 
+#[test]
+fn outline_accessors_reject_a_foreign_helper() {
+    let bytes = named_destination_outline_pdf();
+    let mut source = Pdf::open(Cursor::new(bytes.clone())).unwrap();
+    let mut foreign = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut source_helper = source.outline();
+    let tree = source_helper.get_tree().unwrap();
+    let item = &tree[tree.roots()[0]];
+    let mut foreign_helper = foreign.outline();
+    let expected = "ObjectHandle belongs to another Pdf";
+
+    let results = [
+        item.get_title(&mut foreign_helper).map(|_| ()),
+        item.get_count(&mut foreign_helper).map(|_| ()),
+        item.get_dest(&mut foreign_helper).map(|_| ()),
+        item.get_dest_page(&mut foreign_helper).map(|_| ()),
+    ];
+    for result in results {
+        assert!(
+            matches!(result, Err(Error::Unsupported(ref message)) if message == expected),
+            "foreign outline helper must be rejected, got {result:?}"
+        );
+    }
+}
+
 /// Build a minimal PDF whose catalog points at an `/Outlines` tree with a single
 /// top-level item (object 4). `tail` supplies object 4 and any objects it refers
 /// to, numbered consecutively from 4.
@@ -180,6 +205,18 @@ fn pdf_with_metadata_outline_and_fonts() -> Vec<u8> {
         object8.to_vec(),
         object9,
         object10.to_vec(),
+    ])
+}
+
+fn named_destination_outline_pdf() -> Vec<u8> {
+    finalize_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R /Dests 5 0 R >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [6 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Outlines /First 4 0 R /Last 4 0 R /Count 1 >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Title (Named) /Parent 3 0 R /Dest /chapter >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /chapter [6 0 R /Fit] >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>\nendobj\n".to_vec(),
     ])
 }
 
