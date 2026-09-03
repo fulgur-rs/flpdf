@@ -4617,10 +4617,15 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // This is the qpdf stream writer's live-handle path: filtering and
             // payload framing are decided from the stream handle, while the
             // dictionary serializer remaps only child reference tokens.
+            // Each stream is emitted exactly once (streams cannot be ObjStm
+            // members), so remove the cache entry on consumption instead of
+            // cloning it: this frees the cached body immediately rather than
+            // retaining every cached stream's bytes alongside the growing
+            // output buffer through the rest of emission.
             let cached = cached_stream_outputs
-                .borrow()
-                .get(old_ref)
-                .map(|cached| (cached.dict.clone(), cached.data.clone(), cached.refiltered));
+                .borrow_mut()
+                .remove(old_ref)
+                .map(|cached| (cached.dict, cached.data, cached.refiltered));
             let (stream_dict, stream_data, refiltered) = if let Some(cached) = cached {
                 cached
             } else {
