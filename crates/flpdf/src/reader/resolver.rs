@@ -415,19 +415,19 @@ impl ResolverWarningOptions {
         }
     }
 
-    fn route_warning(&self, offset: Option<u64>, message: &str) -> Result<()> {
-        route_warning(
-            &self.logger,
-            self.suppress_warnings,
-            &self.description,
-            offset,
-            message,
-        )
-    }
-
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
         for diagnostic in diagnostics.entries() {
-            self.route_warning(diagnostic.offset, &diagnostic.message)?;
+            let description = diagnostic
+                .description
+                .as_deref()
+                .unwrap_or(self.description.as_str());
+            route_warning(
+                &self.logger,
+                self.suppress_warnings,
+                description,
+                diagnostic.offset,
+                &diagnostic.message,
+            )?;
         }
         Ok(())
     }
@@ -1798,8 +1798,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let message = message.into();
         let (logger, suppress_warnings, own_description) = {
             let mut core = self.core.borrow_mut();
-            core.repair_diagnostics
-                .push(Diagnostic::warning(message.clone(), offset));
+            let diagnostic = match description_override {
+                Some(description) => {
+                    Diagnostic::warning_with_description(message.clone(), offset, description)
+                }
+                None => Diagnostic::warning(message.clone(), offset),
+            };
+            core.repair_diagnostics.push(diagnostic);
             (
                 core.logger.clone(),
                 core.suppress_warnings,
@@ -1845,7 +1850,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
-        let (logger, suppress_warnings, description) = {
+        let (logger, suppress_warnings, own_description) = {
             let core = self.core.borrow();
             (
                 core.logger.clone(),
@@ -1854,10 +1859,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )
         };
         for diagnostic in diagnostics.entries() {
+            let description = diagnostic
+                .description
+                .as_deref()
+                .unwrap_or(own_description.as_str());
             route_warning(
                 &logger,
                 suppress_warnings,
-                &description,
+                description,
                 diagnostic.offset,
                 &diagnostic.message,
             )?;
@@ -4731,6 +4740,13 @@ mod tests {
         assert!(
             !logged.contains("destination.pdf"),
             "warning must not attribute the source's location to the destination: {logged}"
+        );
+
+        let diagnostics = destination.repair_diagnostics();
+        assert_eq!(diagnostics.entries().len(), 1);
+        assert_eq!(
+            diagnostics.entries()[0].description.as_deref(),
+            Some("source.pdf")
         );
     }
 

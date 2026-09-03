@@ -34,6 +34,13 @@ pub struct Diagnostic {
     pub message: String,
     pub offset: Option<u64>,
     pub origin: DiagnosticOrigin,
+    /// An explicit input-source description captured by the qpdf exception.
+    ///
+    /// `None` means that the output boundary should use the active document's
+    /// description. `Some` preserves a different source description, as with
+    /// qpdf's `QPDFExc` raised while a foreign stream is read by a destination
+    /// document.
+    pub description: Option<String>,
 }
 
 impl Diagnostic {
@@ -44,7 +51,23 @@ impl Diagnostic {
             message: message.into(),
             offset,
             origin: DiagnosticOrigin::Input,
+            description: None,
         }
+    }
+
+    /// Construct a warning with an explicit input-source description.
+    ///
+    /// qpdf retains the source `InputSource`'s name in the `QPDFExc` even when
+    /// the destination `QPDF` owns warning collection. This constructor keeps
+    /// that distinction available to later warning renderers.
+    pub fn warning_with_description(
+        message: impl Into<String>,
+        offset: Option<u64>,
+        description: impl Into<String>,
+    ) -> Self {
+        let mut diagnostic = Self::warning(message, offset);
+        diagnostic.description = Some(description.into());
+        diagnostic
     }
 
     /// Construct an error diagnostic.
@@ -54,6 +77,7 @@ impl Diagnostic {
             message: message.into(),
             offset,
             origin: DiagnosticOrigin::Input,
+            description: None,
         }
     }
 
@@ -66,6 +90,7 @@ impl Diagnostic {
             message: message.into(),
             offset: None,
             origin: DiagnosticOrigin::Object,
+            description: None,
         }
     }
 

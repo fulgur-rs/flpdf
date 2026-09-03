@@ -1319,8 +1319,13 @@ pub(crate) fn write_warning(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
+    let warning_filename = diagnostic
+        .description
+        .as_deref()
+        .map(str::as_bytes)
+        .unwrap_or(filename);
     let message = diagnostic.message.as_str();
-    if let Some(exception) = format_nntree_exception(filename, message) {
+    if let Some(exception) = format_nntree_exception(warning_filename, message) {
         let mut line = b"WARNING: ".to_vec();
         line.extend_from_slice(&exception);
         return write_stderr_bytes(stdout, stderr, &line);
@@ -1332,12 +1337,20 @@ pub(crate) fn write_warning(
     }
     let offset = diagnostic.offset;
     let mut line = b"WARNING: ".to_vec();
-    line.extend_from_slice(filename);
+    if !warning_filename.is_empty() {
+        line.extend_from_slice(warning_filename);
+    }
     if message.starts_with('(') {
-        line.push(b' ');
+        if !warning_filename.is_empty() {
+            line.push(b' ');
+        }
     } else if let Some(offset) = offset {
-        line.extend_from_slice(format!(" (offset {offset}): ").as_bytes());
-    } else {
+        if warning_filename.is_empty() {
+            line.extend_from_slice(format!("offset {offset}: ").as_bytes());
+        } else {
+            line.extend_from_slice(format!(" (offset {offset}): ").as_bytes());
+        }
+    } else if !warning_filename.is_empty() {
         line.extend_from_slice(b": ");
     }
     line.extend_from_slice(message.as_bytes());
@@ -1569,6 +1582,40 @@ requested value of integer is too big; returning INT_MAX\n"
             stderr,
             b"WARNING: number-tree.pdf (Name/Number tree node (object 24)): attempting to repair after error: number-tree.pdf (Name/Number tree node (object 25)): node is missing /Limits\n"
         );
+    }
+
+    #[test]
+    fn warning_output_uses_the_captured_foreign_source_description() {
+        let diagnostic = Diagnostic::warning_with_description(
+            "error decoding stream data for object 26 0: bad code received",
+            Some(3627),
+            "source.pdf",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"destination.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: source.pdf (offset 3627): error decoding stream data for object 26 0: bad code received\n"
+        );
+    }
+
+    #[test]
+    fn warning_output_preserves_an_explicitly_empty_source_description() {
+        let diagnostic =
+            Diagnostic::warning_with_description("warning without a filename", Some(17), "");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"destination.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"WARNING: offset 17: warning without a filename\n");
     }
 
     #[test]
