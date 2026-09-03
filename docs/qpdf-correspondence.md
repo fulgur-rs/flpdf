@@ -332,6 +332,18 @@ walk, `PageDocumentHelper` consumers reuse it across JSON sections, and
 `QPDF::updateAllPagesCache` and the mutation-owned cache invalidation contract
 (`QPDF_pages.cc:141-150`; `QPDF.hh:671-704`).
 
+`QPDF::removePage` first delegates membership lookup to `findPage`, which
+flattens the page tree and throws a `qpdf_e_pages` `QPDFExc` for a non-member
+page. Its exception uses the input source name, the `page object` description,
+zero offset, and `page object not referenced in /Pages tree`
+(`QPDF_pages.cc:254-316`); `QPDFPageDocumentHelper::removePage` is a direct
+delegation (`QPDFPageDocumentHelper.cc:50-52`). `test_driver.cc:862-872`
+removes the same page twice, so `page_api_1.out2` records
+`page_api_1.pdf (page object: object 4 0): page object not referenced in /Pages tree`
+with exit status 2. flpdf's `PageDocumentHelper::remove_page` now raises the
+canonical `Error::Pages` with that complete `QPDFExc::what()` text from the
+resolver's source description; the qtest driver propagates it unchanged.
+
 `flpdf-egzr.3.2.6.19` の `pages/tree_rebuild.rs` は、`QPDF_optimization.cc:159-228`
 に合わせて選択ページへ inheritable attributes を materialize した後、元の page-tree
 に残る `/Pages` node から `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を remove する。

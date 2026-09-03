@@ -6,6 +6,7 @@
 //! materialization, page insertion/removal, resource pruning, and annotation
 //! flattening. The helper holds no copied page-tree state.
 
+use crate::object_handle::{format_qpdf_exception_what, DocumentResolver};
 use crate::pages::tree_rebuild::{rebuild_page_tree, RebuildResult};
 use crate::{Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -262,12 +263,26 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     ///
     /// Mirrors `QPDFPageDocumentHelper::removePage`. qpdf permits removal of
     /// the final page, leaving an empty `/Pages` `/Kids` array and `/Count 0`.
+    /// Returns [`Error::Pages`] when `page` is not in the repaired page list,
+    /// preserving qpdf's source description and page-object context.
     pub fn remove_page(&mut self, page: ObjectRef) -> Result<RebuildResult> {
-        let index = self
-            .get_all_pages()?
-            .iter()
-            .position(|&candidate| candidate == page)
-            .ok_or(Error::Missing("page is not in the document"))?;
+        let pages = self.get_all_pages()?;
+        let Some(index) = pages.iter().position(|&candidate| candidate == page) else {
+            // qpdf's QPDF::findPage sets the last object description to
+            // `page object` and throws qpdf_e_pages with the owning input
+            // filename (`QPDF_pages.cc:304-316`). Keep the complete exception
+            // text on the canonical page-helper error so callers do not need
+            // to reconstruct it at the driver boundary.
+            let description = self.pdf.resolver.input_description();
+            let object = format!("page object: object {} {}", page.number, page.generation);
+            let message = format_qpdf_exception_what(
+                &description,
+                &object,
+                0,
+                "page object not referenced in /Pages tree",
+            );
+            return Err(Error::Pages(message));
+        };
         self.remove_page_at(index)
     }
 

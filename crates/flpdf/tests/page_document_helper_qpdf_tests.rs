@@ -1,4 +1,4 @@
-use flpdf::{ObjectRef, PageDocumentHelper, Pdf};
+use flpdf::{ObjectRef, PageDocumentHelper, Pdf, PdfOpenOptions};
 use std::io::Cursor;
 
 fn one_page_nested_tree_with_unknown_key() -> Vec<u8> {
@@ -38,5 +38,31 @@ fn removing_the_last_page_flattens_intermediate_pages_with_qpdf_warnings() {
             .iter()
             .any(|diagnostic| diagnostic.message.contains("Unknown key /UserUnit")),
         "flattening the intermediate /Pages node must retain qpdf's warning"
+    );
+}
+
+#[test]
+fn removing_an_already_removed_page_preserves_qpdf_exception_context() {
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(one_page_nested_tree_with_unknown_key()),
+        PdfOpenOptions {
+            description: "page_api_1.pdf".to_owned(),
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let page = ObjectRef::new(4, 0);
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_page(page)
+        .expect("the first removal should succeed");
+    let error = PageDocumentHelper::new(&mut pdf)
+        .remove_page(page)
+        .expect_err("the second removal should raise the page exception");
+
+    assert_eq!(
+        error.to_string(),
+        "page_api_1.pdf (page object: object 4 0): page object not referenced in /Pages tree"
     );
 }

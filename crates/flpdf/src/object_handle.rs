@@ -933,7 +933,7 @@ fn expand_description_template(
     result
 }
 
-/// Format the `QPDFExc::createWhat` boundary used by qpdf stream accessors.
+/// Format the `QPDFExc::createWhat` boundary shared by qpdf exception users.
 ///
 /// qpdf's `createWhat` (`libqpdf/QPDFExc.cc:16-48`) only skips the
 /// parenthesized `(object, offset)` segment when `object` is empty AND
@@ -941,7 +941,12 @@ fn expand_description_template(
 /// enters that branch and emits an empty `()` — qpdf's own literal behavior,
 /// not a special case flpdf adds. Only a strictly positive offset ever
 /// contributes "offset N" text inside the parentheses.
-fn format_qpdf_exception_what(filename: &str, object: &str, offset: i64, message: &str) -> String {
+pub(crate) fn format_qpdf_exception_what(
+    filename: &str,
+    object: &str,
+    offset: i64,
+    message: &str,
+) -> String {
     let mut result = filename.to_owned();
     if !(object.is_empty() && offset == 0) {
         if !filename.is_empty() {
