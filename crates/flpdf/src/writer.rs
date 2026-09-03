@@ -758,7 +758,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             &options,
             0,
             self.settings.linearization,
-        )?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
+        )?; // cov:ignore: progress tests exercise this call; LLVM maps its successful multiline continuation to an unhit region
         let result = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
@@ -2144,7 +2144,7 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
     snapshot: Option<CatalogExtensionsSnapshot>,
 ) -> Result<()> {
     let Some(snapshot) = snapshot else {
-        return Ok(()); // cov:ignore: snapshot is always Some after valid linearization planning
+        return Ok(());
     };
     let (_, catalog) = writer_catalog_copy(pdf)?;
     // Raw dictionary membership, matching the snapshot side (see
@@ -2864,18 +2864,19 @@ pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
     let trailer = pdf.trailer();
     let info = match trailer.try_get_key(b"/Info") {
         Ok(info) => info,
-        Err(_) => return Vec::new(), // cov:ignore: defensive resolver-error fallback
+        Err(_) => return Vec::new(), // cov:ignore: a live-Pdf resolver failure is defensive; malformed source is rejected or normalized before this helper
     };
     let dict = match info.try_as_dictionary() {
         Ok(Some(dict)) => dict,
-        Ok(None) | Err(_) => return Vec::new(), // cov:ignore: defensive resolver-error fallback
+        Ok(None) => return Vec::new(),
+        Err(_) => return Vec::new(), // cov:ignore: a live-Pdf resolver failure is defensive; malformed source is rejected or normalized before this helper
     };
     // `ObjectHandle::try_as_dictionary` returns qpdf's lexicographically sorted
     // decoded names, matching `QPDFObjectHandle::getKeys()`.
     let mut suffix = Vec::new();
     for (_key, value) in dict {
         if value.try_dereference().is_err() {
-            continue; // cov:ignore: defensive resolver-error fallback
+            continue; // cov:ignore: a live-Pdf resolver failure is defensive; malformed source is rejected or normalized before this helper
         }
         if let Some(bytes) = value.as_string() {
             suffix.push(b' ');
@@ -3767,7 +3768,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 .get(&source)
                 .map(|cached| cached.parameters_removed)
             {
-                return Ok(parameters_removed); // cov:ignore: the canonical walk probes each source object once; emission reads this cache directly, so a repeated probe is defensive only
+                return Ok(parameters_removed); // The catalog-first and ObjStm-aware walks share this cache.
             }
             let (dict, data, refiltered, parameters_removed) =
                 plain::body::canonical_stream_output_for_rewrite_with_status(
@@ -6202,5 +6203,92 @@ mod final_handle_writer_tests {
         assert!(output
             .windows(b"q /image Do Q\n".len())
             .any(|window| { window == b"q /image Do Q\n" }));
+    }
+
+    #[test]
+    fn first_page_xref_count_rejects_param_dict_above_size() {
+        assert_eq!(
+            crate::linearization::writer::first_page_xref_object_count(10, 3)
+                .expect("valid param-dict slot"),
+            7
+        );
+        let error = crate::linearization::writer::first_page_xref_object_count(10, 11)
+            .expect_err("param-dict slot beyond /Size must be rejected");
+        assert!(matches!(
+            error,
+            Error::Unsupported(message)
+                if message.contains("param-dict object number")
+                    && message.contains("exceeds /Size")
+        ));
+    }
+
+    #[test]
+    fn direct_root_catalog_extension_restore_accepts_a_missing_snapshot() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/direct-root-one-page.pdf").to_vec(),
+        ))
+        .expect("direct-root fixture");
+        let snapshot = snapshot_catalog_extensions(&mut pdf).expect("snapshot direct root");
+        assert!(
+            snapshot.is_none(),
+            "an inline Catalog has no restoration snapshot"
+        );
+        restore_catalog_extensions(&mut pdf, snapshot).expect("restore absent snapshot");
+    }
+
+    #[test]
+    fn qdf_generate_reuses_modified_stream_parameters_between_plans() {
+        struct CountEofTokenFilter {
+            eof_calls: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl crate::token_filter::TokenFilter for CountEofTokenFilter {
+            fn handle_token(
+                &mut self,
+                token: &crate::tokenizer::Token,
+                output: &mut crate::token_filter::TokenFilterOutput<'_>,
+            ) -> crate::pipeline::PipelineResult<()> {
+                output.write_token(token)
+            }
+
+            fn handle_eof(
+                &mut self,
+                _output: &mut crate::token_filter::TokenFilterOutput<'_>,
+            ) -> crate::pipeline::PipelineResult<()> {
+                self.eof_calls.set(self.eof_calls.get() + 1);
+                Ok(())
+            }
+        }
+
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .expect("one-page fixture");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).expect("page resolves");
+        let content = page.try_get_key(b"/Contents").expect("page contents");
+        let eof_calls = Rc::new(std::cell::Cell::new(0));
+        content
+            .add_token_filter(Rc::new(RefCell::new(CountEofTokenFilter {
+                eof_calls: Rc::clone(&eof_calls),
+            })))
+            .expect("register token filter");
+        pdf.mark_object_handle_dirty(&content)
+            .expect("mark modified content");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_qdf_mode(true);
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer
+            .write()
+            .expect("QDF Generate must reuse modified stream parameters");
+        assert!(!writer.get_buffer().expect("written buffer").is_empty());
+        assert_eq!(
+            eof_calls.get(),
+            1,
+            "the modified stream must be prepared once across both planning walks"
+        );
     }
 }
