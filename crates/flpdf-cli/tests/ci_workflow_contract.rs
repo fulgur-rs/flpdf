@@ -14,6 +14,7 @@ const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
 const RELEASE_JOB_NAME: &str = "release";
 const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
 const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --release";
+const LIBJPEG_COMPAT_TEST_CONDITION: &str = "${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}";
 const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
     "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
 ];
@@ -439,6 +440,37 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
         && executable_command_lines == 1)
 }
 
+fn test_job_contains_conditional_commands(
+    workflow: &str,
+    condition: &str,
+    commands: &[&str],
+) -> ContractResult<bool> {
+    let workflow = parse_workflow(workflow)?;
+    let jobs =
+        mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
+    let jobs = require_mapping(jobs, "workflow.jobs")?;
+    let test_job = mapping_get(jobs, "test")
+        .ok_or_else(|| "ci workflow must define the test job".to_owned())?;
+    let test_job = require_mapping(test_job, "test job")?;
+    let Some(steps) = mapping_get(test_job, "steps") else {
+        return Ok(false);
+    };
+    let steps = steps
+        .as_vec()
+        .ok_or_else(|| "test job.steps must be a sequence".to_owned())?;
+
+    Ok(steps.iter().any(|step| {
+        mapping_get(step, "if").and_then(Yaml::as_str) == Some(condition)
+            && mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .is_some_and(|run| {
+                    commands
+                        .iter()
+                        .all(|command| run_contains_test_command(run, command))
+                })
+    }))
+}
+
 fn release_job_contains_test_command(workflow: &str, command: &str) -> ContractResult<bool> {
     let workflow = parse_workflow(workflow)?;
     if has_default_run_override(&workflow, "workflow")? {
@@ -730,6 +762,25 @@ fn test_matrix_runs_default_workspace_suite() {
         test_job_contains_test_command(CI_WORKFLOW, "cargo test --workspace")
             .expect("ci workflow must be valid and define the test job"),
         "the four-OS test matrix must run the complete default workspace suite"
+    );
+}
+
+#[test]
+fn test_matrix_runs_qpdf_libjpeg_compat_suite_on_linux_amd64() {
+    let commands = [
+        "bash scripts/ci-apt-install.sh libjpeg-dev",
+        "cargo test -p flpdf --features qpdf-libjpeg-compat --lib pipeline::dct",
+        "cargo test -p flpdf-libjpeg-compat --features system-libjpeg --test api",
+    ];
+
+    assert!(
+        test_job_contains_conditional_commands(
+            CI_WORKFLOW,
+            LIBJPEG_COMPAT_TEST_CONDITION,
+            &commands
+        )
+        .expect("ci workflow must be valid and define the test job"),
+        "the Linux amd64 test cell must run the system-libjpeg compatibility suite"
     );
 }
 

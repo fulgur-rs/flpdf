@@ -258,6 +258,19 @@ jobs:
           echo "[ci] cargo test --workspace"
           cargo test --workspace
 
+      # The qpdf-libjpeg-compat feature links the runner's system libjpeg and
+      # is therefore scoped to the Linux amd64 cell, just like the qpdf-zlib-
+      # compat byte gates below. Keep these commands explicit: all-features
+      # clippy only compiles this route and the default workspace test does not
+      # execute it.
+      - name: qpdf-compatible DCT backend tests (Linux amd64)
+        if: ${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci-apt-install.sh libjpeg-dev
+          cargo test -p flpdf --features qpdf-libjpeg-compat --lib pipeline::dct
+          cargo test -p flpdf-libjpeg-compat --features system-libjpeg --test api
+
       # amd64-Linux-only: the captured reference bytes match the amd64 Ubuntu
       # base image's zlib1g version; Windows (libz-sys vendored zlib),
       # ubuntu-24.04-arm (different arch base image) and macOS would produce
