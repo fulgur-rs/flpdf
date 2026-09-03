@@ -441,6 +441,28 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn default_backend_reports_a_diagnostic_for_a_reserved_marker_without_crashing() {
+        let mut sink = Sink;
+        let mut stage = PlDct::new("DCT decode", &mut sink);
+        stage
+            .write(&[0xff, 0xd8, 0xff, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00])
+            .expect("DCT stage buffers input");
+
+        let error = stage
+            .finish()
+            .expect_err("reserved JPEG marker must fail rather than silently succeed");
+
+        // The default backend cannot reproduce qpdf's `Unsupported marker
+        // type 0x02` wording (see the module doc's known limitation), but it
+        // must still report the malformed input as an error. Pin the actual
+        // libjpeg-turbo-rs 0.8.0 diagnostic so a future dependency bump that
+        // silently changes or drops this fallback message is caught here.
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.message(), "invalid marker: 0xFF00");
+    }
+
     #[cfg(feature = "qpdf-libjpeg-compat")]
     #[test]
     fn libjpeg_compat_backend_preserves_reserved_marker_byte() {
