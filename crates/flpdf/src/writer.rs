@@ -446,11 +446,14 @@ fn update_minimum_pdf_version(
         Some((current_version, current_extension_level)) => {
             match crate::pdf_version::parse_qpdf_writer_version(current_version) {
                 Some(current_parsed) => {
-                    if candidate > current_parsed
-                        || (candidate == current_parsed
-                            && extension_level > *current_extension_level)
-                    {
+                    if candidate > current_parsed {
                         *current_version = version;
+                        *current_extension_level = extension_level;
+                    } else if candidate == current_parsed
+                        && extension_level > *current_extension_level
+                    {
+                        // qpdf updates only the extension level on a numeric
+                        // tie; the incumbent raw version spelling survives.
                         *current_extension_level = extension_level;
                     }
                 }
@@ -5745,6 +5748,15 @@ mod final_handle_writer_tests {
 
         let mut current = Some(("1.7".to_string(), 1));
         update_minimum_pdf_version(&mut current, "1.7".to_string(), 2);
+
+        assert_eq!(current, Some(("1.7".to_string(), 2)));
+    }
+
+    #[test]
+    fn minimum_version_numeric_tie_keeps_incumbent_raw_version() {
+        let mut current = Some(("1.7".to_string(), 0));
+
+        update_minimum_pdf_version(&mut current, "1.7x".to_string(), 2);
 
         assert_eq!(current, Some(("1.7".to_string(), 2)));
     }
