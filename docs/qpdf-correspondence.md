@@ -1135,6 +1135,16 @@ handle mutation で行うため、page merge に raw metadata closure bridge は
 `copyForeignObject` が拒否する shape であり、後方互換 adapter は追加せず明示的 rejection
 を維持する。
 
+`.4wq4` では、single-source `PageSpecJobOutput::InPlace` の page-selection
+completion（navigation remap、structural `/Pg`/`/P` drop、subset prune、
+AcroForm prune）を `QPDFJob::complete_in_place_page_selection` に集約する。
+これは qpdf の `QPDFJob::createQPDF` における
+`handlePageSpecs` → `handleRotations` → `handleTransformations` の順序
+（`QPDFJob.cc:428-535,2137-2210,2360-2632`）に対応する。CLI の overlay、
+split、writer/output と、QPDFJob の transformation/inspection continuation は
+それぞれの consumer boundary に残し、page-selection helper が qpdf にない
+横断的な output abstraction を作らない。
+
 ⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
 相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を
 `direct_visiting`（`ForeignObjectCopier` フィールド）で bound する。qpdf の該当

@@ -11,14 +11,14 @@
 //! annotation/outline null-out family, where the reference is kept verbatim and
 //! the page object becomes `null`.
 
-use flpdf::job::{remap_outline_and_dests, QPDFJob};
+use flpdf::job::{JobExitCode, QPDFJob};
 use flpdf::{
-    drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, extract_pages, pages,
-    prune_acroform_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
+    extract_pages, pages, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
     RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{BufReader, Cursor};
 
 /// 3-page document with one article thread.
 ///
@@ -107,12 +107,73 @@ fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
 fn run_subset_bytes(bytes: Vec<u8>, pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open fixture");
     let result = rebuild_page_tree(&mut pdf, pages).expect("rebuild");
-    remap_outline_and_dests(&mut pdf, &result).expect("remap");
-    drop_struct_elem_dangling_pg(&mut pdf, &result).expect("pg drop");
-    drop_thread_bead_dangling_p(&mut pdf, &result).expect("bead /P drop");
-    QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
-    prune_acroform_after_subset(&mut pdf, &result).expect("acroform prune");
+    QPDFJob::complete_in_place_page_selection(&mut pdf, &result, RemoveUnreferencedResources::Yes)
+        .expect("complete in-place page selection");
     pdf
+}
+
+#[test]
+fn qpdf_job_in_place_page_selection_drops_dangling_bead_p() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("thread-input.pdf");
+    let output = tempdir.path().join("thread-output.pdf");
+    std::fs::write(&input, build_fixture()).expect("write thread fixture");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "pages": [{"file": ".", "range": "1,3"}],
+        "removeUnreferencedResources": "yes"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json)
+        .expect("initialize the qpdf-shaped page job");
+    assert_eq!(
+        job.run().expect("run the qpdf-shaped page job"),
+        JobExitCode::Success
+    );
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).expect("open output")))
+        .expect("reopen qpdf job output");
+    let root = pdf.trailer_key_handle(b"Root");
+    pdf.resolve(&root).expect("resolve catalog");
+    let threads = root.get_key(b"/Threads");
+    pdf.resolve(&threads).expect("resolve threads");
+    let thread_ref = threads
+        .as_array()
+        .and_then(|items| items.first().cloned())
+        .and_then(|item| item.object_ref())
+        .expect("the thread entry must remain indirect");
+    let thread = pdf.get_object_handle(thread_ref);
+    pdf.resolve(&thread).expect("resolve thread");
+    let mut bead_ref = thread
+        .get_key(b"/F")
+        .object_ref()
+        .expect("the thread first bead must remain indirect");
+    let mut saw_dropped_page_bead = false;
+    let mut visited = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+        assert!(
+            visited.insert(bead_ref),
+            "the bead ring must not repeat early"
+        );
+        let bead = pdf.get_object_handle(bead_ref);
+        pdf.resolve(&bead).expect("resolve bead");
+        assert!(
+            bead.as_dictionary().is_some(),
+            "every ring bead must remain live"
+        );
+        saw_dropped_page_bead |= !bead.try_has_key(b"/P").expect("inspect bead /P");
+        bead_ref = bead
+            .get_key(b"/N")
+            .object_ref()
+            .expect("the next bead must remain indirect");
+    }
+    assert!(
+        saw_dropped_page_bead,
+        "QPDFJob InPlace page completion must drop the removed page bead /P"
+    );
 }
 
 #[test]
