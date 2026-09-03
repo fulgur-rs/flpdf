@@ -1316,6 +1316,16 @@ handle-native. `form_field_object_helper/rendering.rs` uses the
 keys, warning/exit behavior, and the 11.9.0 CreationDate-backed
 `modificationdate` quirk (`QPDFJob.cc:1281-1330`).
 
+The attachment-name key follows the same byte-oriented boundary. qpdf's
+`QPDFNameTreeObjectHelper` exposes `getUTF8Value()` results
+(`QPDFNameTreeObjectHelper.cc:88-98`), and an explicitly UTF-8-prefixed PDF
+string returns the bytes after its BOM without revalidating them
+(`QPDF_String.cc:162-171`). `JSON::Writer::encode_string` only escapes JSON
+syntax/control bytes (`JSON.cc:216-274`); it does not apply lossy UTF-8
+conversion. `build_attachments_section_with_version` therefore retains each
+key as `Vec<u8>` through sorting and `json_dictionary`, so distinct malformed
+UTF-8 keys cannot collapse before qpdf-shaped JSON serialization.
+
 The earlier D2 notes on the `QPDFEmbeddedFileDocumentHelper` and
 `QPDFFileSpecObjectHelper` rows are superseded by this slice. Live probes for
 normal, all-key, direct-Filespec, malformed-scalar, and non-stream-EF inputs
