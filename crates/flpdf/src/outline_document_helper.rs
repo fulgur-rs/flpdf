@@ -48,7 +48,7 @@
 
 use crate::nntree::NameTree;
 use crate::outline_object_helper::{OutlineId, OutlineItem, OutlineTree};
-use crate::{ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -176,6 +176,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// way qpdf's `QPDFObjectHandle` transparently dereferences on access.
     pub(crate) fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
         self.pdf.resolve(handle)
+    }
+
+    pub(crate) fn ensure_handle_belongs_to_pdf(&self, handle: &ObjectHandle) -> Result<()> {
+        if handle.belongs_to_pdf(self.pdf.unique_id()) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(
+            "ObjectHandle belongs to another Pdf".to_string(),
+        ))
     }
 
     /// Resolve one child handle through the owning document while preserving

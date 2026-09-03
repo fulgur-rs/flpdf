@@ -656,6 +656,14 @@ Dictionary/value adapter と object-shaped production reader は legacy object-m
 
 ## 7. ドキュメント / オブジェクトヘルパー
 
+Outline helper の live accessor は、Rust では外部の
+`&mut OutlineDocumentHelper` を受け取るため、各 accessor の入口で
+`ObjectHandle::belongs_to_pdf` による所有 PDF の一致を確認する。これは
+qpdf の `QPDFOutlineObjectHelper::Members::dh` が private かつ生成時に
+固定されることに対応する Rust 側の ownership guard であり、named
+destination 解決や既存の synthetic `Pdf::set_object` bridge の挙動を
+変更するものではない。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDFAcroFormDocumentHelper.cc` | 1047 | `acroform_document_helper.rs`(217-590: `analyze` / `traverseField` 相当の live `ObjectHandle` association cache、direct Widget の orphan fallback、`invalidateCache`、`removeFormFields` の forward-map 起点 cache cleanup; 862-943: frozen-cache `addAndRenameFormFields`; 1229-1337: `getNeedAppearances` / `setNeedAppearances` / `generateAppearancesIfNeeded`) + `page_annotation_flatten.rs`(596-612: `/Fields` guard 後の Widget identity gate) + `page_object_helper.rs`(foreign `copy_annotations_from` が page `/Annots` を append した後の共有 AcroForm cache 無効化、`QPDFAcroFormDocumentHelper.hh:76-83` の手動 mutation 契約) + `acroform_document_helper.rs`(`disableDigitalSignatures` consumer) + `acroform_document_helper.rs`(`transformAnnotations`、`DrMap`、`/DA` の resource-name replacement consumer) + `overlay_appearance_stream.rs`(720: `adjustAppearanceStream`、AP stream consumer) | 🔀 canonical constructor now eagerly analyzes (`QPDFAcroFormDocumentHelper.cc:14-21`) and `Pdf` retains the live association cache across sequential helper facades, matching `QPDFJob::get_afdh_for_qpdf` (`QPDFJob.cc:1847-1856`); foreign transform keeps one per-annotation copy loop; stream kids propagate `stream objects cannot be cloned`; non-dictionary `/Parent` follows qpdf warning/return semantics (`QPDFFormFieldObjectHelper.cc:36-47`). The former survey/placement helpers were removed; canonical transform/copy remains in `acroform_document_helper.rs` and `page_object_helper.rs`. `page_annotation_flatten.rs`'s `remove_acroform` invalidates that shared cache after removing `/AcroForm`, matching `QPDFJob.cc:2141-2193`'s discipline that `flattenAnnotations` uses its own scope-local `QPDFAcroFormDocumentHelper` (discarded on return) rather than the `run()`-level shared `afdh`, so a later `flattenRotation` step's `make_afdh()` always re-analyzes the post-removal state instead of observing the pre-removal association. Foreign orphan-widget append follows the same invalidate-after-manual-page-mutation contract. |

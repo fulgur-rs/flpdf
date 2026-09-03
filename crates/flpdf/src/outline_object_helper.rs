@@ -21,6 +21,9 @@
 //! extraction) and delegates only the name/string branch to
 //! `OutlineDocumentHelper::resolve_named_dest`, exactly as qpdf's
 //! `getDest()` delegates to `m->dh.resolveNamedDest()`.
+//! Before an accessor reads the live item, it verifies that the passed helper's
+//! `Pdf` owns the item's `ObjectHandle`; this is the Rust ownership guard for
+//! qpdf's private, construction-bound `m->dh` reference.
 //!
 //! ```compile_fail
 //! use flpdf::outline_object_helper::{outline_items, outline_items_with_max_depth};
@@ -125,6 +128,7 @@ impl OutlineItem {
         &self,
         helper: &mut OutlineDocumentHelper<'_, R>,
     ) -> Result<String> {
+        helper.ensure_handle_belongs_to_pdf(&self.object)?;
         let Some(value) = outline_dict_key(&self.object, b"/Title")? else {
             return Ok(String::new());
         };
@@ -144,6 +148,7 @@ impl OutlineItem {
         &self,
         helper: &mut OutlineDocumentHelper<'_, R>,
     ) -> Result<i32> {
+        helper.ensure_handle_belongs_to_pdf(&self.object)?;
         let Some(value) = outline_dict_key(&self.object, b"/Count")? else {
             return Ok(0);
         };
@@ -170,6 +175,7 @@ impl OutlineItem {
         &self,
         helper: &mut OutlineDocumentHelper<'_, R>,
     ) -> Result<ObjectHandle> {
+        helper.ensure_handle_belongs_to_pdf(&self.object)?;
         let dest_src = outline_dict_key(&self.object, b"/Dest")?;
         let candidate = match dest_src {
             Some(dest) => Some(dest),
