@@ -1245,7 +1245,7 @@ mod tests {
             bytes,
             PdfOpenOptions {
                 suppress_warnings: true,
-                description: "form-bad-fields-array.pdf".to_owned(),
+                description: b"form-bad-fields-array.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         )
@@ -1295,7 +1295,7 @@ mod tests {
             bytes,
             PdfOpenOptions {
                 suppress_warnings: true,
-                description: "form-parent-error.pdf".to_owned(),
+                description: b"form-parent-error.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         )
@@ -1343,7 +1343,7 @@ mod tests {
             bytes,
             PdfOpenOptions {
                 suppress_warnings: true,
-                description: "direct-orphan.pdf".to_owned(),
+                description: b"direct-orphan.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         )
@@ -1776,7 +1776,7 @@ Set field value: group.child -> 3.14 \xc3\xb7 0\n"
             pdf_with_number_trees(),
             PdfOpenOptions {
                 suppress_warnings: true,
-                description: "number-tree.pdf".to_owned(),
+                description: b"number-tree.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         )

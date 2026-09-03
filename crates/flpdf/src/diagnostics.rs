@@ -40,7 +40,11 @@ pub struct Diagnostic {
     /// description. `Some` preserves a different source description, as with
     /// qpdf's `QPDFExc` raised while a foreign stream is read by a destination
     /// document.
-    pub description: Option<String>,
+    ///
+    /// qpdf stores input names in `std::string`, whose byte contents are kept
+    /// verbatim by `QPDFExc`. Keep the same byte-preserving boundary here so
+    /// output sinks can reproduce non-UTF-8 Unix paths.
+    pub description: Option<Vec<u8>>,
 }
 
 impl Diagnostic {
@@ -63,10 +67,10 @@ impl Diagnostic {
     pub fn warning_with_description(
         message: impl Into<String>,
         offset: Option<u64>,
-        description: impl Into<String>,
+        description: impl AsRef<[u8]>,
     ) -> Self {
         let mut diagnostic = Self::warning(message, offset);
-        diagnostic.description = Some(description.into());
+        diagnostic.description = Some(description.as_ref().to_vec());
         diagnostic
     }
 

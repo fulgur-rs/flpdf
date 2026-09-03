@@ -886,14 +886,16 @@ fn emit_diagnostics_with_suppression(
                 let separator = if diagnostic.message.starts_with("(object ")
                     || diagnostic.message.starts_with("(trailer,")
                 {
-                    " "
+                    &b" "[..]
                 } else {
-                    ": "
+                    &b": "[..]
                 };
-                logger.warn(format!(
-                    "WARNING: {location}{separator}{}\n",
-                    diagnostic.message
-                ))?;
+                let mut line = b"WARNING: ".to_vec();
+                line.extend_from_slice(&location);
+                line.extend_from_slice(separator);
+                line.extend_from_slice(diagnostic.message.as_bytes());
+                line.push(b'\n');
+                logger.warn(line)?;
             }
             Severity::Error => {
                 errors = true;
@@ -918,19 +920,28 @@ fn emit_warning(logger: &QPDFLogger, input_name: &str, message: impl AsRef<str>)
     logger.warn(format!("WARNING: {input_name}: {message}\n"))
 }
 
-fn diagnostic_location(input_name: &str, diagnostic: &crate::Diagnostic) -> String {
+fn diagnostic_location(input_name: &str, diagnostic: &crate::Diagnostic) -> Vec<u8> {
     // A diagnostic raised while piping a copied foreign stream carries the
     // source document's own description (qpdf retains the source
     // InputSource's name in the QPDFExc even though the destination QPDF
     // owns warning collection; see Diagnostic::description). Prefer that
     // over the checked document's own name so the location matches qpdf.
-    let input_name = diagnostic.description.as_deref().unwrap_or(input_name);
+    let input_name = diagnostic
+        .description
+        .as_deref()
+        .unwrap_or(input_name.as_bytes());
     if diagnostic.message.starts_with("(object ") || diagnostic.message.starts_with("(trailer,") {
-        input_name.to_owned()
+        input_name.to_vec()
     } else {
         match diagnostic.offset {
-            Some(offset) => format!("{input_name} (offset {offset})"),
-            None => input_name.to_owned(),
+            Some(offset) => {
+                let mut location = input_name.to_vec();
+                location.extend_from_slice(b" (offset ");
+                location.extend_from_slice(offset.to_string().as_bytes());
+                location.push(b')');
+                location
+            }
+            None => input_name.to_vec(),
         }
     }
 }
@@ -941,11 +952,13 @@ fn emit_error_diagnostic(
     input_name: &str,
     diagnostic: &crate::Diagnostic,
 ) -> Result<()> {
-    logger.error(format!(
-        "{message_prefix}: {}: {}\n",
-        diagnostic_location(input_name, diagnostic),
-        diagnostic.message
-    ))
+    let mut line = message_prefix.as_bytes().to_vec();
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(&diagnostic_location(input_name, diagnostic));
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(diagnostic.message.as_bytes());
+    line.push(b'\n');
+    logger.error(line)
 }
 
 fn emit_error(
@@ -2415,12 +2428,12 @@ WARNING: open-repair-failure.pdf: Attempting to reconstruct cross-reference tabl
         let diagnostic = crate::Diagnostic::warning_with_description(
             "error decoding stream data for object 26 0: bad code received",
             Some(3627),
-            "source.pdf",
+            b"source.pdf",
         );
 
         assert_eq!(
             diagnostic_location("destination.pdf", &diagnostic),
-            "source.pdf (offset 3627)"
+            b"source.pdf (offset 3627)"
         );
     }
 
@@ -2430,7 +2443,7 @@ WARNING: open-repair-failure.pdf: Attempting to reconstruct cross-reference tabl
 
         assert_eq!(
             diagnostic_location("destination.pdf", &diagnostic),
-            "destination.pdf (offset 17)"
+            b"destination.pdf (offset 17)"
         );
     }
 }

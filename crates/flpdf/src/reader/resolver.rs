@@ -380,7 +380,8 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// qpdf `m->suppress_warnings`; collection remains active while true.
     suppress_warnings: bool,
     /// qpdf input-source description used when formatting warning locations.
-    description: String,
+    /// The source name is byte-preserving, matching qpdf's `std::string`.
+    description: Vec<u8>,
     /// qpdf `m->encp` (`include/qpdf/QPDF.hh:1463`), the encryption
     /// parameters `QPDF::pipeStreamData`'s static overload takes as its first
     /// argument and consults before piping a stream
@@ -409,7 +410,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
 pub(crate) struct ResolverWarningOptions {
     logger: crate::QPDFLogger,
     suppress_warnings: bool,
-    description: String,
+    description: Vec<u8>,
 }
 
 /// Keep failures raised while delivering a warning distinct from failures
@@ -444,7 +445,7 @@ impl ResolverWarningOptions {
     pub(crate) fn new(
         logger: crate::QPDFLogger,
         suppress_warnings: bool,
-        description: String,
+        description: Vec<u8>,
     ) -> Self {
         Self {
             logger,
@@ -458,7 +459,7 @@ impl ResolverWarningOptions {
             let description = diagnostic
                 .description
                 .as_deref()
-                .unwrap_or(self.description.as_str());
+                .unwrap_or(self.description.as_slice());
             route_warning(
                 &self.logger,
                 self.suppress_warnings,
@@ -474,30 +475,45 @@ impl ResolverWarningOptions {
 fn route_warning(
     logger: &crate::QPDFLogger,
     suppress_warnings: bool,
-    description: &str,
+    description: &[u8],
     offset: Option<u64>,
     message: &str,
 ) -> Result<()> {
     if suppress_warnings {
         return Ok(());
     }
+    let mut line = b"WARNING: ".to_vec();
     if message.starts_with("(object ") || message.starts_with("(trailer") {
-        let separator = if description.is_empty() { "" } else { " " };
-        return logger.warn(format!("WARNING: {description}{separator}{message}\n"));
+        line.extend_from_slice(description);
+        if !description.is_empty() {
+            line.push(b' ');
+        }
+        line.extend_from_slice(message.as_bytes());
+        line.push(b'\n');
+        return logger.warn(line);
     }
     let positive_offset = offset.filter(|offset| *offset > 0);
-    let location = match (description.is_empty(), positive_offset) {
-        (false, Some(offset)) => format!("{description} (offset {offset})"),
-        (false, None) => description.to_owned(),
-        (true, Some(offset)) => format!("offset {offset}"),
-        (true, None) => String::new(),
-    };
-    if location.is_empty() {
-        logger.warn(format!("WARNING: {message}\n"))
-    } else {
-        let separator = if message.starts_with('(') { " " } else { ": " };
-        logger.warn(format!("WARNING: {location}{separator}{message}\n"))
+    if !description.is_empty() {
+        line.extend_from_slice(description);
+        if let Some(offset) = positive_offset {
+            line.extend_from_slice(b" (offset ");
+            line.extend_from_slice(offset.to_string().as_bytes());
+            line.push(b')');
+        }
+    } else if let Some(offset) = positive_offset {
+        line.extend_from_slice(b"offset ");
+        line.extend_from_slice(offset.to_string().as_bytes());
     }
+    if !description.is_empty() || positive_offset.is_some() {
+        line.extend_from_slice(if message.starts_with('(') {
+            &b" "[..]
+        } else {
+            &b": "[..]
+        });
+    }
+    line.extend_from_slice(message.as_bytes());
+    line.push(b'\n');
+    logger.warn(line)
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -718,7 +734,7 @@ struct ForeignStreamData<R: Read + Seek + 'static> {
     stream_length: usize,
     local_dict: ObjectHandle,
     recovered_stream_eol_length: usize,
-    description: String,
+    description: Vec<u8>,
 }
 
 /// qpdf's `CopiedStreamDataProvider` (`libqpdf/QPDF.cc:126-163`) dispatches
@@ -756,7 +772,7 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
             &self.foreign_data.encryption_parameters,
             recovered_stream_eol_length,
             destination.as_ref(),
-            Some(self.foreign_data.description.as_str()),
+            Some(self.foreign_data.description.as_slice()),
             self.foreign_data.object_ref,
             self.foreign_data.parsed_offset,
             self.foreign_data.stream_length,
@@ -1212,7 +1228,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> String {
-        let input_description = self.core.borrow().description.clone();
+        let core = self.core.borrow();
+        let input_description = String::from_utf8_lossy(&core.description);
         format!(
             "{}, object {} {} at offset $PO",
             input_description, object_ref.number, object_ref.generation
@@ -1220,7 +1237,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> String {
-        let input_description = self.core.borrow().description.clone();
+        let core = self.core.borrow();
+        let input_description = String::from_utf8_lossy(&core.description);
         format!(
             "{}, stream object {} {}",
             input_description, object_ref.number, object_ref.generation
@@ -1748,7 +1766,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let (logger, suppress_warnings, description) = {
             let mut core = self.core.borrow_mut();
             let mut object = object.to_owned();
-            if input_name != core.description {
+            if input_name.as_bytes() != core.description.as_slice() {
                 object.push_str(" from ");
                 object.push_str(input_name);
             }
@@ -1781,7 +1799,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         let mut object = object.to_owned();
-        if input_name != description {
+        if input_name.as_bytes() != description.as_slice() {
             object.push_str(" from ");
             object.push_str(input_name);
         }
@@ -1790,24 +1808,39 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             String::new()
         };
-        let what = if object.is_empty() {
+        let mut what = Vec::new();
+        if object.is_empty() {
             if offset > 0 {
                 if description.is_empty() {
-                    format!("offset {offset}: {message}")
+                    what.extend_from_slice(b"offset ");
+                    what.extend_from_slice(offset.to_string().as_bytes());
+                    what.extend_from_slice(b": ");
                 } else {
-                    format!("{description} (offset {offset}): {message}")
+                    what.extend_from_slice(&description);
+                    what.extend_from_slice(b" (offset ");
+                    what.extend_from_slice(offset.to_string().as_bytes());
+                    what.extend_from_slice(b"): ");
                 }
-            } else if description.is_empty() {
-                message
-            } else {
-                format!("{description}: {message}")
+            } else if !description.is_empty() {
+                what.extend_from_slice(&description);
+                what.extend_from_slice(b": ");
             }
         } else if description.is_empty() {
-            format!("{object}{offset_text}: {message}")
+            what.extend_from_slice(object.as_bytes());
+            what.extend_from_slice(offset_text.as_bytes());
+            what.extend_from_slice(b": ");
         } else {
-            format!("{description} ({object}{offset_text}): {message}")
-        };
-        logger.warn(format!("WARNING: {what}\n"))
+            what.extend_from_slice(&description);
+            what.extend_from_slice(b" (");
+            what.extend_from_slice(object.as_bytes());
+            what.extend_from_slice(offset_text.as_bytes());
+            what.extend_from_slice(b"): ");
+        }
+        what.extend_from_slice(message.as_bytes());
+        let mut line = b"WARNING: ".to_vec();
+        line.extend_from_slice(&what);
+        line.push(b'\n');
+        logger.warn(line)
     }
 
     /// Emit a warning raised while parsing a canonical ObjStm member.
@@ -1844,11 +1877,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 core.description.clone(),
             )
         };
-        let object_stream_description = if description.is_empty() {
-            format!("object stream {stream_number}")
+        let mut object_stream_description = description;
+        if !object_stream_description.is_empty() {
+            object_stream_description.extend_from_slice(b" object stream ");
         } else {
-            format!("{description} object stream {stream_number}")
-        };
+            object_stream_description.extend_from_slice(b"object stream ");
+        }
+        object_stream_description.extend_from_slice(stream_number.to_string().as_bytes());
         route_warning(
             &logger,
             suppress_warnings,
@@ -1870,7 +1905,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn push_warning_with_offset(
         &self,
         offset: Option<u64>,
-        description_override: Option<&str>,
+        description_override: Option<&[u8]>,
         message: impl Into<String>,
     ) -> Result<()> {
         let message = message.into();
@@ -1889,7 +1924,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 core.description.clone(),
             )
         };
-        let description = description_override.unwrap_or(&own_description);
+        let description = description_override.unwrap_or(own_description.as_slice());
         route_warning(&logger, suppress_warnings, description, offset, &message)
     }
 
@@ -1924,7 +1959,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .push(Diagnostic::object_warning(message.clone()));
             (core.logger.clone(), core.suppress_warnings)
         };
-        route_warning(&logger, suppress_warnings, "", None, &message)
+        route_warning(&logger, suppress_warnings, &[], None, &message)
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
@@ -1940,7 +1975,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let description = diagnostic
                 .description
                 .as_deref()
-                .unwrap_or(own_description.as_str());
+                .unwrap_or(own_description.as_slice());
             route_warning(
                 &logger,
                 suppress_warnings,
@@ -2043,7 +2078,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if core.input.borrow().is_closed() {
             CLOSED_INPUT_SOURCE_NAME.to_owned()
         } else {
-            core.description.clone()
+            String::from_utf8_lossy(&core.description).into_owned()
         }
     }
 
@@ -2103,7 +2138,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         stream_number: u32,
         object_ref: ObjectRef,
     ) -> String {
-        let input_description = self.core.borrow().description.clone();
+        let core = self.core.borrow();
+        let input_description = String::from_utf8_lossy(&core.description);
         format!(
             "{input_description} object stream {stream_number}, object {} {} at offset $PO",
             object_ref.number, object_ref.generation
@@ -2363,7 +2399,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     "object {}/{}: error reading object: {message}",
                     object_ref.number, object_ref.generation
                 );
-                self.push_warning_with_offset(None, Some(CLOSED_INPUT_SOURCE_NAME), message)
+                self.push_warning_with_offset(
+                    None,
+                    Some(CLOSED_INPUT_SOURCE_NAME.as_bytes()),
+                    message,
+                )
             }
             error => self.push_warning(error.to_string()),
         }
@@ -3626,7 +3666,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     encryption_parameters: &Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
     recovered_stream_eol_length: usize,
     warning_sink: &dyn DocumentResolver,
-    description_override: Option<&str>,
+    description_override: Option<&[u8]>,
     object_ref: ObjectRef,
     offset: i64,
     length: usize,
@@ -3771,7 +3811,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
 fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
     warning_sink: &dyn DocumentResolver,
-    description_override: Option<&str>,
+    description_override: Option<&[u8]>,
     object_ref: ObjectRef,
     offset: i64,
     length: usize,
@@ -4190,7 +4230,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     }
 
     fn input_description(&self) -> String {
-        self.core.borrow().description.clone()
+        String::from_utf8_lossy(&self.core.borrow().description).into_owned()
     }
 
     fn new_stream(&self) -> Result<ObjectHandle> {
@@ -4238,7 +4278,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     fn warn_stream_data(
         &self,
         offset: u64,
-        description_override: Option<&str>,
+        description_override: Option<&[u8]>,
         message: String,
     ) -> Result<()> {
         self.push_warning_with_offset(Some(offset), description_override, message)
@@ -4725,7 +4765,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         )
     }
@@ -4825,7 +4865,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, "source.pdf".to_owned()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, b"source.pdf".to_vec()),
             0,
         );
         let source_stream = source.direct_object_handle(ObjectValue::Stream {
@@ -4852,7 +4892,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, "destination.pdf".to_owned()),
+            ResolverWarningOptions::new(logger, false, b"destination.pdf".to_vec()),
             0,
         );
         let destination_erased: Rc<dyn DocumentResolver> = destination.clone();
@@ -4886,7 +4926,7 @@ mod tests {
         assert_eq!(diagnostics.entries().len(), 1);
         assert_eq!(
             diagnostics.entries()[0].description.as_deref(),
-            Some("source.pdf")
+            Some(b"source.pdf".as_slice())
         );
     }
 
@@ -4900,7 +4940,7 @@ mod tests {
                 false,
                 false,
                 Diagnostics::default(),
-                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
                 0,
             );
             resolver
@@ -5006,7 +5046,7 @@ mod tests {
                 "(object 5 0, offset 232): expected endobj",
             ),
         ] {
-            super::route_warning(&logger, false, description, offset, message).unwrap();
+            super::route_warning(&logger, false, description.as_bytes(), offset, message).unwrap();
         }
 
         assert_eq!(
@@ -5031,7 +5071,7 @@ mod tests {
         super::route_warning(
             &logger,
             false,
-            "input.pdf",
+            b"input.pdf",
             Some(123),
             "(object 5 0, offset 123): expected endobj",
         )
@@ -5054,7 +5094,7 @@ mod tests {
         super::route_warning(
             &logger,
             false,
-            "input.pdf",
+            b"input.pdf",
             Some(416),
             "(trailer, offset 416): invalid /ID in trailer dictionary",
         )
@@ -5080,7 +5120,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
 
@@ -5112,7 +5152,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
         {
@@ -5154,7 +5194,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
 
@@ -5205,7 +5245,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, "document.pdf".to_owned()),
+            ResolverWarningOptions::new(logger, false, b"document.pdf".to_vec()),
             0,
         );
 
@@ -5262,7 +5302,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, "input.pdf".to_owned()),
+            ResolverWarningOptions::new(logger, false, b"input.pdf".to_vec()),
             0,
         );
         (resolver, output)
@@ -5587,7 +5627,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         )
     }
@@ -5628,7 +5668,11 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, description.to_owned()),
+            ResolverWarningOptions::new(
+                crate::QPDFLogger::create(),
+                true,
+                description.as_bytes().to_vec(),
+            ),
             0,
         )
     }
@@ -5648,7 +5692,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, "stream.pdf".to_owned()),
+            ResolverWarningOptions::new(logger, false, b"stream.pdf".to_vec()),
             0,
         )
     }
@@ -5769,7 +5813,7 @@ mod tests {
         fn warn_stream_data(
             &self,
             _offset: u64,
-            _description_override: Option<&str>,
+            _description_override: Option<&[u8]>,
             _message: String,
         ) -> crate::Result<()> {
             Err(Error::Internal("stream warning sink failed".to_owned()))
@@ -7007,7 +7051,7 @@ mod tests {
                 false,
                 false, // already_reconstructed
                 Diagnostics::default(),
-                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
                 0,
             );
             let dict = crate::ObjectHandle::dictionary(vec![]);
@@ -7101,7 +7145,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         let dict = crate::ObjectHandle::dictionary(vec![]);
@@ -7644,7 +7688,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         let mut state = aes128_encryption_state();
@@ -7675,7 +7719,7 @@ mod tests {
             false,
             false, // already_reconstructed
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         *resolver.encryption_parameters().borrow_mut() = Some(aes128_encryption_state());
@@ -8207,7 +8251,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, "input.pdf".to_owned()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, b"input.pdf".to_vec()),
             0,
         );
 
@@ -8293,7 +8337,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -8344,7 +8388,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
 
@@ -8394,7 +8438,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -8455,7 +8499,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -8518,7 +8562,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
         resolver
@@ -8580,7 +8624,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
         let stream = resolver.get_object_handle(stream_ref);
@@ -8632,7 +8676,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -8699,7 +8743,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -8747,7 +8791,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
 
@@ -8792,7 +8836,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -9017,7 +9061,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -9083,7 +9127,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         resolver
@@ -9142,7 +9186,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
         resolver
@@ -9261,7 +9305,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
 
@@ -9300,7 +9344,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
 
@@ -9369,7 +9413,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(logger, false, String::new()),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
             0,
         );
         resolver
@@ -9416,7 +9460,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
 
@@ -9471,7 +9515,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         *resolver.encryption_parameters().borrow_mut() = Some(encryption);
@@ -10298,7 +10342,7 @@ mod tests {
             false,
             false,
             Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         );
         assert!(matches!(

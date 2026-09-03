@@ -57,7 +57,7 @@ fn open_test_80_secondary(
         PdfOpenOptions {
             repair: true,
             suppress_warnings: true,
-            description: String::from_utf8_lossy(&path_bytes).into_owned(),
+            description: path_bytes.clone(),
             ..PdfOpenOptions::default()
         },
     )?;

@@ -43,7 +43,7 @@ where
     S: Read + Seek + 'static,
 {
     let input_name = input_name.into();
-    options.description = input_name.clone();
+    options.description = input_name.clone().into_bytes();
     let mut pdf = Pdf::<Box<dyn crate::ReadSeek>>::open_with_options(
         Box::new(Cursor::new(JSON_PDF.to_vec())),
         options,
@@ -99,7 +99,7 @@ impl Pdf<Cursor<Vec<u8>>> {
         S: Read + Seek + 'static,
     {
         let input_name = input_name.into();
-        options.description = input_name.clone();
+        options.description = input_name.clone().into_bytes();
         let mut pdf = Self::open_mem_owned_with_options(JSON_PDF.to_vec(), options)?; // cov:ignore: the qpdf rootless seed is a fixed, valid in-memory PDF
         if let Err(error) = pdf.import_json(source, input_name, true) {
             let diagnostics = pdf.repair_diagnostics();

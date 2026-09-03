@@ -521,7 +521,7 @@ mod tests {
             bytes,
             PdfOpenOptions {
                 repair: true,
-                description: "fixture.pdf".to_owned(),
+                description: b"fixture.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         )

@@ -138,7 +138,7 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         // same description on the canonical resolver so a later live logger
         // route (for example test 12/13's setOutputStreams) includes the
         // filename in QPDFExc-compatible warning text.
-        description: String::from_utf8_lossy(&filename_diagnostic).into_owned(),
+        description: filename_diagnostic.clone(),
         ..PdfOpenOptions::default()
     };
     if let (true, Some(password)) = (n == 35 || n == 36, arg2) {
@@ -1319,11 +1319,7 @@ pub(crate) fn write_warning(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    let warning_filename = diagnostic
-        .description
-        .as_deref()
-        .map(str::as_bytes)
-        .unwrap_or(filename);
+    let warning_filename = diagnostic.description.as_deref().unwrap_or(filename);
     let message = diagnostic.message.as_str();
     if let Some(exception) = format_nntree_exception(warning_filename, message) {
         let mut line = b"WARNING: ".to_vec();
@@ -1589,7 +1585,7 @@ requested value of integer is too big; returning INT_MAX\n"
         let diagnostic = Diagnostic::warning_with_description(
             "error decoding stream data for object 26 0: bad code received",
             Some(3627),
-            "source.pdf",
+            b"source.pdf",
         );
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1607,7 +1603,7 @@ requested value of integer is too big; returning INT_MAX\n"
     #[test]
     fn warning_output_preserves_an_explicitly_empty_source_description() {
         let diagnostic =
-            Diagnostic::warning_with_description("warning without a filename", Some(17), "");
+            Diagnostic::warning_with_description("warning without a filename", Some(17), b"");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 

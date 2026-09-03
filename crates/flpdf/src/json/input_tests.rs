@@ -1254,7 +1254,7 @@ fn json_warning_route_preserves_qpdf_context_and_suppression() {
     logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(usize::MAX))));
     let options = PdfOpenOptions {
         logger: Some(logger),
-        description: "document.pdf".to_owned(),
+        description: b"document.pdf".to_vec(),
         ..PdfOpenOptions::default()
     };
     let pdf_bytes = include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec();

@@ -443,7 +443,7 @@ pub(crate) trait DocumentResolver {
     fn warn_stream_data(
         &self,
         _offset: u64,
-        description_override: Option<&str>,
+        description_override: Option<&[u8]>,
         message: String,
     ) -> Result<()> {
         let _ = (description_override, message);
@@ -13817,7 +13817,7 @@ mod mutation_tests {
         fn warn_stream_data(
             &self,
             offset: u64,
-            _description_override: Option<&str>,
+            _description_override: Option<&[u8]>,
             message: String,
         ) -> crate::Result<()> {
             self.warnings

@@ -47,12 +47,12 @@ fn open_secondary_pdf(
         );
         flpdf::Error::System(String::from_utf8_lossy(&message).into_owned())
     })?;
-    let path_bytes = os_str_diagnostic_bytes(path);
+    let path_bytes = os_str_diagnostic_bytes(path).into_owned();
     let options = PdfOpenOptions {
         repair: true,
         password: password.to_vec(),
         suppress_warnings: true,
-        description: String::from_utf8_lossy(&path_bytes).into_owned(),
+        description: path_bytes.clone(),
         ..PdfOpenOptions::default()
     };
     let secondary = Pdf::open_with_options(file, options)?;
@@ -616,9 +616,12 @@ pub(crate) fn run_test_33<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::{open_secondary_pdf, run_test_29, run_test_30, run_test_31};
-    use flpdf::{EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
+    use flpdf::{DecodeLevel, EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     struct CurrentDirGuard(PathBuf);
 
@@ -674,6 +677,30 @@ mod tests {
         bytes
     }
 
+    fn pdf_with_malformed_stream() -> Vec<u8> {
+        let objects: [&[u8]; 3] = [
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            b"2 0 obj\n<< /Marker true >>\nendobj\n",
+            b"3 0 obj\n<< /Length 8 /Filter /FlateDecode >>\nstream\nnot-zlib\nendstream\nendobj\n",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
     fn pdf_with_foreign_page_graph() -> Vec<u8> {
         let objects: [&[u8]; 5] = [
             b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -700,6 +727,78 @@ mod tests {
             .as_bytes(),
         );
         bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secondary_foreign_stream_warning_preserves_non_utf8_path_bytes() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let secondary_path = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"secondary-\xff.pdf".to_vec()));
+        std::fs::write(&secondary_path, pdf_with_malformed_stream()).expect("write secondary PDF");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut secondary_pdf =
+            open_secondary_pdf(secondary_path.as_os_str(), b"", &mut stdout, &mut stderr)
+                .expect("secondary PDF should open");
+
+        let source_stream = secondary_pdf.get_object_handle(flpdf::ObjectRef::new(3, 0));
+        secondary_pdf
+            .resolve(&source_stream)
+            .expect("secondary stream should resolve");
+        let mut destination = Pdf::empty().expect("create destination PDF");
+        destination.set_suppress_warnings(true);
+        let copied_stream = destination
+            .copy_foreign_object(&source_stream)
+            .expect("copy secondary stream");
+        let _ = copied_stream.get_stream_data(DecodeLevel::Generalized);
+
+        let mut diagnostics_written = 0;
+        super::super::emit_new_diagnostics(
+            &destination,
+            &mut diagnostics_written,
+            b"destination.pdf",
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("emit foreign stream warning");
+
+        let path_bytes = super::super::os_str_diagnostic_bytes(secondary_path.as_os_str());
+        assert!(
+            stderr
+                .windows(path_bytes.len())
+                .any(|window| window == path_bytes.as_ref()),
+            "warning output must retain the raw secondary path bytes: {stderr:?}"
+        );
+        let replacement = "\u{fffd}".as_bytes();
+        assert!(
+            !stderr
+                .windows(replacement.len())
+                .any(|window| window == replacement),
+            "warning output must not contain a replacement character: {stderr:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_warning_description_accepts_and_emits_non_utf8_bytes() {
+        let diagnostic = flpdf::Diagnostic::warning_with_description(
+            "secondary warning",
+            Some(17),
+            b"secondary-\xff.pdf",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        super::super::write_warning(b"destination.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert_eq!(
+            stderr,
+            b"WARNING: secondary-\xff.pdf (offset 17): secondary warning\n"
+        );
     }
 
     #[test]

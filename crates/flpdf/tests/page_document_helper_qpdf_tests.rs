@@ -46,7 +46,7 @@ fn removing_an_already_removed_page_preserves_qpdf_exception_context() {
     let mut pdf = Pdf::open_with_options(
         Cursor::new(one_page_nested_tree_with_unknown_key()),
         PdfOpenOptions {
-            description: "page_api_1.pdf".to_owned(),
+            description: b"page_api_1.pdf".to_vec(),
             suppress_warnings: true,
             ..PdfOpenOptions::default()
         },

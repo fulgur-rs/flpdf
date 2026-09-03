@@ -32,6 +32,16 @@ fn password_bytes(password_arg: &std::ffi::OsStr) -> Vec<u8> {
     password_arg.to_string_lossy().into_owned().into_bytes()
 }
 
+#[cfg(unix)]
+fn path_description(path: &std::path::Path) -> Vec<u8> {
+    std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_description(path: &std::path::Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().collect();
     match run(&args) {
@@ -78,7 +88,7 @@ fn read_options(input: &std::path::Path, password: Vec<u8>) -> PdfOpenOptions {
         // The qpdf C API authenticates with one password candidate. The
         // alternate encoding retry loop belongs to QPDFJob, not qpdf-c.
         suppress_password_recovery: true,
-        description: input.to_string_lossy().into_owned(),
+        description: path_description(input),
         ..PdfOpenOptions::default()
     }
 }
@@ -146,7 +156,7 @@ fn run_test2(
             password,
             suppress_password_recovery: true,
             suppress_warnings: true,
-            description: input.to_string_lossy().into_owned(),
+            description: path_description(&input),
             ..PdfOpenOptions::default()
         },
     );
@@ -340,7 +350,7 @@ fn run_test1(input_arg: &std::ffi::OsStr, password_arg: &std::ffi::OsStr) -> Res
             // (`libqpdf/QPDFJob.cc:1744`, gated on `m->suppress_password_recovery`)
             // and is never reached through the raw C API this test targets.
             suppress_password_recovery: true,
-            description: input.to_string_lossy().into_owned(),
+            description: path_description(&input),
             ..PdfOpenOptions::default()
         },
     )?;
@@ -445,7 +455,7 @@ fn run_test19(
             // See run_test1's identical setting: qpdf's C API authenticates
             // with a single attempt, with no QPDFJob-only recovery retry.
             suppress_password_recovery: true,
-            description: input.to_string_lossy().into_owned(),
+            description: path_description(&input),
             ..PdfOpenOptions::default()
         },
     )?;
@@ -476,7 +486,7 @@ fn run_test20(
             // The raw qpdf C API performs a single authentication attempt;
             // password recovery is a QPDFJob-only policy.
             suppress_password_recovery: true,
-            description: input.to_string_lossy().into_owned(),
+            description: path_description(&input),
             ..PdfOpenOptions::default()
         },
     )?;

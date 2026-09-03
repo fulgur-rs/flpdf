@@ -820,6 +820,17 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | clap で代替 | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。 |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
+入力ソース名は qpdf の `FileInputSource::filename` / `InputSource::getName`
+（`libqpdf/FileInputSource.cc:14-18,87-90`; `include/qpdf/InputSource.hh:69-74`）から
+`QPDFParser` の `QPDFExc` へ raw `std::string` のまま渡され、`QPDF::warn` はその
+例外を warning collection に追加して同じ `what()` を logger へ同期配送する
+（`libqpdf/QPDFParser.cc:487-518`; `libqpdf/QPDF.cc:487-504`;
+`libqpdf/QPDFExc.cc:19-50`）。flpdf でも `PdfOpenOptions::description`、resolver の
+source description、`Diagnostic::description` を `Vec<u8>` とし、logger と
+qtest-driver の output boundary が non-UTF-8 Unix path を再変換なしで出力する。
+qpdf 11.9.0 の `qpdf --check` に byte `0xff` を含む path を渡した実測でも、各
+warning line はその byte を保持する。
+
 `--encrypt` の引数表も qpdf と同じ遷移を保つ。qpdf は3番目の positional
 引数または `--bits` を消費した時点で `40-bit encryption`、`128-bit encryption`、
 `256-bit encryption` の option tableへ切り替え、未知・非対応引数の診断にその名前を

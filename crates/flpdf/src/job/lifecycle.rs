@@ -2312,7 +2312,7 @@ impl QPDFJob {
         let input_name = input_name.into();
         self.input_name = input_name.clone();
         options.logger = Some(self.logger.clone());
-        options.description = input_name;
+        options.description = input_name.into_bytes();
         // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
         // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
         // opens (`QPDFJob.cc:663-665`), not just the final completion
@@ -2347,7 +2347,7 @@ impl QPDFJob {
         let mut options = self.configured_open_options(Vec::new());
         options.logger = Some(self.logger.clone());
         options.suppress_warnings = self.suppress_warnings;
-        options.description = "empty PDF".to_owned();
+        options.description = b"empty PDF".to_vec();
         let mut pdf = crate::engine::open_empty_with_options_erased(options)?;
         self.input_name.clear();
         pdf.root_handle()?;
@@ -3052,7 +3052,7 @@ impl QPDFJob {
     fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
         let mut options = self.configured_open_options(password.to_vec());
         options.logger = Some(self.logger.clone());
-        options.description = path.display().to_string();
+        options.description = path.display().to_string().into_bytes();
         // `open_file_with_options` installs the qpdf-shaped reopenable source;
         // keep the job's warning policy on this secondary document exactly as
         // `open_document` does for the primary.
@@ -3447,7 +3447,7 @@ impl QPDFJob {
         let input_name = input_name.into();
         self.input_name = input_name.clone();
         options.logger = Some(self.logger.clone());
-        options.description = input_name;
+        options.description = input_name.into_bytes();
         let mut pdf = Pdf::open_with_options(source, options)?;
         // qpdf's createQPDF calls getVersionAsPDFVersion immediately after
         // processFile; that path enters getExtensionLevel and therefore
@@ -3474,7 +3474,7 @@ impl QPDFJob {
         let input_name = input_name.into();
         self.input_name = input_name.clone();
         options.logger = Some(self.logger.clone());
-        options.description = input_name;
+        options.description = input_name.into_bytes();
         let mut pdf = Pdf::open_for_encryption_inspection(source, options)?;
         // `--password-is-hex-key` (raw key) authentication intentionally
         // leaves both user/owner password-match flags false on success --
