@@ -2023,7 +2023,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })?;
 
         if !stream_dict.try_is_dictionary_of_type(b"ObjStm", b"")? {
-            self.push_warning(format!(
+            // qpdf uses damagedPDF(message) here, so the warning carries the
+            // current object description and input-source last offset
+            // (`QPDF.cc:1760-1779,2630-2644`) rather than a bare message.
+            self.push_damaged_warning(format!(
                 "supposed object stream {stream_number} has wrong type"
             ))
             .map_err(ObjectStreamResolutionError::WarningDelivery)?;
