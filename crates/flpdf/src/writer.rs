@@ -3751,8 +3751,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // with every input object; QDF changes formatting and ObjStm policy, not
     // the reachability setting (`QPDFWriter.cc:2907-2914`). Keep the setting
     // alive on this specialized coordinator, which is the route QDF uses.
+    // The canonical graph walk needs the same filter-parameter visibility that
+    // qpdf decides while writing, but qpdf's enqueue walk itself never invokes
+    // a StreamDataProvider (`QPDFWriter.cc:1072-1141`). Cache every indirect
+    // stream outcome here so the later emission reuses the provider result
+    // rather than running the source a second time.
     let stream_parameters_removed = |handle: &ObjectHandle| {
-        if let Some(source) = handle.object_ref().filter(|_| handle.is_data_modified()) {
+        if let Some(source) = handle.object_ref() {
             if let Some(parameters_removed) = cached_stream_outputs
                 .borrow()
                 .get(&source)
@@ -4612,10 +4617,15 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // This is the qpdf stream writer's live-handle path: filtering and
             // payload framing are decided from the stream handle, while the
             // dictionary serializer remaps only child reference tokens.
+            // Each stream is emitted exactly once (streams cannot be ObjStm
+            // members), so remove the cache entry on consumption instead of
+            // cloning it: this frees the cached body immediately rather than
+            // retaining every cached stream's bytes alongside the growing
+            // output buffer through the rest of emission.
             let cached = cached_stream_outputs
-                .borrow()
-                .get(old_ref)
-                .map(|cached| (cached.dict.clone(), cached.data.clone(), cached.refiltered));
+                .borrow_mut()
+                .remove(old_ref)
+                .map(|cached| (cached.dict, cached.data, cached.refiltered));
             let (stream_dict, stream_data, refiltered) = if let Some(cached) = cached {
                 cached
             } else {
@@ -6421,6 +6431,50 @@ mod final_handle_writer_tests {
             eof_calls.get(),
             1,
             "the modified stream must be prepared once across both planning walks"
+        );
+    }
+
+    #[test]
+    fn qdf_writer_does_not_invoke_a_retry_provider_during_graph_planning() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+        ))
+        .expect("minimal fixture");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let calls_for_provider = Rc::clone(&calls);
+        let stream = pdf.new_stream().expect("provider stream");
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    calls_for_provider
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    if will_retry {
+                        return Ok(false);
+                    }
+                    pipeline.write(b"salad").map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(true)
+                },
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            )
+            .expect("register retry provider");
+        pdf.trailer()
+            .replace_key(b"/Streams", ObjectHandle::array(vec![stream]))
+            .expect("attach provider stream to live trailer");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_qdf_mode(true);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("QDF writer succeeds");
+
+        assert!(!writer.get_buffer().expect("written buffer").is_empty());
+        assert_eq!(
+            *calls.borrow(),
+            vec![(false, true), (false, false)],
+            "provider calls must be limited to qpdf's writer retry loop"
         );
     }
 }
