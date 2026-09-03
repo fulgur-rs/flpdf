@@ -4,6 +4,13 @@
 //! JPEGs after decoding, matching qpdf's whole-buffer libjpeg source manager:
 //! a missing trailing EOI is reported as `invalid jpeg data reading from
 //! buffer` (`libqpdf/Pl_DCT.cc:199-206,312-325`).
+//!
+//! Known diagnostic limitation (`flpdf-69n1`): the default
+//! `libjpeg-turbo-rs` 0.8.0 parser does not expose the reserved marker byte
+//! that system libjpeg formats as `Unsupported marker type 0xNN`. Do not
+//! fabricate that byte in this adapter. Callers that require qpdf's exact
+//! marker diagnostic must enable the explicit `qpdf-libjpeg-compat` feature,
+//! which routes DCT decoding through the system-libjpeg compatibility crate.
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
@@ -110,7 +117,10 @@ impl<'a> PlDct<'a> {
         if matches!(error, libjpeg_turbo_rs::JpegError::UnexpectedEof) {
             return Self::runtime_error("invalid jpeg data reading from buffer");
         }
+        // qpdf-deviation-start: libjpeg-turbo-rs 0.8.0 cannot surface the reserved marker byte
+        // that system libjpeg reports in its Unsupported marker type 0xNN diagnostic
         let message = error.to_string();
+        // qpdf-deviation-end
         PipelineError::runtime(message.as_bytes())
     }
 

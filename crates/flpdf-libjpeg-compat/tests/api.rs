@@ -30,3 +30,15 @@ fn empty_input_reports_qpdf_whole_buffer_exhaustion() {
             if message == "invalid jpeg data reading from buffer"
     ));
 }
+
+#[test]
+fn reserved_marker_reports_the_marker_byte_from_libjpeg() {
+    let malformed = [0xff, 0xd8, 0xff, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00];
+    let result = decode_scanlines(&malformed, &mut |_row| Ok::<(), ()>(()));
+
+    assert!(matches!(
+        result,
+        Err(DecodeError::Codec(message))
+            if message == "Unsupported marker type 0x02"
+    ));
+}
