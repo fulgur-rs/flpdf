@@ -440,4 +440,20 @@ mod tests {
             "unexpected compatibility diagnostic: {error}"
         );
     }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn libjpeg_compat_backend_preserves_reserved_marker_byte() {
+        let mut sink = Sink;
+        let mut stage = PlDct::new("DCT decode", &mut sink);
+        stage
+            .write(&[0xff, 0xd8, 0xff, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00])
+            .expect("DCT stage buffers input");
+
+        let error = stage
+            .finish()
+            .expect_err("reserved JPEG marker must fail in the compatibility backend");
+
+        assert_eq!(error.to_string(), "Unsupported marker type 0x02");
+    }
 }
