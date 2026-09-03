@@ -2569,7 +2569,9 @@ impl QPDFJob {
             return Ok(JobExitCode::Error);
         }
         let Some(input) = self.configuration.input_file.clone() else {
-            // cov:ignore-start: `check_configuration` rejects status queries without an input before this defensive guard
+            // cov:ignore-start: with `empty_input` handled above,
+            // `check_configuration` rejects an encryption-status query that
+            // has no configured input before this defensive invariant guard
             return Err(UsageError::new("an input file name is required").into());
             // cov:ignore-end
         };
