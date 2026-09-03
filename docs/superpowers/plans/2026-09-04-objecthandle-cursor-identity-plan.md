@@ -83,9 +83,9 @@ copied Rust values follow later cursor transitions.
 
 - [ ] Step 4: Run the focused tests and verify behavioral RED
 
-    cargo test -p flpdf --lib cursor_current_returns_child_identity_without_rebinding_held_value -- --exact
-    cargo test -p flpdf --lib dict_cursor_returns_identity_and_initialized_null_for_removed_key -- --exact
-    cargo test -p flpdf --lib dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary -- --exact
+    cargo test -p flpdf --lib cursor_current_returns_child_identity_without_rebinding_held_value
+    cargo test -p flpdf --lib dict_cursor_returns_identity_and_initialized_null_for_removed_key
+    cargo test -p flpdf --lib dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary
 
 Expected: the array test fails at identity or held-value stability, the dictionary
 test fails at identity or removed-key null state, and the non-dictionary test
@@ -151,10 +151,10 @@ uninitialized.
 
 - [ ] Step 5: Run GREEN tests
 
-    cargo test -p flpdf --lib cursor_current_returns_child_identity_without_rebinding_held_value -- --exact
-    cargo test -p flpdf --lib dict_cursor_returns_identity_and_initialized_null_for_removed_key -- --exact
-    cargo test -p flpdf --lib dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary -- --exact
-    cargo test -p flpdf --lib qpdf_cursors_return_live_children_and_uninitialized_end_values -- --exact
+    cargo test -p flpdf --lib cursor_current_returns_child_identity_without_rebinding_held_value
+    cargo test -p flpdf --lib dict_cursor_returns_identity_and_initialized_null_for_removed_key
+    cargo test -p flpdf --lib dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary
+    cargo test -p flpdf --lib qpdf_cursors_return_live_children_and_uninitialized_end_values
     cargo test -p flpdf --lib object_handle
 
 Expected: all commands exit 0 with zero failures.
