@@ -38,15 +38,19 @@ impl Drop for CompressionLevelTestGuard {
 
 #[cfg(test)]
 pub(crate) fn lock_compression_level_for_tests() -> CompressionLevelTestGuard {
-    let guard = COMPRESSION_LEVEL_TEST_LOCK
-        .lock()
-        .expect("compression-level test lock is not poisoned");
+    // Check reentrancy before acquiring the mutex: `std::sync::Mutex` is not
+    // reentrant, so if the current thread already owns the guard, locking
+    // again here would block forever and the assertion below would never
+    // run.
     COMPRESSION_LEVEL_TEST_LOCK_OWNER.with(|owner| {
         assert!(
             !owner.replace(true),
             "compression-level test lock is not reentrant"
         );
     });
+    let guard = COMPRESSION_LEVEL_TEST_LOCK
+        .lock()
+        .expect("compression-level test lock is not poisoned");
     CompressionLevelTestGuard { _guard: guard }
 }
 
@@ -748,6 +752,22 @@ mod tests {
         let encoded = deflate_chunks(&[b"payload payload payload"], 7).unwrap();
         let decoded = inflate_chunks(encoded.chunks(2), 3).unwrap();
         assert_eq!(decoded, b"payload payload payload");
+    }
+
+    #[test]
+    fn lock_compression_level_for_tests_panics_instead_of_deadlocking_on_reentry() {
+        let _outer = lock_compression_level_for_tests();
+        // A reentrant call on the same thread must hit the ownership
+        // assertion before ever attempting to lock the (non-reentrant)
+        // mutex; if the checks were ordered the other way around, this call
+        // would hang forever instead of unwinding.
+        let reentrant = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            lock_compression_level_for_tests,
+        ));
+        assert!(
+            reentrant.is_err(),
+            "a reentrant lock attempt must panic, not deadlock"
+        );
     }
 
     #[test]
