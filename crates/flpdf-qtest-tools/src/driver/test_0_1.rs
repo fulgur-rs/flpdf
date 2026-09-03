@@ -507,6 +507,49 @@ mod tests {
     }
 
     #[test]
+    fn wrong_object_stream_type_warning_preserves_qpdf_object_context() {
+        let mut bytes =
+            include_bytes!("../../../../tests/fixtures/compat/three-page-objstm.pdf").to_vec();
+        let marker = b"/ObjStm";
+        let marker_start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("object-stream type marker");
+        bytes[marker_start..marker_start + marker.len()].copy_from_slice(b"/Potato");
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: true,
+                description: "fixture.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open wrong-object-stream fixture");
+        let qtest = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.trailer()
+            .replace_key(b"/QTest", qtest)
+            .expect("attach compressed object to /QTest");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 0");
+
+        assert_eq!(
+            stderr,
+            b"WARNING: fixture.pdf (object 1 0, offset 532): supposed object stream 1 has wrong type\n"
+        );
+    }
+
+    #[test]
     fn a_parseable_deeply_nested_sibling_trailer_entry_does_not_erase_qtest() {
         // Regression: `run_test_0_1` must read `/QTest` via
         // `Pdf::trailer_key_handle`, not `Pdf::trailer().get_key(...)`
