@@ -164,7 +164,7 @@ fixture, bridge, or deviation-marker file is changed.
 
 **Files:** Verify the complete worktree; do not add qtest fixtures.
 
-- [ ] **Step 1: Build and run qtest**
+- [x] **Step 1: Build and run qtest**
 
 Run in the worktree:
 
@@ -183,7 +183,7 @@ Inspect the same-run `survey/latest/harness.log` and
 cases 0, parity validation errors 0, and the relevant page/type-check cases
 passing. Record any raw non-allowlisted informational failures separately.
 
-- [ ] **Step 2: Run focused, crate, CLI, and workspace tests**
+- [x] **Step 2: Run focused, crate, CLI, and workspace tests**
 
 Run:
 
