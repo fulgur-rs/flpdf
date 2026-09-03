@@ -15,6 +15,20 @@
 //! handle identity and diagnostics are available during xref parsing, while
 //! its `Rc<[u8]>` source snapshot is initialized only for an actual indirect
 //! object or stream-length resolution.
+//!
+//! qpdf's `xref_offset == 0` check (`libqpdf/QPDF.cc:450-452`) throws
+//! `damagedPDF("can't find startxref")` immediately and never calls
+//! `read_xref` at all, whether the zero came from a missing/malformed
+//! `startxref` or a syntactically valid `startxref` that explicitly names
+//! offset 0. `load_xref_state_with_options` instead still attempts a real
+//! parse at logical (header-relative) offset 0 -- index 0 of the already
+//! header-shifted `bytes` slice, not necessarily physical byte 0 of the
+//! original input when repair skipped leading junk -- as a fallback before
+//! recovery in both cases; qpdf has no counterpart for this retry detour,
+//! see the marker comment there. `push_repair_diagnostics` deliberately
+//! records only the initial recovery trigger, faithfully reproducing qpdf's
+//! own three-warning
+//! `reconstruct_xref` sequence either way (`libqpdf/QPDF.cc:450-469,516-531`).
 use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
@@ -1288,6 +1302,18 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     let bytes = &source_bytes[header_offset..];
     let mut parse_errors = Vec::new();
+    // qpdf-deviation-start: qpdf's xref_offset == 0 check
+    // (`QPDF.cc:450-452`) throws damagedPDF("can't find startxref")
+    // immediately and never calls read_xref at all -- whether xref_offset is
+    // 0 because startxref itself could not be parsed, or because a
+    // syntactically valid `startxref` explicitly names offset 0.
+    // parse_startxref's Ok(0) case (an explicit zero) and the Err fallback
+    // below (a missing/malformed startxref) both leave `startxref == 0`
+    // here, and either way flpdf still runs the parse_xref_from_start call
+    // below as a real retry attempt at logical (header-relative) offset 0 in
+    // `bytes` before recovery; qpdf has no such detour, so a failure from
+    // that attempt (as opposed to the recorded "can't find startxref"
+    // trigger) has no qpdf counterpart.
     let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
@@ -1322,7 +1348,9 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         XrefReadContextSpec::ActiveSection,
         Some(&mut observed_first_xref_item_offset),
         true,
-    ) {
+    )
+    // qpdf-deviation-end
+    {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
             // Report the first recorded failure; this parse error is only the
