@@ -216,8 +216,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// `libqpdf/QPDF.cc:278-281`). The resolver replaces its source pointer
     /// with an invalid source; a foreign stream provider that captured the
     /// previous pointer remains independent, matching qpdf's ownership rule.
+    ///
+    /// A file-backed document's reopen controller is a second, independent
+    /// owner of the underlying OS file handle (`Pdf::input_source_control`,
+    /// cloned from the reader's own `InputSourceControl`), so replacing only
+    /// the resolver's source would leave that handle open until the whole
+    /// `Pdf` is dropped. Also release it here, matching a C++ `shared_ptr`
+    /// reset losing its last owner when `m->file` is replaced.
     pub fn close_input_source(&self) {
         self.resolver.close_input_source();
+        self.set_input_source_stay_open(false);
     }
 
     /// Set qpdf's `ClosedFileInputSource::stayOpen` policy when this document

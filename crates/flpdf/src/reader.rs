@@ -60,6 +60,11 @@ impl InputSourceControl {
             state.reader = None;
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed_for_test(&self) -> bool {
+        self.0.borrow().reader.is_none()
+    }
 }
 
 struct ReopenableFileState {
@@ -2242,8 +2247,38 @@ mod source_window_tests {
 
 #[cfg(test)]
 mod reopenable_source_tests {
-    use super::ReopenableFile;
+    use super::{Pdf, PdfOpenOptions, ReopenableFile};
+    use crate::engine::EMPTY_PDF_BYTES;
     use std::io::Read;
+
+    #[test]
+    fn close_input_source_releases_the_file_backed_reopen_controller() {
+        // Codex review on PR #1470: close_input_source only replaced the
+        // resolver's own StreamInput, leaving Pdf::input_source_control -- a
+        // second, independent owner of the same reopen state -- holding the
+        // OS file open until the whole Pdf was dropped.
+        let temp = tempfile::tempdir().expect("temporary source directory");
+        let path = temp.path().join("source.pdf");
+        std::fs::write(&path, EMPTY_PDF_BYTES).expect("write source");
+
+        let pdf = Pdf::open_file_with_options(&path, PdfOpenOptions::default())
+            .expect("open file-backed document");
+        let control = pdf
+            .input_source_control
+            .clone()
+            .expect("file-backed documents install a reopen controller");
+        assert!(
+            !control.is_closed_for_test(),
+            "the controller starts with an open file handle"
+        );
+
+        pdf.close_input_source();
+
+        assert!(
+            control.is_closed_for_test(),
+            "close_input_source must release the reopen controller's file handle too"
+        );
+    }
 
     #[test]
     fn closed_source_reopens_at_the_last_reader_position() {
