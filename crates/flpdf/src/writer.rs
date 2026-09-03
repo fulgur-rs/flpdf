@@ -42,7 +42,7 @@ where
 
 use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams, PasswordMode};
 use crate::linearization::writer::write_linearized_for_pdf_writer;
-use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
+use crate::pdf_version::{parse_qpdf_writer_version, PdfVersion, QpdfVersionParts, PDF_1_5};
 use crate::pipeline::{flate::Flate, Pipeline, PlString};
 use crate::{filters, Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
 use std::cell::RefCell;
@@ -434,16 +434,18 @@ fn update_minimum_pdf_version(
     version: String,
     extension_level: i64,
 ) {
-    let Some(candidate) = crate::pdf_version::parse_pdf_version(&version) else {
-        // qpdf's parseVersion has no error channel and treats an invalid
-        // setter value as an unusable 0.0 candidate. Ignore it here so a
-        // public setter never stores a value that a later setter must unwrap.
+    let Some(candidate) = crate::pdf_version::parse_qpdf_writer_version(&version) else {
+        // qpdf's parseVersion has no error channel for syntactically odd
+        // values, but its integer conversion can overflow. Keep this
+        // non-fallible public setter safe; job-option parsing rejects that
+        // overflow before a writer is configured.
         return;
     };
     match current {
         None => *current = Some((version, extension_level)),
         Some((current_version, current_extension_level)) => {
-            let Some(current_parsed) = crate::pdf_version::parse_pdf_version(current_version)
+            let Some(current_parsed) = // cov:ignore: LLVM maps this multiline qpdf-version binding to its continuation; the invalid-state branch is exercised by the writer unit test
+                crate::pdf_version::parse_qpdf_writer_version(current_version)
             else {
                 *current_version = version;
                 *current_extension_level = extension_level;
@@ -890,15 +892,16 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
     }
 }
 
-/// qpdf's `disableIncompatibleEncryption` for the writer options
-/// that have reached this bridge. A valid forced version is a hard cap: when
-/// it cannot represent the selected Standard security handler, qpdf silently
-/// drops encryption and writes the rewritten objects in cleartext.
+/// qpdf's `disableIncompatibleEncryption` for the writer options that have
+/// reached this bridge. A forced version is a hard cap: when it cannot
+/// represent the selected Standard security handler, qpdf silently drops
+/// encryption and writes the rewritten objects in cleartext.
 fn forced_version_disables_encryption(options: &WriterOptions) -> bool {
     let Some(forced) = options
         .force_version
         .as_deref()
-        .and_then(crate::pdf_version::parse_pdf_version)
+        .filter(|version| !version.is_empty())
+        .and_then(crate::pdf_version::parse_qpdf_writer_version)
     else {
         return false;
     };
@@ -907,23 +910,23 @@ fn forced_version_disables_encryption(options: &WriterOptions) -> bool {
         return false;
     };
 
-    let v = crate::pdf_version::PdfVersion::new(1, 3, 0);
+    let v = QpdfVersionParts::new(1, 3);
     if forced < v {
         return true;
     }
-    let v = crate::pdf_version::PdfVersion::new(1, 4, 0);
+    let v = QpdfVersionParts::new(1, 4);
     if forced < v && (version > 1 || revision > 2) {
         return true;
     }
-    let v = crate::pdf_version::PdfVersion::new(1, 5, 0);
+    let v = QpdfVersionParts::new(1, 5);
     if forced < v && (version > 2 || revision > 3) {
         return true;
     }
-    let v = crate::pdf_version::PdfVersion::new(1, 6, 0);
+    let v = QpdfVersionParts::new(1, 6);
     if forced < v && use_aes {
         return true;
     }
-    let v = crate::pdf_version::PdfVersion::new(1, 7, 0);
+    let v = QpdfVersionParts::new(1, 7);
     (forced < v || (forced == v && options.force_extension_level.unwrap_or(0) < 3))
         && (version >= 5 || revision >= 5)
 }
@@ -1642,14 +1645,16 @@ pub(crate) fn report_progress_finished(options: &WriterOptions) -> Result<()> {
 /// forced header is below 1.5 it suppresses those features entirely and falls
 /// back to a classic xref table (observed on qpdf 11.9.0). `--min-version` is
 /// only a floor — it never triggers this, because the 1.5 object-stream floor
-/// raises above it — so this checks `force_version` specifically. An invalid
-/// (unparseable) `force_version` is ignored, matching [`effective_pdf_version`].
+/// raises above it — so this checks `force_version` specifically. Values whose
+/// qpdf integer conversion overflows are rejected before this predicate is
+/// reached by the CLI parser.
 pub(crate) fn force_version_below_1_5(options: &WriterOptions) -> bool {
     options
         .force_version
         .as_deref()
-        .and_then(parse_pdf_version)
-        .is_some_and(|version| version < PDF_1_5)
+        .filter(|version| !version.is_empty())
+        .and_then(parse_qpdf_writer_version)
+        .is_some_and(|version| version < QpdfVersionParts::new(1, 5))
 }
 
 /// Compute the effective PDF version to write given the source version, the
@@ -1693,23 +1698,31 @@ pub(crate) fn effective_pdf_version<'a>(
     linearize: bool,
     object_streams: bool,
 ) -> &'a str {
-    // --force-version wins outright, but only when the value is a valid version string.
-    // Silently ignore invalid values (same treatment as invalid min_version) so that
-    // callers that cannot pre-validate do not produce a corrupted PDF header.
-    if let Some(ref forced) = options.force_version {
-        if parse_pdf_version(forced).is_some() {
-            return forced.as_str();
+    // --force-version wins outright whenever qpdf's numeric comparison parser
+    // can evaluate it. Syntactically odd but non-overflowing values are still
+    // raw header strings and must not be rejected.
+    if let Some(forced) = options
+        .force_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    {
+        if parse_qpdf_writer_version(forced).is_some() {
+            return forced;
         }
     }
 
-    // Parse source; bail to source string on failure.
-    let Some(mut best) = parse_pdf_version(source) else {
+    // Parse source; bail to source string on an overflowing comparison value.
+    let Some(mut best) = parse_qpdf_writer_version(source) else {
         return source;
     };
 
     // Apply --min-version floor.
-    if let Some(ref min_v) = options.min_version {
-        if let Some(min_parsed) = parse_pdf_version(min_v) {
+    if let Some(min_v) = options
+        .min_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    {
+        if let Some(min_parsed) = parse_qpdf_writer_version(min_v) {
             if min_parsed > best {
                 best = min_parsed;
             }
@@ -1722,40 +1735,52 @@ pub(crate) fn effective_pdf_version<'a>(
     // minimum header version.
     let enc_floor = encryption_version_floor(options);
     if let Some(encryption_floor) = enc_floor {
+        let encryption_floor = QpdfVersionParts::new(
+            i32::from(encryption_floor.major()),
+            i32::from(encryption_floor.minor()),
+        );
         if encryption_floor > best {
             best = encryption_floor;
         }
     }
 
     // Apply object-stream floor (object streams require >= 1.5).
-    if object_streams && PDF_1_5 > best {
-        best = PDF_1_5;
+    if object_streams && QpdfVersionParts::new(1, 5) > best {
+        best = QpdfVersionParts::new(1, 5);
     }
 
     // Apply linearize floor (PDF spec requires >= 1.2).
-    if linearize && PDF_1_2 > best {
-        best = PDF_1_2;
+    if linearize && QpdfVersionParts::new(1, 2) > best {
+        best = QpdfVersionParts::new(1, 2);
     }
 
     // If best == source parsed, return the original source slice to avoid an
     // allocation.  Otherwise find which option string owns this version.
-    if parse_pdf_version(source) == Some(best) {
+    if parse_qpdf_writer_version(source) == Some(best) {
         return source;
     }
-    if let Some(ref min_v) = options.min_version {
-        if parse_pdf_version(min_v) == Some(best) {
-            return min_v.as_str();
+    if let Some(min_v) = options
+        .min_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    {
+        if parse_qpdf_writer_version(min_v) == Some(best) {
+            return min_v;
         }
     }
     // Encryption floor matched — return a static string for the emitted version.
     if let Some(encryption_floor) = enc_floor {
-        if encryption_floor == best {
-            return best.static_version_str().unwrap_or("1.7");
+        if QpdfVersionParts::new(
+            i32::from(encryption_floor.major()),
+            i32::from(encryption_floor.minor()),
+        ) == best
+        {
+            return encryption_floor.static_version_str().unwrap_or("1.7");
         } // cov:ignore: inner-if closing brace is an llvm-cov region artifact; the `return` above is exercised by the encrypt CLI byte-identical gates
     }
     // Object-stream floor "1.5" — reached when best == (1,5) and neither source
     // nor min_version nor encryption floor matched.
-    if best == PDF_1_5 {
+    if best == QpdfVersionParts::new(1, 5) {
         return "1.5";
     }
     // Linearize floor "1.2" — only reached when best == (1,2) and neither
@@ -1853,25 +1878,31 @@ pub(crate) fn effective_pdf_version_and_ext<'a>(
     // (source_ver == min_ver == ver) the higher of the two ext values wins.
     // When neither ties (e.g. the object-stream floor 1.5 or linearize floor
     // 1.2 bumped past both) the effective ext is 0.
-    let ver_parsed = parse_pdf_version(ver);
-    let source_parsed = parse_pdf_version(source);
-    let min_parsed = options.min_version.as_deref().and_then(parse_pdf_version);
+    let ver_parsed = parse_qpdf_writer_version(ver);
+    let source_parsed = parse_qpdf_writer_version(source);
+    let min_parsed = options
+        .min_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+        .and_then(parse_qpdf_writer_version);
     // `--force-version` returns the forced value verbatim from
-    // `effective_pdf_version`. qpdf treats a valid `--force-version` as an
-    // exact version/extension pair: neither the source nor the caller-
-    // supplied minimum extension level propagates across it.
+    // `effective_pdf_version`. qpdf treats a parsed `--force-version` as an
+    // exact version/extension pair: neither the source nor the caller-supplied
+    // minimum extension level propagates across it.
     let forced = options
         .force_version
         .as_deref()
-        .and_then(parse_pdf_version)
+        .filter(|version| !version.is_empty())
+        .and_then(parse_qpdf_writer_version)
         .is_some();
     let enc_floor = encryption_version_floor(options);
     let source_contributes = !forced && ver_parsed.is_some() && ver_parsed == source_parsed;
     let min_contributes = !forced && ver_parsed.is_some() && ver_parsed == min_parsed;
     let enc_contributes = !forced
         && ver_parsed.is_some()
-        && enc_floor.map(|version| PdfVersion::new(version.major(), version.minor(), 0))
-            == ver_parsed;
+        && enc_floor.map(|version| {
+            QpdfVersionParts::new(i32::from(version.major()), i32::from(version.minor()))
+        }) == ver_parsed;
     let min_ext = options.min_extension_level.unwrap_or(0);
     let enc_ext = enc_floor.map(PdfVersion::extension_level).unwrap_or(0);
     // Whichever inputs tie with the effective version each contribute their ext;
@@ -3953,7 +3984,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // already been downgraded to Table just above, so this clamp now fires only
     // for the encrypted paths or a >=1.5 forced/source version.)
     if matches!(effective_xref_form, XrefForm::Stream)
-        && parse_pdf_version(&version).is_none_or(|current| current < PDF_1_5)
+        && parse_qpdf_writer_version(&version)
+            .is_none_or(|current| current < QpdfVersionParts::new(1, 5))
     {
         version = "1.5".to_string();
     }
@@ -3975,7 +4007,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             EncryptMethod::V4Rc4128 => PDF_1_5,
             EncryptMethod::V5R6Aes256 | EncryptMethod::V5R5Aes256 => PdfVersion::new(1, 7, 0),
         };
-        if parse_pdf_version(&version).is_none_or(|current| current < floor) {
+        let floor_parts = QpdfVersionParts::new(i32::from(floor.major()), i32::from(floor.minor()));
+        if parse_qpdf_writer_version(&version).is_none_or(|current| current < floor_parts) {
             version = floor.get_version().0;
         }
     }
@@ -5740,6 +5773,52 @@ mod final_handle_writer_tests {
             entries.push((b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec())));
         }
         ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::new(data))
+    }
+
+    #[test]
+    fn minimum_version_replaces_an_unusable_existing_internal_value() {
+        let mut current = Some(("2147483648".to_string(), 0));
+
+        update_minimum_pdf_version(&mut current, "1.7".to_string(), 0);
+
+        assert_eq!(current, Some(("1.7".to_string(), 0)));
+    }
+
+    #[test]
+    fn forced_raw_version_uses_qpdf_encryption_compatibility_floors() {
+        for (params, forced_version) in [
+            (
+                EncryptParams::rc4(EncryptMethod::V1Rc440, b"u", b"o"),
+                "1.2",
+            ),
+            (
+                EncryptParams::rc4(EncryptMethod::V2Rc4128, b"u", b"o"),
+                "1.3",
+            ),
+            (
+                EncryptParams::rc4(EncryptMethod::V4Rc4128, b"u", b"o"),
+                "1.4",
+            ),
+            (EncryptParams::v4_aes128(b"u", b"o"), "1.5"),
+            (EncryptParams::v5_r6(b"u", b"o"), "1.7"),
+        ] {
+            let options = WriterOptions {
+                encrypt: Some(params),
+                force_version: Some(forced_version.to_string()),
+                ..WriterOptions::default()
+            };
+            assert!(
+                forced_version_disables_encryption(&options),
+                "forced version {forced_version} must disable its incompatible encryption"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_version_applies_the_linearize_floor_to_a_lower_source() {
+        let options = WriterOptions::default();
+
+        assert_eq!(effective_pdf_version("1.1", &options, true, false), "1.2");
     }
 
     #[test]

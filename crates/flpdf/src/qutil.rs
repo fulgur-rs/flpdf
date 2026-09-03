@@ -1,6 +1,6 @@
-//! qpdf correspondence: `QUtil.cc` filesystem identity and UTF-8 single-byte encoding primitives.
+//! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
 //!
-//! This module owns the qpdf `QUtil::utf8_to_ascii`,
+//! This module owns the qpdf `QUtil::string_to_int`, `QUtil::utf8_to_ascii`,
 //! `QUtil::utf8_to_win_ansi`, and `QUtil::utf8_to_mac_roman` behavior used by
 //! form appearance generation (`libqpdf/QUtil.cc:1528-1667` and
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
@@ -162,6 +162,75 @@ fn encode_extended(codepoint: u32, encoding: SingleByteEncoding) -> Option<u8> {
     }
 }
 
+/// Result of qpdf's two-stage decimal-integer conversion
+/// (`QUtil::string_to_int`, `libqpdf/QUtil.cc:373-393`): `strtoll` parses a
+/// leading digit run into an i64 (`string_to_ll`), then `QIntC::to_int`
+/// narrows that i64 to i32. Both stages throw an uncaught `std::range_error`
+/// on overflow in qpdf (`include/qpdf/QIntC.hh:87-109`); callers must
+/// surface [`Overflow`](QpdfIntParse::Overflow) as a fatal error rather than
+/// silently treating the value as absent or mismatched.
+///
+/// [`NoDigits`](QpdfIntParse::NoDigits) represents qpdf's `strtoll` result of
+/// zero when the input has no leading digit run. Callers with a shape
+/// precondition may treat that as impossible; unchecked qpdf callers use it as
+/// the numeric zero.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QpdfIntParse {
+    /// No leading digit was found; qpdf's `strtoll` result is zero.
+    NoDigits,
+    /// qpdf's 64-bit parse or i32 narrowing would overflow.
+    Overflow(String),
+    /// The parsed value after qpdf's i32 narrowing stage.
+    Value(i32),
+}
+
+/// Parse a decimal prefix with qpdf's `QUtil::string_to_int` semantics.
+pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
+    // `QUtil::string_to_ll` delegates to `strtoll`, which consumes leading C
+    // whitespace and exactly one optional sign before the digit prefix.
+    let text = text.split('\0').next().unwrap_or(text);
+    let stripped = text.trim_start_matches(|character| {
+        matches!(
+            character,
+            ' ' | '\n' | '\r' | '\t' | '\u{000c}' | '\u{000b}'
+        )
+    });
+    let (negative, digits) = match stripped.as_bytes().first() {
+        Some(b'-') => (true, &stripped[1..]),
+        Some(b'+') => (false, &stripped[1..]),
+        _ => (false, stripped),
+    };
+    let digits_end = digits
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if digits_end == 0 {
+        return QpdfIntParse::NoDigits;
+    }
+    let Ok(magnitude) = digits[..digits_end].parse::<u128>() else {
+        return QpdfIntParse::Overflow(format!(
+            "overflow/underflow converting {text} to 64-bit integer"
+        ));
+    };
+    let signed = if negative {
+        -(i128::try_from(magnitude).unwrap_or(i128::MAX))
+    } else {
+        i128::try_from(magnitude).unwrap_or(i128::MAX)
+    };
+    if signed < i128::from(i64::MIN) || signed > i128::from(i64::MAX) {
+        return QpdfIntParse::Overflow(format!(
+            "overflow/underflow converting {text} to 64-bit integer"
+        ));
+    }
+    let value = signed as i64;
+    match i32::try_from(value) {
+        Ok(value) => QpdfIntParse::Value(value),
+        Err(_) => QpdfIntParse::Overflow(format!(
+            "integer out of range converting {value} from a 8-byte signed type to a 4-byte signed type"
+        )),
+    }
+}
+
 const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
     0x00c4, 0x00c5, 0x00c7, 0x00c9, 0x00d1, 0x00d6, 0x00dc, 0x00e1, 0x00e0, 0x00e2, 0x00e4, 0x00e3,
     0x00e5, 0x00e7, 0x00e9, 0x00e8, 0x00ea, 0x00eb, 0x00ed, 0x00ec, 0x00ee, 0x00ef, 0x00f1, 0x00f3,
@@ -178,7 +247,45 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{same_file, utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi};
+    use super::{
+        qpdf_string_to_int_checked, same_file, utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi,
+        QpdfIntParse,
+    };
+
+    #[test]
+    fn qpdf_string_to_int_checked_handles_empty_and_negative_values() {
+        assert_eq!(qpdf_string_to_int_checked("-"), QpdfIntParse::NoDigits);
+        assert_eq!(qpdf_string_to_int_checked("-42"), QpdfIntParse::Value(-42));
+    }
+
+    #[test]
+    fn qpdf_string_to_int_checked_matches_strtoll_prefix_rules() {
+        assert_eq!(
+            qpdf_string_to_int_checked("  +42trailing"),
+            QpdfIntParse::Value(42)
+        );
+        assert_eq!(qpdf_string_to_int_checked("+-42"), QpdfIntParse::NoDigits);
+    }
+
+    #[test]
+    fn qpdf_string_to_int_checked_overflows_at_i64_stage() {
+        assert_eq!(
+            qpdf_string_to_int_checked("9999999999999999999999999999999999999999"),
+            QpdfIntParse::Overflow(
+                "overflow/underflow converting 9999999999999999999999999999999999999999 to 64-bit integer".into()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_string_to_int_checked_overflows_at_i32_narrowing_stage() {
+        assert_eq!(
+            qpdf_string_to_int_checked("4294967296"),
+            QpdfIntParse::Overflow(
+                "integer out of range converting 4294967296 from a 8-byte signed type to a 4-byte signed type".into()
+            )
+        );
+    }
 
     #[test]
     fn same_file_identifies_hard_link_and_symlink_aliases() {

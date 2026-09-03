@@ -40,8 +40,18 @@ fn parses_qpdf_version_spec_into_base_version_and_extension_level() {
 }
 
 #[test]
-fn rejects_version_specs_without_major_minor_or_with_extra_components() {
-    for value in ["1", "1.", ".7", "1.7.", "1.7.1.2", "not-a-version"] {
+fn parses_qpdf_version_spec_with_raw_version_and_lenient_extension() {
+    assert_eq!(parse_pdf_version_spec("1.7."), Some(("1.7.".into(), 0)));
+    assert_eq!(parse_pdf_version_spec("1.7.1.2"), Some(("1.7".into(), 1)));
+    assert_eq!(parse_pdf_version_spec("1.7.2x"), Some(("1.7".into(), 2)));
+    assert_eq!(parse_pdf_version_spec("1.7.+2x"), Some(("1.7".into(), 2)));
+    assert_eq!(parse_pdf_version_spec("abc"), Some(("abc".into(), 0)));
+    assert_eq!(parse_pdf_version_spec(".7"), Some((".7".into(), 0)));
+}
+
+#[test]
+fn rejects_version_specs_with_qpdf_integer_overflow() {
+    for value in ["1.7.999999999999999999999", "2147483648.0", "1.2147483648"] {
         assert_eq!(parse_pdf_version_spec(value), None, "{value:?}");
     }
 }

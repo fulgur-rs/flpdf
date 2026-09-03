@@ -1727,7 +1727,7 @@ fn top_level_linearize_accepts_compress_streams_and_pass1() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rewrite_force_version_invalid_abc_exits_nonzero() {
+fn rewrite_force_version_accepts_raw_abc() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -1739,12 +1739,13 @@ fn rewrite_force_version_invalid_abc_exits_nonzero() {
         output.to_str().unwrap(),
     ])
     .assert()
-    .failure()
-    .stderr(predicate::str::contains("invalid --force-version"));
+    .success();
+
+    assert!(std::fs::read(&output).unwrap().starts_with(b"%PDF-abc\n"));
 }
 
 #[test]
-fn rewrite_force_version_with_newline_exits_nonzero() {
+fn rewrite_force_version_accepts_newline_in_raw_value() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -1756,12 +1757,13 @@ fn rewrite_force_version_with_newline_exits_nonzero() {
     ])
     .arg("--force-version=1.4\n")
     .assert()
-    .failure()
-    .stderr(predicate::str::contains("invalid --force-version"));
+    .success();
+
+    assert!(std::fs::read(&output).unwrap().starts_with(b"%PDF-1.4\n\n"));
 }
 
 #[test]
-fn rewrite_min_version_invalid_abc_exits_nonzero() {
+fn rewrite_min_version_accepts_raw_abc_as_a_noop() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -1773,8 +1775,9 @@ fn rewrite_min_version_invalid_abc_exits_nonzero() {
         output.to_str().unwrap(),
     ])
     .assert()
-    .failure()
-    .stderr(predicate::str::contains("invalid --min-version"));
+    .success();
+
+    assert!(std::fs::read(&output).unwrap().starts_with(b"%PDF-1.7\n"));
 }
 
 #[test]
@@ -1915,7 +1918,119 @@ fn rewrite_force_version_with_extension_level_emits_base_header_and_adbe_pair() 
 }
 
 #[test]
-fn top_level_force_version_invalid_value_is_rejected_before_output() {
+fn rewrite_force_version_preserves_qpdf_raw_version_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = "../../tests/fixtures/compat/one-page.pdf";
+    let qpdf_output = temp.path().join("qpdf-force-trailing-dot.pdf");
+    let flpdf_output = temp.path().join("flpdf-force-trailing-dot.pdf");
+
+    let qpdf_status = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--force-version=1.7.", input])
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(qpdf_status.success(), "qpdf force-version probe failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--static-id",
+            "--force-version=1.7.",
+            input,
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+    let expected_header = b"%PDF-1.7.\n";
+    assert!(qpdf_bytes.starts_with(expected_header));
+    assert_eq!(
+        &flpdf_bytes[..expected_header.len().min(flpdf_bytes.len())],
+        expected_header,
+        "flpdf must preserve qpdf's raw forced version header"
+    );
+}
+
+#[test]
+fn top_level_min_version_preserves_qpdf_raw_version_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = "../../tests/fixtures/compat/one-page.pdf";
+    let qpdf_output = temp.path().join("qpdf-min-trailing-dot.pdf");
+    let flpdf_output = temp.path().join("flpdf-min-trailing-dot.pdf");
+
+    let qpdf_status = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--min-version=1.7.", input])
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(qpdf_status.success(), "qpdf min-version probe failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--min-version=1.7.",
+            input,
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+    let expected_header = b"%PDF-1.7.\n";
+    assert!(qpdf_bytes.starts_with(expected_header));
+    assert_eq!(
+        &flpdf_bytes[..expected_header.len().min(flpdf_bytes.len())],
+        expected_header,
+        "top-level min-version must preserve qpdf's raw version header"
+    );
+}
+
+#[test]
+fn empty_force_version_is_a_noop_like_qpdf() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = "../../tests/fixtures/compat/one-page.pdf";
+    let qpdf_output = temp.path().join("qpdf-force-empty.pdf");
+    let flpdf_output = temp.path().join("flpdf-force-empty.pdf");
+
+    let qpdf_status = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--force-version=", input])
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(
+        qpdf_status.success(),
+        "qpdf empty force-version probe failed"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--static-id",
+            "--force-version=",
+            input,
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+    assert!(qpdf_bytes.starts_with(b"%PDF-1.3\n"));
+    assert_eq!(
+        &flpdf_bytes[..b"%PDF-1.3\n".len().min(flpdf_bytes.len())],
+        b"%PDF-1.3\n",
+        "an empty force-version value must not replace qpdf's source version"
+    );
+}
+
+#[test]
+fn top_level_force_version_accepts_raw_value() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -1927,10 +2042,11 @@ fn top_level_force_version_invalid_value_is_rejected_before_output() {
             output.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("invalid --force-version"));
+        .success();
 
-    assert!(!output.exists());
+    assert!(std::fs::read(&output)
+        .unwrap()
+        .starts_with(b"%PDF-not-a-version\n"));
 }
 
 #[test]
