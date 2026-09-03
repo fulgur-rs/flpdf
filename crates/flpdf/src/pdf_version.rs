@@ -118,6 +118,11 @@ pub fn parse_pdf_version_spec(value: &str) -> Option<(String, i64)> {
     // boundary for callers that provide an embedded NUL.
     let value = value.split('\0').next().unwrap_or_default();
     let Some(first_dot) = value.find('.') else {
+        // qpdf's `QPDFWriter::parseVersion` still calls `QUtil::string_to_int`
+        // on the whole undotted string for the major component
+        // (`QPDFWriter.cc:744-757`), so this value must be range-checked here
+        // too, not only when a dot is present.
+        parse_qpdf_writer_version(value)?;
         return Some((value.to_owned(), 0));
     };
     let second_dot = value[first_dot + 1..]

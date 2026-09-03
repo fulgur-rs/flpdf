@@ -51,7 +51,15 @@ fn parses_qpdf_version_spec_with_raw_version_and_lenient_extension() {
 
 #[test]
 fn rejects_version_specs_with_qpdf_integer_overflow() {
-    for value in ["1.7.999999999999999999999", "2147483648.0", "1.2147483648"] {
+    for value in [
+        "1.7.999999999999999999999",
+        "2147483648.0",
+        "1.2147483648",
+        // No dot at all: qpdf's `QPDFWriter::parseVersion` still calls
+        // `QUtil::string_to_int` on the whole value for the major component
+        // (`QPDFWriter.cc:744-757`), so this range check applies here too.
+        "2147483648",
+    ] {
         assert_eq!(parse_pdf_version_spec(value), None, "{value:?}");
     }
 }
