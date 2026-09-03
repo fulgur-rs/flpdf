@@ -209,6 +209,17 @@ impl<R: Read + Seek> Drop for Pdf<R> {
 }
 
 impl<R: Read + Seek> Pdf<R> {
+    /// Close the current qpdf input source while retaining the document's
+    /// already-parsed object graph.
+    ///
+    /// This is qpdf's `QPDF::closeInputSource` (`include/qpdf/QPDF.hh:162-166`,
+    /// `libqpdf/QPDF.cc:278-281`). The resolver replaces its source pointer
+    /// with an invalid source; a foreign stream provider that captured the
+    /// previous pointer remains independent, matching qpdf's ownership rule.
+    pub fn close_input_source(&self) {
+        self.resolver.close_input_source();
+    }
+
     /// Set qpdf's `ClosedFileInputSource::stayOpen` policy when this document
     /// was opened through the file-source factory. Non-file readers have no
     /// close/reopen controller and therefore remain unchanged.
@@ -399,7 +410,14 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolve(&candidate)?;
         let root = candidate;
         if root.as_dictionary().is_none() {
-            return Err(Error::System("unable to find /Root dictionary".into()));
+            let message = "unable to find /Root dictionary";
+            if self.resolver.input_source_closed() {
+                return Err(Error::System(format!(
+                    "{}: {message}",
+                    self.resolver.input_source_name()
+                )));
+            }
+            return Err(Error::System(message.into()));
         }
         if self.check_mode
             && !root
