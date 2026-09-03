@@ -1804,6 +1804,15 @@ fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
 /// The extension level is only meaningful when greater than zero; callers
 /// should injection-gate on that. `linearize` and `object_streams` are
 /// threaded through unchanged.
+fn forced_pdf_version_pair(options: &WriterOptions) -> Option<(&str, i64)> {
+    let forced = options
+        .force_version
+        .as_deref()
+        .filter(|version| !version.is_empty())?;
+    parse_qpdf_writer_version(forced)?;
+    Some((forced, options.force_extension_level.unwrap_or(0)))
+}
+
 pub(crate) fn effective_pdf_version_and_ext<'a>(
     source: &'a str,
     source_ext: i64,
@@ -1811,18 +1820,25 @@ pub(crate) fn effective_pdf_version_and_ext<'a>(
     linearize: bool,
     object_streams: bool,
 ) -> (&'a str, i64) {
-    // `--force-version` is an exact pair: neither the source nor any floor
-    // may replace its raw version or extension level.
-    if let Some(forced) = options
-        .force_version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-    {
-        if parse_qpdf_writer_version(forced).is_some() {
-            return (forced, options.force_extension_level.unwrap_or(0));
-        }
+    match forced_pdf_version_pair(options) {
+        Some(pair) => pair,
+        None => effective_pdf_version_and_ext_without_force(
+            source,
+            source_ext,
+            options,
+            linearize,
+            object_streams,
+        ),
     }
+}
 
+fn effective_pdf_version_and_ext_without_force<'a>(
+    source: &'a str,
+    source_ext: i64,
+    options: &'a WriterOptions,
+    linearize: bool,
+    object_streams: bool,
+) -> (&'a str, i64) {
     // A PDF source header is normally strict M.m. Preserve the previous
     // defensive fallback for an overflowing source comparison value.
     if parse_qpdf_writer_version(source).is_none() {
