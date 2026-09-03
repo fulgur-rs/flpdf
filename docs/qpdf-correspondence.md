@@ -368,6 +368,9 @@ mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObjec
 `parse_pdf_version` remains the strict `PDFVersion` value parser for validated input headers. Job options use the separate qpdf-shaped raw parser: a trailing dot remains part of the header, extra components after the second dot are consumed only as the extension-level integer prefix, and non-numeric raw version text is retained. `QUtil::string_to_int` overflow is a range error, not a clamp (`QPDFJob.cc:2833-2844`, `QPDFWriter.cc:744-757`, `QUtil.cc:371-393`).
 
 `QPDFWriter::getTrimmedTrailer` (`QPDFWriter.cc:2009-2031`) returns an
+
+The byte-oriented job-JSON entry point keeps raw bytes through JSON parsing, but the `minVersion` and `forceVersion` fields are rejected when their bytes are not valid UTF-8 because the writer's raw-version storage is a Rust `String`; this avoids silently replacing qpdf-carried bytes with U+FFFD.
+
 `unsafeShallowCopy` before `enqueueObjectsStandard` and `writeTrailer`; the
 copy keeps the immediate child handles intact because the writer only mutates
 top-level trailer keys. The subsequent

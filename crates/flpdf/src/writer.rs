@@ -1700,94 +1700,38 @@ pub(crate) fn effective_pdf_version<'a>(
     linearize: bool,
     object_streams: bool,
 ) -> &'a str {
-    // --force-version wins outright whenever qpdf's numeric comparison parser
-    // can evaluate it. Syntactically odd but non-overflowing values are still
-    // raw header strings and must not be rejected.
-    if let Some(forced) = options
-        .force_version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-    {
-        if parse_qpdf_writer_version(forced).is_some() {
-            return forced;
-        }
-    }
+    effective_pdf_version_and_ext(source, 0, options, linearize, object_streams).0
+}
 
-    // Parse source; bail to source string on an overflowing comparison value.
-    let Some(mut best) = parse_qpdf_writer_version(source) else {
-        return source;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectivePdfVersion<'a> {
+    raw: &'a str,
+    parsed: QpdfVersionParts,
+    extension_level: i64,
+}
+
+fn update_effective_pdf_version<'a>(
+    current: &mut Option<EffectivePdfVersion<'a>>,
+    raw: &'a str,
+    extension_level: i64,
+) {
+    let Some(parsed) = parse_qpdf_writer_version(raw) else {
+        return;
     };
-
-    // Apply --min-version floor.
-    if let Some(min_v) = options
-        .min_version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-    {
-        if let Some(min_parsed) = parse_qpdf_writer_version(min_v) {
-            if min_parsed > best {
-                best = min_parsed;
-            }
+    let replace = match current.as_ref() {
+        None => true,
+        Some(current) => {
+            parsed > current.parsed
+                || (parsed == current.parsed && extension_level > current.extension_level)
         }
+    };
+    if replace {
+        *current = Some(EffectivePdfVersion {
+            raw,
+            parsed,
+            extension_level,
+        });
     }
-
-    // Apply encryption floor (mirrors qpdf QPDFWriter::setEncryptionParametersInternal
-    // at QPDFWriter.cc L806-815). AES-256 (R>=6), AES-256 legacy (R=5), AES-128
-    // (R=4), RC4-128 (R=3, or R=4 without AES), RC4-40 (R<3) each require a
-    // minimum header version.
-    let enc_floor = encryption_version_floor(options);
-    if let Some(encryption_floor) = enc_floor {
-        let encryption_floor = QpdfVersionParts::new(
-            i32::from(encryption_floor.major()),
-            i32::from(encryption_floor.minor()),
-        );
-        if encryption_floor > best {
-            best = encryption_floor;
-        }
-    }
-
-    // Apply object-stream floor (object streams require >= 1.5).
-    if object_streams && QpdfVersionParts::new(1, 5) > best {
-        best = QpdfVersionParts::new(1, 5);
-    }
-
-    // Apply linearize floor (PDF spec requires >= 1.2).
-    if linearize && QpdfVersionParts::new(1, 2) > best {
-        best = QpdfVersionParts::new(1, 2);
-    }
-
-    // If best == source parsed, return the original source slice to avoid an
-    // allocation.  Otherwise find which option string owns this version.
-    if parse_qpdf_writer_version(source) == Some(best) {
-        return source;
-    }
-    if let Some(min_v) = options
-        .min_version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-    {
-        if parse_qpdf_writer_version(min_v) == Some(best) {
-            return min_v;
-        }
-    }
-    // Encryption floor matched — return a static string for the emitted version.
-    if let Some(encryption_floor) = enc_floor {
-        if QpdfVersionParts::new(
-            i32::from(encryption_floor.major()),
-            i32::from(encryption_floor.minor()),
-        ) == best
-        {
-            return encryption_floor.static_version_str().unwrap_or("1.7");
-        } // cov:ignore: inner-if closing brace is an llvm-cov region artifact; the `return` above is exercised by the encrypt CLI byte-identical gates
-    }
-    // Object-stream floor "1.5" — reached when best == (1,5) and neither source
-    // nor min_version nor encryption floor matched.
-    if best == QpdfVersionParts::new(1, 5) {
-        return "1.5";
-    }
-    // Linearize floor "1.2" — only reached when best == (1,2) and neither
-    // source nor min_version nor encryption floor matched.
-    "1.2"
 }
 
 /// Header-version floor imposed by the encryption method requested via
@@ -1857,10 +1801,9 @@ fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
 /// * new version == current AND new ext > current → take ext only.
 /// * new version < current → ignore.
 ///
-/// This is the pair-aware sibling of [`effective_pdf_version`] and delegates
-/// to it for the version half. The extension level is only meaningful when
-/// greater than zero; callers should injection-gate on that. `linearize` and
-/// `object_streams` are threaded through unchanged.
+/// The extension level is only meaningful when greater than zero; callers
+/// should injection-gate on that. `linearize` and `object_streams` are
+/// threaded through unchanged.
 pub(crate) fn effective_pdf_version_and_ext<'a>(
     source: &'a str,
     source_ext: i64,
@@ -1868,64 +1811,49 @@ pub(crate) fn effective_pdf_version_and_ext<'a>(
     linearize: bool,
     object_streams: bool,
 ) -> (&'a str, i64) {
-    // Version half: delegate.
-    let ver = effective_pdf_version(source, options, linearize, object_streams);
-
-    // Extension level half: pairwise. An input's extension level survives only
-    // when that input's version *equals* the effective version — i.e. that
-    // input won or tied on the version race. A bumped input (whose version was
-    // outbid, including a min_version that beat the source outright) drops its
-    // extension level; the pairwise rule does not carry ext across a version
-    // bump. When only one side ties, its ext wins alone; when both tie
-    // (source_ver == min_ver == ver) the higher of the two ext values wins.
-    // When neither ties (e.g. the object-stream floor 1.5 or linearize floor
-    // 1.2 bumped past both) the effective ext is 0.
-    let ver_parsed = parse_qpdf_writer_version(ver);
-    let source_parsed = parse_qpdf_writer_version(source);
-    let min_parsed = options
-        .min_version
-        .as_deref()
-        .filter(|version| !version.is_empty())
-        .and_then(parse_qpdf_writer_version);
-    // `--force-version` returns the forced value verbatim from
-    // `effective_pdf_version`. qpdf treats a parsed `--force-version` as an
-    // exact version/extension pair: neither the source nor the caller-supplied
-    // minimum extension level propagates across it.
-    let forced = options
+    // `--force-version` is an exact pair: neither the source nor any floor
+    // may replace its raw version or extension level.
+    if let Some(forced) = options
         .force_version
         .as_deref()
         .filter(|version| !version.is_empty())
-        .and_then(parse_qpdf_writer_version)
-        .is_some();
-    let enc_floor = encryption_version_floor(options);
-    let source_contributes = !forced && ver_parsed.is_some() && ver_parsed == source_parsed;
-    let min_contributes = !forced && ver_parsed.is_some() && ver_parsed == min_parsed;
-    let enc_contributes = !forced
-        && ver_parsed.is_some()
-        && enc_floor.map(|version| {
-            QpdfVersionParts::new(i32::from(version.major()), i32::from(version.minor()))
-        }) == ver_parsed;
-    let min_ext = options.min_extension_level.unwrap_or(0);
-    let enc_ext = enc_floor.map(PdfVersion::extension_level).unwrap_or(0);
-    // Whichever inputs tie with the effective version each contribute their ext;
-    // an input that was outbid contributes nothing. Multiple ties combine via
-    // `max` — qpdf-equivalent when multiple setMinimumPDFVersion calls arrive
-    // at the same version, the higher extension level wins the tie.
-    let mut ext = 0i64;
-    if source_contributes {
-        ext = ext.max(source_ext);
+    {
+        if parse_qpdf_writer_version(forced).is_some() {
+            return (forced, options.force_extension_level.unwrap_or(0));
+        }
     }
-    if min_contributes {
-        ext = ext.max(min_ext);
+
+    // A PDF source header is normally strict M.m. Preserve the previous
+    // defensive fallback for an overflowing source comparison value.
+    if parse_qpdf_writer_version(source).is_none() {
+        return (source, 0);
     }
-    if enc_contributes {
-        ext = ext.max(enc_ext);
+
+    let mut best = None;
+    // QPDFWriter's minimum is a pair. Keep the raw string and extension level
+    // together so an equal numeric version with a higher extension level also
+    // selects that candidate's raw header spelling.
+    if let Some(encryption_floor) = encryption_version_floor(options) {
+        let raw = encryption_floor.static_version_str().unwrap_or("1.7");
+        update_effective_pdf_version(&mut best, raw, encryption_floor.extension_level());
     }
-    if forced {
-        (ver, options.force_extension_level.unwrap_or(0))
-    } else {
-        (ver, ext)
+    update_effective_pdf_version(&mut best, source, source_ext);
+    if let Some(min_v) = options
+        .min_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+    {
+        update_effective_pdf_version(&mut best, min_v, options.min_extension_level.unwrap_or(0));
     }
+    if object_streams {
+        update_effective_pdf_version(&mut best, "1.5", 0);
+    }
+    if linearize {
+        update_effective_pdf_version(&mut best, "1.2", 0);
+    }
+
+    best.map(|version| (version.raw, version.extension_level))
+        .unwrap_or((source, 0))
 }
 
 /// Ensure the destination Catalog carries
@@ -5831,6 +5759,20 @@ mod final_handle_writer_tests {
         let options = WriterOptions::default();
 
         assert_eq!(effective_pdf_version("1.1", &options, true, false), "1.2");
+    }
+
+    #[test]
+    fn effective_version_pair_keeps_raw_minimum_when_extension_level_wins_tie() {
+        let options = WriterOptions {
+            min_version: Some("1.7x".to_owned()),
+            min_extension_level: Some(2),
+            ..WriterOptions::default()
+        };
+
+        assert_eq!(
+            effective_pdf_version_and_ext("1.7", 0, &options, false, false),
+            ("1.7x", 2)
+        );
     }
 
     #[test]

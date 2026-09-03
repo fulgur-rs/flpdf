@@ -1991,6 +1991,28 @@ fn top_level_min_version_preserves_qpdf_raw_version_header() {
 }
 
 #[test]
+fn top_level_min_version_extension_tie_preserves_the_raw_winning_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("min-version-extension-tie.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--min-version=1.7x.2",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.7x\n"));
+    assert!(contains(&bytes, b"/BaseVersion /1.7x"));
+    assert!(contains(&bytes, b"/ExtensionLevel 2"));
+}
+
+#[test]
 fn empty_force_version_is_a_noop_like_qpdf() {
     let temp = tempfile::tempdir().unwrap();
     let input = "../../tests/fixtures/compat/one-page.pdf";

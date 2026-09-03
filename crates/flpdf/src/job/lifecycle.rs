@@ -838,7 +838,12 @@ fn parse_json_version(value: &str) -> i32 {
     }
 }
 
-fn parse_job_version(value: &str, path: &str) -> Result<(String, i64)> {
+fn parse_job_version(value: &[u8], path: &str) -> Result<(String, i64)> {
+    let value = std::str::from_utf8(value).map_err(|_| {
+        Error::Usage(UsageError::new(format!(
+            "{path}: version must be valid UTF-8"
+        )))
+    })?;
     crate::parse_pdf_version_spec(value)
         .ok_or_else(|| Error::Usage(UsageError::new(format!("{path}: invalid version {value}"))))
 }
@@ -2010,14 +2015,12 @@ impl QPDFJob {
                 .set_object_stream_mode(parse_object_stream_mode(&value)?);
         }
         if let Some(value) = job_json_string(&members, b"minVersion")? {
-            let value = String::from_utf8_lossy(&value);
             let (version, extension) = parse_job_version(&value, ".minVersion")?;
             configuration
                 .writer
                 .set_minimum_pdf_version(version, extension);
         }
         if let Some(value) = job_json_string(&members, b"forceVersion")? {
-            let value = String::from_utf8_lossy(&value);
             let (version, extension) = parse_job_version(&value, ".forceVersion")?;
             configuration.writer.force_pdf_version(version, extension);
         }
@@ -3927,6 +3930,17 @@ mod tests {
     }
 
     #[test]
+    fn job_json_version_rejects_non_utf8_bytes_instead_of_replacing_them() {
+        let json = b"{\"inputFile\":\"input.pdf\",\"outputFile\":\"output.pdf\",\"forceVersion\":\"\xff\"}";
+
+        let error = QPDFJob::new()
+            .initialize_from_json_bytes(json)
+            .expect_err("non-UTF-8 job JSON version must not be lossy");
+        assert!(error.to_string().contains(".forceVersion"));
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[test]
     fn job_json_private_handlers_cover_qpdf_scalar_and_choice_shapes() {
         let members = job_json_members(
             &crate::json::Json::parse(
@@ -3999,9 +4013,9 @@ mod tests {
         assert_eq!(parse_json_version("2"), 2);
         assert_eq!(parse_json_version("latest"), 2);
         assert_eq!(parse_json_version(""), 2);
-        assert!(parse_job_version("1.7.3", ".version").is_ok());
+        assert!(parse_job_version(b"1.7.3", ".version").is_ok());
         assert_eq!(
-            parse_job_version("invalid", ".version").unwrap(),
+            parse_job_version(b"invalid", ".version").unwrap(),
             ("invalid".to_string(), 0)
         );
         assert_eq!(QPDFJob::parse_collate("2").unwrap(), vec![2]);
