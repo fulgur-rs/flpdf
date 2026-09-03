@@ -26,9 +26,15 @@ fn in_place_page_specs_share_the_qpdf_completion_boundary() {
         .find("fn run_page_extraction_after_plan")
         .expect("shared page completion caller must have a named CLI function");
     let cli_body = &cli_source[cli_start..];
+    let cli_completion = cli_body
+        .find("complete_in_place_page_selection(")
+        .expect("CLI InPlace page path must call the shared completion boundary");
+    let cli_rotation = cli_body
+        .find("apply_rotate_specs(")
+        .expect("CLI InPlace page path must apply rotation");
     assert!(
-        cli_body.contains("complete_in_place_page_selection("),
-        "CLI InPlace page path must call the shared completion boundary"
+        cli_completion < cli_rotation,
+        "CLI InPlace page path must apply rotation after shared completion"
     );
     assert!(
         !cli_body.contains("remap_outline_and_dests(pdf, &result)")
@@ -42,9 +48,16 @@ fn in_place_page_specs_share_the_qpdf_completion_boundary() {
         .find("fn run_document_erased")
         .expect("shared page completion caller must have a named job function");
     let lifecycle_body = &lifecycle_source[lifecycle_start..];
+    let lifecycle_completion = lifecycle_body
+        .find("complete_in_place_page_selection(")
+        .expect("QPDFJob InPlace page path must call the shared completion boundary");
+    let lifecycle_rotation = lifecycle_body[lifecycle_completion..]
+        .find("self.apply_configured_rotations(")
+        .map(|offset| lifecycle_completion + offset)
+        .expect("QPDFJob InPlace page path must apply rotation");
     assert!(
-        lifecycle_body.contains("complete_in_place_page_selection("),
-        "QPDFJob InPlace page path must call the shared completion boundary"
+        lifecycle_completion < lifecycle_rotation,
+        "QPDFJob InPlace page path must apply rotation after shared completion"
     );
     assert!(
         !lifecycle_body.contains("remap_outline_and_dests(pdf, &result)")
