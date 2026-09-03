@@ -10,20 +10,18 @@
 //! The hint table consists of:
 //!
 //! * A **header** with 7 integer items describing the ranges and bit widths
-//!   needed to encode the per-group and per-object entries.
-//! * **M per-group entries** (one per group of shared objects).
+//!   needed to encode the per-shared-object entries.
 //! * **S per-shared-object entries** (one per shared object).
 //!
 //! # Simplifications (relative to full Annex F.3.2)
 //!
 //! This implementation adopts the same simplifications used by qpdf:
 //!
-//! * **1-object-per-group model (M = N)**: each shared object forms its own
-//!   group, so the number of groups equals the number of shared objects.
-//!   This is spec-compliant (the group structure is implementation-defined)
-//!   and matches qpdf's `writeHSharedObject` in `QPDF_linearization.cc`,
-//!   which always emits `nbits_nobjects = 0` and per-entry
-//!   `nobjects_minus_one = 0` — i.e. each group contains exactly one object.
+//! * **1-object-per-group model**: each shared object forms its own group.
+//!   The invariant is represented only by each entry's
+//!   `nobjects_minus_one = 0`; qpdf's `calculateHSharedObject` likewise emits
+//!   `nbits_nobjects = 0` and does not serialize a separate group-entry
+//!   section.
 //! * **Signature suppressed**: the per-object signature flag is always 0
 //!   (signature computation, e.g. MD5, is not performed).  When the flag is 0
 //!   the 16-byte signature field is omitted from the encoded stream.
@@ -38,7 +36,6 @@
 //! | `header.location` (item 2) | header | `0` |
 //! | `header.least_length` (item 6) | header | `0` |
 //! | `entry.length_minus_least` (item 2) per object | entries | `0` |
-//! | `entry.group_offset` (item 4) per object | entries | `0` |
 //!
 //! These fields are stored as `0` in the returned structs.  The back-patcher
 //! locates them by field name and overwrites them once the real
@@ -82,8 +79,8 @@ pub struct SharedObjectHeader {
     /// Item 4 — Total number of shared object entries (= `plan.shared_hints.len()`).
     pub section_entries: u32,
 
-    /// Item 5 — Bits needed to represent the greatest number of objects in a
-    /// shared object group (item 1 of the per-group entry).
+    /// Item 5 — Bits used for each entry's `nobjects_minus_one` value
+    /// (`nbits_nobjects` in qpdf).
     pub bits_group_object_count: u32,
 
     /// Item 6 — Least byte length of an object in the shared objects section.
@@ -102,17 +99,6 @@ pub struct SharedObjectHeader {
 }
 
 // ---------------------------------------------------------------------------
-// Per-group entry
-// ---------------------------------------------------------------------------
-
-/// Per-group entry for the Shared Object Hint Table (1 item per Annex F.3.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedGroupEntry {
-    /// Item 1 — Number of objects in this group.
-    pub object_count: u32,
-}
-
-// ---------------------------------------------------------------------------
 // Per-shared-object entry
 // ---------------------------------------------------------------------------
 
@@ -120,34 +106,34 @@ pub struct SharedGroupEntry {
 ///
 /// ## Back-patch fields
 ///
-/// * `length_minus_least` (item 2): byte length of this object minus
+/// * `length_minus_least` (column 1): byte length of this object minus
 ///   `header.least_length`.  Set to `0` (placeholder); back-patched once
 ///   the real offsets are known.
-/// * `nobjects_minus_one` (item 4): number of additional objects in this
-///   shared object's group, minus one.  In our 1-object-per-group model this
-///   is always `0`; encoded with `bits_group_object_count` bits, which is
-///   also `0` in our model so nothing is actually written.
+/// * `nobjects_minus_one` (column 3): number of additional objects in this
+///   shared object's group, minus one. In our 1-object-per-group model this is
+///   always `0`; it is encoded with `bits_group_object_count` bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedObjectEntry {
-    /// Item 1 (encoded order) — Byte length of this object minus
+    /// Column 1 — Byte length of this object minus
     /// `header.least_length`.  Populated by the writer in `from_plan`.
     pub length_minus_least: u32,
 
-    /// Item 2 (encoded order) — Signature present flag.
+    /// Column 2 — Signature present flag.
     ///
     /// Always `false` in this implementation; signature computation (MD5) is
     /// not performed.  When `false`, the 16-byte signature is omitted from
     /// the encoded stream.
     pub signature_present: bool,
 
-    /// Item 3 (encoded order) — 16-byte MD5 signature of the object data.
+    /// Inline after column 2 when `signature_present` is true — 16-byte MD5
+    /// signature of the object data.
     ///
     /// Always `None` because `signature_present` is always `false`.
     pub signature: Option<[u8; 16]>,
 
-    /// Item 4 (encoded order) — Number of additional objects in this group,
-    /// minus one.  Our writer always uses one object per group, so this is
-    /// always `0`.  Encoded with `bits_group_object_count` bits.
+    /// Column 3 — Number of additional objects in this group, minus one. Our
+    /// writer always uses one object per group, so this is always `0`.
+    /// Encoded with `bits_group_object_count` bits.
     pub nobjects_minus_one: u32,
 }
 
@@ -155,12 +141,12 @@ pub struct SharedObjectEntry {
 // SharedObjectHintTable
 // ---------------------------------------------------------------------------
 
-/// Complete Shared Object Hint Table: header + M group entries + S object entries.
+/// Complete Shared Object Hint Table: header plus one entry per shared object.
 ///
 /// Constructed via [`SharedObjectHintTable::from_plan`].  All placeholder fields
-/// (`location`, `least_length`, per-object `length_minus_least`, `group_offset`)
-/// are initialized to `0`; the back-patcher fills them in once the real
-/// byte offsets are available.
+/// (`location`, `least_length`, and per-object `length_minus_least`) are
+/// initialized to `0`; the back-patcher fills them in once the real byte
+/// offsets are available.
 ///
 /// The hint-stream encoder serializes this struct into the binary bit-packed
 /// format required by Annex F.
@@ -168,16 +154,13 @@ pub struct SharedObjectEntry {
 /// # Group model
 ///
 /// This implementation uses the **1-object-per-group model**: each shared
-/// object forms its own group, so M = N (the number of shared objects), or
-/// M = 0 when there are no shared objects.  This matches qpdf's behaviour
-/// (`writeHSharedObject` in `QPDF_linearization.cc`), which emits
-/// `nbits_nobjects = 0` and `nobjects_minus_one = 0` for every entry.
+/// object forms its own group. The model is encoded by
+/// `nobjects_minus_one = 0` for every entry; qpdf emits the same value with
+/// `nbits_nobjects = 0` and has no separate serialized group entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedObjectHintTable {
     /// The 7-item header.
     pub header: SharedObjectHeader,
-    /// One entry per group (M entries).  Empty when there are no shared objects.
-    pub groups: Vec<SharedGroupEntry>,
     /// One entry per shared object, in `plan.shared_hints` order.
     pub objects: Vec<SharedObjectEntry>,
 }
@@ -194,13 +177,11 @@ impl SharedObjectHintTable {
     /// * `header.location`
     /// * `header.least_length`
     /// * `entry.length_minus_least` (all entries)
-    /// * `entry.group_offset` (all entries)
     ///
     /// # Degenerate case (no shared objects)
     ///
     /// When `plan.shared_hints` is empty the table is almost empty:
     /// * All header numeric fields are `0`.
-    /// * `groups` is empty (M = 0).
     /// * `objects` is empty.
     ///
     /// # Panics
@@ -243,7 +224,6 @@ impl SharedObjectHintTable {
                     least_length: 0,
                     bits_length_delta: 0,
                 },
-                groups: vec![],
                 objects: vec![],
             };
         }
@@ -345,13 +325,8 @@ impl SharedObjectHintTable {
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
         //
-        // bits_group_object_count: greatest objects-in-any-group.
-        //
-        // Each shared object is its own group (one object per group), so the
-        // greatest `nobjects_minus_one` is 0 across all groups, requiring 0
-        // bits per Annex F.4.5 / qpdf nbits_nobjects.  Setting this to
-        // `bits_needed(shared_count)` would be wrong: shared_count is the
-        // *number of groups*, not the *largest group's object count*.
+        // Each shared object is its own group, so every per-entry
+        // `nobjects_minus_one` is 0. This gives qpdf's `nbits_nobjects = 0`.
         //
         // bits_length_delta: since all lengths are 0 (placeholder) the delta
         // is 0, so bits = 0.  The encoder re-derives this after back-patching.
@@ -368,17 +343,7 @@ impl SharedObjectHintTable {
         };
 
         // ------------------------------------------------------------------
-        // Step 4: build per-group entries (1-object-per-group model).
-        //
-        // Each shared object forms its own group with object_count == 1.
-        // This matches the header's `bits_group_object_count = 0`
-        // (greatest nobjects_minus_one across groups is 0) and the
-        // per-object `nobjects_minus_one = 0` written below.
-        // ------------------------------------------------------------------
-        let groups = vec![SharedGroupEntry { object_count: 1 }; shared_count as usize];
-
-        // ------------------------------------------------------------------
-        // Step 5: build per-shared-object entries.
+        // Step 4: build per-shared-object entries.
         //
         // Entries are in folded `shared_hints` order (Part-2, then Part-3 with
         // packed members folded into their container, then Part-8).
@@ -395,11 +360,7 @@ impl SharedObjectHintTable {
             })
             .collect();
 
-        Self {
-            header,
-            groups,
-            objects,
-        }
+        Self { header, objects }
     }
 }
 
@@ -565,7 +526,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn degenerate_groups_and_objects_are_empty() {
+    fn degenerate_objects_are_empty() {
         let plan = single_page_no_shared();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(
@@ -576,10 +537,6 @@ mod tests {
             &Default::default(),
         );
 
-        assert!(
-            table.groups.is_empty(),
-            "no shared objects → groups must be empty"
-        );
         assert!(
             table.objects.is_empty(),
             "no shared objects → objects must be empty"
@@ -685,14 +642,13 @@ mod tests {
             &Default::default(),
         );
 
-        // One object per group (we never group multiple shared objects
-        // together), so the greatest `nobjects_minus_one` across groups is
-        // 0 — bit width is 0 per Annex F.4.5 / qpdf nbits_nobjects.
+        // Every shared object is its own group, so each
+        // `nobjects_minus_one` is 0 and qpdf's `nbits_nobjects` is 0.
         assert_eq!(table.header.bits_group_object_count, 0);
     }
 
     #[test]
-    fn two_page_groups_one_per_shared_object() {
+    fn two_page_entries_use_one_object_groups() {
         let plan = two_page_shared_both_pages();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(
@@ -703,16 +659,11 @@ mod tests {
             &Default::default(),
         );
 
-        assert_eq!(
-            table.groups.len(),
-            4,
-            "1-object-per-group model must have one group per shared object \
-             (2 part2 + 2 part3 = 4)"
-        );
-        for (i, group) in table.groups.iter().enumerate() {
+        assert_eq!(table.objects.len(), 4);
+        for (i, entry) in table.objects.iter().enumerate() {
             assert_eq!(
-                group.object_count, 1,
-                "group {i} must contain exactly 1 object under 1-object-per-group model"
+                entry.nobjects_minus_one, 0,
+                "entry {i} must describe a one-object group"
             );
         }
     }
@@ -822,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_first_page_groups_one_per_shared_object() {
+    fn partial_first_page_entries_use_one_object_groups() {
         let plan = two_page_partial_first_page();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(
@@ -833,13 +784,9 @@ mod tests {
             &Default::default(),
         );
 
-        assert_eq!(
-            table.groups.len(),
-            4,
-            "1-object-per-group: 4 shared objects → 4 groups"
-        );
-        for group in &table.groups {
-            assert_eq!(group.object_count, 1);
+        assert_eq!(table.objects.len(), 4);
+        for entry in &table.objects {
+            assert_eq!(entry.nobjects_minus_one, 0);
         }
     }
 
@@ -855,7 +802,7 @@ mod tests {
             &Default::default(),
         );
 
-        // 1-object-per-group model — see two_page_bits_group_object_count.
+        // One-object-per-group model: see two_page_bits_group_object_count.
         assert_eq!(table.header.bits_group_object_count, 0);
     }
 
@@ -1112,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn part8_shared_groups_count_equals_total_shared_hints() {
+    fn part8_shared_entries_count_equals_total_shared_hints() {
         let plan = two_page_with_part8_shared();
         let renumber = RenumberMap::from_plan(&plan);
         let table = SharedObjectHintTable::from_plan(
@@ -1123,11 +1070,7 @@ mod tests {
             &Default::default(),
         );
 
-        assert_eq!(
-            table.groups.len(),
-            plan.shared_hints.len(),
-            "groups count must equal total shared_hints (1-object-per-group model)"
-        );
+        assert_eq!(table.objects.len(), plan.shared_hints.len());
     }
 
     // -----------------------------------------------------------------------

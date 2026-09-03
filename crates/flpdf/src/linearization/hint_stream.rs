@@ -370,20 +370,6 @@ fn encode_shared_object_header(
     Ok(())
 }
 
-fn encode_shared_object_groups(
-    writer: &mut BitWriter<'_>,
-    t: &SharedObjectHintTable,
-) -> PipelineResult<()> {
-    let h = &t.header;
-    for group in &t.groups {
-        writer.write_bits(
-            group.object_count as u64,
-            h.bits_group_object_count as usize,
-        )?;
-    }
-    Ok(())
-}
-
 fn encode_shared_object_entries(
     writer: &mut BitWriter<'_>,
     t: &SharedObjectHintTable,
@@ -399,8 +385,6 @@ fn encode_shared_object_entries(
     // (Signatures, when present, are inline with the signature_present
     // column per qpdf; we never emit signatures, so this is a no-op.)
     //
-    // group_offset is NOT in the per-entry layout — see header `location`.
-
     // col 1: delta_group_length
     for entry in &t.objects {
         writer.write_bits(
@@ -454,8 +438,6 @@ fn encode_shared_section(
     shared_object: &SharedObjectHintTable,
 ) -> crate::Result<()> {
     encode_shared_object_header(writer, shared_object)?;
-    writer.flush()?;
-    encode_shared_object_groups(writer, shared_object)?;
     writer.flush()?;
     encode_shared_object_entries(writer, shared_object)?;
     writer.flush()?;
@@ -610,9 +592,7 @@ fn encode_hint_stream_with_out_buffer_size(
 mod tests {
     use super::*;
     use crate::linearization::hint_page::PageOffsetHintTable;
-    use crate::linearization::hint_shared::{
-        SharedGroupEntry, SharedObjectEntry, SharedObjectHintTable,
-    };
+    use crate::linearization::hint_shared::{SharedObjectEntry, SharedObjectHintTable};
     use crate::linearization::plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
     use crate::linearization::renumber::RenumberMap;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
@@ -748,7 +728,6 @@ mod tests {
         shared_object.header.section_entries = 1;
         shared_object.header.bits_group_object_count = 8;
         shared_object.header.bits_length_delta = 8;
-        shared_object.groups = vec![SharedGroupEntry { object_count: 1 }];
         shared_object.objects = vec![SharedObjectEntry {
             length_minus_least: 1,
             signature_present: true,
@@ -756,6 +735,32 @@ mod tests {
             nobjects_minus_one: 1,
         }];
         (page_offset, shared_object)
+    }
+
+    #[test]
+    fn shared_section_emits_qpdf_columns_without_group_preamble() {
+        let (page_offset, mut shared_object) = minimal_tables();
+        shared_object.header.first_page_entries = 1;
+        shared_object.header.section_entries = 1;
+        shared_object.header.bits_group_object_count = 8;
+        shared_object.header.bits_length_delta = 8;
+        shared_object.objects = vec![SharedObjectEntry {
+            length_minus_least: 0x2a,
+            signature_present: false,
+            signature: None,
+            nobjects_minus_one: 0x3c,
+        }];
+
+        let encoded = encode_hint_stream(&page_offset, &shared_object, None).expect("encode");
+        let decoded = crate::linearization::show::read_h_shared_object(
+            &encoded.uncompressed[encoded.shared_section_offset_in_uncompressed..],
+        )
+        .expect("decode qpdf-shaped shared section");
+        let entry = &decoded.entries[0];
+
+        assert_eq!(entry.delta_group_length, 0x2a);
+        assert!(!entry.signature_present);
+        assert_eq!(entry.nobjects_minus_one, 0x3c);
     }
 
     #[test]
@@ -1177,8 +1182,8 @@ mod tests {
         //   2 × 16-bit fields = 32 bits
         //   Total = 192 bits = 24 bytes
         //
-        // With no shared objects (degenerate), no groups or object entries
-        // are emitted.  So the total uncompressed length is:
+        // With no shared objects (degenerate), no object entries are emitted.
+        // So the total uncompressed length is:
         //   36 (page offset header) + 24 (shared object header) = 60 bytes.
         let plan = single_page_plan(); // no shared objects
         let renumber = RenumberMap::from_plan(&plan);

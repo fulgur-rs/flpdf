@@ -13,9 +13,10 @@
 //!   followed by seven bit-packed columns (one byte-aligned after each), read
 //!   exactly as qpdf's `readHPageOffset`.
 //! * **Shared Object Hint Table** (Annex F.3.2): a 7-field header followed by
-//!   four columns, read as qpdf's `readHSharedObject`.  There is no separate
-//!   "groups" column in the read path; per-group object counts are carried by
-//!   the `nobjects_minus_one` column.
+//!   three logical columns, read as qpdf's `readHSharedObject`.  Signature
+//!   bytes are inline with the `signature_present` column when that flag is
+//!   set; per-group object counts are carried by the `nobjects_minus_one`
+//!   column.
 //! * **Outlines Hint Table** (Annex F.3.4): the four-field generic table read by
 //!   qpdf's `readHGeneric`, located only when the hint-stream dictionary has an
 //!   `/O` key.  No fixture in this repository exercises it, so it is covered by
@@ -1209,7 +1210,7 @@ mod tests {
         bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHintTable,
     };
     use crate::linearization::hint_shared::{
-        SharedGroupEntry, SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,
+        SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,
     };
 
     /// A page-offset table with varied, non-zero values that force cross-byte
@@ -1280,7 +1281,6 @@ mod tests {
             least_length: 33,
             bits_length_delta: 8,
         };
-        let groups = vec![SharedGroupEntry { object_count: 1 }; 3];
         let objects = vec![
             SharedObjectEntry {
                 length_minus_least: 0,
@@ -1301,11 +1301,7 @@ mod tests {
                 nobjects_minus_one: 0,
             },
         ];
-        SharedObjectHintTable {
-            header,
-            groups,
-            objects,
-        }
+        SharedObjectHintTable { header, objects }
     }
 
     #[test]
@@ -1568,15 +1564,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // signature_present + 128-bit skip (qpdf readHSharedObject column c).
+    // signature_present + 128-bit skip (qpdf readHSharedObject column 2).
     //
-    // qpdf's reader expects four SEPARATE columns: delta_group_length, then a
-    // 1-bit signature_present column (byte-aligned), then a run of 128-bit
-    // signatures (one per set flag, no inner alignment), then nobjects. We
-    // build the bitstream in that exact reader order via BitWriter and
-    // assert the decoder skips the signature correctly so the nobjects column
-    // stays aligned.  (flpdf never emits signatures, so this path is exercised
-    // only here, but it must mirror qpdf for arbitrary linearized input.)
+    // qpdf's reader expects three logical columns: delta_group_length, then a
+    // 1-bit signature_present column (byte-aligned) with a run of 128-bit
+    // signatures inline for set flags, then nobjects. We build the bitstream
+    // in that exact reader order via BitWriter and assert the decoder skips
+    // the signature correctly so the nobjects column stays aligned.
+    // (flpdf never emits signatures, so this path is exercised only here, but
+    // it must mirror qpdf for arbitrary linearized input.)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1602,11 +1598,11 @@ mod tests {
             writer.write_bits(1, 1)?;
             writer.write_bits(0, 1)?;
             writer.flush()?;
-            // col c: 128 bits (4×32) for the one set flag — no inner alignment
+            // Inline signature data for the one set flag — no inner alignment.
             for _ in 0..4 {
                 writer.write_bits(0xDEAD_BEEF, 32)?;
             }
-            // col d: nobjects_minus_one × N
+            // col 3: nobjects_minus_one × N
             writer.write_bits(5, nbits_nobjects as usize)?;
             writer.write_bits(7, nbits_nobjects as usize)?;
             writer.flush()
@@ -2064,22 +2060,10 @@ mod tests {
                 location: 200,
                 first_page_entries: 0,
                 section_entries: 2,
-                // 0: nobjects_minus_one is always 0 below, and (matching
-                // `rich_shared_object_table`) a nonzero width here also
-                // widens the writer's `groups` pre-pass
-                // (`encode_shared_object_groups`, `hint_stream.rs:373-385`),
-                // which qpdf's `readHSharedObject` has no matching read step
-                // for — misaligning every subsequent bit read. Production always
-                // passes 0 here (`hint_shared.rs:242,347`), so this path is
-                // dormant.
                 bits_group_object_count: 0,
                 least_length: 10,
                 bits_length_delta: 8,
             },
-            groups: vec![
-                SharedGroupEntry { object_count: 1 },
-                SharedGroupEntry { object_count: 1 },
-            ],
             objects: vec![
                 SharedObjectEntry {
                     length_minus_least: 5,
@@ -2223,7 +2207,7 @@ mod tests {
             .expect("genuinely split /H overflow stream must merge into one dump");
         assert!(out.contains("\nShared Objects Hint Table\n\n"));
         // The Shared Objects Hint Table came from the overflow stream alone —
-        // its two groups/lengths are only decodable if the merge actually
+        // its two object lengths are only decodable if the merge actually
         // appended the overflow bytes. `least_length: 10` plus each object's
         // `length_minus_least` (5, 20) from `split_overflow_pdf_bytes`.
         assert!(out.contains("Shared Object 0:\n"));
