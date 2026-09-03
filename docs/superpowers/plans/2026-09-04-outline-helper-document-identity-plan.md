@@ -137,7 +137,7 @@ outline title, count, explicit-destination, and destination-page cases.
 
 **Files:**
 - Modify: `crates/flpdf/src/outline_object_helper.rs:16-23`
-- Modify: `docs/qpdf-correspondence.md` in the `QPDFOutlineDocumentHelper / QPDFOutlineObjectHelper` row
+- Modify: `docs/qpdf-correspondence.md` in the outline correspondence section immediately before the `QPDFOutlineDocumentHelper / QPDFOutlineObjectHelper` row
 
 - [ ] **Step 1: Update module documentation**
 
@@ -147,11 +147,11 @@ not own the item handle, corresponding to qpdf's private `m->dh` reference.
 Keep the existing note about the synthetic `Pdf::set_object` terminal chase;
 do not describe the new guard as a qpdf output deviation.
 
-- [ ] **Step 2: Update the correspondence row**
+- [ ] **Step 2: Update the correspondence annotation**
 
-Add the same ownership-boundary explanation to the existing outline row while
-preserving its current live-handle, cache, and bridge descriptions. Do not
-change unrelated correspondence rows.
+Add the same ownership-boundary explanation to the existing outline
+correspondence annotation while preserving the row's current live-handle,
+cache, and bridge descriptions. Do not change unrelated correspondence rows.
 
 - [ ] **Step 3: Verify documentation and formatting**
 
