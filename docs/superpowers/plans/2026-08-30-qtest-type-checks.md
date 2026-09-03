@@ -182,7 +182,7 @@ Resolve the receiver, inspect exact length and numeric children without warnings
 
 - [x] **Step 3: Implement Rust-native reversible cursors**
 
-Add public `ArrayItems`/`ArrayItemCursor` and `DictItems`/`DictItemCursor` owned by ObjectHandle. Provide `begin`, `current`, `next`, `previous`, `is_end`, and initialized-state transitions. Cursors use a stable safe `ivalue` cell that is rebound on movement, and dictionary cursors snapshot qpdf's visible `getKeys()` set so retained values observe qpdf's end transition without unsafe aliasing or raw `Object` materialization.
+Add public `ArrayItems`/`ArrayItemCursor` and `DictItems`/`DictItemCursor` owned by ObjectHandle. Provide `begin`, `current`, `next`, `previous`, `is_end`, and initialized-state transitions. qpdf's C++ iterator test binds `auto&` to the iterator's internal `ivalue`, but a copied `QPDFObjectHandle` remains the selected child after movement; because Rust `current()` returns by value, retained Rust handles remain stable and later positions are read with fresh calls. Dictionary cursors snapshot qpdf's visible `getKeys()` set; a non-end removed-key lookup returns an initialized null, and a non-dictionary lookup follows qpdf's contextual warning/null contract, while only the snapshot end returns an uninitialized value. No unsafe aliasing or raw `Object` materialization is used.
 
 - [x] **Step 4: Add explicit initialized state**
 
