@@ -47,15 +47,16 @@ fn open_secondary_pdf(
         );
         flpdf::Error::System(String::from_utf8_lossy(&message).into_owned())
     })?;
+    let path_bytes = os_str_diagnostic_bytes(path);
     let options = PdfOpenOptions {
         repair: true,
         password: password.to_vec(),
         suppress_warnings: true,
+        description: String::from_utf8_lossy(&path_bytes).into_owned(),
         ..PdfOpenOptions::default()
     };
     let secondary = Pdf::open_with_options(file, options)?;
     let mut secondary_diagnostics_written = 0;
-    let path_bytes = os_str_diagnostic_bytes(path);
     emit_new_diagnostics(
         &secondary,
         &mut secondary_diagnostics_written,
@@ -193,59 +194,82 @@ pub(crate) fn run_test_27<R: Read + Seek>(
     let mut empty2 = Pdf::empty()?;
     let s1 = empty2.copy_foreign_object(&s1)?;
 
-    // A second provider, in `empty3`, which has `setImmediateCopyFrom(true)`
-    // -- matching test_driver.cc:1036-1053.
-    let data2 = b"more data for stream\n".to_vec();
-    let empty3 = Pdf::empty()?;
-    empty3.set_immediate_copy_from(true);
-    let s3 = empty3.new_stream()?;
-    s3.replace_stream_data_with_callback(
-        move |pipeline: &mut dyn Pipeline| {
-            pipeline.write(&data2)?;
-            pipeline.finish()?;
-            Ok(())
-        },
-        Some(ObjectHandle::null()),
-        Some(ObjectHandle::null()),
-    )?;
-
-    // qpdf: `assert(arg2 != nullptr);` (test_driver.cc:1054).
-    let arg2 = arg2.expect("test 27 requires arg2, matching qpdf's own assert(arg2 != nullptr)");
-    let mut oldpdf = open_secondary_pdf(arg2, b"", stdout, stderr)?;
-    let qtest = oldpdf.trailer_key_handle(b"QTest");
-    let o3 = qtest.get_key(b"/O3");
-    let other_page = o3.get_key(b"/OtherPage");
-    let other_page_ref = other_page
-        .object_ref()
-        .expect("/O3/OtherPage is a page, always an indirect object");
-    let o3_ref = o3
-        .object_ref()
-        .expect("/O3 is a page, always an indirect object");
+    // qpdf keeps `empty3`, the provider-backed stream, and `oldpdf` alive only
+    // until all three streams and `/QTest` have been copied
+    // (`test_driver.cc:1036-1068`). The immediate-copy source can therefore be
+    // dropped before the writer, while the non-immediate `empty1`/`empty2`
+    // sources remain alive just as qpdf's outer locals do.
     {
-        // qpdf: `dh.addPage(O3.getKey("/OtherPage"), false); dh.addPage(O3,
-        // false);` (test_driver.cc:1060-1061) -- order matters: the other
-        // page is added first.
-        let mut dh = PageDocumentHelper::new(pdf);
-        dh.add_page(PageInput::foreign(&mut oldpdf, other_page_ref), false)?;
-        dh.add_page(PageInput::foreign(&mut oldpdf, o3_ref), false)?;
+        // A second provider, in `empty3`, which has `setImmediateCopyFrom(true)`
+        // -- matching test_driver.cc:1036-1053.
+        let data2 = b"more data for stream\n".to_vec();
+        let empty3 = Pdf::empty()?;
+        empty3.set_immediate_copy_from(true);
+        let s3 = empty3.new_stream()?;
+        s3.replace_stream_data_with_callback(
+            move |pipeline: &mut dyn Pipeline| {
+                pipeline.write(&data2)?;
+                pipeline.finish()?;
+                Ok(())
+            },
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )?;
+
+        // qpdf: `assert(arg2 != nullptr);` (test_driver.cc:1054).
+        let arg2 =
+            arg2.expect("test 27 requires arg2, matching qpdf's own assert(arg2 != nullptr)");
+        let mut oldpdf = open_secondary_pdf(arg2, b"", stdout, stderr)?;
+        let qtest = oldpdf.trailer_key_handle(b"QTest");
+        let o3 = qtest.get_key(b"/O3");
+        let other_page = o3.get_key(b"/OtherPage");
+        let other_page_ref = other_page
+            .object_ref()
+            .expect("/O3/OtherPage is a page, always an indirect object");
+        let o3_ref = o3
+            .object_ref()
+            .expect("/O3 is a page, always an indirect object");
+        {
+            // qpdf: `dh.addPage(O3.getKey("/OtherPage"), false); dh.addPage(O3,
+            // false);` (test_driver.cc:1060-1061) -- order matters: the other
+            // page is added first.
+            let mut dh = PageDocumentHelper::new(pdf);
+            dh.add_page(PageInput::foreign(&mut oldpdf, other_page_ref), false)?;
+            dh.add_page(PageInput::foreign(&mut oldpdf, o3_ref), false)?;
+        }
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+        let s2 = oldpdf.new_stream_with_data(Rc::new(b"potato\n".to_vec()))?;
+
+        // qpdf replaces `/QTest` in the live trailer with a copy of the
+        // foreign `qtest`, then appends copies of `s1`/`s2`/`s3` (in that
+        // order) into a new `/QTest2` trailer array
+        // (test_driver.cc:1063-1068). Keep the copied handles on the live
+        // trailer; calling copyForeignObject without attaching its return
+        // value would not reproduce qpdf's reachable graph.
+        let trailer = pdf.trailer();
+        let copied_qtest = pdf.copy_foreign_object(&qtest)?;
+        trailer.replace_key(b"/QTest", copied_qtest)?;
+        let qtest2 =
+            trailer.replace_key_and_get_new(b"/QTest2", ObjectHandle::array(Vec::new()))?;
+        for stream in [&s1, &s2, &s3] {
+            qtest2.append_array_item(pdf.copy_foreign_object(stream)?)?;
+        }
+        pdf.mark_object_handle_dirty(&trailer)?;
     }
+
+    // qpdf writes only after the transient source documents above leave
+    // scope. `setDecodeLevel` plus `setCompressStreams(false)` is the exact
+    // writer configuration from test_driver.cc:1070-1076.
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_compress_streams(false);
+    writer.set_decode_level(DecodeLevel::Generalized);
+    writer.write()?;
+    // Writer-time provider/stream errors are collected by the canonical PDF
+    // logger and must be emitted before the shared `test N done` footer.
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-
-    let s2 = oldpdf.new_stream_with_data(Rc::new(b"potato\n".to_vec()))?;
-
-    // qpdf next replaces `/QTest` in `pdf`'s trailer with a copy of the
-    // foreign `qtest`, then appends copies of `s1`/`s2`/`s3` (in that order)
-    // into a new `/QTest2` trailer array (test_driver.cc:1063-1068). Run
-    // each copy for its own real, faithful side effect on `pdf`'s object
-    // graph, but stop there:
-    let _ = pdf.copy_foreign_object(&qtest)?;
-    let _ = pdf.copy_foreign_object(&s1)?;
-    let _ = pdf.copy_foreign_object(&s2)?;
-    let _ = pdf.copy_foreign_object(&s3)?;
-    // GAP(QPDF::getTrailer().replaceKey / replaceKeyAndGetNew): the same
-    // missing primitive as `run_test_26` -- flpdf has no public API to
-    // mutate `Pdf::trailer()` after open, so `/QTest` and `/QTest2` cannot
-    // be attached and `PdfWriter::write()` is not attempted.
     Ok(())
 }
 
@@ -650,6 +674,34 @@ mod tests {
         bytes
     }
 
+    fn pdf_with_foreign_page_graph() -> Vec<u8> {
+        let objects: [&[u8]; 5] = [
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /OtherPage 4 0 R >>\nendobj\n",
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            b"5 0 obj\n<< /O3 3 0 R >>\nendobj\n",
+        ];
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 1 0 R /QTest 5 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
     #[test]
     fn test_29_matches_qpdf_mixed_ownership_output() {
         let _lock = super::super::CURRENT_DIR_LOCK
@@ -691,6 +743,63 @@ logic error: Attempting to add an object from a different QPDF. Use QPDF::copyFo
         assert!(
             stderr.is_empty(),
             "test 29 should not emit stderr: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn test_27_writes_live_trailer_copies_and_provider_streams() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let secondary = directory.path().join("copy-foreign-objects-in.pdf");
+        std::fs::write(&secondary, pdf_with_foreign_page_graph()).expect("write secondary PDF");
+
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .expect("open primary PDF");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        super::run_test_27(
+            &mut pdf,
+            b"minimal.pdf",
+            Some(secondary.as_os_str()),
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 27 should write its live trailer mutations");
+
+        assert!(
+            directory.path().join("a.pdf").is_file(),
+            "test 27 must reach the qpdf writer after trailer mutation"
+        );
+        let mut written = Pdf::open(std::fs::File::open(directory.path().join("a.pdf")).unwrap())
+            .expect("reopen test 27 output");
+        let qtest2 = written.trailer_key_handle(b"QTest2");
+        written.resolve(&qtest2).expect("resolve /QTest2");
+        assert_eq!(qtest2.as_array().expect("/QTest2 array").len(), 3);
+        let qtest = written.trailer_key_handle(b"QTest");
+        written.resolve(&qtest).expect("resolve /QTest");
+        assert!(
+            qtest.as_dictionary().is_some(),
+            "test 27 must attach the copied /QTest to the live trailer"
+        );
+        assert!(
+            stdout.is_empty(),
+            "test 27 stdout should be empty: {stdout:?}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "synthetic test 27 stderr should be empty: {stderr:?}"
         );
     }
 
