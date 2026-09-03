@@ -200,7 +200,7 @@ cargo test --workspace
 
 Every command must exit 0 with no newly ignored test.
 
-- [ ] **Step 3: Run quality and coverage gates**
+- [x] **Step 3: Run quality and coverage gates**
 
 Run:
 
