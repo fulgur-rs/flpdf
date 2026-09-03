@@ -107,12 +107,8 @@ fn run_subset(pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
 fn run_subset_bytes(bytes: Vec<u8>, pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>> {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open fixture");
     let result = rebuild_page_tree(&mut pdf, pages).expect("rebuild");
-    QPDFJob::complete_in_place_page_selection(
-        &mut pdf,
-        &result,
-        RemoveUnreferencedResources::Yes,
-    )
-    .expect("complete in-place page selection");
+    QPDFJob::complete_in_place_page_selection(&mut pdf, &result, RemoveUnreferencedResources::Yes)
+        .expect("complete in-place page selection");
     pdf
 }
 
