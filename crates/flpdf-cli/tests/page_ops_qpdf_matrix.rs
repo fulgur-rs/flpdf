@@ -2407,6 +2407,291 @@ fn pages_secondary_version_floor_matches_qpdf() {
 }
 
 #[test]
+fn pages_multi_source_min_version_preserves_qpdf_raw_spelling() {
+    // qpdf applies the accumulated input floor before the explicit minimum;
+    // the explicit minimum remains a raw writer value even when the page job
+    // has multiple sources. In particular, the trailing dot is observable in
+    // the emitted header and must not be normalized to the source's 1.3.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping raw min-version differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let secondary = fixture_abs(ONE_PAGE);
+    let q = tmp.path().join("q-raw-min.pdf");
+    let f = tmp.path().join("f-raw-min.pdf");
+    let expected_header = b"%PDF-1.7.\n";
+
+    let (q_ok, stderr) = run_qpdf(&[
+        "--min-version=1.7.",
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q.exists(),
+        "qpdf raw min-version merge failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--min-version=1.7.",
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    assert!(std::fs::read(&q).unwrap().starts_with(expected_header));
+    assert!(
+        std::fs::read(&f).unwrap().starts_with(expected_header),
+        "multi-source page extraction must preserve the raw minimum version"
+    );
+}
+
+#[test]
+fn pages_multi_source_min_version_numeric_tie_keeps_input_raw_spelling() {
+    // A PDF 1.7 input and `--min-version=1.7x.2` are numerically tied. qpdf
+    // advances only the extension level in this case and keeps the incumbent
+    // input spelling (`1.7`) for both the header and /BaseVersion.
+    if !qpdf_available() {
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping numeric-tie differential");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let secondary = fixture_abs(ONE_PAGE_V17);
+    let q = tmp.path().join("q-numeric-tie.pdf");
+    let f = tmp.path().join("f-numeric-tie.pdf");
+    let expected_header = b"%PDF-1.7\n";
+
+    let (q_ok, stderr) = run_qpdf(&[
+        "--min-version=1.7x.2",
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q.exists(),
+        "qpdf numeric-tie merge failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--min-version=1.7x.2",
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    for path in [&q, &f] {
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.starts_with(expected_header));
+        assert!(String::from_utf8_lossy(&bytes).contains("/BaseVersion /1.7 "));
+        let check = Shell::new(QPDF)
+            .args(["--check", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stdout.contains("PDF Version: 1.7 extension level 2"),
+            "numeric tie must keep input version and raise only extension level: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn overlay_min_version_preserves_qpdf_raw_spelling() {
+    // The plain rewrite overlay path must keep the explicit raw minimum while
+    // adding the destination and overlay input floors separately.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping overlay raw-version differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let overlay = fixture_abs(ONE_PAGE);
+    let q = tmp.path().join("q-overlay-raw-min.pdf");
+    let f = tmp.path().join("f-overlay-raw-min.pdf");
+    let expected_header = b"%PDF-1.7.\n";
+
+    let (q_ok, stderr) = run_qpdf(&[
+        "--min-version=1.7.",
+        primary.to_str().unwrap(),
+        "--overlay",
+        overlay.to_str().unwrap(),
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q.exists(),
+        "qpdf overlay raw-version job failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--min-version=1.7.",
+            "--overlay",
+            overlay.to_str().unwrap(),
+            "--",
+        ])
+        .assert()
+        .success();
+
+    assert!(std::fs::read(&q).unwrap().starts_with(expected_header));
+    assert!(
+        std::fs::read(&f).unwrap().starts_with(expected_header),
+        "overlay rewrite must preserve the raw minimum version"
+    );
+}
+
+#[test]
+fn empty_pages_min_version_preserves_qpdf_raw_spelling() {
+    // The empty-primary page route has its own source-floor accumulator; it
+    // must not normalize the explicit raw minimum before the final writer.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping empty-pages raw-version differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let source = fixture_abs(ONE_PAGE);
+    let q = tmp.path().join("q-empty-raw-min.pdf");
+    let f = tmp.path().join("f-empty-raw-min.pdf");
+    let expected_header = b"%PDF-1.7.\n";
+
+    let (q_ok, stderr) = run_qpdf(&[
+        "--min-version=1.7.",
+        "--empty",
+        "--pages",
+        source.to_str().unwrap(),
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q.exists(),
+        "qpdf empty-pages raw-version job failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--min-version=1.7.",
+            "--empty",
+            "--pages",
+            source.to_str().unwrap(),
+            "1",
+            "--",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(std::fs::read(&q).unwrap().starts_with(expected_header));
+    assert!(
+        std::fs::read(&f).unwrap().starts_with(expected_header),
+        "empty-primary page extraction must preserve the raw minimum version"
+    );
+}
+
+#[test]
+fn pages_then_overlay_min_version_preserves_qpdf_raw_spelling() {
+    // This reaches run_page_extraction_after_plan's overlay block after page
+    // selection, the fourth aggregation site in the CLI.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping pages-overlay raw-version differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let overlay = fixture_abs(ONE_PAGE);
+    let q = tmp.path().join("q-pages-overlay-raw-min.pdf");
+    let f = tmp.path().join("f-pages-overlay-raw-min.pdf");
+    let expected_header = b"%PDF-1.7.\n";
+
+    let (q_ok, stderr) = run_qpdf(&[
+        "--min-version=1.7.",
+        primary.to_str().unwrap(),
+        "--overlay",
+        overlay.to_str().unwrap(),
+        "--",
+        "--pages",
+        ".",
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q.exists(),
+        "qpdf pages-overlay raw-version job failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--min-version=1.7.",
+            "--overlay",
+            overlay.to_str().unwrap(),
+            "--",
+            "--pages",
+            ".",
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    assert!(std::fs::read(&q).unwrap().starts_with(expected_header));
+    assert!(
+        std::fs::read(&f).unwrap().starts_with(expected_header),
+        "page selection followed by overlay must preserve the raw minimum version"
+    );
+}
+
+#[test]
 fn pages_preserves_primary_catalog_and_trailer_metadata() {
     // QPDFJob mutates the authenticated primary in place
     // (QPDFJob.cc:2462-2472), so page selection must not replace its Catalog or

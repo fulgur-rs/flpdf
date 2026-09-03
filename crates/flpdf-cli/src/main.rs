@@ -75,6 +75,7 @@ struct WriterOptions {
     deterministic_id: bool,
     static_aes_iv: bool,
     no_original_object_ids: bool,
+    input_version_floor: Option<PdfVersion>,
     min_version: Option<String>,
     min_extension_level: Option<i64>,
     force_version: Option<String>,
@@ -104,6 +105,7 @@ impl Default for WriterOptions {
             deterministic_id: false,
             static_aes_iv: false,
             no_original_object_ids: false,
+            input_version_floor: None,
             min_version: None,
             min_extension_level: None,
             force_version: None,
@@ -148,6 +150,27 @@ fn apply_cli_version_options(options: &mut WriterOptions, versions: &CliVersionO
         options.force_version = Some(version.clone());
         options.force_extension_level = Some(*extension_level);
     }
+}
+
+/// Accumulate qpdf's `max_input_version` floor without touching the explicit
+/// raw `--min-version` option. qpdf gathers input versions in `QPDFJob` and
+/// applies that floor to the writer before applying the explicit minimum
+/// (`libqpdf/QPDFJob.cc:1695-1716,2907-2924`).
+fn update_input_version_floor<R: Read + Seek>(
+    floor: &mut Option<PdfVersion>,
+    pdf: &mut Pdf<R>,
+) -> CliResult<()> {
+    if let Some(source_version) = parse_pdf_version(pdf.version()) {
+        let candidate = PdfVersion::new(
+            source_version.major(),
+            source_version.minor(),
+            pdf.adobe_extension_level()?.unwrap_or(0),
+        );
+        if floor.is_none_or(|current| current < candidate) {
+            *floor = Some(candidate);
+        }
+    }
+    Ok(())
 }
 
 fn apply_cli_decode_level(options: &mut WriterOptions, decode_level: Option<CliDecodeLevel>) {
@@ -236,6 +259,10 @@ fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfi
     configuration.set_static_aes_iv(options.static_aes_iv);
     configuration.set_suppress_original_object_ids(options.no_original_object_ids);
     configuration.set_preserve_encryption(options.preserve_encryption);
+    if let Some(version) = options.input_version_floor {
+        let (version, extension_level) = version.get_version();
+        configuration.set_minimum_pdf_version(version, extension_level);
+    }
     if let Some(version) = options.min_version.as_deref() {
         configuration.set_minimum_pdf_version(version, options.min_extension_level.unwrap_or(0));
     }
@@ -4403,42 +4430,14 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let _built_overlay_specs = if !overlay_specs.is_empty() {
             let mut built = build_overlay_specs(overlay_specs, repair, password)?;
 
-            // flpdf-9hc.16.8: propagate max input header version + Adobe
-            // extension_level to the writer (mirrors qpdf QPDFJob.cc L1714
-            // accumulator + L2913 setMinimumPDFVersion). Executed only when
-            // overlay/underlay is in play; a full CLI-wide input-version
-            // accumulator across other paths is out of scope here (documented
-            // as non-scope in the bd design).
-            let initial_version =
-                parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
-            let mut max_version = PdfVersion::new(
-                initial_version.major(),
-                initial_version.minor(),
-                pdf.adobe_extension_level()?.unwrap_or(0),
-            );
+            // flpdf-9hc.16.8: propagate qpdf's max input version and Adobe
+            // extension level to the writer (QPDFJob.cc:1714 and :2913),
+            // while leaving the explicit raw --min-version for the writer's
+            // later setter.
+            update_input_version_floor(&mut options.input_version_floor, &mut pdf)?;
             for spec in built.iter_mut() {
-                let source_version =
-                    parse_pdf_version(spec.source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
-                max_version.update_if_greater(PdfVersion::new(
-                    source_version.major(),
-                    source_version.minor(),
-                    spec.source.adobe_extension_level()?.unwrap_or(0),
-                ));
+                update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
             }
-            // Preserve any pre-existing --min-version / --min-extension-level
-            // CLI arg by taking pairwise max with the accumulated floor.
-            if let Some(ref current) = options.min_version {
-                let current_version =
-                    parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
-                max_version.update_if_greater(PdfVersion::new(
-                    current_version.major(),
-                    current_version.minor(),
-                    options.min_extension_level.unwrap_or(0),
-                ));
-            }
-            let (version, max_ext) = max_version.get_version();
-            options.min_version = Some(version);
-            options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
             // --verbose: emit the per-destination-page overlay/underlay plan
             // to stderr before painting, matching qpdf's --verbose output
@@ -5269,29 +5268,12 @@ fn run_empty_page_extraction(
 
     // qpdf raises the output version floor from every source participating in
     // a page job, including the empty primary's source heap
-    // (`QPDFJob.cc:1714-1715,2847-2918`).
+    // (`QPDFJob.cc:1714-1715,2847-2918`). Keep that floor separate from the
+    // explicit raw minimum so the writer can apply qpdf's setter order.
     let mut options = options;
-    let mut max_version = PdfVersion::new(1, 0, 0);
     for source in &mut sources {
-        let source_version =
-            parse_pdf_version(source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
-        max_version.update_if_greater(PdfVersion::new(
-            source_version.major(),
-            source_version.minor(),
-            source.adobe_extension_level()?.unwrap_or(0),
-        ));
+        update_input_version_floor(&mut options.input_version_floor, source)?;
     }
-    if let Some(ref current) = options.min_version {
-        let current_version = parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
-        max_version.update_if_greater(PdfVersion::new(
-            current_version.major(),
-            current_version.minor(),
-            options.min_extension_level.unwrap_or(0),
-        ));
-    }
-    let (version, max_ext) = max_version.get_version();
-    options.min_version = Some(version);
-    options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
     let collate = parse_collate_values(&page_ops.collate)?;
     let source_warnings = job.has_warnings();
@@ -5459,30 +5441,11 @@ fn run_page_extraction_from_multiple_sources(
     // --min-version/--force-version settings
     // (`QPDFJob.cc:2847-2918`). The merged fresh document starts at its
     // baseline version, so carry the source floor explicitly through the
-    // multi-source consumer boundary. Keep the existing pairwise version /
-    // extension ordering used by the overlay route.
+    // multi-source consumer boundary without rewriting the raw minimum.
     let mut options = options;
-    let mut max_version = PdfVersion::new(1, 0, 0);
     for source in &mut sources {
-        let source_version =
-            parse_pdf_version(source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
-        max_version.update_if_greater(PdfVersion::new(
-            source_version.major(),
-            source_version.minor(),
-            source.adobe_extension_level()?.unwrap_or(0),
-        ));
+        update_input_version_floor(&mut options.input_version_floor, source)?;
     }
-    if let Some(ref current) = options.min_version {
-        let current_version = parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
-        max_version.update_if_greater(PdfVersion::new(
-            current_version.major(),
-            current_version.minor(),
-            options.min_extension_level.unwrap_or(0),
-        ));
-    }
-    let (version, max_ext) = max_version.get_version();
-    options.min_version = Some(version);
-    options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
     let primary_copy_encryption = sources
         .first_mut()
@@ -5813,32 +5776,10 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // source documents through the in-memory writer for the same reason.
     let _built_overlay_specs = if !overlay_specs.is_empty() {
         let mut built = build_overlay_specs(overlay_specs, repair, password)?;
-        let initial_version = parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
-        let mut max_version = PdfVersion::new(
-            initial_version.major(),
-            initial_version.minor(),
-            pdf.adobe_extension_level()?.unwrap_or(0),
-        );
+        update_input_version_floor(&mut options.input_version_floor, pdf)?;
         for spec in built.iter_mut() {
-            let source_version =
-                parse_pdf_version(spec.source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
-            max_version.update_if_greater(PdfVersion::new(
-                source_version.major(),
-                source_version.minor(),
-                spec.source.adobe_extension_level()?.unwrap_or(0),
-            ));
+            update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
         }
-        if let Some(ref current) = options.min_version {
-            let current_version = parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
-            max_version.update_if_greater(PdfVersion::new(
-                current_version.major(),
-                current_version.minor(),
-                options.min_extension_level.unwrap_or(0),
-            ));
-        }
-        let (version, max_ext) = max_version.get_version();
-        options.min_version = Some(version);
-        options.min_extension_level = (max_ext > 0).then_some(max_ext);
 
         if verbose {
             let report = flpdf::overlay_verbose_report(pdf, &mut built)?;

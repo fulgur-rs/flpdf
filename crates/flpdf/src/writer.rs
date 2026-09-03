@@ -446,11 +446,14 @@ fn update_minimum_pdf_version(
         Some((current_version, current_extension_level)) => {
             match crate::pdf_version::parse_qpdf_writer_version(current_version) {
                 Some(current_parsed) => {
-                    if candidate > current_parsed
-                        || (candidate == current_parsed
-                            && extension_level > *current_extension_level)
-                    {
+                    if candidate > current_parsed {
                         *current_version = version;
+                        *current_extension_level = extension_level;
+                    } else if candidate == current_parsed
+                        && extension_level > *current_extension_level
+                    {
+                        // qpdf updates only the extension level on a numeric
+                        // tie; the incumbent raw version spelling survives.
                         *current_extension_level = extension_level;
                     }
                 }
@@ -1856,8 +1859,9 @@ fn effective_pdf_version_and_ext_without_force<'a>(
 
     let mut best = None;
     // QPDFWriter's minimum is a pair. Keep the raw string and extension level
-    // together so an equal numeric version with a higher extension level also
-    // selects that candidate's raw header spelling.
+    // together so a strictly greater numeric version replaces both, while a
+    // numeric tie raises only the extension level and keeps the incumbent raw
+    // header spelling.
     if let Some(encryption_floor) = encryption_version_floor(options) {
         let raw = encryption_floor.static_version_str().unwrap_or("1.7");
         update_effective_pdf_version(&mut best, raw, encryption_floor.extension_level());
@@ -5745,6 +5749,15 @@ mod final_handle_writer_tests {
 
         let mut current = Some(("1.7".to_string(), 1));
         update_minimum_pdf_version(&mut current, "1.7".to_string(), 2);
+
+        assert_eq!(current, Some(("1.7".to_string(), 2)));
+    }
+
+    #[test]
+    fn minimum_version_numeric_tie_keeps_incumbent_raw_version() {
+        let mut current = Some(("1.7".to_string(), 0));
+
+        update_minimum_pdf_version(&mut current, "1.7x".to_string(), 2);
 
         assert_eq!(current, Some(("1.7".to_string(), 2)));
     }

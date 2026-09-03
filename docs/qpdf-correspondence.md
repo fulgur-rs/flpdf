@@ -1047,8 +1047,12 @@ fallback にしない。global な password mode/weak-crypto policy は共有す
 `.50qd.2` では `QPDFJob.cc:1714-1715` の全 input version floor と
 `QPDFJob.cc:2847-2918` の writer 設定境界を、multi-source `--pages` の
 fresh merged document に明示的に伝播する。primary と全 secondary の
-`M.m`/`/Extensions /ADBE /ExtensionLevel` の pairwise max を既存の
-`--min-version` と合成し、`--force-version` は従来どおり最終的に優先させる。
+`M.m`/`/Extensions /ADBE /ExtensionLevel` の pairwise max は
+`WriterOptions::input_version_floor` に保持し、明示 `--min-version` の raw
+文字列を正規化せず、`WriterConfiguration::set_minimum_pdf_version` で
+source floor の後に適用する。`QPDFWriter.cc:217-250` の numeric tie では
+incumbent の raw version を保持して extension level だけ更新し、
+`--force-version` は従来どおり最終的に優先させる。
 `.50qd.3` では `QPDFJob.cc:2462-2472` の「primary QPDF をページ操作の
 base として in-place 更新する」責務と、`QPDFJob.cc:2590-2632` の
 `/Pages`・`/PageLabels`・AcroForm の選択ページ側更新を分離した。`job/page_merge.rs`
