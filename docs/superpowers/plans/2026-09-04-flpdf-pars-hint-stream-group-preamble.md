@@ -273,4 +273,3 @@ git push -u origin fix/flpdf-pars-hint-groups
 ~~~
 
 Expected: Beads prints Push complete. and git push succeeds. Finish with git status --short --branch; preserve any pre-existing main-checkout artifacts such as a.pdf.
-
