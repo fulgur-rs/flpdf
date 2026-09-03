@@ -222,14 +222,14 @@ report to be covered. Do not use `cov:ignore` for reachable helper behavior.
 
 **Files:** Verify git, GitHub, and Beads state; preserve unrelated worktrees.
 
-- [ ] **Step 1: Request independent review**
+- [x] **Step 1: Request independent review**
 
 Review `origin/main..HEAD` against pinned qpdf 11.9.0. Check helper order,
 structural cleanup ownership, rotation-after-helper behavior, QPDFJob/CLI
 scope, and tests. Fix Critical/Important findings with RED tests and rerun
 affected gates.
 
-- [ ] **Step 2: Rebase and run fresh checks**
+- [x] **Step 2: Rebase and run fresh checks**
 
 Run:
 
