@@ -23,6 +23,10 @@ class DctBackendDocumentationTests(unittest.TestCase):
         self.assertIn("Unsupported marker type 0xNN", module_doc)
         self.assertIn("Do not\n//! fabricate that byte", module_doc)
         self.assertIn("`qpdf-libjpeg-compat` feature", module_doc)
+        self.assertIn("Correctness fix (`flpdf-401z`)", module_doc)
+        self.assertIn("scans marker segments", module_doc)
+        self.assertIn("rejects reserved marker codes", module_doc)
+        self.assertIn("accept/reject gap", module_doc)
 
         dct_section = correspondence[
             correspondence.index("| `Pl_DCT.cc` (buffer/decode)") : correspondence.index(
@@ -33,6 +37,9 @@ class DctBackendDocumentationTests(unittest.TestCase):
         self.assertIn("JERR_UNKNOWN_MARKER", dct_section)
         self.assertIn("InvalidMarker", dct_section)
         self.assertIn("`flpdf-69n1`", dct_section)
+        self.assertIn("`flpdf-401z`", dct_section)
+        self.assertIn("accept/reject", dct_section)
+        self.assertIn("pre-pass", dct_section)
         self.assertIn("qpdf-libjpeg-compat", dct_section)
 
 

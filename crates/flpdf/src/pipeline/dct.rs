@@ -12,13 +12,13 @@
 //! marker diagnostic must enable the explicit `qpdf-libjpeg-compat` feature,
 //! which routes DCT decoding through the system-libjpeg compatibility crate.
 //!
-//! Known correctness limitation (`flpdf-401z`): the same reserved-marker
-//! codes are not merely reported with different wording — the default
-//! backend can silently *accept* a JPEG containing one where qpdf/system
-//! libjpeg reject it, because `libjpeg-turbo-rs` treats an unrecognized
-//! marker as "skip its segment and continue" rather than an error. This is
-//! a genuine accept/reject divergence, not only a diagnostic-text gap;
-//! `qpdf-libjpeg-compat` is the only backend that matches qpdf's rejection.
+//! Correctness fix (`flpdf-401z`): the default path now scans marker segments
+//! before the Rust decoder starts and rejects reserved marker codes with a
+//! flpdf-specific error. This compensates for `libjpeg-turbo-rs` treating an
+//! unrecognized marker as "skip its segment and continue" rather than an
+//! error. The pre-pass closes the accept/reject gap for reserved markers while
+//! leaving the exact system-libjpeg diagnostic available through
+//! `qpdf-libjpeg-compat`.
 //!
 //! Known component-count limitation (`flpdf-twm6`): the pinned default
 //! `libjpeg-turbo-rs` 0.8.0 backend supports only 1/3/4-component JPEG decode.
@@ -151,6 +151,53 @@ impl<'a> PlDct<'a> {
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    /// Return the first reserved marker found in the JPEG header.
+    ///
+    /// `libjpeg-turbo-rs` 0.8.0's `MarkerReader` skips every marker that is
+    /// not in its explicit dispatch arms. Real libjpeg rejects reserved
+    /// marker codes instead, so inspect the marker segments before the Rust
+    /// decoder is allowed to start. Payload bytes are skipped by their
+    /// segment length; this pre-pass therefore does not mistake an arbitrary
+    /// `0xff` byte in APP/COM/DQT/DHT data for a marker.
+    fn first_reserved_marker_before_sos(data: &[u8]) -> Option<u8> {
+        if data.get(..2) != Some(&[0xff, 0xd8]) {
+            return None;
+        }
+
+        let mut position = 2;
+        while position < data.len() {
+            if data[position] != 0xff {
+                return None;
+            }
+            while position < data.len() && data[position] == 0xff {
+                position += 1;
+            }
+            let marker = *data.get(position)?;
+            position += 1;
+
+            match marker {
+                0x00 | 0xff => return None,
+                0x01 | 0xd0..=0xd8 => {}
+                0xd9 | 0xda => return None,
+                0xc0..=0xc7 | 0xc9..=0xcf | 0xdb..=0xdf | 0xe0..=0xef | 0xfe => {
+                    let length =
+                        u16::from_be_bytes([*data.get(position)?, *data.get(position + 1)?])
+                            as usize;
+                    if length < 2 {
+                        return None;
+                    }
+                    position = position.checked_add(length)?;
+                    if position > data.len() {
+                        return None;
+                    }
+                }
+                reserved => return Some(reserved),
+            }
+        }
+        None
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     fn require_baseline_eoi(&self, data: &[u8]) -> PipelineResult<()> {
         let metadata = libjpeg_turbo_rs::decode::marker::MarkerReader::new(data)
             .read_markers()
@@ -232,6 +279,12 @@ impl Pipeline for PlDct<'_> {
 
         #[cfg(not(feature = "qpdf-libjpeg-compat"))]
         {
+            if let Some(marker) = Self::first_reserved_marker_before_sos(&data) {
+                return Err(Self::runtime_error(format!(
+                    "unsupported JPEG marker 0x{marker:02x}"
+                )));
+            }
+
             let mut decoder = libjpeg_turbo_rs::ScanlineDecoder::new(&data)
                 .map_err(|error| self.jpeg_error(error, &data))?;
             let (precision, width, height, components) = {
@@ -540,13 +593,37 @@ mod tests {
             .finish()
             .expect_err("reserved JPEG marker must fail rather than silently succeed");
 
-        // The default backend cannot reproduce qpdf's `Unsupported marker
-        // type 0x02` wording (see the module doc's known limitation), but it
-        // must still report the malformed input as an error. Pin the actual
-        // libjpeg-turbo-rs 0.8.0 diagnostic so a future dependency bump that
-        // silently changes or drops this fallback message is caught here.
+        // The default pre-pass reports a flpdf-specific marker diagnostic;
+        // only the compatibility backend preserves qpdf's exact wording.
+        // Pin the default message so a future dependency bump or pre-pass
+        // change cannot silently reintroduce acceptance.
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.message(), "invalid marker: 0xFF00");
+        assert_eq!(error.message(), "unsupported JPEG marker 0x02");
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn reserved_marker_prepass_leaves_other_malformed_headers_to_decoder() {
+        assert_eq!(
+            PlDct::first_reserved_marker_before_sos(&[0xff, 0xd8, 0x00]),
+            None
+        );
+        assert_eq!(
+            PlDct::first_reserved_marker_before_sos(&[0xff, 0xd8, 0xff, 0x00]),
+            None
+        );
+        assert_eq!(
+            PlDct::first_reserved_marker_before_sos(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x01]),
+            None
+        );
+        assert_eq!(
+            PlDct::first_reserved_marker_before_sos(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00,]),
+            None
+        );
+        assert_eq!(
+            PlDct::first_reserved_marker_before_sos(&[0xff, 0xd8, 0xff, 0xd8]),
+            None
+        );
     }
 
     /// Splice a reserved-marker segment (`FF 02 00 04 00 00`) immediately
@@ -575,25 +652,18 @@ mod tests {
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     #[test]
-    fn default_backend_silently_decodes_a_reserved_marker_inside_a_valid_jpeg() {
-        // Known limitation (`flpdf-401z`): libjpeg-turbo-rs 0.8.0 skips an
-        // unrecognized marker segment instead of rejecting it, so a reserved
-        // marker embedded inside an otherwise-valid JPEG decodes
-        // successfully here even though qpdf/system libjpeg reject it (see
-        // `libjpeg_compat_backend_rejects_a_reserved_marker_inside_a_valid_jpeg`
-        // below). This pins the current behavior so a future
-        // libjpeg-turbo-rs bump that starts rejecting it is noticed, not
-        // silently relied upon.
+    fn default_backend_rejects_a_reserved_marker_inside_a_valid_jpeg() {
         let spliced = valid_jpeg_with_spliced_reserved_marker();
 
         let mut sink = Sink;
         let mut decode_stage = PlDct::new("DCT decode", &mut sink);
         decode_stage.write(&spliced).unwrap();
 
-        assert!(
-            decode_stage.finish().is_ok(),
-            "flpdf-401z: default backend is expected to (incorrectly) accept this input"
-        );
+        let error = decode_stage
+            .finish()
+            .expect_err("default backend must reject a reserved marker");
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.to_string(), "unsupported JPEG marker 0x02");
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
