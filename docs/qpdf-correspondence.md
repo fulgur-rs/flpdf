@@ -548,6 +548,24 @@ copy-encryption の Generate でも同じ xref-stream/container route を使う�
 QDF、linearized encrypted Generate、非 Generate の copy-encryption はこの issue の
 scope 外であり、それぞれ既存の dedicated route と `flpdf-j4ph` が担当する。
 
+### Non-linearized source-backed Preserve ObjStm numbering (`flpdf-hi08`, 2026-09-04)
+
+qpdf の encrypted non-linearized standard writer も、出力が暗号化されるかどうかに
+かかわらず、Preserve された source ObjStm の member に最初に到達した時点で
+container と source object-number 順の全 member を予約する
+（`QPDFWriter.cc:1057-1118,1939-1967`）。暗号化された source を平文へ書き直す
+場合も同じ Preserve map と enqueue 順を使うため、`setPreserveEncryption(false)` は
+ObjStm の採番 policy を変更しない。container は再構築され、`/Extends` の間接参照
+だけが引き継がれる（`QPDFWriter.cc:1621-1740`）。
+
+flpdf の specialized non-QDF writer route は `source_xref_entries` から各 Preserve
+batch の source container を再構成し、既存の `ObjectStreamRenumber` に
+`SourceBacked` group として渡す。これにより output encryption と encrypted-source
+decryption の両方で、ordinary object・source container・member range を qpdf の
+reservation order に interleave し、trailer と `/Extends` の参照も同じ map で remap
+する。qpdf の `writeEncryptionDictionary` に合わせ、`/Encrypt` は body の後置 slot
+に残る（`QPDFWriter.cc:2244-2255`）。
+
 **renumber は重複していない**: `writer/rewrite_renumber.rs` は `linearization/plan.rs` からも
 使われる共有機構で、`linearization/renumber.rs` はその上に載る最終採番層。qpdf の
 `obj_renumber` 1 本に対して 2 層構造だが、二重実装ではない。

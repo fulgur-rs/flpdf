@@ -3888,12 +3888,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // does not produce linearized output, so only output encryption applies.
     object_streams::filter_objstm_batches_for_output(pdf, &mut plan.batches, false, encrypting)?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
 
-    // qpdf's non-linearized standard writer assigns generated ObjStm numbers
-    // during the normal enqueue walk even when output encryption is enabled.
-    // The legacy coordinator historically used a Catalog-first map followed by
-    // containers-above-max; keep that route for every other combination and
-    // switch only this explicit non-QDF Generate slice to the canonical
-    // ObjectStreamRenumber walk.
+    // qpdf's non-linearized standard writer assigns ObjStm numbers during the
+    // normal enqueue walk even when output encryption is enabled. The legacy
+    // coordinator historically used a Catalog-first map followed by
+    // containers-above-max; keep that route only for modes whose qpdf contract
+    // does not use source-backed or generated container-first placement.
     let qpdf_generate_encrypted = encrypting
         && !options.qdf
         && options.object_streams == ObjectStreamMode::Generate
@@ -3902,6 +3901,24 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     if qpdf_generate_encrypted {
         qpdf_generate_removed_refs.extend(plan.removed_refs.iter().copied());
     }
+
+    // Preserve mode retains source-container identity from compressed xref
+    // entries. The specialized non-QDF route must use the same container-first
+    // numbering as qpdf's standard writer, including when an encrypted source
+    // is being rewritten as a plain output by test13.
+    let source_xref_entries = pdf.source_xref_entries();
+    let source_container_for_batch: Vec<Option<ObjectRef>> =
+        if options.object_streams == ObjectStreamMode::Preserve {
+            plan.batches
+                .iter()
+                .map(|batch| source_objstm_container_for_batch(batch, &source_xref_entries))
+                .collect()
+        } else {
+            vec![None; plan.batches.len()]
+        };
+    let qpdf_preserve_source_objstm = !options.qdf
+        && options.object_streams == ObjectStreamMode::Preserve
+        && !plan.batches.is_empty();
 
     // Xref form selection: ObjStm-resident objects need type-2 xref entries,
     // which can only live in xref streams.  When the planner emits any batch
@@ -3977,7 +3994,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
     }
 
-    if (options.qdf || qpdf_generate_encrypted) && !plan.batches.is_empty() {
+    if (options.qdf || qpdf_generate_encrypted || qpdf_preserve_source_objstm)
+        && !plan.batches.is_empty()
+    {
         // QPDFWriter's reverse object-stream map is a std::set<QPDFObjGen>, so
         // members inside both generated and preserved containers are emitted
         // in object-number order. The standard enqueue walk determines the
@@ -3993,35 +4012,58 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     // Drive emission from the qpdf enqueue order: `(new_ref, old_ref)` pairs in
-    // ascending reservation order. QDF and encrypted non-QDF Generate both use
-    // the ObjStm-aware walk; other specialized routes retain Catalog-first
-    // numbering.
+    // ascending reservation order. QDF, encrypted non-QDF Generate, and
+    // non-QDF source-backed Preserve all use the ObjStm-aware walk; other
+    // specialized routes retain Catalog-first numbering.
     use crate::writer::object_streams::ObjectStreamGroup;
     use crate::writer::rewrite_renumber::{NewNumberLookup, ObjectStreamRenumber};
-    let object_stream_groups = plan
-        .batches
-        .iter()
-        .cloned()
-        .map(|members| ObjectStreamGroup::Synthetic { members })
-        .collect::<Vec<_>>();
-    let object_stream_renumber =
-        if (options.qdf && !plan.batches.is_empty()) || qpdf_generate_encrypted {
-            let numbering_removed_refs = if qpdf_generate_encrypted {
-                &qpdf_generate_removed_refs
-            } else {
-                &removed_refs
-            };
-            Some(ObjectStreamRenumber::build_with_stream_policy(
-                pdf,
-                &object_stream_groups,
-                true,
-                numbering_removed_refs,
-                options.preserve_unreferenced_objects,
-                Some(&stream_parameters_removed),
-            )?) // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
+    let object_stream_groups = if qpdf_preserve_source_objstm {
+        plan.batches
+            .iter()
+            .enumerate()
+            .map(|(batch_index, members)| {
+                let source = source_container_for_batch
+                    .get(batch_index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "source-backed Preserve ObjStm batch {batch_index} has no source container"
+                        ))
+                    })?;
+                Ok(ObjectStreamGroup::SourceBacked {
+                    source,
+                    members: members.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        plan.batches
+            .iter()
+            .cloned()
+            .map(|members| ObjectStreamGroup::Synthetic { members })
+            .collect::<Vec<_>>()
+    };
+    let object_stream_renumber = if (options.qdf && !plan.batches.is_empty())
+        || qpdf_generate_encrypted
+        || qpdf_preserve_source_objstm
+    {
+        let numbering_removed_refs = if qpdf_generate_encrypted {
+            &qpdf_generate_removed_refs
         } else {
-            None
+            &removed_refs
         };
+        Some(ObjectStreamRenumber::build_with_stream_policy(
+            pdf,
+            &object_stream_groups,
+            true,
+            numbering_removed_refs,
+            options.preserve_unreferenced_objects,
+            Some(&stream_parameters_removed),
+        )?) // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
+    } else {
+        None
+    };
     let renumbered: Vec<(ObjectRef, ObjectRef)> =
         if let Some(object_stream_renumber) = object_stream_renumber.as_ref() {
             let mut pairs = object_stream_renumber.pairs().collect::<Vec<_>>();
@@ -4062,7 +4104,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         } else {
             vec![ObjectRef::new(0, 0); plan.batches.len()]
         }
-    } else if qpdf_generate_encrypted {
+    } else if qpdf_generate_encrypted || qpdf_preserve_source_objstm {
         let refs = (0..plan.batches.len())
             .map(|group_index| {
                 object_stream_renumber
@@ -4072,10 +4114,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             })
             .collect::<Option<Vec<_>>>();
         refs.ok_or_else(|| {
-            // cov:ignore-start: every filtered Generate group is reachable by
+            // cov:ignore-start: every filtered encrypted group is reachable by
             // the same canonical walk that assigned its members.
             crate::Error::Internal(
-                "encrypted Generate ObjStm group was not assigned a container number".to_string(),
+                "encrypted ObjStm group was not assigned a container number".to_string(),
             )
             // cov:ignore-end
         })? // cov:ignore: the canonical walk assigns every emitted Generate group
@@ -4114,22 +4156,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             member_batch_index.insert(member_ref, batch_idx);
         }
     }
-    // Preserve the source ObjStm identity for qpdf's `/Extends` relation.
-    // `PackingPlan` carries member batches for the specialized route, so
-    // recover each source container from the compressed xref entry rather
-    // than guessing from `/Type /ObjStm` (qpdf derives this relation from the
-    // xref table, `QPDF.cc:2381-2390`). Generated batches have no source
-    // container and therefore no `/Extends` value.
-    let source_xref_entries = pdf.source_xref_entries();
-    let source_container_for_batch: Vec<Option<ObjectRef>> =
-        if options.object_streams == ObjectStreamMode::Preserve {
-            plan.batches
-                .iter()
-                .map(|batch| source_objstm_container_for_batch(batch, &source_xref_entries))
-                .collect()
-        } else {
-            vec![None; plan.batches.len()]
-        };
+    // `source_container_for_batch` preserves the source ObjStm identity for
+    // qpdf's `/Extends` relation. It was derived from compressed xref ownership
+    // before the enqueue numbering so placement and reconstruction share one
+    // source identity (qpdf `QPDF.cc:2381-2390`).
     let source_container_to_batch: HashMap<ObjectRef, usize> = source_container_for_batch
         .iter()
         .enumerate()
@@ -4462,7 +4492,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
     let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
     let qdf_body_start = bytes.len();
-    let merge_objstm_chunks = (options.qdf && !plan.batches.is_empty()) || qpdf_generate_encrypted;
+    let merge_objstm_chunks = (options.qdf && !plan.batches.is_empty())
+        || qpdf_generate_encrypted
+        || qpdf_preserve_source_objstm;
     let mut qdf_main_chunks = BTreeMap::<ObjectRef, (usize, usize)>::new();
     let mut qdf_container_chunks = BTreeMap::<usize, (usize, usize)>::new();
 
@@ -4962,7 +4994,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &container_refs,
                     options.qdf,
                     &qdf_emission_renumber,
-                    &renumber,
+                    renumber_lookup,
                 )
             })
         } else {

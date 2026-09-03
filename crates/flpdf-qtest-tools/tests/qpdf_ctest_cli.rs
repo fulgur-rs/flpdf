@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use flpdf::Pdf;
 use std::fs;
 use std::io::Cursor;
+use std::process::Command as ProcessCommand;
 
 fn minimal_pdf() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,6 +15,12 @@ fn encrypted_fixture(name: &str) -> std::path::PathBuf {
         .join("../..")
         .join("tests/fixtures/encrypted")
         .join(name)
+}
+
+fn objstm_fixture() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/compat/three-page-objstm.pdf")
 }
 
 #[test]
@@ -136,6 +143,102 @@ fn qpdf_ctest_encryption_writer_cases_cover_r2_through_r6() {
         .expect("ctest encryption output must authenticate");
         assert!(pdf.is_encrypted());
     }
+}
+
+#[test]
+fn qpdf_ctest_preserves_qpdf_objstm_enqueue_order_for_encryption_and_decryption() {
+    let qpdf_available = ProcessCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !qpdf_available {
+        eprintln!("qpdf is not available; skipping qpdf ObjStm enqueue-order oracle test");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = objstm_fixture();
+    let qpdf_encrypted = directory.path().join("qpdf-r2.pdf");
+    let flpdf_encrypted = directory.path().join("flpdf-r2.pdf");
+    let qpdf_decrypted = directory.path().join("qpdf-decrypted.pdf");
+    let flpdf_decrypted = directory.path().join("flpdf-decrypted.pdf");
+
+    let qpdf_encrypt = ProcessCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--allow-weak-crypto",
+            "--object-streams=preserve",
+            "--encrypt",
+            "user1",
+            "owner1",
+            "40",
+            "--print=n",
+            "--modify=y",
+            "--extract=y",
+            "--annotate=y",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&qpdf_encrypted)
+        .status()
+        .expect("run qpdf R2 encryption oracle");
+    assert!(qpdf_encrypt.success(), "qpdf R2 encryption oracle failed");
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "11",
+            input.to_str().expect("fixture path is UTF-8"),
+            "",
+            flpdf_encrypted.to_str().expect("output path is UTF-8"),
+        ])
+        .assert()
+        .success()
+        .stdout("C test 11 done\n")
+        .stderr("");
+
+    let flpdf_difference = flpdf_qtest_tools::compare_files(
+        &fs::read(&flpdf_encrypted).expect("read flpdf encrypted output"),
+        &fs::read(&qpdf_encrypted).expect("read qpdf encrypted output"),
+        b"user1",
+    )
+    .expect("compare encrypted outputs");
+    assert_eq!(
+        flpdf_difference, None,
+        "encrypted C API output must use qpdf source-backed ObjStm numbering"
+    );
+
+    let qpdf_decrypt = ProcessCommand::new("qpdf")
+        .args(["--static-id", "--password=user1", "--decrypt"])
+        .arg(&qpdf_encrypted)
+        .arg(&qpdf_decrypted)
+        .status()
+        .expect("run qpdf decryption oracle");
+    assert!(qpdf_decrypt.success(), "qpdf decryption oracle failed");
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "13",
+            qpdf_encrypted.to_str().expect("encrypted path is UTF-8"),
+            "user1",
+            flpdf_decrypted.to_str().expect("output path is UTF-8"),
+        ])
+        .assert()
+        .success()
+        .stdout("user password: user1\nC test 13 done\n")
+        .stderr("");
+
+    let flpdf_decrypted_difference = flpdf_qtest_tools::compare_files(
+        &fs::read(&flpdf_decrypted).expect("read flpdf decrypted output"),
+        &fs::read(&qpdf_decrypted).expect("read qpdf decrypted output"),
+        b"",
+    )
+    .expect("compare decrypted outputs");
+    assert_eq!(
+        flpdf_decrypted_difference, None,
+        "decrypted C API output must preserve qpdf source-backed ObjStm numbering"
+    );
 }
 
 #[test]
