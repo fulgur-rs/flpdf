@@ -11,14 +11,15 @@
 //! annotation/outline null-out family, where the reference is kept verbatim and
 //! the page object becomes `null`.
 
-use flpdf::job::{remap_outline_and_dests, QPDFJob};
+use flpdf::job::{remap_outline_and_dests, JobExitCode, QPDFJob};
 use flpdf::{
     drop_struct_elem_dangling_pg, drop_thread_bead_dangling_p, extract_pages, pages,
     prune_acroform_after_subset, rebuild_page_tree, ObjectHandle, ObjectRef, Pdf,
     RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{BufReader, Cursor};
 
 /// 3-page document with one article thread.
 ///
@@ -113,6 +114,43 @@ fn run_subset_bytes(bytes: Vec<u8>, pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>>
     QPDFJob::prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
     prune_acroform_after_subset(&mut pdf, &result).expect("acroform prune");
     pdf
+}
+
+#[test]
+fn qpdf_job_in_place_page_selection_drops_dangling_bead_p() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let input = tempdir.path().join("thread-input.pdf");
+    let output = tempdir.path().join("thread-output.pdf");
+    std::fs::write(&input, build_fixture()).expect("write thread fixture");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "pages": [{"file": ".", "range": "1,3"}],
+        "removeUnreferencedResources": "yes"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json)
+        .expect("initialize the qpdf-shaped page job");
+    assert_eq!(
+        job.run().expect("run the qpdf-shaped page job"),
+        JobExitCode::Success
+    );
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).expect("open output")))
+        .expect("reopen qpdf job output");
+    let bead = pdf.get_object_handle(ObjectRef::new(12, 0));
+    pdf.resolve(&bead).expect("resolve bead 12");
+    assert!(bead.as_dictionary().is_some(), "bead 12 must remain live");
+    assert!(
+        !bead.has_key(b"/P"),
+        "QPDFJob InPlace page completion must drop the removed page bead /P"
+    );
+    assert!(
+        pdf.live_object_refs().contains(&ObjectRef::new(12, 0)),
+        "QPDFJob InPlace page completion must retain the bead ring"
+    );
 }
 
 #[test]
