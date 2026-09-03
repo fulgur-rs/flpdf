@@ -23,8 +23,9 @@ The dictionary iterator snapshots visible keys in `Members::keys`
 (`include/qpdf/QPDFObjectHandle.hh:1485-1508`). For a key position it assigns
 `getKey(key)`, while only the key-set end position receives a default
 uninitialized handle (`libqpdf/QPDFObjectHandle.cc:2452-2461`). qpdf's
-`getKey` returns an initialized null for a missing key or a non-dictionary
-receiver (`libqpdf/QPDFObjectHandle.cc:978-989`).
+`getKey` returns an initialized null for a missing key and, when a QPDF
+warning context is available, for a non-dictionary receiver; without that
+context the type warning throws (`libqpdf/QPDFObjectHandle.cc:978-989`).
 
 A live probe compiled against the pinned headers and the installed qpdf
 11.9.0 library observed:
@@ -57,10 +58,10 @@ Rust value-returning API.
 `DictItemCursor::current()` returns the snapshotted key and calls the
 container's existing `get_key` for the value at every non-end position. This
 preserves the key's child identity when present and produces an initialized
-contextual null when the key was removed or the live receiver is no longer a
-dictionary. At the key snapshot's end it returns an empty key and a new
-uninitialized handle. The key snapshot remains unchanged and no whole-map
-clone is introduced per step.
+null for a removed key; a live non-dictionary receiver follows the existing
+contextual warning/null contract. At the key snapshot's end it returns an
+empty key and a new uninitialized handle. The key snapshot remains unchanged
+and no whole-map clone is introduced per step.
 
 The safe Rust API continues to return `ObjectHandle`/`DictItem` by value; it
 does not attempt to expose qpdf's borrowed `auto&` iterator reference. The

@@ -13,10 +13,10 @@
 ### Task 1: Add source-derived RED tests
 
 **Files:**
-- Modify: crates/flpdf/src/object_handle.rs cursor tests near qpdf_cursors_return_live_children_and_uninitialized_end_values
+- Modify: crates/flpdf/src/object_handle.rs cursor tests near qpdf_cursors_return_child_identity_and_uninitialized_end_values
 - Modify: crates/flpdf-qtest-tools/src/driver/test_42_49.rs run_test_42 cursor assertions
 
-- [ ] Step 1: Add the array identity and value-stability test
+- [x] Step 1: Add the array identity and value-stability test
 
 Add this test before the existing cursor test:
 
@@ -41,7 +41,7 @@ Add this test before the existing cursor test:
         assert_eq!(held.try_get_name().unwrap(), b"/Item0");
     }
 
-- [ ] Step 2: Add the dictionary missing-key/null test
+- [x] Step 2: Add the dictionary missing-key/null test
 
 Add a two-entry test:
 
@@ -74,18 +74,18 @@ Add a two-entry test:
 Change the existing non-dictionary live-container test to assert that its
 non-end /A value is initialized and null after the dictionary becomes a scalar.
 
-- [ ] Step 3: Correct qtest test_42 assertions
+- [x] Step 3: Correct qtest test_42 assertions
 
 In run_test_42, keep the qpdf source-order operations but make the copied
 i_value and entry.value stable. At the end position, inspect a fresh
 cursor.current() for the uninitialized sentinel. Remove comments that claim
 copied Rust values follow later cursor transitions.
 
-- [ ] Step 4: Run the focused tests and verify behavioral RED
+- [x] Step 4: Run the focused tests and verify behavioral RED
 
     cargo test -p flpdf --lib cursor_current_returns_child_identity_without_rebinding_held_value
     cargo test -p flpdf --lib dict_cursor_returns_identity_and_initialized_null_for_removed_key
-    cargo test -p flpdf --lib dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary
+    cargo test -p flpdf --lib dict_item_cursor_returns_contextual_null_when_container_stops_being_a_dictionary
 
 Expected: the array test fails at identity or held-value stability, the dictionary
 test fails at identity or removed-key null state, and the non-dictionary test
@@ -98,13 +98,13 @@ the RED failures are observed.
 **Files:**
 - Modify: crates/flpdf/src/object_handle.rs:1311-1503 and the cursor-only helper near 1524-1620
 
-- [ ] Step 1: Remove current state and constructor rebinding
+- [x] Step 1: Remove current state and constructor rebinding
 
 Remove current: ObjectHandle from ArrayItemCursor and DictItemCursor. Their
 constructors retain only the live container, visible key snapshot where
 applicable, and index. Remove constructor and movement calls to update_current.
 
-- [ ] Step 2: Return the actual array child handle
+- [x] Step 2: Return the actual array child handle
 
 Implement ArrayItemCursor::current with this direct lookup:
 
@@ -120,7 +120,7 @@ Implement ArrayItemCursor::current with this direct lookup:
 The cloned child must be the same outer ObjectHandle allocation as the array
 element. Keep next and previous responsible only for index movement.
 
-- [ ] Step 3: Return dictionary values through get_key
+- [x] Step 3: Return dictionary values through get_key
 
 Implement DictItemCursor::current with a separate end branch:
 
@@ -137,11 +137,11 @@ Implement DictItemCursor::current with a separate end branch:
         }
     }
 
-This preserves present-child identity and returns an initialized contextual null
-for a removed key or a live non-dictionary receiver. Only the snapshot end
-returns an uninitialized handle.
+This preserves present-child identity and returns an initialized null for a
+removed key; a live non-dictionary receiver follows qpdf's contextual
+warning/null contract. Only the snapshot end returns an uninitialized handle.
 
-- [ ] Step 4: Delete rebind_cursor_value and update cursor docs
+- [x] Step 4: Delete rebind_cursor_value and update cursor docs
 
 Run rg -n rebind_cursor_value and confirm the helper has no unrelated caller.
 Delete it without removing shared ownership helpers used by other canonical
@@ -149,12 +149,12 @@ paths. Document that current() returns a value clone sharing selected-child
 identity but not later cursor position; only a fresh end current() is
 uninitialized.
 
-- [ ] Step 5: Run GREEN tests
+- [x] Step 5: Run GREEN tests
 
     cargo test -p flpdf --lib cursor_current_returns_child_identity_without_rebinding_held_value
     cargo test -p flpdf --lib dict_cursor_returns_identity_and_initialized_null_for_removed_key
-    cargo test -p flpdf --lib dict_item_cursor_falls_back_to_uninitialized_when_the_container_stops_being_a_dictionary
-    cargo test -p flpdf --lib qpdf_cursors_return_live_children_and_uninitialized_end_values
+    cargo test -p flpdf --lib dict_item_cursor_returns_contextual_null_when_container_stops_being_a_dictionary
+    cargo test -p flpdf --lib qpdf_cursors_return_child_identity_and_uninitialized_end_values
     cargo test -p flpdf --lib object_handle
 
 Expected: all commands exit 0 with zero failures.
@@ -168,21 +168,22 @@ Expected: all commands exit 0 with zero failures.
 - Modify: docs/superpowers/plans/2026-08-30-qtest-type-checks.md iterator task
 - Modify: docs/qpdf-correspondence.md ObjectHandle/array iterator annotation
 
-- [ ] Step 1: Record the exact value/reference boundary
+- [x] Step 1: Record the exact value/reference boundary
 
 State that qpdf auto& binds to the iterator's internal ivalue, while a copied
 QPDFObjectHandle shares the selected child object but remains a copy of that
 handle after movement. flpdf current() returns by value and follows the latter
 behavior.
 
-- [ ] Step 2: Record dictionary missing-key behavior
+- [x] Step 2: Record dictionary missing-key behavior
 
 State that the visible key snapshot remains qpdf-compatible, get_key supplies
-initialized null for a non-end missing key or non-dictionary receiver, and only
-the position after the snapshot receives an uninitialized value. Preserve pinned
-qpdf citations and the live probe result. Add no deviation marker.
+an initialized null for a non-end missing key and follows qpdf's contextual
+warning/null contract for a non-dictionary receiver, while only the position
+after the snapshot receives an uninitialized value. Preserve pinned qpdf
+citations and the live probe result. Add no deviation marker.
 
-- [ ] Step 3: Verify documentation and formatting
+- [x] Step 3: Verify documentation and formatting
 
     cargo fmt --all -- --check
     git diff --check
@@ -196,14 +197,14 @@ Expected: all commands exit 0.
 **Files:**
 - Verify the full worktree; no additional production modules are expected.
 
-- [ ] Step 1: Build release binaries with qpdf-zlib-compat for qtest
+- [x] Step 1: Build release binaries with qpdf-zlib-compat for qtest
 
     cargo build --release --workspace --features qpdf-zlib-compat
 
 Expected: the worktree release binaries used by flpdf-qtest are built from the
 current commit.
 
-- [ ] Step 2: Run the complete type-check qtest suite
+- [x] Step 2: Run the complete type-check qtest suite
 
 From /home/ubuntu/flpdf-qtest, run:
 
@@ -216,7 +217,7 @@ scripts/verify-parity-manifest.py against that artifact pair and writes their
 summaries under survey/latest; inspect both verdicts.
 Do not copy qpdf-qtest fixtures into flpdf.
 
-- [ ] Step 3: Run focused, crate, CLI, and workspace tests
+- [x] Step 3: Run focused, crate, CLI, and workspace tests
 
     cargo test -p flpdf --lib object_handle
     cargo test -p flpdf-qtest-tools

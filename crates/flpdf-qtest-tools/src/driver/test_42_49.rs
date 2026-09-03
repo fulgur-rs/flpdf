@@ -53,7 +53,10 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     // qpdf 11.9.0 qpdf/test_driver.cc:1407-1549. Keep this as a thin
     // consumer of ObjectHandle's qpdf-shaped accessors: warning text is
     // produced by the handle's document resolver and drained here at the
-    // same boundaries as qpdf's logger.
+    // same boundaries as qpdf's logger. qpdf's C++ test binds `auto&` to the
+    // iterator's internal `ivalue`; this Rust API returns ObjectHandle values,
+    // so copied handles stay stable and later positions use fresh `current()`
+    // calls.
     let qtest = pdf.trailer_key_handle(b"QTest");
     pdf.resolve(&qtest)?;
     let qtest = qtest.clone();
@@ -80,9 +83,12 @@ pub(crate) fn run_test_42<R: Read + Seek>(
         assert!(cursor.is_end());
         cursor.next();
         assert!(cursor.is_end());
-        assert!(!i_value.is_initialized());
+        assert!(!cursor.current().is_initialized());
+        assert!(i_value.is_initialized());
+        assert_eq!(i_value.try_get_name()?, b"/Item0");
         cursor.previous();
-        assert_eq!(i_value.try_get_name()?, b"/Item2");
+        assert_eq!(cursor.current().try_get_name()?, b"/Item2");
+        assert_eq!(i_value.try_get_name()?, b"/Item0");
         assert_eq!(cursor.current().try_get_name()?, b"/Item2");
     }
 
@@ -96,7 +102,9 @@ pub(crate) fn run_test_42<R: Read + Seek>(
         cursor.next();
         cursor.next();
         assert!(cursor.is_end());
-        assert!(!entry.value.is_initialized());
+        assert!(!cursor.current().value.is_initialized());
+        assert!(entry.value.is_initialized());
+        assert_eq!(entry.value.try_get_name()?, b"/Value1");
     }
 
     qtest.try_get_string_value()?;
