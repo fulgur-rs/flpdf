@@ -66,6 +66,7 @@ jobs:
           start_seconds=$SECONDS
           cargo build --workspace --all-targets
           rebuild_seconds=$((SECONDS - start_seconds))
+          echo "clean rebuild seconds: ${rebuild_seconds}"
           {
             echo "## Windows debug-info build experiment"
             echo "- variant: ${{ matrix.label }}"
@@ -83,4 +84,5 @@ jobs:
             echo "::error::cargo test --workspace --no-run recompiled a workspace package"
             exit 1
           fi
+          echo "test --no-run reuse: pass"
           echo "- test --no-run reuse: pass" >> "$GITHUB_STEP_SUMMARY"
