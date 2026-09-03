@@ -778,6 +778,14 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | clap で代替 | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。 |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
+`--encrypt` の引数表も qpdf と同じ遷移を保つ。qpdf は3番目の positional
+引数または `--bits` を消費した時点で `40-bit encryption`、`128-bit encryption`、
+`256-bit encryption` の option tableへ切り替え、未知・非対応引数の診断にその名前を
+含める（`QPDFJob_argv.cc:173-228`, `qpdf/auto_job_init.hh:133-163`,
+`QPDFArgParser.cc:496-502`）。flpdf は `parse_encrypt_segment` で同じ時点に key lengthを
+確定し、`unrecognized_encrypt_argument` から同じ suffixを生成する。key length確定前は
+qpdfの `encryption options must be terminated with --` を維持する。
+
 `QPDFJob::Config::keepFilesOpen` / `keepFilesOpenThreshold` は `job/lifecycle.rs` の job configuration と `job/page_specs.rs::QPDFJob::handle_page_specs` に接続した。未指定時は qpdf の `page_specs` 上の異なる source index 数を閾値（既定200）と比較し、明示 y/n はその値を優先する。CLIとjob JSONのpage-spec callerは全specのsource identity/policyを先に確定し、各secondary sourceのparse直後・次sourceを開く前に `Pdf::set_input_source_stay_open(false)` を適用する。primaryはqpdfと同じくkeep-openのまま保持する。file source は `Pdf::open_file_with_options` の reopenable readerを使い、qpdfの `ClosedFileInputSource::before`/`after` 相当で secondary source を close/reopen する（`QPDFJob_config.cc:342-353`, `QPDFJob.cc:2374-2427`, `ClosedFileInputSource.cc:18-35,97-104`）。
 
 `--job-json-file` の page-transform fields `splitPages`、`rotate`、`removeRestrictions` は、qpdf の生成 JSON handler (`QPDFJob_json.cc:611-624`, `auto_job_json_init.hh`) と Config/Job call order (`QPDFJob_config.cc:535-540,597-609`; `QPDFJob.cc:369-411,428-520,2137-2150,2635-2651,2940-3025`) に対応して `job/lifecycle.rs` の canonical configuration から page split、rotation、security/signature mutation へ接続した。 |
