@@ -29,9 +29,7 @@ pub(crate) use check::{
     check_linearization_parameters, check_linearization_warnings, LinearizationParameterCheck,
 };
 pub use hint_page::{bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHintTable};
-pub use hint_shared::{
-    SharedGroupEntry, SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,
-};
+pub use hint_shared::{SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable};
 pub use hint_stream::{encode_hint_stream, HintStreamBytes};
 pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
