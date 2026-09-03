@@ -19,6 +19,19 @@
 //! marker as "skip its segment and continue" rather than an error. This is
 //! a genuine accept/reject divergence, not only a diagnostic-text gap;
 //! `qpdf-libjpeg-compat` is the only backend that matches qpdf's rejection.
+//!
+//! Known component-count limitation (`flpdf-twm6`): the pinned default
+//! `libjpeg-turbo-rs` 0.8.0 backend supports only 1/3/4-component JPEG decode.
+//! Its `decode_image_inner` has dedicated branches for those counts and
+//! otherwise reports `N components not yet supported`. qpdf's `Pl_DCT` uses
+//! libjpeg's `output_components` for each row (`libqpdf/Pl_DCT.cc:297-326`),
+//! so qpdf accepts, for example, a 2-component JPEG that the default backend
+//! cannot decode. This is a permanent capability limitation of the pinned
+//! default backend until upstream adds the missing component path; keep the
+//! explicit gate in `finish` rather than exposing the less-specific upstream
+//! error. Callers requiring qpdf parity for such streams must enable the
+//! explicit `qpdf-libjpeg-compat` feature, which routes decoding through the
+//! system-libjpeg compatibility backend.
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
@@ -327,6 +340,29 @@ mod tests {
         }
     }
 
+    fn two_component_jpeg() -> Vec<u8> {
+        let mut jpeg = libjpeg_turbo_rs::compress(
+            &[128u8],
+            1,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("component-count test JPEG must encode");
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .expect("baseline JPEG must contain SOF0");
+        let segment_length = u16::from_be_bytes([jpeg[sof + 2], jpeg[sof + 3]]);
+        assert_eq!(segment_length, 11);
+        jpeg[sof + 9] = 2;
+        jpeg[sof + 2..sof + 4].copy_from_slice(&(segment_length + 3).to_be_bytes());
+        let second_component = sof + 2 + usize::from(segment_length);
+        jpeg.splice(second_component..second_component, [2, 0x11, 0]);
+        jpeg
+    }
+
     #[test]
     fn compatibility_test_sink_implements_pipeline_methods() {
         let mut sink = Sink;
@@ -425,6 +461,48 @@ mod tests {
         assert_eq!(
             finish_stage.finish().unwrap_err().message(),
             "sink finish failure 1"
+        );
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn default_backend_rejects_two_component_jpeg() {
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        let error = {
+            let mut stage = PlDct::new("DCT decode", &mut sink);
+            stage
+                .write(&two_component_jpeg())
+                .expect("two-component JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("default backend must reject unsupported component count")
+        };
+
+        assert_eq!(error.to_string(), "unsupported JPEG component count 2");
+        assert!(trace.borrow().output.is_empty());
+        assert!(trace.borrow().calls.is_empty());
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn compat_backend_accepts_two_component_jpeg_like_qpdf() {
+        let trace = shared_trace();
+        let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
+        {
+            let mut stage = PlDct::new("DCT decode", &mut sink);
+            stage
+                .write(&two_component_jpeg())
+                .expect("two-component JPEG must buffer");
+            stage
+                .finish()
+                .expect("compat backend must accept qpdf's component count");
+        }
+
+        assert_eq!(trace.borrow().output, [128, 128]);
+        assert_eq!(
+            trace.borrow().calls.last(),
+            Some(&TraceCall::Finish { failed: false })
         );
     }
 

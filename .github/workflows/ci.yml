@@ -30,6 +30,9 @@ jobs:
       - name: Test DCT backend documentation contract
         run: python3 -m unittest scripts/tests/test_dct_backend_documentation.py
 
+      - name: Test DCT component-limit documentation contract
+        run: python3 -m unittest scripts/tests/test_dct_component_limit_documentation.py
+
       - name: Check qpdf module correspondence
         run: python3 scripts/qpdf-module-docs.py --check
 
