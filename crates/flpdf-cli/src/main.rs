@@ -6,10 +6,10 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
-    remap_outline_and_dests, should_remove_unreferenced_resources, AttachmentAddOptions,
-    AttachmentCopyOptions, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
-    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
-    PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
+    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
+    FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions,
+    JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
+    RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -23,10 +23,7 @@ use flpdf::{
     QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError, WriterConfiguration,
 };
 use flpdf::{
-    objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
-    struct_tree_pg::drop_struct_elem_dangling_pg,
-    thread_bead_p::drop_thread_bead_dangling_p,
     CombinedPage, InputSpec, PageRange, RotateSpec,
 };
 use std::collections::HashSet;
@@ -5717,14 +5714,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         copy_duplicate_page_annotations(pdf, &result)?;
         (result, prune_mode.into())
     };
+    QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode)?;
     apply_rotate_specs(pdf, &page_ops.rotate, &result.new_kids)?;
-
-    remap_outline_and_dests(pdf, &result)?;
-    let objr_obj_targets = drop_struct_elem_dangling_pg(pdf, &result)?;
-    drop_thread_bead_dangling_p(pdf, &result)?;
-    drop_objr_obj_annot_dangling_p(pdf, &result, &objr_obj_targets)?;
-    QPDFJob::prune_after_subset(pdf, prune_mode)?;
-    QPDFJob::prune_acroform_after_subset(pdf, &result)?;
 
     // qpdf runs image externalization/optimization after page selection and
     // before the final writer (`QPDFJob.cc:2151-2174`). Keep the same order so

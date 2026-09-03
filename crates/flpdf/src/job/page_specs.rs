@@ -769,6 +769,32 @@ impl super::QPDFJob {
         super::acroform_field_prune::prune_acroform_after_subset(pdf, result)
     }
 
+    /// Complete qpdf's page-selection mutation for an in-place result.
+    ///
+    /// qpdf performs page navigation cleanup, page-reference cleanup, subset
+    /// pruning, and AcroForm field filtering as one ordered continuation of
+    /// `handlePageSpecs` (`libqpdf/QPDFJob.cc:2360-2632`). Keep the same
+    /// completion boundary for both the QPDFJob lifecycle and the CLI's
+    /// already-opened primary document. Rotation remains a later operation,
+    /// matching qpdf's `createQPDF` order (`QPDFJob.cc:466-470`).
+    ///
+    /// The structural-reference helpers are qpdf-backed page-subset
+    /// consumers: they drop dangling `/Pg` and `/P` references before the
+    /// subset sweep can collect the removed pages. CLI output and writer
+    /// stages are deliberately outside this helper.
+    pub fn complete_in_place_page_selection<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        result: &RebuildResult,
+        prune_mode: RemoveUnreferencedResources,
+    ) -> Result<()> {
+        super::outline_dest_remap::remap_outline_and_dests(pdf, result)?;
+        let objr_obj_targets = crate::drop_struct_elem_dangling_pg(pdf, result)?;
+        crate::drop_thread_bead_dangling_p(pdf, result)?;
+        crate::drop_objr_obj_annot_dangling_p(pdf, result, &objr_obj_targets)?;
+        super::page_subset::prune_after_subset(pdf, prune_mode)?;
+        super::acroform_field_prune::prune_acroform_after_subset(pdf, result)
+    }
+
     /// Resolve and execute qpdf's page-specification operation
     /// (`QPDFJob::handlePageSpecs`, `libqpdf/QPDFJob.cc:2360-2632`). The
     /// low-level page tree and foreign-object responsibilities remain in
