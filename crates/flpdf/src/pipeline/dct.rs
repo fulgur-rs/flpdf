@@ -11,6 +11,14 @@
 //! fabricate that byte in this adapter. Callers that require qpdf's exact
 //! marker diagnostic must enable the explicit `qpdf-libjpeg-compat` feature,
 //! which routes DCT decoding through the system-libjpeg compatibility crate.
+//!
+//! Known correctness limitation (`flpdf-401z`): the same reserved-marker
+//! codes are not merely reported with different wording — the default
+//! backend can silently *accept* a JPEG containing one where qpdf/system
+//! libjpeg reject it, because `libjpeg-turbo-rs` treats an unrecognized
+//! marker as "skip its segment and continue" rather than an error. This is
+//! a genuine accept/reject divergence, not only a diagnostic-text gap;
+//! `qpdf-libjpeg-compat` is the only backend that matches qpdf's rejection.
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
@@ -461,6 +469,68 @@ mod tests {
         // silently changes or drops this fallback message is caught here.
         assert!(matches!(error, PipelineError::Runtime(_)));
         assert_eq!(error.message(), "invalid marker: 0xFF00");
+    }
+
+    /// Splice a reserved-marker segment (`FF 02 00 04 00 00`) immediately
+    /// after the SOI marker of an otherwise-valid 8x8 grayscale JPEG.
+    fn valid_jpeg_with_spliced_reserved_marker() -> Vec<u8> {
+        let mut valid = Vec::new();
+        {
+            let mut sink = super::super::PlString::new("sink", None, &mut valid);
+            let mut stage = PlDct::new_compressor(
+                "jpg",
+                &mut sink,
+                8,
+                8,
+                libjpeg_turbo_rs::PixelFormat::Grayscale,
+            );
+            stage.write(&[128; 64]).unwrap();
+            stage.finish().unwrap();
+        }
+        assert_eq!(&valid[0..2], &[0xff, 0xd8], "must start with SOI");
+
+        let mut spliced = vec![0xff, 0xd8];
+        spliced.extend_from_slice(&[0xff, 0x02, 0x00, 0x04, 0x00, 0x00]);
+        spliced.extend_from_slice(&valid[2..]);
+        spliced
+    }
+
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn default_backend_silently_decodes_a_reserved_marker_inside_a_valid_jpeg() {
+        // Known limitation (`flpdf-401z`): libjpeg-turbo-rs 0.8.0 skips an
+        // unrecognized marker segment instead of rejecting it, so a reserved
+        // marker embedded inside an otherwise-valid JPEG decodes
+        // successfully here even though qpdf/system libjpeg reject it (see
+        // `libjpeg_compat_backend_rejects_a_reserved_marker_inside_a_valid_jpeg`
+        // below). This pins the current behavior so a future
+        // libjpeg-turbo-rs bump that starts rejecting it is noticed, not
+        // silently relied upon.
+        let spliced = valid_jpeg_with_spliced_reserved_marker();
+
+        let mut sink = Sink;
+        let mut decode_stage = PlDct::new("DCT decode", &mut sink);
+        decode_stage.write(&spliced).unwrap();
+
+        assert!(
+            decode_stage.finish().is_ok(),
+            "flpdf-401z: default backend is expected to (incorrectly) accept this input"
+        );
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn libjpeg_compat_backend_rejects_a_reserved_marker_inside_a_valid_jpeg() {
+        let spliced = valid_jpeg_with_spliced_reserved_marker();
+
+        let mut sink = Sink;
+        let mut decode_stage = PlDct::new("DCT decode", &mut sink);
+        decode_stage.write(&spliced).unwrap();
+
+        let error = decode_stage
+            .finish()
+            .expect_err("system libjpeg must reject a reserved marker, matching qpdf");
+        assert_eq!(error.to_string(), "Unsupported marker type 0x02");
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
