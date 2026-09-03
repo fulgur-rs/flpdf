@@ -1,0 +1,4 @@
+interface:
+  display_name: "flpdf qpdf Primitive Readiness"
+  short_description: "Audit qpdf prerequisites before flpdf implementation"
+  default_prompt: "Use $flpdf-qpdf-primitive-readiness to audit the required qpdf primitives for this Beads issue before implementation."
