@@ -102,6 +102,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
 
+/// qpdf's `InvalidInputSource` exception text (`libqpdf/QPDF.cc:55-106`).
+pub(crate) const CLOSED_INPUT_SOURCE_ERROR: &str =
+    "QPDF operation attempted on a QPDF object with no input source. QPDF operations are invalid before processFile (or another process method) or after closeInputSource";
+pub(crate) const CLOSED_INPUT_SOURCE_NAME: &str = "closed input source";
+
 /// The state `QPDF::resolve` and the functions it calls operate on.
 ///
 /// The field list is taken from qpdf's `QPDF::Members`
@@ -129,7 +134,11 @@ use std::rc::{Rc, Weak};
 /// a deferred foreign-stream provider can outlive its source resolver while
 /// still using the source input and its logical offset coordinates.
 struct StreamInput<R: Read + Seek + 'static> {
-    reader: Rc<RefCell<R>>,
+    /// `None` is qpdf's `InvalidInputSource`. The input source is held behind
+    /// an `Rc` and replaced, rather than mutated, when it is closed so a
+    /// deferred foreign-stream provider retains the source it captured before
+    /// `QPDF::closeInputSource` (`libqpdf/QPDF.cc:278-281,2265-2273`).
+    reader: Option<Rc<RefCell<R>>>,
     header_offset: usize,
     last_offset: Cell<u64>,
 }
@@ -137,28 +146,48 @@ struct StreamInput<R: Read + Seek + 'static> {
 impl<R: Read + Seek + 'static> StreamInput<R> {
     fn new(reader: R, header_offset: usize) -> Self {
         Self {
-            reader: Rc::new(RefCell::new(reader)),
+            reader: Some(Rc::new(RefCell::new(reader))),
             header_offset,
             last_offset: Cell::new(0),
         }
     }
 
+    fn invalid() -> Self {
+        Self {
+            reader: None,
+            header_offset: 0,
+            last_offset: Cell::new(0),
+        }
+    }
+
+    fn active_reader(&self) -> Result<&Rc<RefCell<R>>> {
+        self.reader
+            .as_ref()
+            .ok_or_else(|| Error::Internal(CLOSED_INPUT_SOURCE_ERROR.to_owned()))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.reader.is_none()
+    }
+
     fn seek(&self, offset: u64) -> Result<()> {
         let physical = (self.header_offset as u64).saturating_add(offset);
-        self.reader.borrow_mut().seek(SeekFrom::Start(physical))?;
+        self.active_reader()?
+            .borrow_mut()
+            .seek(SeekFrom::Start(physical))?;
         Ok(())
     }
 
     fn tell(&self) -> Result<u64> {
         Ok(self
-            .reader
+            .active_reader()?
             .borrow_mut()
             .stream_position()?
             .saturating_sub(self.header_offset as u64))
     }
 
     fn source_length(&self) -> Result<u64> {
-        let mut reader = self.reader.borrow_mut();
+        let mut reader = self.active_reader()?.borrow_mut();
         let position = reader.stream_position()?;
         let end = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(position))?;
@@ -168,7 +197,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     fn seek_relative(&self, delta: u64) -> Result<()> {
         const MAX_OFFSET: u64 = i64::MAX as u64;
 
-        let mut reader = self.reader.borrow_mut();
+        let mut reader = self.active_reader()?.borrow_mut();
         let position = reader.stream_position()?;
         if delta > MAX_OFFSET.saturating_sub(position) {
             return Err(Error::parse(
@@ -183,7 +212,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     fn read(&self, buf: &mut [u8]) -> Result<usize> {
         self.last_offset
             .set(self.tell().unwrap_or(self.last_offset.get()));
-        let mut reader = self.reader.borrow_mut();
+        let mut reader = self.active_reader()?.borrow_mut();
         let mut filled = 0;
         while filled < buf.len() {
             match reader.read(&mut buf[filled..]) {
@@ -197,7 +226,9 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     }
 
     fn rewind_underlying_source(&self) -> Result<()> {
-        self.reader.borrow_mut().seek(SeekFrom::Start(0))?;
+        self.active_reader()?
+            .borrow_mut()
+            .seek(SeekFrom::Start(0))?;
         Ok(())
     }
 
@@ -205,7 +236,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         let pos = self.tell()?;
         self.rewind_underlying_source()?;
         let mut bytes = Vec::new();
-        self.reader.borrow_mut().read_to_end(&mut bytes)?;
+        self.active_reader()?.borrow_mut().read_to_end(&mut bytes)?;
         self.seek(pos)?;
         Ok(bytes)
     }
@@ -229,7 +260,10 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
 
 pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// qpdf `m->file` (`QPDF.hh:1456`).
-    input: Rc<StreamInput<R>>,
+    /// The current `InputSource` pointer. Closing replaces this pointer with
+    /// `InvalidInputSource`; it does not mutate the previously captured
+    /// source, which is required by qpdf's foreign-stream ownership contract.
+    input: RefCell<Rc<StreamInput<R>>>,
     /// Also qpdf `m->file`: when repair finds a valid header after leading
     /// material, qpdf does not keep the offset beside the input source, it
     /// *wraps* the source so the shift is invisible to every later read —
@@ -470,7 +504,7 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// `m->file` (`libqpdf/QPDF.cc:406`): every caller above this line works
     /// in qpdf-logical coordinates and never sees the physical position.
     fn seek(&mut self, offset: u64) -> Result<()> {
-        self.input.seek(offset)
+        self.input.borrow().seek(offset)
     }
 
     /// The input source's current qpdf-logical position.
@@ -480,11 +514,11 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// (`libqpdf/QPDF.cc:1367-1384`) — not a value recomputed from an
     /// argument, which is precisely why the restore is load-bearing.
     fn tell(&mut self) -> Result<u64> {
-        self.input.tell()
+        self.input.borrow().tell()
     }
 
     fn source_length(&mut self) -> Result<u64> {
-        self.input.source_length()
+        self.input.borrow().source_length()
     }
 
     /// Advance the input by `delta` bytes from wherever it currently is,
@@ -520,7 +554,7 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// Collapsing this into "expected endstream" would file the case on the
     /// wrong fork for whichever slice ports recovery.
     fn seek_relative(&mut self, delta: u64) -> Result<()> {
-        self.input.seek_relative(delta)
+        self.input.borrow().seek_relative(delta)
     }
 
     /// Fill `buf` from the current position, returning how many bytes were
@@ -533,13 +567,13 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// loop here is what makes a short `Read::read` — legal for any `R` —
     /// indistinguishable from that contract.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.input.read(buf)
+        self.input.borrow().read(buf)
     }
 
     /// Read all physical bytes of the input source from position 0, restoring the
     /// logical position afterwards.
     fn read_underlying_bytes(&mut self) -> Result<Vec<u8>> {
-        self.input.read_underlying_bytes()
+        self.input.borrow().read_underlying_bytes()
     }
 }
 
@@ -827,7 +861,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } = warning_options;
         Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
-                input: Rc::new(StreamInput::new(reader, header_offset)),
+                input: RefCell::new(Rc::new(StreamInput::new(reader, header_offset))),
                 header_offset,
                 source_xref_entries,
                 object_cache: BTreeMap::new(),
@@ -845,6 +879,46 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 reconstructed_xref: already_reconstructed,
                 fixed_dangling_refs: false,
                 repair_diagnostics,
+                logger,
+                suppress_warnings,
+                description,
+                encryption_parameters: Rc::new(RefCell::new(None)),
+            }),
+            recovered_stream_eols: RefCell::new(BTreeMap::new()),
+            self_weak: self_weak.clone(),
+            immediate_copy_from: Cell::new(false),
+            pclm_mode: Cell::new(false),
+            pdf_unique_id,
+        })
+    }
+
+    /// Build qpdf's default-constructed document resolver. Its input source
+    /// is already the invalid source used before `processFile` and the object
+    /// cache is empty, so no reader or sentinel byte buffer is required.
+    pub(crate) fn new_uninitialized(
+        warning_options: ResolverWarningOptions,
+        pdf_unique_id: u64,
+    ) -> Rc<Self> {
+        let ResolverWarningOptions {
+            logger,
+            suppress_warnings,
+            description,
+        } = warning_options;
+        Rc::new_cyclic(|self_weak| Self {
+            core: RefCell::new(ResolverCore {
+                input: RefCell::new(Rc::new(StreamInput::invalid())),
+                header_offset: 0,
+                source_xref_entries: BTreeMap::new(),
+                object_cache: BTreeMap::new(),
+                last_object_description: String::new(),
+                allocated_object_refs: BTreeSet::new(),
+                resolving: BTreeSet::new(),
+                resolved_object_streams: BTreeSet::new(),
+                default_xref_entries: BTreeSet::new(),
+                attempt_recovery: true,
+                reconstructed_xref: false,
+                fixed_dangling_refs: false,
+                repair_diagnostics: Diagnostics::default(),
                 logger,
                 suppress_warnings,
                 description,
@@ -1164,7 +1238,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let message = message.into();
         let (diagnostic_message, diagnostic_offset, logger, suppress_warnings, description) = {
             let mut core = self.core.borrow_mut();
-            let offset = core.input.last_offset();
+            let offset = core.input.borrow().last_offset();
             let object = core.last_object_description.clone();
             let (diagnostic_message, diagnostic_offset) = if object.is_empty() {
                 (message.clone(), (offset > 0).then_some(offset))
@@ -1938,7 +2012,35 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     fn stream_input(&self) -> Rc<StreamInput<R>> {
-        self.core.borrow().input.clone()
+        self.core.borrow().input.borrow().clone()
+    }
+
+    /// Replace the current source with qpdf's `InvalidInputSource`
+    /// (`libqpdf/QPDF.cc:278-281`). The previous `Rc` is deliberately left
+    /// alive for any foreign-stream provider that captured it before this
+    /// operation, just as qpdf replaces `m->file` without changing the source
+    /// pointer stored in `ForeignStreamData`.
+    pub(crate) fn close_input_source(&self) {
+        self.core
+            .borrow_mut()
+            .input
+            .replace(Rc::new(StreamInput::invalid()));
+    }
+
+    pub(crate) fn input_source_closed(&self) -> bool {
+        self.core.borrow().input.borrow().is_closed()
+    }
+
+    /// Return the name of the current qpdf input source. An active source uses
+    /// the caller-provided description; the invalid replacement has qpdf's
+    /// fixed `closed input source` name.
+    pub(crate) fn input_source_name(&self) -> String {
+        let core = self.core.borrow();
+        if core.input.borrow().is_closed() {
+            CLOSED_INPUT_SOURCE_NAME.to_owned()
+        } else {
+            core.description.clone()
+        }
     }
 
     /// This document's cross-reference entry for `object_ref`, if the source
@@ -2188,6 +2290,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn resolve_object_stream_or_null(
         &self,
         stream_number: u32,
+        object_ref: ObjectRef,
         handle: &ObjectHandle,
     ) -> Result<()> {
         match self.resolve_object_stream_with_failure_kind(stream_number) {
@@ -2214,7 +2317,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // `QPDF::resolve` catches the QPDFExc raised by
                 // `resolveObjectsInStream`, warns, and lets its common tail
                 // cache the requested object as null (`QPDF.cc:1724-1750`).
-                self.push_caught_resolution_warning(error)?;
+                self.push_caught_resolution_warning(error, object_ref)?;
                 if !handle.is_resolved() {
                     handle.set_resolved(ObjectValue::Null);
                 }
@@ -2225,7 +2328,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     fn is_qpdf_caught_resolution_error(error: &Error) -> bool {
-        matches!(error, Error::Parse { .. } | Error::Unsupported(_))
+        match error {
+            Error::Parse { .. } | Error::Unsupported(_) => true,
+            Error::Internal(message) => message == CLOSED_INPUT_SOURCE_ERROR,
+            _ => false,
+        }
     }
 
     /// Preserve the source position carried by qpdf's `QPDFExc` when its
@@ -2234,7 +2341,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// so the diagnostic keeps the exception offset rather than rendering it
     /// into the message text. Offsetless failures retain the existing text
     /// path.
-    fn push_caught_resolution_warning(&self, error: Error) -> Result<()> {
+    fn push_caught_resolution_warning(&self, error: Error, object_ref: ObjectRef) -> Result<()> {
         match error {
             Error::Parse { offset, message } => {
                 let object = self.core.borrow().last_object_description.clone();
@@ -2246,6 +2353,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     format!("({object}): {message}")
                 };
                 self.push_warning_at(u64::try_from(offset).unwrap_or(u64::MAX), message)
+            }
+            Error::Internal(message) if message == CLOSED_INPUT_SOURCE_ERROR => {
+                let message = format!(
+                    "object {}/{}: error reading object: {message}",
+                    object_ref.number, object_ref.generation
+                );
+                self.push_warning_with_offset(None, Some(CLOSED_INPUT_SOURCE_NAME), message)
             }
             error => self.push_warning(error.to_string()),
         }
@@ -2411,7 +2525,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// flips a field on a fault-injecting cursor.
     #[cfg(test)]
     pub(crate) fn with_reader_mut<T>(&self, f: impl FnOnce(&mut R) -> T) -> T {
-        let reader = self.core.borrow().input.reader.clone();
+        let input = self.core.borrow().input.borrow().clone();
+        let reader = input
+            .reader
+            .as_ref()
+            .expect("with_reader_mut requires an active input source");
         let mut guard = reader.borrow_mut();
         f(&mut *guard)
     }
@@ -2565,13 +2683,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// source read (`QPDF.cc:2624-2628`). Linearization diagnostics use this
     /// physical read offset when wrapping a damaged parameter error.
     pub(crate) fn last_offset(&self) -> u64 {
-        self.core.borrow().input.last_offset()
+        self.core.borrow().input.borrow().last_offset()
     }
 
     /// Seed the shared input source's qpdf-style last-read position after the
     /// initial xref/trailer snapshot has been loaded outside the resolver.
     pub(crate) fn set_last_offset(&self, offset: u64) {
-        self.core.borrow().input.last_offset.set(offset);
+        self.core.borrow().input.borrow().last_offset.set(offset);
     }
 
     /// Return the logical source bytes while restoring the resolver's current
@@ -2579,7 +2697,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// second file open: qpdf's `QPDF::checkLinearization` reads the same
     /// `m->file` that resolution and stream providers use.
     pub(crate) fn source_bytes(&self) -> Result<Vec<u8>> {
-        self.core.borrow().input.read_logical_bytes()
+        self.core.borrow().input.borrow().read_logical_bytes()
     }
 
     /// Append the next chunk of input to `bytes`, reporting whether anything
@@ -4268,7 +4386,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
             super::READER_STACK_GROWTH_SIZE,
             || self.resolve_indirect_inner(object_ref, handle),
         );
-        self.finish_indirect_resolution(handle, result)
+        self.finish_indirect_resolution(object_ref, handle, result)
     }
 }
 
@@ -4278,7 +4396,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// per indirect link, so even a small local-layout change compounds on
     /// the deep-chain path.
     #[inline(never)]
-    fn finish_indirect_resolution(&self, handle: &ObjectHandle, result: Result<()>) -> Result<()> {
+    fn finish_indirect_resolution(
+        &self,
+        object_ref: ObjectRef,
+        handle: &ObjectHandle,
+        result: Result<()>,
+    ) -> Result<()> {
         match result {
             Ok(()) => Ok(()),
             Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
@@ -4288,7 +4411,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
                 // flpdf's structural equivalent; I/O, encryption,
                 // and diagnostic-channel failures remain caller errors.
-                self.push_caught_resolution_warning(error)?;
+                self.push_caught_resolution_warning(error, object_ref)?;
                 handle.set_resolved(ObjectValue::Null);
                 Ok(())
             }
@@ -4388,7 +4511,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                 if let Some(XrefEntry::Compressed { stream, .. }) =
                                     self.xref_entry(object_ref)
                                 {
-                                    self.resolve_object_stream_or_null(stream, handle)
+                                    self.resolve_object_stream_or_null(stream, object_ref, handle)
                                 } else {
                                     Err(err)
                                 }
@@ -4401,7 +4524,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
             }
             Some(XrefEntry::Compressed { stream, .. }) => {
-                self.resolve_object_stream_or_null(stream, handle)
+                self.resolve_object_stream_or_null(stream, object_ref, handle)
             }
             Some(XrefEntry::Free { .. }) => {
                 handle.set_resolved(ObjectValue::Null);
@@ -4426,6 +4549,7 @@ mod tests {
     use super::ResolveMark;
     use super::ResolverHandle;
     use super::ResolverWarningOptions;
+    use super::CLOSED_INPUT_SOURCE_ERROR;
     use crate::encryption::state::{EncryptionMode, EncryptionState};
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
     use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
@@ -4978,7 +5102,7 @@ mod tests {
         {
             let mut core = resolver.core.borrow_mut();
             core.last_object_description = "object 7 0".to_owned();
-            core.input.last_offset.set(0);
+            core.input.borrow().last_offset.set(0);
         }
 
         resolver
@@ -5450,6 +5574,30 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         )
+    }
+
+    #[test]
+    fn close_input_source_replaces_only_the_document_source_pointer() {
+        let resolver = resolver_over(b"retained source".to_vec());
+        let captured_source = resolver.stream_input();
+
+        assert_eq!(resolver.input_source_name(), "");
+        resolver.close_input_source();
+
+        assert_eq!(
+            captured_source
+                .tell()
+                .expect("captured source remains live"),
+            0
+        );
+        assert_eq!(
+            resolver
+                .stream_input()
+                .tell()
+                .expect_err("the document source must now be invalid")
+                .to_string(),
+            CLOSED_INPUT_SOURCE_ERROR
+        );
     }
 
     fn resolver_over_named_object(
@@ -10548,9 +10696,10 @@ mod tests {
     fn a_caught_offsetless_resolution_failure_keeps_the_existing_warning_path() {
         let resolver = bare_resolver();
         resolver
-            .push_caught_resolution_warning(Error::Unsupported(
-                "unfilterable object stream".to_owned(),
-            ))
+            .push_caught_resolution_warning(
+                Error::Unsupported("unfilterable object stream".to_owned()),
+                ObjectRef::new(1, 0),
+            )
             .expect("the offsetless warning should reach the document sink");
 
         let diagnostics = resolver.repair_diagnostics();

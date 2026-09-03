@@ -10,7 +10,7 @@ use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::{PdfOpenOptions, ReopenableFile};
 use crate::xref::{load_xref_state_with_options, XrefLoadOptions};
 #[allow(unused_imports)]
-use crate::{Error, ObjectHandle};
+use crate::{Error, ObjectHandle, XrefForm};
 use crate::{Pdf, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +30,53 @@ static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
 impl<R: Read + Seek> Pdf<R> {
+    /// Construct qpdf's default, unprocessed document.
+    ///
+    /// qpdf's `QPDF()` leaves both its trailer and input source uninitialized;
+    /// `emptyPDF()` is a separate operation that processes a canonical empty
+    /// file (`libqpdf/QPDF.cc:198-213,278-293`). This constructor preserves
+    /// that distinction. The resolver owns an explicit invalid input-source
+    /// state, so construction does not require a byte buffer or a sentinel
+    /// reader.
+    pub fn uninitialized() -> Self {
+        let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
+        let resolver = ResolverHandle::new_uninitialized(
+            ResolverWarningOptions::new(crate::QPDFLogger::default_logger(), false, String::new()),
+            unique_id,
+        );
+        let encryption = resolver.encryption_parameters();
+        Self {
+            unique_id,
+            resolver,
+            input_source_control: None,
+            version: String::new(),
+            check_mode: false,
+            trailer: ObjectHandle::uninitialized(),
+            last_xref_form: XrefForm::Table,
+            first_xref_item_offset: 0,
+            cache: ObjectCache::default(),
+            foreign_object_maps: BTreeMap::new(),
+            foreign_object_visiting: BTreeMap::new(),
+            acroform_cache: Rc::new(RefCell::new(None)),
+            trailer_handle_memo: None,
+            root_handle_memo: None,
+            compressed_member_parents: BTreeMap::new(),
+            sorted_object_offsets: Vec::new(),
+            legacy_resolution_state_synced: false,
+            resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
+            dirty_object_refs: BTreeSet::new(),
+            handle_mutated_object_refs: BTreeSet::new(),
+            qpdf_dangling_refs: BTreeSet::new(),
+            qpdf_trailer_references: BTreeSet::new(),
+            qpdf_parsed_xref_stream_refs: BTreeSet::new(),
+            qpdf_removed_refs: BTreeSet::new(),
+            ever_called_get_all_pages: false,
+            page_list_cache: None,
+            encryption,
+            encryption_inspection: Rc::new(RefCell::new(None)),
+        }
+    }
+
     /// Open a document with qpdf's default recovery policy.
     ///
     /// qpdf enables recovery by default. Use [`Pdf::open_with_options`] with
@@ -488,16 +535,10 @@ pub(crate) fn open_empty_with_options_erased(
 }
 
 impl Pdf<Cursor<Vec<u8>>> {
-    // CLAUDE.md deviation class (B): qpdf's `QPDF::emptyPDF()` is a `void`
-    // method that lazily initializes an already-constructed `QPDF` (the
-    // C++ type has a default-constructed, not-yet-loaded state). flpdf's
-    // `Pdf` has no such state; every `open*` returns a ready-to-use
-    // `Result<Self>`. `empty()` is the static-factory counterpart of that
-    // mutator — same fixed bytes, same `processMemoryFile`-equivalent
-    // parse path (`open_mem_owned`), only the "already-constructed
-    // instance to mutate" scaffolding is replaced by a factory return.
-    // Recorded in docs/qpdf-correspondence.md (QPDFPageDocumentHelper.cc
-    // row, §7).
+    // qpdf's `QPDF::emptyPDF()` is a `void` method that initializes an already-
+    // constructed `QPDF` with the canonical empty bytes. `Pdf::uninitialized`
+    // preserves the separate default-constructed state, while `empty()` is
+    // the ready-to-use factory for qpdf's `emptyPDF()` result.
     /// Open a canonical minimal PDF: a `Catalog` (object 1) pointing at an
     /// empty `Pages` tree (object 2, zero pages), read through the normal
     /// parser and object cache like any other document.

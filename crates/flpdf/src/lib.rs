@@ -5,6 +5,8 @@
 //!
 //! - [`Pdf`] is the parsed-but-lazy document handle. [`Pdf::open`] reads the trailer
 //!   and cross-reference table, then resolves objects on demand via [`Pdf::resolve`].
+//!   [`Pdf::uninitialized`] represents qpdf's default-constructed document before
+//!   any input source has been processed.
 //! - [`ObjectHandle`] and [`ObjectRef`] are the data model.
 //! - [`pages`] and [`outline_object_helper`] are traversal helpers built on top of `Pdf`. They
 //!   mirror the read-only inspection surface that `qpdf --show-pages` and

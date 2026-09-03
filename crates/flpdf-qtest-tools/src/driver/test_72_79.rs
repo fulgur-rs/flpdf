@@ -260,39 +260,28 @@ pub(crate) fn run_test_73<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDF::QPDF() default constructor / unprocessed-file state): qpdf
-    // constructs a second, wholly unprocessed `QPDF pdf2` and calls
-    // `pdf2.getRoot()`. `QPDF::getRoot` reads `m->trailer.getKey("/Root")`
-    // (`libqpdf/QPDF.cc:2354-2368`); on a default-constructed `QPDF`,
-    // `m->trailer` is never assigned, so this resolves to a non-dictionary
-    // and `getRoot` throws `damagedPDF("", 0, "unable to find /Root
-    // dictionary")`, printed to stderr as "getRoot: <e.what()>". flpdf's
-    // `Pdf<R>::open`/`open_mem*` constructors always parse an actual byte
-    // source immediately; there is no "constructed but never processed"
-    // state to reproduce this call on, so the try/catch is not ported and
-    // its one stderr line is not emitted. This is test_73's only qpdf
-    // output that depends on this gap -- the remainder below is real,
-    // faithful translation of the rest of the function.
-
-    // GAP(QPDF::closeInputSource): closes the underlying `InputSource`
-    // while keeping already-parsed objects live in the object cache, so
-    // the getRoot() call below is exercised without further disk access
-    // (`libqpdf/QPDF.cc:278`; `include/qpdf/QPDF.hh:166`'s own doc: "may be
-    // called ... after all processing has been done"). flpdf's `Pdf<R>`
-    // has no equivalent operation to detach/close its reader while
-    // retaining cached state, so this call is not ported. `pdf.getRoot()`
-    // itself returns a `std::string` from `unparseResolved()` that is
-    // immediately discarded by the C++ statement below, so this has no
-    // observable output of its own in the success path either way -- only
-    // its ability to *not* error is exercised, which the real call below
-    // still exercises against the still-open reader.
-    let root_seed = pdf.trailer_key_handle(b"Root");
-    let root = resolve_once(pdf, &root_seed)?;
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    if root.as_dictionary().is_none() {
-        return Err(Error::System("unable to find /Root dictionary".to_string()));
+    // qpdf constructs a second, wholly unprocessed `QPDF pdf2` and catches
+    // the uninitialized-handle exception from `pdf2.getRoot()`
+    // (`test_driver.cc:2489-2496`). `Pdf::uninitialized` preserves that
+    // document state without manufacturing a byte source.
+    let mut pdf2 = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+    if let Err(error) = pdf2.root_handle() {
+        writeln!(stderr, "getRoot: {error}")?;
     }
-    let pages_seed = root.get_key(b"/Pages");
+
+    // qpdf replaces `m->file` with `InvalidInputSource` while retaining the
+    // parsed trailer and cached handles (`QPDF.cc:278-281`). The later root
+    // lookup therefore records the closed-source warning and then raises the
+    // source-named missing-root error.
+    pdf.close_input_source();
+    let root = match pdf.root_handle() {
+        Ok(root) => root,
+        Err(error) => {
+            emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+            return Err(error);
+        }
+    };
+    let pages_seed = root.try_get_key(b"/Pages")?;
     let pages = resolve_once(pdf, &pages_seed)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let _ = pages.unparse_resolved();
@@ -851,9 +840,13 @@ mod tests {
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let options = PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
         Pdf::open_mem_owned_with_options(
             include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
-            PdfOpenOptions::default(),
+            options,
         )
         .expect("open minimal fixture")
     }
@@ -884,13 +877,13 @@ mod tests {
     }
 
     #[test]
-    fn test_73_resolves_root_and_pages_without_legacy_chasing() {
+    fn test_73_reproduces_uninitialized_and_closed_source_lifecycle() {
         let mut pdf = minimal_pdf();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
 
-        run_test_73(
+        let error = run_test_73(
             &mut pdf,
             b"minimal.pdf",
             None,
@@ -898,10 +891,18 @@ mod tests {
             &mut stderr,
             &mut diagnostics_written,
         )
-        .expect("run test 73");
+        .expect_err("closed input source must make the later root lookup fail");
 
         assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
+        assert_eq!(
+            error.to_string(),
+            "closed input source: unable to find /Root dictionary"
+        );
+        assert_eq!(
+            stderr,
+            b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n\
+WARNING: closed input source: object 1/0: error reading object: QPDF operation attempted on a QPDF object with no input source. QPDF operations are invalid before processFile (or another process method) or after closeInputSource\n"
+        );
     }
 
     #[test]
