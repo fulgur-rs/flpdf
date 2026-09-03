@@ -194,8 +194,8 @@ Expected: both commands exit 0 without warnings promoted to errors.
 
 ```bash
 cargo test --workspace
-cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail
-scripts/patch-coverage.sh --base origin/main --lcov
+cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail --lcov --output-path target/patch-cov.lcov
+scripts/patch-coverage.sh --base origin/main --lcov target/patch-cov.lcov
 ```
 
 Expected: workspace tests pass and patch coverage reports zero uncovered
