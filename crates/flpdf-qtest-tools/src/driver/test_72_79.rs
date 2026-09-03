@@ -4,9 +4,9 @@
 //! through `super::emit_new_diagnostics`, and how deep qpdf-source-line
 //! comments justify each translation decision.
 //!
-//! Two tests here (`run_test_78`, `run_test_79`) hit the same trailer-write
-//! primitive gap already established in `driver/test_18_25.rs` (see that
-//! file's own module doc and `run_test_20`'s `GAP` comment):
+//! `run_test_79` still hits the trailer-write primitive gap established in
+//! `driver/test_18_25.rs` (see that file's own module doc and `run_test_20`'s
+//! `GAP` comment):
 //! `Pdf::trailer().replace_key(...)` compiles and returns `Ok`, but
 //! `PdfWriter::write` reads `Pdf::trailer()` (a plain `&Dictionary` set once
 //! at construction, confirmed by `crates/flpdf/src/writer.rs:2865` reading
@@ -17,13 +17,15 @@
 //! read the blocked trailer entry are still translated normally on either
 //! side of it.
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
+use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, EmbeddedFileDocumentHelper, EmbeddedFileStream, Error, FileSpec, NameTree,
-    NumberTree, ObjectHandle, ObjectHandleParserCallbacks, PageDocumentHelper, ParseControl, Pdf,
-    PdfWriter, TokenFilter, TokenFilterOutput,
+    pipeline::Discard, DecodeLevel, EmbeddedFileDocumentHelper, EmbeddedFileStream, Error,
+    FileSpec, NameTree, NumberTree, ObjectHandle, ObjectHandleParserCallbacks, PageDocumentHelper,
+    ParseControl, Pdf, PdfWriter, TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
@@ -87,6 +89,20 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+/// Flush callback diagnostics at the same operation boundaries at which the
+/// qpdf test writes to its process-global `std::cerr`. Provider callbacks must
+/// be `'static`, so they cannot borrow the driver's injected stderr writer;
+/// an owned buffer preserves the callback contract while keeping this driver
+/// testable and preserving qpdf's observable ordering.
+fn flush_callback_diagnostics(
+    callback_output: &Rc<RefCell<Vec<u8>>>,
+    stderr: &mut dyn Write,
+) -> flpdf::Result<()> {
+    let bytes = std::mem::take(&mut *callback_output.borrow_mut());
+    stderr.write_all(&bytes)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -654,7 +670,7 @@ pub(crate) fn run_test_78<R: Read + Seek>(
     _filename: &[u8],
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
+    stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     // f1: the simple, non-retry-aware provider form.
@@ -670,66 +686,67 @@ pub(crate) fn run_test_78<R: Read + Seek>(
     )?;
 
     // f2: the retry-aware provider form. qpdf's lambda captures
-    // `std::cerr` -- a process-global stream, unaffected by this test
-    // driver's redirected diagnostic channel -- so this closure writes
-    // directly to `std::io::stderr()` rather than to this function's own
-    // `stderr: &mut dyn Write` parameter: `StreamDataProvider` callbacks
-    // are `Fn(...) + 'static` (`object_handle.rs:4289`), which cannot
-    // borrow this call's non-'static `stderr` reference. In the real
-    // `flpdf-test-driver` binary (`driver.rs`) both resolve to the process's
-    // real stderr, but this diverges from the injected-writer contract
-    // other functions in this crate follow; see this file's own caveats.
+    // `std::cerr` (test_driver.cc:2670-2685). The callback contract is
+    // `'static` (`object_handle.rs:4289`), so retain its diagnostic bytes in
+    // owned state and flush them through the driver's stderr at each qpdf
+    // operation boundary.
+    let callback_output = Rc::new(RefCell::new(Vec::new()));
+    let callback_output_for_provider = Rc::clone(&callback_output);
     let s2 = pdf.new_stream()?;
     s2.replace_stream_data_with_retry_callback(
-        |pipeline, suppress_warnings, will_retry| {
-            let mut stderr = std::io::stderr();
-            writeln!(stderr, "f2").map_err(Error::from)?;
+        move |pipeline, suppress_warnings, will_retry| {
+            let mut output = callback_output_for_provider.borrow_mut();
+            writeln!(&mut *output, "f2").map_err(Error::from)?;
             if will_retry {
-                writeln!(stderr, "failing").map_err(Error::from)?;
+                writeln!(&mut *output, "failing").map_err(Error::from)?;
                 return Ok(false);
             }
             if !suppress_warnings {
-                writeln!(stderr, "warning").map_err(Error::from)?;
+                writeln!(&mut *output, "warning").map_err(Error::from)?;
             }
             pipeline.write(b"salad").map_err(Error::from)?;
             pipeline.finish().map_err(Error::from)?;
-            writeln!(stderr, "f2 done").map_err(Error::from)?;
+            writeln!(&mut *output, "f2 done").map_err(Error::from)?;
             Ok(true)
         },
         Some(ObjectHandle::null()),
         Some(ObjectHandle::null()),
     )?;
 
-    // GAP(QPDFObjectHandle::replaceKey on the trailer): qpdf installs
-    // `/Streams [s1 s2]` here as a *new* trailer entry so the closing
-    // `QPDFWriter` serializes both streams. Per the established gap (see
-    // this file's own module doc and `driver/test_18_25.rs`'s
-    // `run_test_20`): `Pdf::trailer().replace_key(...)` has no
-    // effect on what `PdfWriter::write` emits, so this installation is not
-    // performed. `s1`/`s2` and their providers above are still real,
-    // faithful translation -- only their reachability from the eventual
-    // write is what this gap removes.
+    // qpdf/test_driver.cc:2687 installs `/Streams [s1 s2]` on the live
+    // trailer before the explicit pipe and writer. `Pdf::trailer()` is the
+    // canonical live handle and `PdfWriter` consumes that same graph.
+    let trailer = pdf.trailer();
+    trailer.replace_key(
+        b"/Streams",
+        ObjectHandle::array(vec![s1.clone(), s2.clone()]),
+    )?; // cov:ignore: the live trailer mutation is exercised by the test 78 regression
     writeln!(stdout, "piping with warning suppression")?;
 
-    // GAP(QPDFObjectHandle::pipeStreamData with explicit suppress_warnings/
-    // will_retry arguments): qpdf calls `s2.pipeStreamData(&d, nullptr, 0,
-    // qpdf_dl_all, true, false)` to invoke `f2` directly with a
-    // caller-chosen `suppress_warnings = true`, `will_retry = false`. The
-    // only flpdf method that threads a per-call `suppress_warnings`
-    // argument into a `StreamDataProvider` is
-    // `ObjectHandle::pipe_stream_data` (`object_handle.rs:4472`), which is
-    // `pub(crate)` and not reachable from this crate;
-    // `Pdf::set_suppress_warnings` is an unrelated document-wide flag, not
-    // this per-call argument. This explicit debug pipe is not performed, so
-    // the "f2"/"warning"/"f2 done" stderr lines it alone would produce here
-    // are not emitted by this call (independent of whatever `f2`'s own
-    // invocation from a real `PdfWriter::write` -- were the trailer gap
-    // above not also blocking that -- would separately produce).
+    // qpdf/test_driver.cc:2691 calls
+    // `s2.pipeStreamData(&d, nullptr, 0, qpdf_dl_all, true, false)`.
+    let mut discard = Discard;
+    let mut filtering_attempted = false;
+    s2.pipe_stream_data(
+        &mut discard,
+        &mut filtering_attempted,
+        0,
+        DecodeLevel::All,
+        true,
+        false,
+    )?; // cov:ignore: the explicit qpdf pipe flags are exercised by the test 78 regression
+    flush_callback_diagnostics(&callback_output, stderr)?;
 
     writeln!(stdout, "writing")?;
-    // The `QPDFWriter` write itself is not performed: with `/Streams`
-    // unreachable per the gap above, a write here would produce a file that
-    // diverges from qpdf's own output, which this port must not fabricate.
+    // qpdf/test_driver.cc:2698-2702 writes in QDF mode with a static ID. The
+    // writer's retry path invokes f2 first with `will_retry=true`, then with
+    // `will_retry=false`, matching QPDFWriter's filtered-to-raw fallback.
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_qdf_mode(true);
+    writer.write()?;
+    flush_callback_diagnostics(&callback_output, stderr)?;
     Ok(())
 }
 
@@ -830,7 +847,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{chase_array_item, chase_key, resolve_once, run_test_73};
+    use super::{chase_array_item, chase_key, resolve_once, run_test_73, run_test_78};
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
@@ -885,6 +902,43 @@ mod tests {
 
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_78_replays_retry_callback_and_writes_output_in_qpdf_order() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_78(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 78");
+
+        assert_eq!(
+            stdout,
+            b"piping with warning suppression\nwriting\n".to_vec()
+        );
+        assert_eq!(
+            stderr,
+            b"f2\nf2 done\nf2\nfailing\nf2\nwarning\nf2 done\n".to_vec()
+        );
+        assert!(directory.path().join("a.pdf").is_file());
     }
 
     fn pdf_with_erase_trees() -> Vec<u8> {
