@@ -2054,6 +2054,35 @@ fn top_level_min_version_numeric_tie_keeps_the_source_s_raw_version() {
 }
 
 #[test]
+fn top_level_min_version_numeric_tie_keeps_the_source_s_higher_extension() {
+    // The source's own extension level (8) numerically ties with
+    // --min-version's version (1.7x) but is higher than its extension
+    // level (2): the source wins the tie outright (qpdf's compare == 0,
+    // extension_level(2) > m->min_extension_level(8) is false, so neither
+    // set_version nor set_extension_level fire), and the header and
+    // Catalog /Extensions /ADBE entry must agree. Verified byte-identical
+    // against live qpdf 11.9.0.
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("min-version-source-wins-extension.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--min-version=1.7x.2",
+            "../../tests/fixtures/compat/direct-root-adbe.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.7\n"));
+    assert!(contains(&bytes, b"/BaseVersion /1.7 "));
+    assert!(contains(&bytes, b"/ExtensionLevel 8"));
+}
+
+#[test]
 fn empty_force_version_is_a_noop_like_qpdf() {
     let temp = tempfile::tempdir().unwrap();
     let input = "../../tests/fixtures/compat/one-page.pdf";
