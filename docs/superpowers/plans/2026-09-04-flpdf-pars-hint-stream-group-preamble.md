@@ -6,7 +6,7 @@
 
 **Architecture:** Keep SharedObjectHintTable as the seven-field header plus per-shared-object entries. The existing bits_group_object_count header field remains qpdf's nbits_nobjects width and is used only by the nobjects_minus_one column. The encoder emits the three qpdf columns directly, preserving their existing byte-alignment and signature rules.
 
-**Tech Stack:** Rust workspace, cargo test, cargo fmt, qpdf 11.9.0 source at /home/ubuntu/.cache/flpdf/qpdf-11.9.0, and the in-crate qpdf-shaped hint decoder in crates/flpdf/src/linearization/show.rs.
+**Tech Stack:** Rust workspace, cargo test, cargo fmt, qpdf 11.9.0 source resolved via `scripts/fetch-qpdf-source.sh --print-path`, and the in-crate qpdf-shaped hint decoder in crates/flpdf/src/linearization/show.rs.
 
 ---
 
@@ -184,8 +184,9 @@ Expected: no matches in production code or documentation. The generic word group
 - [ ] **Step 3: Verify the qpdf source remains the documented oracle.**
 
 ~~~bash
-sed -n '374,407p' /home/ubuntu/.cache/flpdf/qpdf-11.9.0/libqpdf/QPDF_linearization.cc
-sed -n '1569,1606p' /home/ubuntu/.cache/flpdf/qpdf-11.9.0/libqpdf/QPDF_linearization.cc
+qpdf_source=$(scripts/fetch-qpdf-source.sh --print-path)
+sed -n '374,407p' "$qpdf_source/libqpdf/QPDF_linearization.cc"
+sed -n '1569,1606p' "$qpdf_source/libqpdf/QPDF_linearization.cc"
 ~~~
 
 Expected: qpdf reads and computes only the header plus per-entry columns; no change is made in the pinned qpdf mirror.
