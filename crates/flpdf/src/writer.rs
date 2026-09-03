@@ -5776,6 +5776,44 @@ mod final_handle_writer_tests {
     }
 
     #[test]
+    fn effective_version_pair_keeps_forced_raw_version_and_extension() {
+        let options = WriterOptions {
+            force_version: Some("1.7x".to_owned()),
+            force_extension_level: Some(2),
+            ..WriterOptions::default()
+        };
+
+        assert_eq!(
+            effective_pdf_version_and_ext("1.3", 0, &options, true, true),
+            ("1.7x", 2)
+        );
+    }
+
+    #[test]
+    fn effective_version_pair_ignores_an_overflowing_minimum() {
+        let options = WriterOptions {
+            min_version: Some("2147483648".to_owned()),
+            min_extension_level: Some(2),
+            ..WriterOptions::default()
+        };
+
+        assert_eq!(
+            effective_pdf_version_and_ext("1.7", 0, &options, false, false),
+            ("1.7", 0)
+        );
+    }
+
+    #[test]
+    fn effective_version_pair_falls_back_for_an_overflowing_source() {
+        let options = WriterOptions::default();
+
+        assert_eq!(
+            effective_pdf_version_and_ext("2147483648", 0, &options, false, false),
+            ("2147483648", 0)
+        );
+    }
+
+    #[test]
     fn encryption_shape_reads_copy_encryption_handles() {
         let options = WriterOptions {
             copy_encryption: Some(CopyEncryptionSource {
