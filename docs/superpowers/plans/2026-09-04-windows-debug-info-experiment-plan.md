@@ -30,7 +30,7 @@ changes to `ci.yml`, Cargo profiles, required matrix, and source code.
 **Files:**
 - Create: `.github/workflows/build-experiment.yml`
 
-- [ ] **Step 1: Create the exact workflow**
+- [x] **Step 1: Create the exact workflow**
 
 Create `.github/workflows/build-experiment.yml` with:
 
@@ -121,7 +121,7 @@ Create `.github/workflows/build-experiment.yml` with:
               fi
               echo "- test --no-run reuse: pass" >> "$GITHUB_STEP_SUMMARY"
 
-- [ ] **Step 2: Verify scope and commit**
+- [x] **Step 2: Verify scope and commit**
 
 Run:
 
@@ -141,7 +141,7 @@ Then run:
 
 **Files:** Verify the new workflow only; do not modify `ci.yml` or Cargo profiles.
 
-- [ ] **Step 1: Run local checks**
+- [x] **Step 1: Run local checks**
 
 Run:
 
@@ -156,7 +156,7 @@ Expected: YAML and repository checks pass, the diff is clean, and required CI
 and Cargo profiles are unchanged. If an existing actionlint is available,
 run it against the new workflow; do not install new tooling for this issue.
 
-- [ ] **Step 2: Push and locate the workflow run**
+- [x] **Step 2: Push and locate the workflow run**
 
 Run:
 
@@ -168,7 +168,7 @@ not expose the branch workflow, dispatch it with:
 
     gh workflow run build-experiment.yml --repo fulgur-rs/flpdf --ref feature/flpdf-w2mi-build-experiment
 
-- [ ] **Step 3: Watch and record the experiment**
+- [x] **Step 3: Watch and record the experiment**
 
 Run:
 
