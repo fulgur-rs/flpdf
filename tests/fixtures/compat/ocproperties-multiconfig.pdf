@@ -1,0 +1,41 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /OCProperties 5 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 0 /Kids [] >>
+endobj
+3 0 obj
+<< /Type /OCG /Name (Layer A) >>
+endobj
+4 0 obj
+<< /Type /OCG /Name (Layer B) >>
+endobj
+5 0 obj
+<< /OCGs [3 0 R 4 0 R] /D 6 0 R /Configs [7 0 R 8 0 R] >>
+endobj
+6 0 obj
+<< /BaseState /ON /Order [3 0 R [4 0 R]] /ON [3 0 R] /OFF [4 0 R] /AS [] /Intent [/View] >>
+endobj
+7 0 obj
+<< /Name (Print) /BaseState /OFF /Order [3 0 R 4 0 R] /ON [] /OFF [3 0 R 4 0 R] /AS [] /Intent [/Print] >>
+endobj
+8 0 obj
+<< /Name (Screen) /BaseState /ON /Order [4 0 R 3 0 R] /ON [4 0 R] /OFF [] /AS [] /Intent [/View] >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000009 00000 n 
+0000000078 00000 n 
+0000000130 00000 n 
+0000000178 00000 n 
+0000000226 00000 n 
+0000000299 00000 n 
+0000000406 00000 n 
+0000000528 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R >>
+startxref
+643
+%%EOF
