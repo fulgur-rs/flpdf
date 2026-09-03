@@ -947,6 +947,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// bounded window — matching [`Self::parse_source_file_object_at`]'s
     /// guarded full-object retry for a corrupt or false next-xref offset.
     #[cfg(feature = "qtest-driver")]
+    #[allow(deprecated)]
     fn qtest_read_source_object_with_retry<T>(
         &mut self,
         offset: u64,
@@ -979,6 +980,7 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(tokenizer.position())
     }
 
+    #[allow(deprecated)]
     fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingHandleFileObject> {
         let next = self.next_object_offset(offset);
         let bytes = self.resolver.read_window(offset, next)?;

@@ -19,10 +19,12 @@
 //! When `startxref` cannot be parsed, qpdf throws `damagedPDF("can't find
 //! startxref")` immediately and never calls `read_xref` at all
 //! (`libqpdf/QPDF.cc:450-452`). `load_xref_state_with_options` instead still
-//! attempts a real parse at physical offset 0 as a fallback before recovery
-//! -- a retry detour qpdf has no counterpart for; see the marker comment
-//! there. `push_repair_diagnostics` deliberately records only the initial
-//! recovery trigger, faithfully reproducing qpdf's own three-warning
+//! attempts a real parse at logical (header-relative) offset 0 -- index 0 of
+//! the already header-shifted `bytes` slice, not necessarily physical byte 0
+//! of the original input when repair skipped leading junk -- as a fallback
+//! before recovery; qpdf has no counterpart for this retry detour, see the
+//! marker comment there. `push_repair_diagnostics` deliberately records only
+//! the initial recovery trigger, faithfully reproducing qpdf's own three-warning
 //! `reconstruct_xref` sequence either way (`libqpdf/QPDF.cc:450-469,516-531`).
 use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
@@ -1300,10 +1302,11 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     // qpdf-deviation-start: qpdf throws damagedPDF("can't find startxref")
     // immediately when the startxref keyword/offset cannot be parsed and
     // never calls read_xref at all (`QPDF.cc:450-452`). Falling back to
-    // offset 0 here instead still runs the parse_xref_from_start call below
-    // as a real retry-at-offset-0 attempt before recovery; qpdf has no such
-    // detour, so a failure from that attempt (as opposed to the recorded
-    // "can't find startxref" trigger) has no qpdf counterpart.
+    // logical (header-relative) offset 0 in `bytes` here instead still runs
+    // the parse_xref_from_start call below as a real retry attempt before
+    // recovery; qpdf has no such detour, so a failure from that attempt (as
+    // opposed to the recorded "can't find startxref" trigger) has no qpdf
+    // counterpart.
     let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {

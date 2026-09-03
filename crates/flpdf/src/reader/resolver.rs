@@ -2428,12 +2428,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// names generalising this owned-window shape as a wrong turn that would
     /// entrench a divergence, so `readObjectAtOffset`/`readStream` port that
     /// save/restore seam rather than reusing this.
-    // qpdf-deviation-start: qpdf reads the live `m->file` source and has no
-    // bounded owned-window helper (`InputSource.hh:71-74`; `QPDF.cc:1360-1398`);
-    // this legacy resolver seam (`read_window` and its `read_to_owned` helper
-    // below) is built only for the remaining raw reader paths.
+    // Separable at function granularity, so CLAUDE.md's marker policy calls
+    // for #[deprecated] here rather than a block comment marker: qpdf reads
+    // the live `m->file` source and has no bounded owned-window helper
+    // (`InputSource.hh:71-74`; `QPDF.cc:1360-1398`). Callers get
+    // #[allow(deprecated)] locally rather than spreading unchecked.
+    #[deprecated(
+        note = "no qpdf counterpart; qpdf reads m->file live and has no bounded owned-window helper -- do not add new callers"
+    )]
     pub(crate) fn read_window(&self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
         self.seek(offset)?;
+        #[allow(deprecated)]
         self.read_to_owned(next.map(|next| next.saturating_sub(offset)))
     }
 
@@ -2445,6 +2450,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// cross-reference offset, which a corrupt table can make arbitrarily
     /// large on a small file. `std::io::Read::take(n).read_to_end(..)`, which
     /// this replaces, had the same property.
+    #[deprecated(
+        note = "no qpdf counterpart; only used by the equally legacy read_window -- do not add new callers"
+    )]
     fn read_to_owned(&self, limit: Option<u64>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         loop {
@@ -2465,7 +2473,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         }
     }
-    // qpdf-deviation-end
 
     /// qpdf `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2538`), the only
     /// path by which a stream's original bytes reach a consumer: `QPDF_Stream`
