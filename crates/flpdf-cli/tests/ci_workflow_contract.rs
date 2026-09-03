@@ -11,6 +11,9 @@ const REQUIRED_TEST_MATRIX_OS: [&str; 4] = [
     "windows-latest",
 ];
 const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
+const RELEASE_JOB_NAME: &str = "release";
+const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
+const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --release";
 const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
     "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
 ];
@@ -436,6 +439,65 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
         && executable_command_lines == 1)
 }
 
+fn release_job_contains_test_command(workflow: &str, command: &str) -> ContractResult<bool> {
+    let workflow = parse_workflow(workflow)?;
+    if has_default_run_override(&workflow, "workflow")? {
+        return Ok(false);
+    }
+
+    let jobs =
+        mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
+    let jobs = require_mapping(jobs, "workflow.jobs")?;
+    let release_job = mapping_get(jobs, RELEASE_JOB_NAME)
+        .ok_or_else(|| "ci workflow must define the release job".to_owned())?;
+    let release_job = require_mapping(release_job, "release job")?;
+
+    if has_default_run_override(release_job, "release job")?
+        || mapping_contains_key(release_job, "if")
+        || !continue_on_error_is_gating(release_job)
+    {
+        return Ok(false);
+    }
+    if mapping_get(release_job, "needs").and_then(Yaml::as_str) != Some("quality") {
+        return Ok(false);
+    }
+    if mapping_get(release_job, "runs-on").and_then(Yaml::as_str) != Some(RELEASE_JOB_RUNS_ON) {
+        return Ok(false);
+    }
+
+    let Some(steps) = mapping_get(release_job, "steps") else {
+        return Ok(false);
+    };
+    let steps = steps
+        .as_vec()
+        .ok_or_else(|| "release job.steps must be a sequence".to_owned())?;
+
+    let total_raw_command_occurrences = steps
+        .iter()
+        .map(|step| {
+            mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .map_or(0, |run| run_raw_command_occurrence_count(run, command))
+        })
+        .sum::<usize>();
+    let total_exact_command_lines = steps
+        .iter()
+        .map(|step| {
+            mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .map_or(0, |run| run_exact_command_line_count(run, command))
+        })
+        .sum::<usize>();
+    let executable_command_lines = steps
+        .iter()
+        .map(|step| test_job_step_exact_command_line_count(step, command))
+        .sum::<usize>();
+
+    Ok(total_raw_command_occurrences == 1
+        && total_exact_command_lines == 1
+        && executable_command_lines == 1)
+}
+
 fn test_job_has_required_os_matrix(test_job: &Yaml) -> ContractResult<bool> {
     let Some(strategy) = mapping_get(test_job, "strategy") else {
         return Ok(false);
@@ -668,6 +730,96 @@ fn test_matrix_runs_default_workspace_suite() {
         test_job_contains_test_command(CI_WORKFLOW, "cargo test --workspace")
             .expect("ci workflow must be valid and define the test job"),
         "the four-OS test matrix must run the complete default workspace suite"
+    );
+}
+
+#[test]
+fn release_job_runs_gating_workspace_release_suite() {
+    assert!(
+        release_job_contains_test_command(CI_WORKFLOW, RELEASE_TEST_COMMAND)
+            .expect("ci workflow must be valid and define the release job"),
+        "release job must be an Ubuntu quality-dependent gating release test"
+    );
+}
+
+fn release_job_workflow(release_job_fields: &str) -> String {
+    let release_job_fields = release_job_fields
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "\
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo quality
+  release:
+{release_job_fields}
+"
+    )
+}
+
+#[test]
+fn release_job_contract_rejects_wrong_runner() {
+    let workflow = release_job_workflow(
+        "\
+needs: quality
+runs-on: macos-latest
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      cargo test --workspace --release
+",
+    );
+
+    assert!(
+        !release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
+    );
+}
+
+#[test]
+fn release_job_contract_rejects_missing_quality_dependency() {
+    let workflow = release_job_workflow(
+        "\
+runs-on: ubuntu-latest
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      cargo test --workspace --release
+",
+    );
+
+    assert!(
+        !release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
+    );
+}
+
+#[test]
+fn release_job_contract_rejects_conditional_or_allowed_failure_execution() {
+    let workflow = release_job_workflow(
+        "\
+needs: quality
+runs-on: ubuntu-latest
+continue-on-error: true
+steps:
+  - if: runner.os == 'Linux'
+    shell: bash
+    run: |
+      set -euo pipefail
+      cargo test --workspace --release
+",
+    );
+
+    assert!(
+        !release_job_contains_test_command(&workflow, RELEASE_TEST_COMMAND)
+            .expect("synthetic release workflow must be valid")
     );
 }
 
