@@ -444,18 +444,20 @@ fn update_minimum_pdf_version(
     match current {
         None => *current = Some((version, extension_level)),
         Some((current_version, current_extension_level)) => {
-            let Some(current_parsed) = // cov:ignore: LLVM maps this multiline qpdf-version binding to its continuation; the invalid-state branch is exercised by the writer unit test
-                crate::pdf_version::parse_qpdf_writer_version(current_version)
-            else {
-                *current_version = version;
-                *current_extension_level = extension_level;
-                return;
-            };
-            if candidate > current_parsed
-                || (candidate == current_parsed && extension_level > *current_extension_level)
-            {
-                *current_version = version;
-                *current_extension_level = extension_level;
+            match crate::pdf_version::parse_qpdf_writer_version(current_version) {
+                Some(current_parsed) => {
+                    if candidate > current_parsed
+                        || (candidate == current_parsed
+                            && extension_level > *current_extension_level)
+                    {
+                        *current_version = version;
+                        *current_extension_level = extension_level;
+                    }
+                }
+                None => {
+                    *current_version = version;
+                    *current_extension_level = extension_level;
+                }
             }
         }
     }
@@ -5782,6 +5784,16 @@ mod final_handle_writer_tests {
         update_minimum_pdf_version(&mut current, "1.7".to_string(), 0);
 
         assert_eq!(current, Some(("1.7".to_string(), 0)));
+
+        let mut current = Some(("1.4".to_string(), 0));
+        update_minimum_pdf_version(&mut current, "1.7".to_string(), 0);
+
+        assert_eq!(current, Some(("1.7".to_string(), 0)));
+
+        let mut current = Some(("1.7".to_string(), 1));
+        update_minimum_pdf_version(&mut current, "1.7".to_string(), 2);
+
+        assert_eq!(current, Some(("1.7".to_string(), 2)));
     }
 
     #[test]
