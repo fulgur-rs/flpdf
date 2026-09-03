@@ -16,9 +16,14 @@
 //! its `Rc<[u8]>` source snapshot is initialized only for an actual indirect
 //! object or stream-length resolution.
 //!
-//! `push_repair_diagnostics` deliberately records only the initial recovery
-//! trigger: qpdf has no retry-at-offset-0 detour whose later failure could be
-//! reported (`libqpdf/QPDF.cc:450-469,516-531,1567-1574`).
+//! When `startxref` cannot be parsed, qpdf throws `damagedPDF("can't find
+//! startxref")` immediately and never calls `read_xref` at all
+//! (`libqpdf/QPDF.cc:450-452`). `load_xref_state_with_options` instead still
+//! attempts a real parse at physical offset 0 as a fallback before recovery
+//! -- a retry detour qpdf has no counterpart for; see the marker comment
+//! there. `push_repair_diagnostics` deliberately records only the initial
+//! recovery trigger, faithfully reproducing qpdf's own three-warning
+//! `reconstruct_xref` sequence either way (`libqpdf/QPDF.cc:450-469,516-531`).
 use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
@@ -1292,6 +1297,13 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     let bytes = &source_bytes[header_offset..];
     let mut parse_errors = Vec::new();
+    // qpdf-deviation-start: qpdf throws damagedPDF("can't find startxref")
+    // immediately when the startxref keyword/offset cannot be parsed and
+    // never calls read_xref at all (`QPDF.cc:450-452`). Falling back to
+    // offset 0 here instead still runs the parse_xref_from_start call below
+    // as a real retry-at-offset-0 attempt before recovery; qpdf has no such
+    // detour, so a failure from that attempt (as opposed to the recorded
+    // "can't find startxref" trigger) has no qpdf counterpart.
     let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
@@ -1300,6 +1312,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         }
         Err(error) => return Err(error),
     };
+    // qpdf-deviation-end
     let xref_pos = match usize::try_from(startxref) {
         Ok(xref_pos) => xref_pos,
         // cov:ignore-start: converting the u64 startxref offset can overflow
@@ -2865,9 +2878,6 @@ fn is_xref_stream_dict(context: &mut XrefReadContext, dict: &ObjectHandle) -> bo
 /// offset when available (falling back to the `startxref` offset); the
 /// surrounding warnings carry no offset, matching qpdf, which reports them
 /// at offset 0 and suppresses the display.
-// qpdf-deviation: qpdf has no retry-at-offset-0 recovery detour
-// (`QPDF.cc:450-469,516-531,1567-1574`), so a subsequent detour failure has no
-// qpdf counterpart; this helper intentionally emits only the initial trigger.
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", None));
     let (message, offset) = match trigger_error {
