@@ -1991,7 +1991,10 @@ fn top_level_min_version_preserves_qpdf_raw_version_header() {
 }
 
 #[test]
-fn top_level_min_version_extension_tie_preserves_the_raw_winning_version() {
+fn top_level_min_version_outright_win_takes_the_raw_winning_version() {
+    // 1.7x > 1.3 numerically, so this is an outright win, not a tie: qpdf's
+    // compare > 0 branch (QPDFWriter.cc:217-247) takes both the raw string
+    // and the extension level from the winning --min-version candidate.
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("min-version-extension-tie.pdf");
 
@@ -2009,6 +2012,44 @@ fn top_level_min_version_extension_tie_preserves_the_raw_winning_version() {
     let bytes = std::fs::read(&output).unwrap();
     assert!(bytes.starts_with(b"%PDF-1.7x\n"));
     assert!(contains(&bytes, b"/BaseVersion /1.7x"));
+    assert!(contains(&bytes, b"/ExtensionLevel 2"));
+}
+
+#[test]
+fn top_level_min_version_numeric_tie_keeps_the_source_s_raw_version() {
+    // A genuine numeric tie (source forced to exactly 1.7, --min-version
+    // ties at 1.7 but spells it "1.7x"): qpdf's setMinimumPDFVersion never
+    // sets set_version on compare == 0, only set_extension_level. Verified
+    // against live qpdf 11.9.0: the source's raw "1.7" spelling survives,
+    // not the tying --min-version candidate's "1.7x".
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source-1.7.pdf");
+    let output = temp.path().join("min-version-numeric-tie.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--force-version=1.7",
+            "../../tests/fixtures/compat/one-page.pdf",
+            source.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--min-version=1.7x.2",
+            source.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.7\n"));
+    assert!(contains(&bytes, b"/BaseVersion /1.7 "));
     assert!(contains(&bytes, b"/ExtensionLevel 2"));
 }
 

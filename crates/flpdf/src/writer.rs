@@ -1718,19 +1718,28 @@ fn update_effective_pdf_version<'a>(
     let Some(parsed) = parse_qpdf_writer_version(raw) else {
         return;
     };
-    let replace = match current.as_ref() {
-        None => true,
-        Some(current) => {
-            parsed > current.parsed
-                || (parsed == current.parsed && extension_level > current.extension_level)
+    match current.as_mut() {
+        None => {
+            *current = Some(EffectivePdfVersion {
+                raw,
+                parsed,
+                extension_level,
+            });
         }
-    };
-    if replace {
-        *current = Some(EffectivePdfVersion {
-            raw,
-            parsed,
-            extension_level,
-        });
+        Some(existing) => {
+            if parsed > existing.parsed {
+                // qpdf's setMinimumPDFVersion (QPDFWriter.cc:217-247) sets both
+                // set_version and set_extension_level when the new numeric
+                // version is strictly greater.
+                existing.raw = raw;
+                existing.parsed = parsed;
+                existing.extension_level = extension_level;
+            } else if parsed == existing.parsed && extension_level > existing.extension_level {
+                // On a numeric tie, qpdf only sets set_extension_level; the
+                // incumbent's raw version string is never replaced.
+                existing.extension_level = extension_level;
+            }
+        }
     }
 }
 
@@ -5778,7 +5787,13 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn effective_version_pair_keeps_raw_minimum_when_extension_level_wins_tie() {
+    fn effective_version_pair_keeps_incumbent_raw_version_when_extension_level_wins_tie() {
+        // qpdf's setMinimumPDFVersion (QPDFWriter.cc:217-247) never sets
+        // set_version on a numeric tie, only set_extension_level. Verified
+        // against live qpdf 11.9.0: forcing a source to exactly "1.7" and
+        // applying --min-version=1.7x.2 emits "%PDF-1.7" with
+        // /BaseVersion /1.7 and /ExtensionLevel 2 -- the source's raw
+        // spelling survives, not the tying --min-version candidate's.
         let options = WriterOptions {
             min_version: Some("1.7x".to_owned()),
             min_extension_level: Some(2),
@@ -5787,6 +5802,23 @@ mod final_handle_writer_tests {
 
         assert_eq!(
             effective_pdf_version_and_ext("1.7", 0, &options, false, false),
+            ("1.7", 2)
+        );
+    }
+
+    #[test]
+    fn effective_version_pair_takes_the_minimum_s_raw_version_on_an_outright_numeric_win() {
+        // Contrast with the tie case above: 1.7x > 1.3 numerically, so
+        // qpdf's compare > 0 branch sets both the raw string and the
+        // extension level from the winning --min-version candidate.
+        let options = WriterOptions {
+            min_version: Some("1.7x".to_owned()),
+            min_extension_level: Some(2),
+            ..WriterOptions::default()
+        };
+
+        assert_eq!(
+            effective_pdf_version_and_ext("1.3", 0, &options, false, false),
             ("1.7x", 2)
         );
     }
