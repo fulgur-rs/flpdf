@@ -1859,8 +1859,9 @@ fn effective_pdf_version_and_ext_without_force<'a>(
 
     let mut best = None;
     // QPDFWriter's minimum is a pair. Keep the raw string and extension level
-    // together so an equal numeric version with a higher extension level also
-    // selects that candidate's raw header spelling.
+    // together so a strictly greater numeric version replaces both, while a
+    // numeric tie raises only the extension level and keeps the incumbent raw
+    // header spelling.
     if let Some(encryption_floor) = encryption_version_floor(options) {
         let raw = encryption_floor.static_version_str().unwrap_or("1.7");
         update_effective_pdf_version(&mut best, raw, encryption_floor.extension_level());
