@@ -1312,7 +1312,6 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         }
         Err(error) => return Err(error),
     };
-    // qpdf-deviation-end
     let xref_pos = match usize::try_from(startxref) {
         Ok(xref_pos) => xref_pos,
         // cov:ignore-start: converting the u64 startxref offset can overflow
@@ -1339,7 +1338,9 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         XrefReadContextSpec::ActiveSection,
         Some(&mut observed_first_xref_item_offset),
         true,
-    ) {
+    )
+    // qpdf-deviation-end
+    {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
             // Report the first recorded failure; this parse error is only the
