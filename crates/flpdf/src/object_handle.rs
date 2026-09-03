@@ -55,7 +55,7 @@
 //! beside a separate `Weak` resolver route. `ObjectSlot::pdf_unique_ids` has
 //! no qpdf counterpart at all -- it is flpdf-only history bookkeeping that
 //! outlives detachment, not a live containment index; see the field's own
-//! marker comment.
+//! `#[deprecated]` attribute.
 //
 // qpdf-deviation-start: qpdf 11.9.0's default destruction of a sufficiently
 // deep programmatic direct container graph recursively follows the
@@ -1018,12 +1018,18 @@ struct ObjectSlot {
     parsed_offset: i64,
     end_before_space: i64,
     end_after_space: i64,
-    // qpdf-deviation: qpdf has no per-object document-id set. This set
-    // supports flpdf's ownership/dirty-propagation bookkeeping, but it is not
-    // a live containment index: `associate_pdf_identity` inserts an id that
-    // `detach_child_from_parent` never removes, so a value's prior document
-    // ids remain here as history after it is no longer reachable there (see
-    // `check_key_value_ownership`'s own note on this).
+    // Separable at field granularity, so CLAUDE.md's marker policy calls for
+    // #[deprecated] here rather than a comment marker: qpdf has no per-object
+    // document-id set. This set supports flpdf's ownership/dirty-propagation
+    // bookkeeping, but it is not a live containment index:
+    // `associate_pdf_identity` inserts an id that `detach_child_from_parent`
+    // never removes, so a value's prior document ids remain here as history
+    // after it is no longer reachable there (see `check_key_value_ownership`'s
+    // own note on this). Its six accessor functions get #[allow(deprecated)]
+    // locally rather than spreading unchecked.
+    #[deprecated(
+        note = "no qpdf counterpart; not a live containment index -- retains stale document ids as history, do not add new callers"
+    )]
     pdf_unique_ids: BTreeSet<u64>,
     /// The document identity claimed by a handle-native name/number-tree
     /// wrapper while this shared root is still contextless. qpdf's tree
@@ -1181,6 +1187,7 @@ pub(crate) enum ObjectValue {
     },
 }
 
+#[allow(deprecated)]
 fn empty_object_slot() -> Rc<RefCell<ObjectSlot>> {
     Rc::new(RefCell::new(ObjectSlot {
         initialized: false,
@@ -1546,6 +1553,7 @@ impl ObjectHandle {
     /// moves; clones of the reference returned by `operator*` therefore see
     /// the later end/next-item assignment too
     /// (`libqpdf/QPDFObjectHandle.cc:2534-2542`).
+    #[allow(deprecated)]
     fn rebind_cursor_value(&self, target: Option<ObjectHandle>) {
         let old_owners = self.0.borrow().state_owners.clone();
         Self::remove_state_owner(&old_owners, &self.0);
@@ -1805,6 +1813,7 @@ impl ObjectHandle {
     /// Construct qpdf's document-owned reserved sentinel with a fresh
     /// indirect identity. The resolver link is weak for the same lifetime
     /// reason as ordinary canonical handles.
+    #[allow(deprecated)]
     pub(crate) fn new_reserved_for_pdf(
         object_ref: ObjectRef,
         pdf_unique_id: u64,
@@ -1843,6 +1852,7 @@ impl ObjectHandle {
     /// [`crate::Pdf::new_reserved`] hands out), this shares no identity, no
     /// object number, and no owning document with the handle it was copied
     /// from.
+    #[allow(deprecated)]
     pub(crate) fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             initialized: true,
@@ -1893,6 +1903,7 @@ impl ObjectHandle {
         )
     }
 
+    #[allow(deprecated)]
     fn new_indirect_unresolved_with_identity(
         object_ref: ObjectRef,
         offset: i64,
@@ -1946,6 +1957,7 @@ impl ObjectHandle {
         Self::new_direct_with_resolver_inner(value, parsed_offset, None)
     }
 
+    #[allow(deprecated)]
     fn new_direct_with_resolver_inner(
         value: ObjectValue,
         parsed_offset: i64,
@@ -2294,6 +2306,7 @@ impl ObjectHandle {
     /// payload during promotion. This is the corresponding primitive here:
     /// every alias keeps its `Rc` identity while this slot receives its active
     /// object reference, document identity, and weak resolver.
+    #[allow(deprecated)]
     pub(crate) fn promote_to_indirect(
         &self,
         object_ref: ObjectRef,
@@ -2541,6 +2554,7 @@ impl ObjectHandle {
             .collect()
     }
 
+    #[allow(deprecated)]
     pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let slot = self.0.borrow();
         if slot.object_ref.is_some() {
@@ -2564,6 +2578,7 @@ impl ObjectHandle {
     /// check does not catch. [`Self::check_key_value_ownership`] (the
     /// `replace_key` and array mutator ownership boundary) intentionally does
     /// not call this: qpdf's real `checkOwnership` never does either.
+    #[allow(deprecated)]
     pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let mut pending = vec![self.clone()];
         let mut visited = BTreeSet::new();
@@ -4832,6 +4847,7 @@ impl ObjectHandle {
         Weak::ptr_eq(left, right)
     }
 
+    #[allow(deprecated)]
     fn attach_child_to_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
         if child.is_indirect() {
             return;
@@ -4881,6 +4897,7 @@ impl ObjectHandle {
         }
     }
 
+    #[allow(deprecated)]
     fn associate_pdf_identity(&self, pdf_unique_id: u64, visited: &mut BTreeSet<usize>) {
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {

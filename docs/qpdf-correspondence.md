@@ -1172,9 +1172,13 @@ bound されないため、十分に長い参照チェーンを持つ実在の P
 ### `flpdf-77kv` の正式マーカー監査（2026-09-04）
 
 `flpdf-77kv`（qpdf-deviation 監査: 2次候補6件の精査とマーク）がスコープとする
-6候補のうち、既にマーク済みの2件（`ref_chain.rs`、`stream_filter.rs`）を除いた
-残り4候補について、qpdf 11.9.0 に対応物がない挙動をソース近傍の
-`qpdf-deviation` マーカーへ記録した。この表は `flpdf-77kv` の候補リストに
+6候補のうち、`stream_filter.rs` は既にマーク済みだった。もう1件の既存マーク
+候補として bd issue が記録していた `ref_chain.rs`
+（`resolve_ref_chain`/`terminal_ref_of_chain`/`MAX_REF_CHAIN_DEPTH`）は、
+本PR時点のツリーには存在しない — 該当機能自体が候補リスト作成後の別作業で
+削除されており、新たなマーカーを追加すべき対象は残っていない。したがって
+本PRが実際に新規マークしたのは残り4候補（`stream_filter.rs` を含めた
+既存分と合わせて現存する候補は5件）。この表は `flpdf-77kv` の候補リストに
 限定したものであり、直前の2件（`reserve_objects` の owner 再検証、
 `stacker::maybe_grow` によるスタック保護）を含む repository 全体の
 未マーク候補を網羅する監査ではない。それらは ⚪（逸脱候補・要承認、まだ
@@ -1186,7 +1190,7 @@ bound されないため、十分に長い参照チェーンを持つ実在の P
 |---|---|---|
 | `object_copy.rs` の `ForeignObjectCopier::direct_visiting` | `reserveObjects` / `replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）に direct dictionary/array cycle 用 visited set はない。これは `ObjectHandle::replace_key` でのみ作れる direct graph の防御である。 | reservation と replacement の各 direct-cycle guard |
 | `xref.rs::load_xref_state_with_options` の `startxref` 解析失敗フォールバック | qpdf は `startxref` を解析できないと即座に `damagedPDF("can't find startxref")` を投げ `read_xref` を一切呼ばない（`QPDF.cc:450-452`）。flpdf はこのフォールバックで offset 0 を使い、実際に `parse_xref_from_start` を再試行する — qpdf に対応物のない retry-at-offset-0 detour。`push_repair_diagnostics` 自体は qpdf の `reconstruct_xref` 3行警告シーケンスを忠実に再現するだけで、対応物のない挙動はこの detour 側にある。 | `startxref` 解析失敗時の offset-0 フォールバックと、その後続の `parse_xref_from_start` 呼び出し |
-| `object_handle.rs::ObjectSlot::pdf_unique_ids` | qpdf は document-level `unique_id`（`QPDF.hh:1454`, `QPDF.cc:2294-2296`）と各 value の `QPDF*` back-pointer（`QPDFValue.hh:150`, `QPDFObject.cc:6-11`）を持つが、別の per-object numeric id set は持たない。`active_pdf_unique_id`（単一値）は qpdf の `QPDF*` back-pointer への container 表現代替（CLAUDE.md 分類 (B)）であり対応物があるため、この行の対象外（マーカーなし）。 | history を保持する containment set（`detach_child_from_parent` では削除されない） |
+| `object_handle.rs::ObjectSlot::pdf_unique_ids` | qpdf は document-level `unique_id`（`QPDF.hh:1454`, `QPDF.cc:2294-2296`）と各 value の `QPDF*` back-pointer（`QPDFValue.hh:150`, `QPDFObject.cc:6-11`）を持つが、別の per-object numeric id set は持たない。`active_pdf_unique_id`（単一値）は qpdf の `QPDF*` back-pointer への container 表現代替（CLAUDE.md 分類 (B)）であり対応物があるため、この行の対象外（マーカーなし）。フィールド単位で切り離せるため `#[deprecated]`（アクセスする11関数に `#[allow(deprecated)]`）で記録し、comment block マーカーは使わない。 | history を保持する containment set（`detach_child_from_parent` では削除されない） |
 | `reader/resolver.rs::ResolverHandle::read_window` / `read_to_owned` | qpdf の `InputSource` は live `seek`/`tell`/`read`（`InputSource.hh:71-74`）で、`readStream` もその source を保存・復元して読む（`QPDF.cc:1360-1398`）。bounded owned-window helper は qpdf にない。関数単位で切り離せるため `#[deprecated]`（呼び出し元は `#[allow(deprecated)]`）で記録し、comment block マーカーは使わない。 | `read_window` / `read_to_owned` の legacy owned-buffer seam |
 
 ---
