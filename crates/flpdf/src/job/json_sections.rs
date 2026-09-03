@@ -874,7 +874,7 @@ fn filespec_handle_to_json<R: Read + Seek>(
 /// Build the qpdf JSON v2 `"attachments"` section.
 ///
 /// Returns a [`Json`] dictionary where each key is an EmbeddedFiles name-tree
-/// entry name (decoded PDF string, bare without prefix) and each value is a
+/// entry name (qpdf's UTF-8 byte view, bare without prefix) and each value is a
 /// filespec entry object.
 ///
 /// Returns an empty [`Json`] dictionary when the document has no `/Names/EmbeddedFiles`.
@@ -895,17 +895,14 @@ pub(crate) fn build_attachments_section_with_version<R: Read + Seek>(
         let mut embedded_files = pdf.embedded_files();
         embedded_files.get_embedded_files()?
     };
-    let mut raw_entries: Vec<(String, ObjectHandle)> = entries
-        .into_iter()
-        .map(|(key_bytes, filespec)| (String::from_utf8_lossy(&key_bytes).into_owned(), filespec))
-        .collect();
+    let mut raw_entries: Vec<(Vec<u8>, ObjectHandle)> = entries.into_iter().collect();
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Build the output object. Both indirect and direct Filespec handles use
     // the same qpdf-shaped helper boundary.
-    let mut pairs: Vec<(String, Json)> = Vec::new();
+    let mut pairs: Vec<(Vec<u8>, Json)> = Vec::new();
     for (name, filespec) in raw_entries {
         let entry = filespec_handle_to_json(pdf, filespec)?;
         pairs.push((name, entry));

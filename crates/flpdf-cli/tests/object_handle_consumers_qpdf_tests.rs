@@ -151,6 +151,24 @@ fn json_attachments_match_qpdf_for_direct_filespec_leaves() {
 }
 
 #[test]
+fn json_attachments_preserve_distinct_invalid_explicit_utf8_keys() {
+    run_json_parity(
+        "invalid-explicit-utf8-name-collision",
+        build_pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R /Names 3 0 R >>",
+            b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+            b"<< /EmbeddedFiles 5 0 R >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            b"<< /Names [(\xef\xbb\xbf\xfe) 6 0 R (\xef\xbb\xbf\xff) 8 0 R] >>",
+            b"<< /Type /Filespec /F (a.txt) /EF << /F 7 0 R >> >>",
+            b"<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream",
+            b"<< /Type /Filespec /F (b.txt) /EF << /F 9 0 R >> >>",
+            b"<< /Type /EmbeddedFile /Length 0 >>\nstream\n\nendstream",
+        ]),
+    );
+}
+
+#[test]
 fn json_attachments_malformed_outcomes_match_qpdf() {
     run_json_outcome_probe(
         "scalar-filespec",
