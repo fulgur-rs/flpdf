@@ -61,7 +61,7 @@ compilation or fixture failures. Commit the design and tests with:
 - Modify: `crates/flpdf/src/job/lifecycle.rs`
 - Modify: `crates/flpdf-cli/src/main.rs`
 
-- [ ] **Step 1: Add the job-owned helper**
+- [x] **Step 1: Add the job-owned helper**
 
 Add this operation beside `QPDFJob::handle_page_specs` in `page_specs.rs`:
 
@@ -84,7 +84,7 @@ Document the qpdf source boundaries and the fact that route-specific output
 stages are not part of this helper. Leave the existing public prune wrappers
 for other consumers unchanged.
 
-- [ ] **Step 2: Replace the QPDFJob InPlace arm**
+- [x] **Step 2: Replace the QPDFJob InPlace arm**
 
 Replace the direct remap/subset/AcroForm calls in `run_document_erased` with:
 
@@ -97,7 +97,7 @@ self.run_document_stages(pdf, configuration)
 Do not change the `Merged` arm or later QPDFJob transformation/inspection
 ordering.
 
-- [ ] **Step 3: Replace the CLI InPlace arm**
+- [x] **Step 3: Replace the CLI InPlace arm**
 
 In `run_page_extraction_after_plan`, replace direct page completion calls with:
 
@@ -110,7 +110,7 @@ Move the existing CLI rotation call below the helper. Preserve image,
 overlay, split, writer, and warning-completion code after it. Remove only
 imports that are proven unused.
 
-- [ ] **Step 4: Run GREEN focused checks**
+- [x] **Step 4: Run GREEN focused checks**
 
 Run:
 
@@ -131,21 +131,21 @@ dictionary without `/P`, and the outline InPlace regression remains green.
 - Modify: `docs/qpdf-correspondence.md`
 - Modify: `docs/superpowers/specs/2026-09-04-inplace-page-spec-completion-design.md`
 
-- [ ] **Step 1: Use the helper in the direct fixture harness**
+- [x] **Step 1: Use the helper in the direct fixture harness**
 
 Change `run_subset_bytes` to call
 `QPDFJob::complete_in_place_page_selection` once after `rebuild_page_tree`.
 Remove only its direct individual remap/drop/prune calls and unused imports.
 Keep all existing structural assertions.
 
-- [ ] **Step 2: Update qpdf correspondence**
+- [x] **Step 2: Update qpdf correspondence**
 
 Extend the QPDFJob row near `docs/qpdf-correspondence.md:263` with the shared
 helper and citations `QPDFJob.cc:428-535,2137-2210,2360-2632`. State that CLI
 writer/output stages remain outside the helper. Add no deviation marker and
 do not call the CLI output owner qpdf's `handleTransformations`.
 
-- [ ] **Step 3: Run scope/document checks**
+- [x] **Step 3: Run scope/document checks**
 
 Run:
 
