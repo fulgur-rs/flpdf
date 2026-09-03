@@ -919,6 +919,12 @@ fn emit_warning(logger: &QPDFLogger, input_name: &str, message: impl AsRef<str>)
 }
 
 fn diagnostic_location(input_name: &str, diagnostic: &crate::Diagnostic) -> String {
+    // A diagnostic raised while piping a copied foreign stream carries the
+    // source document's own description (qpdf retains the source
+    // InputSource's name in the QPDFExc even though the destination QPDF
+    // owns warning collection; see Diagnostic::description). Prefer that
+    // over the checked document's own name so the location matches qpdf.
+    let input_name = diagnostic.description.as_deref().unwrap_or(input_name);
     if diagnostic.message.starts_with("(object ") || diagnostic.message.starts_with("(trailer,") {
         input_name.to_owned()
     } else {
@@ -2401,6 +2407,30 @@ WARNING: open-repair-failure.pdf: Attempting to reconstruct cross-reference tabl
         assert!(
             warnings.lock().expect("warning capture").is_empty(),
             "--no-warn must suppress open-failure repair diagnostics entirely"
+        );
+    }
+
+    #[test]
+    fn diagnostic_location_prefers_a_captured_foreign_source_description() {
+        let diagnostic = crate::Diagnostic::warning_with_description(
+            "error decoding stream data for object 26 0: bad code received",
+            Some(3627),
+            "source.pdf",
+        );
+
+        assert_eq!(
+            diagnostic_location("destination.pdf", &diagnostic),
+            "source.pdf (offset 3627)"
+        );
+    }
+
+    #[test]
+    fn diagnostic_location_falls_back_to_the_checked_document_without_a_description() {
+        let diagnostic = crate::Diagnostic::warning("plain repair warning", Some(17));
+
+        assert_eq!(
+            diagnostic_location("destination.pdf", &diagnostic),
+            "destination.pdf (offset 17)"
         );
     }
 }
