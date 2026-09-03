@@ -4027,10 +4027,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     .copied()
                     .flatten()
                     .ok_or_else(|| {
+                        // cov:ignore-start: every Preserve batch is derived
+                        // from a compressed source xref entry above, so a
+                        // valid plan cannot lack its source container.
                         crate::Error::Unsupported(format!(
                             "source-backed Preserve ObjStm batch {batch_index} has no source container"
                         ))
-                    })?;
+                        // cov:ignore-end
+                    })?; // cov:ignore: the validated Preserve plan always supplies a source container
                 Ok(ObjectStreamGroup::SourceBacked {
                     source,
                     members: members.clone(),
@@ -4994,7 +4998,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &container_refs,
                     options.qdf,
                     &qdf_emission_renumber,
-                    renumber_lookup,
+                    renumber_lookup, // cov:ignore: forwarding-only argument; the remap helper owns the lookup behavior
                 )
             })
         } else {
@@ -6408,6 +6412,65 @@ mod final_handle_writer_tests {
             "an inline Catalog has no restoration snapshot"
         );
         restore_catalog_extensions(&mut pdf, snapshot).expect("restore absent snapshot");
+    }
+
+    #[test]
+    fn source_objstm_extends_remaps_to_preserved_or_fallback_container() {
+        let extends = ObjectRef::new(4, 0);
+        let fallback = ObjectRef::new(7, 0);
+        let missing = ObjectRef::new(8, 0);
+        let mut source_container_to_batch = HashMap::new();
+        source_container_to_batch.insert(extends, 1);
+        let container_refs = vec![ObjectRef::new(20, 0), ObjectRef::new(21, 0)];
+        let mut qdf_emission_renumber = HashMap::new();
+        qdf_emission_renumber.insert(fallback, ObjectRef::new(30, 0));
+        let mut ordinary_renumber = HashMap::new();
+        ordinary_renumber.insert(fallback, ObjectRef::new(31, 0));
+
+        assert_eq!(
+            remap_source_objstm_extends(
+                extends,
+                &source_container_to_batch,
+                &container_refs,
+                false,
+                &qdf_emission_renumber,
+                &ordinary_renumber,
+            ),
+            Some(ObjectRef::new(21, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                fallback,
+                &source_container_to_batch,
+                &container_refs,
+                true,
+                &qdf_emission_renumber,
+                &ordinary_renumber,
+            ),
+            Some(ObjectRef::new(30, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                fallback,
+                &source_container_to_batch,
+                &container_refs,
+                false,
+                &qdf_emission_renumber,
+                &ordinary_renumber,
+            ),
+            Some(ObjectRef::new(31, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                missing,
+                &source_container_to_batch,
+                &container_refs,
+                false,
+                &qdf_emission_renumber,
+                &ordinary_renumber,
+            ),
+            None
+        );
     }
 
     #[test]
