@@ -72,6 +72,12 @@ pub enum Error {
     #[error("missing required PDF entry: {0}")]
     Missing(&'static str),
 
+    /// A qpdf `qpdf_e_pages` exception from an invalid or unsupported pages
+    /// structure. The string is the complete `QPDFExc::what()` location and
+    /// message, including the source description and page-object context.
+    #[error("{0}")]
+    Pages(String),
+
     #[error("encrypted PDF: {0}")]
     Encrypted(#[from] EncryptedError),
 
