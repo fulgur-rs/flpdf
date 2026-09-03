@@ -5928,9 +5928,7 @@ mod final_handle_writer_tests {
 
     #[test]
     fn pdf_writer_compression_level_changes_recompressed_output() {
-        let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
-            .lock()
-            .unwrap();
+        let _guard = crate::pipeline::flate::lock_compression_level_for_tests();
 
         fn rewrite(level: i32) -> Vec<u8> {
             let mut pdf = Pdf::open(Cursor::new(
@@ -5958,9 +5956,7 @@ mod final_handle_writer_tests {
 
     #[test]
     fn pdf_writer_reprocesses_an_invalid_compression_level_without_filtering() {
-        let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
-            .lock()
-            .unwrap();
+        let _guard = crate::pipeline::flate::lock_compression_level_for_tests();
         struct CompressionLevelReset;
         impl Drop for CompressionLevelReset {
             fn drop(&mut self) {
@@ -6017,9 +6013,7 @@ mod final_handle_writer_tests {
 
     #[test]
     fn get_final_version_does_not_leak_compression_level_into_a_later_writer() {
-        let _guard = crate::pipeline::flate::COMPRESSION_LEVEL_TEST_LOCK
-            .lock()
-            .unwrap();
+        let _guard = crate::pipeline::flate::lock_compression_level_for_tests();
         crate::pipeline::flate::Flate::set_compression_level(-1).expect("reset level");
 
         fn rewrite_at_default_level() -> Vec<u8> {
