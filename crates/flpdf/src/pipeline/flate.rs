@@ -8,6 +8,8 @@
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 
 pub(crate) const DEFAULT_OUT_BUFFER_SIZE: usize = 65_536;
 const Z_BUF_ERROR: i32 = -5;
@@ -15,7 +17,43 @@ const BUF_ERROR_WARNING: &str = "input stream is complete but output may still b
 static COMPRESSION_LEVEL: AtomicI32 = AtomicI32::new(-1);
 
 #[cfg(test)]
-pub(crate) static COMPRESSION_LEVEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static COMPRESSION_LEVEL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static COMPRESSION_LEVEL_TEST_LOCK_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct CompressionLevelTestGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for CompressionLevelTestGuard {
+    fn drop(&mut self) {
+        COMPRESSION_LEVEL_TEST_LOCK_OWNER.with(|owner| owner.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_compression_level_for_tests() -> CompressionLevelTestGuard {
+    let guard = COMPRESSION_LEVEL_TEST_LOCK
+        .lock()
+        .expect("compression-level test lock is not poisoned");
+    COMPRESSION_LEVEL_TEST_LOCK_OWNER.with(|owner| {
+        assert!(
+            !owner.replace(true),
+            "compression-level test lock is not reentrant"
+        );
+    });
+    CompressionLevelTestGuard { _guard: guard }
+}
+
+#[cfg(test)]
+fn compression_level_test_lock_owned_by_current_thread() -> bool {
+    COMPRESSION_LEVEL_TEST_LOCK_OWNER.with(std::cell::Cell::get)
+}
 
 /// The zlib operation performed by [`PlFlate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +177,9 @@ impl<'a> Flate<'a> {
         // (`libqpdf/Pl_Flate.cc:221-224`). zlib validates it lazily at
         // deflateInit time, where the owning stream's retry boundary can
         // report the failure and fall back to unfiltered bytes.
+        #[cfg(test)]
+        let _test_guard = (!compression_level_test_lock_owned_by_current_thread())
+            .then(|| COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap());
         COMPRESSION_LEVEL.store(level, Ordering::Relaxed);
         Ok(())
     }
@@ -169,6 +210,15 @@ impl<'a> Flate<'a> {
         if self.codec.is_some() {
             return Ok(());
         }
+        #[cfg(test)]
+        let _test_guard = if self.action == FlateAction::Deflate
+            && self.compression_level.is_none()
+            && !compression_level_test_lock_owned_by_current_thread()
+        {
+            Some(COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap())
+        } else {
+            None
+        };
         self.codec = Some(match self.action {
             FlateAction::Inflate => FlateCodec::Inflate(Decompress::new(false)),
             FlateAction::Deflate => {
@@ -522,14 +572,15 @@ impl Pipeline for PlFlate<'_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Flate, FlateAction, PlFlate, BUF_ERROR_WARNING, COMPRESSION_LEVEL_TEST_LOCK, Z_BUF_ERROR,
+        lock_compression_level_for_tests, Flate, FlateAction, PlFlate, BUF_ERROR_WARNING,
+        Z_BUF_ERROR,
     };
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     fn deflate_chunks(chunks: &[&[u8]], out_buffer_size: usize) -> PipelineResult<Vec<u8>> {
-        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let _guard = lock_compression_level_for_tests();
         Flate::set_compression_level(-1)?;
         let mut sink = Buffer::new("sink", None);
         {
@@ -701,7 +752,7 @@ mod tests {
 
     #[test]
     fn compression_level_setter_accepts_qpdf_zlib_values() {
-        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let _guard = lock_compression_level_for_tests();
         Flate::set_compression_level(-1).unwrap();
         Flate::set_compression_level(0).unwrap();
         Flate::set_compression_level(1).unwrap();
@@ -713,7 +764,7 @@ mod tests {
 
     #[test]
     fn invalid_deflate_level_fails_at_first_nonempty_write_like_qpdf() {
-        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let _guard = lock_compression_level_for_tests();
         let mut sink = Buffer::new("sink", None);
         let mut flate = Flate::new_with_compression_level(
             "flate",
@@ -729,7 +780,7 @@ mod tests {
 
     #[test]
     fn invalid_deflate_level_is_not_initialized_for_empty_input() {
-        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let _guard = lock_compression_level_for_tests();
         let mut sink = Buffer::new("sink", None);
         let mut flate = Flate::new_with_compression_level(
             "flate",
@@ -747,7 +798,7 @@ mod tests {
 
     #[test]
     fn public_pl_flate_boundary_delegates_to_the_canonical_stage() {
-        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let _guard = lock_compression_level_for_tests();
         PlFlate::set_compression_level(1).unwrap();
         let mut sink = Buffer::new("sink", None);
         let mut flate = PlFlate::new("public flate", &mut sink, FlateAction::Deflate).unwrap();
@@ -761,7 +812,7 @@ mod tests {
 
     #[test]
     fn deflate_reads_process_level_at_first_nonempty_write() {
-        let _guard = COMPRESSION_LEVEL_TEST_LOCK.lock().unwrap();
+        let _guard = lock_compression_level_for_tests();
         let input = b"abcdefghijklmnopqrstuvwabcdefghijklmnopqrstuvwabcdefghijklmnopqrstuvw\
             abcdefghijklmnopqrstuvwabcdefghijklmnopqrstuvwabcdefghijklmnopqrstuvw";
         let changed_after_new = deflate_after_level_change(input, -1, 1);
