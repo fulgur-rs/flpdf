@@ -115,10 +115,11 @@ Create `.github/workflows/build-experiment.yml` with:
               set -euo pipefail
               log_path="${RUNNER_TEMP}/flpdf-w2mi-${{ matrix.label }}-test-no-run.log"
               cargo test --workspace --no-run 2>&1 | tee "$log_path"
-              if grep -Eq 'Compiling (flpdf|flpdf-cli|flpdf-libjpeg-compat|flpdf-qtest-tools) v' "$log_path"; then
+              if grep -Eq 'Compiling.*(flpdf|flpdf-cli|flpdf-libjpeg-compat|flpdf-qtest-tools) v' "$log_path"; then
                 echo "::error::cargo test --workspace --no-run recompiled a workspace package"
                 exit 1
               fi
+              echo "test --no-run reuse: pass"
               echo "- test --no-run reuse: pass" >> "$GITHUB_STEP_SUMMARY"
 
 - [x] **Step 2: Verify scope and commit**
@@ -163,10 +164,10 @@ Run:
     git push -u origin feature/flpdf-w2mi-build-experiment
     gh run list --repo fulgur-rs/flpdf --workflow build-experiment.yml --branch feature/flpdf-w2mi-build-experiment --limit 5 --json databaseId,status,conclusion,headSha,event,url
 
-Require the push-triggered run to use the current branch head. If GitHub does
-not expose the branch workflow, dispatch it with:
-
-    gh workflow run build-experiment.yml --repo fulgur-rs/flpdf --ref feature/flpdf-w2mi-build-experiment
+Require the push-triggered run to use the current branch head. Before this
+workflow is present on the default branch, the push-triggered run is the
+available pre-merge execution path; `workflow_dispatch` can be used for
+manual reruns after the workflow is present on the default branch.
 
 - [x] **Step 3: Watch and record the experiment**
 
@@ -179,6 +180,12 @@ Run:
 Require all three matrix jobs to pass. Record each job summary's debug setting,
 clean rebuild seconds, and `test --no-run reuse: pass`. Treat the timings as
 data; do not change profile settings based on this issue.
+
+Recorded successful run `33797921540` at commit `cf04b876`:
+
+- `CARGO_PROFILE_DEV_DEBUG=true`: 256 seconds; reuse passed.
+- `CARGO_PROFILE_DEV_DEBUG=line-tables-only`: 168 seconds; reuse passed.
+- `CARGO_PROFILE_DEV_DEBUG=0`: 97 seconds; reuse passed.
 
 ### Task 4: Run repository gates and create a Draft PR
 

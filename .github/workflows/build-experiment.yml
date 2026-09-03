@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           log_path="${RUNNER_TEMP}/flpdf-w2mi-${{ matrix.label }}-test-no-run.log"
           cargo test --workspace --no-run 2>&1 | tee "$log_path"
-          if grep -Eq 'Compiling (flpdf|flpdf-cli|flpdf-libjpeg-compat|flpdf-qtest-tools) v' "$log_path"; then
+          if grep -Eq 'Compiling.*(flpdf|flpdf-cli|flpdf-libjpeg-compat|flpdf-qtest-tools) v' "$log_path"; then
             echo "::error::cargo test --workspace --no-run recompiled a workspace package"
             exit 1
           fi

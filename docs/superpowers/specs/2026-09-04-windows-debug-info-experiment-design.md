@@ -64,8 +64,8 @@ The measured sequence is:
 4. Run `cargo test --workspace --no-run` without timing it. Its log must contain
    no `Compiling` line for the four cleaned packages, proving the measured
    all-target build produced the test artifacts used by the existing split.
-5. Write the variant, profile value, warm-up seconds, rebuild seconds, and
-   test-no-run reuse result to `$GITHUB_STEP_SUMMARY`.
+5. Write the variant, profile value, rebuild seconds, and test-no-run reuse
+   result to `$GITHUB_STEP_SUMMARY`.
 
 `set -euo pipefail` applies to every shell block. The workflow does not call
 the full test suite, change `ci.yml`, alter Cargo profiles, modify source code,
