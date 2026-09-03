@@ -1,4 +1,4 @@
-//! Route guards for the qpdf-shaped reader/cache cutover.
+//! Route guards for the qpdf-shaped reader/cache behavior.
 
 #[test]
 fn resolved_cache_entries_are_handle_native() {

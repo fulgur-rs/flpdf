@@ -606,8 +606,7 @@ mod tests {
 
     #[test]
     fn a_directly_nested_qtest_value_past_max_inline_depth_is_not_erased() {
-        // Codex Review on PR #610, follow-up finding: it is not only an
-        // *unrelated* sibling's deep nesting that must not erase `/QTest` —
+        // Deep nesting in an *unrelated* sibling must not erase `/QTest` —
         // `/QTest` itself, nested between the crate's inline-object-nesting
         // limit (256) and the parser's own, higher, acceptance limit (500),
         // parses successfully and must be reported as the array it is, not

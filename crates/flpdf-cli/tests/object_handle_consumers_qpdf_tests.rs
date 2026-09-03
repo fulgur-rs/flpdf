@@ -1,4 +1,4 @@
-//! Live qpdf probes for the ObjectHandle consumer cutover.
+//! Live qpdf probes for the ObjectHandle consumer paths.
 
 use assert_cmd::Command;
 use std::process::Command as ShellCommand;

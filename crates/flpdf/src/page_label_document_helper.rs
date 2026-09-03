@@ -1798,9 +1798,8 @@ mod tests {
     // `getLabelsForPageRange`'s entries with `getJSON(json_version)` and no
     // schema transformation, so `qpdf --json=2 --json-key=pagelabels` is a
     // faithful window onto the raw label dictionaries these two functions
-    // build. This does not wire flpdf's own `--json` output (that CLI wiring
-    // is `flpdf-q28i`'s scope) — it is a test-only observation of qpdf's
-    // internal state via its own JSON serializer.
+    // build. This does not exercise flpdf's own `--json` output; it observes
+    // qpdf's internal state through its own JSON serializer.
     //
     // `getLabelsForPageRange`'s `skip_first` redundancy-skip branch needs a
     // non-empty accumulator from a prior call, which `doJSONPageLabels`

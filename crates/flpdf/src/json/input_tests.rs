@@ -153,7 +153,7 @@ fn qpdf_json_validators_reject_a_generation_too_large_for_flpdf_object_ref() {
     // (`is_indirect_object` only checks `obj > 0`, never `gen`'s range).
     // flpdf's `ObjectRef` generation is `u16`, matching the PDF xref
     // table's actual generation width; a generation that fits i32 but not
-    // u16 has no flpdf-representable identity, so it is not a match here.
+    // u16 has no representable PDF object identity, so it is not a match here.
     assert_eq!(
         parse_indirect_reference(b"52 99999 R"),
         IndirectReferenceParse::NoMatch

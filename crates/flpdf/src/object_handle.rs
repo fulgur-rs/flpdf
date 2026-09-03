@@ -1586,8 +1586,8 @@ impl ObjectHandle {
                     slot.mutation_generation = mutation_generation;
                     // Preserve the target's own containment provenance so a
                     // cursor-derived direct child stays dirty-markable via
-                    // Pdf::mark_object_handle_dirty (Codex Review finding on
-                    // PR #1353; clearing it here silently dropped edits made
+                    // Pdf::mark_object_handle_dirty; clearing it here silently
+                    // drops edits made
                     // through a cursor's current() handle).
                     slot.containment_parents = containment_parents;
                 }
@@ -10617,8 +10617,8 @@ mod stream_payload_sharing_tests {
     // `Reserved` arm can only be reached by a *direct* reserved handle --
     // only constructible via `ObjectHandle::shallow_copy` on a reserved
     // handle (`QPDF_Reserved::copy`, `libqpdf/QPDF_Reserved.cc:14-19`, never
-    // null, never a throw). Codex Review round 5 on PR #789, databaseId
-    // 3773627592: this used to fall into the same `Ok(None)` bucket as a
+    // null, never a throw). A direct reserved handle used to fall into the
+    // same `Ok(None)` bucket as a
     // genuinely indirect handle, so `Pdf::make_indirect_object_handle`
     // reported "cannot make an already-indirect ObjectHandle indirect" for
     // a handle its own `is_direct()` would confirm is not indirect.
@@ -11194,9 +11194,8 @@ mod is_resolved_visibility_tests {
         // already covers is_resolved's semantics exhaustively) — it exists
         // only to keep a compile-time witness that `is_resolved` stays
         // `pub`, the same way the rest of this module's public surface has
-        // a direct caller in-tree. Real external verification happens in
-        // Task 7 (zero-consumer-diff gate does not apply to this file
-        // itself, so a positive compile check here is the useful signal).
+        // a direct caller in-tree. The positive compile check here is the
+        // useful signal for this API.
         let handle = ObjectHandle::integer(1);
         let _: bool = ObjectHandle::is_resolved(&handle);
     }
@@ -11441,8 +11440,8 @@ mod type_code_tests {
         // 130-132`) -- that identity is already known on the handle before
         // resolution ever runs, so qpdf never needs resolution to SUCCEED to
         // emit `N G R` for a dangling or otherwise unresolvable child. Drop
-        // the child's resolver to force `try_dereference` to fail, matching
-        // Codex's finding on PR #1354 that eagerly dereferencing before the
+        // the child's resolver to force `try_dereference` to fail. Eagerly
+        // dereferencing before the
         // `object_ref()` check let a single unresolvable element fail the
         // whole array.
         let (child, resolver) = identity_tests::resolver_bearing_handle(ObjectValue::Integer(5));
@@ -11856,14 +11855,14 @@ mod unparse_object_tests {
 
     #[test]
     fn unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached() {
-        // Code-quality review of commit 6cae41fd: `dict_is_sig_with_byte_range`
+        // `dict_is_sig_with_byte_range`
         // was hoisted to run once, unconditionally, before the per-entry loop
         // even started -- rather than lazily, only when the loop's own
         // iteration actually reaches a surviving `/Contents` key -- for the
         // Sig+ByteRange hex-string special case that same commit added. This
-        // reintroduced the identical unnecessary-force-resolution bug class
-        // Finding 2's `refiltered`-key exclusion fix (see
-        // `unparse_stream_dict_entries`'s own doc) already fixed for
+        // reintroduced an unnecessary-force-resolution bug. The
+        // `refiltered`-key exclusion test (see
+        // `unparse_stream_dict_entries`'s own doc) covers
         // `/Filter`/`/DecodeParms`: `/Type` (and, conditionally,
         // `/ByteRange`) now gets force-resolved even for a dict with no
         // `/Contents` key at all to apply the special case to -- see
@@ -12082,8 +12081,8 @@ mod unparse_object_tests {
         // QPDFObjectHandle's resolved value is never itself a stream
         // outside an indirect object), so there is no byte-parity oracle
         // here. This pins down the same "inline the dictionary, do not
-        // write the `stream`/`endstream` framing" behavior `write_stream_body`
-        // (Task 6) is separately responsible for, and stays consistent with
+        // write the `stream`/`endstream` framing" behavior for which
+        // `write_stream_body` is separately responsible, and stays consistent with
         // that primitive's scope rather than reproducing framing logic here.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
@@ -12109,8 +12108,8 @@ mod unparse_object_tests {
         // case and inlines just the dictionary -- not qpdf's real
         // stream-writing output at this position (see
         // `ObjectHandle::write_object`'s own doc). Pins today's actual
-        // behavior; `write_stream_body` (Task 6) is the primitive that
-        // will implement the real stream-writing path.
+        // behavior; `write_stream_body` is the primitive that implements the
+        // real stream-writing path.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
@@ -12666,7 +12665,8 @@ mod unparse_object_tests {
     #[test]
     fn unparse_stream_body_refiltered_does_not_resolve_a_would_error_indirect_filter_or_decodeparms(
     ) {
-        // Codex Review on PR #644 (crates/flpdf/src/object_handle.rs:2425):
+        // Refiltered output must exclude these entries before visibility
+        // checks:
         // `visible_dict_entries` previously ran over every entry --
         // including `/Filter`/`/DecodeParms` -- before the `refiltered`
         // skip in the write loop below ever got a chance to drop them,
@@ -13084,8 +13084,8 @@ mod unparse_object_tests {
         // use its `stream_dict`'s entries rather than falling into the
         // non-dictionary-self `<< >>` degrade below -- keeping the promise
         // those two `write_object`/`write_object_qdf` tests made on this
-        // primitive's behalf ("`write_stream_body` (Task 6) is separately
-        // responsible for this").
+        // primitive's behalf (`write_stream_body` is separately responsible
+        // for this).
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
@@ -15573,8 +15573,7 @@ mod mutation_tests {
 
     #[test]
     fn replace_key_removes_the_key_for_a_direct_null_previously_contained_by_another_document() {
-        // Regression test for a chatgpt-codex-connector finding on PR #791
-        // (databaseId 3773208253): a direct null handle that was earlier a
+        // A direct null handle that was earlier a
         // descendant of a PDF-A indirect object picks up PDF A's id in its
         // `pdf_unique_ids` live-containment bookkeeping (`promote_to_indirect`
         // -> `associate_pdf_identity`). That bookkeeping tracks *current*

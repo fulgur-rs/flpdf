@@ -412,7 +412,7 @@ fn open_with_options_accepts_r5_and_r6_by_default() {
 }
 
 // ---------------------------------------------------------------------------
-// flpdf-9hc.3.21: authentication error parity for V=5 (and the V<5/V=4 path).
+// authentication error parity for V=5 (and the V<5/V=4 path).
 //
 // Error behavior in reader.rs `authenticate_if_encrypted`:
 //   - Password authentication runs FIRST. Both user+owner failing => BadPassword.
@@ -1319,7 +1319,7 @@ fn r5_and_r6_reject_malformed_encrypt_metadata() {
 }
 
 // ---------------------------------------------------------------------------
-// flpdf-9hc.3.20: user_password_matched / owner_password_matched API parity
+// user_password_matched / owner_password_matched API parity
 //
 // Acceptance matrix: for each encryption version, opening with the USER
 // password must yield (user=true, owner=false), opening with the OWNER
@@ -2993,14 +2993,14 @@ fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, 
     entries.push(field2);
 }
 
-// ── flpdf-9hc.27: authoritative indirect /Length via xref ─────────────────
+// ── Authoritative indirect /Length via xref ────────────────────────────────
 
 /// When `/Length` is an indirect reference, the reader resolves the holder
 /// via the xref and slices EXACTLY that many content bytes. Here the
 /// authoritative length (2) is shorter than what the `endstream`-scan
 /// fallback would yield (`ab\n`, after trimming one of the two trailing
 /// EOLs), so without xref resolution the stream would carry a spurious
-/// trailing newline. With flpdf-9hc.27 it is exactly `ab`.
+/// trailing newline; resolving the holder makes it exactly `ab`.
 #[test]
 fn indirect_length_resolved_via_xref_is_authoritative() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -3035,7 +3035,7 @@ fn indirect_length_resolved_via_xref_is_authoritative() {
     );
 }
 
-/// flpdf-9hc.27 re-slices on the still-encrypted object bytes BEFORE
+/// The reader re-slices on the still-encrypted object bytes BEFORE
 /// `decrypt_resolved_object`. Opening an encrypted fixture and resolving its
 /// objects must still yield correctly decrypted streams (no double-decrypt /
 /// ciphertext leakage from the new path).
@@ -3061,7 +3061,7 @@ fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
     assert!(stream_seen, "fixture must contain at least one stream");
 }
 
-/// flpdf-9hc.27 (roborev #199): a cyclic indirect-/Length holder chain
+/// A cyclic indirect-/Length holder chain
 /// (obj 1's /Length -> obj 2 -> obj 1) must NOT recurse forever. The
 /// in-progress `Reserved` guard breaks the cycle; resolution terminates and
 /// the stream falls back to the endstream-scan length.
@@ -3094,7 +3094,7 @@ fn cyclic_indirect_length_holder_terminates() {
     );
 }
 
-// ── flpdf-9hc.28: whole-file QDF detection for exact-window indirect /Length ──
+// ── Whole-file QDF detection for exact-window indirect /Length ─────────────
 
 fn exact_window_indirect_length_pdf(header: &[u8]) -> Vec<u8> {
     // obj 1: stream `ab\n` followed *directly* by `endstream` (non-conformant:

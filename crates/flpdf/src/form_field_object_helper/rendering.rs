@@ -713,7 +713,7 @@ fn build_qpdf_choice_appearance_content(
     // branch keeps the unmatched value as its own row and appends up to
     // `max_rows - 1` options on top, so it needs room for the value plus
     // every option -- `options.len() + 1` rows -- when the bounding box is
-    // tall enough to hold them (flpdf-25kg.3.8.2.3's clamp under-served
+    // tall enough to hold them (the clamp in this function under-served
     // this branch by exactly one row).
     let max_rows = ((bbox_h / tfh).max(0.0) as usize).min(options.len().saturating_add(1));
     let mut lines = vec![value.to_vec()];

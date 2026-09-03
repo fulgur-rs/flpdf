@@ -137,10 +137,10 @@ fn qpdf_objects_json(path: &Path, password: &str, allow_weak_crypto: bool) -> Ve
 }
 
 // ---------------------------------------------------------------------------
-// flpdf-9hc.3.18: `rewrite --remove-restrictions`
+// `rewrite --remove-restrictions`
 //
 // `--remove-restrictions` explicitly disables the normal rewrite's source
-// encryption preservation. These tests pin the acceptance criteria: the flag
+// encryption preservation. These tests verify that the flag
 // de-restricts an encrypted+restricted fixture (one-line diagnostic, no
 // /Encrypt, `show-encryption` reports "File is not encrypted"), it does NOT
 // bypass authentication, and it is a no-op exit-0 rewrite on unencrypted
@@ -331,7 +331,7 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
 }
 
 // ---------------------------------------------------------------------------
-// flpdf-9hc.4.10: `--decrypt`
+// `--decrypt`
 //
 // `--decrypt` is qpdf's silent encryption-removal flag. Unlike
 // `--remove-restrictions`, it explicitly disables source-encryption

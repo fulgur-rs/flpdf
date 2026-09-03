@@ -1,5 +1,5 @@
 //! CLI integration tests for the `--password-is-hex-key` and
-//! `--suppress-password-recovery` flags (flpdf-9hc.3.19, stack layer 6/6).
+//! `--suppress-password-recovery` flags.
 //!
 //! `--password-is-hex-key` (qpdf parity): the --password value is the
 //! precomputed file encryption key as hex, NOT a user/owner password. All
@@ -10,9 +10,9 @@
 //! encoding retries while leaving the first authentication attempt unchanged.
 //!
 //! End-to-end strategy: recover the hex key from a known password via the
-//! layer-4 `show-encryption-key` subcommand, then reopen the file with that
-//! key and `--password-is-hex-key`. This proves the layer-4 dependency and
-//! the round-trip together.
+//! `show-encryption-key` subcommand, then reopen the file with that key and
+//! `--password-is-hex-key`. This verifies the key extraction and round-trip
+//! together.
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;

@@ -8,8 +8,8 @@
 //! - The report contains the expected number of tuples.
 //! - JSON and Markdown output are well-formed (non-empty, contain headers).
 //!
-//! Does NOT assert byte equality between qpdf and flpdf outputs — that is
-//! the responsibility of later subtasks (.3+).
+//! Does NOT assert byte equality between qpdf and flpdf outputs; this smoke
+//! test focuses on harness execution and report structure.
 
 #[path = "support/mod.rs"]
 mod support;

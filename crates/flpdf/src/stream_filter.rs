@@ -508,10 +508,9 @@ fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
     // parameters are read for. `filters::prepare_decode_filters` peels the
     // spec off into `PreparedStage::Crypt` before consulting
     // `stream_filter_for`, and the crypt provider is then handed
-    // `&stage.spec.decode_params` — plan decision D2 of `flpdf-25kg.3.4` has
-    // that provider selecting its crypt filter from `/Name`. Leaving it out
-    // would make that reader's supply depend on a registry entry it never
-    // queries.
+    // `&stage.spec.decode_params` after the crypt provider selects its filter
+    // from `/Name`. Leaving it out would make that reader's supply depend on a
+    // registry entry it never queries.
     if is_crypt_filter(filter_name) {
         return true;
     }

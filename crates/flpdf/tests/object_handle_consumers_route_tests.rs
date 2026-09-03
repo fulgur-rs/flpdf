@@ -1,4 +1,4 @@
-//! Route contracts for the page/helper/job/JSON consumer cutover.
+//! Route contracts for page, helper, job, and JSON consumers.
 
 fn function_body<'a>(source: &'a str, signature: &str, end: &str) -> &'a str {
     source

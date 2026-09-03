@@ -1,4 +1,4 @@
-//! Route guards for the qpdf-shaped ObjectHandle core cutover.
+//! Route guards for the qpdf-shaped ObjectHandle core.
 
 #[test]
 fn object_handle_unparse_production_has_no_raw_materialization_helper() {

@@ -7,8 +7,8 @@
 //!    on the same input: ID[0] is preserved from the input trailer when
 //!    present, and ID[1] is qpdf's static constant (the first 32 hex digits
 //!    of π). The byte-level comparison is value-only — the surrounding array
-//!    syntax (whitespace between `<...>` elements) still differs and is
-//!    deferred to the writer-whitespace task in epic 9hc.20.
+//!    syntax (whitespace between `<...>` elements) still differs; this suite
+//!    compares the `/ID` values independently of that surrounding syntax.
 //!
 //! Sub-test (2) needs qpdf as an external oracle and follows the same skip
 //! rules as `cli_linearize_qpdf.rs`: hard-fail on CI, soft-skip locally.
@@ -198,7 +198,7 @@ fn static_id_trailer_id_matches_qpdf_oracle() {
 #[test]
 fn static_id_emits_test_only_warning_on_stderr() {
     // --static-id is a test/parity-only flag; using it must surface a
-    // stderr warning (flpdf-9hc.13.4) without changing the exit code.
+    // stderr warning without changing the exit code.
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("out.pdf");
@@ -222,7 +222,7 @@ fn static_id_top_level_alias_is_silent() {
     // `--static-id`. Emitting one here diverges from that documented contract
     // and regresses the qtest parity suite (8 allowlist subtests assert a
     // clean stderr). The test-only safety warning is retained on flpdf's
-    // native `rewrite --static-id` surface instead (flpdf-4x6).
+    // native `rewrite --static-id` surface instead.
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("out.pdf");
@@ -276,7 +276,7 @@ fn no_static_id_emits_no_static_id_warning() {
 
 #[test]
 fn static_id_with_linearize_succeeds() {
-    // --static-id with --linearize is now supported (epic 9hc.20 sub-task .19).
+    // --static-id with --linearize is supported.
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("out.pdf");

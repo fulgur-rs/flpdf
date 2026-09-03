@@ -11869,7 +11869,7 @@ mod tests {
             .spawn(|| {
                 let bytes = chained_indirect_length_pdf_bytes(4000);
                 // This test covers resolution stack growth, not the separate
-                // recursive teardown gap tracked by flpdf-97x9. On Windows,
+                // recursive teardown behavior is separate. On Windows,
                 // dropping the deep graph after the assertion can overflow
                 // before the spawned thread reports the result under test.
                 let mut pdf = std::mem::ManuallyDrop::new(

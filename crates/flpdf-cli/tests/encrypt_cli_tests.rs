@@ -1,6 +1,5 @@
-//! CLI tests for the writer-side `--encrypt` flag (flpdf-9hc.4.9): V=4
-//! AES-128 (KEY-LEN 128 `--use-aes=y`) and V=5 R=6 AES-256 (KEY-LEN 256,
-//! flpdf-9hc.4.9.4).
+//! CLI tests for the writer-side `--encrypt` flag: V=4
+//! AES-128 (KEY-LEN 128 `--use-aes=y`) and V=5 R=6 AES-256 (KEY-LEN 256).
 //!
 //! Strategy: invoke `flpdf --encrypt …` on a plaintext fixture, then verify
 //! the resulting encrypted PDF round-trips through qpdf's reader (the
@@ -402,10 +401,9 @@ fn rewrite_subcommand_encrypt_v4_aes_128_round_trips_via_qpdf() {
 
     // `qpdf --check` on an encrypted minimal-fixture output reliably
     // triggers a libstdc++/libc++ vector range-check assertion in qpdf
-    // 11.x on macOS (brew) and Windows (choco) — same shape as the bug
-    // tracked in flpdf-d4k (resolved for the writer_tests path in
-    // PR #209 by reinstalling matching qpdf versions, but the
-    // encrypted-output code path here surfaces it again on those
+    // 11.x on macOS (brew) and Windows (choco) — the same range-check failure
+    // can occur in qpdf's checker. The encrypted-output code path surfaces it
+    // again on those
     // platforms). Linux qpdf accepts the same bytes cleanly. Use
     // `qpdf --show-encryption` instead — it does enough work to prove
     // the password authenticates and the dict shape is valid, without
@@ -464,7 +462,7 @@ fn qdf_direct_encryption_works_on_top_level_and_rewrite_surfaces() {
 
 /// `flpdf --encrypt USER OWNER 256 -- IN OUT` produces a V=5 R=6 AES-256
 /// document that qpdf authenticates with BOTH the user and owner passwords —
-/// the cross-implementation gate for flpdf-9hc.4.9.4. qpdf recovering the user
+/// the cross-implementation gate. qpdf recovering the user
 /// password from `/O` via the owner password proves `/O` `/OE` are correct.
 #[test]
 fn top_level_encrypt_v5_r6_aes256_round_trips_via_qpdf() {
@@ -854,8 +852,7 @@ fn encrypt_owner_password_authenticates_via_qpdf() {
 /// structurally valid plaintext PDF that passes `qpdf --check`.
 ///
 /// Object-graph byte-equality between the original input and the
-/// round-tripped output is deferred to flpdf-9hc.4.12 (the explicit
-/// "encrypt round-trip + cross-implementation cross-check" task): flpdf's
+/// round-tripped output is intentionally checked structurally: flpdf's
 /// `full_rewrite` path doesn't preserve source object numbering, so a
 /// byte-level qpdf JSON v1 comparison diverges in a way that says
 /// nothing about encryption correctness.
@@ -905,11 +902,11 @@ fn encrypt_round_trip_on_one_page_decrypts_cleanly_via_qpdf() {
 
 // ── Validation matrix ───────────────────────────────────────────────────────
 //
-// User-visible diagnostics are pinned here so future scope expansions to the
+// User-visible diagnostics are pinned here so changes to the
 // `parse_encrypt_segment` accept matrix don't silently change error messages
 // that users may grep for.
 
-/// KEY-LEN=40 is V=1 RC4-40 — weak crypto. flpdf-9hc.4.9.1 wires the writer
+/// KEY-LEN=40 is V=1 RC4-40 — weak crypto. The writer
 /// dispatch, but (like qpdf) refuses to write RC4 without --allow-weak-crypto.
 #[test]
 fn encrypt_key_len_40_v1_rc4_requires_allow_weak_crypto() {
@@ -954,8 +951,7 @@ fn encrypt_key_len_40_v1_rc4_requires_allow_weak_crypto() {
 
 #[test]
 fn encrypt_key_len_256_is_accepted_as_v5_r6() {
-    // KEY-LEN=256 used to be rejected ("not yet supported"); flpdf-9hc.4.9.4
-    // wires the V=5 R=6 AES-256 writer dispatch, so it now succeeds and emits
+    // KEY-LEN=256 uses the V=5 R=6 AES-256 writer dispatch, so it succeeds and emits
     // an encrypted document.
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("ok.pdf");
@@ -977,7 +973,7 @@ fn encrypt_key_len_256_is_accepted_as_v5_r6() {
     );
 }
 
-/// flpdf-9hc.4.14: a non-empty user password with an EMPTY owner password
+/// a non-empty user password with an EMPTY owner password
 /// under a 256-bit key is insecure (anyone can open the file as owner), so it
 /// is rejected unless `--allow-insecure` is given — matching qpdf's
 /// checkConfiguration. No output is written.
@@ -1071,7 +1067,7 @@ fn encrypt_allow_insecure_ignores_an_attached_value() {
 }
 
 /// KEY-LEN=128 without `--use-aes=y` is qpdf's default V=2 R=3 RC4-128 — weak
-/// crypto (flpdf-9hc.4.9.2). Refused without --allow-weak-crypto; with it,
+/// crypto. Refused without --allow-weak-crypto; with it,
 /// qpdf reports R=3.
 #[test]
 fn encrypt_128_no_aes_is_v2_rc4_gated_by_weak_crypto() {
@@ -1114,7 +1110,7 @@ fn encrypt_128_no_aes_is_v2_rc4_gated_by_weak_crypto() {
 }
 
 /// `--encrypt … 128 --force-V4` without `--use-aes=y` selects the V=4 R=4
-/// /CFM V2 (RC4-128) variant — weak crypto (flpdf-9hc.4.9.3). With
+/// /CFM V2 (RC4-128) variant — weak crypto. With
 /// --allow-weak-crypto, qpdf reports R=4.
 #[test]
 fn encrypt_128_force_v4_no_aes_is_v4_rc4() {
@@ -1281,7 +1277,7 @@ fn encrypt_empty_segment_is_rejected_not_treated_as_absent() {
     );
 }
 
-/// flpdf-9hc.4.9.5: the R>=3 `--encrypt` permission sub-flags must produce the
+/// The R>=3 `--encrypt` permission sub-flags must produce the
 /// SAME /P permissions as qpdf for identical flags — including the
 /// order-sensitive `--modify`/individual-flag interaction and an owner-only
 /// restriction. Compares `qpdf --show-encryption` permission lines for
@@ -1377,7 +1373,7 @@ fn encrypt_permission_sub_flags_match_qpdf() {
     }
 }
 
-/// flpdf-9hc.4.9.6: `--cleartext-metadata` is accepted for V=4/V=5 (including
+/// `--cleartext-metadata` is accepted for V=4/V=5 (including
 /// the 128-bit default's forced V=4 path) and rejected by the 40-bit option
 /// table, which has no `/EncryptMetadata` concept.
 #[test]
@@ -1576,7 +1572,7 @@ fn encrypt_conflicts_with_decrypt_flag() {
         .stderr(predicates::str::contains("cannot be used"));
 }
 
-// ── --static-aes-iv tests (flpdf-9hc.4.13) ───────────────────────────────────
+// ── --static-aes-iv tests ───────────────────────────────────
 
 /// `--static-id --static-aes-iv --encrypt …` must produce byte-identical
 /// output on two consecutive runs (deterministic encryption).
@@ -2197,7 +2193,7 @@ fn rewrite_subcommand_static_aes_iv_produces_deterministic_output() {
     );
 }
 
-// ── --copy-encryption tests (flpdf-9hc.4.11) ───────────────────────────
+// ── --copy-encryption tests ───────────────────────────
 
 /// Build a donor PDF encrypted with V=4 AES-128 and return the path.
 /// Uses `--static-id --static-aes-iv` so the donor is deterministic, but the
@@ -2558,7 +2554,7 @@ fn copy_encryption_wrong_password_is_rejected() {
     assert!(!out.exists());
 }
 
-// ── --force-R5 tests (flpdf-9hc.4.15) ──────────────────────────────────────
+// ── --force-R5 tests ──────────────────────────────────────
 
 /// `--force-R5` produces the qpdf-verbatim V=5 R=5 AES-256 report.
 #[test]
@@ -2739,8 +2735,7 @@ fn encrypt_r6_default_not_gated_without_allow_weak_crypto() {
 }
 
 /// `--force-R5` produces V=5 R=5 AES-256 output that qpdf authenticates with
-/// both user and owner passwords (cross-implementation gate for
-/// flpdf-9hc.4.15).
+/// both user and owner passwords.
 #[test]
 fn encrypt_force_r5_round_trips_via_qpdf() {
     if !ensure_qpdf_or_skip() {
@@ -2992,7 +2987,7 @@ fn encrypt_with_generate_object_streams_uncompressed_xref_matches_qpdf() {
     assert_qpdf_uncompressed_xref_stream_dictionary_contract(qpdf_dictionary);
 }
 
-/// flpdf-9hc.4.17: xref-stream ソース + --object-streams=disable + --encrypt
+/// xref-stream ソース + --object-streams=disable + --encrypt
 ///
 /// source がすでに xref stream 形式を持つ場合、ObjStm を無効化して暗号化しても
 /// xref stream 形式が保持され、qpdf で復号できること。
@@ -3006,7 +3001,7 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
     }
     let tmp = tempfile::tempdir().unwrap();
 
-    // Step 1: xref stream ソースを生成（--object-streams=generate）
+    // First, generate an xref-stream source (--object-streams=generate).
     let xref_stream_source = tmp.path().join("xref_stream_source.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -3016,7 +3011,7 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
         .assert()
         .success();
 
-    // Step 2: ObjStm を無効化して暗号化（4.17 固有パス: plan.batches が空、source form を継承）
+    // Then, disable ObjStm and encrypt it while preserving the source form.
     let encrypted = tmp.path().join("encrypted_xref_stream.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -3106,7 +3101,7 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
     );
 }
 
-// ── --linearize + --encrypt / --copy-encryption (flpdf-txag) ──────────
+// ── --linearize + --encrypt / --copy-encryption ──────────
 //
 // qpdf itself supports `--linearize --encrypt ... --` and
 // `--linearize --copy-encryption=...` (verified empirically against qpdf
@@ -3473,7 +3468,7 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
     }
 }
 
-// ── Round-2 Codex review findings on the top-level --show-encryption ──────
+// ── Top-level --show-encryption routing checks ───────────────────────────
 // surface (dispatch conflicts, --no-warn threading, --update-from-json
 // routing). Verified against qpdf 11.9.0 directly (see comments below).
 

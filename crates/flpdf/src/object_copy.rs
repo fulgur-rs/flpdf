@@ -990,7 +990,7 @@ mod tests {
         // guard here, the replacement phase recurses `a -> b -> a -> b ...`
         // without end. qpdf's own `replaceForeignIndirectObjects`
         // (`QPDF.cc:2158-2213`) has no visited-set at all, so this same
-        // input would also recurse unbounded there; this is a flpdf-only
+        // input would also recurse unbounded there; this is a crate-specific
         // bound (see the `direct_visiting` field doc), not a qpdf parity
         // restoration, because no parsed PDF can produce a direct cycle in
         // the first place (only the public `ObjectHandle` API can).
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn copy_foreign_object_poisons_retry_after_a_reservation_phase_failure() {
-        // Regression test for round-3 Codex finding #1: qpdf never rolls
+        // qpdf never rolls
         // `ObjCopier::object_map`/`visiting` back when `copyForeignObject`
         // fails partway (`libqpdf/QPDF.cc:2019-2093` holds one mutable
         // reference to the persistent per-source `ObjCopier` for the whole
@@ -1217,8 +1217,8 @@ mod tests {
 
     #[test]
     fn copy_foreign_object_dirty_marks_a_nested_page_null_reservation() {
-        // Regression test for round-3 Codex finding #2: a nested `/Page`
-        // reservation created while copying some other, unrelated root
+        // A nested `/Page` reservation created while copying some
+        // other, unrelated root
         // returns before ever entering `to_copy` (`QPDF.cc:2124-2132`
         // mirrors this early return). Without an explicit dirty mark, that
         // fresh indirect null placeholder -- now referenced by the copied
@@ -1232,7 +1232,7 @@ mod tests {
         // from serialization entirely, regardless of dirty state. Arrays
         // have no such elision (`QPDF_Array` keeps every position), so an
         // array-held nested-page reference is the shape that actually
-        // exercises the dangling-reference failure the finding describes.
+        // exercises the dangling-reference failure.
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
         let page = source.get_object_handle(ObjectRef::new(3, 0));
@@ -1264,7 +1264,7 @@ mod tests {
         // handle proves nothing about a full rewrite: the canonical writer
         // discovers objects by walking from `/Root`, so the copied root
         // itself must be reachable for its `/Kids` array to be discovered
-        // and put to the dangling-reference test the finding describes).
+        // and exercise the dangling-reference test).
         let catalog_ref = target.root_ref().expect("target has a root");
         let catalog = target.get_object_handle(catalog_ref);
         catalog

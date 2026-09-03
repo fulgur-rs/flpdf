@@ -124,7 +124,8 @@ fn assemble(objs: &BTreeMap<u32, String>) -> Vec<u8> {
 /// 2-page document whose named destinations are attacker-controlled: `evil`
 /// points its first array element at a signature field (obj 7, a non-page
 /// object); `dp2` points at the genuinely removed page (obj 4). Mirrors the
-/// security PoC for [`flpdf-hn1g.11`].
+/// security regression involving a destination that points at a non-page
+/// object.
 fn build_malformed_dest_fixture() -> Vec<u8> {
     let mut objs: BTreeMap<u32, String> = BTreeMap::new();
     objs.insert(
@@ -299,7 +300,7 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
 
 #[test]
 fn malformed_dest_to_non_page_object_is_never_nulled() {
-    // Security regression (flpdf-hn1g.11): a destination's first array element
+    // Security regression: a destination's first array element
     // is attacker-controlled and may reference a non-page object. qpdf nulls
     // only removed /Page objects (it enumerates the page tree, never follows
     // destinations), so the non-page object (here a signature field) must
@@ -310,7 +311,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     // rewrite. It is NOT an end-to-end signature-validity guarantee — the full
     // `--pages` pipeline still prunes `/AcroForm` and full-rewrites, which
     // invalidates the signature; that distinct signature-refusal bypass is
-    // tracked separately in flpdf-hn1g.13.
+    // A separate signature-refusal bypass is exercised by the CLI pipeline.
     let mut pdf = Pdf::open(Cursor::new(build_malformed_dest_fixture())).expect("open fixture");
     let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).expect("rebuild");
     remap_outline_and_dests(&mut pdf, &result).expect("remap");
@@ -372,7 +373,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
 
 #[test]
 fn removed_page_behind_indirect_dest_does_not_leak() {
-    // Regression (Codex P1): a destination reaching the removed page only via an
+    // A destination reaching the removed page only via an
     // indirect reference holder (`40 0 obj` = `4 0 R`) or a non-page wrapper dict
     // (`40 0 obj` = `<< /X 4 0 R >>`) must not keep the page or its contents in
     // the output. qpdf nulls the page leaf directly (verified with qpdf 11.9.0),

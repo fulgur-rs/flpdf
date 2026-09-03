@@ -307,7 +307,7 @@ fn cli_pages_subset_reconstructs_labels_like_qpdf() {
         flpdf_ranges, qpdf_ranges,
         "flpdf's reconstructed /PageLabels must match qpdf's"
     );
-    // Pin the expected shape explicitly too, so a future change to either
+    // Pin the expected shape explicitly too, so a change to either
     // side's fixture/behaviour surfaces as a clear diff.
     assert_eq!(
         flpdf_ranges,

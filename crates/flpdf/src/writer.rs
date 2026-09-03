@@ -2282,7 +2282,7 @@ fn fresh_id_bytes() -> [u8; 16] {
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 mod _writer_doc_anchor {} // keeps the `emit_canonical_pdf` docstring above attached to its function.
 
-// ── Encryption context (flpdf-9hc.4.9) ───────────────────────────────────────
+// ── Encryption context ───────────────────────────────────────────
 
 /// How the writer derives per-object string/stream encryption key material.
 ///
@@ -3623,7 +3623,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
+    // Propagate the Adobe extension level into the destination
     // Catalog BEFORE any downstream dispatch, so every full-rewrite route sees
     // the injected Catalog.
     // When WriterOptions::min_extension_level requests an ext >= 1 (or the
@@ -3691,7 +3691,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         None
     };
 
-    // Catalog-first renumber (flpdf-9hc.32): assign output object numbers in
+    // Catalog-first renumber: assign output object numbers in
     // qpdf's `enqueueObjectsStandard` BFS order so that plain rewrite output is
     // byte-identical to `qpdf --static-id`. `build` borrows `pdf` mutably (lazy
     // load) and returns an owned map, releasing the borrow before the loop.
@@ -3798,9 +3798,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // final xref form, which becomes `Stream` when ObjStm batches are emitted.
     let mut version = effective_pdf_version(pdf.version(), options, false, false).to_owned();
 
-    // ── encryption preflight (flpdf-9hc.4.9 / 4.11 / 4.16 / 4.17) ─────────
-    // --encrypt supports xref-stream form and ObjStm containers (flpdf-9hc.4.16
-    // / 4.17).  --copy-encryption-from keeps the existing classic-xref route
+    // ── encryption preflight ───────────────────────────────────────────────
+    // --encrypt supports xref-stream form and ObjStm containers. --copy-
+    // encryption-from keeps the existing classic-xref route
     // except for the explicit non-QDF Generate path handled below, where qpdf
     // also emits an xref stream for the type-2 ObjStm entries. Reject
     // incompatible flag combinations upfront with a clear diagnostic.
@@ -4318,7 +4318,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         Some(generate_id_handle(source_id0.as_deref(), options.static_id))
     };
 
-    // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
+    // ── encryption context ────────────────────────────────────────────────
     // Built ONCE up front so /ID[0] is decided before any object is encrypted.
     // Compact /Encrypt follows existing objects and generated ObjStm containers.
     // QDF /Encrypt follows the final interleaved /Length holder from the pre-scan.
@@ -4410,7 +4410,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // Enumerate page content streams through the canonical
             // ObjectHandle graph. Keep the live stream handle's original
             // indirect identity for the emission loop; qpdf does not chase
-            // flpdf-only reference-holder chains here.
+            // crate-specific reference-holder chains here.
             for content_ref in collect_content_stream_refs(pdf, *page_ref)? {
                 contents_seq.insert(content_ref, seq);
             }
@@ -4760,7 +4760,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
 
         bytes.extend_from_slice(b"\nendobj\n");
-        // QDF framing (flpdf-9hc.6.10): qpdf `--qdf` separates every indirect
+        // QDF framing: qpdf `--qdf` separates every indirect
         // object with one blank line (`endobj\n\n%% Original object ID:` …, and
         // `endobj\n\nxref` before the xref table). The trailing blank line is
         // also emitted before the next holder/ObjStm object and, because
@@ -5079,7 +5079,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             );
         }
         bytes.extend_from_slice(b"\nendobj\n");
-        // QDF inter-object blank-line separator (flpdf-9hc.6.10). This applies
+        // QDF inter-object blank-line separator. This applies
         // to ordinary emitted objects; ObjStm member bodies use their own qpdf
         // pair-table and member framing.
         if options.qdf {
@@ -5152,7 +5152,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
     }
 
-    // ── flpdf-9hc.4.9: emit the /Encrypt dictionary as a plaintext indirect
+    // ── Emit the /Encrypt dictionary as a plaintext indirect
     // object. Per PDF 1.7 §7.6.1 the /Encrypt dict itself is never encrypted;
     // its strings (/U /O /UE /OE /Perms) are already in their final wire form
     // from the dict builders.
@@ -5535,7 +5535,7 @@ fn apply_stream_compress_policy_with_decode_level(
             // `/Length M G R` does not leak an indirect /Length (and a renumbered
             // holder reference) into the output — a byte divergence from qpdf for
             // passthrough/non-decodable streams whose length holder is kept live
-            // by another reference (flpdf-q1j2). The data bytes are untouched, so
+            // by another reference. The data bytes are untouched, so
             // /Length equals stream.data.len().
             let dict = stream_dictionary_copy(&stream_dict);
             dict.replace_key(

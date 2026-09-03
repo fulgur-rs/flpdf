@@ -1,19 +1,19 @@
-//! End-to-end QDF round-trip + `qdf-fix` test matrix (flpdf-9hc.6.9, FINAL
-//! leaf of epic flpdf-9hc.6). TEST-ONLY: no `src` changes; drives the real
-//! `flpdf` binary via assert_cmd exactly as a user / qpdf would.
+//! End-to-end QDF round-trip and `qdf-fix` test matrix.
+//! These tests drive the real `flpdf` binary via assert_cmd exactly as
+//! a user or qpdf would.
 //!
 //! Matrix:
-//!  (a) `rewrite --qdf <in> <out.qdf>` — structural invariants asserted
+//! (a) `rewrite --qdf <in> <out.qdf>` — structural invariants asserted
 //!      unconditionally; qpdf parity (check + page count + re-canonicalize)
 //!      asserted only when qpdf is present.
-//!  (b) `qdf-fix` on committed hand-edited corruptions (stale /Length holder,
+//! (b) `qdf-fix` on committed hand-edited corruptions (stale /Length holder,
 //!      lengthened stream payload, shifted xref offsets) — holder recomputed,
 //!      qpdf accepts the fixed file, the human-edited bytes survive,
 //!      idempotent on a second application.
-//!  (c) `rewrite --qdf` then `rewrite` (no --qdf) returns to normal form
+//! (c) `rewrite --qdf` then `rewrite` (no --qdf) returns to normal form
 //!      (no `%QDF-1.0` / `%% Original object ID:`; parses; page-equivalent).
 //!      Exercises that flpdf can re-read its own QDF (indirect /Length, m41).
-//!  (d) `qdf-fix` is a byte no-op on a valid clean QDF and idempotent.
+//! (d) `qdf-fix` is a byte no-op on a valid clean QDF and idempotent.
 //!
 //! qpdf is the external oracle. Every live-qpdf assertion is gated behind an
 //! availability check (same hard-fail-on-CI / soft-skip-locally policy as
@@ -25,8 +25,8 @@
 //! (object 5 is an integer where a dict is expected). QDF does not introduce
 //! the warning, so the qpdf-parity cell applies a "QDF must be no worse than
 //! the original input under qpdf" rule for this one fixture rather than the
-//! literal `== 0` rule (empirically verified during 6.9 bring-up). All
-//! flpdf-internal invariants and content equivalence still hold exactly.
+//! literal `== 0` rule. All
+//! Implementation invariants and content equivalence still hold exactly.
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
@@ -67,18 +67,18 @@ fn skip_if_qpdf_missing() -> bool {
 }
 
 /// Sentinel returned by [`qpdf_check_code`] when qpdf 12.x aborts `--check`
-/// with its upstream empty-page-tree `vector::at()` crash (flpdf-d4k) instead
+/// with a zero-page empty-page-tree `vector::at()` crash instead
 /// of producing a real exit code. The zero-page fixture (`minimal.pdf`) is a
 /// valid PDF — qpdf 11.x and the spec accept it — so callers treat this as
-/// "oracle unavailable for this input" and skip the qpdf gate. Self-heals
-/// once qpdf fixes the bug upstream.
+/// "oracle unavailable for this input" and skip the qpdf gate.
 const QPDF_EMPTY_PAGE_TREE_BUG: i32 = i32::MIN;
 
 /// Exit code of `qpdf --check <path>` (0 = clean, 3 = succeeded with
-/// warnings, 2 = errors), or [`QPDF_EMPTY_PAGE_TREE_BUG`] when qpdf hit the
-/// upstream zero-page crash. libstdc++ renders the crash as
-/// `vector::_M_range_check: ...`, libc++ (macOS) as a bare `vector`; both
-/// surface on stderr as a line starting `ERROR: vector`.
+/// warnings, 2 = errors), or [`QPDF_EMPTY_PAGE_TREE_BUG`] when qpdf aborts while
+/// checking the zero-page fixture. libstdc++ renders the crash as
+/// `vector::_M_range_check: ...`, libc++ (macOS) as a bare `vector`;
+/// both surface on stderr as a line starting `ERROR: vector`. The sentinel
+/// isolates this platform-specific termination from real qpdf exit codes.
 fn qpdf_check_code(path: &Path) -> i32 {
     let out = ShellCommand::new("qpdf")
         .args(["--check", path.to_str().unwrap()])
@@ -393,7 +393,7 @@ fn cell_a_rewrite_qdf_invariants_and_qpdf_parity() {
         let out_code = qpdf_check_code(&out);
         if out_code == QPDF_EMPTY_PAGE_TREE_BUG {
             eprintln!(
-                "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                "qpdf aborted while checking the empty page tree; \
                  skipping the qpdf gate for zero-page fixture {}",
                 spec.rel
             );
@@ -436,9 +436,7 @@ fn cell_a_rewrite_qdf_invariants_and_qpdf_parity() {
 
 #[test]
 fn cell_a_encrypted_input_is_transparently_decrypted_by_qdf() {
-    // DESIGN anticipated that the QDF path would *reject* encrypted input and
-    // made asserting that rejection optional. Empirically (6.9 bring-up)
-    // flpdf instead transparently decrypts an empty-user-password file (same
+    // The QDF path transparently decrypts an empty-user-password file (same
     // as qpdf) and emits a valid, unencrypted QDF. That is correct, useful
     // behavior — not a product bug — so this cell pins the *actual* boundary:
     // encrypted input -> success, output is unencrypted canonical QDF.
@@ -642,7 +640,7 @@ fn cell_c_qdf_to_normal_round_trip() {
         let code = qpdf_check_code(&normal);
         if code == QPDF_EMPTY_PAGE_TREE_BUG {
             eprintln!(
-                "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                "qpdf aborted while checking the empty page tree; \
                  skipping the qpdf gate for zero-page fixture {}",
                 spec.rel
             );
@@ -704,7 +702,7 @@ fn cell_d_fix_qdf_is_noop_and_idempotent_on_clean() {
             let code = qpdf_check_code(&clean);
             if code == QPDF_EMPTY_PAGE_TREE_BUG {
                 eprintln!(
-                    "qpdf hit the empty-page-tree --check bug (flpdf-d4k); \
+                    "qpdf aborted while checking the empty page tree; \
                      skipping the qpdf gate for zero-page fixture {clean_name}"
                 );
             } else {

@@ -32,15 +32,15 @@ fn read(name: &str) -> Vec<u8> {
 /// cross-reference stream (`/Type /XRef`) — qpdf `fix-qdf` accepts both
 /// (`qpdf/fix-qdf.cc`'s `st_in_ostream_*` / `st_in_xref_stream_dict`
 /// states), so these are part of the same byte-identical contract as the
-/// classic-xref-table cases above (flpdf-9hc.43).
+/// classic-xref-table cases above.
 const OBJSTM_CASES: &[&str] = &[
     "corrupt-objstm",
     "corrupt-objstm-multi",
     "corrupt-objstm-big",
 ];
 
-/// Edge cases in the object-stream/cross-reference-stream scanner added for
-/// flpdf-9hc.43, each confirmed against the live `fix-qdf` 11.9.0 oracle
+/// Edge cases in the object-stream/cross-reference-stream scanner, each
+/// confirmed against the live `fix-qdf` 11.9.0 oracle
 /// (`fix-qdf <input> > <golden>`) before being committed:
 ///
 /// * `corrupt-xref-truncated` — a cross-reference-stream object truncated
@@ -165,7 +165,7 @@ fn repaired_output_passes_qpdf_check() {
         return;
     }
     // Per-invocation unique temp dir: a fixed shared path races under
-    // parallel `cargo test` / concurrent CI jobs (flpdf-9hc.26).
+    // parallel `cargo test` / concurrent CI jobs.
     let dir = tempfile::tempdir().expect("temp dir");
     let tmp = dir.path().join("fix-check.pdf");
     // `corrupt-objstm-big` is excluded: it is a synthetic 300-member ObjStm
@@ -345,11 +345,8 @@ fn object_without_endobj_is_rejected() {
 /// rejected with `"...: expected object 2"` (the un-classified object's
 /// would-be sole member, object 2, is never counted into the sequential
 /// `1..N` counter, so the next real top-level object — numbered 3 — is
-/// non-sequential). This supersedes the prior "roborev job 994" POSITIVE
-/// expectation for this fixture (never itself verified against the
-/// oracle, and predating this PR's `find_raw_type_line` fix, which
-/// replaced a comment/string-aware `/Type` scan with the oracle's raw
-/// per-line one — flpdf-9hc.43 round-2 review).
+/// non-sequential). The raw per-line scan is authoritative for this fixture;
+/// a comment-aware `/Type` scan would produce a different result.
 #[test]
 fn objstm_type_split_across_comment_line_is_not_recognized() {
     let mut pdf = Vec::new();
@@ -485,7 +482,9 @@ fn objstm_in_classic_xref_form_is_unsupported() {
     );
 }
 
-/// Regression for roborev job 989 (qdf_fix.rs robustness):
+/// A stream body may contain a line-anchored `xref` without being the
+/// cross-reference table, and a dictionary string may contain `stream` without
+/// being the stream keyword:
 ///   1. A decompressed stream body that contains a line-anchored `xref` must
 ///      NOT be mistaken for the cross-reference table (use the LAST one).
 ///   2. A `stream` byte sequence inside a dictionary string value must NOT be
@@ -548,7 +547,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Regression for roborev job 991 (qdf_fix.rs ~251):
+/// A stream body may contain line-anchored `endobj` and `xref` text:
 ///   A decompressed QDF stream body may contain a line-anchored `endobj` (and
 ///   `xref`). The naive "first line-anchored endobj after N G obj" would
 ///   truncate the object span there, corrupting subsequent xref/length repair.
@@ -556,7 +555,8 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     // obj 1: stream whose decompressed body contains BOTH a line `endobj` and
-    // a line `xref` — the canonical regression case for roborev 991.
+    // a line `xref`; the object terminator must still be found after
+    // `endstream`.
     // /Length is indirect (held by obj 3). xref offsets are bogus zeros.
     // Object numbering is contiguous 1..3 (qpdf's fix-qdf rejects gaps).
     let mut pdf = Vec::new();
@@ -617,7 +617,7 @@ fn stream_body_endobj_and_xref_not_mistaken_for_object_terminator() {
     );
 }
 
-/// Regression for roborev job 992 (qdf_fix.rs ~189 classify_length):
+/// A `/Length1` key must not be mistaken for the real indirect `/Length` key:
 ///   A stream dict containing `/Length1 999` before the real `/Length H 0 R`
 ///   must not fool classify_length into treating `/Length1` as `/Length`.
 ///   fix_qdf must locate and recompute the REAL indirect length holder H.
@@ -673,9 +673,9 @@ fn length1_not_mistaken_for_indirect_length() {
     );
 }
 
-/// Negative control for roborev job 992: a dict with ONLY `/Length1` and a
+/// A dictionary with ONLY `/Length1` and a
 /// direct `/Length` integer has no indirect holder; fix_qdf must leave the
-/// direct length verbatim (the oracle/design: direct lengths are out of scope).
+/// direct length verbatim, matching qpdf.
 #[test]
 fn direct_length_with_length1_left_verbatim() {
     // obj 1: stream with `/Length1 999` and a DIRECT `/Length 11`.
@@ -711,13 +711,13 @@ fn direct_length_with_length1_left_verbatim() {
     );
 }
 
-/// Closed loop for flpdf-9hc.6.12: the flpdf QDF writer and flpdf::fix_qdf
+/// Closed loop for the flpdf QDF writer and flpdf::fix_qdf
 /// must mesh. Produce a real QDF via the writer (it now emits indirect
 /// `/Length H 0 R` + a bare-integer holder), hand-edit a stream's decoded
 /// payload (the canonical "human edits the QDF" use case), run flpdf::fix_qdf,
 /// and verify it repairs the indirect length-holder body — then `qpdf --check`
 /// accepts the result. This is the lighter version; the full round-trip
-/// matrix is flpdf-9hc.6.9.
+/// A broader round-trip matrix is covered by the CLI integration tests.
 #[test]
 fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
     use flpdf::Pdf;
@@ -788,7 +788,7 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
 
     // qpdf must accept the closed-loop result.
     if Command::new("qpdf").arg("--version").output().is_ok() {
-        // Per-invocation unique temp dir (flpdf-9hc.26).
+        // Per-invocation unique temp dir.
         let dir = tempfile::tempdir().expect("temp dir");
         let tmp = dir.path().join("closed-loop.pdf");
         fs::write(&tmp, &fixed).unwrap();
@@ -850,7 +850,7 @@ fn ignore_newline_marker_repairs_raw_length_and_is_idempotent() {
     );
 }
 
-/// Regression for roborev job 993: `/Length` appearing inside a string value
+/// A `/Length` appearing inside a string value
 /// or a comment in the stream dict must NOT be mistaken for the real key.
 /// fix_qdf must still locate the genuine indirect `/Length H 0 R` and
 /// recompute holder H after the stream content is edited.
@@ -895,7 +895,7 @@ fn length_inside_string_or_comment_not_mistaken_for_key() {
     );
 }
 
-/// Regression for roborev job 994 #1: `/ObjStm` inside a string/comment must
+/// A `/ObjStm` inside a string/comment must
 /// NOT trigger the Unsupported(ObjStm) rejection. A valid QDF with no real
 /// object stream but text mentioning /ObjStm must repair normally.
 #[test]
@@ -915,7 +915,7 @@ fn objstm_substring_in_string_not_rejected() {
     assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
 }
 
-/// Regression for roborev job 994 #2: a trailer key like `/SizeExtra` before
+/// A trailer key like `/SizeExtra` before
 /// the real `/Size` must not absorb the recomputed size.
 #[test]
 fn sizeextra_not_mistaken_for_size() {
@@ -951,7 +951,7 @@ fn sizeextra_not_mistaken_for_size() {
     );
 }
 
-/// Regression for roborev job 995: `/ObjStm` as a non-/Type name value (or
+/// `/ObjStm` as a non-/Type name value (or
 /// after a custom key) must NOT trigger the Unsupported(ObjStm) rejection —
 /// only a real `/Type /ObjStm` object stream is unsupported.
 #[test]
@@ -969,7 +969,7 @@ fn objstm_as_plain_name_value_not_rejected() {
     assert!(find(&fixed, b"\nxref\n0 2\n").is_some());
 }
 
-/// Regression for roborev job 996: `>>` inside a trailer string/comment must
+/// `>>` inside a trailer string/comment must
 /// not be taken as the dict close, so the real /Size is still rewritten.
 #[test]
 fn trailer_close_ignores_brackets_in_string() {
@@ -1002,7 +1002,7 @@ fn trailer_close_ignores_brackets_in_string() {
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
-/// Regression for the historical roborev #193 comment-split-`/ObjStm`
+/// A comment-split-`/ObjStm`
 /// fixture. This fixture's FIRST top-level object is numbered `2` (not
 /// `1`) — a construction quirk independent of the comment split itself.
 /// Confirmed against the live `fix-qdf` binary that this exact fixture is
@@ -1014,7 +1014,7 @@ fn trailer_close_ignores_brackets_in_string() {
 /// per-line scan; per `objstm_type_split_across_comment_line_is_not_recognized`,
 /// a comment-split `/Type`/`/ObjStm` is never classified as an object
 /// stream in the first place, so no "ObjStm"-specific error path is ever
-/// reached here either — flpdf-9hc.43 round-2 review).
+/// reached here either).
 #[test]
 fn objstm_with_comment_between_type_and_objstm_is_rejected() {
     let mut pdf = Vec::new();
@@ -1039,7 +1039,7 @@ fn objstm_with_comment_between_type_and_objstm_is_rejected() {
     );
 }
 
-/// Regression for roborev #193 (2): a NON-stream object whose literal string
+/// A NON-stream object whose literal string
 /// value contains line-anchored `stream`/`endstream`/`endobj` byte sequences
 /// must not be mis-detected as a stream / mis-spanned. The string lives inside
 /// `<<...>>`, before the dict close, so the dict-close-anchored stream scan
@@ -1078,7 +1078,7 @@ fn stream_keywords_inside_dict_string_not_mistaken_for_stream() {
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
-// ── flpdf-9hc.25: indirect /Length holder validation ──────────────────────
+// ── Indirect /Length holder validation ─────────────────────────────────────
 
 /// A stream whose indirect `/Length M G R` points at a NON-existent object
 /// `M` must be rejected, not silently "repaired" with a dangling /Length.
@@ -1118,7 +1118,7 @@ fn missing_indirect_length_holder_is_rejected() {
 /// covers), so both the oracle and flpdf reject it. (flpdf's own holder
 /// resolution is declared-`M`-keyed rather than positional and does not
 /// reproduce the oracle's mechanism when the two diverge — a separate,
-/// pre-existing gap tracked outside this fixture's scope.)
+/// pre-existing gap outside this fixture's scope.)
 #[test]
 fn objstm_typed_length_holder_is_rejected() {
     let mut pdf = Vec::new();
@@ -1191,7 +1191,7 @@ fn same_length_indirect_holder_reuse_is_ok() {
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
-/// flpdf-9hc.25 (roborev #199): an indirect `/Length M G R` with a non-zero
+/// An indirect `/Length M G R` with a non-zero
 /// generation is not canonical QDF and cannot be validated/rewritten by
 /// object-number-keyed holder tracking — it must be an explicit error, not a
 /// silent wrong-generation rewrite.
@@ -1213,7 +1213,7 @@ fn nonzero_generation_indirect_length_holder_is_rejected() {
     );
 }
 
-/// flpdf-9hc.25 (roborev #199 follow-up): an indirect `/Length 3 0 R` whose
+/// An indirect `/Length 3 0 R` whose
 /// only object numbered 3 is `3 1 obj` (generation 1, NOT the gen-0 holder
 /// the reference points at) must be rejected — number-only matching would
 /// wrongly accept it and rewrite the wrong-generation object. (Numbering stays
@@ -1237,13 +1237,13 @@ fn indirect_length_holder_generation_must_match() {
     );
 }
 
-// ── flpdf-rnnr / flpdf-o10m: object numbers must be 1..N in file order ──────
+// ── Object numbers must be 1..N in file order ──────────────────────────────
 // fix_qdf sizes the regenerated xref from the object COUNT, never the maximum
 // object number, so a sparse/huge number cannot amplify the table. It requires
 // objects numbered exactly 1..N in ascending file order (qpdf's
 // QdfFixer::checkObjId), which closes the dense-xref amplification DoS and the
 // `max_num + 1` overflow AND matches qpdf byte-for-byte. flpdf's own writer
-// emits objects in ascending file order (flpdf-abu3 / PR #430), so this rejects
+// emits objects in ascending file order, so this rejects
 // nothing the writer produces — see `writer_indirect_length_qdf_round_trips`.
 
 /// A sparse high object number (the second object is `1_000_000`, not `2`) is
@@ -1336,12 +1336,12 @@ fn two_object_qdf_with_second_number(second: u32) -> Vec<u8> {
 }
 
 /// flpdf's QDF writer emits each indirect `/Length` holder inline after its
-/// stream (flpdf-abu3 / PR #430), so even an indirect-length source — which used
+/// stream, so even an indirect-length source — which used
 /// to produce out-of-order numbering (`1 2 3 4 5 7 6 8`) — now emits objects in
 /// ascending file order `1..N`. Because fix_qdf requires that order, its
-/// acceptance here *proves* the writer output is qpdf-canonical; and on the
+/// this test *proves* the writer output is qpdf-canonical; and on the
 /// writer's already-correct output it must be a strict no-op. This is the
-/// writer↔fix_qdf mesh guard for an indirect-length source (flpdf-o10m: it would
+/// writer↔fix_qdf mesh guard for an indirect-length source (the test would
 /// regress to a hard error if the writer ever re-emitted holders out of order).
 #[test]
 fn writer_indirect_length_qdf_round_trips() {

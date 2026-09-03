@@ -1,6 +1,6 @@
 //! CLI integration tests for qpdf-compatible `--check` / `check` exit codes.
 //!
-//! # Exit-code semantics (flpdf-9hc.23.2)
+//! # Exit-code semantics
 //!
 //! Source: qpdf manual §"Exit Status"
 //!   <https://qpdf.readthedocs.io/en/stable/cli.html#exit-status>

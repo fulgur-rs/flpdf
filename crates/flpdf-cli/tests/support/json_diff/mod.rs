@@ -1,5 +1,5 @@
 //! JSON tree diff + allowlist + report machinery for the qpdf JSON schema-diff
-//! corpus test (flpdf-9hc.11.14).
+//! corpus test.
 //!
 //! Public surface:
 //! - [`Divergence`] — one path-level mismatch between qpdf and flpdf JSON.
@@ -7,8 +7,7 @@
 //! - [`Allowlist`] — load + match + stale-entry detection.
 //! - [`Report`] — fixture × top-level-key matrix + markdown/json writers.
 //!
-//! See `docs/plans/2026-05-27-flpdf-9hc-11-14-json-schema-diff.md` for the full
-//! plan.
+//! The fixture matrix and report format are defined by the corpus data below.
 
 use serde_json::Value;
 use std::path::Path;
@@ -43,7 +42,7 @@ pub fn run_qpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, St
 ///
 /// flpdf's clap surface accepts `--json=2` with `require_equals = true` and
 /// `--json-stream-data=none`; see `crates/flpdf-cli/src/main.rs` for the flag
-/// definitions. Verified by pre-flight check during Task 5 (flpdf-9hc.11.14).
+/// definitions.
 pub fn run_flpdf_json(fixture: &Path, password: Option<&str>) -> Result<Value, String> {
     let mut cmd = assert_cmd::Command::cargo_bin("flpdf").map_err(|e| e.to_string())?;
     cmd.arg("--json=2").arg("--json-stream-data=none");
@@ -165,7 +164,7 @@ impl Allowlist {
 ///
 /// Records one [`Divergence`] per mismatched path. No normalization is applied:
 /// integers and floats with the same numerical value are reported as different
-/// (consistent with the strict-value-match policy in flpdf-9hc.11.14).
+/// (consistent with strict value matching).
 pub fn diff_values(qpdf: &Value, flpdf: &Value) -> Vec<Divergence> {
     let mut out = Vec::new();
     diff_at(qpdf, flpdf, "$", &mut out);
@@ -1030,7 +1029,7 @@ mod tests {
         // mark allowlist entries as used. If classification short-circuits on
         // the first unknown, a sibling allowlisted divergence is left unmarked
         // and stale_entries() returns a false positive — which would fail the
-        // Task 7 corpus runner's stale_allowlist.is_empty() assertion.
+        // corpus runner's stale_allowlist.is_empty() assertion.
         //
         // Key names a_unknown / z_allowed force alphabetical ordering inside
         // serde_json::Map (a BTreeMap by default) so the unknown appears first.

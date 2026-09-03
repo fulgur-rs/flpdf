@@ -6,13 +6,12 @@
 //! `tests/golden/regenerate.sh`). Gated on `qpdf-zlib-compat` because byte
 //! identity requires flpdf's deflate to match qpdf's classic-zlib output.
 //!
-//! Two milestones:
+//! Two comparison modes:
 //! * **structural** (`mask_id1`): everything except the changing `/ID[1]` digest.
-//!   This is the layout milestone — object numbering, xref-stream encoding
+//!   This compares object numbering, xref-stream encoding
 //!   (`/Predictor 12`, `/W [1 2 1]`), hint stream, offsets, framing.
-//! * **strict**: full byte identity including `/ID[1]`. This needs qpdf's pass-1
-//!   xref-stream reconstruction for the deterministic `/ID` digest; until that
-//!   lands the strict tests are `#[ignore]`d.
+//! * **strict**: full byte identity including `/ID[1]`, using qpdf's pass-1
+//!   xref-stream reconstruction for the deterministic digest.
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
@@ -400,7 +399,7 @@ fn shared_stream_objstm_structurally_byte_identical_to_qpdf() {
 }
 
 // Full byte-identity, including the deterministic /ID[1] (digested from qpdf's
-// pass-1 xref-stream buffer; flpdf-9ntt).
+// pass-1 xref-stream buffer).
 #[test]
 fn two_page_objstm_byte_identical_to_qpdf() {
     assert_strict("two-page.pdf", "two-page");
@@ -411,7 +410,7 @@ fn three_page_objstm_byte_identical_to_qpdf() {
     assert_strict("three-page.pdf", "three-page");
 }
 
-// flpdf-zbf9: linearizing an ObjStm-bearing input (qpdf --object-streams=generate
+// linearizing an ObjStm-bearing input (qpdf --object-streams=generate
 // three-page.pdf). qpdf drops the source's stale /Type /ObjStm and /Type /XRef
 // containers (rebuilding the xref and repacking ObjStm members into fresh
 // containers), so the body carries no leaked structural objects. Note qpdf
@@ -430,10 +429,10 @@ fn objstm_bearing_input_byte_identical_to_qpdf() {
     assert_strict("three-page-objstm.pdf", "three-page-objstm");
 }
 
-// flpdf-4vpi: a malformed input whose trailer references a missing indirect
+// A malformed input whose trailer references a missing indirect
 // object (`/Info 99 0 R`, no xref entry). qpdf resolves the dangling ref to
 // null, drops /Info, and linearizes the remaining objects; flpdf's generate
-// planner must drop the unplanned `99 0 R` from ObjStm membership (rather than
+// planner must drop the dangling `99 0 R` from ObjStm membership (rather than
 // panic at place_objstm_members_per_half) and produce the same layout. This
 // pins the post-fix output to qpdf's own oracle so the panic fix did not just
 // stop crashing but stayed byte-parity.
@@ -447,11 +446,11 @@ fn missing_trailer_info_objstm_byte_identical_to_qpdf() {
     assert_strict("missing-trailer-info.pdf", "missing-trailer-info");
 }
 
-// flpdf-4vpi / PR #421 Codex review: 100 missing `/Junk` trailer refs whose
+// 100 missing `/Junk` trailer refs whose
 // even-split positions would otherwise scatter the two real ObjStm members
 // (the `/Info` dict and the `/Pages` tree) across separate containers. qpdf
 // drops the missing refs before splitting, emitting ONE `/N 2` ObjStm; flpdf
-// must match. Filtering the unplanned refs only AFTER the split produced two
+// must match. Filtering the dangling refs only AFTER the split produced two
 // `/N 1` ObjStms (≈119 extra bytes) and broke byte-parity for this input class.
 #[test]
 fn split_boundary_objstm_structurally_byte_identical_to_qpdf() {
@@ -463,11 +462,12 @@ fn split_boundary_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-split-boundary.pdf", "objstm-lin-split-boundary");
 }
 
-// flpdf-5apf: null-resolving body refs in the Catalog under --object-streams=
+// null-resolving body refs in the Catalog under --object-streams=
 // generate. qpdf drops the null-valued dict keys and inlines `null` for the
 // object-0 array element, then compresses the surviving objects; flpdf must
 // match. (The missing-xref *array* resurrection case is out of scope here — see
-// flpdf-0gyq — so this fixture deliberately uses only object-0 in the array.)
+// This fixture deliberately uses only object-0 in the array, so the
+// missing-xref array-resurrection behavior is not part of this case.
 #[test]
 fn dangling_body_refs_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("dangling-body-one-page.pdf", "dangling-body-one-page");
@@ -478,7 +478,7 @@ fn dangling_body_refs_objstm_byte_identical_to_qpdf() {
     assert_strict("dangling-body-one-page.pdf", "dangling-body-one-page");
 }
 
-// flpdf-8891: the first-page private/shared split (Step 5) is object-stream-mode
+// The first-page private/shared split is object-stream-mode
 // independent, so the Catalog /Ref2 edge that makes the Font lc_first_page_shared
 // must reorder the generate-mode first-page ObjStm members too.
 #[test]
@@ -497,15 +497,15 @@ fn catalog_firstpage_shared_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-9vkl: the two-page sibling — font 6 is cross-page-shared and font 7 is
+// The two-page sibling — font 6 is cross-page-shared and font 7 is
 // document-`others`-shared (via Catalog /Ref2) *and* a first-page object, so it
 // is lc_first_page_shared. An earlier generate-mode divergence (first-page ObjStm
-// /O, /L, container /N) was resolved by the post-8891 closure-classification
-// fixes; this pins generate mode to qpdf's own oracle. It also locks the
+// /O, /L, container /N) was resolved by the closure-classification fixes;
+// this pins generate mode to qpdf's own oracle. It also locks the
 // %PDF-1.4 -> 1.5 version-floor bump qpdf applies when emitting object streams
 // (the fixture header is 1.4; the linearized generate output must be 1.5). The
 // single first-page ObjStm container here does not exercise multi-container
-// private-before-shared ordering (that latent gap is a separate follow-up).
+// private-before-shared ordering; that ordering needs a multi-container fixture.
 #[test]
 fn catalog_firstpage_shared_two_page_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural(
@@ -522,7 +522,7 @@ fn catalog_firstpage_shared_two_page_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-19ac: qpdf classifies the generated ObjStm container union, not each
+// qpdf classifies the generated ObjStm container union, not each
 // member independently. The earlier even-split container contains obj 4,
 // which is first-page-shared through Catalog /Ref2. The later container is
 // first-page-private, so qpdf emits the later private container first.
@@ -542,7 +542,7 @@ fn firstpage_private_container_precedes_shared_generate_byte_identical_to_qpdf()
     );
 }
 
-// flpdf-25kg.6.20: a direct inherited /MediaBox array is promoted by
+// a direct inherited /MediaBox array is promoted by
 // optimization after Generate has allocated its ObjStm placeholder. qpdf
 // classifies the promoted object as lc_first_page_private and places its plain
 // body before the first-half ObjStm container; it must not be swept into the
@@ -596,7 +596,7 @@ fn firstpage_private_container_precedes_shared_preserve_byte_identical_to_qpdf()
     report(fixture, &actual, &expected, "preserve strict");
 }
 
-// flpdf-0gyq: under --object-streams=generate the resurrected null body object is
+// under --object-streams=generate the resurrected null body object is
 // compressed as the TRAILING ObjStm member (qpdf compresses it last). free and
 // missing variants must both match.
 #[test]
@@ -625,7 +625,7 @@ fn resurrect_missing_array_ref_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-o9im: when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
+// when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
 // the resurrected null must land in the first-page section in generate mode too.
 #[test]
 fn resurrect_missing_page_arr_objstm_byte_identical_to_qpdf() {
@@ -635,7 +635,7 @@ fn resurrect_missing_page_arr_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-891f: when Page 1 holds /Bad 99 0 R (dict value) and Page 2 holds
+// when Page 1 holds /Bad 99 0 R (dict value) and Page 2 holds
 // /Arr [99 0 R] (array element), the resurrected null must land in the
 // second-half section (low object number) in generate mode too.
 #[test]
@@ -646,7 +646,7 @@ fn resurrect_page2_arr_page1_dictval_not_in_first_page_section_objstm() {
     );
 }
 
-// flpdf-891f: both edges on same page — null must land in first-page section
+// both edges on same page — null must land in first-page section
 // in generate mode too.
 #[test]
 fn resurrect_both_edges_same_page_null_in_first_page_section_objstm() {
@@ -656,7 +656,7 @@ fn resurrect_both_edges_same_page_null_in_first_page_section_objstm() {
     );
 }
 
-// flpdf-891f: cross-object case — null must land in first-page section in
+// cross-object case — null must land in first-page section in
 // generate mode too (same original-number sort fix applies).
 #[test]
 fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section_objstm() {
@@ -666,7 +666,7 @@ fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section_objstm() {
     );
 }
 
-// flpdf-891f: else-branch ordering in generate mode — same number-order rule
+// else-branch ordering in generate mode — same number-order rule
 // applies when ObjStm generation is enabled.
 #[test]
 fn else_branch_children_ordered_by_original_object_number_objstm() {
@@ -676,7 +676,7 @@ fn else_branch_children_ordered_by_original_object_number_objstm() {
     );
 }
 
-// flpdf-hsjh: revorder case in generate mode — resurrectable ref (orig 99)
+// The revorder case in generate mode — resurrectable ref (orig 99)
 // lower-numbered than the live descendant (orig 100) holding the array edge.
 // Deferred admission + sorted-tail insertion must place the null correctly in
 // ObjStm output too.
@@ -685,7 +685,7 @@ fn revorder_resurrect_null_in_first_page_section_objstm() {
     assert_strict("revorder-resurrect.pdf", "revorder-resurrect");
 }
 
-// flpdf-hsjh (discriminator): Page at high original number (10), content
+// Discriminator: Page at high original number (10), content
 // stream at low original number (3). Sorted-tail (non-page) ensures Page
 // stays first in the closure even when its original number exceeds descendants.
 #[test]
@@ -696,7 +696,7 @@ fn page_highnum_content_lownum_page_before_content_objstm() {
     );
 }
 
-// flpdf-hsjh (Codex P2): resurrectable null also reachable via Catalog
+// Resurrectable null also reachable via Catalog
 // dict-value (/OpenAction 99 0 R, dropped) AND first-page array (/Arr [99 0 R]).
 // closure_from_seeds must skip Object::Null so the null stays lc_first_page.
 #[test]
@@ -704,7 +704,7 @@ fn od_null_also_in_first_page_arr_byte_identical_to_qpdf_objstm() {
     assert_strict("od-null-page-arr.pdf", "od-null-page-arr");
 }
 
-// flpdf-hsjh (Codex P2): Catalog ARRAY edge (/OpenAction [99 0 R]) to
+// Catalog ARRAY edge (/OpenAction [99 0 R]) to
 // xref-absent null — null must land in OD section (open_document_set), not
 // first-page.  closure_from_seeds tracks array vs dict-value edges.
 #[test]
@@ -717,7 +717,7 @@ fn shared_stream_objstm_byte_identical_to_qpdf() {
     assert_strict("shared-stream-objstm.pdf", "shared-stream-objstm");
 }
 
-// nonid-id0 (flpdf-9hc.13.11): a non-16-byte (20-byte / 40-hex) source /ID[0] on
+// nonid-id0: a non-16-byte (20-byte / 40-hex) source /ID[0] on
 // the ObjStm / xref-stream linearized path. This exercises the placeholder-then-
 // patch route (patch_linearized_deterministic_id) at a non-16-byte id0 width: the
 // 40-hex id0 must be carried verbatim at both /ID sites (first-page + main xref
@@ -728,11 +728,11 @@ fn nonid_id0_linearized_objstm_is_byte_identical_to_qpdf() {
     assert_strict("nonid-id0.pdf", "nonid-id0");
 }
 
-// ---- Phase-2 (flpdf-g6hb.2): >cap global even-split + part routing ----------
+// ---- >cap global even-split + part routing -------------------------------
 //
 // sharedfonts-100: 104 eligible first-page-shared dicts → 2 containers (50+51),
 // BOTH in part6 (first half). Exercises the global even-split membership fix
-// without second-half container numbering (finding-4): no part4 containers, so
+// without second-half container numbering: no part4 containers, so
 // the existing per-half renumber suffices.
 #[test]
 fn sharedfonts100_objstm_structurally_byte_identical_to_qpdf() {
@@ -779,7 +779,7 @@ fn cap_boundary_199_objstm_byte_identical_to_qpdf() {
 }
 
 // mixed-60-70: a part7 (other-page-private) ObjStm container. Exercises the
-// second-half container numbering (finding-4), the page-private-font
+// second-half container numbering, the page-private-font
 // compression, and the per-page object-count / page-length container folds.
 // Fully byte-identical to qpdf (structural + strict).
 #[test]
@@ -829,7 +829,7 @@ fn disc_part7_part8_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-disc-2-250-2.pdf", "objstm-lin-disc-2-250-2");
 }
 
-// openaction-80-80 (flpdf-1dmy, Stage A — in_open_document): the catalog's
+// openaction-80-80 (in_open_document): the catalog's
 // /OpenAction subtree (an action dict + 80 "od-only" font dicts reachable ONLY
 // from /OpenAction) is qpdf's in_open_document category → lc_open_document →
 // part4 (FIRST half, right after the Catalog, before the first page). The 80
@@ -854,7 +854,7 @@ fn openaction_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// openaction-multi-od (flpdf-699x): TWO open-document ObjStm containers.
+// openaction-multi-od: TWO open-document ObjStm containers.
 // The fixture arranges high-numbered OD objects (100..149) to be visited FIRST
 // in DFS (/HighRef < /LowRef lexically), so even-split C0 has min-member 5
 // (action) while C1 has min-member 2 (pages).  Discriminates between "DFS
@@ -877,11 +877,12 @@ fn openaction_multi_od_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// acroform-widget-page0-5-10 (flpdf-sjgv): AcroForm widgets in both
+// acroform-widget-page0-5-10: AcroForm widgets in both
 // /AcroForm /Fields (in_open_document) and page 0 /Annots (in_first_page).
 // qpdf's in_open_document > in_first_page precedence means widgets go to the
 // open-document section (part4, first half, before /O). Without the fix,
-// from_pdf Step 5 places them in part2, inflating page_hints[0].object_count
+// from_pdf's open-document precedence places them in part2, inflating
+// page_hints[0].object_count
 // and diverging hint tables. Exercises the from_pdf open_document_set peeling.
 #[test]
 fn acroform_widget_page0_objstm_structurally_byte_identical_to_qpdf() {
@@ -899,7 +900,7 @@ fn acroform_widget_page0_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-80-80 (flpdf-rm09, Stage B — in_outlines, part9): the catalog's
+// outlines-80-80 (in_outlines, part9): the catalog's
 // /Outlines subtree (an outline dict + 80 items reachable ONLY from /Outlines)
 // is qpdf's in_outlines category. With no /PageMode /UseOutlines, qpdf places it
 // in part9 (second half) via pushOutlinesToPart and emits the Outlines Hint Table
@@ -916,7 +917,7 @@ fn outlines_objstm_byte_identical_to_qpdf() {
     assert_strict("objstm-lin-outlines-80-80.pdf", "objstm-lin-outlines-80-80");
 }
 
-// useoutlines-80-80 (flpdf-vvjr.1): /PageMode /UseOutlines causes outline
+// useoutlines-80-80: /PageMode /UseOutlines causes outline
 // objects (dict + 80 items) to route to part6 (first-page section) instead of
 // part9. Their ObjStm container folds into page-0 nobjects (qpdf: 4, was 3).
 // Two pages share fonts so a first-page (part6) container coexists.
@@ -937,14 +938,14 @@ fn useoutlines_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-80-200 (flpdf-vvjr.3): outline tree with S=80 shared fonts and K=200
+// outlines-80-200: outline tree with S=80 shared fonts and K=200
 // items spans 3 ObjStm containers (281 eligible objects, even split:
 // ceil(281/100)=3, containers of ~94 each). All three containers route to
 // ContainerPart::Rest (outline priority applies). Verifies group_length
 // consecutiveness in the multi-container case: nobjects=3, group_length covers
 // all three consecutive containers.
 //
-// Previously #[ignore]d (flpdf-fmlf): second-half ObjStm containers were
+// The second-half ObjStm containers were previously
 // incorrectly included in the first-page section of the Shared Object Hint
 // Table (nshared=3 vs qpdf's 2). Fixed by canonical_shared_hints skipping
 // containers in second_half_container_nums when input_idx < first_page_input.
@@ -1073,7 +1074,7 @@ fn outlines_multi_container_hint_table_matches_qpdf() {
     assert!(nobjects >= 2, "nobjects={nobjects}: not multi-container");
 }
 
-// outlines-shared-page-80-80 (flpdf-vvjr.4 scenario A): outline∩page object
+// outlines-shared-page-80-80 ( scenario A): outline∩page object
 // overlap — outline items reference page objects, which are already assigned to
 // part-4/6/7. Verifies that the shared-page objects are not double-counted and
 // are placed in the correct linearization part.
@@ -1094,7 +1095,7 @@ fn outlines_shared_page_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-coloc-200-20 (flpdf-vvjr.4 scenario B): ObjStm co-location — outline
+// outlines-coloc-200-20 ( scenario B): ObjStm co-location — outline
 // items and page content share the same ObjStm containers (K=20 items spread
 // over fewer containers alongside page objects). Verifies correct part assignment
 // when outline objects co-locate with page objects in the same ObjStm.
@@ -1115,7 +1116,7 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-otherpage-2-60-20 (flpdf-7aek): a single even-split ObjStm container
+// outlines-otherpage-2-60-20: a single even-split ObjStm container
 // mixes /Outlines items (in_outlines => part9 / Rest, no /PageMode /UseOutlines)
 // with other-page-shared fonts (referenced by pages 1 AND 2, NOT page 0 => part8 /
 // lc_other_page_shared). route_objstm_containers gives outline priority, so the
@@ -1123,7 +1124,7 @@ fn outlines_coloc_objstm_byte_identical_to_qpdf() {
 // Shared Object Hint Table entries (canonical_shared_hints must guard part9
 // containers in the input_idx >= first_page_input section too). Sized so the
 // compressible set stays under the 100-object cap => one container, isolating this
-// SOHT bug from the even-split page-dict-erasure boundary divergence (flpdf-g1eu).
+// SOHT bug from the even-split page-dict-erasure boundary divergence.
 #[test]
 fn outlines_otherpage_objstm_structurally_identical_to_qpdf() {
     assert_structural(
@@ -1141,7 +1142,7 @@ fn outlines_otherpage_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-otherpage-0-60-20 (flpdf-7aek, Codex P2): same as above but page 0 has
+// outlines-otherpage-0-60-20: same as above but page 0 has
 // NO ObjStm-eligible private member (P0=0), so the part9 container carries no
 // first-page member. `part8_container_nums` (keyed on page reachability) would
 // re-add it as a Part-8 entry in canonical_shared_hints' enumeration tail AND
@@ -1164,7 +1165,7 @@ fn outlines_otherpage_empty_first_page_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-otherpage-2-120-20 (flpdf-g1eu): the 2-container variant of the above.
+// outlines-otherpage-2-120-20: the 2-container variant of the above.
 // With G=120 the compressible set is 149 > the 100-per-stream cap, so qpdf's
 // even split makes TWO containers: a part9 mixed container (DFS-early /Outlines
 // items + page-0 fonts + 47 shared fonts) and a part8 pure other-page-shared
@@ -1191,12 +1192,12 @@ fn outlines_otherpage_two_container_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-otherpage-0-120-20 (flpdf-g1eu, flpdf-7aek forward flag): the
+// outlines-otherpage-0-120-20 (forward flag): the
 // 2-container variant with P0=0, so the part9 mixed container holds NO first-page
-// member (page 0 has no ObjStm-eligible font). This is the scenario flpdf-7aek's
-// forward flag warned could reach canonical_shared_hints' enumeration tail. With
+// member (page 0 has no ObjStm-eligible font). This exercises the forward
+// flag path through canonical_shared_hints' enumeration tail. With
 // the part-rank emission order (part8 shared container before the part9 outline
-// container) AND flpdf-7aek's existing part9 guards, the output is byte-identical
+// container) AND the existing part9 guards, the output is byte-identical
 // and qpdf --check is clean — so no extra part9 enumeration-tail guard is needed.
 #[test]
 fn outlines_otherpage_two_container_empty_first_page_structurally_identical_to_qpdf() {
@@ -1215,7 +1216,7 @@ fn outlines_otherpage_two_container_empty_first_page_byte_identical_to_qpdf() {
     );
 }
 
-// otherpage-others-48-50 (flpdf-pn7h): a two-container part7/part9 layout. Page 0
+// otherpage-others-48-50: a two-container part7/part9 layout. Page 0
 // is fontless (no first-page ObjStm member), page 1 has 48 private fonts, page 2
 // has 50 private fonts. The even split yields C1 = {Pages tree node + the 48
 // page-1 fonts} and C2 = {the 50 page-2 fonts}. C1's union has other_pages=={1}
@@ -1223,7 +1224,7 @@ fn outlines_otherpage_two_container_empty_first_page_byte_identical_to_qpdf() {
 // not an open-document key nor /Outlines), so qpdf categorizes it lc_other (part9);
 // C2 has other_pages=={2}, others==0, so it is lc_other_page_private (part7). qpdf
 // emits/numbers the second half in strict part order — C2 (part7) before C1
-// (part9). Before flpdf-pn7h, `route_objstm_containers` routed C1 to part7 by
+// (part9). Before this change, `route_objstm_containers` routed C1 to part7 by
 // other_pages.len()==1 alone (ignoring `others`), AND `second_half_container_anchors`
 // classified C1 as part7 because it holds a page-private member — both diverging
 // from qpdf. This pins the part7/part9 container ordering AND numbering. Distinct
@@ -1246,7 +1247,7 @@ fn otherpage_others_two_container_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// otherpage-shared-docother (flpdf-w0vu): a drift-trigger fixture proving that
+// otherpage-shared-docother: a drift-trigger fixture proving that
 // `route_objstm_containers` and `second_half_container_anchors` disagree on ONE
 // container's part WITHOUT any byte divergence from qpdf. Page 0 is fontless;
 // page 1 has 48 private fonts; page 2 has 53 fonts, whose FIRST font (B*) is also
@@ -1266,7 +1267,7 @@ fn otherpage_others_two_container_objstm_byte_identical_to_qpdf() {
 // `place_objstm_members_per_half` a part9 plain object is always emitted
 // post-container while part8 is the last pre-container part, so the part9-mislabeled
 // container lands at the same terminal slot a part8 container would. This pins the
-// non-divergence as a regression guard: a future change to
+// non-divergence as a regression guard: a change to
 // `place_objstm_members_per_half` or either classifier that makes the drift
 // observable would break this golden. Distinct from otherpage-others-48-50 above,
 // which is the part7 (other-page-private) `others` gate; this is the part8
@@ -1339,7 +1340,7 @@ fn outline_od_shared_stream_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// useoutline-od-shared-stream (flpdf-q9o3): the UseOutlines sibling of
+// useoutline-od-shared-stream: the UseOutlines sibling of
 // outline-od-shared-stream. With /PageMode /UseOutlines the outline objects (and
 // the ineligible OD+outline JS stream) route to the FIRST-page section (qpdf
 // part6 / lc_outlines), BEFORE /E instead of part9. The ineligible outline stream
@@ -1363,13 +1364,13 @@ fn useoutline_od_shared_stream_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// acroform-widget-ap-stream-page0 (PR #393 Fix 1 + Fix 3): AcroForm widget with
+// acroform-widget-ap-stream-page0: AcroForm widget with
 // an /AP /N Form XObject appearance stream (Object::Stream → ineligible for
 // ObjStm packing). The Form XObject is in open_document_set (via
 // Catalog → /AcroForm → widget → /AP) but cannot be an ObjStm member.
 // qpdf emits it as a plain indirect object between the Catalog and the OD ObjStm
 // containers (pre-/O region). flpdf routes it to `part4_open_document_plain` and
-// emits it similarly. Exercises the eligibility check in from_pdf Step 6b and the
+// emits it similarly. Exercises the eligibility check in from_pdf and the
 // pre-/O plain emission loop in writer.rs.
 #[test]
 fn acroform_widget_ap_stream_page0_objstm_structurally_byte_identical_to_qpdf() {
@@ -1388,7 +1389,7 @@ fn acroform_widget_ap_stream_page0_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// acroform-widget-page1-only (PR #393 Fix 4 — r3443001374): AcroForm widget
+// acroform-widget-page1-only: AcroForm widget
 // exclusive to page 1 (not on page 0). Widget has page_reach==1 and is in
 // open_document_set. Without the fix, the per_page_private_objects filter
 // includes the widget (inflating page_hints[1].object_count) and the part7
@@ -1412,7 +1413,7 @@ fn acroform_widget_page1_only_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// acroform-widget-page1-page2 (PR #393 Fix 5 — r3443001371): AcroForm widget
+// acroform-widget-page1-page2: AcroForm widget
 // shared by pages 1 AND 2 (page_reach==2, in open_document_set). OD routing
 // sends the widget to part4_rest. Its OD ObjStm container spans pages {1,2}
 // in all_referenced_pages, satisfying part8_container_nums' container_pages
@@ -1499,7 +1500,7 @@ fn otherpage_thumbnail_rest_preserve_byte_identical_to_qpdf() {
     report(fixture, &actual, &expected, "preserve strict");
 }
 
-// thumb-firstpage-shared (flpdf-hn1g.16): a 2-page fixture where obj 5 (an image)
+// thumb-firstpage-shared: a 2-page fixture where obj 5 (an image)
 // is BOTH page0's /Resources /XObject AND page1's /Thumb. qpdf gives it ou_page(0)
 // + ou_thumb(1), so thumbs>0 makes it lc_first_page_shared (part3) — placed after
 // the first-page-private content, not before it. Pins that the /Thumb signal feeds
@@ -1599,7 +1600,7 @@ fn thumb_first_edge_wins_preserve_byte_identical_to_qpdf() {
     report(fixture, &actual, &expected, "preserve strict");
 }
 
-// cap-boundary-199-bearing (flpdf-ihb.4): PRESERVE mode (qpdf
+// cap-boundary-199-bearing: PRESERVE mode (qpdf
 // --object-streams=preserve) on an ObjStm-bearing input. qpdf's
 // preserveObjectStreams keeps the SOURCE document's ObjStm grouping rather than
 // repacking: 3 source containers 68/67/68, minus the erased /Catalog and /Page
@@ -1630,7 +1631,7 @@ fn cap_boundary_199_bearing_preserve_byte_identical_to_qpdf() {
     report(fixture, &actual, &expected, "preserve strict");
 }
 
-// od-indirect-length (flpdf-2vfg): an open-document stream (catalog
+// od-indirect-length: an open-document stream (catalog
 // /OpenAction → JavaScript action → /JS stream) whose /Length is an indirect
 // reference, with the holder reachable ONLY via that /Length edge. Every writer
 // normalizes a stream's /Length to a direct integer, so the holder becomes
@@ -1672,7 +1673,7 @@ fn od_indirect_length_flate_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// page-contents-indirect-length (flpdf-2vfg, Codex review on PR #400): the PAGE
+// page-contents-indirect-length: the PAGE
 // /Contents stream (not an open-document stream) carries an indirect /Length
 // whose holder is reachable only via that /Length edge. The holder enters the
 // first-page closure because compute_closure follows the stream dict's /Length,
@@ -1712,7 +1713,7 @@ fn page_contents_indirect_length_flate_objstm_byte_identical_to_qpdf() {
     );
 }
 
-// kept-indirect-length (flpdf-hwx0): a page /Resources image XObject (/DCTDecode
+// kept-indirect-length: a page /Resources image XObject (/DCTDecode
 // passthrough) carries an indirect /Length whose holder is ALSO referenced by the
 // catalog (/KeepHolder), so it stays live after /Length is directized. Two qpdf
 // parities are pinned here: (1) the kept holder must NOT be page-reachable — qpdf
@@ -1720,7 +1721,7 @@ fn page_contents_indirect_length_flate_objstm_byte_identical_to_qpdf() {
 // container (with the /Pages tree) land in the second half (part9), not the
 // first-page section; and (2) the first-page section streams (content + image)
 // must be numbered in ascending source-object order, not /Resources-DFS order.
-// Both diverged before flpdf-hwx0 (object-numbering at byte 16; ordering later).
+// Both previously diverged (object-numbering at byte 16; ordering later).
 #[test]
 fn kept_indirect_length_objstm_structurally_byte_identical_to_qpdf() {
     assert_structural("kept-indirect-length.pdf", "kept-indirect-length");
@@ -1731,7 +1732,7 @@ fn kept_indirect_length_objstm_byte_identical_to_qpdf() {
     assert_strict("kept-indirect-length.pdf", "kept-indirect-length");
 }
 
-// ── flpdf-ipc6: forced sub-1.5 header suppresses object/xref-stream generation ──
+// ── Forced sub-1.5 header suppresses object/xref-stream generation ─────────
 // on the linearize path too. The output is a CLASSIC linearized PDF at header
 // 1.4 (no `/ObjStm`, no `/Type /XRef`), identical to the disable path. Unlike the
 // xref-stream objstm goldens (whose strict /ID[1] is `#[ignore]`d pending pass-1
@@ -1789,7 +1790,7 @@ fn three_page_linearize_generate_force_version_1_4_suppressed_is_byte_identical_
     );
 }
 
-// flpdf-w35w: a forced sub-1.5 header downgrades an inherited xref-stream/ObjStm
+// a forced sub-1.5 header downgrades an inherited xref-stream/ObjStm
 // SOURCE to a classic linearized output. The linearize renumbering is distinct
 // from the non-linearized rewrite, so anchor it to qpdf separately: flpdf
 // preserve+force1.4 on an ObjStm source == qpdf's classic linearized output.

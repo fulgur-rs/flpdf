@@ -2069,9 +2069,9 @@ mod tests {
                 // widens the writer's `groups` pre-pass
                 // (`encode_shared_object_groups`, `hint_stream.rs:373-385`),
                 // which qpdf's `readHSharedObject` has no matching read step
-                // for — misaligning every subsequent bit read. Tracked
-                // separately (flpdf-pars); production always passes 0 here
-                // (`hint_shared.rs:242,347`) so this is currently dormant.
+                // for — misaligning every subsequent bit read. Production always
+                // passes 0 here (`hint_shared.rs:242,347`), so this path is
+                // dormant.
                 bits_group_object_count: 0,
                 least_length: 10,
                 bits_length_delta: 8,

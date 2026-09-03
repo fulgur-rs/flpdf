@@ -16,7 +16,7 @@
 //! byte-parity — which only holds when flpdf runs against classic zlib.
 //! Under the default (miniz_oxide) feature this test is compiled out —
 //! blessing miniz output here would flip byte-equal from a parity signal
-//! into a "miniz drift" snapshot and reintroduce the trap flpdf-qrg8
+//! into a "miniz drift" snapshot and reintroduce the trap
 //! removed from the sibling `compat_baseline_static_id`.
 //!
 //! Run initial generation with:
@@ -223,7 +223,7 @@ fn fnv1a_64_hex(bytes: &[u8]) -> String {
 /// both sides preserves the byte-equal verdict.
 ///
 /// Scope is intentionally restricted to trailer-equivalent dictionaries.  A
-/// whole-file `/ID [...]` scan would silently mask drift if a future corpus
+/// whole-file `/ID [...]` scan would silently mask drift if a non-trailer
 /// fixture exposed a `/ID` array in some other place (e.g. a custom dict,
 /// structure tree, or a literal-string body that happens to contain the
 /// byte sequence).  Linearized PDFs carry two trailer dicts that share the
@@ -738,7 +738,7 @@ fn compat_matrix_baseline() {
 // Unit tests for trailer/xref-stream scoping
 // ---------------------------------------------------------------------------
 //
-// These guard the regression flpdf-d6j was filed for: prior versions of the
+// These guard the regression  was filed for: prior versions of the
 // /ID-eliding helper scanned the entire file byte stream and would silently
 // strip any `/ID [...]` array — including one that future fixtures might
 // legitimately carry in a non-trailer dict.  The scoping must keep eliding
@@ -786,7 +786,7 @@ fn elide_trailer_id_arrays_linearized_two_trailers_both_replaced() {
 fn elide_trailer_id_arrays_non_trailer_id_preserved() {
     // `/ID [<aa>]` appears inside an object dict that is neither a trailer
     // nor an xref stream.  The scoped elision must leave it alone — that
-    // is exactly the latent risk flpdf-d6j was filed for.
+    // is exactly the latent risk  was filed for.
     let pdf: &[u8] = b"%PDF-1.4\n\
         1 0 obj\n<< /Type /CustomThing /ID [<bodyid01>] /Other 1 >>\nendobj\n\
         xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n\

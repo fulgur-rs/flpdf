@@ -1,4 +1,4 @@
-//! Shared fixtures for stream-filter CLI tests (flpdf-9hc.7.6 / .7.7).
+//! Shared fixtures for stream-filter CLI tests.
 //!
 //! These helpers build minimal PDFs whose stream data is supplied **pre-encoded**,
 //! bypassing `filters::encode_stream_data` — required for codecs flpdf cannot

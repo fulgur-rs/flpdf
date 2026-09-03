@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(decode_pdf_text_string(&bytes), "plain ascii");
     }
 
-    // Regression for roborev #953: non-ASCII PDFDocEncoding must decode via
+    // Non-ASCII PDFDocEncoding must decode via
     // the canonical ISO 32000-1 Annex D.3 table, not a lossy UTF-8 cast.
     #[test]
     fn decode_non_ascii_pdfdocencoding() {
@@ -1196,7 +1196,7 @@ mod tests {
         assert_eq!(decode_pdf_text_string(b"caf\xE9"), "café");
     }
 
-    // Regression for roborev #953: /Desc verbose output must decode PDF text
+    // The /Desc verbose output must decode PDF text
     // strings (here UTF-16BE) instead of showing mojibake.
     #[test]
     fn verbose_description_decodes_utf16be() {

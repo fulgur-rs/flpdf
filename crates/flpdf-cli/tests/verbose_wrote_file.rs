@@ -2,8 +2,8 @@
 //!
 //! qpdf `--verbose` prints `qpdf: wrote file <output-path>` after a successful
 //! rewrite. flpdf-cli emits `flpdf: wrote file <path>` through logger info; the
-//! flpdf-qtest shim normalizes the prefix. This is the second verbose line
-//! flpdf-9hc.16.12 adds to reach parity with qpdf's uo-1..uo-5, uo-7 goldens.
+//! flpdf-qtest shim normalizes the prefix. This completes the verbose-output
+//! parity check for qpdf's uo-1..uo-5 and uo-7 goldens.
 
 use std::path::{Path, PathBuf};
 

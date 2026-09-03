@@ -318,7 +318,7 @@ fn od_indirect_length_plain_rewrite_drops_orphan_holder_byte_identical_to_qpdf()
     // INDIRECT /Length (7 0 R); the holder (obj 7) is reachable ONLY through
     // that /Length edge. Once /Length is normalized to a direct integer the
     // holder orphans, and qpdf garbage-collects it. The plain full-rewrite path
-    // must drop it too (flpdf-sqkq), shifting object numbers contiguously — not
+    // must drop it too, shifting object numbers contiguously — not
     // emit it as a trailing integer object.
     assert_cmp_diff_zero(
         "objstm-lin-od-indirect-length.pdf",
@@ -340,7 +340,7 @@ fn od_indirect_length_flate_plain_rewrite_drops_orphan_holder_byte_identical_to_
 #[test]
 fn od_indirect_length_preserve_drops_orphan_holder_byte_identical_to_qpdf() {
     // --stream-data=preserve keeps the stream bytes verbatim, but qpdf still
-    // direct-izes every stream's /Length and GCs the orphaned holder (flpdf-3g8o).
+    // direct-izes every stream's /Length and GCs the orphaned holder.
     // The orphan-drop gate must therefore fire for preserve too, not only when
     // streams are recompressed.
     let actual = rewrite_preserve_qpdf_equivalent("objstm-lin-od-indirect-length.pdf");
@@ -366,14 +366,14 @@ fn kept_indirect_length_preserve_directizes_kept_holder_byte_identical_to_qpdf()
     // ALSO referenced by the catalog (/KeepHolder), so it stays live. qpdf still
     // direct-izes the stream's /Length even under preserve (it normalizes EVERY
     // stream's /Length to a direct integer), keeping the holder as a now
-    // length-unreferenced live integer. flpdf must match (flpdf-3g8o).
+    // length-unreferenced live integer. flpdf must match.
     let actual = rewrite_preserve_qpdf_equivalent("kept-indirect-length.pdf");
     assert_cmp_diff_zero_named(&actual, "kept-indirect-length", "preserve.pdf");
 }
 
 #[test]
 fn kept_indirect_length_plain_rewrite_directizes_length_keeps_holder_byte_identical_to_qpdf() {
-    // Dual of the orphan case (flpdf-q1j2): an image XObject (obj 5) declares
+    // Dual of the orphan case: an image XObject (obj 5) declares
     // /Filter /DCTDecode — which flpdf cannot decode, so it is passed through
     // verbatim — and carries an INDIRECT /Length (6 0 R) whose holder (obj 6) is
     // ALSO referenced by the catalog (/KeepHolder 6 0 R). qpdf direct-izes the

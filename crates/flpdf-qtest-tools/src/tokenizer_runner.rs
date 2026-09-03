@@ -291,9 +291,8 @@ fn process(
         // rather than tokenizing raw bytes. This tool instead uses the
         // lower-level pipeStreamData overload directly and continues
         // tokenizing the remaining object streams after reporting one
-        // unfilterable stream: an flpdf-only choice with no qpdf
-        // counterpart, not yet reconciled with qpdf's actual
-        // abort-on-first-failure behavior. Keep the canonical handle and
+        // unfilterable stream, whereas qpdf aborts on the first failure.
+        // Keep the canonical handle and
         // avoid a second non-canonical reader lookup so a stream-length
         // recovery emits only one warning sequence.
         let mut sink = ObjectStreamPipeline::default();

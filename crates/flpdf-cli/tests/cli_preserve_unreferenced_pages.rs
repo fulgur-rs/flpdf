@@ -494,14 +494,11 @@ fn null_object_numbers(qdf: &[u8]) -> Vec<u32> {
 /// so a *further* qpdf normalization pass without `--preserve-unreferenced`
 /// sweeps it away identically regardless of whether flpdf produced it --
 /// that would launder away exactly the defect this test targets. Assert
-/// directly against the raw, unprocessed CLI output instead: flpdf does not
-/// yet regenerate object streams for multi-source `--pages` output at all
-/// (a separate, pre-existing gap reproducible even without
-/// `--preserve-unreferenced`, filed as flpdf-clq9), so a correct raw
+/// directly against the raw, unprocessed CLI output instead: this multi-source
+/// `--pages` route does not regenerate object streams, even without
+/// `--preserve-unreferenced`, so a correct raw
 /// output here has zero `/Type /ObjStm` objects and exactly one occurrence
-/// of the marker string. If flpdf-clq9 is fixed, the raw output will
-/// legitimately gain a regenerated `/ObjStm` and this assertion should
-/// change to "exactly one, non-duplicated, with correct membership".
+/// of the marker string.
 #[test]
 fn multi_source_pages_preserve_does_not_duplicate_source_object_stream_container() {
     if !qpdf_available() {
@@ -561,7 +558,7 @@ fn multi_source_pages_preserve_does_not_duplicate_source_object_stream_container
         .count();
     assert_eq!(
         objstm_count, 0,
-        "flpdf does not yet regenerate object streams for multi-source --pages \
+        "flpdf does not regenerate object streams for multi-source --pages \
          output, so a correct raw output here has zero /Type /ObjStm objects; \
          a non-zero count means the source's original container was copied \
          verbatim as a dangling duplicate"

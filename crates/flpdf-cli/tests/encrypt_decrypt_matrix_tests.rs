@@ -1,4 +1,4 @@
-//! flpdf-9hc.4.12: encrypt → cross-implementation decrypt matrix.
+//! Encrypt → cross-implementation decrypt matrix.
 //!
 //! Direction **(a) flpdf encrypt → qpdf decrypt**: flpdf encrypts each Standard
 //! security-handler variant the writer supports, and qpdf must authenticate
@@ -12,11 +12,8 @@
 //! (`encrypted_fixtures_rewrite_to_plaintext_matching_qpdf_decrypt_objects`),
 //! so they are intentionally not duplicated here.
 //!
-//! Documented edge cases per the bead acceptance: the empty-user-password row
-//! is covered below; "owner-only restrictions" and "/EncryptMetadata=false"
-//! require the `--encrypt` permission sub-flags (flpdf-9hc.4.9.5) and
-//! `--cleartext-metadata` (flpdf-9hc.4.9.6) CLI wiring, which are not yet
-//! implemented — those rows are tracked on those beads.
+//! The empty-user-password row is covered below. Option-specific permission
+//! and metadata cases are covered by the writer-side CLI tests.
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};

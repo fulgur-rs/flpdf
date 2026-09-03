@@ -95,7 +95,7 @@ fn dump_object_unknown_object_reports_clear_error() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// flpdf-9hc.7.4: passthrough codec marker tests
+// passthrough codec marker tests
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// DCTDecode is decodable (unlike JBIG2Decode/JPXDecode/CCITTFaxDecode
