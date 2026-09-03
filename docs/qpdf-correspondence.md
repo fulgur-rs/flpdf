@@ -314,7 +314,7 @@ Rust unit test と qtest の `error-condition 45`
 | `QPDF::decryptStream` (`QPDF_encryption.cc`) | `1045-1153` | `reader/resolver.rs` の `inspect_stream_encryption` / `pipe_stream_data` | ✅ `/XRef` early return、`/V >= 4` gate、typed direct `/Crypt` と equal-length array pairing、Crypt-before-Metadata precedence、unknown warning + `cf_stream` rewrite、qpdf の object-key cache、`PlAesPdf` / `PlRc4` 前置を source read 前に実行。stream dictionary の lazy resolve 中は encryption cell borrow を保持しない。resolve-time payload 復号の重複は qpdf-deviation として解消対象（本issueではconsumer cutoverを範囲外とする） |
 | `QPDFParser.cc` | 519 | `parser.rs` の `LiveInput` / `LiveTokenSource` / `LiveFileParser` は `InputSource` を一度だけ前進する file-object baseline（`QPDFParser.cc:27-518`）。canonical resolver の uncompressed type-1 consumer と、decoded-stream-relative `SliceLiveInput` 経由の ObjStm member consumer（`reader.rs::parse_object_stream_entry`）が使い、token 終端の one-character unread、diagnostic、top-level/nested/container/null の parsed offset、empty/dictionary/bad-token/depth recovery をここで共有する。uncompressed 側は canonical unresolved handle を同時に生成する。live canonical と context-none explicit の parser invocation は qpdf の parse-call description template を非 null handle に stamp し、container の render shift と null の無記述も維持する。`ObjectHandle::parse` / `parse_with_description` は同じ context-none entry point で、warning を `Error`、nested `N G R` を `Error::Internal`、非 C whitespace の後続を parse error にする。`ObjectHandle::parse_with_context` は同じ live parserをcanonical resolver/cacheへ接続し、qpdfの未解決参照identityとdocument warning sinkを維持する | 🔀 canonical uncompressed consumer は `StringDecrypter`（`flpdf-25kg.3.17`）を object-ref と shared `EncryptionState` に束縛し、`QPDF::readObject` / `QPDFParser` と同様に top-level・array・nested dictionary・stream dictionary の `tt_string` だけを token 時に復号する（`QPDF.cc:1331-1340`; `QPDFParser.cc:114-121,327-365`; `QPDF_encryption.cc:977-1039`）。完成した `/Type /Sig` + `/ByteRange` 辞書だけは raw `/Contents` bytes と parsed offset を復元する。ObjStm / context-none explicit parse / content mode は decrypter を渡さず、unknown word も callback 非呼出し。Content mode は既存 `Parser` を維持し、file-object live parser は content grammar を兼用しない |
 | `QPDFTokenizer.cc` | 965 | `tokenizer.rs`（18 token types、owned value/raw/error bytes/offset、push/pull、pull-only `allowEOF`、`includeIgnorable`、space/comment、bad-token recovery、max length、`betweenTokens`、unread、inline-image `EI` discovery。`QPDFTokenizer.hh:34-193`; `QPDFTokenizer.cc:45-965`）+ `parser.rs` の content mode + `content_stream.rs` の `ParserCallbacks` orchestration + `object.rs` の `Operator` / `InlineImage`（`QPDFParser.cc:27-125,130-377`; `QPDFObjectHandle.cc:1770-1847`） | ✅ `QPDFTokenizer` の責務境界を移植済み。object/parser/content callback consumers は共有 tokenizer を使用し、旧 content lexer は削除 |
-| `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替。所有者は `reader/resolver.rs` の `ResolverCore`（`m->file` 相当）。`ResolverCore` のメソッドは `InputSource` の 3 操作 `seek`/`tell`/`read`（`InputSource.hh:71-74`）に限定し、`OffsetInputSource`（`QPDF.cc:406`）が担う header shift は `seek`/`tell` が適用する。例外は `rewind_underlying_source` 1 つで、これは wrapper が持つ `proxied`（`libqpdf/qpdf/OffsetInputSource.hh:24`）に相当する — `OffsetInputSource::rewind` は logical 0 に行く（`OffsetInputSource.cc:55-59`）ため `m->file` では表現できない。owned-window 系の legacy helper（`read_window` / `read_physical_input`）は `ResolverHandle` 側の `qpdf-legacy-tenant` で、`ResolverCore` の面には置かない | ⚪ |
+| `InputSource` 系 5 ファイル | 625 | `Read + Seek` ジェネリクスで代替。所有者は `reader/resolver.rs` の `ResolverCore`（`m->file` 相当）。`ResolverCore` のメソッドは `InputSource` の 3 操作 `seek`/`tell`/`read`（`InputSource.hh:71-74`）に限定し、`OffsetInputSource`（`QPDF.cc:406`）が担う header shift は `seek`/`tell` が適用する。例外は `rewind_underlying_source` 1 つで、これは wrapper が持つ `proxied`（`libqpdf/qpdf/OffsetInputSource.hh:24`）に相当する — `OffsetInputSource::rewind` は logical 0 に行く（`OffsetInputSource.cc:55-59`）ため `m->file` では表現できない。owned-window 系の legacy helper（`read_window` / `read_to_owned`）は `ResolverHandle` 側の `qpdf-deviation` marker で記録し、`ResolverCore` の面には置かない | ⚪ |
 
 `QPDFObjectHandle::parsePageContents` keeps the `all_description` produced by
 `arrayOrStreamToStreamArray` when it enters `parseContentStream_data`
@@ -1168,6 +1168,19 @@ bound されないため、十分に長い参照チェーンを持つ実在の P
 `replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）にもこの経路の深さ制限は
 無いため、qpdf parity の欠落ではなく flpdf 実装固有の Rust スタック安全性対応
 であり、出力バイトには影響しない。
+
+### `flpdf-77kv` の正式マーカー監査（2026-09-04）
+
+以下の残り4候補について、qpdf 11.9.0 に対応物がない挙動をソース近傍の
+`qpdf-deviation` マーカーへ記録した。ここでのマーカーは対応関係の欠落を
+機械可読にするものであり、既存の ⚪（要承認）を承認済みに変更するものではない。
+
+| flpdf | qpdf 11.9.0 との照合 | 記録範囲 |
+|---|---|---|
+| `object_copy.rs` の `ForeignObjectCopier::direct_visiting` | `reserveObjects` / `replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）に direct dictionary/array cycle 用 visited set はない。これは `ObjectHandle::replace_key` でのみ作れる direct graph の防御である。 | reservation と replacement の各 direct-cycle guard |
+| `xref.rs::push_repair_diagnostics` | qpdf の初回 xref failure → `reconstruct_xref`（`QPDF.cc:450-469,516-531`）に retry-at-offset-0 detour はなく、`readObjectAtOffset` の offset 0 は null/warning で終わる（`QPDF.cc:1567-1574`）。後続 detour failure を報告する qpdf 対応物はない。 | 初回 recovery trigger の診断 helper |
+| `object_handle.rs::ObjectSlot::{active_pdf_unique_id,pdf_unique_ids}` | qpdf は document-level `unique_id`（`QPDF.hh:1454`, `QPDF.cc:2294-2296`）と各 value の `QPDF*` back-pointer（`QPDFValue.hh:150`, `QPDFObject.cc:6-11`）を持つが、別の per-object numeric id/set は持たない。 | numeric identity projection と containment set |
+| `reader/resolver.rs::ResolverHandle::read_window` / `read_to_owned` | qpdf の `InputSource` は live `seek`/`tell`/`read`（`InputSource.hh:71-74`）で、`readStream` もその source を保存・復元して読む（`QPDF.cc:1360-1398`）。bounded owned-window helper は qpdf にない。 | `read_window` / `read_to_owned` の legacy owned-buffer seam |
 
 ---
 

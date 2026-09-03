@@ -83,6 +83,9 @@
 //! diagnostics to [`ResolverHandle::read_object_at_offset_with_description`] after it has
 //! released its input adapter, so each source token contributes at most one
 //! document warning.
+//!
+//! `ResolverHandle::read_window` remains a legacy owned-buffer seam: qpdf
+//! reads its live `m->file` source and has no bounded-window helper.
 
 use crate::encryption::crypt_filters::interpret_cf_from_handle;
 use crate::encryption::state::{EncryptionMode, EncryptionState};
@@ -2424,6 +2427,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// names generalising this owned-window shape as a wrong turn that would
     /// entrench a divergence, so `readObjectAtOffset`/`readStream` port that
     /// save/restore seam rather than reusing this.
+    // qpdf-deviation: qpdf reads the live `m->file` source and has no bounded
+    // owned-window helper (`InputSource.hh:71-74`; `QPDF.cc:1360-1398`); this
+    // legacy resolver seam is built only for the remaining raw reader paths.
     pub(crate) fn read_window(&self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
         self.seek(offset)?;
         self.read_to_owned(next.map(|next| next.saturating_sub(offset)))

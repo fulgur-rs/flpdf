@@ -399,6 +399,9 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             return Ok(());
         }
 
+        // qpdf-deviation-start: qpdf's `reserveObjects` has no direct-container
+        // cycle visited set (`QPDF.cc:2101-2213`); this guard protects direct
+        // graphs constructible only through `ObjectHandle::replace_key`.
         if self
             .direct_visiting
             .iter()
@@ -409,6 +412,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         self.direct_visiting.push(foreign.clone());
         let result = self.reserve_children(&foreign);
         self.direct_visiting.pop();
+        // qpdf-deviation-end
         result
     }
 
@@ -483,6 +487,10 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         // stop descending because the enclosing frame is already reserving
         // that subtree, while replacement is still mid-construction of the
         // ancestor's copy and has no finite value to hand back for the cycle.
+        // qpdf-deviation-start: qpdf's `replaceForeignIndirectObjects` has no
+        // direct-container cycle visited set (`QPDF.cc:2101-2213`); this guard
+        // protects a direct graph constructible only through
+        // `ObjectHandle::replace_key`.
         if foreign.object_ref().is_none() {
             if self
                 .direct_visiting
@@ -498,6 +506,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             self.direct_visiting.pop();
             return result;
         }
+        // qpdf-deviation-end
 
         self.replace_foreign_value(foreign)
     }

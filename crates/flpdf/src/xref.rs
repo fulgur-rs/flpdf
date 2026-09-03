@@ -15,6 +15,10 @@
 //! handle identity and diagnostics are available during xref parsing, while
 //! its `Rc<[u8]>` source snapshot is initialized only for an actual indirect
 //! object or stream-length resolution.
+//!
+//! `push_repair_diagnostics` deliberately records only the initial recovery
+//! trigger: qpdf has no retry-at-offset-0 detour whose later failure could be
+//! reported (`libqpdf/QPDF.cc:450-469,516-531,1567-1574`).
 use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
@@ -2861,6 +2865,9 @@ fn is_xref_stream_dict(context: &mut XrefReadContext, dict: &ObjectHandle) -> bo
 /// offset when available (falling back to the `startxref` offset); the
 /// surrounding warnings carry no offset, matching qpdf, which reports them
 /// at offset 0 and suppresses the display.
+// qpdf-deviation: qpdf has no retry-at-offset-0 recovery detour
+// (`QPDF.cc:450-469,516-531,1567-1574`), so a subsequent detour failure has no
+// qpdf counterpart; this helper intentionally emits only the initial trigger.
 fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
     diagnostics.push(Diagnostic::warning("file is damaged", None));
     let (message, offset) = match trigger_error {

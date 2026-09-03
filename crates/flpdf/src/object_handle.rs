@@ -48,6 +48,10 @@
 //! The `Rc` choice is an internal Rust ownership detail; qpdf's observable
 //! callback, identity, retry, error, and `/Length` contracts remain the
 //! authority.
+//!
+//! The per-slot `pdf_unique_ids` bookkeeping is a flpdf ownership projection,
+//! not a qpdf field: qpdf's per-value `QPDF*` back-pointer carries the document
+//! route and identity, without a separate numeric id set.
 //
 // qpdf-deviation-start: qpdf 11.9.0's default destruction of a sufficiently
 // deep programmatic direct container graph recursively follows the
@@ -1000,11 +1004,16 @@ struct ObjectSlot {
     /// stale ownership metadata.
     state_owners: Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
     object_ref: Option<ObjectRef>,
+    // qpdf-deviation: qpdf's per-value `QPDF*` back-pointer carries document
+    // identity and resolver route together (`QPDFValue.hh:150`); flpdf keeps
+    // the numeric identity as a separate per-slot projection beside `Weak`.
     active_pdf_unique_id: Option<u64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
     parsed_offset: i64,
     end_before_space: i64,
     end_after_space: i64,
+    // qpdf-deviation: qpdf has no per-object document-id set; this live
+    // containment bookkeeping supports flpdf's ownership/dirty propagation.
     pdf_unique_ids: BTreeSet<u64>,
     /// The document identity claimed by a handle-native name/number-tree
     /// wrapper while this shared root is still contextless. qpdf's tree
