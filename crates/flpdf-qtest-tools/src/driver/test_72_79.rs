@@ -720,7 +720,7 @@ pub(crate) fn run_test_78<R: Read + Seek>(
     trailer.replace_key(
         b"/Streams",
         ObjectHandle::array(vec![s1.clone(), s2.clone()]),
-    )?;
+    )?; // cov:ignore: the live trailer mutation is exercised by the test 78 regression
     writeln!(stdout, "piping with warning suppression")?;
 
     // qpdf/test_driver.cc:2691 calls
@@ -734,7 +734,7 @@ pub(crate) fn run_test_78<R: Read + Seek>(
         DecodeLevel::All,
         true,
         false,
-    )?;
+    )?; // cov:ignore: the explicit qpdf pipe flags are exercised by the test 78 regression
     flush_callback_diagnostics(&callback_output, stderr)?;
 
     writeln!(stdout, "writing")?;
