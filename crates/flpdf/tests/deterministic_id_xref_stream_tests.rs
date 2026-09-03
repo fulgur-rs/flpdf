@@ -117,7 +117,7 @@ fn id_words(bytes: &[u8]) -> (String, String) {
 // byte-exact goldens below are pinned for the default backend only; the
 // backend-agnostic structural checks (no placeholder, run-stability) run under
 // either backend.
-// Re-blessed for flpdf-g6hb.1: non-linearized --object-streams=generate now uses
+// Non-linearized --object-streams=generate uses
 // qpdf's generate-mode numbering (ObjStm container numbered first, members
 // renumbered ascending-source) and qpdf's `/Predictor 12` `/W [1 2 1]` xref
 // stream (was `/W [1 8 4]`, no predictor, container-above-max). Both change the

@@ -357,8 +357,8 @@ fn overlay_encrypted_source_with_correct_password_succeeds() {
     // The source is AES-256 encrypted (user password "u"). The segment's
     // --password= must be threaded to the source open so the page can be
     // imported as the overlay XObject. (Output is not byte-compared here — see
-    // the module doc; byte-identity for a higher-version source is tracked
-    // separately as version-floor propagation.)
+    // the module doc; byte-identity for a higher-version source is checked
+    // separately by the version-floor propagation tests.)
     let enc = fixture("one-page-enc-u.pdf");
     let bytes = run_overlay_ok("three-page.pdf", &["--overlay", &enc, "--password=u", "--"]);
     let text = String::from_utf8_lossy(&bytes);
@@ -559,7 +559,7 @@ fn overlay_from_rc4_source_opens_without_allow_weak_crypto() {
 /// Return bytes for a 1-page PDF whose `xref` keyword is corrupted so that
 /// `open_with_repair` runs the reconstruction path and records warning
 /// diagnostics. Duplicated from the private helper in `cli_tests.rs` to keep
-/// this test file self-contained (a shared `mod common` is a follow-up).
+/// this test file self-contained.
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 

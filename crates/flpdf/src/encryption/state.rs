@@ -435,8 +435,8 @@ pub(crate) fn authenticate(
         // password. We skip ALL password→key derivation (Algorithm 2 /
         // 2.A / 2.B / 6 / 7) and the layer-2 user/owner attempt +
         // bad-password ordering block entirely. This is a SEPARATE
-        // sibling branch: the `else` below preserves layer-2's password
-        // authentication logic (flpdf-9hc.3.21).
+        // sibling branch: the `else` below preserves the normal password
+        // authentication logic.
         //
         // revision / crypt_filters / encrypt_ref / permissions and the
         // crypt-filter methods are already determined above and do NOT
@@ -467,8 +467,7 @@ pub(crate) fn authenticate(
             id0,
         )
     } else if matches!(revision, 5 | 6) {
-        // Authentication error behavior must match qpdf (see
-        // flpdf-9hc.3.21):
+        // Authentication error behavior must match qpdf:
         //
         //   1. Password authentication runs FIRST.  If neither the user nor
         //      the owner password authenticates, return `BadPassword`.

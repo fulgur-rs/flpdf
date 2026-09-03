@@ -922,9 +922,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // table sized by the maximum object number), so a sparse or huge object
     // number can no longer drive an overflow — AND restores full byte-for-byte
     // fix-qdf parity: flpdf's own QDF writer emits objects in ascending file
-    // order with each `/Length` holder inline after its stream
-    // (flpdf-abu3 / PR #430), so this rejects nothing the writer (or qpdf
-    // `--qdf`) produces.
+    // order with each `/Length` holder inline after its stream. This rejects
+    // nothing produced by the writer or qpdf `--qdf`.
     let mut last_obj: u32 = 0;
     for obj in &objects {
         last_obj = check_sequential(obj.num, last_obj, obj.obj_line_start)?;
@@ -958,7 +957,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     }
 
     // ---- 2. Compute the new length-holder integer bodies. ---------------
-    // Validate every indirect `/Length M G R` holder (flpdf-9hc.25):
+    // Validate every indirect `/Length M G R` holder:
     //   * the holder object `M` must actually exist in the parsed set —
     //     otherwise the "repaired" file still carries a dangling indirect
     //     length and is invalid for downstream readers; and
@@ -981,8 +980,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // "missing" below.
     //
     // The holder's classified BODY must also be `Plain` (not `ObjStm`/
-    // `XRefStream`) — this is a real qpdf behavior, not an flpdf-invented
-    // restriction, though the underlying oracle mechanism is different from
+    // `XRefStream`) — this is a real qpdf behavior, not an
+    // implementation-specific restriction, though the underlying oracle
+    // mechanism is different from
     // what this M-keyed lookup implements. qpdf's own `st_in_length` never
     // reads the declared `/Length M G R` value at all: it is purely
     // positional — whatever top-level object immediately follows a stream's
@@ -1003,8 +1003,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // does not exist is silently ignored by the live oracle, which
     // overwrites whatever plain-integer object actually sits next instead
     // of erroring) — that gap is a pre-existing declared-M-vs-positional
-    // architecture difference outside this check's scope (tracked in
-    // flpdf-cvby). Rejecting an ObjStm/XRefStream-typed holder here
+    // architecture difference outside this check's scope. Rejecting an
+    // ObjStm/XRefStream-typed holder here
     // fails loud instead of silently emitting `Ok` with an unresolved
     // `/Length` reference, matching the oracle for the reported common
     // shape and erring toward failure (like the `Error::Unsupported` block

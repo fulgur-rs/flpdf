@@ -1,7 +1,7 @@
 //! Byte-identity: flpdf `--object-streams=generate` (NON-linearized) ==
 //! `qpdf --object-streams=generate --static-id`.
 //!
-//! First parity coverage for the non-linearized generate path (flpdf-g6hb.1).
+//! First parity coverage for the non-linearized generate path.
 //! qpdf assigns object streams up front (`QPDF::getCompressibleObjGens` DFS +
 //! `QPDFWriter::generateObjectStreams` even split), then numbers each ObjStm
 //! container immediately before its members and serializes members in ascending
@@ -89,7 +89,7 @@ fn assert_cmp_diff_zero(fixture: &str, stem: &str) {
     }
 }
 
-// ── Step A: no-stream, single container ──────────────────────────────────────
+// ── No-stream input, single container ───────────────────────────────────────
 // 5-page natural fixture: 7 eligible dicts (Catalog + Pages + 5 pages), no
 // content streams => 1 ObjStm container, no plain-object emission. Isolates the
 // container-first / members-ascending-source numbering.
@@ -98,7 +98,7 @@ fn nostream_5_generate_is_byte_identical_to_qpdf() {
     assert_cmp_diff_zero("objstm-gen-nostream-5.pdf", "objstm-gen-nostream-5");
 }
 
-// ── Step B: no-stream, even split into multiple containers ───────────────────
+// ── No-stream input, even split into multiple containers ────────────────────
 // 130-page reverse fixture: 132 eligible => ceil(132/100)=2 containers of 66
 // (even split, NOT greedy fill-100). /Kids descending so the
 // getCompressibleObjGens DFS grouping differs from numeric order.
@@ -110,7 +110,7 @@ fn nostream_130rev_generate_is_byte_identical_to_qpdf() {
     );
 }
 
-// ── flpdf-ipc6: generate + forced sub-1.5 header suppresses object/xref streams ─
+// ── Generate with a forced sub-1.5 header suppresses object/xref streams ─
 // A forced sub-1.5 header is a hard cap qpdf will not exceed, so object streams
 // and cross-reference streams (both PDF 1.5 features) are suppressed: qpdf keeps
 // the 1.4 header and writes a classic xref table (no `/ObjStm`, no `/Type /XRef`),
@@ -164,7 +164,7 @@ fn three_page_generate_force_version_1_4_suppressed_is_byte_identical_to_qpdf() 
     }
 }
 
-// ── Step C: content streams interleaved with the ObjStm container ────────────
+// ── Content streams interleaved with the ObjStm container ───────────────────
 // three-page fixture: the Catalog/Pages/page dicts pack into one container
 // (objs 2-9), while the content streams and font remain plain objects numbered
 // AFTER the members (objs 10-13). Validates the unified ascending-new-number
@@ -185,7 +185,7 @@ fn three_page_generate_is_byte_identical_to_qpdf() {
     assert_cmp_diff_zero("three-page.pdf", "three-page");
 }
 
-// ── Step D: orphaned indirect /Length holder dropped (flpdf-sqkq) ─────────────
+// ── Orphaned indirect /Length holder dropped ──────────────────────────────
 // The catalog's /OpenAction reaches a JavaScript stream (obj 6) with an INDIRECT
 // /Length (7 0 R); the holder (obj 7) is reachable ONLY through that /Length
 // edge. Once /Length is normalized to a direct integer the holder orphans, and
@@ -208,7 +208,7 @@ fn od_indirect_length_flate_generate_drops_orphan_holder_byte_identical_to_qpdf(
     );
 }
 
-// ── flpdf-ndjy: missing/dangling trailer refs are dropped, not compressed ─────
+// ── Missing/dangling trailer refs are dropped, not compressed ─────────────
 // A real /Info (obj 4) plus 100 dangling /Junk trailer refs (objects 10..109,
 // no xref entry). qpdf treats each missing ref as null: it never enters the
 // compressible set, consumes no object number, and is dropped from the trailer.

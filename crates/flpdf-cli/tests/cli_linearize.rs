@@ -133,8 +133,8 @@ fn check_linearization_tampered_l_reports_not_linearized() {
         .assert()
         .success();
 
-    // Read and tamper: find "/L " followed by ASCII digits (variable-width
-    // post flpdf-9hc.20.25) and bump the last digit so /L != file_length.
+    // Read and tamper: find "/L " followed by ASCII digits, whose width changes
+    // after compaction, then bump the last digit so /L != file_length.
     let mut bytes = std::fs::read(&linearized_path).unwrap();
     let needle = b"/L ";
     let pos = bytes
@@ -515,7 +515,7 @@ fn linearize_force_version_overrides_linearize_floor() {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Default /ID strategy (flpdf-9hc.13.2): when source has no /ID and
+// 10. Default /ID strategy: when source has no /ID and
 //     --static-id is not set, the linearized output must still emit a fresh
 //     random two-element /ID that differs between runs and is not the qpdf
 //     static-id (π) constant.  Matches qpdf's default observable behaviour
@@ -740,7 +740,7 @@ fn linearize_part1_startxref_is_zero_final_startxref_points_at_first_page_xref()
 
 // ---------------------------------------------------------------------------
 // 14. Param dict integers are variable-width decimal (no zero-padding),
-//     matching qpdf byte format (flpdf-9hc.20.25).
+//     matching qpdf byte format.
 //
 //     qpdf emits e.g. `/L 1701 /H [ 601 118 ] /O 6 /E 1198 /N 1 /T 1523`,
 //     not flpdf's earlier `/L 0000001701 /H [ 0000000601 0000000118 ] ...`
@@ -839,7 +839,7 @@ fn linearize_param_dict_integers_are_variable_width_decimal() {
 
 // ---------------------------------------------------------------------------
 // 15. Param dict /L value equals total file length after variable-width
-//     compaction (flpdf-9hc.20.25 — value semantics regression guard).
+//     compaction (value semantics regression guard).
 // ---------------------------------------------------------------------------
 #[test]
 fn linearize_l_value_equals_file_length_post_compact() {

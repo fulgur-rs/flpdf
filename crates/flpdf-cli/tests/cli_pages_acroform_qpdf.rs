@@ -1048,7 +1048,7 @@ fn original_indirect_widget_dangling_page_is_not_repaired() {
 /// was never dropped from the selection must never be classified the same
 /// way (this scenario exercises the true dangling-`/P` shape directly,
 /// bypassing a pre-existing, unrelated staleness in `rebuild_page_tree`'s
-/// own widget materialization tracked separately as flpdf-25kg.3.38.2.1).
+/// own widget materialization, which is outside the scope of this test.
 fn acroform_original_direct_widget_with_dropped_sibling_page_pdf() -> Vec<u8> {
     assemble_pdf(&[
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),

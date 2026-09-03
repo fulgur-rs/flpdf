@@ -1065,8 +1065,8 @@ impl ObjectWriterEmission for ObjectHandle {
 // only skip those two keys afterward inside the write loop), which could
 // force-resolve -- and needlessly fail on -- a stale or unsupported
 // indirect `/Filter`/`/DecodeParms` reference that is guaranteed to be
-// irrelevant to the refiltered output (Codex Review on PR #644,
-// crates/flpdf/src/object_handle.rs:2425).
+// irrelevant to the refiltered output. The corresponding qpdf writer path
+// removes these entries before checking which dictionary values are visible.
 fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     refiltered: bool,
@@ -1929,7 +1929,7 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 // and when the loop below actually reaches a surviving `/Contents` key --
 // rather than once, unconditionally, before the loop starts.
 //
-// Note what this ordering fix does *not* claim: unlike Finding 2's
+// Note what this ordering fix does *not* claim: unlike the
 // `refiltered`-key exclusion (see `unparse_stream_dict_entries`'s own doc),
 // this is not a "never touched at all" guarantee for `/Type`/`/ByteRange`.
 // Both remain ordinary surviving dict keys -- unlike `/Filter`/`/DecodeParms`
@@ -1944,8 +1944,8 @@ pub(crate) fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -
 // (`BTreeMap`) alphabetical order surfaces `/Type`'s own resolution error
 // ahead of an earlier-sorting key's error that qpdf's single-pass loop would
 // have reached first. Gating the call on the loop's *current* key, as fixed
-// here, keeps that resolution order aligned with qpdf's own single pass
-// (code-quality review of commit 6cae41fd; see
+// here, keeps that resolution order aligned with qpdf's own single pass.
+// The test
 // `unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached`
 // below, which pins this ordering against a dict with no `/Contents` key at
 // all -- and documents, in its own comment, why a plain success-vs-error
@@ -2004,8 +2004,7 @@ fn try_write_sig_contents_hex_string(
 // the `/Contents`-in-a-`/Sig`-dictionary hex-string special case that same
 // qpdf loop applies unconditionally (`QPDFWriter.cc:1490-1504`) -- see
 // `dict_is_sig_with_byte_range`/`try_write_sig_contents_hex_string`'s own
-// docs for the detection/writing split (Codex Review on PR #644,
-// crates/flpdf/src/object_handle.rs:2087).
+// docs for the detection/writing split.
 fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(b"<<");
     for (key, value) in visible_dict_entries(entries)? {

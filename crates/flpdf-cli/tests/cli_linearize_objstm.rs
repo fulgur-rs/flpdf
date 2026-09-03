@@ -1,29 +1,26 @@
-//! Integration tests for `--linearize` combined with `--object-streams`
-//! (flpdf-9hc.5.8.2 — thread the ObjStm batch plan into Part3/Part4 emission).
+//! Integration tests for `--linearize` combined with `--object-streams`.
 //!
-//! Scope of 5.8.2 (per the epic data flow): the linearized writer consumes
+//! The linearized writer consumes
 //! `WriterOptions.object_streams`, emits ObjStm containers in their assigned
 //! Annex F part (Part 3 = shared/catalog, before `/E`; Part 5 = rest), keeps
 //! renumber/offset consistency, and the result **round-trips via `Pdf::open`**
 //! with all members (incl. compressed ones) resolvable.
 //!
-//! `qpdf --check-linearization` reporting *zero* warnings on ObjStm-bearing
-//! output is the explicit acceptance gate of the downstream subtask
-//! flpdf-9hc.5.8.4 (qpdf cross-check made ObjStm-aware).
+//! `qpdf --check-linearization` must report *zero* warnings on
+//! ObjStm-bearing output. The internal checker must accept the same
+//! cross-reference-stream output.
 //!
-//! flpdf-9hc.5.8.4 status: delivered (a) the renumber container-before-member
-//! ordering fix (removes qpdf's "uncompressed object after a compressed one in
-//! a cross-reference stream" error for multi-container output) and (b) the
+//! The suite covers (a) container-before-member numbering, which avoids qpdf's
+//! "uncompressed object after a compressed one in a cross-reference stream"
+//! error for multi-container output, and (b) the
 //! `check.rs` cross-reference-*stream* awareness (the internal
 //! `check-linearization` now accepts xref-stream / ObjStm-bearing linearized
-//! output, not only classic-`xref`-keyword files).  Part-3 first-page shared
-//! object ObjStm packing remains deferred behind a safety valve
-//! (`plan.rs::objstm_batches` clears `part3_batches`): qpdf's
-//! `checkHSharedObject` numbers first-page shared objects *positionally* from
-//! the first-page object id, which is structurally incompatible with
-//! flpdf-56u's split-xref tail relocation; tracked as flpdf-ihb.  These tests
-//! therefore exercise Part-4 (rest-of-document) ObjStm packing, which IS
-//! qpdf-clean.
+//! output, not only classic-`xref`-keyword files). First-page shared-object
+//! ObjStm packing is disabled by a safety valve (`plan.rs::objstm_batches`
+//! clears `part3_batches`). qpdf's `checkHSharedObject` numbers
+//! first-page shared objects positionally from the first-page object id, which
+//! conflicts with this writer's split-xref tail relocation. These tests therefore
+//! exercise Part-4 (rest-of-document) ObjStm packing, which is qpdf-clean.
 
 mod common;
 use common::PdfCanonicalTestExt;
@@ -226,7 +223,7 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
 //    default path, contains no ObjStm, and keeps a classic xref table.
 //
 //    Both invocations pass --static-id so the comparison is deterministic:
-//    the default /ID strategy (flpdf-9hc.13.2) is now random, so two separate
+//    the default /ID strategy is now random, so two separate
 //    runs would otherwise differ only in the trailer /ID bytes.  The /ID
 //    randomness itself is covered by dedicated tests; this test isolates the
 //    structural disable-vs-default equivalence.
@@ -293,10 +290,10 @@ fn linearize_disable_is_unchanged_and_no_objstm() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Acceptance gate of flpdf-9hc.5.8.4: qpdf --check-linearization must
+// 3. qpdf --check-linearization must
 //    report zero warnings on ObjStm-bearing linearized output (Part-4
 //    rest-of-document packing; Part-3 first-page packing stays behind the
-//    flpdf-ihb safety valve).  Also asserts the internal `check-linearization`
+//     safety valve). Also asserts that the internal `check-linearization`
 //    accepts the same xref-stream output (5.8.4 check.rs ObjStm-awareness).
 // ---------------------------------------------------------------------------
 #[test]
@@ -329,7 +326,7 @@ fn linearize_generate_qpdf_check_clean() {
     let (ok, msg) = qpdf_check_linearization(&out);
     assert!(ok && msg.contains("no linearization errors"), "{msg}");
 
-    // flpdf-9hc.5.8.4 scope item 3: the internal linearization checker must
+    // The internal linearization checker must
     // accept cross-reference-*stream* (ObjStm-bearing) linearized output, not
     // only classic-`xref`-keyword files.
     Command::cargo_bin("flpdf")
@@ -341,12 +338,12 @@ fn linearize_generate_qpdf_check_clean() {
 }
 
 // ============================================================================
-// Epic acceptance gate (flpdf-9hc.5.8.5) — systematic 3-mode × multi-page
+// Cross-mode coverage — systematic 3-mode × multi-page
 // coverage with Part-boundary, per-page-1, round-trip, and qpdf cross-check.
 // ============================================================================
 
 // ---------------------------------------------------------------------------
-// Helpers (acceptance gate)
+// Helpers
 // ---------------------------------------------------------------------------
 
 /// Run `qpdf --show-xref <path>` and return stdout.
@@ -455,7 +452,7 @@ fn linearize_with_mode(mode: &str, input: &Path, output: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Epic acceptance gate: 3 modes × multi-page fixture
+// 4. Cross-mode coverage: 3 modes × multi-page fixture
 //    (a) qpdf --check-linearization clean
 //    (c) per-page-1 plain indirect (not compressed)
 //    (d) round-trip (all objects resolve, page count matches)
@@ -638,7 +635,7 @@ fn acceptance_gate_generate_has_objstm_in_part4() {
 //    Validates (d) round-trip and (c) per-page-1 invariants on ObjStm input.
 // ---------------------------------------------------------------------------
 
-// flpdf-zbf9: linearizing an ObjStm-bearing input drops the source's structural
+// linearizing an ObjStm-bearing input drops the source's structural
 // containers (/Type /ObjStm, /Type /XRef) from the live body, matching qpdf —
 // see LinearizationPlan::from_pdf / writer::is_source_structural_container.
 #[test]
@@ -686,9 +683,9 @@ fn acceptance_gate_objstm_bearing_input() {
 //    and flpdf's output both keep first-page object as plain indirect.
 //
 //    Note: qpdf itself DOES place an ObjStm container in Part-3 (before /E),
-//    packing shared catalog/font/info objects.  flpdf currently defers Part-3
-//    ObjStm packing entirely (safety valve clears part3_batches, tracked as
-//    flpdf-ihb).  The observable behavioral agreement between the two tools is
+//    packing shared catalog/font/info objects. The safety valve disables
+//    Part-3 ObjStm packing by clearing part3_batches. The
+//    observable behavioral agreement between the two tools is
 //    therefore NOT "same ObjStm placement" but rather "first-page object stays
 //    uncompressed" — which both tools satisfy.
 // ---------------------------------------------------------------------------

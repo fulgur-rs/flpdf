@@ -1,6 +1,6 @@
 //! Attachment lifecycle integration tests with qpdf cross-checks.
 //!
-//! Covers the acceptance matrix for flpdf-9hc.10.10:
+//! Covers the attachment lifecycle matrix:
 //!
 //! 1. add → list: key appears in both flpdf and qpdf listing
 //! 2. add → show → byte round-trip: text, PNG-style binary, ZIP-style binary,
@@ -500,8 +500,7 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         verbose.contains("D:20240316100000"),
         "copy: verbose listing must preserve mod date; got: {verbose}"
     );
-    // /CheckSum must survive the copy (roborev #936 — the test claimed to
-    // verify /CheckSum preservation but never asserted it). The verbose
+    // /CheckSum must survive the copy. The verbose
     // listing prints the MD5 of the payload as lowercase hex; assert the
     // exact expected value so a dropped/rewritten /CheckSum during
     // --copy-attachments-from is caught.
@@ -514,8 +513,8 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         "copy: verbose listing must preserve /CheckSum={expected_checksum_hex}; got: {verbose}"
     );
 
-    // /Desc survives too (roborev #936 follow-up — the test set these flags
-    // but never asserted their survival).
+    // /Desc must survive the copy because these flags are part of the
+    // attachment metadata contract.
     assert!(
         verbose.contains(format!("  description: Copy test image{EOL}").as_str()),
         "copy: verbose listing must preserve /Desc 'Copy test image'; got: {verbose}"

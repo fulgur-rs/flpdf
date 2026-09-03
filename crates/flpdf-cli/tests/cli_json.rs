@@ -1,6 +1,6 @@
-/// Integration tests for --json and related flags (flpdf-9hc.11.13).
+/// Integration tests for --json and related flags.
 ///
-/// Covers the flag matrix described in the acceptance criteria:
+/// Covers the supported flag matrix:
 ///   --json stdout / --json-output file / --json-key / --json-object /
 ///   --json-key invalid / --json-object invalid /
 ///   --json-stream-data inline / --json-stream-data file side files.
@@ -731,7 +731,7 @@ fn json_key_invalid_exits_nonzero_with_error() {
         input.path().to_str().unwrap(),
     ])
     .assert()
-    // The acceptance criteria require exit code 2 specifically (not just
+    // The CLI contract requires exit code 2 specifically (not just
     // any nonzero) so a regression to code 1 is caught.
     .code(2)
     .stderr(predicate::str::contains("--json-key"));
@@ -1463,7 +1463,7 @@ fn json_output_conflicts_with_the_json_exclusive_flag_set() {
 }
 
 // ===========================================================================
-// flpdf-5st: --json-stream-data must apply DecodeLevel to the stream payload.
+// --json-stream-data must apply DecodeLevel to the stream payload.
 //
 // build_qpdf_json_v2_with_options is invoked with DecodeLevel::Generalized, so
 // inline `data` and file-mode side files must carry the *filter-decoded*

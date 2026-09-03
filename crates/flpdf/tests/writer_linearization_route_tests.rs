@@ -1,4 +1,4 @@
-//! Route contracts for the writer/linearization ObjectHandle cutover.
+//! Route contracts for the writer and linearization ObjectHandle paths.
 
 fn production_source(source: &str, test_module: &str) -> String {
     let source = source.replace("\r\n", "\n");

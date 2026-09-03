@@ -777,7 +777,7 @@ fn rewrite_remove_restrictions_keeps_widget_annotation() {
 
 #[test]
 fn rewrite_default_is_qpdf_equivalent_full_rewrite() {
-    // flpdf-9hc.12.7 acceptance: a plain `flpdf rewrite IN OUT` (no flags)
+    // A plain `flpdf rewrite IN OUT` (no flags)
     // must match qpdf's documented defaults — qpdf full-rewrites and applies
     // --compress-streams=y by default. This asserts that the deliberate
     // default behavior (fresh rewrite + FlateDecode compression) holds, so a
@@ -947,8 +947,8 @@ fn dump_object_subcommand_accepts_ref() {
 
 #[test]
 fn qdf_subcommand_rewrites_output() {
-    // The `qdf` subcommand is now an alias of `rewrite --qdf` (epic
-    // flpdf-9hc.6 architecture decision): it must emit canonical QDF, not the
+    // The `qdf` subcommand is an alias of `rewrite --qdf`: it must
+    // emit canonical QDF, not the
     // legacy raw-dump route.
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
@@ -1328,7 +1328,7 @@ fn rewrite_subcommand_rewrites_output() {
 // ---------------------------------------------------------------------------
 // qpdf-style top-level flat flags
 //
-// These exist so the qpdf qtest acceptance harness (which PATH-shims
+// These exist so the qpdf qtest harness (which PATH-shims
 // `qpdf` → `flpdf` with no arg translation) can drive flpdf with the
 // commands its `.test` files already use. The behaviour mirrors the
 // equivalent `flpdf rewrite ...` subcommand invocation.
@@ -1700,7 +1700,7 @@ fn top_level_linearize_accepts_compress_streams_and_pass1() {
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     // --static-id normally emits a "testing only" stderr warning
-    // (flpdf-9hc.13.4). This test mirrors qpdf qtest's "no stdout/stderr"
+    //. This test mirrors qpdf qtest's "no stdout/stderr"
     // condition, so suppress the diagnostic via the documented opt-out env
     // var; the empty-stderr assertion below still pins the parity guarantee.
     cmd.env("FLPDF_STATIC_ID_QUIET", "1")
@@ -1797,8 +1797,8 @@ fn rewrite_valid_force_version_succeeds() {
 
     assert!(output.exists());
     // minimal.pdf has header 1.7; --force-version=1.4 must rewrite the header
-    // line down to exactly 1.4 (acceptance: "Output header line matches the
-    // chosen version"). flpdf-9hc.13.1.
+    // line down to exactly 1.4 ("Output header line matches the chosen
+    // version").
     let bytes = std::fs::read(&output).unwrap();
     assert!(
         bytes.starts_with(b"%PDF-1.4\n"),
@@ -1824,7 +1824,7 @@ fn rewrite_valid_min_version_succeeds() {
 
     assert!(output.exists());
     // minimal.pdf is already 1.7; --min-version=1.3 is below the source, so
-    // it must be a no-op (header stays 1.7). flpdf-9hc.13.1.
+    // it must be a no-op (header stays 1.7).
     let bytes = std::fs::read(&output).unwrap();
     assert!(
         bytes.starts_with(b"%PDF-1.7\n"),
@@ -1836,7 +1836,7 @@ fn rewrite_valid_min_version_succeeds() {
 #[test]
 fn rewrite_min_version_raises_header_on_low_source() {
     // Build a header-1.3 PDF and request --min-version=1.7: the header line
-    // must be raised to exactly 1.7. flpdf-9hc.13.1.
+    // must be raised to exactly 1.7.
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("v13.pdf");
     let output = temp.path().join("out.pdf");
@@ -2143,7 +2143,7 @@ fn top_level_force_version_accepts_raw_value() {
 
 #[test]
 fn rewrite_force_version_honored_without_mutation() {
-    // Regression for flpdf-9hc.13.1: `--remove-unreferenced-resources=no`
+    // Regression: `--remove-unreferenced-resources=no`
     // must not change the canonical writer route or silently drop
     // --force-version. qpdf always emits a fresh rewrite and honors the
     // version setter.
@@ -5090,7 +5090,7 @@ fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// flpdf-9hc.12.7: CLI flags --compress-streams / --normalize-content /
+// CLI flags --compress-streams / --normalize-content /
 //                 --coalesce-contents / --remove-unreferenced-resources /
 //                 --newline-before-endstream
 // ---------------------------------------------------------------------------
@@ -5098,8 +5098,9 @@ fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
 /// Minimal single-page PDF with a content stream and a font resource entry.
 /// `/F2` is NOT referenced in the content stream. On a plain `rewrite` flpdf
 /// keeps it — matching qpdf, which only prunes `/Resources` entries during page
-/// operations (`--pages`), not on a plain rewrite (flpdf-79ef). The tests using
-/// this fixture assert flag acceptance + structurally valid output, not pruning;
+/// operations (`--pages`), not on a plain rewrite. The tests using
+/// this fixture assert that each flag is accepted and the output is structurally
+/// valid, not that resources are pruned;
 /// the behavioral retention assertions live in `cli_optimization_matrix.rs`.
 fn one_page_pdf_with_unused_resource() -> Vec<u8> {
     let content_data = b"BT /F1 12 Tf (Hello) Tj ET";
@@ -5921,7 +5922,7 @@ fn top_level_coalesce_contents_with_overlay_underlay_trailing_position() {
     // qpdf→flpdf): --coalesce-contents at the very end of argv, after
     // TWO overlay/underlay groups each terminated by `--`. The parser
     // must let the trailing top-level flag through to clap, and clap
-    // must accept it (see flpdf-9hc.16.18). We only assert exit 0 —
+    // must accept it. We only assert exit 0 —
     // byte-parity of the output is a separate concern.
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("in.pdf");
@@ -6241,7 +6242,7 @@ fn rewrite_normalize_and_remove_unreferenced_combination() {
 
 // ===========================================================================
 // Page operations: --pages / --rotate / --split-pages / --collate
-// (flpdf-9hc.8.12).
+//
 //
 // qpdf observation basis (/usr/bin/qpdf 11.9.0): see the comment block at the
 // top of the page-ops section in main.rs. Key facts encoded in these tests:
@@ -7271,7 +7272,7 @@ fn pages_help_text_mirrors_qpdf_terms() {
         .stdout(predicate::str::contains("--collate"));
 }
 
-// ── Attachment tests (flpdf-9hc.10.9) ────────────────────────────────────────
+// ── Attachment tests ────────────────────────────────────────
 
 /// Write a minimal valid PDF to a tempfile and return the path.
 fn minimal_pdf_temp() -> tempfile::NamedTempFile {
@@ -8334,7 +8335,7 @@ fn copy_attachments_from_verbose_prints_progress_and_wrote_file() {
 
 #[test]
 fn attachment_round_trip_add_list_show_remove_copy() {
-    // Full end-to-end round-trip as described in the subtask acceptance criteria.
+    // Full end-to-end round-trip for attachment lifecycle behavior.
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
     let payload = b"round-trip payload bytes \x00\x01\x02";
@@ -8589,7 +8590,7 @@ fn copy_attachments_from_corrupt_donor_recovers_without_explicit_repair_flag() {
         ));
 }
 
-// ── --no-original-object-ids (flpdf-9hc.13.5) ────────────────────────────────
+// ── --no-original-object-ids ────────────────────────────────
 //
 // qpdf `--no-original-object-ids` omits the `%% Original object ID: N M`
 // comments QDF output carries. Observed against qpdf 11.9.0: the flag changes
@@ -8598,8 +8599,8 @@ fn copy_attachments_from_corrupt_donor_recovers_without_explicit_repair_flag() {
 // cases purely because the flag was "unrecognized"; the load-bearing fix is
 // clap acceptance on both the top-level and `rewrite` surfaces.
 //
-// flpdf's QDF writer does not yet emit those comments (the comment body is
-// epic flpdf-9hc.6), so today the flag is a byte-level no-op: default output
+// flpdf's QDF writer does not emit those comments, so the flag is a byte-level
+// no-op: default output
 // and `--no-original-object-ids` output must be byte-identical.
 
 #[test]
@@ -8646,9 +8647,8 @@ fn no_original_object_ids_default_behavior_unchanged() {
     // flag must not perturb any output byte. Compared same-surface (flag vs
     // no-flag on the SAME `rewrite` path) and made deterministic with
     // --static-id so the random trailer /ID does not cause a spurious diff.
-    // This guards the "default behavior unchanged" acceptance criterion and
-    // will keep holding once flpdf-9hc.6 adds the comment body (the comment
-    // is absent by default; the flag only suppresses an opt-in QDF annotation).
+    // This guards the default behavior: the comment is absent, and the flag
+    // does not alter any output byte.
     let temp = tempfile::tempdir().unwrap();
     let baseline = temp.path().join("baseline.pdf");
     let with_flag = temp.path().join("with_flag.pdf");
@@ -8683,7 +8683,7 @@ fn no_original_object_ids_default_behavior_unchanged() {
     assert_eq!(
         baseline_bytes, with_flag_bytes,
         "rewrite --no-original-object-ids must not change output bytes \
-         (no QDF-comment emission point exists yet; flpdf-9hc.6)"
+         (QDF original-object-ID comments are not emitted)"
     );
 }
 
@@ -8706,7 +8706,7 @@ fn no_original_object_ids_conflicts_with_json() {
 }
 
 // ===========================================================================
-// flpdf-9hc.9.10: --flatten-annotations / --generate-appearances /
+// --flatten-annotations / --generate-appearances /
 // --flatten-rotation
 // ===========================================================================
 

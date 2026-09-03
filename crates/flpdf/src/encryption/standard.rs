@@ -667,7 +667,7 @@ pub(crate) fn trim_user_password(password: &[u8]) -> Vec<u8> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Writer side — /Encrypt dictionary construction (V=1/V=2; flpdf-9hc.4.1)
+// Writer side — /Encrypt dictionary construction (V=1/V=2)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Inputs for building a V=1 or V=2 `/Encrypt` dictionary via
@@ -937,7 +937,7 @@ pub(crate) fn build_v1_v2_encrypt_dict(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Writer side — /Encrypt dictionary construction (V=4 CF; flpdf-9hc.4.2)
+// Writer side — /Encrypt dictionary construction (V=4 CF)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Cipher method selected for V=4's single named crypt filter (`/StdCF`).
@@ -1064,8 +1064,8 @@ pub(crate) fn build_v4_encrypt_dict(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Writer side — V=5 R=6 /Encrypt dictionary (flpdf-9hc.4.3) + /Perms blob
-// (Algorithm 10, the V=5 R=6 piece of flpdf-9hc.4.8)
+// Writer side — V=5 R=6 /Encrypt dictionary + /Perms blob
+// (Algorithm 10)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// ISO 32000-2 Algorithm 10 — Encode and AES-256-encrypt the 16-byte
@@ -1505,7 +1505,7 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
 
 // ────────────────────────────────────────────────────────────────────────────
 // Writer side — String / stream encryption passes
-// (flpdf-9hc.4.5 strings, flpdf-9hc.4.6 stream payloads)
+// (strings and stream payloads)
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Cipher material for ENCRYPTING string objects and stream payloads.
@@ -1582,7 +1582,7 @@ pub(crate) fn encrypt_cipher_bytes(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Writer side — explicit /Crypt filter chain entry (flpdf-9hc.4.7)
+// Writer side — explicit /Crypt filter chain entry
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

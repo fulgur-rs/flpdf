@@ -1,4 +1,4 @@
-//! qpdf 11.9.0 JSON input/update CLI boundary tests (flpdf-3yn9.16).
+//! qpdf 11.9.0 JSON input/update CLI boundary tests.
 //!
 //! The core JSON document boundary is tested in `flpdf`; this suite pins the
 //! qpdf-shaped job ordering that consumes it: complete input creation,

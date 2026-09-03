@@ -1,4 +1,4 @@
-//! `--qdf` flag and `qdf-fix` subcommand integration tests (flpdf-9hc.6.8).
+//! `--qdf` flag and `qdf-fix` subcommand integration tests.
 //!
 //! Pins the CLI wiring for QDF:
 //!  - `flpdf rewrite --qdf` produces canonical QDF (uncompressed, normalized,
@@ -630,8 +630,8 @@ fn qdf_page_ops_is_applied_top_level() {
 }
 
 /// qpdf's `setWriterOptions` is applied to every split chunk, not only to the
-/// intermediate document. This is the RED regression for flpdf-25kg.6.10:
-/// before the writer configuration bridge exists, the intermediate is QDF but
+/// intermediate document. The writer configuration must reach every split
+/// chunk; otherwise the intermediate is QDF but
 /// the final chunk is emitted by a default non-QDF writer.
 #[test]
 fn qdf_split_pages_applies_qdf_to_every_chunk() {

@@ -348,7 +348,7 @@ fn write_qpdf_to_memory<R: Read + Seek + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// qpdf-compatible exit-code infrastructure (flpdf-9hc.23.2)
+// qpdf-compatible exit-code infrastructure
 //
 // Source: qpdf manual §"Exit Status"
 //   https://qpdf.readthedocs.io/en/stable/cli.html#exit-status
@@ -360,8 +360,8 @@ fn write_qpdf_to_memory<R: Read + Seek + 'static>(
 // Note: exit code 1 is intentionally unused by qpdf (shells use it for
 // command-not-found); flpdf follows the same convention.
 //
-// Future subtasks (e.g. flpdf-9hc.3.17) should express their own
-// exit-code semantics by constructing a `CliExitError` with the appropriate
+// Each subcommand expresses its exit-code semantics by constructing a
+// `CliExitError` with the appropriate
 // `ExitCode` variant — the enum is generic enough for `--is-encrypted` (0/2)
 // and `--requires-password` (0/2/3) once those subcommands are added.
 // ---------------------------------------------------------------------------
@@ -968,7 +968,7 @@ struct Cli {
     #[arg(long = "ii-min-bytes", value_name = "BYTES")]
     ii_min_bytes: Option<String>,
 
-    // ── Page-operation flags (flpdf-9hc.8.12) ─────────────────────────────
+    // ── Page-operation flags ──────────────────────────────────────────────
     // These mirror qpdf's page-selection / page-transformation surface.
     // Observed against /usr/bin/qpdf 11.9.0:
     //   qpdf --help=--pages / --rotate / --split-pages / --collate
@@ -976,7 +976,7 @@ struct Cli {
     #[command(flatten)]
     page_ops: PageOpArgs,
 
-    // ── Overlay / underlay flags (flpdf-9hc.16), top-level alias ──────────
+    // ── Overlay / underlay flags, top-level alias ──────────────────────────
     // Mirror qpdf's top-level `qpdf in --overlay f -- out` form. Like the
     // `rewrite` subcommand fields, the per-group boundaries are extracted from
     // raw argv by `preprocess_qpdf_args` before clap parses; these fields
@@ -1009,7 +1009,7 @@ struct Cli {
     )]
     underlay: Vec<String>,
 
-    // ── Attachment flags (flpdf-9hc.10.9) ────────────────────────────────
+    // ── Attachment flags ──────────────────────────────────────────────────
     // Five qpdf-compatible attachment operations.  Each is a top-level flag
     // dispatched before the default rewrite branch.
     //
@@ -1792,7 +1792,7 @@ struct RewriteCommand {
     #[command(flatten)]
     page_ops: PageOpArgs,
 
-    // ── Overlay / underlay flags (flpdf-9hc.16) ───────────────────────────
+    // ── Overlay / underlay flags ──────────────────────────────────────────
     // qpdf --overlay / --underlay impose pages from another file on top of
     // (overlay) or beneath (underlay) the destination pages. Both are
     // REPEATABLE and each group is terminated by a bare `--`. Within a group
@@ -2295,7 +2295,7 @@ fn main() {
     // for deterministic test/parity output. The native `rewrite --static-id`
     // surface warns loudly (stderr only, exit code unchanged) so it is never
     // mistaken for a production option; the top-level qpdf-shaped alias stays
-    // silent to mirror qpdf (flpdf-4x6). Done here, after clap parsing
+    // silent to mirror qpdf. Done here, after clap parsing
     // succeeds and before any rewrite work, so the warning never precedes a
     // usage error yet is always visible.
     warn_if_static_id(&args);
@@ -2615,7 +2615,8 @@ fn main() {
         // the same shape `rewrite --encrypt --pages …` already uses
         // (mirrors the existing `--decrypt` / `--remove-restrictions`
         // rejection in the subcommand surface). Wiring encryption
-        // through the page-op pipeline is a flpdf-9hc.4.9 follow-up.
+        // through the page-op pipeline is unsupported, so reject the option
+        // before any page operation runs.
         if args.encrypt.is_some() {
             emit_logger_error(
                 "flpdf: --encrypt is not applied in the \
@@ -3405,7 +3406,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 std::process::exit(1);
             }
 
-            // Page-operation dispatch (flpdf-9hc.8.12). When --pages is set
+            // Page-operation dispatch. When --pages is set
             // the extraction pipeline owns the write; otherwise --rotate /
             // --split-pages decorate a plain rewrite. --linearize with page
             // ops is rejected (the extraction path produces a normalized,
@@ -3679,7 +3680,7 @@ fn build_copy_encryption_source(
         .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
 
     // Validate the donor is encrypted using qpdf's individual encryption
-    // projections rather than a flpdf-only aggregate information object.
+    // projections rather than a crate-specific aggregate information object.
     let version = donor
         .encryption_version()
         .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
@@ -4369,11 +4370,10 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // `--remove-unreferenced-resources=yes`, keeps every /Resources entry
         // (verified against qpdf 11.9.0). flpdf mirrors this: resource-entry
         // pruning lives in `run_page_extraction` (the --pages path), not here.
-        // Pruning on a plain rewrite was a divergence that dropped an
-        // unreferenced image XObject (flpdf-79ef); it is the resource-entry half
-        // of flpdf-9hc.12.4/12.7, which conflated unreferenced-OBJECT GC (the
-        // renumber drops unreachable objects on every canonical rewrite — kept) with
-        // /Resources-ENTRY pruning (page-op-only — removed here).
+        // Pruning on a plain rewrite would incorrectly drop an unreferenced
+        // image XObject. Resource-entry pruning is distinct from unreferenced-
+        // object GC: renumbering drops unreachable objects on every canonical
+        // rewrite, while /Resources-entry pruning is limited to page operations.
         //
         // qpdf always creates a fresh document and defaults to
         // `--compress-streams=y`; the canonical writer applies those defaults
@@ -4430,7 +4430,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         let _built_overlay_specs = if !overlay_specs.is_empty() {
             let mut built = build_overlay_specs(overlay_specs, repair, password)?;
 
-            // flpdf-9hc.16.8: propagate qpdf's max input version and Adobe
+            // Propagate qpdf's max input version and Adobe
             // extension level to the writer (QPDFJob.cc:1714 and :2913),
             // while leaving the explicit raw --min-version for the writer's
             // later setter.
@@ -4516,7 +4516,7 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
 }
 
 // ===========================================================================
-// Page operations (flpdf-9hc.8.12): --pages / --rotate / --split-pages /
+// Page operations: --pages / --rotate / --split-pages /
 // --collate plumbing.
 //
 // qpdf observation basis (/usr/bin/qpdf 11.9.0):
@@ -4637,7 +4637,7 @@ fn resolve_page_specs(
 }
 
 // ===========================================================================
-// --overlay / --underlay segment parser (flpdf-9hc.16.1)
+// --overlay / --underlay segment parser
 //
 // qpdf 11.9.0 grammar (--help=overlay-underlay):
 //   {--overlay|--underlay} [--file=]FILE [--password=PW]
@@ -6651,7 +6651,7 @@ fn run_show_linearization(
 }
 
 // ---------------------------------------------------------------------------
-// Encryption inspection subcommands (flpdf-9hc.3.17)
+// Encryption inspection subcommands
 //
 // qpdf exit-code semantics for these subcommands, from
 // qpdf/include/qpdf/Constants.h `enum qpdf_exit_code_e`:
@@ -7351,7 +7351,7 @@ fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> 
     error.into()
 }
 
-// ── Attachment helpers (flpdf-9hc.10.9) ──────────────────────────────────────
+// ── Attachment helpers ──────────────────────────────────────────
 
 /// Parse and retain the PDF timestamp syntax accepted by qpdf's
 /// `QUtil::pdf_time_to_qpdf_time`: `D:YYYYMMDDHHmmSS`, optionally followed by
@@ -8805,9 +8805,8 @@ mod tests {
         // qtest form-xobject uo-3 style: a top-level flag appears AFTER the
         // overlay/underlay group's `--` terminator. The extractor must place
         // that trailing flag verbatim into the residual argv so clap sees it.
-        // A regression here would reintroduce the flpdf-9hc.16.18 diagnosis
-        // trap ("blame the extractor when the top-level flag is missing from
-        // clap's schema").
+        // A regression here would put the trailing top-level flag in the wrong
+        // parser group and make clap report it as an unknown option.
         let argv = strs(&[
             "flpdf",
             "in.pdf",

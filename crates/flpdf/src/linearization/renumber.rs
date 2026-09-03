@@ -1460,7 +1460,7 @@ mod tests {
         );
         // The container block precedes the main (second-half) xref slot: qpdf
         // numbers second-half ObjStm containers among the uncompressed objects,
-        // before the xref stream (finding-4).
+        // before the xref stream.
         assert!(
             c1 < relocation.main_xref_slot,
             "container block ({c0}, {c1}) must precede the main xref slot ({})",

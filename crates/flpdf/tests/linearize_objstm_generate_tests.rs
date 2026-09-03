@@ -482,7 +482,7 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
         .position(|w| w == js_marker.as_bytes())
         .expect("shared /JS stream object header present");
 
-    // Discriminating invariant (flpdf-q9o3): qpdf numbers the part6 ObjStm
+    // Discriminating invariant: qpdf numbers the part6 ObjStm
     // container BEFORE the ineligible outline stream, so the container's object
     // number is LESS than the stream's. The physical order is container-then-
     // stream regardless of the fix — only the numbers swap — so this asserts on
@@ -512,7 +512,7 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     }
 }
 
-/// A fixture with TWO open-document ObjStm containers (flpdf-699x).
+/// A fixture with TWO open-document ObjStm containers.
 ///
 /// The catalog `/OpenAction` action dict carries `/HighRef` (50 high-numbered OD
 /// fonts, 100..149) BEFORE `/LowRef` (50 low-numbered OD fonts, 6..55) because
@@ -580,7 +580,7 @@ fn openaction_multi_od_generates_two_od_containers_in_dfs_order() {
 /// shared by pages 1 & 2 — alongside a part7 container. Exercises the
 /// shared-object hint table's plain-Part-8 branch (`first_object_number` taken
 /// from a non-compressed shared object). Structure-only round-trip; this fixture
-/// is not yet byte-identical to qpdf (it needs part-ordered second-half
+/// is not byte-identical to qpdf because it needs part-ordered second-half
 /// containers), so no golden comparison is made here.
 #[test]
 fn disc_part7_part8_generate_round_trips() {
@@ -604,7 +604,7 @@ fn disc_part7_part8_generate_round_trips() {
     }
 }
 
-// flpdf-pn7h: a two-container part7/part9 layout. Page 0 is fontless, page 1 has
+// A two-container part7/part9 layout. Page 0 is fontless, page 1 has
 // 48 private fonts, page 2 has 50. The even split yields a part9 container ({Pages
 // node + page-1 fonts}: other_pages=={1} AND others>0 via the /Pages tree node)
 // and a part7 container ({page-2 fonts}: other_pages=={2}, others==0). This
@@ -631,7 +631,7 @@ fn otherpage_others_two_container_generate_round_trips() {
     }
 }
 
-// flpdf-zbf9: linearizing an ObjStm-bearing input must NOT leak the source's
+// Linearizing an ObjStm-bearing input must NOT leak the source's
 // /Type /ObjStm and /Type /XRef containers into the body. After the fix the
 // output carries exactly one freshly-generated ObjStm container and the two
 // regenerated linearization XRef streams (first-page + main) — the same clean
@@ -670,7 +670,7 @@ fn objstm_bearing_input_drops_source_structural_containers() {
     }
 }
 
-// flpdf-vvjr.1: /PageMode /UseOutlines causes outline containers to route to
+// /PageMode /UseOutlines causes outline containers to route to
 // FirstPage (part6). Exercises route_objstm_containers FirstPage arm and
 // page-0 nobjects fold without qpdf-zlib-compat. Byte-parity is gated on
 // qpdf-zlib-compat in cmp_linearize_objstm_tests.rs.
@@ -719,8 +719,9 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
 /// AND page 0 /Annots (first-page closure). qpdf's in_open_document > in_first_page
 /// precedence means widgets must NOT be in part2/part3 (first-page section) — they
 /// should be left in Part 4 so route_objstm_containers puts their ObjStm container
-/// in the OpenDocument slot (first half, before /O). Pins the from_pdf Step 5 fix
-/// (flpdf-sjgv): before the fix, widgets land in part2 and inflate
+/// in the OpenDocument slot (first half, before /O). Pins the from_pdf
+/// open-document precedence rule:
+/// Before this behavior was corrected, widgets landed in part2 and inflated
 /// page_hints[0].object_count beyond what qpdf computes.
 ///
 /// Fixture layout (W=5, S=10):
@@ -970,7 +971,7 @@ fn thumbnail_private_shared_routes_thumbs_to_part9() {
     }
 }
 
-/// Regression test (flpdf-lubb): the open-document peeling applies in
+/// Regression test: the open-document peeling applies in
 /// non-generate mode too.
 ///
 /// Oracle: `qpdf --linearize --object-streams=disable` on the AcroForm fixture
@@ -1256,7 +1257,8 @@ fn linearize_generate_force_below_1_5_is_byte_identical_to_disable() {
     );
 }
 
-/// Regression for the open-document plan-ordering leak (Codex review on PR #406):
+/// The open-document ordering must remain consistent when object-stream
+/// generation is disabled by a forced PDF version:
 /// a generate-mode `LinearizationPlan` peels first-page open-document objects
 /// (here an `/AcroForm` + widget) out of Part 2/3, so suppressing only the batch
 /// plan left generate-mode ORDERING in the classic output. The fix rebuilds the
@@ -1322,7 +1324,7 @@ fn build_recoverable_length_pdf() -> Vec<u8> {
 }
 
 /// Regression for a content-loss bug introduced while fixing the
-/// generate-mode progress denominator (flpdf-gd66): counting the
+/// Generate-mode reporter denominator: counting the
 /// to-be-generated ObjStm containers for progress accounting
 /// (`compressible_objgens_qpdf_plan`) must run AFTER
 /// `LinearizationPlan::from_pdf_with_object_stream_mode` has entered qpdf's
@@ -1378,7 +1380,7 @@ fn linearize_generate_recovers_malformed_length_content_stream() {
 ///
 /// qpdf's `attempt_recovery` is document-wide (`QPDF.hh:1461`), so resolving
 /// the object count for progress must see the same recovery permission as the
-/// later writer walk. Before `flpdf-xm72`, registering a reporter exposed the
+/// later writer walk. Before this ordering was corrected, registering a reporter exposed the
 /// pre-route `get_object_count()` resolution and silently dropped this
 /// recoverable content in all four reporter-enabled cases. The eight cases
 /// must all retain the payload and all three qpdf recovery diagnostics.

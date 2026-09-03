@@ -1303,7 +1303,7 @@ mod tests {
     fn duplicate_selection_allocates_after_canonical_direct_promotion() {
         let mut pdf = open(build_direct_leaf_pdf());
 
-        // This is the lower-layer sequence from the review: page enumeration
+        // This is the page-preparation sequence: page enumeration
         // first promotes the direct leaf, then rebuild receives its canonical
         // reference twice. The allocator must see that promoted reference.
         let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)

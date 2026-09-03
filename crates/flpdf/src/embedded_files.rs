@@ -385,8 +385,7 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 /// reader only surfaces `(key, ObjectRef)` pairs. Mutation and copying use the
 /// handle-valued [`EmbeddedFileDocumentHelper::get_embedded_files`] projection,
 /// which preserves direct-dict values.
-// TODO(flpdf-9hc.10.6): consider exposing direct-dict entries via the public
-// list/show API (e.g. an `Object`-valued variant) once list/show land.
+//
 ///
 /// List every embedded file referenced by an indirect `/Filespec` entry,
 /// returning each entry's name and the [`ObjectRef`] of its file-specification
@@ -944,7 +943,7 @@ mod tests {
         );
     }
 
-    // ── Test: transitively-unreachable subgraph is swept (flpdf-eg3) ─────────
+    // ── Test: transitively-unreachable subgraph is swept ───────────────
     //
     // The old ad-hoc GC only ever considered the filespec ref and its `/EF`
     // streams, so an object reachable *only* through the filespec dictionary
@@ -1302,7 +1301,7 @@ mod tests {
     // Two filespecs share one /EmbeddedFile stream.  Removing one attachment
     // must GC its (otherwise-unreferenced) filespec but keep the shared stream
     // and the other filespec intact.  Guards against an over-conservative
-    // "pair-or-nothing" regression of the roborev #949 fix.
+    // "pair-or-nothing" handling would incorrectly discard the shared stream.
     #[test]
     fn remove_attachment_with_shared_stream_keeps_stream_and_other_filespec() {
         let mut pdf = open_minimal();
@@ -1354,9 +1353,9 @@ mod tests {
 
     // ── Test: filespec with distinct /EF streams GCs all of them ─────────────
     //
-    // Regression for roborev #950-1: only the first /EF stream was resolved,
-    // so sibling streams under other /EF keys were orphaned (left live) once
-    // the filespec was GC-deleted.
+    // Every stream under an /EF key must be collected when the filespec is
+    // deleted; resolving only the first stream would leave sibling streams
+    // orphaned.
     #[test]
     fn remove_attachment_gcs_all_distinct_ef_streams() {
         let mut pdf = open_minimal();
@@ -1409,9 +1408,9 @@ mod tests {
 
     // ── Test: empty/target-absent indirect /AF array is left untouched ───────
     //
-    // Regression for roborev #950-2: an *empty* (or target-absent) indirect
-    // /AF array used to be deleted and its parent /AF key removed even though
-    // the target ref was never present — dangling the array if it is shared.
+    // An *empty* (or target-absent) indirect /AF array must remain intact when
+    // the target reference was never present, especially when the array is
+    // shared by multiple dictionaries.
     #[test]
     fn remove_attachment_leaves_empty_indirect_af_array_intact() {
         let mut pdf = open_minimal();

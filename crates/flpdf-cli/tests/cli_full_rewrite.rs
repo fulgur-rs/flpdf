@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 /// Parse the output PDF and assert how many signatures the library detects.
 ///
-/// Stronger than a raw `/ByteRange` byte scan (gemini review on PR #424): it
+/// Stronger than a raw `/ByteRange` byte scan: it
 /// confirms the `/FT /Sig` field + its signature dictionary are structurally
 /// intact and detectable via [`flpdf::signatures`], or — for the drop case —
 /// that they are genuinely gone.
@@ -303,7 +303,7 @@ fn remove_restrictions_allows_signed_linearized_rewrite() {
 
 #[test]
 fn signed_pages_extraction_proceeds_qpdf_compatible() {
-    // Direct regression for flpdf-hn1g.13: a signed `--pages` extraction (always
+    // Direct regression: a signed `--pages` extraction (always
     // a fresh rewrite) used to be REFUSED (exit 2) when the signature field was a
     // retained-page widget. qpdf does not refuse — it proceeds, leaving the
     // signature present-but-invalid. flpdf now matches: exit 0, signature objects

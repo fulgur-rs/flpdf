@@ -8,12 +8,12 @@
 //! - **(b)** `flpdf rewrite` (without `--linearize`) of an already-linearized PDF must
 //!   produce a *non-linearized* output.  **This sub-case MUST PASS.**
 //! - **(c)** `flpdf check-linearization`'s Pass-vs-Fail verdict must agree with qpdf's.
-//!   Verdict mismatches now hard-fail (the previous lenient behaviour was tracked as
-//!   flpdf-0dl, which has been fixed).
+//!   Verdict mismatches now hard-fail; a mismatch between the two checkers is
+//!   always reported.
 //!
 //! # Known fingerprints
-//! None — all previously tracked flpdf-b82 shared-object hint table warnings have been
-//! resolved.  The KNOWN list is empty; any new qpdf warning will immediately hard-fail.
+//! None — no shared-object hint table warnings remain in the known-warning
+//! list. The list is empty, so any qpdf warning immediately hard-fails.
 //!
 //! When qpdf is not installed:
 //! - **CI** (`CI` env var set): the test panics — qpdf is treated as a hard
@@ -276,11 +276,11 @@ impl CaseResult {
 /// Only **explicitly enumerated** warning fingerprints are accepted as known
 /// issues; any other warning text surfaces as a `Fail` so the oracle keeps
 /// catching new regressions instead of silently absorbing them under a
-/// previously-tracked label.  Each known fingerprint is attributed to a
-/// beads issue so reviewers can trace the underlying bug.
+/// previously accepted label. Each known fingerprint has an explicit
+/// description in this test.
 fn classify_qpdf_warning(label: &str, msg: &str) -> CaseResult {
     const KNOWN: &[(&str, &str, &str)] = &[
-        // All flpdf-b82 shared-object hint table warnings have been fixed:
+        // All  shared-object hint table warnings have been fixed:
         // - "shared object N length mismatch" — fixed by including part2 entries
         //   in shared_hints and using them for location/length back-patching.
         // - "unable to get object for item in shared objects hint table" — fixed
@@ -372,8 +372,8 @@ fn linearize_qpdf_check_matrix() {
 
     print_summary(&results);
 
-    // Acceptance: all (a) cases must produce linearized output (even if warnings).
-    // Hard failures in (a) are tracked; they must not be silently NotLinearized.
+    // All (a) cases must produce linearized output, even if warnings.
+    // Hard failures must not be silently classified as NotLinearized.
     let hard_failures: Vec<&CaseResult> = results
         .iter()
         .filter(|r| matches!(r.status, CaseStatus::Fail))
@@ -402,7 +402,7 @@ fn non_linear_collapse_from_qpdf_linearized() {
     let tmp = tempdir().unwrap();
     let source = fixture_path("one-page.pdf");
 
-    // Step 1: produce a qpdf-linearized intermediate.
+    // First, produce a qpdf-linearized intermediate.
     let qpdf_linearized = tmp.path().join("qpdf-linearized.pdf");
     qpdf_linearize(&source, &qpdf_linearized);
 
@@ -417,12 +417,12 @@ fn non_linear_collapse_from_qpdf_linearized() {
         "(b) pre-condition: qpdf --linearize output must be linearized"
     );
 
-    // Step 2: flpdf rewrite WITHOUT --linearize.
+    // Then, run flpdf rewrite WITHOUT --linearize.
     let flpdf_out = tmp.path().join("flpdf-collapsed.pdf");
     let rewrite_ok = rewrite_via_flpdf(&qpdf_linearized, &flpdf_out);
     assert!(rewrite_ok, "(b) flpdf rewrite exited with non-zero status");
 
-    // Step 3: qpdf must say "is not linearized".
+    // Finally, qpdf must say "is not linearized".
     let (qpdf_exit, qpdf_output) = run_qpdf_check(&flpdf_out);
     let verdict = qpdf_verdict(qpdf_exit, &qpdf_output);
 
@@ -480,7 +480,7 @@ fn verdict_match_flpdf_vs_qpdf() {
         if fv_pass == qv_pass {
             results.push(CaseResult::pass(label));
         } else {
-            // flpdf-0dl (validator over-leniency) is closed.  A verdict
+            // The validator must not be more lenient than the oracle. A verdict
             // mismatch is now a real regression — neither checker should
             // accept what the other rejects.
             let detail = format!(
@@ -497,8 +497,8 @@ fn verdict_match_flpdf_vs_qpdf() {
 
     print_summary(&results);
 
-    // After flpdf-0dl was fixed, mismatches must surface as failures so the
-    // oracle catches divergence between the two implementations.
+    // Mismatches must surface as failures so the oracle catches divergence
+    // between the two implementations.
     let mismatches: Vec<&CaseResult> = results
         .iter()
         .filter(|r| matches!(r.status, CaseStatus::Fail))
@@ -579,7 +579,7 @@ fn non_linear_collapse_multi_page() {
 
 /// Asserts that an *unknown* qpdf warning is classified as Fail, not as a
 /// known issue.  Without this discipline the oracle silently swallows
-/// regressions — the original concern in flpdf-23w.
+/// regressions — an unknown warning must not be silently accepted.
 #[test]
 fn classify_unknown_warning_fails() {
     let r = classify_qpdf_warning("(a) test", "some unrelated qpdf warning text");
@@ -595,8 +595,8 @@ fn classify_unknown_warning_fails() {
     );
 }
 
-/// Asserts that the previously-tracked "hint table length mismatch" fingerprint
-/// (flpdf-b82) is no longer exempted — all such warnings must now hard-fail.
+/// Asserts that the "hint table length mismatch" fingerprint is not exempted —
+/// all such warnings must now hard-fail.
 /// This confirms the KNOWN list is truly empty and the oracle is strict.
 #[test]
 fn classify_hint_table_warning_is_known() {
@@ -604,8 +604,8 @@ fn classify_hint_table_warning_is_known() {
         "(a) test",
         "WARNING: file: hint table length mismatch detected",
     );
-    // flpdf-b82 is fixed: "hint table length mismatch" is no longer a known
-    // issue.  Any qpdf warning (including this one) must now Fail.
+    // "hint table length mismatch" is not a known issue. Any qpdf warning
+    // (including this one) must now Fail.
     assert!(
         matches!(r.status, CaseStatus::Fail),
         "hint-table-length-mismatch is no longer a known issue — must be Fail"
@@ -613,7 +613,7 @@ fn classify_hint_table_warning_is_known() {
 }
 
 // ---------------------------------------------------------------------------
-// flpdf-602: Page Offset Hint Table per-page content_length must be non-zero
+// Page Offset Hint Table per-page content_length must be non-zero
 // ---------------------------------------------------------------------------
 
 /// Returns the `content_length:` values per page from `qpdf --show-linearization`.
@@ -644,7 +644,7 @@ fn qpdf_show_linearization_content_lengths(path: &Path) -> Vec<u64> {
         .collect()
 }
 
-/// flpdf-602: after linearizing, every page's content_length in the page-offset
+/// After linearizing, every page's content_length in the page-offset
 /// hint table must be non-zero.  qpdf reuses page-length as content-length
 /// (Adobe implementation note 127), so we mirror that — pages with body bytes
 /// must report a positive content_length to give fast-web-view readers a usable
@@ -680,7 +680,7 @@ fn linearize_populates_per_page_content_length() {
             assert!(
                 len > 0,
                 "page {i} of {fixture_name} has content_length=0; \
-                 expected non-zero per flpdf-602 AC, got {lengths:?}"
+                 expected a positive content_length, got {lengths:?}"
             );
         }
     }

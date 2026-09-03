@@ -1198,7 +1198,7 @@ mod tests {
         split(src, 1, &template, false).expect("split should succeed");
 
         // qpdf 11.9.0: --split-pages=1 → single-number suffix (out-N.pdf),
-        // not the range form out-N-N.pdf (flpdf-s5e).
+        // not the range form out-N-N.pdf.
         let out1 = tmpdir.path().join("out-1.pdf");
         let out2 = tmpdir.path().join("out-2.pdf");
         let out3 = tmpdir.path().join("out-3.pdf");

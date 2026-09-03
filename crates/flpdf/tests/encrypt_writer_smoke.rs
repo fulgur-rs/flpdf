@@ -1,5 +1,5 @@
 //! End-to-end smoke tests for the writer-side `--encrypt` path
-//! (flpdf-9hc.4.9 walking skeleton: V=4 AES-128 only).
+//! (V=4 AES-128 only).
 //!
 //! Each test builds an encrypted PDF via `write_with_settings` with
 //! `WriterTestSettings.encrypt = Some(EncryptParams::v4_aes128(...))`, then
@@ -480,7 +480,7 @@ fn v4_aes128_wrong_password_is_rejected() {
 /// derivation + AES IV/padding + `/Length` update on a non-trivial stream
 /// payload.
 ///
-/// The full-rewrite writer renumbers objects Catalog-first (flpdf-9hc.32), so
+/// The full-rewrite writer renumbers objects Catalog-first, so
 /// the output `/Root` number is NOT the input's; the round-trip property is
 /// that the trailer's `/Root` still resolves to the document catalog.
 #[test]
@@ -848,9 +848,9 @@ fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
         .expect("/Length present")
 }
 
-/// `--stream-data=preserve` + `--encrypt` (the Codex PR #401 NOTES case): the
-/// orphan-/Length-holder drop must still fire under encryption. Before
-/// flpdf-3g8o the preserve gate (`effective_stream_policy().is_some()`) was false
+/// `--stream-data=preserve` + `--encrypt`: the
+/// orphan-/Length-holder drop must still fire under encryption. Before this,
+/// the preserve gate (`effective_stream_policy().is_some()`) was false
 /// for preserve, so the holder survived; the old in-place stream encryption
 /// path then direct-ized `/Length` anyway, leaving a stale orphan emitted as a
 /// real object.

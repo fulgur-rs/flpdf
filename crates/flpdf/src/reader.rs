@@ -620,7 +620,7 @@ impl<R: Read + Seek> Pdf<R> {
         if acroform.as_dictionary().is_some() && acroform.try_has_key(b"/SigFlags")? {
             // qpdf replaces the key whenever its visible hasKey test
             // succeeds, including an already-zero direct integer. The
-            // changed result is an flpdf-only observation of structural
+            // changed result is a crate-specific observation of structural
             // change, since qpdf's operation returns void.
             // qpdf-deviation-start: `changed` has no qpdf counterpart --
             // QPDF::removeSecurityRestrictions is void, so nothing classifies

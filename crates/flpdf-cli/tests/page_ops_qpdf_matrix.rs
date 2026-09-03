@@ -1,4 +1,4 @@
-//! Page-operation observable-behavior matrix vs qpdf 11.9.0 (flpdf-9hc.8.13).
+//! Page-operation observable-behavior matrix vs qpdf 11.9.0.
 //!
 //! Truth source: `/usr/bin/qpdf` 11.9.0. Every cell runs the *same* inputs and
 //! flags through both `qpdf` and the `flpdf` binary, then compares the
@@ -7,8 +7,8 @@
 //! Intentional, documented divergences are asserted as EXPECTED (flpdf's value
 //! plus a comment explaining why it differs from qpdf). Genuinely unknown
 //! divergences discovered while writing this matrix are marked `#[ignore]`
-//! with a descriptive reason and reported for a follow-up at the originating
-//! layer (this subtask only adds tests; it does not patch lower layers).
+//! with a descriptive reason. This file only adds tests; it does not patch
+//! lower layers.
 //!
 //! Matrix axes:
 //!   --pages     { single range, multi-input (repeat), :odd, :even,
@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Shell;
 
 // NOTE: qpdf's machine-readable inspection is `--json=2`, but this crate has no
-// JSON dependency and the test-only subtask must not add one. Instead we read
+// JSON dependency and the test code must not add one. Instead we read
 // qpdf's *output PDF* with flpdf's own `--show-pages` / `--show-npages` — the
 // SAME reader is then applied to both tools' outputs, so any divergence is in
 // the page-op transform, not in how the observable property is measured. The
@@ -1139,7 +1139,7 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
 fn split_pages_one_filename_matches_qpdf() {
     // qpdf 11.9.0: `3p --split-pages=1` → q-1.pdf, q-2.pdf, q-3.pdf.
     // flpdf now matches: chunk_size==1 uses the single-number suffix
-    // (job::page_split::chunk_output_path). Regression guard for flpdf-s5e.
+    // (job::page_split::chunk_output_path). Regression guard for .
     let qdir = tempfile::tempdir().unwrap();
     let fdir = tempfile::tempdir().unwrap();
     let src = fixture_abs(THREE_PAGE);

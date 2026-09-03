@@ -839,7 +839,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // flatten_rotation_on_pages (flpdf-9hc.9.9)
+    // flatten_rotation_on_pages
     // -----------------------------------------------------------------------
 
     /// Assemble a minimal PDF from `(number, body)` objects numbered 1..=N in

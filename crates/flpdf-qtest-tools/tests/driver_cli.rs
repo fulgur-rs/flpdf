@@ -1144,7 +1144,7 @@ fn test_driver_fixture_dir() -> std::path::PathBuf {
     ))
 }
 
-/// Regression for the P2 review finding on test 45's open-failure path
+/// Test 45's open-failure path must report the real obfuscated path
 /// (`crates/flpdf-qtest-tools/src/driver/mod.rs`): qpdf's own test 45 reads
 /// `"<filename1>.obfuscated"` through `QUtil::read_file_into_memory` /
 /// `QUtil::safe_fopen` (`libqpdf/QUtil.cc:1139`, `:490-518`) and only
@@ -1182,7 +1182,7 @@ fn obfuscated_open_failure_reports_the_real_obfuscated_path_not_the_fabricated_p
     );
 }
 
-/// Regression for the P2 review finding on tests 26/27/29/30's secondary
+/// Secondary input failures in tests 26/27/29/30 must report
 /// `arg2` open (`crates/flpdf-qtest-tools/src/driver/test_26_33.rs`): qpdf's
 /// `QPDF::processFile` opens `arg2` through `FileInputSource`, which uses
 /// `QUtil::safe_fopen` (`libqpdf/FileInputSource.cc:14-18`), whose failure
@@ -1212,7 +1212,7 @@ fn secondary_open_failure_uses_the_qpdf_open_wording_not_a_bare_io_error() {
         .stderr(expected);
 }
 
-/// Regression for the P2 review finding on test 91
+/// Test 91 must forward warnings emitted during JSON serialization
 /// (`crates/flpdf-qtest-tools/src/driver/test_88_98.rs`): `QPDF::writeJSON`
 /// dereferences every object it serializes via `getAllObjects()`
 /// (`libqpdf/QPDF_json.cc:900-925`), and a malformed object resolved lazily

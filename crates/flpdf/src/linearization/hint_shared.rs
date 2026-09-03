@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ObjStm-aware back-patch behaviour (flpdf-9hc.5.8.3)
+    // ObjStm-aware back-patch behaviour
     //
     // `from_plan` computes `first_object_number` from the renumber map only
     // — it has no knowledge of ObjStm containers.  When the first Part-8

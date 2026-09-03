@@ -177,7 +177,7 @@ fn three_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("three-page.pdf", "three-page");
 }
 
-// flpdf-05jt: a degenerate first page — the 3-object catalog/pages/page shape
+// A degenerate first page — the 3-object catalog/pages/page shape
 // with NO /Contents and NO /Resources (no content stream, no inheritable
 // resources to push down). The one/two/three-page corpus above all carry a page
 // content stream, so this pins the no-stream shape that was previously
@@ -196,7 +196,7 @@ fn no_stream_one_page_linearized_is_byte_identical_to_qpdf() {
 #[test]
 fn nonid_id0_linearized_is_byte_identical_to_qpdf() {
     // Non-16-byte (20-byte) source /ID[0] preserved verbatim on the linearized
-    // path, byte-identical to qpdf --linearize --deterministic-id (flpdf-9hc.13.11).
+    // path, byte-identical to qpdf --linearize --deterministic-id.
     assert_linearize_byte_identical("nonid-id0.pdf", "nonid-id0");
 }
 
@@ -208,12 +208,12 @@ fn indirect_extensions_linearized_is_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-8wo1: the /Pages node holds a DIRECT /Resources dict (not a
+// The /Pages node holds a DIRECT /Resources dict (not a
 // reference) and the /Page leaf has no local /Resources, so linearization
 // must push the inherited /Resources down to the leaf (minting a fresh
 // indirect object for the copy) and strip it from the now-interior /Pages
 // node. This exercises the fix on `write_linearized`'s own `Pdf` handle (a
-// separate handle from the one `LinearizationPlan::from_pdf` planned with,
+// separate handle from the one `LinearizationPlan::from_pdf` used for planning,
 // exactly as the CLI and this file's `flpdf_linearized` helper both do).
 // Confirmed (by temporarily reverting the fix) that without it, this fixture
 // diverges from qpdf: the interior /Pages node keeps its /Resources dict
@@ -231,7 +231,7 @@ fn inherited_resources_one_page_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-d8pc: the pure-SCALAR sibling of the /Resources case above. The /Pages
+// the pure-SCALAR sibling of the /Resources case above. The /Pages
 // node holds a DIRECT /Rotate 90 and the /Page leaf has none, so linearization
 // copies the scalar down to the leaf BY VALUE (a literal /Rotate 90) and strips
 // it from the now-interior /Pages node — WITHOUT minting a new indirect object,
@@ -255,7 +255,7 @@ fn inherited_rotate_one_page_byte_identical_to_qpdf() {
 // The original leaf then inherits parent A's `/Rotate 90` and the clone inherits
 // parent B's `/Rotate 180`; the clone keeps the original leaf's `/Parent` (the
 // clone arm never flattens) and both share the `/Contents` stream. The param
-// dict must report `/N 2` and the root `/Count` stays 2 (flpdf-52md).
+// dict must report `/N 2` and the root `/Count` stays 2.
 #[test]
 fn shared_page_two_parents_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("shared-page-two-parents.pdf", "shared-page-two-parents");
@@ -265,7 +265,7 @@ fn shared_page_two_parents_byte_identical_to_qpdf() {
 // inherited-attribute push mints into a fresh indirect object. This pins the
 // relative object numbers of the clone (minted first, in the cache()-equivalent
 // pass) and the push-minted `/Resources` (minted after), which must match qpdf's
-// cache()-then-push order (flpdf-52md).
+// cache()-then-push order.
 #[test]
 fn shared_page_two_parents_pushmint_byte_identical_to_qpdf() {
     assert_linearize_byte_identical(
@@ -278,7 +278,7 @@ fn shared_page_two_parents_pushmint_byte_identical_to_qpdf() {
 // on open. qpdf 11.9.0's getAllPagesInternal has no reconstruction gate
 // (QPDF_pages.cc:77-138), so it STILL clones the duplicate leaf into a distinct
 // page object; flpdf mirrors this unconditionally (the `!reconstructed` gate was
-// removed in flpdf-s5i2). Pins the reconstructed-xref linearize path to the qpdf
+// removed from the reconstructed-xref path. Pins this path to the qpdf
 // 11.9.0 golden.
 #[test]
 fn shared_page_two_parents_reconstructed_byte_identical_to_qpdf() {
@@ -291,7 +291,7 @@ fn shared_page_two_parents_reconstructed_byte_identical_to_qpdf() {
 /// An interior /Pages node whose /Type is not /Pages and a leaf whose /Type is not
 /// /Page. qpdf 11.9.0's getAllPagesInternal overrides both /Type keys
 /// (QPDF_pages.cc:89-92, 131-134); the corrected interior node then has its inherited
-/// /Rotate pushed down to the leaf (flpdf-nd38 repair 2).
+/// /Rotate pushed down to the leaf, matching qpdf's repair behavior.
 #[test]
 fn mistyped_page_tree_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("mistyped-page-tree.pdf", "mistyped-page-tree");
@@ -299,7 +299,7 @@ fn mistyped_page_tree_byte_identical_to_qpdf() {
 
 /// A /Page leaf with no /MediaBox and no ancestor /MediaBox. qpdf 11.9.0's
 /// getAllPagesInternal defaults it to letter/ANSI A [0 0 612 792]
-/// (QPDF_pages.cc:104-112) (flpdf-nd38 repair 3).
+/// (QPDF_pages.cc:104-112), matching qpdf's repair behavior.
 #[test]
 fn missing_mediabox_leaf_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("missing-mediabox-leaf.pdf", "missing-mediabox-leaf");
@@ -315,7 +315,7 @@ fn missing_mediabox_leaf_byte_identical_to_qpdf() {
 /// [0 0 612 792] with /Parent -> A (verified from the qpdf 11.9.0 golden). Were
 /// the order reversed (clone before default), the A page would keep A's inherited
 /// [0 0 200 300] and only the clone would be [0 0 612 792] — a divergence this
-/// guards (flpdf-nd38 repair 3).
+/// guards ( repair 3).
 #[test]
 fn shared_leaf_mediabox_default_byte_identical_to_qpdf() {
     assert_linearize_byte_identical(
@@ -328,8 +328,7 @@ fn shared_leaf_mediabox_default_byte_identical_to_qpdf() {
 /// element ([0 0 612 4 0 R], obj 4 = 792). qpdf 11.9.0's isRectangle()
 /// dereferences each element via isNumber(), so the box is a valid rectangle and
 /// is kept, NOT overwritten with the [0 0 612 792] default. is_rectangle must
-/// resolve each element before defaulting (flpdf-nd38 repair 3; codex review
-/// r3522482671 on PR #453).
+/// resolve each element before defaulting, matching qpdf's repair behavior.
 #[test]
 fn indirect_mediabox_element_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("indirect-mediabox-element.pdf", "indirect-mediabox-element");
@@ -337,7 +336,7 @@ fn indirect_mediabox_element_byte_identical_to_qpdf() {
 
 /// A /Pages node whose single /Kids entry is a DIRECT (inline) /Page dictionary
 /// rather than an indirect reference. qpdf 11.9.0's getAllPagesInternal converts
-/// it to an indirect object (QPDF_pages.cc:113-118) (flpdf-nd38 repair 1).
+/// it to an indirect object (QPDF_pages.cc:113-118), matching qpdf's repair behavior.
 #[test]
 fn direct_leaf_kid_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("direct-leaf-kid.pdf", "direct-leaf-kid");
@@ -345,7 +344,7 @@ fn direct_leaf_kid_byte_identical_to_qpdf() {
 
 /// A catalog whose /Pages points INTO the page tree (at the first page) instead
 /// of at the true root. qpdf 11.9.0's getAllPages walks /Parent up to the real
-/// root and rewrites the catalog /Pages (QPDF_pages.cc:50-67) (flpdf-nd38 repair 6).
+/// root and rewrites the catalog /Pages (QPDF_pages.cc:50-67), matching qpdf's repair behavior.
 #[test]
 fn root_pages_points_into_tree_byte_identical_to_qpdf() {
     assert_linearize_byte_identical(
@@ -358,11 +357,11 @@ fn root_pages_points_into_tree_byte_identical_to_qpdf() {
 fn relinearize_one_page_is_byte_identical_to_qpdf() {
     // Re-linearizing an already-linearized input: the source's old /Linearized
     // param dict and hint stream must be reachability-GC'd, not leaked into the
-    // second half, to stay byte-identical to qpdf --linearize (flpdf-phfu).
+    // second half, to stay byte-identical to qpdf --linearize.
     assert_linearize_byte_identical("linearized-one-page.pdf", "linearized-one-page");
 }
 
-// flpdf-5apf: a live body object (the Catalog) carrying null-resolving indirect
+// a live body object (the Catalog) carrying null-resolving indirect
 // refs. qpdf drops the null-valued dict keys (/Bad 0 0 R, /Junk 99 0 R, the
 // nested /Inner 99 0 R) and inlines `null` for the object-0 array element
 // (/ArrZero [0 0 R 2 0 R] -> [null <font>]); flpdf must reproduce that byte for
@@ -372,7 +371,7 @@ fn dangling_body_refs_classic_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("dangling-body-one-page.pdf", "dangling-body-one-page");
 }
 
-// flpdf-0gyq: a null-resolving ARRAY ref (/Arr [<null-ref> 8 0 R]) is resurrected
+// a null-resolving ARRAY ref (/Arr [<null-ref> 8 0 R]) is resurrected
 // as an indirect null body object the array points at. The FREE variant (obj 9, a
 // free xref row) already worked; the MISSING variant (obj 99, no row) must produce
 // the identical layout — qpdf treats the two the same.
@@ -389,7 +388,7 @@ fn resurrect_missing_array_ref_classic_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-8891: a document-level (Catalog) reference to a first-page object marks
+// a document-level (Catalog) reference to a first-page object marks
 // it lc_first_page_shared, so qpdf orders the first-page section private-then-
 // shared (Page, Resources, Content, Font) rather than by source number alone.
 // Without the document-`others` signal flpdf left the Font in part2 (private)
@@ -402,7 +401,7 @@ fn catalog_firstpage_shared_classic_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-8891 (non-degenerate shape): two pages share font 6 (other_pages) while
+//  (non-degenerate shape): two pages share font 6 (other_pages) while
 // page 1's private font 7 is referenced by the Catalog /Ref2 (others). Both
 // sharing signals land in part6's shared group; qpdf orders the first-page
 // section Page, Content, Font6, Font7 (private before shared, shared by source
@@ -417,14 +416,15 @@ fn catalog_firstpage_shared_two_page_classic_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-zda0: a NON-first-page object (page-2 font, obj 7) reached by exactly one
+// a NON-first-page object (page-2 font, obj 7) reached by exactly one
 // other page AND by a document-level `others` reference (Catalog /Ref2) is qpdf
 // `lc_other` (part9), not `lc_other_page_private` (part7): part7 requires
 // others==0 (QPDF_linearization.cc:1128). The demoted object takes a part9 object
 // number (after the pages tree) and page 1's part7 `object_count` hint excludes
 // it (oracle: page-1 nobjects==2). On `main` flpdf routes it to part7, shifting
 // object numbers and the hint; the fix makes it byte-identical. (Generate mode
-// for this shape is tracked in flpdf-pn7h, so only the classic layout is pinned.)
+// for this shape has a separate object-stream layout, so only the classic
+// layout is pinned here.)
 #[test]
 fn catalog_otherpage_other_two_page_classic_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical(
@@ -433,7 +433,7 @@ fn catalog_otherpage_other_two_page_classic_is_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-jggp: the catalog-otherpage-other shape PLUS a real /Info dict (obj 10).
+// the catalog-otherpage-other shape PLUS a real /Info dict (obj 10).
 // qpdf treats /Info as an ordinary member of the number-sorted part9 remaining
 // lc_other set (QPDF_linearization.cc:1335, `for (auto const& og: lc_other)` over
 // a std::set<QPDFObjGen>), so the lower-numbered font (obj 7) precedes /Info: qpdf
@@ -441,7 +441,8 @@ fn catalog_otherpage_other_two_page_classic_is_byte_identical_to_qpdf() {
 // flpdf previously promoted /Info to a FIXED part9-head slot right after the pages
 // tree (before the font), diverging at the trailer /Info N 0 R and every downstream
 // offset. The fix drops that promotion so /Info flows through the number-sorted
-// remaining lc_other loop. CLASSIC ONLY (generate sibling tracked in flpdf-pn7h).
+// remaining lc_other loop. This section covers the classic layout; the generate
+// sibling has its own object-stream coverage.
 #[test]
 fn catalog_otherpage_other_info_two_page_classic_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical(
@@ -450,7 +451,7 @@ fn catalog_otherpage_other_info_two_page_classic_is_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-8891 (page-tree custom key): a custom extension key on an interior
+//  (page-tree custom key): a custom extension key on an interior
 // /Pages node references the first-page Font. qpdf keeps non-inheritable custom
 // keys on /Pages nodes (only the inheritable /Resources,/MediaBox,/CropBox,
 // /Rotate are stripped), so ou_root_key("/Pages") still reaches the Font ->
@@ -464,7 +465,7 @@ fn pages_ext_firstpage_shared_classic_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-o9im: when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
+// when the FIRST-PAGE dict directly holds /Arr [<missing-ref> <live-ref>],
 // the resurrected null must be classified in the first-page section (Part 2) and
 // receive a HIGH object number — not land in part4_rest with a LOW number.
 // Oracle: qpdf 11.9.0 assigns obj 9 = null, /Size 10 for this fixture.
@@ -476,7 +477,7 @@ fn resurrect_missing_page_arr_classic_byte_identical_to_qpdf() {
     );
 }
 
-// flpdf-891f: when Page 1 holds /Bad 99 0 R (dict value → dropped by writer)
+// when Page 1 holds /Bad 99 0 R (dict value → dropped by writer)
 // and Page 2 holds /Arr [99 0 R] (array element → resurrected null), the null
 // must land in the SECOND-HALF section (low object number) — NOT in Part 2.
 // Oracle: qpdf 11.9.0 assigns obj 2 = null in the second-half for this fixture.
@@ -488,7 +489,7 @@ fn resurrect_page2_arr_page1_dictval_not_in_first_page_section() {
     );
 }
 
-// flpdf-891f: when Page 1 holds BOTH /Bad 99 0 R (dict value, dropped by
+// when Page 1 holds BOTH /Bad 99 0 R (dict value, dropped by
 // writer) AND /Good [99 0 R] (array element, resurrected null), the null must
 // land in the FIRST-PAGE section — the array edge wins even though the
 // dict-value edge is enqueued first (alphabetical key order).
@@ -500,7 +501,7 @@ fn resurrect_both_edges_same_page_null_in_first_page_section() {
     );
 }
 
-// flpdf-891f: cross-object case — Page 1 references resurrectable ref 99 via a
+// cross-object case — Page 1 references resurrectable ref 99 via a
 // dict-value edge (/Bad 99 0 R) AND via an array element in a live descendant
 // (/Other 4 0 R where obj 4 = << /Good [99 0 R] >>). The dict-value tuple is
 // dequeued before the descendant is expanded, but sorting page-dict refs by
@@ -515,7 +516,7 @@ fn resurrect_crossobj_arr_via_live_desc_null_in_first_page_section() {
     );
 }
 
-// flpdf-891f: else-branch ordering — a live non-page object's children must be
+// else-branch ordering — a live non-page object's children must be
 // enqueued in ascending original-object-number order, not dict-key (alphabetical)
 // order. The fixture has an intermediate dict with /AA→orig6 and /ZZ→orig5;
 // alphabetical ordering would emit orig6 before orig5, but qpdf emits orig5
@@ -528,10 +529,10 @@ fn else_branch_children_ordered_by_original_object_number() {
     );
 }
 
-// flpdf-hsjh: revorder case — resurrectable ref (orig 99) has a LOWER original
+// revorder case — resurrectable ref (orig 99) has a LOWER original
 // number than the live descendant (orig 100) that holds the array edge
 // ([99 0 R]). Sort-at-enqueue puts 99 in the queue before 100 is expanded,
-// so seen_as_array is empty when 99 is dequeued → deferred. After the full
+// so seen_as_array is empty when 99 is dequeued → delayed. After the full
 // BFS, 100 has populated seen_as_array with 99, so the post-BFS pass admits
 // it and inserts it at the correct position in the sorted non-page tail.
 #[test]
@@ -539,7 +540,7 @@ fn revorder_resurrect_null_in_first_page_section() {
     assert_linearize_byte_identical("revorder-resurrect.pdf", "revorder-resurrect");
 }
 
-// flpdf-hsjh (discriminator): Page leaf at a HIGH original-object-number (10)
+//  (discriminator): Page leaf at a HIGH original-object-number (10)
 // with its content stream at a LOWER original-object-number (3). A naive
 // fully-global sort by original number would misplace the Page (renumber it
 // higher than its content stream), but qpdf keeps the Page first in its
@@ -552,7 +553,7 @@ fn page_highnum_content_lownum_page_before_content() {
     );
 }
 
-// flpdf-hsjh (Codex P2): resurrectable null (orig 99) is reachable via BOTH
+// The resurrectable null (orig 99) is reachable via BOTH
 // a Catalog dict-value edge (/OpenAction 99 0 R, dropped by writer) and a
 // first-page array edge (/Arr [99 0 R], produces a null body object). Before
 // this fix, closure_from_seeds admitted the null-resolving ref into
@@ -565,7 +566,7 @@ fn od_null_also_in_first_page_arr_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("od-null-page-arr.pdf", "od-null-page-arr");
 }
 
-// flpdf-hsjh (Codex P2): resurrectable null (orig 99) reached via a Catalog
+// The resurrectable null (orig 99) reached via a Catalog
 // ARRAY edge (/OpenAction [99 0 R]) — qpdf classifies this as open_document
 // (lc_open_document) because the null body IS emitted for the surviving array
 // slot.  The null must land in the OD section (pre-/O, before the hint stream)
@@ -579,7 +580,7 @@ fn od_catalog_arr_null_byte_identical_to_qpdf() {
 }
 
 // --------------------------------------------------------------------------
-// Structural byte-parity (flpdf-9hc.13.10): the full-file byte-identity tests
+// Structural byte-parity: the full-file byte-identity tests
 // above now subsume these — flpdf reproduces qpdf's deterministic `/ID[1]` by
 // digesting a byte-identical reconstruction of qpdf's *first* write pass (empty
 // parameter dict, no hint stream, unresolved first-page xref; see
@@ -655,7 +656,7 @@ fn lone_flate_l9_linearized_structurally_byte_identical_to_qpdf() {
 }
 
 // --------------------------------------------------------------------------
-// Body content-stream recompression parity (flpdf-9hc.13.10, divergence A).
+// Body content-stream recompression parity (divergence A).
 //
 // The linearized writer used to clone each body stream's dict + raw data
 // verbatim, preserving e.g. an `[/ASCII85Decode /FlateDecode]` source chain,
@@ -780,7 +781,7 @@ fn one_page_linearized_content_stream_equals_plain_and_qpdf_golden() {
 }
 
 // --------------------------------------------------------------------------
-// Classic (non-ObjStm) linearize: outline object section routing (flpdf-vvjr.2).
+// Classic (non-ObjStm) linearize: outline object section routing.
 //
 // outlines-80-80 (!UseOutlines): catalog /Outlines -> outline dict + 80 items.
 // qpdf routes these to part9 (second-half, after /E). Regression: the
@@ -820,7 +821,7 @@ fn useoutlines_classic_byte_identical_to_qpdf() {
     );
 }
 
-// outlines-shared-page-80-80 (flpdf-q2zw): one font (the highest-numbered outline
+// outlines-shared-page-80-80: one font (the highest-numbered outline
 // object) is referenced by BOTH pages AND an outline item via /Extra. qpdf's
 // categorization (QPDF_linearization.cc:1120) ranks in_outlines above in_first_page,
 // so that font is lc_outlines (part9, second half) while the 79 page-only fonts stay
@@ -845,7 +846,7 @@ fn outlines_shared_page_classic_byte_identical_to_qpdf() {
 }
 
 // --------------------------------------------------------------------------
-// Open-document closure (flpdf-lubb): objects reachable from the catalog
+// Open-document closure: objects reachable from the catalog
 // open-document keys (/OpenAction, /AcroForm, /PageMode, /Threads,
 // /ViewerPreferences) are placed in part4 (first half, before /O) by qpdf in
 // ALL object-stream modes. These fixtures carry no source ObjStm, so the

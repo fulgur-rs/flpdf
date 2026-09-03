@@ -540,12 +540,10 @@ fn resolve_lifts_array_elements_recursively() {
     assert_eq!(kids[1].object_ref(), Some(ObjectRef::new(3, 0)));
 }
 
-/// Every scalar `Object` variant `Pdf::lift` is responsible for must lift
-/// without panicking or being silently dropped from the dictionary. This
-/// crate does not yet expose `as_boolean`/`as_real`/`as_name`/`as_string`
-/// accessors on `ObjectHandle` (a later task), so the boolean/real/name/
-/// string entries can only be checked for presence here; `Integer` and
-/// `RealLiteral` (which do have accessors already) are checked by value.
+/// Every scalar `Object` variant handled by `Pdf::lift` must lift without
+/// panicking or being silently dropped from the dictionary. The test checks
+/// the boolean, real, name, and string values through the corresponding
+/// `ObjectHandle` accessors, as well as the integer variants by value.
 #[test]
 fn resolve_lifts_every_scalar_object_value_variant() {
     let bytes = classic_pdf_with_bodies(
@@ -576,7 +574,7 @@ fn resolve_lifts_every_scalar_object_value_variant() {
 }
 
 // ---------------------------------------------------------------------
-// Task 7: parsed offsets for the plain uncompressed-file-object case.
+// Parsed offsets for the plain uncompressed-file-object case.
 //
 // `classic_pdf_with_bodies` always starts with the fixed 9-byte
 // `%PDF-1.7\n` header, so a single-body fixture's own bytes start at file
@@ -775,8 +773,7 @@ fn compressed_object_stream_member_records_its_canonical_member_offset() {
 /// A file-object body containing `.4`, resolved via the native handle path,
 /// must preserve the non-canonical source literal — exercising the shared
 /// `real_object`/`real_object_handle` literal-preservation decision through
-/// actual parsing (Task 4 only ever exercised this via a hand-built direct
-/// handle).
+/// actual parsing rather than only a hand-built direct handle.
 #[test]
 fn real_literal_round_trips_through_native_parsing() {
     let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n.4\nendobj\n"], ObjectRef::new(1, 0));

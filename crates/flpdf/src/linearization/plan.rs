@@ -980,15 +980,13 @@ impl LinearizationPlan {
         // this order. It must run before object-ref capture because those
         // preparations may mint indirect objects.
         //
-        // Warm the canonical qpdf object cache before the legacy Optimization
+        // Warm the canonical qpdf object cache before the Optimization
         // compatibility consumer runs. qpdf has one object cache: if the
         // malformed stream framing below is first parsed through the
         // ObjectHandle route, Optimization observes that same cached value
         // instead of reparsing the source and duplicating its recovery
-        // diagnostics. This is a temporary orchestration seam until the
-        // Optimization consumer itself completes its ObjectHandle cutover;
-        // the producer must not use a legacy-resolve/materialize bridge in
-        // the other direction.
+        // diagnostics. The producer must not use a resolve/materialize bridge
+        // in the other direction.
         if pdf.root_ref().is_some() {
             crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
                 pdf,
@@ -1056,7 +1054,7 @@ impl LinearizationPlan {
         // via the canonical handle renumber walk's trailer-seeded BFS; the linearize universe
         // must too, or re-linearizing an already-linearized source leaks its old
         // /Linearized parameter dict + hint stream — both unreachable structural
-        // artifacts — into the second half (flpdf-phfu).
+        // artifacts — into the second half.
         //
         // `skip_length = true`: the linearized writer always emits a direct
         // `/Length` — re-encoded and lone-`/FlateDecode`-verbatim streams alike,
@@ -1117,7 +1115,7 @@ impl LinearizationPlan {
         // includes these refs in the page closure they're first reached from.
         // qpdf classifies them as first-page section objects (Part 2) when reached
         // from the first page, giving them HIGH object numbers. Without this, they
-        // land in part4_rest with LOW numbers (flpdf-o9im).
+        // land in part4_rest with LOW numbers.
         let source_had_compressed_objects = pdf
             .source_xref_entries()
             .iter()
@@ -1229,7 +1227,7 @@ impl LinearizationPlan {
         // holder never enters a page closure: an orphan holder (referenced only via
         // /Length) is GC'd by the all_refs filter above, and a kept holder is
         // reached only via its other (e.g. catalog) edge and partitions from there
-        // (flpdf-hwx0 / flpdf-2vfg).
+        // (for the indirect-length and shared-stream cases).
         let first_page_set: BTreeSet<ObjectRef> = first_page_closure.iter().copied().collect();
 
         // ----------------------------------------------------------------
@@ -1320,7 +1318,7 @@ impl LinearizationPlan {
             // under /UseOutlines), never part2/part3. Peel it here so the part4
             // outline extraction in Step 8 can place it. Verified against qpdf
             // 11.9.0: outlines-shared-page-80-80's /Extra-referenced font is the
-            // last second-half object, not a first-page-shared object (flpdf-q2zw).
+            // last second-half object, not a first-page-shared object.
             if root_objects.contains(obj_ref)
                 || all_outline_refs.contains(obj_ref)
                 || open_document_objects.contains(obj_ref)
@@ -1451,7 +1449,7 @@ impl LinearizationPlan {
                     // Outline objects (in_outlines) outrank other-page-private the
                     // same way: keep them out of the per-page-private set so the
                     // part7 pre-pass never claims them and they stay available for
-                    // outline routing in the part8/part9 loop (flpdf-q2zw).
+                    // outline routing in the part8/part9 loop.
                     if all_outline_refs.contains(r) {
                         return false;
                     }
@@ -1463,7 +1461,7 @@ impl LinearizationPlan {
                     // Keep it out of the per-page-private set so it is neither placed
                     // in part7 nor counted in this page's part7 object_count hint; it
                     // flows through part4_provisional into the part8/part9 loop and
-                    // lands in part4_rest (part9) (flpdf-zda0).
+                    // lands in part4_rest (part9).
                     if document_other_objects.contains(r) {
                         return false;
                     }
@@ -1590,7 +1588,7 @@ impl LinearizationPlan {
             } else {
                 // reach == 0 (trailer-/document-only), or reach == 1 with others>0
                 // (excluded from per_page_private above, so it is lc_other not
-                // lc_other_page_private — QPDF_linearization.cc:1128, flpdf-zda0).
+                // lc_other_page_private — QPDF_linearization.cc:1128).
                 // Both are qpdf part9.
                 part4_rest.push(r);
             }
@@ -2435,8 +2433,8 @@ impl LinearizationPlan {
         // objgen comes from makeIndirectObject in even-split order — so set order ==
         // even-split order. part7 (page order) and part9 (pages-tree / outlines /
         // lc_other sub-order) only have one container each in the fixtures seen so
-        // far, so their within-part multi-container order is untested (see flpdf-g1eu
-        // follow-up); if such a case ever arises a finer per-part sort may be needed.
+        // far, so their within-part multi-container order has not been exercised;
+        // if such a case arises, a finer per-part sort may be needed.
         let mut part4_private: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_shared: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();

@@ -1,4 +1,4 @@
-//! Route guards for the qpdf-shaped parser and resolver cutover.
+//! Route guards for the qpdf-shaped parser and resolver.
 
 #[test]
 fn parser_has_no_detached_live_object_projection() {

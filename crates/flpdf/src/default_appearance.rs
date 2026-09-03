@@ -321,7 +321,7 @@ mod tests {
     }
 
     // ── Tf acceptance range (qpdf TfFinder::handleToken, (1.0, 1000.0) ──────
-    // exclusive) — flpdf-25kg.3.8.2.1 scope item 2.
+    // exclusive) ────────────────────────────────────────────────────────────
 
     #[test]
     fn tf_boundary_exactly_one_is_auto_size() {

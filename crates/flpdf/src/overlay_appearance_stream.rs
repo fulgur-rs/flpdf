@@ -1194,10 +1194,8 @@ mod tests {
         // rename BEFORE its own try/catch'd tokenize step
         // (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807` runs before
         // `:824-849`), and does NOT roll the rename back when the
-        // subsequent tokenize fails — confirmed by fetching qpdf's actual
-        // source for roborev PR #490 iter-3 finding 3, which proposed a
-        // rollback; a rollback would have been the qpdf DIVERGENCE, so it
-        // was declined and this test instead documents the verified,
+        // subsequent tokenize fails. A rollback would have been the qpdf
+        // DIVERGENCE. The test documents the verified,
         // matching (if internally inconsistent-looking) result: the dict
         // says "F1_1", the content still says "F1" — exactly like qpdf.
         let mut pdf = open_minimal();
@@ -1318,9 +1316,9 @@ mod tests {
         // collides under the destination's own pre-existing F1_1). This
         // stream's own /Resources/Font has both F1 and F1_1 locally.
         //
-        // qpdf's rename loop (`libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`,
-        // fetched and read for roborev PR #490 iter-3 finding 1) mutates the
-        // sub-dictionary IN PLACE: processing F1->F1_1 first (dr_map is
+        // qpdf's rename loop (`libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`)
+        // mutates the sub-dictionary IN PLACE: processing F1->F1_1 first
+        // (dr_map is
         // sorted, "F1" < "F1_1") moves F1's value into the F1_1 slot,
         // displacing the true original F1_1 value into a `merge_with`
         // side-map. Processing F1_1->F1_1_1 next then reads the ALREADY-
@@ -1383,13 +1381,13 @@ mod tests {
 
     #[test]
     fn adjust_appearance_stream_reuses_existing_key_for_same_object_on_new_conflict() {
-        // Phase 2's conflict resolution (`libqpdf/QPDFAcroFormDocumentHelper.cc:805-807`'s
+        // The conflict-resolution pass (`libqpdf/QPDFAcroFormDocumentHelper.cc:805-807`'s
         // `resources.mergeResources(merge_with, &dr_map)`, `QPDFObjectHandle::mergeResources`'s
         // `og_to_name` reuse) is exercised here: /Resources/Font has F1 and
         // F2 BOTH pointing at the SAME object, plus F3 at a different
-        // object. dr_map renames F3->F2. Phase 1 moves F3's value into F2
+        // object. dr_map renames F3->F2. The first pass moves F3's value into F2
         // (displacing F2's original occupant — which is the SAME object as
-        // F1 — into `merge_with`). Phase 2 then finds F2 occupied (by F3's
+        // F1 — into `merge_with`). The second pass then finds F2 occupied (by F3's
         // moved-in value) and, instead of minting a fresh name for the
         // displaced value, notices it already lives under F1 (by
         // `ObjectRef` identity) and records an EXTRA dr_map redirect
@@ -1448,8 +1446,8 @@ mod tests {
 
     #[test]
     fn adjust_appearance_stream_reuses_slot_vacated_earlier_in_same_merge() {
-        // roborev PR #490 iter-4 finding 1: an earlier version of phase 2's
-        // "reuse a key that already names the same object" lookup snapshot
+        // An earlier implementation of the merge loop snapshotted the
+        // "reuse a key that already names the same object" lookup
         // `subdict` into `ref_to_key` ONCE, EAGERLY, before the staged loop
         // began. That missed a value that becomes visible to `subdict` only
         // DURING the loop — specifically, a slot phase 1 vacated and phase
@@ -1457,10 +1455,8 @@ mod tests {
         // order) just refilled with the SAME object a LATER staged entry is
         // about to collide on.
         //
-        // Ground truth (fetched from qpdf `main`,
-        // `libqpdf/QPDFObjectHandle.cc`, `mergeResources`, since deepwiki's
-        // summary of this was internally inconsistent): `og_to_name` is
-        // built lazily — ONCE, on the FIRST genuine conflict — via the
+        // Qpdf's `mergeResources` implementation (`libqpdf/QPDFObjectHandle.cc`)
+        // builds `og_to_name` lazily — ONCE, on the FIRST genuine conflict — via
         // `initialized_maps` guard around `make_og_to_name(this_val, ...)`.
         // Because that snapshot is taken mid-loop, it legitimately captures
         // any vacated-slot reinstate that ran earlier in the SAME
@@ -1483,11 +1479,11 @@ mod tests {
         //   F2 -> F4:   displaces F4's ORIGINAL value (shared_ref, the SAME
         //               object as above) into merge_with["F4"]; F2's value
         //               (other_ref) moves in.
-        // After phase 1: subdict = {F3: temp_ref, F4: other_ref}; no key
+        // After the first pass: subdict = {F3: temp_ref, F4: other_ref}; no key
         // names shared_ref any more. merge_with = {F1_1: shared_ref,
         // F4: shared_ref} — both entries name the SAME object.
         //
-        // Phase 2 processes merge_with in key order: "F1_1" < "F4".
+        // The second pass processes merge_with in key order: "F1_1" < "F4".
         //   F1_1: vacated (subdict has no F1_1) -> reinstated verbatim,
         //         subdict["F1_1"] = shared_ref. THIS is the in-loop
         //         mutation the eager snapshot could not see.
@@ -1796,9 +1792,8 @@ mod tests {
 
     #[test]
     fn adjust_appearance_stream_lzw_reencode_failure_falls_back_to_flate() {
-        // `/LZWDecode` is the one filter flpdf can decode but not re-encode
-        // (crate::filters::apply_single_filter_encode, decision
-        // flpdf-9hc.7.2). Unlike the CCITT test above, this stream's own
+        // `/LZWDecode` is the one filter flpdf can decode but not re-encode;
+        // unlike the CCITT test above, this stream's own
         // /Resources/Font DOES have "F1", so dr_map's F1->F1_1 rename is a
         // REAL rename, not a no-op. Before this fix, the /Resources rename
         // still applied but the content-rewrite step silently discarded the

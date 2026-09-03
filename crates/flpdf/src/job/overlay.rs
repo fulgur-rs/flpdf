@@ -823,7 +823,7 @@ fn overlay_page_handle<R: Read + Seek>(
 // libz output (see CLAUDE.md DEFLATE carve-out). It lives inside the crate, not
 // in `tests/`, because the overlay entry points are `pub(crate)`.
 //
-// Overlay/underlay byte-identity matrix (flpdf-9hc.16.7). Each row is a
+// Overlay/underlay byte-identity matrix. Each row is a
 // `qpdf 11.9.0 --static-id` invocation reproduced byte-for-byte at the library
 // layer; the golden recipes live in tests/golden/regenerate.sh. Goldens under
 // tests/golden/references/overlay/.
@@ -847,7 +847,7 @@ fn overlay_page_handle<R: Read + Seek>(
 //   swapped box (lkk7)  | overlay  | swapped-box   | one-page      | -      | -     | -
 //   swapped+r90 (lkk7)  | overlay  | swapped-r90   | swapped-r90   | -      | -     | -
 //
-// The flpdf-lkk7 rows cover reversed page boxes (llx>urx AND lly>ury): qpdf reads
+// The reversed-box rows cover page boxes (llx>urx AND lly>ury): qpdf reads
 // all placement geometry through getArrayAsRectangle (min/max normalized). The
 // swapped-box row proves the placement-rect normalization (a raw rect would reflect
 // the source cm). The swapped+r90 row (overlaid onto itself) additionally proves the
@@ -859,7 +859,7 @@ fn overlay_page_handle<R: Read + Seek>(
 //
 // The rotated-source row is the matrix-transformed placement check: the source
 // page carries /Rotate 90, so its imported Form XObject gets a non-identity
-// /Matrix. The flpdf-9hc.16.10 rows widen the gate to the four byte-parity gaps
+// /Matrix. The extended rows widen the gate to the four byte-parity gaps
 // the narrow fixtures had masked: multi-stream exercises the conditional /Matrix
 // omission (no /Rotate) and qpdf's newline content coalescing; rotated dest
 // exercises the destination inverse transform folded into every placement cm;

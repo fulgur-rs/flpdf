@@ -82,7 +82,7 @@ use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 const EBADF_ERRNO: i32 = 9;
 
 // ---------------------------------------------------------------------------
-// ObjStm layout (flpdf-9hc.5.8.2)
+// ObjStm layout
 // ---------------------------------------------------------------------------
 
 /// A single ObjStm container scheduled for the linearized output.
@@ -2141,7 +2141,7 @@ fn do_write_pass<R: Read + Seek>(
 
     // The classic Part-1 mini-xref + first trailer is only emitted on the
     // non-ObjStm path.  For ObjStm-bearing output the first-page (Part-1)
-    // *xref stream* takes its place — and, per the flpdf-56u review, it MUST
+    // *xref stream* takes its place, and it MUST
     // sit physically here (inside the first-page region, before /E) so a
     // reader can resolve page 1 from the leading bytes.  It is written with a
     // deterministic byte length (uncompressed payload + fixed-width /Prev) and
@@ -2640,7 +2640,7 @@ fn do_write_pass<R: Read + Seek>(
         })?;
         let first_page_obj_offset = patch.region.start;
 
-        // Boundary invariant (epic 5.8 acceptance / flpdf-56u): the first-page
+        // Boundary invariant: the first-page
         // cross-reference section must be physically inside the first-page
         // region, i.e. before /E.
         debug_assert!(
