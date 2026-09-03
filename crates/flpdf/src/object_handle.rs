@@ -1788,8 +1788,10 @@ impl ObjectHandle {
     /// comparing two documents for sameness
     /// (`libqpdf/QPDFPageObjectHelper.cc:1020`).
     ///
-    /// What has no qpdf counterpart is storing that id *per object*. A qpdf
-    /// value reaches its document through a raw `QPDF*` back-pointer
+    /// Storing that id *per object* does have a qpdf counterpart -- it is a
+    /// container representation substitute (CLAUDE.md class (B)), not a
+    /// class (C) deviation. A qpdf value reaches its document through a raw
+    /// `QPDF*` back-pointer
     /// (`libqpdf/qpdf/QPDFValue.hh:150`, `QPDF* qpdf{nullptr}`) which
     /// `QPDFObject::doResolve` hands straight to `QPDF::Resolver::resolve`
     /// (`libqpdf/QPDFObject.cc:6-11`), so upstream one pointer is both the
@@ -4654,15 +4656,15 @@ impl ObjectHandle {
     /// carry the parser's QPDF context (`QPDFParser.cc:394-444`). Mere
     /// containment inside another document's object graph does not confer
     /// ownership. This deliberately does not consult
-    /// [`Self::belongs_exclusively_to_pdf`] or the
-    /// `pdf_unique_ids` live-containment set that field reads from: that
-    /// bookkeeping tracks *current* containment for dirty-marking
-    /// ([`Self::containing_object_refs_for_pdf`]) and keeps a value's prior
-    /// document id after it is no longer reachable there, which is not
-    /// qpdf's ownership semantics and would reject a direct value (a null
-    /// or any other scalar) that merely passed through a different
-    /// document's object graph at some earlier point, even though qpdf
-    /// itself never associates ownership with a direct value that way.
+    /// [`Self::belongs_exclusively_to_pdf`] or the `pdf_unique_ids` history
+    /// set that field reads from: that bookkeeping supports dirty-marking
+    /// ([`Self::containing_object_refs_for_pdf`]) but is not a live
+    /// containment index -- it keeps a value's prior document id after it is
+    /// no longer reachable there, which is not qpdf's ownership semantics
+    /// and would reject a direct value (a null or any other scalar) that
+    /// merely passed through a different document's object graph at some
+    /// earlier point, even though qpdf itself never associates ownership
+    /// with a direct value that way.
     fn check_key_value_ownership(&self, value: &ObjectHandle) -> Result<()> {
         if let (Some(self_pdf_unique_id), Some(value_pdf_unique_id)) =
             (self.owning_pdf_unique_id(), value.owning_pdf_unique_id())
@@ -15616,9 +15618,9 @@ mod mutation_tests {
     fn replace_key_removes_the_key_for_a_direct_null_previously_contained_by_another_document() {
         // A direct null handle that was earlier a
         // descendant of a PDF-A indirect object picks up PDF A's id in its
-        // `pdf_unique_ids` live-containment bookkeeping (`promote_to_indirect`
-        // -> `associate_pdf_identity`). That bookkeeping tracks *current*
-        // containment for dirty-marking, not qpdf's notion of ownership
+        // `pdf_unique_ids` history bookkeeping (`promote_to_indirect` ->
+        // `associate_pdf_identity`). That bookkeeping supports dirty-marking,
+        // not qpdf's notion of ownership
         // (`getOwningQPDF()`, set only by `setObjGen`/indirect promotion --
         // see `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_
         // container` above), and never clears when the null value is no

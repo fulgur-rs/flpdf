@@ -135,6 +135,7 @@ pub(crate) fn copy_foreign_value<R: Read + Seek>(
     copy_foreign_with_source_id(target, source_id, foreign, false, true)
 }
 
+#[allow(deprecated)]
 fn copy_foreign_with_source_id<R: Read + Seek>(
     target: &mut Pdf<R>,
     source_id: u64,
@@ -217,6 +218,16 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     source_id: u64,
     object_map: BTreeMap<ObjectRef, ObjectRef>,
     visiting: BTreeSet<ObjectRef>,
+    // Separable at field granularity, so CLAUDE.md's marker policy calls for
+    // #[deprecated] here rather than a comment marker: qpdf's
+    // reserveObjects/replaceForeignIndirectObjects (`QPDF.cc:2101-2213`) have
+    // no direct-container cycle visited set at all. This guard exists only
+    // because the public `ObjectHandle::replace_key` API can construct a
+    // direct cycle no parsed PDF can express. Its accessors get
+    // #[allow(deprecated)] locally rather than spreading unchecked.
+    #[deprecated(
+        note = "no qpdf counterpart; direct-cycle guard for graphs only constructible via ObjectHandle::replace_key -- do not add new callers"
+    )]
     direct_visiting: Vec<ObjectHandle>,
     /// Whether this invocation is the qpdf `copyForeignObject` page boundary.
     /// The writer-preservation traversal disables the boundary so otherwise
@@ -310,6 +321,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         )
     }
 
+    #[allow(deprecated)]
     fn reserve_objects_inner(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
         foreign.try_dereference()?;
         if foreign.is_reserved() {
@@ -399,9 +411,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             return Ok(());
         }
 
-        // qpdf-deviation-start: qpdf's `reserveObjects` has no direct-container
-        // cycle visited set (`QPDF.cc:2101-2213`); this guard protects direct
-        // graphs constructible only through `ObjectHandle::replace_key`.
         if self
             .direct_visiting
             .iter()
@@ -412,7 +421,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         self.direct_visiting.push(foreign.clone());
         let result = self.reserve_children(&foreign);
         self.direct_visiting.pop();
-        // qpdf-deviation-end
         result
     }
 
@@ -458,6 +466,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         )
     }
 
+    #[allow(deprecated)]
     fn replace_foreign_indirect_objects_inner(
         &mut self,
         foreign: ObjectHandle,
@@ -487,10 +496,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         // stop descending because the enclosing frame is already reserving
         // that subtree, while replacement is still mid-construction of the
         // ancestor's copy and has no finite value to hand back for the cycle.
-        // qpdf-deviation-start: qpdf's `replaceForeignIndirectObjects` has no
-        // direct-container cycle visited set (`QPDF.cc:2101-2213`); this guard
-        // protects a direct graph constructible only through
-        // `ObjectHandle::replace_key`.
         if foreign.object_ref().is_none() {
             if self
                 .direct_visiting
@@ -506,7 +511,6 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             self.direct_visiting.pop();
             return result;
         }
-        // qpdf-deviation-end
 
         self.replace_foreign_value(foreign)
     }
@@ -841,6 +845,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn replace_foreign_stream_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
         let mut source = minimal_pdf();
         let indirect_null = source
@@ -910,6 +915,7 @@ mod tests {
         assert_eq!(target.object_refs(), target_refs_before);
     }
 
+    #[allow(deprecated)]
     fn empty_copier<'a>(
         target: &'a mut Pdf<Cursor<Vec<u8>>>,
     ) -> ForeignObjectCopier<'a, Cursor<Vec<u8>>> {
@@ -964,6 +970,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn foreign_copier_stops_reservation_on_a_direct_identity_cycle() {
         // NOTE: `direct.replace_key(b"/Self", direct.clone())` is a no-op —
         // `ObjectHandle::is_direct_value_alias` silently rejects a direct
@@ -1042,6 +1049,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn foreign_copier_rejects_a_non_stream_destination_reservation() {
         let source = minimal_pdf();
         let source_stream = source.new_stream().expect("source stream");
