@@ -27,6 +27,9 @@ jobs:
       - name: Test qpdf module correspondence checker
         run: python3 -m unittest scripts/tests/test_qpdf_module_docs.py
 
+      - name: Test DCT backend documentation contract
+        run: python3 -m unittest scripts/tests/test_dct_backend_documentation.py
+
       - name: Check qpdf module correspondence
         run: python3 scripts/qpdf-module-docs.py --check
 
