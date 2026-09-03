@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
-use crate::pdf_version::{parse_pdf_version, PDF_1_5};
+use crate::pdf_version::{parse_qpdf_writer_version, QpdfVersionParts};
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::body;
 use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
@@ -291,13 +291,13 @@ impl PlainWritePlan {
             has_object_stream || form == XrefForm::Stream,
         )
         .to_string();
-        // `effective_pdf_version` returns an unparseable source version verbatim,
-        // so a malformed header such as `%PDF-x.y` would survive into a plan that
-        // `validate` then rejects. PDF 1.5 introduced xref streams, so repair the
-        // header to that floor exactly as the full-rewrite path does, keeping an
-        // input the previous route rewrote successfully out of the error arm.
+        // If a source version cannot be numerically compared, the canonical
+        // writer keeps its raw value. PDF 1.5 introduced xref streams, so
+        // repair the header to that floor exactly as the full-rewrite path
+        // does whenever this plan actually uses a stream form.
         if form == XrefForm::Stream
-            && parse_pdf_version(&version).is_none_or(|current| current < PDF_1_5)
+            && parse_qpdf_writer_version(&version)
+                .is_none_or(|current| current < QpdfVersionParts::new(1, 5))
         {
             version = "1.5".to_string();
         }
@@ -523,13 +523,13 @@ impl PlainWritePlan {
         } // cov:ignore: a valid plan always places the mapped root, so outputs is nonempty
 
         if has_object_stream || self.trailer.form == XrefForm::Stream {
-            let version = parse_pdf_version(&self.version).ok_or_else(|| {
+            let version = parse_qpdf_writer_version(&self.version).ok_or_else(|| {
                 crate::Error::Unsupported(format!(
                     "plain writer plan: invalid PDF version {}",
                     self.version
                 ))
             })?;
-            if version < PDF_1_5 {
+            if version < QpdfVersionParts::new(1, 5) {
                 return Err(crate::Error::Unsupported(format!(
                     "plain writer plan: PDF {} cannot contain object or xref streams",
                     self.version
@@ -1521,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_invalid_version_for_xref_stream() {
+    fn validation_rejects_raw_version_below_1_5_for_xref_stream() {
         let mut plan = plan_for_test(vec![source(1, 1)]);
         plan.version = "invalid".to_string();
         plan.trailer.form = XrefForm::Stream;
@@ -1529,7 +1529,7 @@ mod tests {
         let err = plan.validate().unwrap_err();
 
         assert!(matches!(err, crate::Error::Unsupported(ref message)
-            if message.contains("invalid PDF version invalid")));
+            if message.contains("PDF invalid cannot contain object or xref streams")));
     }
 
     #[test]

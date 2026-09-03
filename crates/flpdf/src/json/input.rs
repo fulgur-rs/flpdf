@@ -27,6 +27,7 @@ use super::{Json, Reactor};
 use crate::filespec_helper::qpdf_style_open_error;
 use crate::object_handle::{ObjectValue, StreamDataProvider};
 use crate::pipeline::{Base64Action, Pipeline, PlBase64};
+use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 
 const STREAM_PROVIDER_BUFFER_SIZE: usize = 8192;
@@ -1172,116 +1173,4 @@ fn validate_pdf_version(value: &[u8]) -> Option<String> {
         return None;
     }
     String::from_utf8(value.to_vec()).ok()
-}
-
-/// Result of qpdf's two-stage decimal-integer conversion
-/// (`QUtil::string_to_int`, `libqpdf/QUtil.cc:373-393`): `strtoll` parses a
-/// leading digit run into an i64 (`string_to_ll`), then `QIntC::to_int`
-/// narrows that i64 to i32. Both stages throw an uncaught `std::range_error`
-/// on overflow in qpdf (`include/qpdf/QIntC.hh:87-109`); callers must
-/// surface [`Overflow`](QpdfIntParse::Overflow) as a fatal error rather than
-/// silently treating the value as absent or mismatched.
-///
-/// [`NoDigits`](QpdfIntParse::NoDigits) has no qpdf-side counterpart for the
-/// indirect-reference and JSON-version callers in this module, which only
-/// reach `string_to_int` once their own shape check has already guaranteed a
-/// digit is present. A caller that instead calls `string_to_int` directly on
-/// unchecked input, the way `QPDFJob::Config::splitPages`
-/// (`libqpdf/QPDFJob_config.cc:604-609`) does, DOES have a real qpdf-side
-/// counterpart for it: `strtoll` performs no conversion and returns `0`,
-/// which is falsy in qpdf's own `if (m->split_pages)` checks
-/// (`libqpdf/QPDFJob.cc:488,576,616`).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum QpdfIntParse {
-    /// No leading digit was found. See the enum doc for whether this has a
-    /// qpdf-side counterpart in a given caller's context.
-    NoDigits,
-    Overflow(String),
-    Value(i32),
-}
-
-pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
-    // `QUtil::string_to_ll` delegates to `strtoll`, which consumes leading C
-    // whitespace and exactly one optional sign before the digit prefix.
-    let text = text.split('\0').next().unwrap_or(text);
-    let stripped = text.trim_start_matches(|character| {
-        matches!(
-            character,
-            ' ' | '\n' | '\r' | '\t' | '\u{000c}' | '\u{000b}'
-        )
-    });
-    let (negative, digits) = match stripped.as_bytes().first() {
-        Some(b'-') => (true, &stripped[1..]),
-        Some(b'+') => (false, &stripped[1..]),
-        _ => (false, stripped),
-    };
-    let digits_end = digits
-        .bytes()
-        .position(|byte| !byte.is_ascii_digit())
-        .unwrap_or(digits.len());
-    if digits_end == 0 {
-        return QpdfIntParse::NoDigits;
-    }
-    let Ok(magnitude) = digits[..digits_end].parse::<u128>() else {
-        return QpdfIntParse::Overflow(format!(
-            "overflow/underflow converting {text} to 64-bit integer"
-        ));
-    };
-    let signed = if negative {
-        -(i128::try_from(magnitude).unwrap_or(i128::MAX))
-    } else {
-        i128::try_from(magnitude).unwrap_or(i128::MAX)
-    };
-    if signed < i128::from(i64::MIN) || signed > i128::from(i64::MAX) {
-        return QpdfIntParse::Overflow(format!(
-            "overflow/underflow converting {text} to 64-bit integer"
-        ));
-    }
-    let value = signed as i64;
-    match i32::try_from(value) {
-        Ok(value) => QpdfIntParse::Value(value),
-        Err(_) => QpdfIntParse::Overflow(format!(
-            "integer out of range converting {value} from a 8-byte signed type to a 4-byte signed type"
-        )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{qpdf_string_to_int_checked, QpdfIntParse};
-
-    #[test]
-    fn qpdf_string_to_int_checked_handles_empty_and_negative_values() {
-        assert_eq!(qpdf_string_to_int_checked("-"), QpdfIntParse::NoDigits);
-        assert_eq!(qpdf_string_to_int_checked("-42"), QpdfIntParse::Value(-42));
-    }
-
-    #[test]
-    fn qpdf_string_to_int_checked_matches_strtoll_prefix_rules() {
-        assert_eq!(
-            qpdf_string_to_int_checked("  +42trailing"),
-            QpdfIntParse::Value(42)
-        );
-        assert_eq!(qpdf_string_to_int_checked("+-42"), QpdfIntParse::NoDigits);
-    }
-
-    #[test]
-    fn qpdf_string_to_int_checked_overflows_at_i64_stage() {
-        assert_eq!(
-            qpdf_string_to_int_checked("99999999999999999999"),
-            QpdfIntParse::Overflow(
-                "overflow/underflow converting 99999999999999999999 to 64-bit integer".into()
-            )
-        );
-    }
-
-    #[test]
-    fn qpdf_string_to_int_checked_overflows_at_i32_narrowing_stage() {
-        assert_eq!(
-            qpdf_string_to_int_checked("4294967296"),
-            QpdfIntParse::Overflow(
-                "integer out of range converting 4294967296 from a 8-byte signed type to a 4-byte signed type".into()
-            )
-        );
-    }
 }

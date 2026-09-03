@@ -18,10 +18,10 @@ use super::resource_pruning::RemoveUnreferencedResources;
 use super::rotate::{apply_rotate_to_pages, flatten_rotation_on_pages};
 use super::rotate_spec::RotateSpec;
 use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
-use crate::json::input::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizationError};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
+use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectRef, ObjectStreamMode, PageDocumentHelper,
     PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, Severity,
@@ -4000,7 +4000,10 @@ mod tests {
         assert_eq!(parse_json_version("latest"), 2);
         assert_eq!(parse_json_version(""), 2);
         assert!(parse_job_version("1.7.3", ".version").is_ok());
-        assert!(parse_job_version("invalid", ".version").is_err());
+        assert_eq!(
+            parse_job_version("invalid", ".version").unwrap(),
+            ("invalid".to_string(), 0)
+        );
         assert_eq!(QPDFJob::parse_collate("2").unwrap(), vec![2]);
         assert_eq!(QPDFJob::parse_collate("0").unwrap(), vec![0]);
         assert_eq!(QPDFJob::parse_collate("not-number").unwrap(), vec![0]);
