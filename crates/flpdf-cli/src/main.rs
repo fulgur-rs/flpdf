@@ -3216,7 +3216,13 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
         RemoveUnreferencedResources::Auto,
         false,
     )? {
-        PageSpecJobOutput::InPlace { .. } => Ok(()),
+        PageSpecJobOutput::InPlace {
+            pdf,
+            result,
+            prune_mode,
+        } => {
+            QPDFJob::complete_in_place_page_selection(pdf, &result, prune_mode).map_err(Into::into)
+        }
         PageSpecJobOutput::Merged(_) => {
             Err("--pages: JSON output unexpectedly selected a multi-source page job".into())
         }
