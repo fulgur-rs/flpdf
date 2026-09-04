@@ -601,6 +601,13 @@ A ファイルがその単純化は `object_handle.rs`（桁 0 の `#[cfg(test)]
 `write_qpdf_to_memory`（D30）は leaf の衝突と行ベース heuristic のため `--expect-zero`
 自体が使えず、§6.3 の該当行に書いた行側の列挙で判定する。
 
+**D27 follow-up（`flpdf-3yn9.44.1`）:** linearization の stream-parameter probe は
+deletable route の独立 symbol にはせず、D21 の canonical owner
+`crates/flpdf/src/optimization.rs::Optimization` の callback に吸収した。したがって
+`tracked-symbols.txt` に全 object prepass の symbol を追加せず、D27 の完了状態と
+「linearized planning も page/trailer/root 起点の到達範囲だけを解決する」境界を
+`d-writer.md` と §7.3 の follow-up 記録で追跡する。
+
 **(b) baseline denominator には `--expect-zero` を当てない。** その行の完了判定は
 「canonical owner に収束したか」であって「caller が 0 になったか」ではない。
 
@@ -871,6 +878,25 @@ flpdf の pre-write sweep はこのどれにも対応しない追加処理で、
    sweep 後の `live_object_refs()` に依存しているものが、writer の出力バイトを見る形へ
    書き換わっているか削除されていること。
 3. 上の RED byte test が GREEN になること。
+
+#### D27 follow-up: linearization prepass（`flpdf-3yn9.44.1`）
+
+親 cutover で pre-write sweep を撤去した結果、linearized planning に残っていた
+`stream_refs_to_skip_parameter_edges` の全 object 走査が、到達不能 stream の解決という
+別の qpdf mismatch を露呈した。この follow-up では、qpdf 11.9.0 の
+`QPDF::optimize`（`libqpdf/QPDF_optimization.cc:57-118,261-338`）と
+`QPDFWriter::writeLinearized`（`libqpdf/QPDFWriter.cc:2537-2561`）に合わせ、
+stream-parameter の probe と skip 記録を既存の `Optimization::optimize` callback 内へ
+移した。callback は page、trailer key、Catalog root-key の mark walk から呼ばれるため、
+`pdf.object_refs()` を全件 resolve する standalone prepass は存在しない。linearization
+object universe のフィルタも到達性判定を先に行い、discarded object の型確認のために
+resolve しない。
+
+回帰 fixture は `crates/flpdf/tests/linearization_unreachable_stream_tests.rs`。
+qpdf 11.9.0 の `--linearize` が成功する一方、unreachable stream の間接 `/Length`
+holder を読むとだけ失敗する reader を使い、flpdf の linearized write が成功し、生成物を
+qpdf `--check` が受理することを確認する。qpdf source からの到達境界、実機 qpdf の成功、
+flpdf の RED→GREEN test はすべて同一 fixture で再実行可能である。
 
 #### 次の cutover へ進む条件
 
