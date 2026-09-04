@@ -174,6 +174,57 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertIn("QPDF.cc:0", result.stdout)
 
+    def test_malformed_qpdf_citation_is_not_silently_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER + "| 1 | x | `libqpdf/QPDF.cc:1--2` | y | z | canonical | w | - |\n",
+            )
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("QPDF.cc:1--2", result.stdout)
+
+    def test_non_numeric_qpdf_citation_is_not_a_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER + "| 1 | x | `libqpdf/QPDF.cc:bogus` | y | z | canonical | w | - |\n",
+            )
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("QPDF.cc:bogus", result.stdout)
+
+    def test_comma_separated_flpdf_ranges_are_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", "See `crates/flpdf/src/reader.rs:1,99` for details.\n")
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("reader.rs:1,99", result.stdout)
+
+    def test_escaped_pipe_in_a_matrix_cell_does_not_shift_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER + "| 1 | x | `libqpdf/QPDF.cc:1` | y \\| z | x | canonical | w | - |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_flpdf_symbol_in_comment_or_string_is_not_a_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            (repo.root / "crates" / "flpdf" / "src" / "reader.rs").write_text(
+                '// fn gone() {}\nlet text = "fn gone()";\n', encoding="utf-8"
+            )
+            repo.write("a.md", "See `crates/flpdf/src/reader.rs::gone`.\n")
+            result = repo.check("--no-qpdf")
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("gone", result.stdout)
+
     def test_field_and_variant_declarations_are_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
