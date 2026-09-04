@@ -53,6 +53,41 @@ fn run_qpdf_ctest(directory: &Path, args: &[String]) -> std::process::Output {
     command.output().expect("qpdf-ctest should spawn")
 }
 
+/// qpdf's CLI writes JSON files through a text-mode path on Windows, while
+/// qpdf-ctest test46/47 explicitly use a binary `FILE*` and Rust writes LF.
+/// Compare the textual JSON independent of that platform-only translation.
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+
+    normalized
+}
+
+fn assert_json_files_equal(adapter: &Path, oracle: &Path) {
+    assert_eq!(
+        normalize_text_newlines(&fs::read(adapter).unwrap()),
+        normalize_text_newlines(&fs::read(oracle).unwrap())
+    );
+}
+
+#[test]
+fn text_newline_normalization_only_collapses_crlf_pairs() {
+    assert_eq!(
+        normalize_text_newlines(b"first\r\nsecond\nthird\rfourth"),
+        b"first\nsecond\nthird\rfourth"
+    );
+}
+
 #[test]
 fn qpdf_ctest_2_reports_invalid_password_through_the_c_api_error_surface() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -485,10 +520,7 @@ fn qpdf_ctest_json_cases_42_through_47_match_qpdf() {
         .output()
         .expect("qpdf should spawn for test46 oracle");
     assert!(qpdf_json46_result.status.success());
-    assert_eq!(
-        fs::read(&output46).unwrap(),
-        fs::read(&qpdf_json46).unwrap()
-    );
+    assert_json_files_equal(&output46, &qpdf_json46);
 
     let adapter47 = directory.path().join("adapter-47");
     let oracle47 = directory.path().join("oracle-47");
@@ -529,10 +561,7 @@ fn qpdf_ctest_json_cases_42_through_47_match_qpdf() {
         .output()
         .expect("qpdf should spawn for test47 oracle");
     assert!(qpdf_json47_result.status.success());
-    assert_eq!(
-        fs::read(&output47).unwrap(),
-        fs::read(&qpdf_json47).unwrap()
-    );
+    assert_json_files_equal(&output47, &qpdf_json47);
     assert_eq!(
         fs::read(adapter47.join("auto-4")).unwrap(),
         fs::read(oracle47.join("auto-4")).unwrap()
