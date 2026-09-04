@@ -608,11 +608,21 @@ indirect object を参照する。flpdf の `Pdf::make_indirect_object_handle`
 （`reader.rs`）は既存 handle を in-place で indirect 化せず新しい handle を
 割り当てるので、この map はその in-place `og` 代入の side table として
 「live な direct 値 1 つにつき indirect object 1 つ」という同じ結果を
-再現する。parse 由来のグラフでは direct 値の identity が出現箇所ごとに
-異なるため cache hit は起きない。したがって shared-identity の形でも
-出力バイトは qpdf と一致する。この map 自体は qpdf に対応する構造を持たない
-flpdf 固有の、出力バイトを変えない category-(C) の allocation reuse であり、
-実装の誤差ではないことを source-near `qpdf-deviation` marker に記録する。
+`/Pages` tree 内の slot について再現する。ただし置換されるのは walk が
+訪れる `/Pages` node の slot だけなので、同じ direct handle が tree の外
+（例: Catalog の任意キー）にも alias されている形では、qpdf が共有
+`QPDFObject` の in-place `og` 代入によってその外部 slot も `N 0 R` として
+書き出すのに対し、flpdf の外部 slot は direct のまま inline 出力され、
+出力バイトが異なる。この API 限定の乖離は `make_indirect_object_handle` が
+qpdf の in-place 昇格（flpdf では `make_indirect_from_object_handle` →
+`ObjectHandle::promote_to_indirect` が対応し、`optimization/inherited_attrs.rs`
+は既にそちらを使う）ではなく clone 経路であることに由来し、`flpdf-n3ev`
+で tree_rebuild 側を in-place 経路へ移行して cache ごと撤去する。parse
+由来のグラフでは direct 値の identity が出現箇所ごとに異なるため cache hit
+も外部 alias も起きない。この map 自体は qpdf に対応する構造を持たない
+flpdf 固有の category-(C) の allocation reuse であり（出力バイトは上記の
+外部 alias を除いて変えない）、実装の誤差ではないことを source-near
+`qpdf-deviation` marker に記録する。
 
 線形化の stream-parameter reachability は `writeLinearized` の
 `skip_stream_parameters`（`QPDFWriter.cc:2543-2553`）と
