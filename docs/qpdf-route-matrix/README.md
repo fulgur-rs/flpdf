@@ -758,9 +758,15 @@ qpdf 呼び出し順を壊さない理由: §5.D 第 1 行（採番は enqueue �
 1. **E-29（完了）** — `open_with_description`、`open_document_with_description`、
    `open_for_encryption_inspection_with_description`、`open_job_source`、JSON seed の各入力境界で
    `suppress_warnings` を open 前に OR / 適用した（`libqpdf/QPDFJob.cc:663-665`）。CLI 直書きの
-   `Pdf::open_with_options` / `Pdf::create_from_json` は通常 route から消えた。reopenable source を
-   必要とする `open_page_source` の direct `open_file_with_options` だけは残るが、同じ option を
-   open 前に渡す。`crates/flpdf-cli/tests/cli_no_warn.rs` が ordinary・secondary・JSON route と
+   `Pdf::open_with_options` / `Pdf::create_from_json` は通常 route から消えたが、direct
+   `Pdf::open_with_options` は2つの exception route に残る: reopenable source を必要とする
+   `open_page_source`（`open_file_with_options`）、および qpdf の `doCopyAttachments`
+   （`libqpdf/QPDFJob.cc:2100`、donor を `processFile(other, ...)` で job 本体の main input
+   slot と独立に開く）に対応する `run_copy_attachments_from` の attachment donor open
+   （donor を job 経由で開くと `job.input_name()` が donor のパスで上書きされ、後続の
+   duplicate-key エラーが target ではなく donor を誤って名指すため、意図的に job 非経由）。
+   どちらも同じ `suppress_warnings` option を open 前に渡す。
+   `crates/flpdf-cli/tests/cli_no_warn.rs` が ordinary・secondary・JSON・split-pages route と
    qpdf の warning delivery / exit status を比較する。
 2. **E-19 / E-7** — `complete` / exit code の 1 回判定化。前提: probe E-P3。
 3. **E-2 / E-3** — `create_qpdf` の内側へ変換 5 段を戻し、3 分岐を `write_qpdf` の内側へ移す。
