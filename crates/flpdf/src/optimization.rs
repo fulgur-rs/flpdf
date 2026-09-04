@@ -384,6 +384,7 @@ mod tests {
     use crate::object_handle::ObjectHandle;
     use crate::parser::MAX_PARSE_DEPTH;
     use crate::{ObjectRef, Result};
+    use std::rc::Rc;
 
     fn nested_direct_array(depth: usize) -> ObjectHandle {
         let mut value = ObjectHandle::null();
@@ -410,6 +411,13 @@ mod tests {
     #[test]
     fn object_user_walk_rejects_programmatic_depth_beyond_parser_limit() {
         let mut optimization = Optimization::default();
+        optimization
+            .update_object_maps(
+                ObjectUser::Root,
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+                &mut no_stream_parameter_skip,
+            )
+            .expect("the test callback must be exercised by a stream");
         let error = optimization
             .update_object_maps(
                 ObjectUser::Root,
