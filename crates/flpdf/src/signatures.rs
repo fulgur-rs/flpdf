@@ -150,7 +150,10 @@ pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
 ///
 /// The field dictionaries themselves are preserved so widgets and field names
 /// remain in place, but signed fields no longer point at a signature
-/// dictionary. Returns `true` when at least one field value was removed.
+/// dictionary. The former signature dictionary is deliberately not deleted;
+/// qpdf leaves it in its object cache for the writer's reachability decision
+/// (`QPDFAcroFormDocumentHelper.cc:418-439`). Returns `true` when at least one
+/// field value was removed.
 ///
 /// # Errors
 ///
@@ -248,17 +251,11 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         .cloned()
         .unwrap_or_else(ObjectHandle::null);
 
-    let signature_value_ref = entries
-        .get(b"/V".as_slice())
-        .and_then(|value| value.object_ref());
     let has_signature_value = entries.contains_key(b"/V".as_slice());
 
     if field_type.as_deref() == Some(b"Sig") && has_signature_value {
         field.remove_key(b"/V");
         pdf.mark_object_handle_dirty(&field)?;
-        if let Some(signature_ref) = signature_value_ref {
-            pdf.delete_object(signature_ref);
-        }
         *changed = true;
         if depth == DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
             return Ok(());

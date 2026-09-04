@@ -305,4 +305,12 @@ fn strip_signature_values_removes_the_indirect_signature_value() {
         .is_null());
     let signature = pdf.get_object_handle(ObjectRef::new(6, 0));
     assert!(pdf.resolve(&signature).is_ok());
+    assert!(
+        signature
+            .try_get_key(b"/ByteRange")
+            .expect("signature dictionary must remain available")
+            .as_array()
+            .is_some(),
+        "stripping a field's /V must not delete the signature dictionary"
+    );
 }

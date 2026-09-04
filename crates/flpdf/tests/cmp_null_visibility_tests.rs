@@ -940,16 +940,17 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
 }
 
 #[test]
-fn preserve_explicit_structural_deletion_keeps_source_container_over_100_members() {
+fn preserve_explicit_structural_null_replacement_keeps_source_container_over_100_members() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/null-visible-preserve-over-100.pdf");
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
 
     // The source xref stream is structural and unreachable from the document
-    // graph, so deleting it is behavior-neutral. Explicit deletions now stay on
-    // the shared Preserve pipeline without changing the 104 reachable source
-    // ObjStm members.
-    pdf.delete_object(ObjectRef::new(107, 0));
+    // graph, so replacing it with qpdf's public null value is behavior-neutral.
+    // The shared Preserve pipeline still keeps the 104 reachable source ObjStm
+    // members.
+    pdf.replace_object(ObjectRef::new(107, 0), ObjectHandle::null())
+        .expect("replace the structural xref stream with null");
 
     let settings = WriterTestSettings {
         object_streams: ObjectStreamMode::Preserve,

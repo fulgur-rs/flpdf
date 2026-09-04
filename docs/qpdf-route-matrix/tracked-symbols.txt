@@ -2,7 +2,7 @@
 #
 # 対象: docs/qpdf-route-matrix/{a..e}-*.md の 162 行のうち、classification が
 # `bridge` または `mixed` の 97 行の「flpdf current entrypoint」に現れる flpdf symbol
-# （170 個）。`canonical` 行は対象外。bridge/mixed で唯一 entrypoint が `absent` の
+# （167 個）。`canonical` 行は対象外。bridge/mixed で唯一 entrypoint が `absent` の
 # B7 も対象外（qpdf の `QPDF::readToken` に対応する flpdf の集約点が存在せず、
 # 追跡すべき symbol が無い）。B29 も `absent` だが `unknown` なので元から対象外。
 #
@@ -95,8 +95,6 @@ crates/flpdf/src/reader.rs::Pdf::live_object_refs                        # A10
 crates/flpdf/src/reader.rs::Pdf::resolved_count                          # A10
 crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
 crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 shallow copy 版
-crates/flpdf/src/reader/resolver.rs::remove_object_preserving_handle     # A13
-crates/flpdf/src/reader.rs::Pdf::delete_object                           # A14
 crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref    # A15
 crates/flpdf/src/pdf.rs::legacy_resolution_state_synced                  # A15（フィールド）
 crates/flpdf/src/reader.rs::Pdf::mark_object_handle_dirty                # A18
@@ -107,7 +105,6 @@ crates/flpdf/src/pdf.rs::handle_mutated_object_refs                      # A18�
 crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
 crates/flpdf/src/reader/resolver.rs::read_window                         # A22
 crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23
-crates/flpdf/src/reader.rs::Pdf::promote_resolved_object_stream_members  # A24
 crates/flpdf/src/pdf.rs::compressed_member_parents                       # A24（フィールド）
 
 # --- (b) baseline denominator ---

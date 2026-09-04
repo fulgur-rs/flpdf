@@ -2407,21 +2407,6 @@ impl ObjectHandle {
         }
     }
 
-    /// Rebind only this slot to a null value while leaving its indirect
-    /// identity in place. This is the compatibility-delete transition: qpdf
-    /// detaches the cache object before nulling it (`QPDF.cc:1996-2005`), so a
-    /// replacement alias must not observe the target's null mutation.
-    pub(crate) fn detach_value_to_null(&self) {
-        if self.is_indirect() {
-            self.replace_detached_state(ObjectValue::Null);
-            let mut slot = self.0.borrow_mut();
-            slot.parsed_offset = NO_PARSED_OFFSET;
-            slot.end_before_space = NO_PARSED_OFFSET;
-            slot.end_after_space = NO_PARSED_OFFSET;
-            slot.description = None;
-        }
-    }
-
     /// Return the canonical indirect objects that contain this direct handle.
     /// Indirect handles own themselves and are intentionally excluded: callers
     /// that need that case already use [`Self::object_ref`].
