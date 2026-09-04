@@ -57,16 +57,18 @@ After reading the rule file:
    missing or off the pin — it never clones), run
    `scripts/fetch-qpdf-source.sh` with no arguments to install the pinned
    worktree, then retry `--print-path`.
-3. Confirm `qpdf --version` reports exactly `qpdf version 11.9.0` before
-   treating any live probe as evidence. `fetch-qpdf-source.sh` only warns
-   on a missing or mismatched binary and keeps running; a probe against an
-   unverified or wrong-version binary is not usable evidence — return
-   `unknown` instead if no verified 11.9.0 binary is available.
-4. Read qpdf first. Identify the relevant classes, fields, public contracts,
+3. Read qpdf first. Identify the relevant classes, fields, public contracts,
    ownership, call order, default implementations, errors, and consumer
-   boundary. Use a focused live qpdf probe (only against the verified 11.9.0
-   binary from the previous step) when source alone does not settle
-   observable behavior.
+   boundary. Many audits are fully conclusive from source alone — a live
+   probe is not required by default.
+4. Only when source alone does not settle observable behavior, use a
+   focused live qpdf probe — but first confirm `qpdf --version` reports
+   exactly `qpdf version 11.9.0`. `fetch-qpdf-source.sh` only warns on a
+   missing or mismatched binary and keeps running; a probe against an
+   unverified or wrong-version binary is not usable evidence. If the
+   needed evidence genuinely requires a probe and no verified 11.9.0
+   binary is available, return `unknown` — do not force `unknown` merely
+   because the binary check step ran when no probe was actually needed.
 5. Write the required qpdf primitives as separate one-to-one responsibility
    units.
 6. Only now inspect flpdf code and tests. Map every qpdf primitive to its flpdf
@@ -219,19 +221,19 @@ report. If context does not contain that report and approval, rerun phase 1.
    that qpdf evidence contradicts, and update the parent epic's and the
    dependent side's description, per
    `.claude/rules/qpdf-port-design-patterns.md` rule 4.
-7. Run `bd dolt push` to persist the notes and dependency changes. If it
-   fails, stop here: do not add `primitive-audited` (a label added before
-   the notes it describes are even persisted would be worse than
-   premature). Follow Partial Failure and Retry below.
-8. Read back the audited issue, prerequisite issues, dependency tree,
+7. Read back the audited issue, prerequisite issues, dependency tree,
    notes, and every issue whose text step 6 repaired (the parent epic
-   and/or the dependent-side issue, when applicable) now, before adding
-   the label. Confirm they all match the approved plan exactly. If
-   anything is missing, unexpected, or wrong — including an omitted or
-   incorrect parent-epic or dependent-side text repair — stop here and do
-   not add the label — the completion marker must not be published ahead
-   of a plan that failed verification.
-9. Only after that verification passes, add `primitive-audited` with
+   and/or the dependent-side issue, when applicable) now, locally, before
+   any push. Confirm they all match the approved plan exactly (catches a
+   mistyped issue ID or a misapplied edge before it ever reaches the
+   remote). If anything is missing, unexpected, or wrong, correct it and
+   re-verify before proceeding — do not push unverified content.
+8. Only after that local verification passes, run `bd dolt push` to
+   persist the notes and dependency changes. If it fails, stop here: do
+   not add `primitive-audited` (a label added before the notes it
+   describes are even persisted would be worse than premature). Follow
+   Partial Failure and Retry below.
+9. Add `primitive-audited` with
    `bd update <audited> --add-label primitive-audited`.
 10. Read back the label locally to confirm it was actually applied, before
     pushing it. If it is missing or wrong, correct it before proceeding —
