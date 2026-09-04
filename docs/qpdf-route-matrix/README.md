@@ -1,7 +1,7 @@
 # flpdf ↔ qpdf route matrix（canonical / bridge / consumer 棚卸し）
 
 **Oracle:** qpdf 11.9.0（`scripts/fetch-qpdf-source.sh --print-path` で解決される pinned source と
-`/usr/bin/qpdf` 11.9.0 の実機挙動）。本表の引用（`libqpdf/X.cc:N-M`、`crates/.../file.rs::Symbol`）は
+`/usr/bin/qpdf` 11.9.0 の実機挙動）。本表の引用（`libqpdf/X.cc:N-M`、`crates/<crate>/src/<file>.rs::<Symbol>`）は
 `scripts/check-qpdf-route-matrix.py --check` でファイル・行範囲・識別子の実在を検証する。
 **関連:** [`docs/qpdf-correspondence.md`](../qpdf-correspondence.md)（責務対応表。本表はその上に
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
