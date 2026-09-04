@@ -589,6 +589,41 @@ reservation order に interleave し、trailer と `/Extends` の参照も同じ
 | `QPDF_linearization.cc` | 1796 | `linearization/`（`plan.rs` 7176, `hint_*` 3741, `check.rs` 3467, `show.rs` 2642, ほか）≒ 17,000 行 | ✅ qpdf `QPDF_linearization.cc:452-470` と同じく、`check.rs` の `/T` は xref parser が保持する `first_xref_item_offset` (`QPDF.cc:845-869,1110-1120`) に対する whitespace 消費後の位置比較だけを行う（構造探索・subsection再解析・flpdf 固有の hard failure は除去済み、`qpdf-deviation` マーカーも撤去済み）。初回または `/Prev` の classic xref row parse が後続 row で失敗しても、object 0 row で観測した offset を reconstruction へ保持する qpdf の mutable-state 挙動 (`QPDF.cc:626-708,846-869`) を `flpdf-7yvv` の side channel で再現する。`flpdf-1quo` で check consumer は primary/overflow hint stream を qpdf と同じ buffer に連結し、Page Offset / Shared Object / Outline の各 hint table の object count・length・shared membership・physical offset を qpdf の object-user 分類と実 xref extent に照合する。実装は 5+ モジュールに分散したまま（`optimization.rs` が達成したような単一モジュールへの集約は未達）。ObjectHandle 移行自体は完了: producer 側（`flpdf-3yn9.4`、plan.rs + hint_*）と consumer 側（`flpdf-egzr.3.2.9`、check.rs + show.rs）が close 済み。`check_consumer_production_uses_the_canonical_object_handle_route` / `show_consumer_production_uses_the_canonical_object_handle_route` は production 経路から `Object::` / `resolve_borrowed` / `decode_stream_data` / `page_refs` が消えたことを機械的に保証する。残存する `plan.rs` の `collect_direct_refs`（Object 版）は `#[cfg(test)]` の fixture walker に限定され、production closure と writer の計算は同ファイルの `collect_direct_handle_refs`（ObjectHandle 版）が担う。線形化書き込み経路自体（writer.rs 側、`flpdf-3yn9.5` 系列）は issue タイトルが明記する通り §3 `QPDFWriter.cc` のスライスであり本行の対応先ではない
 | `QPDF_optimization.cc` | 381 | `optimization.rs`（optimization orchestration、inherited-page preparation、object-user maps、compressed-object folding）+ `optimization/inherited_attrs.rs`(575) | ✅ `flpdf-qxba.9.3` / `.9.4` で完全 cutover。`linearization/plan.rs` 側に `ObjUser` / `update_object_maps` は残っていない。⚪ `inherited_attrs.rs` の inheritable key null 判定（`push_node_attributes` / `push_child_reference`）は `Pdf::resolve_to_terminal` で `Pdf::set_object` bare-reference redirect の終端まで辿る。qpdf 自身のオブジェクトグラフは「あるオブジェクトの値が別の参照そのもの」という形を持てない（対応物なし）ため、`pages.rs` の `resolve_inherited_handle_with_max_depth`（bottom-up の姉妹関数）と同じ理由で同じ補償を行っている。⚪ `Optimization::update_object_maps` の reference-valued handle 再ディスパッチも `Pdf::set_object` が作る flpdf 固有形状だけを対象にし、qpdf parsed graph には追加の対応物を作らない（`QPDFParser.cc:26-90,140-176`）。 |
 
+`flpdf-64ne` では、`pages/tree_rebuild.rs::promote_inherited_value` が
+`HashMap<ObjectHandleIdentity, ObjectHandle>` を使って、ページ選択前の
+inherited-value promotion を同じ live handle identity ごとに再利用する。
+qpdf 11.9.0 の `pushInheritedAttributesToPageInternal` は
+`key_ancestors` の key ごとの stack を top-down に管理し、各 `/Pages` node
+の direct non-scalar value を `makeIndirectObject` で一度 indirect 化してから
+その handle を子へ渡すだけで、この identity-keyed cache を持たない
+（`QPDF_optimization.cc:159-239`）。qpdf で同じ direct な `QPDFObject` を
+複数の `/Pages` slot が共有する形（API で同一 handle を `replaceKey` した
+場合。`QPDF_Dictionary::replaceKey` は handle をそのまま格納する、
+`QPDF_Dictionary.cc:136-146`）でも、最初の `makeIndirectObject` が
+`makeIndirectFromQPDFObject` → `newIndirect` → `setDefaultDescription` で
+共有 `QPDFObject` 自身に `og` を in-place で書き込む
+（`QPDF.cc:1836-1840,1883-1897`、`QPDFValue.hh:68-72`）ため、後続 node
+では `oh.isIndirect()` が真になって再割り当てされず、全 slot が同じ 1 つの
+indirect object を参照する。flpdf の `Pdf::make_indirect_object_handle`
+（`reader.rs`）は既存 handle を in-place で indirect 化せず新しい handle を
+割り当てるので、この map はその in-place `og` 代入の side table として
+「live な direct 値 1 つにつき indirect object 1 つ」という同じ結果を
+`/Pages` tree 内の slot について再現する。ただし置換されるのは walk が
+訪れる `/Pages` node の slot だけなので、同じ direct handle が tree の外
+（例: Catalog の任意キー）にも alias されている形では、qpdf が共有
+`QPDFObject` の in-place `og` 代入によってその外部 slot も `N 0 R` として
+書き出すのに対し、flpdf の外部 slot は direct のまま inline 出力され、
+出力バイトが異なる。この API 限定の乖離は `make_indirect_object_handle` が
+qpdf の in-place 昇格（flpdf では `make_indirect_from_object_handle` →
+`ObjectHandle::promote_to_indirect` が対応し、`optimization/inherited_attrs.rs`
+は既にそちらを使う）ではなく clone 経路であることに由来し、`flpdf-n3ev`
+で tree_rebuild 側を in-place 経路へ移行して cache ごと撤去する。parse
+由来のグラフでは direct 値の identity が出現箇所ごとに異なるため cache hit
+も外部 alias も起きない。この map 自体は qpdf に対応する構造を持たない
+flpdf 固有の category-(C) の allocation reuse であり（出力バイトは上記の
+外部 alias を除いて変えない）、実装の誤差ではないことを source-near
+`qpdf-deviation` marker に記録する。
+
 線形化の stream-parameter reachability は `writeLinearized` の
 `skip_stream_parameters`（`QPDFWriter.cc:2543-2553`）と
 `QPDF_optimization.cc:274-333` に合わせ、refilter 判定済みの参照元 stream
