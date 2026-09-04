@@ -286,28 +286,42 @@ def excluded_lines(relpath):
         errors.append((start_line, "cov:ignore-start without matching end"))
     return excl, errors
 
-# 3b. A file is "declaration-only" if every line is a module/use declaration
-#     (optionally multi-line, e.g. `pub use foo::{\n  a,\n  b,\n};`), a `//`
-#     comment (incl. `//!`/`///`, and a trailing `// ...` after a declaration),
-#     a module-level attribute, or blank. Such a file compiles to zero
-#     executable regions, so llvm-cov never emits an SF: record for it — in a
-#     fresh run just as much as a reused one. Used only to exempt these files
-#     from the missing-coverage check below; a single non-matching line (a
-#     real function, expression, or braced inline `mod name { ... }`) makes
-#     the whole file ineligible, falling back to the safe default of still
-#     flagging it. `pub(...)` accepts any restricted-visibility path (`pub(crate)`,
+# 3b. A file is "declaration-only" if every line is a module/use/type
+#     declaration (optionally multi-line, e.g. `pub use foo::{\n  a,\n  b,\n};`
+#     or `pub enum Kind {\n  A,\n  B,\n}`), a `//` comment (incl.
+#     `//!`/`///`, and a trailing `// ...` after a declaration), a
+#     module-level attribute, or blank. Such a file compiles to zero executable
+#     regions, so llvm-cov never emits an SF: record for it — in a fresh run
+#     just as much as a reused one. Used only to exempt these files from the
+#     missing-coverage check below; a single non-matching line (a real function,
+#     expression, or braced inline `mod name { ... }`) makes the whole file
+#     ineligible, falling back to the safe default of still flagging it.
+#     `pub(...)` accepts any restricted-visibility path (`pub(crate)`,
 #     `pub(super)`, `pub(in crate::foo)`), not just a single identifier.
 _DECL_MOD_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?mod\s+\w+\s*;\s*$")
 _DECL_USE_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?use\s+")
+_DECL_TYPE_RE = re.compile(r"^(pub(\([^)]+\))?\s+)?(?:enum|struct|union)\s+\w+\b")
 
 def is_declaration_only_file(relpath):
     full = os.path.join(repo_root, relpath)
     if not os.path.isfile(full):
         return False
     in_multiline_use = False
+    in_type_decl = False
+    type_brace_depth = 0
+    type_saw_open_brace = False
     with open(full, encoding="utf-8", errors="replace") as fh:
         for src in fh:
             stripped = _code_before_comment(src).strip()
+            if in_type_decl:
+                type_brace_depth += stripped.count("{") - stripped.count("}")
+                if type_brace_depth < 0:
+                    return False
+                if "{" in stripped:
+                    type_saw_open_brace = True
+                if type_saw_open_brace and type_brace_depth == 0:
+                    in_type_decl = False
+                continue
             if in_multiline_use:
                 if stripped.endswith(";"):
                     in_multiline_use = False
@@ -320,8 +334,19 @@ def is_declaration_only_file(relpath):
                 if not stripped.endswith(";"):
                     in_multiline_use = True
                 continue
+            if _DECL_TYPE_RE.match(stripped):
+                if stripped.endswith(";"):
+                    continue
+                type_brace_depth = stripped.count("{") - stripped.count("}")
+                type_saw_open_brace = "{" in stripped
+                in_type_decl = True
+                if type_brace_depth < 0:
+                    return False
+                if type_saw_open_brace and type_brace_depth == 0:
+                    in_type_decl = False
+                continue
             return False
-    return not in_multiline_use
+    return not in_multiline_use and not in_type_decl
 
 # Unit-test modules are compiled only under `cfg(test)`. cargo llvm-cov does
 # not emit an SF record for the source file when it measures the workspace,
