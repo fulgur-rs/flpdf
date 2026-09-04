@@ -30,12 +30,16 @@ again before inspecting or changing Beads.
 
 - Start from pinned qpdf 11.9.0. The existing flpdf shape is a change target,
   not a design constraint.
-- Keep phase 1 read-only. Do not create or update issues, add or remove
-  dependencies, edit notes, add labels, claim work, change status, or create a
-  worktree.
+- Keep phase 1 read-only for the audited issue: do not create or update
+  issues, add or remove dependencies, edit notes, add labels, claim work,
+  change status, or create an implementation worktree for it. This does not
+  cover `scripts/fetch-qpdf-source.sh` installing the pinned qpdf oracle
+  source — a separate, read-only, shared reference repository outside the
+  flpdf tree, not an implementation worktree for the audited issue.
 - Stop for explicit approval of the exact change set before phase 2.
-- Never claim, close, reprioritize, implement, or create a worktree for the
-  audited issue. This skill audits and records readiness only.
+- Never claim, close, reprioritize, implement, or create an implementation
+  worktree for the audited issue. This skill audits and records readiness
+  only.
 - Treat qpdf source and observed behavior as authoritative over issue text,
   acceptance criteria, dependency records, and existing flpdf patterns.
 
@@ -126,17 +130,22 @@ Return this structure with concrete content:
 
 ### Existing Beads candidates
 
-- <ID or none>: <open or closed>; <why it is or is not the same
-  responsibility>. A closed match is not reusable as an unresolved
-  prerequisite while flpdf inspection still shows the primitive missing —
-  state explicitly whether the plan reopens it or creates a new issue.
+- <one line per candidate, or `none`>: <ID>, <open or closed>; <why it is
+  or is not the same responsibility>. A closed match is not reusable as an
+  unresolved prerequisite while flpdf inspection still shows the primitive
+  missing — state explicitly whether the plan reopens it or creates a new
+  issue.
 
 ### Proposed Beads changes
 
-- Create/reuse: <complete issue draft, or existing OPEN issue ID; if the
-  only match is closed and the primitive remains missing, state
-  create-new or reopen-<ID> explicitly>
-- Dependency: bd dep add <audited> <prerequisite>
+- Create/reuse: <one line per required primitive, or `none` for a plain
+  `ready` audit with no prerequisite — never invent a dependency to fill
+  this slot, and never collapse two independent missing primitives into
+  one entry; each primitive keeps its own line: complete issue draft, or
+  existing OPEN issue ID, or create-new/reopen-<ID> when the only match is
+  closed>
+- Dependency: <one `bd dep add <audited> <prerequisite>` line per created
+  or reused prerequisite above, or `none`>
 - Remove/reverse: <exact approved edge changes or none>
 - Issue-text repairs: <exact acceptance-criteria/parent-epic/dependent-side
   description corrections required by
@@ -144,7 +153,7 @@ Return this structure with concrete content:
   reverses or contradicts recorded text, or none>
 - Notes: <exact complete block to append>
 - Label: bd update <audited> --add-label primitive-audited (only after
-  `bd dolt push` in phase 2 succeeds)
+  phase 2's pre-label readback and the first `bd dolt push` succeed)
 
 ### Evidence gaps
 
@@ -172,17 +181,20 @@ report. If context does not contain that report and approval, rerun phase 1.
    docs, so re-run the relevant phase-1 correspondence checks (or confirm
    the audited flpdf revision is unchanged) before resuming, especially
    after any gap between approval and phase 2.
-2. Reuse a matching issue only if it is open. If the only match is closed
-   and flpdf inspection still shows the primitive missing, follow the
-   approved plan's explicit choice: reopen that issue or create a new one
-   — never treat a closed match as an unresolved prerequisite by default.
-   Otherwise create only the approved prerequisite issue. Make it one qpdf
-   responsibility unit; keep consumer migration in the audited issue.
-3. Locate the created or reopened issue by its exact title and read it back
-   with `bd show`. Never treat warning-laden `bd create` stdout as a bare
-   ID.
+2. For a plain `ready` audit with no prerequisite, skip to step 5. For each
+   approved prerequisite (there may be zero, one, or several — one per
+   missing qpdf responsibility unit, never collapsed into a single issue):
+   reuse it only if it is open. If the only match is closed and flpdf
+   inspection still shows the primitive missing, follow the approved
+   plan's explicit choice: reopen that issue or create a new one — never
+   treat a closed match as an unresolved prerequisite by default.
+   Otherwise create only that approved prerequisite issue, one qpdf
+   responsibility unit each; keep consumer migration in the audited issue.
+3. Locate each created or reopened issue by its exact title and read it
+   back with `bd show`. Never treat warning-laden `bd create` stdout as a
+   bare ID.
 4. Check the current dependency tree and `bd dep cycles`. Apply only approved
-   removals, reversals, and additions. The audited consumer depends on the
+   removals, reversals, and additions. The audited consumer depends on each
    prerequisite:
    `bd dep add <audited> <prerequisite>`.
 5. Run `bd dep cycles` again. Stop on a cycle; do not invent a graph repair.
@@ -197,15 +209,22 @@ report. If context does not contain that report and approval, rerun phase 1.
    fails, stop here: do not add `primitive-audited` (a label added before
    the notes it describes are even persisted would be worse than
    premature). Follow Partial Failure and Retry below.
-8. Only after that push succeeds, add `primitive-audited` with
+8. Read back the audited issue, prerequisite issues, dependency tree, and
+   notes now, before adding the label. Confirm they match the approved
+   plan exactly. If anything is missing, unexpected, or wrong, stop here
+   and do not add the label — the completion marker must not be published
+   ahead of a plan that failed verification.
+9. Only after that verification passes, add `primitive-audited` with
    `bd update <audited> --add-label primitive-audited`.
-9. Run `bd dolt push` again to persist the label itself. If this second
-   push fails, the notes and dependencies are already persisted but the
-   label is only local — report exactly this state; the only remaining
-   retry step is re-running `bd dolt push` (idempotent) until it succeeds.
-   Do not report the audit as complete until this push succeeds.
-10. Read back the audited issue, prerequisite issues, dependency tree,
-    notes, and labels.
+10. Read back the label locally to confirm it was actually applied, before
+    pushing it. If it is missing or wrong, correct it before proceeding —
+    do not push an unverified label state.
+11. Run `bd dolt push` again to persist the verified label. If this second
+    push fails, the notes and dependencies are already persisted but the
+    label is only local — report exactly this state; the only remaining
+    retry step is re-running `bd dolt push` (idempotent) until it
+    succeeds. Do not report the audit as complete until this push
+    succeeds.
 
 This skill's own Beads mutations do not by themselves require `git push` —
 they change no git-tracked implementation files. That does not override the
