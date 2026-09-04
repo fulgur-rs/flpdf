@@ -4257,6 +4257,59 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn xref_candidate_scan_commits_the_wide_retry_s_recovered_null_with_its_diagnostics() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let first_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /Info (prefix\n");
+        let false_header_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\nsuffix) /Deep ");
+        bytes.extend(std::iter::repeat_n(
+            b'[',
+            crate::parser::MAX_PARSE_DEPTH + 1,
+        ));
+        bytes.extend_from_slice(b"\n%%EOF\n");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            ObjectRef::new(1, 0),
+            XrefEntry::Uncompressed {
+                offset: first_offset as u64,
+            },
+        );
+        entries.insert(
+            ObjectRef::new(2, 0),
+            XrefEntry::Uncompressed {
+                offset: false_header_offset as u64,
+            },
+        );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
+
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &reference_offsets,
+        );
+
+        assert!(candidate.is_none());
+        // The wider retry recovers only a null again (under
+        // `RecoveryPolicy::Bounded` the over-deep array is recovered, not
+        // rejected), and that accepted read is committed with its
+        // diagnostics: qpdf warns once and caches the substituted null for a
+        // failed read (`QPDF.cc:1738-1748`) instead of dropping the object.
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.starts_with("(object 1 0,")),
+            "a wide retry that recovers a null must keep its diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn reconstruction_reference_read_retries_a_narrow_window_that_recovers_nonempty_but_truncated_data(
     ) {
         // A narrow window's heuristic search can accept a *non-empty* but
