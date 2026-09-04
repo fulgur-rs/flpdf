@@ -53,10 +53,16 @@ After reading the rule file:
    Record scope, acceptance criteria, parent, dependencies, labels, and
    existing notes.
 2. Resolve the pinned source with
-   `scripts/fetch-qpdf-source.sh --print-path`. If it exits 1 (the tree is
-   missing or off the pin — it never clones), run
-   `scripts/fetch-qpdf-source.sh` with no arguments to install the pinned
-   worktree, then retry `--print-path`.
+   `scripts/fetch-qpdf-source.sh --print-path`. If it exits 1, read its
+   stderr message before reacting: a genuinely missing or off-pin tree
+   says so and is safe to install with `scripts/fetch-qpdf-source.sh`
+   (no arguments), then retry `--print-path`. A tree with local edits or
+   unverifiable git metadata exits 1 too, but the plain install form
+   refuses that exact same tree for the same reason — do not retry it in
+   a loop. Follow the script's own printed remediation instead (it names
+   the exact recovery command for that case, such as discarding edits or
+   `--force`), or return `unknown` if that remediation is not something
+   this audit should perform unattended.
 3. Read qpdf first. Identify the relevant classes, fields, public contracts,
    ownership, call order, default implementations, errors, and consumer
    boundary. Many audits are fully conclusive from source alone — a live
@@ -89,8 +95,17 @@ After reading the rule file:
 | Result | Required evidence | Beads mutation |
 |---|---|---|
 | `ready` | Every required primitive exists with qpdf-equivalent responsibility, and the target is implementable and testable without a special case. A recorded dependency direction that conflicts with qpdf responsibility does not by itself block `ready`: if every primitive is otherwise qpdf-equivalent and the approval report proposes the exact corrected edge (and any required issue-text repairs, see below), the verdict is `ready` with an included dependency/text correction. | Propose notes, the dependency correction if any, any required issue-text repairs, plus `primitive-audited`. |
-| `missing` | A primitive is absent, owns the wrong responsibility, collapses distinct qpdf concepts, or forces a special case. | Propose prerequisite reuse/creation, dependencies, notes, and label. |
-| `unknown` | Source or observed behavior is insufficient for a safe responsibility or dependency decision. | None. Report the evidence gap and stop. |
+| `missing` | Every required primitive has been conclusively evaluated, and at least one is absent, owns the wrong responsibility, collapses distinct qpdf concepts, or forces a special case. | Propose prerequisite reuse/creation, dependencies, notes, and label. |
+| `unknown` | Source or observed behavior is insufficient for a safe responsibility or dependency decision for any required primitive. | None. Report the evidence gap and stop. |
+
+`unknown` takes precedence over `missing` whenever a target has both a
+conclusively absent primitive and a separately unresolved one: do not
+report `missing` and mutate Beads for the known-absent part while another
+required primitive's responsibility or behavior is still unevaluated. Every
+required primitive must be conclusively assessed (as `equivalent`,
+`divergent`, or `missing` in the flpdf correspondence table) before `ready`
+or `missing` is a legal verdict; any unresolved primitive makes the whole
+audit `unknown`.
 
 These are mandatory stop signals; they cannot produce `ready`:
 
@@ -184,14 +199,16 @@ phase 2 for it; report the evidence gap and stop there.
 Enter this phase only when the user explicitly approves the exact phase-1
 report. If context does not contain that report and approval, rerun phase 1.
 
-1. Re-read the target and every proposed prerequisite. If relevant state
-   changed since the phase-1 evidence was gathered — including flpdf code,
-   tests, or `docs/qpdf-correspondence.md`, not only the Beads issue text —
-   stop and present a revised plan. Re-checking only the Beads records is
-   not sufficient: the verdict was derived from flpdf's actual code and
-   docs, so re-run the relevant phase-1 correspondence checks (or confirm
-   the audited flpdf revision is unchanged) before resuming, especially
-   after any gap between approval and phase 2.
+1. Re-read the target, every proposed prerequisite, and every issue named
+   in an approved issue-text repair (parent epic, dependent side) — a
+   stale re-read of only the target can apply step 6's approved text over
+   newer content in one of those issues. Re-run the relevant phase-1
+   correspondence checks before resuming, especially after any gap
+   between approval and phase 2: the verdict was derived from flpdf's
+   actual code, tests, and `docs/qpdf-correspondence.md`, not only the
+   Beads issue text, and checking only a recorded revision hash would
+   miss uncommitted working-tree edits to those tracked files. If
+   anything relevant changed, stop and present a revised plan.
 2. For each approved prerequisite (there may be zero, one, or several — one
    per missing qpdf responsibility unit, never collapsed into a single
    issue): reuse it only if it is open. If the only match is closed and
@@ -213,7 +230,13 @@ report. If context does not contain that report and approval, rerun phase 1.
    step just because there was no prerequisite to create in step 2. The
    audited consumer depends on each prerequisite:
    `bd dep add <audited> <prerequisite>`.
-5. Run `bd dep cycles` again. Stop on a cycle; do not invent a graph repair.
+5. Run `bd dep cycles` again. If a cycle now exists that step 4's initial
+   check did not show, the edges step 4 just applied introduced it: remove
+   or reverse exactly those just-applied edges (never edges that already
+   existed before step 4) to restore the prior, non-cyclic state, then
+   stop and report the conflict — do not invent a different graph repair,
+   and do not leave the newly cyclic graph in place for the mandatory
+   session-close push to persist.
 6. Inspect existing notes. Skip an identical audit. If evidence supersedes an
    older audit, name that entry explicitly. Append the approved block with
    `bd update <audited> --append-notes ...`; never overwrite unrelated notes.
@@ -221,13 +244,17 @@ report. If context does not contain that report and approval, rerun phase 1.
    that qpdf evidence contradicts, and update the parent epic's and the
    dependent side's description, per
    `.claude/rules/qpdf-port-design-patterns.md` rule 4.
-7. Read back the audited issue, prerequisite issues, dependency tree,
-   notes, and every issue whose text step 6 repaired (the parent epic
-   and/or the dependent-side issue, when applicable) now, locally, before
-   any push. Confirm they all match the approved plan exactly (catches a
-   mistyped issue ID or a misapplied edge before it ever reaches the
-   remote). If anything is missing, unexpected, or wrong, correct it and
-   re-verify before proceeding — do not push unverified content.
+7. Before this step's push, read back every issue actually named in the
+   approved plan (`<audited>`, each prerequisite, and each issue-text
+   repair target) and confirm each one matches the plan exactly — this
+   also means checking each ID against the plan character-for-character
+   before running any `bd dep add`/`bd update`/`bd create` command in
+   steps 2–6, since a mistyped-but-otherwise-valid ID silently mutates an
+   unrelated issue that this readback would not otherwise think to
+   inspect. If anything is missing, unexpected, or wrong, correct it and
+   re-verify before proceeding — do not push unverified content. If a
+   command already reached an unintended issue, revert that specific
+   mutation before continuing.
 8. Only after that local verification passes, run `bd dolt push` to
    persist the notes and dependency changes. If it fails, stop here: do
    not add `primitive-audited` (a label added before the notes it
