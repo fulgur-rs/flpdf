@@ -4,8 +4,8 @@
 //! -> `drop_struct_elem_dangling_pg` -> `QPDFJob::prune_after_subset` -> inspection) and
 //! asserts the qpdf 11.9.0 behaviour for the structural-reference *drop* family:
 //! a structure element whose `/Pg` points at a removed page has the `/Pg` key
-//! dropped (not nulled), and the page — once unreferenced — is garbage-collected
-//! entirely. This is the opposite of the annotation/outline null-out family,
+//! dropped (not nulled), and the page — once unreferenced — is omitted by the
+//! writer. This is the opposite of the annotation/outline null-out family,
 //! where the reference is kept verbatim and the page object becomes `null`.
 
 use flpdf::job::{remap_outline_and_dests, QPDFJob};
@@ -35,7 +35,14 @@ fn build_fixture() -> Vec<u8> {
     for n in 3..=5 {
         objs.insert(
             n,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]{} >>",
+                if n == 4 {
+                    " /Secret (UNREFERENCED_PAGE2)"
+                } else {
+                    ""
+                }
+            ),
         );
     }
     objs.insert(10, "<< /Type /StructTreeRoot /K 20 0 R >>".into());
@@ -102,12 +109,12 @@ fn dangling_pg_dropped_and_page_gced() {
         "StructElem 21 /Pg (removed page) must be dropped"
     );
 
-    // The /Pg drop leaves the removed page unreferenced, so the existing GC
-    // sweeps it: absent from the output, not emitted as `null` (qpdf parity).
+    // The /Pg drop leaves the removed page unreferenced. It remains in memory
+    // until the writer owns the reachability decision.
     let live = pdf.live_object_refs();
     assert!(
-        !live.contains(&ObjectRef::new(4, 0)),
-        "removed page 2 must be garbage-collected after /Pg drop"
+        live.contains(&ObjectRef::new(4, 0)),
+        "unreferenced page 2 remains in memory before writing"
     );
 
     // The StructElem pointing at a surviving page keeps its /Pg.
@@ -118,4 +125,21 @@ fn dangling_pg_dropped_and_page_gced() {
         elem.get_key(b"/Pg").object_ref() == Some(ObjectRef::new(3, 0)),
         "StructElem 22 /Pg (surviving page 1) must be kept"
     );
+
+    let mut out = Vec::new();
+    write_default(&mut pdf, &mut out).expect("write subset");
+    assert!(
+        !out.windows(b"UNREFERENCED_PAGE2".len())
+            .any(|window| window == b"UNREFERENCED_PAGE2"),
+        "writer must omit the unreferenced page 2"
+    );
+    let mut written = Pdf::open(Cursor::new(out)).expect("reopen subset");
+    assert_eq!(
+        flpdf::pages::page_refs(&mut written).unwrap().len(),
+        2,
+        "writer output must retain only the selected pages"
+    );
 }
+
+mod common;
+use common::write_default;

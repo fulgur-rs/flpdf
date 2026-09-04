@@ -342,6 +342,9 @@ jobs:
           # flpdf-sha and byte-equal columns record qpdf byte-parity, not
           # miniz drift.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline -- --nocapture
+          # Pins single-source --pages preserve-unreferenced output after
+          # page-local resource pruning; the writer owns reachability (D27).
+          cargo test -p flpdf --features qpdf-zlib-compat --test cmp_preserve_unreferenced_sweep_tests
           # flpdf-qtest-tools' flate-compression-tolerance e2e is gated
           # behind qpdf-zlib-compat (mirrors the flpdf-cli byte-identical
           # tests above); the default `cargo test` above cfgs it out.

@@ -384,7 +384,8 @@ document-wide の独自 aggregate route ではなく、保持された各 leaf �
 旧 aggregate API とそれ専用の回帰テストは、qpdf 11.9.0 に対応物がないため削除した。
 `QPDFJob.cc:2251-2337` の Auto 判定は tree rebuild 前に済ませ、job の page-subset boundary はその
 結果が prune を許可した場合だけこの per-page route を実行する。xref-level の orphan
-mark-and-sweep は `writer/reachability.rs` の責務とする。共有 `/XObject` category、
+判定は writer の emission boundary に委ね、`writer/reachability.rs` に残る明示 sweep は
+multi-source merge の保護参照を扱う別 route とする。共有 `/XObject` category、
 継承 `/Resources`、非対象 resource category、重複ページの差分回帰は
 `crates/flpdf-cli/tests/cli_tests.rs` が qpdf 11.9.0 と比較する。
 

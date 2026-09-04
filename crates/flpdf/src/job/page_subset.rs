@@ -1,31 +1,33 @@
 //! qpdf correspondence: `QPDFJob::handlePageSpecs` page-subset completion.
 //!
 //! This module owns the job-level composition of the page-document resource
-//! pass and the writer-owned reachability sweep. The page/Form resource
-//! algorithm itself remains in `resources.rs`, and the mark-and-sweep walker
-//! remains in `writer::reachability`.
+//! pass. The page/Form resource algorithm remains in `resources.rs`, while
+//! document-wide reachability remains a writer-time concern in
+//! `writer::reachability`.
 //!
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has restructured the
 //! document so that only the selected pages remain reachable from `/Root`,
-//! two kinds of "garbage" may linger in the object table:
+//! stale page-local resource names may remain in retained pages, and dropped
+//! page objects may remain in the in-memory object table until the document is
+//! written.
 //!
 //! 1. **Stale `/Resources` name entries** – fonts or XObjects that are listed
 //!    in a page's `/Resources` sub-dictionary but not actually referenced by
 //!    any content stream of a retained page.
 //!
 //! 2. **Orphan objects at the xref level** – whole indirect objects that are
-//!    no longer reachable from `/Root` at all (e.g. dropped pages, their
-//!    content streams, the intermediate `/Pages` nodes that `rebuild_page_tree`
-//!    intentionally leaves as orphans).
+//!    no longer reachable from `/Root` at all. The writer decides whether
+//!    those objects are emitted; this module does not delete them.
 //!
-//! [`prune_after_subset`] composes the two qpdf-owned boundaries, gated by
-//! [`RemoveUnreferencedResources`]:
+//! [`prune_after_subset`] owns only the page-local qpdf resource boundary,
+//! gated by [`RemoveUnreferencedResources`]. Writer-level reachability is
+//! applied later by the canonical writer:
 //!
-//! | Mode | Name-level prune | xref-level GC |
-//! |------|------------------|---------------|
-//! | [`RemoveUnreferencedResources::No`]   | No  | No  |
-//! | [`RemoveUnreferencedResources::Auto`] | Yes, when the job heuristic enabled it | Yes |
-//! | [`RemoveUnreferencedResources::Yes`]  | Yes | Yes |
+//! | Mode | In-memory name-level prune | Writer-level xref GC |
+//! |------|----------------------------|----------------------|
+//! | [`RemoveUnreferencedResources::No`]   | No  | At write time |
+//! | [`RemoveUnreferencedResources::Auto`] | Yes, when the job heuristic enables it | At write time |
+//! | [`RemoveUnreferencedResources::Yes`]  | Yes | At write time |
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
@@ -41,13 +43,14 @@
 //!   5 = page1 /Font (F1 entry), 6 = font F1,
 //!   7 = page2 dict, 8 = page2 content, 9 = page2 /Font (F2 entry), 10 = font F2
 //!
-//! After extraction (6 objects, qpdf default = auto):
-//!   - obj 7, 8, 9, 10 are completely absent from xref (xref-level GC).
+//! After writing the extraction (6 emitted objects, qpdf default = auto):
+//!   - obj 7, 8, 9, 10 are absent from the output xref (writer-level GC).
 //!   - F2 font is gone; F1 remains.
 //!   - The page 1 objects are renumbered but all present.
 //!
-//! This confirms that `Auto` (the qpdf default) performs both name-level
-//! pruning **and** xref-level GC of unreachable objects.  `No` preserves both.
+//! This confirms that `Auto` (the qpdf default) performs name-level pruning,
+//! while the writer performs xref-level GC independently. `No` preserves the
+//! resource names but does not disable ordinary writer reachability.
 
 use super::resource_pruning::RemoveUnreferencedResources;
 use crate::page_document_helper::PageDocumentHelper;
@@ -56,37 +59,29 @@ use std::io::{Read, Seek};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Complete qpdf's page-subset cleanup after the page tree has been rebuilt by
-/// [`crate::pages::tree_rebuild::rebuild_page_tree`].
+/// Apply qpdf's page-local resource pruning after the page tree has been rebuilt
+/// by [`crate::pages::tree_rebuild::rebuild_page_tree`].
 ///
-/// Two passes are performed when `mode` is not [`RemoveUnreferencedResources::No`]:
-///
-/// 1. **Name-level prune** (`PageObjectHelper::remove_unreferenced_resources`):
+/// When `mode` is not [`RemoveUnreferencedResources::No`], this performs one
+/// **name-level prune** (`PageObjectHelper::remove_unreferenced_resources`):
 ///    applies qpdf's parse-gated, page-local `/Font` and `/XObject` pruning to
 ///    each retained output page. The helper copies an inherited or indirect
 ///    `/Resources` value only after content parsing succeeds, and copies each
 ///    category before mutating it.
-///
-/// 2. **xref-level GC** (the writer reachability pass): walks every
-///    indirect child handle reachable from `/Root` (transitively), then calls
-///    [`Pdf::delete_object`] for every live object that was **not** reached.
-///    This removes orphaned intermediate `/Pages` nodes left by
-///    `rebuild_page_tree`, dropped-page content streams, and similar debris.
+///    Document-wide xref reachability is deliberately deferred to the writer,
+///    so `preserve_unreferenced_objects` can still affect a later write.
 ///
 /// `Auto` is the effective mode selected by the caller's pre-rebuild
 /// `should_remove_unreferenced_resources` check; this function does not repeat
 /// that check after page-tree inheritance has been flattened.
 ///
-/// Calling this function on a PDF that has **not** been rebuilt (i.e. all
-/// pages are still reachable) is safe: no objects will be deleted by the GC
-/// pass, and the name-level prune still applies independently to each page.
+/// Calling this function on a PDF that has **not** been rebuilt is safe: the
+/// page-local prune still applies independently to each page, and any writer
+/// reachability decision remains deferred until serialization.
 ///
 /// # Errors
 ///
-/// Propagates errors from the page-local resource helper. The GC reachability
-/// pass deliberately *swallows* [`Pdf::resolve`] errors
-/// (an unresolvable object is conservatively treated as reachable and
-/// kept), so a resolve failure there does not abort the prune.
+/// Propagates errors from the page-local resource helper.
 pub(crate) fn prune_after_subset<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mode: RemoveUnreferencedResources,
@@ -97,16 +92,13 @@ pub(crate) fn prune_after_subset<R: Read + Seek>(
 
     // QPDFPageDocumentHelper owns page iteration and delegates the
     // parse-gated `/Font` and `/XObject` mutation to each PageObjectHelper.
-    // QPDFJob owns the ordering that follows page selection: resource pruning
-    // first, then writer reachability cleanup.
+    // QPDFJob owns the ordering that follows page selection: page-local
+    // resource pruning happens here, while writer reachability is deferred to
+    // the later write boundary.
     PageDocumentHelper::new(pdf).remove_unreferenced_resources()?;
-    crate::writer::reachability::sweep_unreachable_objects(pdf)?;
 
     Ok(())
 }
-
-// Reachability cleanup is writer-owned; page-subset orchestration calls it
-// through `crate::writer::reachability` above.
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -162,7 +154,8 @@ mod tests {
             (
                 7,
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-                 /Contents 8 0 R /Resources << /Font 9 0 R >> >>"
+                 /Contents 8 0 R /Resources << /Font 9 0 R >> \
+                 /Secret (UNREFERENCED_PAGE2) >>"
                     .into(),
             ),
             // 8 = content stream, written below
@@ -386,8 +379,8 @@ mod tests {
 
     // ── Tests: distinct fonts per page ───────────────────────────────────────
 
-    /// After extracting page 1 (which uses F1), page2 objects should be
-    /// garbage-collected; F1 must remain; F2 must be gone.
+    /// After writing an extraction of page 1 (which uses F1), page2 objects
+    /// should be omitted by the writer; F1 must remain; F2 must be gone.
     #[test]
     fn auto_drops_page2_objects_and_f2_font() {
         let bytes = build_two_page_distinct_fonts();
@@ -398,28 +391,17 @@ mod tests {
 
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
 
-        // xref-level: page2 objects (7=page2, 8=content, 9=fontdict, 10=font) should be deleted.
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(7, 0)),
-            "page2 dict should be deleted"
-        );
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(8, 0)),
-            "page2 content should be deleted"
-        );
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(9, 0)),
-            "page2 /Font dict should be deleted"
-        );
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(10, 0)),
-            "font F2 should be deleted"
-        );
+        // The removed page remains in memory until the writer owns the
+        // reachability decision.
+        assert!(is_live(&mut pdf, ObjectRef::new(7, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(8, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(9, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(10, 0)));
 
         // Name-level: page1 /Font entry for F1 must survive. The canonical
         // qpdf helper shallow-copies the indirect category dictionary before
         // pruning, so the original obj 5 is intentionally no longer an
-        // identity invariant after xref-level GC.
+        // identity invariant after the writer's reachability pass.
         assert_eq!(
             resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "Font"),
             vec!["F1"],
@@ -430,8 +412,18 @@ mod tests {
             "font F1 should survive"
         );
 
-        // Output must still be valid.
+        // Output must be valid and must omit the now-unreachable page2 graph.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        assert!(
+            !out.windows(b"UNREFERENCED_PAGE2".len())
+                .any(|window| window == b"UNREFERENCED_PAGE2"),
+            "writer must omit the unreferenced page2 dictionary"
+        );
+        assert!(!out
+            .windows(b"/Courier".len())
+            .any(|window| window == b"/Courier"));
+        let mut written = Pdf::open(Cursor::new(out.clone())).unwrap();
+        assert_eq!(page_refs(&mut written).unwrap().len(), 1);
         check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
@@ -445,9 +437,17 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Yes).unwrap();
 
-        assert!(!is_live(&mut pdf, ObjectRef::new(7, 0)));
-        assert!(!is_live(&mut pdf, ObjectRef::new(10, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(7, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(10, 0)));
         assert!(is_live(&mut pdf, ObjectRef::new(6, 0)));
+
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        assert!(!out
+            .windows(b"UNREFERENCED_PAGE2".len())
+            .any(|window| window == b"UNREFERENCED_PAGE2"));
+        assert!(!out
+            .windows(b"/Courier".len())
+            .any(|window| window == b"/Courier"));
     }
 
     /// No mode: nothing deleted — all original objects survive.
@@ -470,7 +470,7 @@ mod tests {
     }
 
     /// Shared resource: when both pages are retained, the shared intermediate
-    /// /Pages node and its /Resources must NOT be garbage-collected.
+    /// /Pages node and its /Resources must remain available to writer output.
     #[test]
     fn shared_resources_survive_when_both_pages_retained() {
         let bytes = build_shared_resources_pdf();
@@ -483,12 +483,10 @@ mod tests {
         // After rebuild, the intermediate /Pages node (3) becomes orphan
         // because rebuild_page_tree makes leaves point directly to the root.
         // The /Resources dict (6) was materialized onto the leaves.
-        // Object 3 (intermediate node) is now orphaned and should be GC'd.
-        // Objects 4, 5 (pages), 6 (resources), 7, 8 (streams) should survive.
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(3, 0)),
-            "intermediate /Pages node (obj 3) must be GC'd after rebuild+prune"
-        );
+        // Object 3 (intermediate node) is orphaned in memory but remains until
+        // the writer performs its reachability walk. Objects 4, 5 (pages), 6
+        // (resources), 7, 8 (streams) should survive.
+        assert!(is_live(&mut pdf, ObjectRef::new(3, 0)));
         assert!(
             is_live(&mut pdf, ObjectRef::new(4, 0)),
             "page1 must survive"
@@ -506,8 +504,17 @@ mod tests {
             "content stream 2 must survive"
         );
 
-        // Output should be valid.
+        // Output should be valid and contain only the fresh page-tree root.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        assert_eq!(
+            out.windows(b"/Type /Pages".len())
+                .filter(|window| *window == b"/Type /Pages")
+                .count(),
+            1,
+            "writer must omit the orphaned intermediate /Pages node"
+        );
+        let mut written = Pdf::open(Cursor::new(out.clone())).unwrap();
+        assert_eq!(page_refs(&mut written).unwrap().len(), 2);
         check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
@@ -515,7 +522,7 @@ mod tests {
     /// After rebuild, qpdf's page-copy resource-prune boundary materializes the
     /// inherited indirect /Resources dictionary directly on page1. After prune
     /// (Auto), F2 must be removed from that private copy, and page2 objects must
-    /// be GC'd.
+    /// be omitted from ordinary writer output.
     #[test]
     fn auto_extracts_page1_from_shared_resources_prunes_f2() {
         let bytes = build_shared_resources_pdf();
@@ -525,20 +532,10 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)]).unwrap();
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
 
-        // xref-level: intermediate /Pages node (3), page2 (5) and its content
-        // stream (8) should be gone.
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(3, 0)),
-            "intermediate /Pages node (obj 3) must be GC'd"
-        );
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(5, 0)),
-            "page2 must be GC'd"
-        );
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(8, 0)),
-            "page2 content must be GC'd"
-        );
+        // These objects remain in memory until the writer emits the output.
+        assert!(is_live(&mut pdf, ObjectRef::new(3, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(5, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(8, 0)));
 
         // Page 1 must survive.
         assert!(
@@ -582,8 +579,18 @@ mod tests {
             "F2 must be pruned: {font_keys:?}"
         );
 
-        // Valid output.
+        // Valid output has one page and one fresh page-tree root; the unused
+        // F2 resource is removed by the page-local pass before writing.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        let mut written = Pdf::open(Cursor::new(out.clone())).unwrap();
+        assert_eq!(page_refs(&mut written).unwrap().len(), 1);
+        assert_eq!(
+            out.windows(b"/Type /Pages".len())
+                .filter(|window| *window == b"/Type /Pages")
+                .count(),
+            1
+        );
+        assert!(!out.windows(b"/F2".len()).any(|window| window == b"/F2"));
         check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
@@ -708,7 +715,7 @@ mod tests {
     }
 
     /// Build a 2-page PDF where the trailer has an /Info reference.
-    /// After extracting page 1, the /Info object must NOT be GC'd.
+    /// After extracting page 1, the /Info object must survive writer output.
     ///
     /// Object layout:
     ///   1  Catalog  (/Pages 2)
@@ -724,7 +731,11 @@ mod tests {
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
             (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
             (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
-            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Secret (UNREFERENCED_PAGE2) >>",
+            ),
             (5, "<< /Title (Test Document) /Author (Test Author) >>"),
         ];
 
@@ -750,7 +761,7 @@ mod tests {
     }
 
     /// Regression: /Info object referenced from the trailer (not from /Root)
-    /// must NOT be deleted by the xref-level GC pass.
+    /// must survive the writer's reachability pass.
     #[test]
     fn trailer_info_object_survives_gc() {
         let bytes = build_pdf_with_info();
@@ -760,20 +771,24 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
 
-        // /Info (obj 5) is referenced from the trailer — it must survive.
-        assert!(
-            is_live(&mut pdf, ObjectRef::new(5, 0)),
-            "/Info object (trailer ref) must NOT be GC'd"
-        );
+        // Both source objects remain in memory before serialization.
+        assert!(is_live(&mut pdf, ObjectRef::new(5, 0)));
+        assert!(is_live(&mut pdf, ObjectRef::new(4, 0)));
 
-        // Page 2 (obj 4) is not reachable from anywhere and must be GC'd.
-        assert!(
-            !is_live(&mut pdf, ObjectRef::new(4, 0)),
-            "page 2 should be GC'd"
-        );
-
-        // Output must still be valid.
+        // The trailer reference survives, while the unreachable page is
+        // omitted by the writer.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        assert!(!out
+            .windows(b"UNREFERENCED_PAGE2".len())
+            .any(|window| window == b"UNREFERENCED_PAGE2"));
+        let mut written = Pdf::open(Cursor::new(out.clone())).unwrap();
+        let info = written.trailer_key_handle(b"Info");
+        written.resolve(&info).unwrap();
+        assert_eq!(
+            info.get_key(b"/Author").as_string(),
+            Some(b"Test Author".to_vec())
+        );
+        assert_eq!(page_refs(&mut written).unwrap().len(), 1);
         check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
