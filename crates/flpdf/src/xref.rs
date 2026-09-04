@@ -1361,8 +1361,15 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                     error
                 }
             });
-            for diagnostic in initial_parse_diagnostics.entries() {
-                initial_diagnostics.push(diagnostic.clone());
+            // qpdf rejects an xref offset of zero before calling read_xref
+            // (`QPDF.cc:450-452`), so diagnostics from flpdf's marked
+            // offset-zero retry have no qpdf counterpart. Keep diagnostics
+            // from a real non-zero xref read, but discard this detour's
+            // warnings before candidate recovery.
+            if startxref != 0 {
+                for diagnostic in initial_parse_diagnostics.entries() {
+                    initial_diagnostics.push(diagnostic.clone());
+                }
             }
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
@@ -3333,7 +3340,7 @@ fn parse_xref_stream(
                     Error::parse(xref_pos, "xref stream data size calculation overflow")
                 }) // cov:ignore-end
             })?;
-            let size_warning = if stream_data.len() < expected_size {
+            if stream_data.len() < expected_size {
                 return Err(Error::parse(
                     xref_pos,
                     format!(
@@ -3341,31 +3348,28 @@ fn parse_xref_stream(
                         stream_data.len()
                     ),
                 ));
-            } else if stream_data.len() > expected_size {
-                Some(Diagnostic::warning(
+            }
+            if stream_data.len() > expected_size {
+                // qpdf calls warn() as soon as the decoded payload size is
+                // known, before parsing the entries (`QPDF.cc:1051-1065`),
+                // so a later entry-decoding error must not discard this
+                // diagnostic.
+                context.diagnostics.push(Diagnostic::warning(
                     format!(
                         "(xref stream, offset {xref_pos}): Cross-reference stream data has the wrong size; expected = {expected_size}; actual = {}",
                         stream_data.len()
                     ),
                     None,
-                ))
-            } else {
-                None
-            };
+                ));
+            }
             let mut cursor = ByteCursor::new(&stream_data, 0);
             let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
             let trailer_references = collect_trailer_references(&trailer);
 
-            Ok((
-                trailer,
-                entries,
-                trailer_references,
-                has_first_xref_item,
-                size_warning,
-            ))
+            Ok((trailer, entries, trailer_references, has_first_xref_item))
         };
         let build_result = build().map(
-            |(trailer, entries, trailer_references, has_first_xref_item, size_warning)| {
+            |(trailer, entries, trailer_references, has_first_xref_item)| {
                 (
                     object_ref,
                     handle_object.clone(),
@@ -3373,7 +3377,6 @@ fn parse_xref_stream(
                     entries,
                     trailer_references,
                     has_first_xref_item,
-                    size_warning,
                 )
             },
         );
@@ -3384,30 +3387,19 @@ fn parse_xref_stream(
         (build_result, reconstruction_trigger, bootstrap_cache)
     };
 
-    let (
-        object_ref,
-        handle_object,
-        trailer,
-        entries,
-        trailer_references,
-        has_first_xref_item,
-        size_warning,
-    ) = match build_result {
-        Ok(built) => built,
-        Err(error) => {
-            let error = reconstruction_trigger.unwrap_or(error);
-            if let Some(sink) = error_diagnostics_sink {
-                for diagnostic in repair_diagnostics.entries() {
-                    sink.push(diagnostic.clone());
-                }
-            } // cov:ignore: diagnostic forwarding closes only on a sink-backed xref build failure
-            return Err(error);
-        }
-    };
-
-    if let Some(size_warning) = size_warning {
-        repair_diagnostics.push(size_warning);
-    }
+    let (object_ref, handle_object, trailer, entries, trailer_references, has_first_xref_item) =
+        match build_result {
+            Ok(built) => built,
+            Err(error) => {
+                let error = reconstruction_trigger.unwrap_or(error);
+                if let Some(sink) = error_diagnostics_sink {
+                    for diagnostic in repair_diagnostics.entries() {
+                        sink.push(diagnostic.clone());
+                    }
+                } // cov:ignore: diagnostic forwarding closes only on a sink-backed xref build failure
+                return Err(error);
+            }
+        };
 
     for entry in entries {
         match entry {
@@ -3481,7 +3473,6 @@ type XrefStreamBuild = (
     Vec<ParsedXrefEntry>,
     BTreeSet<ObjectRef>,
     bool,
-    Option<Diagnostic>,
 );
 
 // qpdf 11.9.0's QPDF::processXRefStream rejects each /W value above
@@ -4735,6 +4726,47 @@ mod final_handle_tests {
 
         assert!(matches!(error, Error::Parse { .. }));
         assert!(diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn candidate_xref_stream_wrong_size_warning_survives_later_decode_failure() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n";
+        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+            .expect_err("the malformed candidate must fail after warning");
+        let (_, diagnostics) = error
+            .open_failure()
+            .expect("permissive candidate failure carries repair diagnostics");
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "file is damaged",
+                "can't find startxref",
+                "Attempting to reconstruct cross-reference table",
+                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4",
+            ]
+        );
+    }
+
+    #[test]
+    fn nonzero_xref_stream_decode_warning_is_kept_before_recovery() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n";
+        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+            .expect_err("the malformed xref stream must enter recovery");
+        let (_, diagnostics) = error
+            .open_failure()
+            .expect("permissive xref failure carries repair diagnostics");
+        assert!(
+            diagnostics.entries().iter().any(|diagnostic| {
+                diagnostic.message
+                    == "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4"
+            }),
+            "the warning from the non-zero initial xref read must survive recovery: {diagnostics:?}"
+        );
     }
 
     #[test]
