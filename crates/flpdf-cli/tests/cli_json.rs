@@ -264,6 +264,33 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
     out
 }
 
+fn duplicate_page_inherited_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 2 /Resources 8 0 R >>",
+            ),
+            (
+                3,
+                "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R 4 0 R] /Count 2 >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
+            ),
+            (
+                5,
+                "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream",
+            ),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (8, "<< /Font << /F1 6 0 R >> >>"),
+        ],
+        1,
+    )
+}
+
 fn short_name_tree_pair_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -1863,4 +1890,41 @@ fn json_stream_data_inline_holds_decoded_content() {
     .success()
     // Inline mode at DecodeLevel::Generalized must base64 the decoded content.
     .stdout(predicate::str::contains(base64_encode(content)));
+}
+
+#[test]
+fn json_output_pages_selection_rebuilds_the_live_page_tree() {
+    let input = write_temp_pdf(&duplicate_page_inherited_pdf());
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("pages.json");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json-output",
+            input.path().to_str().unwrap(),
+            "--json-key=pages",
+            "--pages",
+            ".",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(3);
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    assert_eq!(json["qpdf"][0]["pushedinheritedpageresources"], true);
+    assert_eq!(json["qpdf"][0]["calledgetallpages"], true);
+    assert_eq!(json["qpdf"][0]["maxobjectid"], 8);
+    assert_eq!(
+        json["qpdf"][1]["obj:2 0 R"]["value"]["/Kids"],
+        serde_json::json!(["4 0 R", "7 0 R"])
+    );
+    assert!(json["qpdf"][1]["obj:4 0 R"]["value"]
+        .get("/Resources")
+        .is_some());
+    assert!(json["qpdf"][1]["obj:7 0 R"]["value"]
+        .get("/Resources")
+        .is_some());
 }

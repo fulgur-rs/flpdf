@@ -13,6 +13,7 @@
 ## File map
 
 - Modify `crates/flpdf/src/pdf.rs`: store and expose the monotonic qpdf inherited-page push observation.
+- Modify `crates/flpdf/src/engine.rs`: initialize that document state for uninitialized and parsed Pdf values.
 - Modify `crates/flpdf/src/page_document_helper.rs`: set that observation at the canonical push boundary.
 - Modify `crates/flpdf/src/document_json.rs`: serialize the stored observation instead of a constant.
 - Modify `crates/flpdf-cli/src/main.rs`: apply parsed single-source `--pages` selection before JSON serialization using `QPDFJob::handle_page_specs`.
