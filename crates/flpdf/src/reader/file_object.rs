@@ -106,6 +106,10 @@ pub(crate) struct HandleFileObjectRead {
     pub(crate) object_ref: ObjectRef,
     pub(crate) object: ObjectHandle,
     pub(crate) diagnostics: Vec<FileObjectDiagnostic>,
+    /// Stream payload offset relative to the input slice, when this read
+    /// produced a stream. Bootstrap xref parsing uses it to report errors at
+    /// the same source byte as qpdf's xref-stream decoder.
+    pub(crate) stream_data_offset: Option<usize>,
     pub(crate) included_recovery_eol: Option<IncludedStreamDataEol>,
 }
 
@@ -245,6 +249,7 @@ pub(crate) fn finish_file_object_handle(
                 object_ref,
                 object,
                 diagnostics,
+                stream_data_offset: None,
                 included_recovery_eol: None,
             })
         }
@@ -284,6 +289,7 @@ fn finish_handle_stream(
         object_ref,
         object: completed.object,
         diagnostics: completed.diagnostics,
+        stream_data_offset: Some(data_start),
         included_recovery_eol: completed.included_recovery_eol,
     })
 }
