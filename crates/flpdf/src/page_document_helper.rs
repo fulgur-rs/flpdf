@@ -104,6 +104,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         if let Some(prepared) = crate::pages::repair::prepare_for_optimization(self.pdf)? {
             crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, false)?;
         } // cov:ignore: closing brace is the already-covered successful push join
+        self.pdf.ever_pushed_inherited_attributes_to_pages = true;
         Ok(())
     }
 

@@ -3152,6 +3152,7 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
             open_pdf_from_file(input, input_file, cli.repair, &cli.password, cli.no_warn)?;
         job.record_document_warnings(&pdf);
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+        apply_json_page_specs(&mut job, &mut pdf, input, &cli.page_ops)?;
         if cli.optimize_images {
             flpdf::optimize_images(
                 &mut pdf,
@@ -3178,6 +3179,47 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
             &json_keys,
             &json_objects,
         )
+    }
+}
+
+/// Apply the single-source `--pages` operation before qpdf JSON output.
+///
+/// qpdf's `createQPDF` applies `handlePageSpecs` after opening and updating the
+/// primary document, and only then does `writeQPDF` serialize JSON
+/// (`libqpdf/QPDFJob.cc:428-480`). Keep the JSON route on the existing page-job
+/// boundary so page-tree repair and inherited-attribute state are shared with
+/// ordinary page operations.
+fn apply_json_page_specs<R: Read + Seek + 'static>(
+    job: &mut QPDFJob,
+    pdf: &mut Pdf<R>,
+    primary_input: &Path,
+    page_ops: &PageOpArgs,
+) -> CliResult<()> {
+    if page_ops.pages.is_empty() {
+        return Ok(());
+    }
+
+    let raw_specs = parse_pages_segment(&page_ops.pages)?;
+    let inputs = resolve_page_specs(&raw_specs, primary_input)?;
+    if inputs.iter().any(|input| input.path != primary_input) {
+        return Err("--pages: JSON output currently accepts only the primary input source".into());
+    }
+    let specs: Vec<_> = inputs
+        .into_iter()
+        .map(|input| PageSpecInput::new(0, input.range))
+        .collect();
+    let collate = parse_collate_values(&page_ops.collate)?;
+    match job.handle_page_specs(
+        std::slice::from_mut(pdf),
+        &specs,
+        collate.as_deref(),
+        RemoveUnreferencedResources::Auto,
+        false,
+    )? {
+        PageSpecJobOutput::InPlace { .. } => Ok(()),
+        PageSpecJobOutput::Merged(_) => {
+            Err("--pages: JSON output unexpectedly selected a multi-source page job".into())
+        }
     }
 }
 

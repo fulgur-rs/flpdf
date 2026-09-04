@@ -270,7 +270,7 @@ fn duplicate_page_inherited_pdf() -> Vec<u8> {
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
             (
                 2,
-                "<< /Type /Pages /Kids [3 0 R] /Count 2 /Resources 8 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 2 /Resources << /Font << /F1 6 0 R >> >> >>",
             ),
             (
                 3,
@@ -280,12 +280,8 @@ fn duplicate_page_inherited_pdf() -> Vec<u8> {
                 4,
                 "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>",
             ),
-            (
-                5,
-                "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream",
-            ),
+            (5, "<< /Length 15 >>\nstream\nBT /F1 12 Tf ET\nendstream"),
             (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
-            (8, "<< /Font << /F1 6 0 R >> >>"),
         ],
         1,
     )
@@ -1912,8 +1908,7 @@ fn json_output_pages_selection_rebuilds_the_live_page_tree() {
         .assert()
         .code(3);
 
-    let json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
     assert_eq!(json["qpdf"][0]["pushedinheritedpageresources"], true);
     assert_eq!(json["qpdf"][0]["calledgetallpages"], true);
     assert_eq!(json["qpdf"][0]["maxobjectid"], 8);

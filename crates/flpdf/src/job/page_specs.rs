@@ -187,6 +187,12 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     collate: Option<&[usize]>,
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<(RebuildResult, RemoveUnreferencedResources)> {
+    // QPDF::insertPage first flattens the source page tree, whose qpdf
+    // implementation calls pushInheritedAttributesToPage before rebuilding
+    // the selected page list (`QPDF_pages.cc:204-218`). Keep that operation at
+    // the page-document boundary so JSON metadata observes the same
+    // everPushedInheritedAttributesToPages state as qpdf.
+    crate::PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
     let selected = select_single_source_pages(source, specs, collate)?;
     let prune_mode = if resource_mode == RemoveUnreferencedResources::Auto
         && !should_remove_unreferenced_resources(source)?

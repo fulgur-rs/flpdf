@@ -172,6 +172,9 @@ pub struct Pdf<R: Read + Seek + 'static> {
     pub(crate) qpdf_removed_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     pub(crate) ever_called_get_all_pages: bool,
+    /// Monotonic observation matching qpdf's
+    /// `everPushedInheritedAttributesToPages()`.
+    pub(crate) ever_pushed_inherited_attributes_to_pages: bool,
     /// qpdf's `m->all_pages` cache (`QPDF_pages.cc:39-75`). The prepared
     /// root and leaf identities stay together because page consumers need the
     /// repaired root as well as the ordered page list. An empty qpdf page
@@ -288,6 +291,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// `everCalledGetAllPages()` observation used by JSON v2 metadata.
     pub fn ever_called_get_all_pages(&self) -> bool {
         self.ever_called_get_all_pages
+    }
+
+    /// Whether inherited page attributes have been pushed to page leaves.
+    ///
+    /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's
+    /// `everPushedInheritedAttributesToPages()` observation used by JSON v2
+    /// metadata.
+    pub fn ever_pushed_inherited_attributes_to_pages(&self) -> bool {
+        self.ever_pushed_inherited_attributes_to_pages
     }
 
     /// Rebuild qpdf's document-owned page-list cache after direct `/Pages`
