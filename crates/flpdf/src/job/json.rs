@@ -539,7 +539,7 @@ pub struct JsonJobOptions<'a> {
     pub stream_data: JsonStreamData,
     /// Explicit prefix for stream side files, when stream data uses file mode.
     /// An empty prefix is treated as absent.
-    pub stream_prefix: Option<&'a str>,
+    pub stream_prefix: Option<&'a [u8]>,
     /// Requested top-level qpdf JSON v2 keys.
     pub keys: &'a [JsonKey],
     /// Requested object selectors for the JSON `objects` section.
@@ -641,7 +641,7 @@ pub(crate) fn write_json_with_version_with_logger<R: Read + Seek>(
         },
         (JsonStreamData::File, None, JsonJobOutput::File { filename, .. }) => {
             StreamDataMode::File {
-                prefix: filename.to_string_lossy().into_owned(),
+                prefix: path_bytes(filename),
             }
         }
         (JsonStreamData::File, None, JsonJobOutput::Stdout(_)) => {
@@ -669,6 +669,20 @@ pub(crate) fn write_json_with_version_with_logger<R: Read + Seek>(
         &schema_error_output,
     )?;
     Ok(())
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
 }
 
 #[cfg(test)]

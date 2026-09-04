@@ -486,7 +486,7 @@ impl NameTree {
         key: K,
         return_previous_if_missing: bool,
     ) -> Result<NameTreeCursor> {
-        let key = key.as_ref().to_vec();
+        let key = normalized_utf8_value(key.as_ref());
         self.inner
             .find(pdf, &key, return_previous_if_missing)
             .map(|inner| NameTreeCursor {
@@ -539,7 +539,7 @@ impl NameTree {
     ) -> Result<Option<ObjectHandle>> {
         Ok(self
             .inner
-            .find(pdf, &key.as_ref().to_vec(), false)?
+            .find(pdf, &normalized_utf8_value(key.as_ref()), false)?
             .cloned_current()
             .map(|(_, value)| value))
     }
@@ -554,7 +554,7 @@ impl NameTree {
         pdf: &mut Pdf<R>,
         key: K,
     ) -> Result<Option<ObjectHandle>> {
-        self.inner.remove(pdf, &key.as_ref().to_vec())
+        self.inner.remove(pdf, &normalized_utf8_value(key.as_ref()))
     }
 
     /// Materialize the tree as a sorted map.

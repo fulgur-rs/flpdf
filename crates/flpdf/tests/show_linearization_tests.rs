@@ -126,12 +126,15 @@ fn soft_linearization_warnings_are_returned_without_dropping_the_dump() {
 
     let result = show_linearization_bytes_with_warnings(&bytes, "mismatch.pdf")
         .expect("soft mismatches should still produce a dump");
-    assert!(result.dump.contains("linearization data:"));
+    assert!(result
+        .dump
+        .windows(b"linearization data:".len())
+        .any(|window| window == b"linearization data:"));
     assert_eq!(
         result.warnings,
         [
-            "first page object (/O) mismatch".to_owned(),
-            "space before first xref item (/T) mismatch (computed = 1524; file = 1522".to_owned(),
+            b"first page object (/O) mismatch".to_vec(),
+            b"space before first xref item (/T) mismatch (computed = 1524; file = 1522".to_vec(),
         ]
     );
 }

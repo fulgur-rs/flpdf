@@ -147,7 +147,7 @@ pub enum StreamDataMode {
     /// Yields `{ "stream": { "datafile": "<prefix>-<obj_num>", "dict": ... } }`.
     /// The JSON writer opens the named file after the outer `stream` key and
     /// writes its decoded bytes before emitting the stream dictionary.
-    File { prefix: String },
+    File { prefix: Vec<u8> },
 }
 
 // ── DecodeLevel ──────────────────────────────────────────────────────────────

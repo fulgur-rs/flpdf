@@ -619,15 +619,23 @@ fn show_bool(value: bool) -> &'static str {
     }
 }
 
-fn linearization_parameter_error_message(input_name: &[u8], message: &str, offset: u64) -> String {
-    let input_name = String::from_utf8_lossy(input_name);
+fn linearization_parameter_error_message(input_name: &[u8], message: &str, offset: u64) -> Vec<u8> {
     for object in ["linearization dictionary", "linearization hint table"] {
         let prefix = format!("{object}: ");
         if let Some(detail) = message.strip_prefix(&prefix) {
-            return format!("{input_name} ({object}, offset {offset}): {detail}");
+            let mut result = input_name.to_vec();
+            result.extend_from_slice(b" (");
+            result.extend_from_slice(object.as_bytes());
+            result.extend_from_slice(b", offset ");
+            result.extend_from_slice(offset.to_string().as_bytes());
+            result.extend_from_slice(b"): ");
+            result.extend_from_slice(detail.as_bytes());
+            return result;
         }
     }
-    format!("linearization check failed: {message}")
+    let mut result = b"linearization check failed: ".to_vec();
+    result.extend_from_slice(message.as_bytes());
+    result
 }
 
 fn linearization_parameter_offset<R: Read + Seek + 'static>(
@@ -707,16 +715,15 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
         }
         Ok(LinearizationParameterCheck::Error(message)) => {
             warnings = true;
-            let message = format!(
-                "error encountered while checking linearization data: {}",
-                linearization_parameter_error_message(
-                    input_name,
-                    message,
-                    linearization_parameter_offset(pdf, message)?,
-                )
-            );
+            let mut warning_message =
+                b"error encountered while checking linearization data: ".to_vec();
+            warning_message.extend_from_slice(&linearization_parameter_error_message(
+                input_name,
+                message,
+                linearization_parameter_offset(pdf, message)?,
+            ));
             if !suppress_warnings {
-                emit_warning(logger, input_name, message)?;
+                emit_warning_bytes(logger, input_name, &warning_message)?;
             } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
         }
         Err(error) if logger_failure_since(pdf, diagnostics_seen) && is_logger_error(&error) => {
@@ -755,16 +762,15 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
         }
         Err(LinearizationCheckError::NotLinearized) => Ok(false), // cov:ignore: check_document accepts only a linearized candidate before this helper
         Err(LinearizationCheckError::InvalidParam { message }) => {
-            let message = format!(
-                "error encountered while checking linearization data: {}",
-                linearization_parameter_error_message(
-                    input_name,
-                    &message,
-                    linearization_parameter_offset(pdf, &message)?
-                )
-            );
+            let mut warning_message =
+                b"error encountered while checking linearization data: ".to_vec();
+            warning_message.extend_from_slice(&linearization_parameter_error_message(
+                input_name,
+                &message,
+                linearization_parameter_offset(pdf, &message)?,
+            ));
             if !suppress_warnings {
-                emit_warning(logger, input_name, message)?;
+                emit_warning_bytes(logger, input_name, &warning_message)?;
             } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
             Ok(true)
         }
@@ -938,14 +944,17 @@ fn is_contextless_object_warning(message: &str) -> bool {
         .any(|prefix| message.starts_with(prefix))
 }
 
-fn emit_warning(logger: &QPDFLogger, input_name: &[u8], message: impl AsRef<str>) -> Result<()> {
-    let message = message.as_ref();
+fn emit_warning_bytes(logger: &QPDFLogger, input_name: &[u8], message: &[u8]) -> Result<()> {
     let mut line = b"WARNING: ".to_vec();
     line.extend_from_slice(input_name);
     line.extend_from_slice(b": ");
-    line.extend_from_slice(message.as_bytes());
+    line.extend_from_slice(message);
     line.push(b'\n');
     logger.warn(line)
+}
+
+fn emit_warning(logger: &QPDFLogger, input_name: &[u8], message: impl AsRef<str>) -> Result<()> {
+    emit_warning_bytes(logger, input_name, message.as_ref().as_bytes())
 }
 
 fn diagnostic_location(input_name: &[u8], diagnostic: &crate::Diagnostic) -> Vec<u8> {

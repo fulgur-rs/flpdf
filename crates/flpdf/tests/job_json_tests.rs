@@ -13,7 +13,7 @@ fn open_fixture() -> Pdf<BufReader<File>> {
     Pdf::open(BufReader::new(File::open(fixture()).unwrap())).unwrap()
 }
 
-fn options<'a>(stream_data: JsonStreamData, stream_prefix: Option<&'a str>) -> JsonJobOptions<'a> {
+fn options<'a>(stream_data: JsonStreamData, stream_prefix: Option<&'a [u8]>) -> JsonJobOptions<'a> {
     JsonJobOptions {
         decode_level: DecodeLevel::Generalized,
         stream_data,
@@ -55,7 +55,7 @@ fn stdout_file_mode_empty_prefix_is_usage_error() {
     let options = JsonJobOptions {
         decode_level: DecodeLevel::Generalized,
         stream_data: JsonStreamData::File,
-        stream_prefix: Some(""),
+        stream_prefix: Some(b""),
         keys: &keys,
         objects: &[],
     };
@@ -81,7 +81,7 @@ fn stdout_file_mode_uses_explicit_prefix() {
 
     write_json(
         &mut pdf,
-        options(JsonStreamData::File, prefix.to_str()),
+        options(JsonStreamData::File, prefix.to_str().map(str::as_bytes)),
         JsonJobOutput::Stdout(&mut bytes),
     )
     .unwrap();
@@ -130,7 +130,7 @@ fn file_output_file_mode_empty_prefix_defaults_to_output_filename() {
 
     write_json(
         &mut pdf,
-        options(JsonStreamData::File, Some("")),
+        options(JsonStreamData::File, Some(b"")),
         JsonJobOutput::File {
             filename: &output_path,
             writer: &mut bytes,

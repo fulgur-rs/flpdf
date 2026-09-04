@@ -731,7 +731,7 @@ struct Cli {
                 defaults to the JSON output path; with JSON on stdout, an explicit \
                 non-empty prefix is required. An empty prefix is treated as absent."
     )]
-    json_stream_prefix: Option<String>,
+    json_stream_prefix: Option<OsString>,
 
     // qpdf-style top-level write flags. When `--linearize` is set together
     // with INPUT and OUTPUT, behave as if `flpdf rewrite --linearize ...`
@@ -1066,7 +1066,7 @@ struct Cli {
         value_name = "KEY",
         help = "Remove the embedded file with the given key (qpdf --remove-attachment)"
     )]
-    remove_attachment: Option<String>,
+    remove_attachment: Option<OsString>,
 
     /// List all embedded-file attachments (qpdf --list-attachments compatible).
     #[arg(
@@ -1099,7 +1099,7 @@ struct Cli {
         help = "Extract the embedded file with the given key to stdout \
                 (qpdf --show-attachment)"
     )]
-    show_attachment: Option<String>,
+    show_attachment: Option<OsString>,
 
     /// Copy attachments from another PDF (qpdf --copy-attachments-from compatible).
     ///
@@ -1153,7 +1153,7 @@ struct Cli {
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
     )]
-    encrypt: Option<Vec<String>>,
+    encrypt: Option<Vec<OsString>>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
@@ -1191,7 +1191,7 @@ struct Cli {
         requires = "copy_encryption",
         help = "User password to open the donor PDF for --copy-encryption"
     )]
-    encryption_file_password: Option<String>,
+    encryption_file_password: Option<OsString>,
 
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -1560,7 +1560,7 @@ struct RewriteCommand {
             "copy_encryption",
         ]
     )]
-    encrypt: Option<Vec<String>>,
+    encrypt: Option<Vec<OsString>>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
@@ -1591,7 +1591,7 @@ struct RewriteCommand {
         requires = "copy_encryption",
         help = "User password to open the donor PDF for --copy-encryption"
     )]
-    encryption_file_password: Option<String>,
+    encryption_file_password: Option<OsString>,
     /// Set a minimum PDF version for the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.
@@ -2052,7 +2052,7 @@ struct PasswordArgs {
     recovery: RecoveryArgs,
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
-    password: Option<String>,
+    password: Option<OsString>,
     /// File containing password bytes. Only the first LF-delimited line is
     /// used; a trailing CR before that LF is stripped. `-` reads from stdin.
     #[arg(long = "password-file", value_name = "PATH")]
@@ -2935,7 +2935,7 @@ fn run_job_json_file(
         })?;
     }
     if let Some(password) = password.password.as_deref() {
-        job.set_password(password.as_bytes().to_vec());
+        job.set_password(arg_parser::os_bytes(password));
     }
     // The library JSON entry point uses qpdfjob's C-helper prefix while the
     // CLI's QPDFJob caller uses the ordinary qpdf prefix. Set the CLI
@@ -3100,7 +3100,9 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
         .map_err(|error| error_with_file(input, error.into()))?;
 
     if cli.json_input {
-        let mut pdf = job.create_from_json_document(input_file, input.display().to_string())?;
+        let mut pdf = job
+            .create_from_json_document(input_file, path_description(input))
+            .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         if cli.optimize_images {
             flpdf::optimize_images(
@@ -3178,7 +3180,9 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
     })?;
 
     if cli.json_input {
-        let mut pdf = job.create_from_json_document(file, input.display().to_string())?;
+        let mut pdf = job
+            .create_from_json_document(file, path_description(input))
+            .map_err(|error| json_error_with_file(input, Box::new(error)))?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
     }
@@ -3265,12 +3269,13 @@ fn run_json_document<R: Read + Seek>(
         .output
         .as_ref()
         .filter(|path| path.as_path() != Path::new("-"));
+    let stream_prefix = cli.json_stream_prefix.as_deref().map(arg_parser::os_bytes);
     let json_result = if let Some(path) = output_path {
         let mut file = open_verified_json_output(runtime.input_identity, path)?;
         let options = JsonJobOptions {
             decode_level: json_decode_level,
             stream_data,
-            stream_prefix: cli.json_stream_prefix.as_deref(),
+            stream_prefix: stream_prefix.as_deref(),
             keys: json_keys,
             objects: json_objects,
         };
@@ -3290,7 +3295,7 @@ fn run_json_document<R: Read + Seek>(
         let options = JsonJobOptions {
             decode_level: json_decode_level,
             stream_data,
-            stream_prefix: cli.json_stream_prefix.as_deref(),
+            stream_prefix: stream_prefix.as_deref(),
             keys: json_keys,
             objects: json_objects,
         };
@@ -3684,9 +3689,9 @@ fn run_check_linearization(
 /// fires.
 fn apply_encryption_options(
     options: &mut WriterOptions,
-    encrypt: Option<&[String]>,
+    encrypt: Option<&[OsString]>,
     copy_encryption: Option<&std::path::Path>,
-    encryption_file_password: Option<&str>,
+    encryption_file_password: Option<&OsStr>,
     password_args: &PasswordArgs,
     suppress_warnings: bool,
 ) {
@@ -3737,7 +3742,7 @@ fn apply_encryption_options(
 /// rejected with a "not yet supported" message.
 fn build_copy_encryption_source(
     path: &std::path::Path,
-    password: Option<&str>,
+    password: Option<&OsStr>,
     password_args: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<CopyEncryptionSource> {
@@ -3746,7 +3751,7 @@ fn build_copy_encryption_source(
     let reader = BufReader::new(file);
 
     let mut donor_password = password_args.clone();
-    donor_password.password = Some(password.unwrap_or("").to_owned());
+    donor_password.password = Some(password.map(OsStr::to_os_string).unwrap_or_default());
     donor_password.password_file = None;
     let opts = pdf_open_options(true, &donor_password)
         .map_err(|error| format!("--copy-encryption: failed to configure {:?}: {error}", path))?;
@@ -3851,6 +3856,22 @@ struct ParsedEncryptSegment {
     accessibility_warning: bool,
 }
 
+trait RawCliArg {
+    fn raw_bytes(&self) -> Vec<u8>;
+}
+
+impl RawCliArg for String {
+    fn raw_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+}
+
+impl RawCliArg for OsString {
+    fn raw_bytes(&self) -> Vec<u8> {
+        arg_parser::os_bytes(self)
+    }
+}
+
 /// Return qpdf's active option-table name for an encryption segment.
 ///
 /// qpdf selects the key-length-specific table as soon as it consumes the
@@ -3872,8 +3893,8 @@ fn unrecognized_encrypt_argument(token: &str, key_len: Option<u32>) -> String {
     )
 }
 
-fn parse_encrypt_segment(
-    tokens: &[String],
+fn parse_encrypt_segment<T: RawCliArg>(
+    tokens: &[T],
     allow_weak_crypto: bool,
 ) -> CliResult<ParsedEncryptSegment> {
     if tokens.is_empty() {
@@ -3884,47 +3905,52 @@ fn parse_encrypt_segment(
     // key-length-specific table after the third positional argument or the
     // named --bits argument. Keep the two password forms distinct so the
     // mixed-form error is raised at the same boundary as qpdf.
-    let mut positional = Vec::new();
+    let mut positional: Vec<Vec<u8>> = Vec::new();
     let mut dashed_mode = false;
     let mut positional_mode = false;
     let mut user_password = None;
     let mut owner_password = None;
     let mut key_len = None;
     let mut key_len_seen = false;
-    let mut subflags = Vec::new();
+    let mut subflags: Vec<Vec<u8>> = Vec::new();
 
     let mut index = 0;
     while index < tokens.len() {
         let token = &tokens[index];
-        let (raw_name, attached) = token
-            .split_once('=')
-            .map_or((token.as_str(), None), |(name, value)| (name, Some(value)));
+        let token_bytes = token.raw_bytes();
+        let token_text = String::from_utf8_lossy(&token_bytes);
+        let equal = token_bytes.iter().position(|byte| *byte == b'=');
+        let (raw_name, attached) = match equal {
+            Some(position) => (&token_bytes[..position], Some(&token_bytes[position + 1..])),
+            None => (token_bytes.as_slice(), None),
+        };
         let name = raw_name
-            .strip_prefix("--")
-            .or_else(|| raw_name.strip_prefix('-'))
-            .unwrap_or(raw_name);
+            .strip_prefix(b"--")
+            .or_else(|| raw_name.strip_prefix(b"-"))
+            .and_then(|name| std::str::from_utf8(name).ok())
+            .unwrap_or("");
         if matches!(name, "user-password" | "owner-password" | "bits") {
             if positional_mode {
                 return Err("positional and dashed encryption arguments may not be mixed".into());
             }
             if key_len_seen {
-                return Err(unrecognized_encrypt_argument(token, key_len).into());
+                return Err(unrecognized_encrypt_argument(&token_text, key_len).into());
             }
             dashed_mode = true;
             let value = if let Some(value) = attached {
-                value.to_owned()
+                value.to_vec()
             } else {
                 index += 1;
                 tokens
                     .get(index)
-                    .cloned()
-                    .ok_or_else(|| format!("{token} requires a value"))?
+                    .map(RawCliArg::raw_bytes)
+                    .ok_or_else(|| format!("{token_text} requires a value"))?
             };
             match name {
-                "user-password" => user_password = Some(value.into_bytes()),
-                "owner-password" => owner_password = Some(value.into_bytes()),
+                "user-password" => user_password = Some(value),
+                "owner-password" => owner_password = Some(value),
                 "bits" => {
-                    key_len = Some(parse_encrypt_key_len(&value)?);
+                    key_len = Some(parse_encrypt_key_len(&String::from_utf8_lossy(&value))?);
                     key_len_seen = true;
                 }
                 _ => unreachable!("name was matched above"),
@@ -3934,30 +3960,30 @@ fn parse_encrypt_segment(
         }
 
         if dashed_mode {
-            if !token.starts_with('-') || token == "-" {
+            if !token_bytes.starts_with(b"-") || token_bytes == b"-" {
                 return Err("positional and dashed encryption arguments may not be mixed".into());
             }
             // qpdf's password-argument table has no key-specific options;
             // `--bits` must select the key-length-specific table before any
             // other named option is recognized.
             if !key_len_seen {
-                return Err(unrecognized_encrypt_argument(token, key_len).into());
+                return Err(unrecognized_encrypt_argument(&token_text, key_len).into());
             }
-            subflags.push(token.clone());
+            subflags.push(token_bytes);
         } else if positional.len() < 3 {
-            if token.starts_with('-') && token != "-" {
-                return Err(unrecognized_encrypt_argument(token, None).into());
+            if token_bytes.starts_with(b"-") && token_bytes != b"-" {
+                return Err(unrecognized_encrypt_argument(&token_text, None).into());
             }
             positional_mode = true;
-            positional.push(token.clone());
+            positional.push(token_bytes.clone());
             if positional.len() == 3 {
-                key_len = Some(parse_encrypt_key_len(token)?);
+                key_len = Some(parse_encrypt_key_len(&token_text)?);
             }
         } else {
-            if !token.starts_with('-') || token == "-" {
-                return Err(unrecognized_encrypt_argument(token, key_len).into());
+            if !token_bytes.starts_with(b"-") || token_bytes == b"-" {
+                return Err(unrecognized_encrypt_argument(&token_text, key_len).into());
             }
-            subflags.push(token.clone());
+            subflags.push(token_bytes);
         }
         index += 1;
     }
@@ -3980,11 +4006,7 @@ fn parse_encrypt_segment(
             .into());
         }
         let key_len = key_len.ok_or("--encrypt key length is required")?;
-        (
-            positional[0].as_bytes().to_vec(),
-            positional[1].as_bytes().to_vec(),
-            key_len,
-        )
+        (positional[0].clone(), positional[1].clone(), key_len)
     };
 
     let mut use_aes = None;
@@ -3997,41 +4019,49 @@ fn parse_encrypt_segment(
     let mut accessibility_explicitly_disabled = false;
 
     for token in &subflags {
-        let (raw_flag, value) = token
-            .split_once('=')
-            .map_or((token.as_str(), ""), |(flag, value)| (flag, value));
+        let token_text = String::from_utf8_lossy(token);
+        let equal = token.iter().position(|byte| *byte == b'=');
+        let (raw_flag, value_bytes) = match equal {
+            Some(position) => (&token[..position], &token[position + 1..]),
+            None => (token.as_slice(), b"".as_slice()),
+        };
         let flag = raw_flag
-            .strip_prefix("--")
-            .or_else(|| raw_flag.strip_prefix('-'))
-            .unwrap_or(raw_flag);
+            .strip_prefix(b"--")
+            .or_else(|| raw_flag.strip_prefix(b"-"))
+            .and_then(|flag| std::str::from_utf8(flag).ok())
+            .unwrap_or("");
+        let value = match std::str::from_utf8(value_bytes) {
+            Ok(value) => value,
+            Err(_) => return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into()),
+        };
         match flag {
             "use-aes" => {
                 if key_len != 128 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 use_aes = Some(parse_perm_yn(flag, value)?);
             }
             "force-V4" => {
                 if key_len != 128 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 force_v4 = true;
             }
             "force-R5" => {
                 if key_len != 256 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 force_r5 = true;
             }
             "allow-insecure" => {
                 if key_len != 256 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 allow_insecure = true;
             }
             "cleartext-metadata" => {
                 if !matches!(key_len, 128 | 256) {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 cleartext_metadata = true;
             }
@@ -4093,31 +4123,31 @@ fn parse_encrypt_segment(
             }
             "form" => {
                 if key_len == 40 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 perms.fill_forms = parse_perm_yn(flag, value)?;
             }
             "assemble" => {
                 if key_len == 40 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 perms.assemble = parse_perm_yn(flag, value)?;
             }
             "accessibility" => {
                 if key_len == 40 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 perms.accessibility = parse_perm_yn(flag, value)?;
                 accessibility_explicitly_disabled = value == "n";
             }
             "modify-other" => {
                 if key_len == 40 {
-                    return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                    return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
                 }
                 perms.modify_contents = parse_perm_yn(flag, value)?;
             }
             _other => {
-                return Err(unrecognized_encrypt_argument(token, Some(key_len)).into());
+                return Err(unrecognized_encrypt_argument(&token_text, Some(key_len)).into());
             }
         }
     }
@@ -4532,24 +4562,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             // order across specs) is source-shared with apply_overlay_specs.
             if verbose {
                 let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
-                let mut message = String::from("flpdf: processing underlay/overlay\n");
-                for page in &report {
-                    message.push_str(&format!("  page {}\n", page.dest_page));
-                    for src in &page.sources {
-                        let file = &overlay_specs[src.spec_index].file;
-                        let kind_str = match src.kind {
-                            flpdf::OverlayKind::Underlay => "underlay",
-                            flpdf::OverlayKind::Overlay => "overlay",
-                        };
-                        message.push_str(&format!(
-                            "    {} {} {}\n",
-                            file.to_string_lossy(),
-                            kind_str,
-                            src.src_page
-                        ));
-                    }
-                }
-                logger_info(message)?;
+                logger_info(overlay_verbose_message(&report, overlay_specs))?;
             }
 
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
@@ -4626,7 +4639,7 @@ struct PageSegmentSpec {
     /// File token as written (`.` = primary input, or a path).
     file_token: OsString,
     /// Per-input password (`--password=` immediately following the file).
-    password: Option<String>,
+    password: Option<OsString>,
     /// Page-range string (empty = all pages).
     range: String,
 }
@@ -4660,7 +4673,7 @@ fn parse_pages_segment<T: AsRef<OsStr>>(tokens: &[T]) -> CliResult<Vec<PageSegme
             let cur = specs
                 .last_mut()
                 .ok_or("--pages: --password= must follow a file in the --pages segment")?;
-            cur.password = Some(arg_parser::os_to_string(&pw, "--pages --password")?);
+            cur.password = Some(pw);
             continue;
         }
         if let Some(r) = arg_parser::os_strip_prefix(tok, "--range=") {
@@ -4725,7 +4738,11 @@ fn resolve_page_specs(
                 s.range
             ))
         })?;
-        out.push(InputSpec::new(path, s.password.clone(), range));
+        out.push(InputSpec::new(
+            path,
+            s.password.as_deref().map(arg_parser::os_bytes),
+            range,
+        ));
     }
     Ok(out)
 }
@@ -4762,7 +4779,7 @@ struct OverlaySpec {
     /// Path to the overlay/underlay source PDF.
     file: OsString,
     /// Password for the source PDF, if supplied via `--password=`.
-    password: Option<String>,
+    password: Option<OsString>,
     /// Raw `--from=` page-range string (source pages to cycle through).
     from: Option<String>,
     /// Raw `--to=` page-range string (destination pages to receive content).
@@ -4806,7 +4823,7 @@ fn parse_overlay_segment<T: AsRef<OsStr>>(
     }
 
     let mut file: Option<OsString> = None;
-    let mut password: Option<String> = None;
+    let mut password: Option<OsString> = None;
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
     let mut repeat: Option<String> = None;
@@ -4824,7 +4841,7 @@ fn parse_overlay_segment<T: AsRef<OsStr>>(
             if password.is_some() {
                 return Err(format!("{flag}: duplicate --password= in segment").into());
             }
-            password = Some(arg_parser::os_to_string(&pw, "overlay --password")?);
+            password = Some(pw);
             continue;
         }
         if let Some(r) = arg_parser::os_strip_prefix(tok, "--to=") {
@@ -4877,6 +4894,28 @@ fn parse_overlay_segment<T: AsRef<OsStr>>(
         to,
         repeat,
     })
+}
+
+fn overlay_verbose_message(report: &[flpdf::OverlayVerbosePage], specs: &[OverlaySpec]) -> Vec<u8> {
+    let mut message = b"flpdf: processing underlay/overlay\n".to_vec();
+    for page in report {
+        message.extend_from_slice(format!("  page {}\n", page.dest_page).as_bytes());
+        for source in &page.sources {
+            let file = &specs[source.spec_index].file;
+            let kind = match source.kind {
+                flpdf::OverlayKind::Underlay => "underlay",
+                flpdf::OverlayKind::Overlay => "overlay",
+            };
+            message.extend_from_slice(b"    ");
+            message.extend_from_slice(&arg_parser::os_bytes(file));
+            message.push(b' ');
+            message.extend_from_slice(kind.as_bytes());
+            message.push(b' ');
+            message.extend_from_slice(source.src_page.to_string().as_bytes());
+            message.push(b'\n');
+        }
+    }
+    message
 }
 
 #[cfg(test)]
@@ -5169,7 +5208,7 @@ fn run_page_extraction(
         if let Some(top_pw) = &password.password {
             for spec in &mut inputs {
                 if spec.password.is_none() {
-                    spec.password = Some(top_pw.clone());
+                    spec.password = Some(arg_parser::os_bytes(top_pw));
                 }
             }
         }
@@ -5381,7 +5420,9 @@ fn run_empty_page_extraction(
             ))?;
         }
         let mut source_password = password.clone();
-        source_password.password = source_passwords[source_index].clone();
+        source_password.password = source_passwords[source_index]
+            .as_deref()
+            .map(os_string_from_bytes);
         source_password.password_file = None;
         sources.push(open_page_source(
             path,
@@ -5515,7 +5556,7 @@ fn run_page_extraction_from_multiple_sources(
     // resolve_page_specs; path equality therefore preserves qpdf's documented
     // distinction between two different spellings of the same file.
     let mut source_paths = vec![primary_input.to_path_buf()];
-    let mut source_passwords: Vec<Option<String>> = vec![None];
+    let mut source_passwords: Vec<Option<Vec<u8>>> = vec![None];
     let mut specs = Vec::with_capacity(inputs.len());
     for input in inputs {
         let source_index = if input.path == primary_input {
@@ -5558,7 +5599,9 @@ fn run_page_extraction_from_multiple_sources(
         // not a fallback for a secondary with no segment password; retain the
         // global interpretation/policy flags, but replace both credential
         // fields with the per-source value, including an explicit empty value.
-        source_password.password = source_passwords[source_index].clone();
+        source_password.password = source_passwords[source_index]
+            .as_deref()
+            .map(os_string_from_bytes);
         source_password.password_file = None;
         if verbose {
             logger_info(format!(
@@ -5942,24 +5985,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
 
         if verbose {
             let report = flpdf::overlay_verbose_report(pdf, &mut built)?;
-            let mut message = String::from("flpdf: processing underlay/overlay\n");
-            for page in &report {
-                message.push_str(&format!("  page {}\n", page.dest_page));
-                for src in &page.sources {
-                    let file = &overlay_specs[src.spec_index].file;
-                    let kind_str = match src.kind {
-                        flpdf::OverlayKind::Underlay => "underlay",
-                        flpdf::OverlayKind::Overlay => "overlay",
-                    };
-                    message.push_str(&format!(
-                        "    {} {} {}\n",
-                        file.to_string_lossy(),
-                        kind_str,
-                        src.src_page
-                    ));
-                }
-            }
-            logger_info(message)?;
+            logger_info(overlay_verbose_message(&report, overlay_specs))?;
         }
 
         flpdf::apply_overlay_specs(pdf, &mut built)?;
@@ -7130,8 +7156,8 @@ fn apply_json_update<R: Read + Seek + 'static>(
 ) -> CliResult<()> {
     if let Some(path) = update_from_json {
         let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
-        pdf.update_from_json(source, path.display().to_string())
-            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+        pdf.update_from_json(source, path_description(path))
+            .map_err(|error| json_error_with_file(path, Box::new(error)))?;
     }
     Ok(())
 }
@@ -7143,7 +7169,8 @@ fn apply_json_update_with_job<R: Read + Seek + 'static>(
 ) -> CliResult<()> {
     if let Some(path) = update_from_json {
         let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
-        job.update_from_json(pdf, source, path.display().to_string())?;
+        job.update_from_json(pdf, source, path_description(path))
+            .map_err(|error| json_error_with_file(path, Box::new(error)))?;
     }
     Ok(())
 }
@@ -7195,8 +7222,8 @@ fn open_json_pdf(
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
     let mut pdf = job
-        .create_from_json(source, input.display().to_string())
-        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+        .create_from_json(source, path_description(input))
+        .map_err(|error| json_error_with_file(input, Box::new(error)))?;
     apply_json_update(&mut pdf, update_from_json)?;
     Ok(pdf)
 }
@@ -7324,7 +7351,7 @@ fn open_pdf_file_impl(
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
     let password_bytes = if let Some(password) = &password.password {
-        password.as_bytes().to_vec()
+        arg_parser::os_bytes(password)
     } else if let Some(path) = &password.password_file {
         read_password_file(path)?
     } else {
@@ -7460,6 +7487,20 @@ fn path_description(input: &Path) -> Vec<u8> {
 #[cfg(not(unix))]
 fn path_description(input: &Path) -> Vec<u8> {
     input.to_string_lossy().into_owned().into_bytes()
+}
+
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Program name used in qpdf-parity diagnostic prefixes.
@@ -7606,6 +7647,23 @@ fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
     Box::new(CliPathError {
         path: path_description(input),
         message: error.to_string(),
+        source: error,
+    })
+}
+
+fn json_error_with_file(
+    input: &Path,
+    error: Box<dyn std::error::Error>,
+) -> Box<dyn std::error::Error> {
+    let path = path_description(input);
+    let lossy_path = String::from_utf8_lossy(&path);
+    let message = error
+        .to_string()
+        .strip_prefix(&format!("{lossy_path}: "))
+        .map_or_else(|| error.to_string(), str::to_owned);
+    Box::new(CliPathError {
+        path,
+        message,
         source: error,
     })
 }
@@ -7881,7 +7939,7 @@ fn run_remove_attachment(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    key: &str,
+    key: &OsStr,
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
@@ -7896,9 +7954,14 @@ fn run_remove_attachment(
 
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
 
-    let found = pdf.embedded_files().remove_embedded_file(key.as_bytes())?;
+    let key = arg_parser::os_bytes(key);
+    let found = pdf.embedded_files().remove_embedded_file(&key)?;
     if !found {
-        return Err(format!("--remove-attachment: key {:?} not found in document", key).into());
+        return Err(format!(
+            "--remove-attachment: key {:?} not found in document",
+            String::from_utf8_lossy(&key)
+        )
+        .into());
     }
 
     let mut options = WriterOptions {
@@ -7948,7 +8011,7 @@ fn run_show_attachment(
     input: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    key: &str,
+    key: &OsStr,
     suppress_warnings: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--show-attachment: missing input PDF")?;
@@ -7958,14 +8021,13 @@ fn run_show_attachment(
     job.set_message_prefix(progname());
     job.set_suppress_warnings(suppress_warnings);
     job.set_input_name_bytes(path_description(&input));
-    let status = job
-        .show_attachment(&mut pdf, key.as_bytes())
-        .map_err(|error| {
-            format!(
-                "--show-attachment: key {:?} not found or unreadable: {error}",
-                key
-            )
-        })?;
+    let key = arg_parser::os_bytes(key);
+    let status = job.show_attachment(&mut pdf, &key).map_err(|error| {
+        format!(
+            "--show-attachment: key {:?} not found or unreadable: {error}",
+            String::from_utf8_lossy(&key)
+        )
+    })?;
     finish_job_exit_status(status)
 }
 
@@ -8265,7 +8327,7 @@ mod tests {
             &path,
             true,
             &PasswordArgs {
-                password: Some("wrong".to_owned()),
+                password: Some("wrong".to_owned().into()),
                 ..PasswordArgs::default()
             },
             false,
@@ -9121,7 +9183,7 @@ mod tests {
         assert_eq!(specs.len(), 1);
         let s = &specs[0];
         assert_eq!(s.file, "src.pdf");
-        assert_eq!(s.password.as_deref(), Some("pw"));
+        assert_eq!(s.password.as_deref(), Some(OsStr::new("pw")));
         assert_eq!(s.from.as_deref(), Some("1"));
         assert_eq!(s.to.as_deref(), Some("2-3"));
         assert_eq!(s.repeat.as_deref(), Some("1"));
@@ -9234,7 +9296,7 @@ mod tests {
         let argv = strs(&["--overlay", "src.pdf", "--password=--weird", "--"]);
         let (_residual, specs) = extract_overlay_groups(argv).unwrap();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].password.as_deref(), Some("--weird"));
+        assert_eq!(specs[0].password.as_deref(), Some(OsStr::new("--weird")));
     }
 
     #[test]

@@ -74,14 +74,14 @@ pub struct InputSpec {
     pub path: PathBuf,
     /// Optional password to decrypt the file.
     /// The bytes are passed verbatim to [`PdfOpenOptions::password`].
-    pub password: Option<String>,
+    pub password: Option<Vec<u8>>,
     /// Which pages to include from this input.
     pub range: PageRange,
 }
 
 impl InputSpec {
     /// Convenience constructor.
-    pub fn new(path: impl Into<PathBuf>, password: Option<String>, range: PageRange) -> Self {
+    pub fn new(path: impl Into<PathBuf>, password: Option<Vec<u8>>, range: PageRange) -> Self {
         Self {
             path: path.into(),
             password,
@@ -202,11 +202,7 @@ impl CombinedPlan {
             })?;
             let reader = BufReader::new(file);
             let opts = PdfOpenOptions {
-                password: spec
-                    .password
-                    .as_deref()
-                    .map(|s| s.as_bytes().to_vec())
-                    .unwrap_or_default(),
+                password: spec.password.clone().unwrap_or_default(),
                 ..PdfOpenOptions::default()
             };
             // Preserve the terminal Error::Encrypted / Error::Io classification
@@ -554,10 +550,10 @@ mod tests {
         // so it will be passed to PdfOpenOptions when from_specs is called.
         let spec = InputSpec::new(
             "test.pdf",
-            Some("secret".into()),
+            Some(b"secret".to_vec()),
             PageRange::parse("").unwrap(),
         );
-        assert_eq!(spec.password, Some("secret".to_string()));
+        assert_eq!(spec.password, Some(b"secret".to_vec()));
 
         // Also verify no-password case
         let spec_no_pw = InputSpec::new("test.pdf", None, PageRange::parse("").unwrap());
@@ -636,7 +632,7 @@ mod tests {
         std::fs::write(&input, bytes).expect("write encrypted fixture");
         let error = CombinedPlan::from_specs(vec![InputSpec::new(
             &input,
-            Some("wrong".to_owned()),
+            Some(b"wrong".to_vec()),
             PageRange::parse("").expect("all pages range"),
         )])
         .expect_err("wrong password must fail");

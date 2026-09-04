@@ -6306,10 +6306,11 @@ impl ObjectHandle {
         json_data: QpdfStreamJsonData,
         mut decode_level: DecodeLevel,
         pipeline: Option<&mut dyn Pipeline>,
-        data_filename: &str,
+        data_filename: impl AsRef<[u8]>,
         no_data_key: bool,
         depth: usize,
     ) -> std::result::Result<DecodeLevel, ObjectJsonError> {
+        let data_filename = data_filename.as_ref();
         if !matches!(json_version, 1 | 2) {
             return Err(ObjectJsonError::UnsupportedVersion(json_version));
         }
@@ -6422,7 +6423,7 @@ impl ObjectHandle {
                     out,
                     &mut stream_first,
                     b"datafile",
-                    &Json::make_string(data_filename.as_bytes()),
+                    &Json::make_string(data_filename),
                     depth + 1,
                 )?;
                 pipeline

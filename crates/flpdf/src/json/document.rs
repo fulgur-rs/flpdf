@@ -36,14 +36,14 @@ const JSON_PDF: &[u8] = concat!(
 /// (`QPDF_json.cc:54-63`).
 pub(crate) fn create_from_json_erased<S>(
     source: S,
-    input_name: impl Into<String>,
+    input_name: impl AsRef<[u8]>,
     mut options: PdfOpenOptions,
 ) -> Result<Pdf<Box<dyn crate::ReadSeek>>>
 where
     S: Read + Seek + 'static,
 {
-    let input_name = input_name.into();
-    options.description = input_name.clone().into_bytes();
+    let input_name = input_name.as_ref().to_vec();
+    options.description = input_name.clone();
     let mut pdf = Pdf::<Box<dyn crate::ReadSeek>>::open_with_options(
         Box::new(Cursor::new(JSON_PDF.to_vec())),
         options,
@@ -69,7 +69,7 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// JSON reactor recorded warnings before the import failed; the caller
     /// can drain those warnings through [`Error::open_failure`] the same way
     /// it drains a failed permissive PDF open.
-    pub fn create_from_json<S>(source: S, input_name: impl Into<String>) -> Result<Self>
+    pub fn create_from_json<S>(source: S, input_name: impl AsRef<[u8]>) -> Result<Self>
     where
         S: Read + Seek + 'static,
     {
@@ -92,14 +92,14 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// it drains a failed permissive PDF open.
     pub fn create_from_json_with_options<S>(
         source: S,
-        input_name: impl Into<String>,
+        input_name: impl AsRef<[u8]>,
         mut options: PdfOpenOptions,
     ) -> Result<Self>
     where
         S: Read + Seek + 'static,
     {
-        let input_name = input_name.into();
-        options.description = input_name.clone().into_bytes();
+        let input_name = input_name.as_ref().to_vec();
+        options.description = input_name.clone();
         let mut pdf = Self::open_mem_owned_with_options(JSON_PDF.to_vec(), options)?; // cov:ignore: the qpdf rootless seed is a fixed, valid in-memory PDF
         if let Err(error) = pdf.import_json(source, input_name, true) {
             let diagnostics = pdf.repair_diagnostics();
@@ -111,7 +111,7 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// Create a PDF from a complete qpdf JSON v2 file.
     pub fn create_from_json_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let input_name = path.display().to_string();
+        let input_name = path_description_bytes(&path);
         let source = open_json_file(&path)?;
         Self::create_from_json(source, input_name)
     }
@@ -126,7 +126,7 @@ where
     /// Objects omitted from the input remain unchanged. The input is consumed
     /// incrementally and may remain alive behind deferred stream providers.
     /// This mirrors `QPDF::updateFromJSON`.
-    pub fn update_from_json<S>(&mut self, source: S, input_name: impl Into<String>) -> Result<()>
+    pub fn update_from_json<S>(&mut self, source: S, input_name: impl AsRef<[u8]>) -> Result<()>
     where
         S: Read + Seek + 'static,
     {
@@ -136,7 +136,7 @@ where
     /// Apply a partial qpdf JSON v2 file to this PDF.
     pub fn update_from_json_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref().to_path_buf();
-        let input_name = path.display().to_string();
+        let input_name = path_description_bytes(&path);
         let source = open_json_file(&path)?;
         self.update_from_json(source, input_name)
     }
@@ -145,13 +145,13 @@ where
     pub(crate) fn import_json<S>(
         &mut self,
         source: S,
-        input_name: impl Into<String>,
+        input_name: impl AsRef<[u8]>,
         must_be_complete: bool,
     ) -> Result<()>
     where
         S: Read + Seek + 'static,
     {
-        let input_name = input_name.into();
+        let input_name = input_name.as_ref().to_vec();
         // The tokenizer records offsets from its own first byte, not from
         // `source`'s absolute position (see `JsonReactor::with_stream_data_base_offset`),
         // so a caller-supplied reader that starts mid-stream (e.g. JSON
@@ -161,9 +161,9 @@ where
         // read for a `Seek` implementation whose relative `stream_position`
         // fails while absolute seeks still succeed.
         let mut source = source;
-        let base_offset = source
-            .stream_position()
-            .map_err(|error| Error::System(format!("{input_name}: {error}")))?;
+        let base_offset = source.stream_position().map_err(|error| {
+            Error::System(format!("{}: {error}", String::from_utf8_lossy(&input_name)))
+        })?;
         let source = Rc::new(RefCell::new(source));
         let mut reactor = JsonReactor::new(
             self,
@@ -190,13 +190,22 @@ where
         // reported, before any later-and-therefore-qpdf-unreachable parser
         // error `parsed` might carry from continuing past that point.
         if let Some(error) = reactor.fatal_error() {
-            return Err(Error::System(format!("{input_name}: {error}")));
+            return Err(Error::System(format!(
+                "{}: {error}",
+                String::from_utf8_lossy(&input_name)
+            )));
         }
         if let Err(error) = parsed {
-            return Err(Error::System(format!("{input_name}: {error}")));
+            return Err(Error::System(format!(
+                "{}: {error}",
+                String::from_utf8_lossy(&input_name)
+            )));
         }
         if reactor.any_errors() {
-            return Err(Error::System(format!("{input_name}: errors found in JSON")));
+            return Err(Error::System(format!(
+                "{}: errors found in JSON",
+                String::from_utf8_lossy(&input_name)
+            )));
         }
         Ok(())
     }
@@ -204,4 +213,18 @@ where
 
 fn open_json_file(path: &PathBuf) -> Result<File> {
     File::open(path).map_err(|error| Error::file_io("open JSON input", path.clone(), error))
+}
+
+fn path_description_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
 }

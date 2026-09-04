@@ -56,8 +56,8 @@ fn captured_bytes(bytes: &Arc<Mutex<Vec<u8>>>) -> flpdf::Result<Vec<u8>> {
 
 fn append_show_warnings(
     logger: &QPDFLogger,
-    display_name: &str,
-    warnings: &[String],
+    display_name: &[u8],
+    warnings: &[Vec<u8>],
 ) -> flpdf::Result<()> {
     // `flpdf::linearization::show_with_pdf`'s warnings are a mix of two
     // shapes: those already formatted by `linearization_parameter_warning`
@@ -69,17 +69,22 @@ fn append_show_warnings(
     // message (a `display_name` of "first" would wrongly treat that exact
     // message as already qualified). Match the two literal shapes
     // `linearization_parameter_warning` actually produces instead.
-    let qualified_with_paren = format!("{display_name} (");
-    let qualified_with_colon = format!("{display_name}: ");
+    let mut qualified_with_paren = display_name.to_vec();
+    qualified_with_paren.extend_from_slice(b" (");
+    let mut qualified_with_colon = display_name.to_vec();
+    qualified_with_colon.extend_from_slice(b": ");
     for warning in warnings {
-        let warning = if warning.starts_with(&qualified_with_paren)
-            || warning.starts_with(&qualified_with_colon)
+        let mut line = b"WARNING: ".to_vec();
+        if warning.starts_with(&qualified_with_paren) || warning.starts_with(&qualified_with_colon)
         {
-            format!("WARNING: {warning}\n")
+            line.extend_from_slice(warning);
         } else {
-            format!("WARNING: {display_name}: {warning}\n")
-        };
-        logger.warn(warning)?;
+            line.extend_from_slice(display_name);
+            line.extend_from_slice(b": ");
+            line.extend_from_slice(warning);
+        }
+        line.push(b'\n');
+        logger.warn(line)?;
     }
     Ok(())
 }
@@ -95,10 +100,9 @@ fn capture_live_linearization<R: Read + Seek>(
     pdf.set_logger(logger.clone());
     pdf.set_suppress_warnings(false);
 
-    let display_name = String::from_utf8_lossy(filename);
-    let result = show_linearization_pdf_with_warnings(pdf, &display_name)
+    let result = show_linearization_pdf_with_warnings(pdf, filename)
         .map_err(|show_error| Error::System(show_error.to_string()))?;
-    append_show_warnings(&logger, &display_name, &result.warnings)?;
+    append_show_warnings(&logger, filename, &result.warnings)?;
     logger.info(result.dump)?;
 
     *diagnostics_written = pdf.repair_diagnostics().entries().len();
@@ -723,10 +727,10 @@ mod tests {
 
         append_show_warnings(
             &logger,
-            "input.pdf",
+            b"input.pdf",
             &[
-                "input.pdf: named warning".to_owned(),
-                "bare warning".to_owned(),
+                b"input.pdf: named warning".to_vec(),
+                b"bare warning".to_vec(),
             ],
         )
         .expect("append show warnings");
@@ -753,8 +757,8 @@ mod tests {
 
         append_show_warnings(
             &logger,
-            "first",
-            &["first page object (/O) mismatch".to_owned()],
+            b"first",
+            &[b"first page object (/O) mismatch".to_vec()],
         )
         .expect("append show warnings");
 
