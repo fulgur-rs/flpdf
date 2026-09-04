@@ -5985,6 +5985,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             options.deterministic_id,
             split_progress,
             verbose,
+            no_warn,
             writer_configuration(&options, false),
         )?;
         // The intermediate rewrite may already have repaired the condition
@@ -6080,11 +6081,20 @@ fn split_rewritten_pdf(
     deterministic_id: bool,
     progress: bool,
     verbose: bool,
+    suppress_warnings: bool,
     writer_configuration: WriterConfiguration,
 ) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    // qpdf never creates a second job for `--split-pages`: `writeQPDF`
+    // (`QPDFJob.cc:483-503`) calls `doSplitPages` on `this` and gates
+    // "operation succeeded with warnings" on the same `m->suppress_warnings`
+    // used everywhere else. flpdf's split path uses a fresh `QPDFJob`
+    // instead, so that job's own suppression must be set explicitly, and
+    // before `split_pages` runs so warnings raised during the split itself
+    // are suppressed too, not only the final summary line.
+    job.set_suppress_warnings(suppress_warnings);
     let input_name = input_path.to_string_lossy().into_owned();
     let mut pdf = job.open(Cursor::new(bytes), input_name, PdfOpenOptions::default())?;
     if progress {
@@ -6200,6 +6210,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     }
 
     if let Some(n) = split_pages.filter(|size| *size > 0) {
+        let suppress_warnings = pdf.suppress_warnings();
         let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
@@ -6209,6 +6220,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             options.deterministic_id,
             split_progress,
             verbose,
+            suppress_warnings,
             writer_configuration(&options, false),
         )?;
         // The intermediate rewrite may already have repaired the condition
@@ -7993,20 +8005,27 @@ fn run_copy_attachments_from(
 
     // Open the source with its own password (independent of the target's).
     // Retain the command-wide open policy so qpdf's recovery/xref controls
-    // apply to this secondary input exactly as they do to the target.
+    // apply to this secondary input exactly as they do to the target. This
+    // uses a standalone open rather than `job.open_with_description`, since
+    // qpdf's own `doCopyAttachments` (`QPDFJob.cc:2100`) opens the donor as
+    // its own local `QPDF` independent of `this->pdf`
+    // (`processFile(other, ...)`), not through the job's single main-input
+    // slot: routing the donor through the job here would overwrite its
+    // `input_name` with the donor's path, misattributing a later
+    // `copy_attachments` "already has attachments with keys that conflict"
+    // error (which reports `self.input_name()`, matching qpdf's
+    // `pdf.getFilename()` at `QPDFJob.cc:2127`) to the donor instead of the
+    // target.
     let mut source_password = password.clone();
     source_password.password = None;
     source_password.password_file = None;
-    let src_options =
+    let mut src_options =
         pdf_open_options_with_password_bytes(repair, &source_password, args.password.clone());
+    configure_document_logger(&mut src_options, &args.file);
+    src_options.suppress_warnings |= suppress_warnings;
     let src_file =
         File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
-    let mut src = job
-        .open_with_description(
-            BufReader::new(src_file),
-            path_description(&args.file),
-            src_options,
-        )
+    let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
     src.root_handle()
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;

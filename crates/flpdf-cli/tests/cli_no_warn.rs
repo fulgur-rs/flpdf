@@ -419,3 +419,51 @@ fn json_input_no_warn_matches_qpdf_for_an_import_warning() {
         .windows(b"WARNING:".len())
         .any(|window| window == b"WARNING:"));
 }
+
+/// `--split-pages` builds its own `QPDFJob` for each split output
+/// (`crates/flpdf-cli/src/main.rs::split_rewritten_pdf`) rather than reusing
+/// the job that opened the input, unlike qpdf's `writeQPDF`
+/// (`QPDFJob.cc:483-503`), which calls `doSplitPages` on the same job that
+/// applied `noWarn`. That fresh job's own suppression must be threaded
+/// through explicitly or the "operation succeeded with warnings" summary
+/// (and any warning raised during the split itself) leaks past `--no-warn`.
+#[test]
+fn split_pages_no_warn_matches_qpdf_for_a_warning_bearing_source() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = write_corrupt_xref_with_page(temp.path(), "input.pdf");
+    let input = input.to_str().expect("input path is UTF-8");
+
+    let qpdf_dir = temp.path().join("qpdf-split");
+    let flpdf_dir = temp.path().join("flpdf-split");
+    std::fs::create_dir(&qpdf_dir).expect("qpdf split dir");
+    std::fs::create_dir(&flpdf_dir).expect("flpdf split dir");
+    let qpdf_template = qpdf_dir.join("out%d.pdf");
+    let flpdf_template = flpdf_dir.join("out%d.pdf");
+
+    let qpdf = run_qpdf(&[
+        "--no-warn",
+        input,
+        "--split-pages",
+        "--",
+        qpdf_template.to_str().expect("qpdf template is UTF-8"),
+    ]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--no-warn", input, "--split-pages", "--"])
+        .arg(&flpdf_template)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert!(qpdf.stdout.is_empty());
+    assert!(qpdf.stderr.is_empty());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(qpdf_dir.join("out1.pdf").exists());
+    assert!(flpdf_dir.join("out1.pdf").exists());
+}

@@ -974,3 +974,68 @@ fn plain_listing_is_one_line_per_attachment() {
     assert_listing_matches_qpdf(&with_attachment, &["--list-attachments"]);
     assert_listing_matches_qpdf(&with_attachment, &["--list-attachments", "--verbose"]);
 }
+
+/// `--copy-attachments-from`'s "already has attachments with keys that
+/// conflict" error must name the target document, matching qpdf's
+/// `pdf.getFilename()` (`QPDFJob.cc:2127`) -- `pdf` there is qpdf's own main
+/// input, never the donor opened separately via `processFile(other, ...)`.
+/// The donor must be opened independent of the job's single main-input slot,
+/// or a later error referencing `self.input_name()` misattributes the
+/// conflict to the donor instead of the target.
+#[test]
+fn copy_attachments_conflict_error_names_the_target_not_the_donor() {
+    let temp = tempfile::tempdir().unwrap();
+    let target_input = minimal_pdf_temp();
+    let donor_input = minimal_pdf_temp();
+    let target_attachment = temp.path().join("target-attachment.txt");
+    let donor_attachment = temp.path().join("donor-attachment.txt");
+    std::fs::write(&target_attachment, b"target payload").unwrap();
+    std::fs::write(&donor_attachment, b"donor payload").unwrap();
+
+    let target_pdf = temp.path().join("target.pdf");
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--add-attachment",
+            target_attachment.to_str().unwrap(),
+            "--key=dupkey",
+            "--",
+            target_input.path().to_str().unwrap(),
+        ])
+        .arg(&target_pdf)
+        .assert()
+        .success();
+
+    let donor_pdf = temp.path().join("donor.pdf");
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--add-attachment",
+            donor_attachment.to_str().unwrap(),
+            "--key=dupkey",
+            "--",
+            donor_input.path().to_str().unwrap(),
+        ])
+        .arg(&donor_pdf)
+        .assert()
+        .success();
+
+    let output = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            target_pdf.to_str().unwrap(),
+            "--copy-attachments-from",
+            donor_pdf.to_str().unwrap(),
+            "--",
+        ])
+        .arg(temp.path().join("output.pdf"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("target.pdf already has attachments with keys that conflict"),
+        "the conflict error must name the target file, not the donor: {stderr:?}"
+    );
+}
