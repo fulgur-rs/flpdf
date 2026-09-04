@@ -358,4 +358,18 @@ mod tests {
         assert_eq!(decode_pdf_text_string(&[0xff, 0xfe, 0x00]), None);
         assert_eq!(decode_pdf_text_string(&[0xfe, 0xff, 0xd8, 0x00]), None);
     }
+
+    #[test]
+    fn decode_pdf_text_string_falls_back_to_pdfdoc_encoding_without_a_bom() {
+        assert_eq!(
+            decode_pdf_text_string(b"plain ascii"),
+            Some("plain ascii".into())
+        );
+        // PDFDocEncoding (ISO 32000-1 Annex D.3) diverges from Latin-1 in the
+        // 0x18-0x1F range: 0x18 is BREVE, not the C0 control character U+0018.
+        assert_eq!(decode_pdf_text_string(&[0x18]), Some("\u{02D8}".into()));
+        // 0xA0..=0xFF otherwise follows ISO-8859-1, so 0xE9 decodes to 'é'.
+        assert_eq!(decode_pdf_text_string(&[0xe9]), Some("é".into()));
+        assert_eq!(decode_pdf_text_string(b"caf\xe9"), Some("café".into()));
+    }
 }
