@@ -154,7 +154,8 @@ class Checker:
         pattern = re.compile(
             rf"\b{DECLARATION_KEYWORDS}\s+{escaped}\b"
             rf"|^\s*(?:pub(?:\([a-z]+\))?\s+)?{escaped}\s*:"
-            rf"|^\s*{escaped}\s*(?:[,({{]|$)",
+            rf"|^\s*{escaped}\s*(?:[,({{]|$)"
+            rf"|\blet\s+(?:mut\s+)?{escaped}\b",
             re.MULTILINE,
         )
         if pattern.search(self._text(target)) is None:

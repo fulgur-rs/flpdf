@@ -5,7 +5,11 @@
 `scripts/check-qpdf-route-matrix.py --check` でファイル・行範囲・識別子の実在を検証する。
 **関連:** [`docs/qpdf-correspondence.md`](../qpdf-correspondence.md)（責務対応表。本表はその上に
 「経路（route）」軸を足したもので、対応表の行を置き換えない）/ Beads `flpdf-3yn9.41`（親 epic `flpdf-3yn9`）
-**調査日:** 2026-09-04（main `8fd1a2bf` + in-flight PR #1486 の writer 差分を含む）
+**調査日:** 2026-09-04（flpdf 側の行番号引用の基準は main `8fd1a2bf`。作成中に in-flight だった
+PR #1486 は同日に merge 済みで、本ブランチの rebase 後は `object_handle.rs` / `reader/resolver.rs` /
+`writer.rs` / `nntree.rs` 等の行番号が最大数十行ずれる。`scripts/check-qpdf-route-matrix.py` は
+ファイルと行範囲の実在・識別子の宣言のみを検証し、行の中身の一致は検証しないので、行番号は
+対応表と同じくスナップショットとして読み、cutover slice が各行に触るときに再アンカーする）
 
 ## 1. 目的
 
@@ -524,8 +528,8 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 68 (26 files) / test 1254
 素の leaf 一致とは一致しない。以下は乖離が意味を持つものだけを挙げる。
 **既定では tracker が正**（1 つの規約で再測定できるのはこちらだけ）。行側が正になるのは
 leaf が曖昧なときと、tracker の行ベース heuristic が構造的に誤るときの 2 つ。これに加えて
-D29 のように symbol が main に存在せず（PR #1486 のみ）行セルも tracker も「どちらでもない」
-と判定する行が 1 つある。表の行数は 25（E-9 が 2 symbol で 2 行を占めるため、行 ID の
+D29 のように計測時点では symbol が main に存在しなかった（PR #1486、2026-09-04 に merge 済み）ため
+行セルも tracker も「どちらでもない」と判定した行が 1 つある。表の行数は 25（E-9 が 2 symbol で 2 行を占めるため、行 ID の
 異なり数は 24）。
 
 | 行 | symbol（leaf） | 行セル prod | tracker prod | 乖離の理由 | 今後どちらを正とするか |
@@ -546,7 +550,7 @@ D29 のように symbol が main に存在せず（PR #1486 のみ）行セル�
 | D16 | `EncryptionContext` | 22 | 21 | 合計だけでなくファイル別内訳も一致しない（`writer.rs` 13→12、`linearization/writer.rs` 6→7、`writer/encrypted_strings.rs` 3→2）。除外規則（宣言行 / `use` 行 / `impl` ヘッダ）の適用差 | tracker |
 | D19 | `write_linearized` | 0 | 1 | **tracker が構造的に誤る唯一の例**。`crates/flpdf/src/linearization/writer.rs:3673` は複数行にまたがる文字列リテラルの継続行で、`mask_strings` が行単位のため文字列内と判定できない | **行**（prod 0 が正しい。`--expect-zero` はこの 1 件のせいで永久に失敗するので、D19 の完了判定は tracker ではなく行の列挙で行う） |
 | D30 | `write_qpdf_to_memory` | 0 | 2 | tracker の 2 件は `crates/flpdf-cli/src/main.rs:5806` と `:6021` で、**行が明記している同名の別関数**（CLI ローカルの `write_qpdf_to_memory`）の呼び出し | **行**（leaf が 2 つの別関数に衝突している。`--expect-zero` は使えない） |
-| D29 | `qpdf_preserve_source_objstm` | 1 | 0 | この識別子は PR #1486 の diff にのみ存在し、main（本 worktree）には無い | どちらでもない。**0 は「cutover 済み」ではなく「未マージ」** |
+| D29 | `qpdf_preserve_source_objstm` | 1 | 0 | §6.2 の計測時点（HEAD `0f4f5e7c`）では PR #1486 の diff にのみ存在し main に無かった。#1486 は 2026-09-04 に merge 済み（`35233ba3`）で、rebase 後の本 worktree では `crates/flpdf/src/writer.rs:3919,3997` に存在する | tracker（merge 後の再計測で 1 になる。**§6.2 の 0 は「cutover 済み」ではなく「計測が merge 前」**） |
 | E-5 | `split_pages` | 2 | 23 | leaf が `QPDFJob::split_pages` メソッドと `configuration.split_pages` フィールド（`crates/flpdf/src/job/lifecycle.rs:191`）に衝突 | 行（leaf が曖昧）。tracker の 23 は分母としてのみ読む |
 | E-9 | `format_attachment_list_with_sink` | 0 | 2 | **行の事実誤り**。E-9 は 4 つの free 関数を一括して「`src/` に prod caller が 1 つも無い」と書いたが、この 1 つには `crates/flpdf/src/job/attachments.rs:344` と `crates/flpdf/src/job/attachment_list.rs:239` の production 呼び出しがある（`format_attachment_list` と `list_attachment_info` は prod 0 で正しい） | **tracker**（行を訂正すべき。この symbol は他の 3 つと同じ「caller ゼロの削除候補」ではない） |
 | E-9 | `list_attachments` | 1 | 10 | leaf が `QPDFJob::list_attachments` の呼び出し以外（`crates/flpdf-cli/src/main.rs` 4 件の引数処理、`crates/flpdf/src/job/lifecycle.rs` 6 件の configuration フィールド参照）にも一致する | 行（leaf が曖昧） |
@@ -618,7 +622,7 @@ A ファイルがその単純化は `object_handle.rs`（桁 0 の `#[cfg(test)]
 | 候補（行） | tracker prod / test | 今日観測できる乖離（probe 証拠） | 絡み（同時に触ってはいけない行） | 判定 |
 |---|---|---|---|---|
 | **D27** `crates/flpdf/src/writer/reachability.rs::sweep_unreachable_objects` | 3 / 3 | **あり。** `probe: qpdf --static-id --preserve-unreferenced --remove-unreferenced-resources=yes --pages . 1 -- two.pdf q.pdf` と flpdf 同等呼び出しの `cmp` → `q.pdf 967 バイト / f.pdf 697 バイト、differ: byte 145`。詳細は §7.3 | A14（consumer 1 つを持つ）、D2（置換先の到達性）。`sweep_unreachable_objects_except`（別 leaf、`crates/flpdf/src/job/page_merge.rs:1224`）は非対象 | **採用**（§7.3） |
-| A14 `crates/flpdf/src/reader.rs::Pdf::delete_object` | 2 / 8 | あり（D27 と同一 probe）。ただし **単独では閉じない** — `Pdf::delete_object` を qpdf の `replaceObject(og, newNull())`（`libqpdf/QPDF.cc:1985-1993`）へ寄せても、swept された非参照 object は `null` として出力されるだけで、qpdf が中身ごと保存する（`libqpdf/QPDFWriter.cc:2909-2914`）のとは一致しない | A2 / A15 / A24 / A13（tombstone 台帳・同期層・ObjStm 昇格。§5.A の第 3 行） | D27 の**次**。D27 完了で prod 2→1 になり 1 consumer だけの slice になる |
+| A14 `crates/flpdf/src/reader.rs::Pdf::delete_object` | 2 / 8 | あり（D27 と同一 probe）。ただし **単独では閉じない** — `Pdf::delete_object` を qpdf の `replaceObject(og, newNull())`（`libqpdf/QPDF.cc:1985-1993`）へ寄せても、swept された非参照 object は `null` として出力されるだけで、qpdf が中身ごと保存する（`libqpdf/QPDFWriter.cc:2909-2914`）のとは一致しない | A2 / A15 / A24 / A13（tombstone 台帳・同期層・ObjStm 昇格。§5.A の第 3 行） | D27 の**次**だが、D27 完了後も `crates/flpdf/src/writer/reachability.rs:63`（非対象の `sweep_unreachable_objects_except` の内側）が残るため prod は 2 のまま。`_except` の撤去（§7.2.4 writer family、D3/D11 の後）が終わって初めて `crates/flpdf/src/signatures.rs` 1 consumer の slice になる |
 | E-29 `crates/flpdf/src/job/lifecycle.rs::QPDFJob::open` | 行の数え方で prod 5 / test 6（§6.3 E-29 — leaf `open_document` は無関係な同名フィールドに衝突する） | **あり。** `probe: qpdf --no-warn --show-npages selfprev.pdf` → `1` のみ（exit 3）。flpdf 同等 → `WARNING:` 3 行 + `flpdf: operation succeeded with warnings` + `1`（exit 3）。`--check` 経路（`QPDFJob::open_document` 側）は正しく抑止される | なし（1 行の `suppress_warnings` OR 追加。`libqpdf/QPDFJob.cc:663-665`） | job family の 1 手目（§7.2）。**最初の cutover にはしない** — canonical owner が `absent` で 5 つの prod caller は残るべきものなので `--expect-zero` を当てる leaf が無い |
 | B14 `crates/flpdf/src/xref.rs::parse_xref_from_start` | 3 / 6 | **観測できず。** `probe:` 自分の startxref を指す `/Prev` を持つ 1 section PDF で `qpdf --check` / `flpdf --check` → 双方とも `file is damaged` / `loop detected following xref tables` / `Attempting to reconstruct cross-reference table` の 3 行・同順・exit 3。B14 が予測する診断の二重 push は現れない | なし（単一ファイル `crates/flpdf/src/xref.rs`） | 保留。RED が立たない。B-P1 は「二重 push は起きない」で決着させ、行の主張を弱める（§7.4 の後続 issue） |
 | C22 `crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe` | 2 / 0 | **観測できず（CLI 経路では）。** `probe: qpdf --static-id --normalize-content=y [--linearize] two.pdf` と flpdf 同等 → plain / `--linearize` の双方で byte 一致。早期 return を踏むには token filter 登録が要り、それは CLI から到達しない（C-U3 は library harness を要求する） | C20 / C21（canonical。順序を壊さないこと） | 保留。harness を先に作る（§7.2 stream family の 3 手目） |
@@ -647,8 +651,9 @@ warning の flush 位置（B27 / E-7）の問題である。
 2. **A15 / A24** — A2 の同期層（`crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref`）と
    ObjStm メンバー昇格経路。1 が終われば消える。単独では畳めない。
 3. **A9 / A10 / A11** — 列挙 3 本と採番。
-4. **A13 / A14 / A17** — tombstone に触る変異 API。**A14 は本節の最初の cutover（§7.3）で
-   prod 2→1 になっているので、ここでは `crates/flpdf/src/signatures.rs` の 1 consumer だけを扱う。**
+4. **A13 / A14 / A17** — tombstone に触る変異 API。**A14 は D27（§7.3）と
+   `sweep_unreachable_objects_except` の撤去（§7.2.4）の両方が終わって初めて
+   `crates/flpdf/src/signatures.rs` の 1 consumer になる。それまでは着手しない。**
 5. **A6 → A7** — 非解決アクセサ族を `try_*` 族へ寄せてから `crates/flpdf/src/reader.rs::Pdf::resolve` を落とす。
    逆順にはできない。
 6. **A20** — teardown walk 2 本の統合。bootstrap 構造（A1）が 1 に依存する。
@@ -751,7 +756,7 @@ qpdf 呼び出し順を壊さない理由: §5.D 第 1 行（採番は enqueue �
 5. **E-9 / E-24 / E-26 / E-14** — 可視性と命名の debt。前提: `flpdf-xsq1` / `flpdf-7bkv` / `flpdf-ei0h`。
    4 が終わるまで `RotateSpec` は `pub(crate)` に落とせない。
 
-qpdf 呼び出し順を壊さない理由: §5.E 第 3 行（入力は必ず `doProcessOnce` 経由で開き、
+qpdf 呼び出し順を壊さない理由: §5.E 第 4 行（入力は必ず `doProcessOnce` 経由で開き、
 `QPDF` 構築直後に `setQPDFOptions` を適用してから読む）が 1 を最初に置く理由で、
 読み込み側の option 適用が 3 経路で違ったままだと 3 / 4 の統合後にどの経路の挙動が正だったか
 判別できなくなる。§5.E 第 1 行（`run()` は `createQPDF` → `writeQPDF` の 2 呼び出しだけ）と
@@ -768,7 +773,7 @@ production consumer 3 つすべて。**この順で着手する** — oracle 付
 |---|---|---|---|
 | 1 | `crates/flpdf/src/job/page_subset.rs:103`（`QPDFJob::prune_after_subset` の中） | 単一 source `--pages`。**CLI から到達する唯一の consumer**で、RED はここで立つ | あり（下の RED + control 2 本） |
 | 2 | `crates/flpdf/src/embedded_files.rs:338`（`remove_attachment`） | library 専用。CLI の `--remove-attachment` は `remove_embedded_file` を直接呼ぶ（`crates/flpdf-cli/src/main.rs:7624`）ので、この経路を通らない | あり。qpdf の `removeEmbeddedFile` は name tree から外して `replaceObject(og, newNull())` を呼ぶだけ（`libqpdf/QPDFEmbeddedFileDocumentHelper.cc:105-121`）。sweep を通らない CLI 経路は既に一致する — `probe: qpdf --static-id --preserve-unreferenced --remove-attachment=att with-att.pdf` と flpdf 同等 → **双方 753 バイトで byte 一致**。これが consumer 2 の control |
-| 3 | `crates/flpdf/src/page_extract.rs:218`（`extract_pages`） | library 専用。`crates/flpdf-cli/src/main.rs` からの呼び出しは無い | **なし。** `extract_pages` は qpdf に対応物のない flpdf 固有のライブラリ機能（`.claude/rules/qpdf-port-design-patterns.md` 8 の根拠 3）で、sweep 撤去の正当化は「この pass 自体が qpdf 非対応（D27）で、writer の enqueue walk が同じ判定を内包する」という一般論だけになる。さらに `crates/flpdf/src/lib.rs` 冒頭 doc が `extract_pages` を「returns a *minimal* new document」と規定しており、rebuild 由来の孤児を残すことはその記述と矛盾する。**同じスライスの中で「別手段で minimal を保つ」か「doc を改める」かを決める**こと。決めずに撤去しない |
+| 3 | `crates/flpdf/src/page_extract.rs:218`（`extract_pages`） | library 専用。`crates/flpdf-cli/src/main.rs` からの呼び出しは無い | **なし。** `extract_pages` は qpdf に対応物のない flpdf 固有のライブラリ機能（`.claude/rules/qpdf-port-design-patterns.md` 8 の根拠 3）で、sweep 撤去の正当化は「この pass 自体が qpdf 非対応（D27）で、writer の enqueue walk が同じ判定を内包する」という一般論だけになる。さらに sweep を約束している doc が 2 箇所ある: `crates/flpdf/src/page_extract.rs:78-81`（「mark-and-sweep from the new catalog removes any other unreachable construction objects」）と `crates/flpdf/src/embedded_files.rs:315-319`（sweep が「qpdf の complete-rewrite 挙動に一致する」— 本節の oracle と矛盾）。`crates/flpdf/src/lib.rs:70-74` の「minimal」は catalog レベルの navigation（`/Outlines` 等）を含めないことを指し、sweep には依存しない。**同じスライスで両 doc を改める**。「別手段で minimal を保つ」案は qpdf に対応物のない中間機構になり §7.1 の基準 2 に反するので採らない |
 
 **明示的な非対象**:
 
@@ -818,15 +823,18 @@ flpdf の pre-write sweep はこのどれにも対応しない追加処理で、
   中身ごと保存する（object 10 個）のに対し、flpdf 側はその 3 つが出力に存在しない（object 6 個）。
 - **cutover 後の期待値がこの qpdf 出力であることの裏取り（control 2 本）**:
   1. `probe: qpdf --static-id --preserve-unreferenced --pages . 1 -- two.pdf` と flpdf 同等
-     （`--remove-unreferenced-resources` を省略 = 既定 `auto` → このフィクスチャでは
-     `RemoveUnreferencedResources::No` に落ちて sweep が走らない）→ **双方 967 バイトで byte 一致**。
-     つまり「sweep を走らせない」ことが即ち qpdf 一致である。
+     （`--remove-unreferenced-resources=no` を明示する。既定 `auto` もこの fixture では `No` に落ちる —
+     `crates/flpdf/src/job/page_specs.rs:191-197`。`no`/`auto` では `prune_after_subset` が早期 return し、
+     `/Resources` の刈り込みと sweep が同時に止まる）→ **双方 967 バイトで byte 一致**。
+     つまり sweep を走らせない経路では、preserved orphan の採番・出力が既に qpdf と一致している
+     （control 1 と 2 を合わせて、撤去後の期待値が qpdf 出力であることを裏取りする）。
   2. `probe: qpdf --static-id --remove-unreferenced-resources=yes --pages . 1 -- two.pdf` と flpdf 同等
      （`--preserve-unreferenced` なし）→ **双方 697 バイトで byte 一致**。
      sweep は `--preserve-unreferenced` を付けたときにしか観測されない = 撤去の影響範囲が
      この 1 フラグに限られる。
 - fixture はまだリポジトリに無い。本 cutover の issue が `tests/fixtures/` へ追加し、
-  byte test を `.github/workflows/ci.yml` の bytes-identical テスト列挙へ手で足す
+  byte test を `crates/flpdf/tests/cmp_preserve_unreferenced_sweep_tests.rs`（新規、`qpdf-zlib-compat`
+  gated）に置き、`.github/workflows/ci.yml` の bytes-identical テスト列挙へ手で足す
   （feature gate されたテストは列挙しないと CI で走らない）。
 
 #### 完了判定
@@ -847,9 +855,11 @@ flpdf の pre-write sweep はこのどれにも対応しない追加処理で、
 #### 次の cutover へ進む条件
 
 1〜3 がすべて満たされ、かつ
-`python3 scripts/qpdf-route-callers.py --root . --symbol delete_object` が
-`prod 1 (1 files)`（`crates/flpdf/src/signatures.rs` のみ）を返すこと。
-これが確認できたら A14 が 1 consumer だけの slice になるので、§7.2.1 の 4 を次に着手する
+`python3 scripts/qpdf-route-callers.py --root . --symbol sweep_unreachable_objects_except` が
+`prod 1 (1 files)`（`crates/flpdf/src/job/page_merge.rs` のみ）を返すこと。
+`delete_object` は `crates/flpdf/src/writer/reachability.rs:63`（非対象 `_except` の内側）が残るため
+prod 2 のままなので、A14（§7.2.1 の 4）は `_except` の撤去（§7.2.4）の後に着手する。D27 の直後は、
+D27 と独立に進められる hygiene 2 slice（§7.4）と E-29（§7.2.6 の 1）を並行させる
 （qpdf の `QPDFAcroFormDocumentHelper::disableDigitalSignatures` は `/FT` `/V` `/SV` `/Lock` の
 キーを消すだけで signature dictionary を削除しない、`libqpdf/QPDFAcroFormDocumentHelper.cc:418-439`）。
 逆に 1 が満たせない（consumer 2 / 3 の test 移行が想定より重い）と分かった時点で手を止め、
@@ -930,3 +940,4 @@ A は接頭辞なしの `1`–`4`。本節では領域接頭辞を付けて `A-1
 | **X-5** | writer 側 data key が D では canonical、C では mixed | **D17 は `canonical`**（`crates/flpdf/src/writer/encryption_state.rs::WriterEncryptionState` が set / unparse / clear の順序を写す）。**C18 は `mixed`**（その中で呼ばれる `compute_data_key` が reader 側の複製） | 両立する（順序は 1 本、鍵計算が 3 本）。ただし **D17 だけを読むと writer の暗号化が片付いて見える**。C-U4 の等価テストは D17 の cutover の前提になる |
 | **X-6** | 5 ファイルの caller 数え方の細則が一致していない | **A ファイル**は「D の『モジュール直下の最初の `#[cfg(test)] mod` より前＝prod』という単純化は本領域では使えない」と明記する（`object_handle.rs` は桁 0 の `#[cfg(test)] mod` を 21 個持ち間に production コードが挟まる）。**D ファイル**はその単純化を採用している。B / C / E はさらに別の細則を書いている | `scripts/qpdf-route-callers.py` は A 側の brace 追跡規約を実装している。**以降の再測定は tracker を唯一の規約とする**（§6）。D の行セルが tracker と最も乖離するのはこの差が原因（§6.3） |
 | **X-7** | 「responsibility に qpdf 対応物がある」と「route に qpdf 対応物がある」の区別が領域で揃っていない | **C ファイル**は末尾で明示的に区別し、C23 を「責務には対応物があるが経路には無い」`bridge` に置く。**A ファイル**の A14（`Pdf::delete_object`）も同型だが、区別の宣言は無い。**D ファイル**は D27（`sweep_unreachable_objects`、モジュール doc 自身が「qpdf's writer does not have a separate delete pass」と明記）を `bridge` ではなく `mixed` に置いている | 分類の再検討ではなく、**Task 7 が「削除できる route」を数えるときに D27 が bridge 側に数えられていない**ことを承知して進める。D-U5 が同じ点を別角度から挙げている |
+| **X-8** | open 時 warning の出力位置（B27 / E-7 のどちらにも未記録。Task 7 の probe で判明） | **qpdf** は `processFile` 中に warning を即時に logger へ出すので `checking <file>` の**前**に並ぶ。**flpdf** は `checking <file>` の**後**に出す（probe: 自 startxref を指す `/Prev` fixture で `qpdf --check` / `flpdf --check`。Task 7 と §7 review で 2 回再現。warning 本文・件数・順序・exit code 3 は一致し、位置だけが違う） | B27 / E-7 の行に「flush 位置」を追加し、`QPDFJob::doCheck`（`libqpdf/QPDFJob.cc:744-803`）と `crates/flpdf/src/job/check.rs` の出力順を突き合わせる。E-29（`--no-warn` 未適用）の後続として扱う |

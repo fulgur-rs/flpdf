@@ -239,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
         if failing:
             print("FAILED: production callers remain for: " + ", ".join(f"{s}: prod {totals[s].prod}" for s in failing))
             return 1
+        # A symbol with no occurrence at all passes vacuously: it may have been
+        # deleted (the intended end state) or misspelled. Say so, so the gate
+        # cannot be mistaken for evidence that the route was ever tracked.
+        absent = [symbol for symbol, c in totals.items() if c.prod == 0 and c.test == 0]
+        if absent:
+            print("note: no occurrence at all (deleted, or misspelled?): " + ", ".join(absent))
         print("OK: no production callers remain")
     return 0
 

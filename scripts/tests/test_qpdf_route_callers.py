@@ -166,6 +166,12 @@ class ManifestAndGate(unittest.TestCase):
 
             only_dead = run(root, "--symbol", "dead_fn", "--expect-zero")
             self.assertEqual(0, only_dead.returncode, only_dead.stdout + only_dead.stderr)
+            self.assertNotIn("no occurrence at all", only_dead.stdout)
+
+            absent = run(root, "--symbol", "never_existed", "--expect-zero")
+            self.assertEqual(0, absent.returncode, absent.stdout + absent.stderr)
+            self.assertIn("no occurrence at all", absent.stdout)
+            self.assertIn("never_existed", absent.stdout)
 
     def test_missing_manifest_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as t:

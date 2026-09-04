@@ -10,10 +10,11 @@ shared plain pipeline と legacy coordinator の分岐）、`writer/rewrite_renu
 `writer/encrypted_strings.rs`、`writer/pclm.rs`、`linearization/{writer,renumber,plan}.rs`、
 `optimization.rs`。
 
-**in-flight:** PR #1486（`flpdf-hi08`、`feature/flpdf-hi08-encrypted-preserve-objstm`）が
-`crates/flpdf/src/writer.rs` の legacy coordinator を変更中。本表は main（`8fd1a2bf`）+ #1486 を
-記述し、#1486 由来の行・注記に `(#1486)` を付ける。worktree の `writer.rs` 自体は main の内容
-（#1486 未適用）なので、`(#1486)` 行の行番号は diff 適用前の main の位置を指す。
+**PR #1486（`flpdf-hi08`、`feature/flpdf-hi08-encrypted-preserve-objstm`）は 2026-09-04 に
+merge 済み（`35233ba3`）。** 本表の作成時は in-flight だったため main（`8fd1a2bf`）+ #1486 として
+記述し、#1486 由来の行・注記に `(#1486)` を残している。`crates/flpdf/src/writer.rs` の行番号引用は
+作成時の main（`8fd1a2bf`、#1486 未適用）を基準にしており、#1486 の merge で `writer.rs:3888` 以降は
+最大で数十行ずれる。引用の再アンカーは本表の保守項目（README §8 参照）。
 
 **caller の数え方（本ファイル共通）:** `rg -n '\b<leaf>\b' crates --glob '*.rs'` の出力から
 次の 5 種を除いた残りを、`src/` のモジュール直下 `#[cfg(test)] mod …` より前＝`prod`、

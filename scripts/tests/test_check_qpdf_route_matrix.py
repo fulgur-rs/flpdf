@@ -34,7 +34,8 @@ class SyntheticRepository:
             "impl<R> Pdf<R> {\n    pub fn resolve(&mut self) {}\n}\n"
             "pub(crate) struct ObjectCache;\n"
             "pub struct Pdf {\n    pub(crate) legacy_state_synced: bool,\n}\n"
-            "pub enum CacheEntry {\n    Resolved(u8),\n    Deleted,\n}\n",
+            "pub enum CacheEntry {\n    Resolved(u8),\n    Deleted,\n}\n"
+            "fn gate() {\n    let qpdf_gate_flag = true;\n    let _ = qpdf_gate_flag;\n}\n",
             encoding="utf-8",
         )
         (root / "docs" / "qpdf-route-matrix").mkdir(parents=True)
@@ -181,7 +182,8 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
                 HEADER
                 + "| 1 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::Pdf::legacy_state_synced` | z | bridge | w | - |\n"
                 "| 2 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::CacheEntry::Deleted` | z | mixed | w | - |\n"
-                "| 3 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::CacheEntry::Resolved` | z | mixed | w | - |\n",
+                "| 3 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::CacheEntry::Resolved` | z | mixed | w | - |\n"
+                "| 4 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::qpdf_gate_flag` | z | mixed | w | - |\n",
             )
             result = repo.check()
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
