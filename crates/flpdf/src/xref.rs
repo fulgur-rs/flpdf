@@ -2879,15 +2879,18 @@ fn is_recovered_null_candidate(completed: &HandleFileObjectRead) -> bool {
     completed.object.is_null() && !completed.diagnostics.is_empty()
 }
 
-/// Commit the accepted candidate read: record its diagnostics, then cache
-/// the parsed handle unless the read only recovered a null.
+/// Commit the accepted candidate read: record its diagnostics and cache the
+/// parsed handle. A recovered null is cached as well -- qpdf's `resolve`
+/// caches the null it substitutes for a failed read (`QPDF.cc:1738-1748`),
+/// so a later reference to the object neither re-reads it nor repeats its
+/// diagnostics; the caller's `/Type /XRef` check is what excludes it as a
+/// candidate.
 fn commit_xref_candidate(
     context: &mut XrefReadContext,
     completed: HandleFileObjectRead,
     offset: u64,
     object_ref: ObjectRef,
 ) -> Option<ObjectHandle> {
-    let reject_recovered_null = is_recovered_null_candidate(&completed);
     for diagnostic in completed.diagnostics {
         context.diagnostics.push(xref_file_object_diagnostic(
             XrefObjectDescription::Ordinary,
@@ -2895,9 +2898,6 @@ fn commit_xref_candidate(
             offset,
             diagnostic,
         ));
-    }
-    if reject_recovered_null {
-        return None;
     }
     let canonical = context.document.handle_for_reference(object_ref);
     let value = completed.object.into_direct_value()?.0;
@@ -5207,6 +5207,29 @@ mod final_handle_tests {
                 .expect("a well-framed object is read before it is committed");
         assert!(context.diagnostics.entries().is_empty());
         assert!(commit_xref_candidate(&mut context, completed, 0, ObjectRef::new(1, 0)).is_some());
+        assert!(!context.diagnostics.entries().is_empty());
+
+        let bytes = b"1 0 obj\n<< /Info (unterminated";
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+        let completed =
+            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(1, 0))
+                .expect("a truncated object is recovered as a null read");
+        assert!(is_recovered_null_candidate(&completed));
+        // qpdf caches the null it substitutes for a failed read
+        // (`QPDF.cc:1738-1748`); the recovered null stays cached so a later
+        // reference neither re-reads the object nor repeats its diagnostics.
+        let cached = commit_xref_candidate(&mut context, completed, 0, ObjectRef::new(1, 0))
+            .expect("a recovered null is still committed to the cache");
+        assert!(cached.is_null());
+        assert!(context.cache.get(&ObjectRef::new(1, 0)).is_some());
         assert!(!context.diagnostics.entries().is_empty());
 
         let malformed = vec![b'['; crate::parser::MAX_PARSE_DEPTH + 1];
