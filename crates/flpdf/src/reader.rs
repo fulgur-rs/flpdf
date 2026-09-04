@@ -218,7 +218,10 @@ pub struct PdfOpenOptions {
     /// [`Pdf::repair_diagnostics`].
     pub suppress_warnings: bool,
     /// Input-source description used in qpdf-compatible warning prefixes.
-    pub description: String,
+    ///
+    /// qpdf's `InputSource` name is a byte-preserving `std::string`; keep raw
+    /// bytes here so warning output can reproduce non-UTF-8 Unix paths.
+    pub description: Vec<u8>,
 }
 
 impl Default for PdfOpenOptions {
@@ -236,7 +239,7 @@ impl Default for PdfOpenOptions {
             password_is_hex_key: false,
             logger: None,
             suppress_warnings: false,
-            description: String::new(),
+            description: Vec::new(),
         }
     }
 }

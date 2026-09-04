@@ -867,7 +867,7 @@ mod tests {
 
     fn non_dictionary_root_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let options = PdfOpenOptions {
-            description: "bad-root.pdf".to_owned(),
+            description: b"bad-root.pdf".to_vec(),
             suppress_warnings: true,
             ..PdfOpenOptions::default()
         };
@@ -881,7 +881,7 @@ mod tests {
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let options = PdfOpenOptions {
-            description: "minimal.pdf".to_owned(),
+            description: b"minimal.pdf".to_vec(),
             suppress_warnings: true,
             ..PdfOpenOptions::default()
         };

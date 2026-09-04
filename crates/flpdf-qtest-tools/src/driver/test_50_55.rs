@@ -511,7 +511,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned_with_options(
             include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec(),
             PdfOpenOptions {
-                description: "button-set-broken.pdf".to_owned(),
+                description: b"button-set-broken.pdf".to_vec(),
                 suppress_warnings: true,
                 ..PdfOpenOptions::default()
             },

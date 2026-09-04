@@ -29,14 +29,15 @@ fn open_secondary_pdf(
     stderr: &mut dyn Write,
 ) -> flpdf::Result<Pdf<std::fs::File>> {
     let file = std::fs::File::open(path)?;
+    let path_bytes = os_str_diagnostic_bytes(path).into_owned();
     let options = PdfOpenOptions {
         repair: true,
         suppress_warnings: true,
+        description: path_bytes.clone(),
         ..PdfOpenOptions::default()
     };
     let secondary = Pdf::open_with_options(file, options)?;
     let mut secondary_diagnostics_written = 0;
-    let path_bytes = os_str_diagnostic_bytes(path);
     emit_new_diagnostics(
         &secondary,
         &mut secondary_diagnostics_written,

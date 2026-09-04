@@ -98,7 +98,7 @@ fn canonical_acroform_analysis_warns_for_a_non_array_fields_value() {
         build_non_array_fields_pdf(),
         PdfOpenOptions {
             suppress_warnings: true,
-            description: "non-array-fields.pdf".to_owned(),
+            description: b"non-array-fields.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
@@ -119,7 +119,7 @@ fn canonical_acroform_analysis_propagates_a_warning_sink_failure() {
         build_non_array_fields_pdf(),
         PdfOpenOptions {
             suppress_warnings: false,
-            description: "non-array-fields.pdf".to_owned(),
+            description: b"non-array-fields.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )

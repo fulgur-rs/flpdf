@@ -41,7 +41,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn uninitialized() -> Self {
         let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
         let resolver = ResolverHandle::new_uninitialized(
-            ResolverWarningOptions::new(crate::QPDFLogger::default_logger(), false, String::new()),
+            ResolverWarningOptions::new(crate::QPDFLogger::default_logger(), false, Vec::new()),
             unique_id,
         );
         let encryption = resolver.encryption_parameters();

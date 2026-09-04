@@ -6972,7 +6972,7 @@ fn open_page_source(
 ) -> CliResult<Pdf<Box<dyn flpdf::ReadSeek>>> {
     let mut options = pdf_open_options(repair, password)?;
     options.logger = Some(cli_logger());
-    options.description = input.display().to_string();
+    options.description = path_description(input);
     let mut pdf = Pdf::<Box<dyn flpdf::ReadSeek>>::open_file_with_options(input, options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     pdf.root_handle()
@@ -7188,7 +7188,19 @@ fn emit_logger_error(data: impl AsRef<[u8]>) {
 
 fn configure_document_logger(options: &mut PdfOpenOptions, input: &Path) {
     options.logger = Some(cli_logger());
-    options.description = input.display().to_string();
+    options.description = path_description(input);
+}
+
+#[cfg(unix)]
+fn path_description(input: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    input.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_description(input: &Path) -> Vec<u8> {
+    input.to_string_lossy().into_owned().into_bytes()
 }
 
 /// Program name used in qpdf-parity diagnostic prefixes.

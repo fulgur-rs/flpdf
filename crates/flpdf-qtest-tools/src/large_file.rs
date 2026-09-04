@@ -317,7 +317,7 @@ fn check_pdf(path: &Path, large: bool, output: &Output) -> flpdf::Result<()> {
     let mut pdf = Pdf::open_with_options(
         BufReader::new(file),
         flpdf::PdfOpenOptions {
-            description: path.display().to_string(),
+            description: crate::driver::os_str_diagnostic_bytes(path.as_os_str()).into_owned(),
             ..flpdf::PdfOpenOptions::default()
         },
     )?;

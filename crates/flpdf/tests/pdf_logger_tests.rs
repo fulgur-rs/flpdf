@@ -133,7 +133,7 @@ fn open_options_clone_and_compare_an_explicit_logger_by_identity() {
     let options = PdfOpenOptions {
         logger: Some(logger.clone()),
         suppress_warnings: true,
-        description: "input.pdf".to_owned(),
+        description: b"input.pdf".to_vec(),
         ..PdfOpenOptions::default()
     };
 
@@ -151,7 +151,7 @@ fn warning_replays_initial_repair_diagnostics_once_in_original_order() {
         PdfOpenOptions {
             repair: true,
             logger: Some(logger),
-            description: "input.pdf".to_owned(),
+            description: b"input.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
@@ -190,7 +190,7 @@ fn warning_suppression_keeps_initial_repair_diagnostics() {
             repair: true,
             logger: Some(logger),
             suppress_warnings: true,
-            description: "input.pdf".to_owned(),
+            description: b"input.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
@@ -212,7 +212,7 @@ fn warning_initial_replay_failure_is_returned_by_open() {
             PdfOpenOptions {
                 repair: true,
                 logger: Some(logger),
-                description: "input.pdf".to_owned(),
+        description: b"input.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         ),
@@ -235,7 +235,7 @@ fn check_with_repair_propagates_warning_delivery_failure() {
             PdfOpenOptions {
                 repair: true,
                 logger: Some(logger),
-                description: "check.pdf".to_owned(),
+        description: b"check.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         ),
@@ -252,7 +252,7 @@ fn terminal_open_failure_delivers_accumulated_repair_warnings_first() {
         PdfOpenOptions {
             repair: true,
             logger: Some(logger),
-            description: "broken.pdf".to_owned(),
+            description: b"broken.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     ) {
@@ -284,7 +284,7 @@ fn terminal_open_failure_returns_warning_delivery_failure() {
             PdfOpenOptions {
                 repair: true,
                 logger: Some(logger),
-                description: "broken.pdf".to_owned(),
+        description: b"broken.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         ),
@@ -299,7 +299,7 @@ fn warning_routes_lazy_resolution_immediately_and_only_once() {
         Cursor::new(LAZY_WARNING_PDF),
         PdfOpenOptions {
             logger: Some(logger),
-            description: "lazy.pdf".to_owned(),
+            description: b"lazy.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
@@ -323,7 +323,7 @@ fn warning_delivery_failure_is_returned_after_the_diagnostic_is_appended() {
         Cursor::new(LAZY_WARNING_PDF),
         PdfOpenOptions {
             logger: Some(logger),
-            description: "lazy.pdf".to_owned(),
+            description: b"lazy.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
@@ -347,7 +347,7 @@ fn live_logger_replacement_routes_only_to_the_replacement() {
         Cursor::new(LAZY_WARNING_PDF),
         PdfOpenOptions {
             logger: Some(original),
-            description: "live.pdf".to_owned(),
+            description: b"live.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
@@ -371,7 +371,7 @@ fn live_suppression_toggle_only_changes_delivery_not_collection() {
         Cursor::new(two_lazy_warning_objects()),
         PdfOpenOptions {
             logger: Some(logger),
-            description: "live.pdf".to_owned(),
+            description: b"live.pdf".to_vec(),
             ..PdfOpenOptions::default()
         },
     )

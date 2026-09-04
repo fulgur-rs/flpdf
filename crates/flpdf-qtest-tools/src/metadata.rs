@@ -59,7 +59,7 @@ fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
         PdfOpenOptions {
             repair: true,
             suppress_warnings: true,
-            description: path.display().to_string(),
+            description: crate::driver::os_str_diagnostic_bytes(path.as_os_str()).into_owned(),
             ..PdfOpenOptions::default()
         },
     )?)

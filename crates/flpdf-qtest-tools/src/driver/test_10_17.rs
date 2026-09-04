@@ -933,7 +933,7 @@ mod tests {
             duplicate_page_pdf(),
             PdfOpenOptions {
                 suppress_warnings: true,
-                description: "page_api_2.pdf".to_owned(),
+                description: b"page_api_2.pdf".to_vec(),
                 ..PdfOpenOptions::default()
             },
         )
