@@ -4602,7 +4602,9 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn one_page_pdf_with_direct_outlines_and_deep_resource() -> Vec<u8> {
+    use crate::writer::ProgressReporter;
+
+    fn one_page_pdf_with_direct_outlines() -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let off1 = pdf.len();
         pdf.extend_from_slice(
@@ -4612,12 +4614,8 @@ mod tests {
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
         let off3 = pdf.len();
         pdf.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources ",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
         );
-        let depth = crate::object_handle::MAX_INLINE_DEPTH + 1;
-        pdf.extend(std::iter::repeat_n(b'[', depth));
-        pdf.extend(std::iter::repeat_n(b']', depth));
-        pdf.extend_from_slice(b" >>\nendobj\n");
         let xref = pdf.len();
         pdf.extend_from_slice(
             format!(
@@ -4629,22 +4627,25 @@ mod tests {
     }
 
     #[test]
-    fn linearized_writer_keeps_catalog_dirty_after_canonical_planning_failure() {
+    fn linearized_writer_keeps_catalog_dirty_after_canonical_planning_mutation_and_progress_failure(
+    ) {
         // The canonical optimization pass promotes direct /Outlines before
-        // its object-user walk reaches the over-deep page resource. The later
-        // planning error must not let restoration clear that permanent change.
-        let mut pdf = Pdf::open(Cursor::new(
-            one_page_pdf_with_direct_outlines_and_deep_resource(),
-        ))
-        .expect("source parses");
+        // writing. A later qpdf progress-reporter failure must not let
+        // restoration clear that permanent change.
+        let mut pdf =
+            Pdf::open(Cursor::new(one_page_pdf_with_direct_outlines())).expect("source parses");
         let root_ref = pdf.root_ref().expect("Catalog present");
         assert!(!pdf.is_dirty(root_ref), "fresh source must start clean");
 
-        let error = write_linearized_for_pdf_writer(&mut pdf, &WriterOptions::default(), None)
-            .expect_err("deep canonical resource must fail planning");
+        let mut options = WriterOptions::default();
+        options.progress_reporter = Some(ProgressReporter::new(Box::new(|_| {
+            Err(crate::Error::System("test progress failure".to_owned()))
+        })));
+        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect_err("canonical progress reporter failure must abort writing");
         assert!(
-            error.to_string().contains("inline object nesting exceeds"),
-            "unexpected planning error: {error}"
+            error.to_string().contains("test progress failure"),
+            "unexpected writer error: {error}"
         );
 
         let root = pdf.get_object_handle(root_ref);
