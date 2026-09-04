@@ -378,10 +378,10 @@ pub(crate) trait DocumentResolver {
         None
     }
 
-    /// The input name carried by qpdf's `InputSource`, used when a stream
-    /// accessor constructs a `QPDFExc` at the document boundary.
-    fn input_description(&self) -> String {
-        String::new()
+    /// The byte-preserving input name carried by qpdf's `InputSource`, used
+    /// when a stream accessor constructs a `QPDFExc` at the document boundary.
+    fn input_description(&self) -> Vec<u8> {
+        Vec::new()
     }
 
     /// Create qpdf's owned empty stream object for an ObjectHandle operation.
@@ -485,9 +485,10 @@ pub(crate) trait DocumentResolver {
     /// it; qpdf has no resolver that cannot warn, so reaching this default is
     /// the same condition as qpdf's null context, which `QPDFObjectHandle::warn`
     /// also turns into a thrown exception.
-    fn warn(&self, message: String) -> Result<()> {
+    fn warn(&self, message: Vec<u8>) -> Result<()> {
         Err(Error::Internal(format!(
-            "warning raised through a resolver with no document warning sink: {message}"
+            "warning raised through a resolver with no document warning sink: {}",
+            String::from_utf8_lossy(&message)
         )))
     }
 
@@ -592,12 +593,12 @@ mod parse_tests {
         let parsed = ObjectHandle::parse(b"<< /Value 7 >>")
             .expect("direct values do not need a parse context");
 
-        assert_eq!(parsed.description(), "parsed object,  at offset 2");
+        assert_eq!(parsed.description(), b"parsed object,  at offset 2");
         let value = parsed
             .as_dictionary()
             .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("parsed scalar");
-        assert_eq!(value.description(), "parsed object,  at offset 10");
+        assert_eq!(value.description(), b"parsed object,  at offset 10");
 
         let error = value
             .object_warning("contextless explicit parse")
@@ -891,31 +892,45 @@ impl std::fmt::Debug for ObjectHandle {
 #[derive(Clone)]
 pub(crate) struct ChildDescription {
     parent: Weak<RefCell<ObjectSlot>>,
-    static_descr: String,
-    var_descr: String,
+    static_descr: Vec<u8>,
+    var_descr: Vec<u8>,
 }
 
 #[derive(Clone)]
 pub(crate) struct JsonDescription {
-    pub(crate) input: String,
-    pub(crate) object: String,
+    pub(crate) input: Vec<u8>,
+    pub(crate) object: Vec<u8>,
 }
 
 #[derive(Clone)]
+/// qpdf's `QPDFValue::Description`, whose `std::string` payload is an
+/// arbitrary byte sequence rather than a UTF-8 contract.
 pub(crate) enum ObjectDescription {
-    Template(String),
+    Template(Vec<u8>),
     Json(JsonDescription),
     Child(ChildDescription),
 }
 
+fn replace_first(bytes: &mut Vec<u8>, needle: &[u8], replacement: &[u8]) {
+    if let Some(position) = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+    {
+        bytes.splice(
+            position..position + needle.len(),
+            replacement.iter().copied(),
+        );
+    }
+}
+
 fn expand_description_template(
-    template: &str,
+    template: &[u8],
     object_ref: Option<ObjectRef>,
     state: &ObjectValue,
     parsed_offset: i64,
-) -> String {
+) -> Vec<u8> {
     let og = object_ref
-        .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation))
+        .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation).into_bytes())
         .unwrap_or_default();
     let shift = match state {
         ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
@@ -923,21 +938,17 @@ fn expand_description_template(
         _ => 0,
     };
     let offset = if parsed_offset >= 0 {
-        (parsed_offset + shift).to_string()
+        (parsed_offset + shift).to_string().into_bytes()
     } else {
-        parsed_offset.to_string()
+        parsed_offset.to_string().into_bytes()
     };
 
     // qpdf's QPDFValue::getDescription performs one `find`/`replace` for
     // each marker (`libqpdf/QPDFValue.cc:23-31`). There is no `$$` escape
     // convention: unknown and repeated markers remain in the result.
-    let mut result = template.to_owned();
-    if let Some(position) = result.find("$OG") {
-        result.replace_range(position..position + 3, &og);
-    }
-    if let Some(position) = result.find("$PO") {
-        result.replace_range(position..position + 3, &offset);
-    }
+    let mut result = template.to_vec();
+    replace_first(&mut result, b"$OG", &og);
+    replace_first(&mut result, b"$PO", &offset);
     result
 }
 
@@ -1057,7 +1068,7 @@ struct ObjectSlot {
 }
 
 impl ObjectSlot {
-    fn get_description(&self) -> String {
+    fn get_description(&self) -> Vec<u8> {
         let state = self.state.borrow();
         if let Some(desc) = &self.description {
             match desc {
@@ -1065,32 +1076,32 @@ impl ObjectSlot {
                     expand_description_template(tmpl, self.object_ref, &state, self.parsed_offset)
                 }
                 ObjectDescription::Json(j) => {
-                    let obj_part = if j.object.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", {}", j.object)
-                    };
-                    format!("{}{obj_part} at offset {}", j.input, self.parsed_offset)
+                    let mut result = j.input.clone();
+                    if !j.object.is_empty() {
+                        result.extend_from_slice(b", ");
+                        result.extend_from_slice(&j.object);
+                    }
+                    result.extend_from_slice(b" at offset ");
+                    result.extend_from_slice(self.parsed_offset.to_string().as_bytes());
+                    result
                 }
                 ObjectDescription::Child(child) => {
-                    let mut result = String::new();
+                    let mut result = Vec::new();
                     if let Some(parent_slot) = child.parent.upgrade() {
                         result = parent_slot.borrow().get_description();
                     }
-                    result.push_str(&child.static_descr);
+                    result.extend_from_slice(&child.static_descr);
                     // qpdf's child branch replaces only the first marker in
                     // the already-rendered parent/static string
                     // (`libqpdf/QPDFValue.cc:52-54`).
-                    if let Some(position) = result.find("$VD") {
-                        result.replace_range(position..position + 3, &child.var_descr);
-                    }
+                    replace_first(&mut result, b"$VD", &child.var_descr);
                     result
                 }
             }
         } else if let Some(object_ref) = self.object_ref {
-            format!("object {} {}", object_ref.number, object_ref.generation)
+            format!("object {} {}", object_ref.number, object_ref.generation).into_bytes()
         } else {
-            String::new()
+            Vec::new()
         }
     }
 }
@@ -2661,9 +2672,17 @@ impl ObjectHandle {
         None
     }
 
-    pub(crate) fn set_description_json(&self, input: String, object: String, offset: i64) {
+    pub(crate) fn set_description_json(
+        &self,
+        input: impl AsRef<[u8]>,
+        object: impl AsRef<[u8]>,
+        offset: i64,
+    ) {
         let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Json(JsonDescription { input, object }));
+        slot.description = Some(ObjectDescription::Json(JsonDescription {
+            input: input.as_ref().to_vec(),
+            object: object.as_ref().to_vec(),
+        }));
         // qpdf writes the description offset through the same set-once guard
         // as any other parsed offset (`QPDFValue::setDescription` calls
         // `setParsedOffset`, `libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so a
@@ -2686,14 +2705,16 @@ impl ObjectHandle {
     /// object description and renders a bare message only when that
     /// description is empty; this port forms the same prefix before the
     /// contextless error is returned.
-    fn warn_through_context(&self, message: String) -> Result<()> {
+    fn warn_through_context(&self, message: Vec<u8>) -> Result<()> {
         match self.context() {
             Some(context) => context.warn(message),
-            None => Err(Error::System(message)),
+            None => Err(Error::System(
+                String::from_utf8_lossy(&message).into_owned(),
+            )),
         }
     }
 
-    pub(crate) fn description(&self) -> String {
+    pub(crate) fn description(&self) -> Vec<u8> {
         self.0.borrow().get_description()
     }
 
@@ -2702,7 +2723,7 @@ impl ObjectHandle {
     /// than the rendered [`Self::description`]: a caller's escaped literal
     /// `$PO`/`$OG` would otherwise become parser-owned placeholders again on
     /// the next render.
-    pub(crate) fn description_template(&self) -> Option<String> {
+    pub(crate) fn description_template(&self) -> Option<Vec<u8>> {
         match self.0.borrow().description.as_ref() {
             Some(ObjectDescription::Template(template)) => Some(template.clone()),
             Some(ObjectDescription::Json(_) | ObjectDescription::Child(_)) | None => None,
@@ -2719,6 +2740,8 @@ impl ObjectHandle {
     /// stores the document pointer and description on the shared
     /// `QPDFValue`. The supplied `Pdf` must remain alive while the handle may
     /// emit a warning; the weak resolver preserves that lifetime boundary.
+    /// `description` accepts qpdf's raw `std::string` bytes through
+    /// `AsRef<[u8]>`, so a non-UTF-8 source name is not replaced by U+FFFD.
     ///
     /// # Errors
     ///
@@ -2727,19 +2750,19 @@ impl ObjectHandle {
     pub fn set_object_description<R: std::io::Read + std::io::Seek + 'static>(
         &self,
         pdf: &crate::Pdf<R>,
-        description: impl Into<String>,
+        description: impl AsRef<[u8]>,
     ) -> Result<()> {
         let resolver = pdf.resolver.document_resolver_weak()?;
         let mut slot = self.0.borrow_mut();
         slot.resolver = Some(resolver);
         slot.active_pdf_unique_id = Some(pdf.unique_id);
-        slot.description = Some(ObjectDescription::Template(description.into()));
+        slot.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         Ok(())
     }
 
-    pub(crate) fn set_description(&self, description: String, offset: i64) {
+    pub(crate) fn set_description(&self, description: impl AsRef<[u8]>, offset: i64) {
         let mut slot = self.0.borrow_mut();
-        slot.description = Some(ObjectDescription::Template(description));
+        slot.description = Some(ObjectDescription::Template(description.as_ref().to_vec()));
         // Set-once, matching qpdf's `setParsedOffset` guard that
         // `QPDFValue::setDescription` calls through
         // (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`). `QPDF_Stream::setDescription`
@@ -2763,14 +2786,14 @@ impl ObjectHandle {
     pub(crate) fn set_child_description(
         &self,
         parent: &ObjectHandle,
-        static_descr: &str,
-        var_descr: &str,
+        static_descr: impl AsRef<[u8]>,
+        var_descr: impl AsRef<[u8]>,
     ) {
         let mut slot = self.0.borrow_mut();
         slot.description = Some(ObjectDescription::Child(ChildDescription {
             parent: Rc::downgrade(&parent.0),
-            static_descr: static_descr.to_owned(),
-            var_descr: var_descr.to_owned(),
+            static_descr: static_descr.as_ref().to_vec(),
+            var_descr: var_descr.as_ref().to_vec(),
         }));
     }
 
@@ -2789,16 +2812,18 @@ impl ObjectHandle {
     pub(crate) fn type_warning(&self, expected_type: &str, warning: &str) -> Result<()> {
         self.try_dereference()?;
         let desc = self.description();
-        let prefix = if desc.is_empty() {
-            String::new()
-        } else {
-            format!("{desc}: ")
-        };
         let type_name = self.type_name()?;
-        self.warn_through_context(format!(
-            "{prefix}operation for {expected_type} attempted on object of type {}: {warning}",
-            type_name
-        ))
+        let mut message = desc;
+        if !message.is_empty() {
+            message.extend_from_slice(b": ");
+        }
+        message.extend_from_slice(
+            format!(
+                "operation for {expected_type} attempted on object of type {type_name}: {warning}"
+            )
+            .as_bytes(),
+        );
+        self.warn_through_context(message)
     }
 
     /// Report damage this handle noticed about itself.
@@ -2826,12 +2851,12 @@ impl ObjectHandle {
         if let Some(context) = self.context() {
             self.try_dereference()?;
             let desc = self.description();
-            let prefix = if desc.is_empty() {
-                String::new()
-            } else {
-                format!("{desc}: ")
-            };
-            context.warn(format!("{prefix}{warning}"))
+            let mut message = desc;
+            if !message.is_empty() {
+                message.extend_from_slice(b": ");
+            }
+            message.extend_from_slice(warning.as_bytes());
+            context.warn(message)
         } else {
             crate::QPDFLogger::default_logger().error(format!("{warning}\n"))
         }
@@ -2851,12 +2876,12 @@ impl ObjectHandle {
     /// mirroring the exception qpdf throws instead of warning.
     pub(crate) fn object_warning(&self, warning: &str) -> Result<()> {
         let desc = self.description();
-        let prefix = if desc.is_empty() {
-            String::new()
-        } else {
-            format!("{desc}: ")
-        };
-        self.warn_through_context(format!("{prefix}{warning}"))
+        let mut message = desc;
+        if !message.is_empty() {
+            message.extend_from_slice(b": ");
+        }
+        message.extend_from_slice(warning.as_bytes());
+        self.warn_through_context(message)
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
@@ -3591,19 +3616,21 @@ impl ObjectHandle {
             let null = ObjectHandle::null();
             null.set_child_description(
                 self,
-                " -> null returned from getting key $VD from non-Dictionary",
-                "",
+                b" -> null returned from getting key $VD from non-Dictionary",
+                b"",
             );
             Ok(null)
         } else {
-            let key_str = String::from_utf8_lossy(key);
             let null = ObjectHandle::null();
-            let var_descr = if key_str.starts_with('/') {
-                key_str.into_owned()
+            let var_descr = if key.starts_with(b"/") {
+                key.to_vec()
             } else {
-                format!("/{key_str}")
+                let mut var_descr = Vec::with_capacity(key.len() + 1);
+                var_descr.push(b'/');
+                var_descr.extend_from_slice(key);
+                var_descr
             };
-            null.set_child_description(self, " -> dictionary key $VD", &var_descr);
+            null.set_child_description(self, b" -> dictionary key $VD", &var_descr);
             Ok(null)
         }
     }
@@ -5733,17 +5760,23 @@ impl ObjectHandle {
                 if item.type_code()? == 10 {
                     result.push(item);
                 } else {
-                    item.warn_through_context(format!(
-                        "{description}: item index {index} (from 0): ignoring non-stream in an array of streams"
-                    ))?;
+                    item.warn_through_context(
+                        format!(
+                            "{description}: item index {index} (from 0): ignoring non-stream in an array of streams"
+                        )
+                        .into_bytes(),
+                    )?;
                 }
             }
         } else if self.type_code()? == 10 {
             result.push(self.clone());
         } else if !self.is_null() {
-            self.warn_through_context(format!(
-                "{description}:  object is supposed to be a stream or an array of streams but is neither"
-            ))?;
+            self.warn_through_context(
+                format!(
+                    "{description}:  object is supposed to be a stream or an array of streams but is neither"
+                )
+                .into_bytes(),
+            )?;
         }
 
         let mut all_description = description.to_owned();
@@ -6236,6 +6269,7 @@ impl ObjectHandle {
                 .context()
                 .map(|context| context.input_description())
                 .unwrap_or_default();
+            let filename = String::from_utf8_lossy(&filename);
             return Err(Error::Unsupported(format_qpdf_exception_what(
                 &filename,
                 "",
@@ -10872,12 +10906,15 @@ mod resolution_state_tests {
     fn disconnect_clears_a_previously_recorded_description() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
-        handle.set_description("input.pdf, object 1 0 at offset $PO".to_owned(), 100);
-        assert!(handle.description().contains("offset"));
+        handle.set_description("input.pdf, object 1 0 at offset $PO", 100);
+        assert!(handle
+            .description()
+            .windows(b"offset".len())
+            .any(|window| window == b"offset"));
 
         handle.disconnect();
 
-        assert_eq!(handle.description(), "");
+        assert_eq!(handle.description(), b"");
     }
 
     #[test]
@@ -13809,8 +13846,10 @@ mod mutation_tests {
     }
 
     impl DocumentResolver for SourcePipeResolver {
-        fn warn(&self, message: String) -> crate::Result<()> {
-            self.warnings.borrow_mut().push(message);
+        fn warn(&self, message: Vec<u8>) -> crate::Result<()> {
+            self.warnings
+                .borrow_mut()
+                .push(String::from_utf8_lossy(&message).into_owned());
             Ok(())
         }
 
@@ -17926,8 +17965,10 @@ pub(crate) mod warning_emission_tests {
             Ok(())
         }
 
-        fn warn(&self, message: String) -> crate::Result<()> {
-            self.warnings.borrow_mut().push(message);
+        fn warn(&self, message: Vec<u8>) -> crate::Result<()> {
+            self.warnings
+                .borrow_mut()
+                .push(String::from_utf8_lossy(&message).into_owned());
             Ok(())
         }
     }
@@ -17986,7 +18027,7 @@ pub(crate) mod warning_emission_tests {
         assert!(null.is_null());
         assert_eq!(
             null.description(),
-            "object 3 0 -> null returned from getting key  from non-Dictionary"
+            b"object 3 0 -> null returned from getting key  from non-Dictionary"
         );
         assert_eq!(
             warnings(&recorder),
@@ -18940,7 +18981,7 @@ pub(crate) mod warning_emission_tests {
     #[test]
     fn object_description_template_placeholders_and_offset_shifts() {
         let dict = ObjectHandle::dictionary(vec![]);
-        dict.set_description("object $OG at offset $PO".to_owned(), 100);
+        dict.set_description("object $OG at offset $PO", 100);
         // `$OG` needs indirect identity; qpdf only ever installs that
         // together with the owning document (`QPDFValue::setDefaultDescription`,
         // `libqpdf/qpdf/QPDFValue.hh:66-71`), so promote through the same
@@ -18948,15 +18989,15 @@ pub(crate) mod warning_emission_tests {
         // writing `object_ref` alone.
         let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
         dict.promote_to_indirect(ObjectRef::new(5, 0), 1, Rc::downgrade(&resolver));
-        assert_eq!(dict.description(), "object 5 0 at offset 102");
+        assert_eq!(dict.description(), b"object 5 0 at offset 102");
 
         let arr = ObjectHandle::array(vec![]);
-        arr.set_description("array at offset $PO".to_owned(), 200);
-        assert_eq!(arr.description(), "array at offset 201");
+        arr.set_description("array at offset $PO", 200);
+        assert_eq!(arr.description(), b"array at offset 201");
 
         let scalar = ObjectHandle::integer(42);
-        scalar.set_description("scalar at offset $PO".to_owned(), 300);
-        assert_eq!(scalar.description(), "scalar at offset 300");
+        scalar.set_description("scalar at offset $PO", 300);
+        assert_eq!(scalar.description(), b"scalar at offset 300");
     }
 
     #[test]
@@ -18973,19 +19014,23 @@ pub(crate) mod warning_emission_tests {
 
         for (template, expected) in cases {
             let handle = ObjectHandle::integer(7);
-            handle.set_description(template.to_owned(), 300);
-            assert_eq!(handle.description(), expected, "template {template:?}");
+            handle.set_description(template, 300);
+            assert_eq!(
+                handle.description(),
+                expected.as_bytes(),
+                "template {template:?}"
+            );
         }
     }
 
     #[test]
     fn object_description_template_replaces_each_qpdf_marker_only_once() {
         let handle = ObjectHandle::dictionary(vec![]);
-        handle.set_description("$$/$PO/$PO/$OG/$OG".to_owned(), 100);
+        handle.set_description("$$/$PO/$PO/$OG/$OG", 100);
         let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
         handle.promote_to_indirect(ObjectRef::new(5, 0), 1, Rc::downgrade(&resolver));
 
-        assert_eq!(handle.description(), "$$/102/$PO/5 0/$OG");
+        assert_eq!(handle.description(), b"$$/102/$PO/5 0/$OG");
     }
 
     #[test]
@@ -18999,10 +19044,10 @@ pub(crate) mod warning_emission_tests {
         let stream = ObjectHandle::integer(7);
         stream.set_parsed_offset_if_unset(500);
 
-        stream.set_description("stream object $OG at offset $PO".to_owned(), 999);
+        stream.set_description("stream object $OG at offset $PO", 999);
 
         assert_eq!(stream.get_parsed_offset(), 500);
-        assert_eq!(stream.description(), "stream object  at offset 500");
+        assert_eq!(stream.description(), b"stream object  at offset 500");
     }
 
     #[test]
@@ -19010,10 +19055,10 @@ pub(crate) mod warning_emission_tests {
         let stream = ObjectHandle::integer(7);
         stream.set_parsed_offset_if_unset(500);
 
-        stream.set_description_json("input.pdf".to_owned(), "object 1 0".to_owned(), 999);
+        stream.set_description_json("input.pdf", "object 1 0", 999);
 
         assert_eq!(stream.get_parsed_offset(), 500);
-        assert_eq!(stream.description(), "input.pdf, object 1 0 at offset 500");
+        assert_eq!(stream.description(), b"input.pdf, object 1 0 at offset 500");
     }
 
     #[test]
@@ -19022,7 +19067,7 @@ pub(crate) mod warning_emission_tests {
         assert_eq!(without_description.description_template(), None);
 
         let json = ObjectHandle::null();
-        json.set_description_json("input.pdf".to_owned(), "object 1 0".to_owned(), 123);
+        json.set_description_json("input.pdf", "object 1 0", 123);
         assert_eq!(json.description_template(), None);
 
         let parent = ObjectHandle::dictionary(vec![]);
@@ -19034,39 +19079,39 @@ pub(crate) mod warning_emission_tests {
     #[test]
     fn object_description_child_chaining_and_var_descr() {
         let parent = ObjectHandle::dictionary(vec![]);
-        parent.set_description("object 5 0 at offset 253".to_owned(), 253);
+        parent.set_description("object 5 0 at offset 253", 253);
 
         let child = ObjectHandle::null();
         child.set_child_description(&parent, " -> dictionary key $VD", "/EF");
 
         assert_eq!(
             child.description(),
-            "object 5 0 at offset 253 -> dictionary key /EF"
+            b"object 5 0 at offset 253 -> dictionary key /EF"
         );
     }
 
     #[test]
     fn object_description_child_replaces_only_the_first_qpdf_marker() {
         let parent = ObjectHandle::dictionary(vec![]);
-        parent.set_description("parent $VD".to_owned(), 253);
+        parent.set_description("parent $VD", 253);
 
         let child = ObjectHandle::null();
         child.set_child_description(&parent, " -> dictionary key $VD", "/EF");
 
-        assert_eq!(child.description(), "parent /EF -> dictionary key $VD");
+        assert_eq!(child.description(), b"parent /EF -> dictionary key $VD");
     }
 
     #[test]
     fn object_description_indirect_fallback() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(12, 0), NO_PARSED_OFFSET);
-        assert_eq!(handle.description(), "object 12 0");
+        assert_eq!(handle.description(), b"object 12 0");
     }
 
     #[test]
     fn object_description_type_warning_includes_parent_and_object_path() {
         let (parent, recorder) =
             handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
-        parent.set_description("object 5 0 at offset 253".to_owned(), 253);
+        parent.set_description("object 5 0 at offset 253", 253);
 
         let child = parent.try_get_key(b"/EF").unwrap();
         child
@@ -19125,24 +19170,27 @@ pub(crate) mod warning_emission_tests {
     #[test]
     fn object_description_json_and_negative_offset_and_unresolved() {
         let handle1 = ObjectHandle::null();
-        handle1.set_description_json("input.pdf".to_owned(), "".to_owned(), 123);
-        assert_eq!(handle1.description(), "input.pdf at offset 123");
+        handle1.set_description_json("input.pdf", "", 123);
+        assert_eq!(handle1.description(), b"input.pdf at offset 123");
 
         let handle2 = ObjectHandle::null();
-        handle2.set_description_json("input.pdf".to_owned(), "object 1 0".to_owned(), 456);
-        assert_eq!(handle2.description(), "input.pdf, object 1 0 at offset 456");
+        handle2.set_description_json("input.pdf", "object 1 0", 456);
+        assert_eq!(
+            handle2.description(),
+            b"input.pdf, object 1 0 at offset 456"
+        );
 
         let handle3 = ObjectHandle::null();
-        handle3.set_description("item at offset $PO".to_owned(), -1);
-        assert_eq!(handle3.description(), "item at offset -1");
+        handle3.set_description("item at offset $PO", -1);
+        assert_eq!(handle3.description(), b"item at offset -1");
 
         let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
         let handle4 = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(3, 0),
             Rc::downgrade(&resolver),
         );
-        handle4.set_description("unresolved at offset $PO".to_owned(), 50);
-        assert_eq!(handle4.description(), "unresolved at offset 50");
+        handle4.set_description("unresolved at offset $PO", 50);
+        assert_eq!(handle4.description(), b"unresolved at offset 50");
     }
 
     #[test]
@@ -19279,14 +19327,21 @@ pub(crate) mod warning_emission_tests {
     fn try_get_key_without_leading_slash_formats_key() {
         let parent = ObjectHandle::dictionary(vec![]);
         let child = parent.try_get_key(b"/NoSlash").unwrap();
-        assert_eq!(child.description(), " -> dictionary key /NoSlash");
+        assert_eq!(child.description(), b" -> dictionary key /NoSlash");
     }
 
     #[test]
     fn try_get_key_with_leading_slash_formats_key() {
         let parent = ObjectHandle::dictionary(vec![]);
         let child = parent.try_get_key(b"/EF").unwrap();
-        assert_eq!(child.description(), " -> dictionary key /EF");
+        assert_eq!(child.description(), b" -> dictionary key /EF");
+    }
+
+    #[test]
+    fn try_get_key_preserves_non_utf8_key_bytes_in_the_child_description() {
+        let parent = ObjectHandle::dictionary(vec![]);
+        let child = parent.try_get_key(b"/\xff").unwrap();
+        assert_eq!(child.description(), b" -> dictionary key /\xff");
     }
 }
 

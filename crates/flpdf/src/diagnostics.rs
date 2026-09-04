@@ -21,7 +21,7 @@ pub enum DiagnosticOrigin {
     /// the caller that renders the diagnostic.
     Input,
     /// A `QPDFObjectHandle` warning whose qpdf object description is already
-    /// part of [`Diagnostic::message`].
+    /// part of the diagnostic's raw message.
     Object,
 }
 
@@ -45,6 +45,11 @@ pub struct Diagnostic {
     /// verbatim by `QPDFExc`. Keep the same byte-preserving boundary here so
     /// output sinks can reproduce non-UTF-8 Unix paths.
     pub description: Option<Vec<u8>>,
+    /// The complete qpdf object-warning message before its UTF-8-facing
+    /// [`Self::message`] projection. `None` means `message.as_bytes()` is the
+    /// authoritative representation. Object descriptions are qpdf
+    /// `std::string` values and may contain arbitrary bytes.
+    pub raw_message: Option<Vec<u8>>,
 }
 
 impl Diagnostic {
@@ -56,6 +61,7 @@ impl Diagnostic {
             offset,
             origin: DiagnosticOrigin::Input,
             description: None,
+            raw_message: None,
         }
     }
 
@@ -82,6 +88,7 @@ impl Diagnostic {
             offset,
             origin: DiagnosticOrigin::Input,
             description: None,
+            raw_message: None,
         }
     }
 
@@ -89,13 +96,28 @@ impl Diagnostic {
     /// description and therefore must not receive a second input filename at
     /// the output boundary.
     pub fn object_warning(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self::object_warning_bytes(message.as_bytes())
+    }
+
+    /// Construct an object warning from qpdf's byte-preserving exception text.
+    pub fn object_warning_bytes(message: impl AsRef<[u8]>) -> Self {
+        let raw_message = message.as_ref().to_vec();
         Self {
             severity: Severity::Warning,
-            message: message.into(),
+            message: String::from_utf8_lossy(&raw_message).into_owned(),
             offset: None,
             origin: DiagnosticOrigin::Object,
             description: None,
+            raw_message: Some(raw_message),
         }
+    }
+
+    /// Return the warning bytes exactly as qpdf supplied them.
+    pub fn message_bytes(&self) -> &[u8] {
+        self.raw_message
+            .as_deref()
+            .unwrap_or(self.message.as_bytes())
     }
 
     /// Whether this diagnostic carries a qpdf object-level exception
@@ -184,5 +206,6 @@ mod tests {
         assert!(diagnostic.is_object_warning());
         assert_eq!(diagnostic.message, "test array: warning");
         assert_eq!(diagnostic.offset, None);
+        assert_eq!(diagnostic.message_bytes(), b"test array: warning");
     }
 }

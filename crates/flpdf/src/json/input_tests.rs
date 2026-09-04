@@ -533,7 +533,8 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
     catalog.try_dereference().expect("catalog resolves");
     assert!(catalog
         .description()
-        .contains("input.json, obj:1 0 R at offset"));
+        .windows(b"input.json, obj:1 0 R at offset".len())
+        .any(|window| window == b"input.json, obj:1 0 R at offset"));
     let catalog_dict = catalog.as_dictionary().expect("catalog dictionary");
     assert_eq!(
         catalog_dict
@@ -575,7 +576,8 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
     // received a description at all.
     assert!(stream
         .description()
-        .contains("input.json, obj:3 0 R at offset"));
+        .windows(b"input.json, obj:3 0 R at offset".len())
+        .any(|window| window == b"input.json, obj:3 0 R at offset"));
 
     let trailer = pdf.trailer();
     trailer.try_dereference().expect("trailer resolves");

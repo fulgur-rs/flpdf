@@ -1321,14 +1321,14 @@ pub(crate) fn write_warning(
 ) -> io::Result<()> {
     let warning_filename = diagnostic.description.as_deref().unwrap_or(filename);
     let message = diagnostic.message.as_str();
+    if diagnostic.is_object_warning() {
+        let mut line = b"WARNING: ".to_vec();
+        line.extend_from_slice(diagnostic.message_bytes());
+        return write_stderr_bytes(stdout, stderr, &line);
+    }
     if let Some(exception) = format_nntree_exception(warning_filename, message) {
         let mut line = b"WARNING: ".to_vec();
         line.extend_from_slice(&exception);
-        return write_stderr_bytes(stdout, stderr, &line);
-    }
-    if diagnostic.is_object_warning() {
-        let mut line = b"WARNING: ".to_vec();
-        line.extend_from_slice(message.as_bytes());
         return write_stderr_bytes(stdout, stderr, &line);
     }
     let offset = diagnostic.offset;
@@ -1612,6 +1612,43 @@ requested value of integer is too big; returning INT_MAX\n"
 
         assert!(stdout.is_empty());
         assert_eq!(stderr, b"WARNING: offset 17: warning without a filename\n");
+    }
+
+    #[test]
+    fn object_warning_output_preserves_raw_description_bytes() {
+        let diagnostic = Diagnostic::object_warning_bytes(
+            b"/tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"destination.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: /tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array\n"
+        );
+    }
+
+    #[test]
+    fn object_warning_starting_with_nntree_text_preserves_raw_bytes_over_the_heuristic() {
+        // An object-warning diagnostic whose message happens to start with
+        // the NNTree exception prefix must still take the origin-based
+        // raw-byte branch, not the message-prefix heuristic meant for
+        // push_warning-origin diagnostics: is_object_warning() is the
+        // authoritative signal, and the heuristic below it operates on the
+        // lossy `message` projection.
+        let diagnostic = Diagnostic::object_warning_bytes(b"Name/Number tree node: bad node \xff");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"destination.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"WARNING: Name/Number tree node: bad node \xff\n");
     }
 
     #[test]

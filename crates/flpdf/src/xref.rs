@@ -875,10 +875,10 @@ impl HandleResolver for BootstrapHandleParser<'_> {
         ObjectHandle::from_parsed_value_with_resolver(value, self.document.resolver_weak())
     }
 
-    fn description_template(&self) -> Option<String> {
+    fn description_template(&self) -> Option<Vec<u8>> {
         Some(match self.description {
-            XrefObjectDescription::Ordinary => "object $OG".to_owned(),
-            XrefObjectDescription::XrefStream => "xref stream: object $OG".to_owned(),
+            XrefObjectDescription::Ordinary => b"object $OG".to_vec(),
+            XrefObjectDescription::XrefStream => b"xref stream: object $OG".to_vec(),
         })
     }
 }

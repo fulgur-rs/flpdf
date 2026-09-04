@@ -55,7 +55,7 @@ pub(crate) trait HandleResolver {
     /// Return the one qpdf-style description template shared by this parse
     /// call, if the caller has an observable object-description context.
     /// Detached legacy materialization keeps the default `None`.
-    fn description_template(&self) -> Option<String> {
+    fn description_template(&self) -> Option<Vec<u8>> {
         None
     }
 }
@@ -144,7 +144,7 @@ impl LiveInput for SliceLiveInput<'_> {
 /// references before returning the value.
 #[derive(Default)]
 struct DetachedHandles {
-    description_template: Option<String>,
+    description_template: Option<Vec<u8>>,
 }
 
 impl HandleResolver for DetachedHandles {
@@ -152,7 +152,7 @@ impl HandleResolver for DetachedHandles {
         ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET)
     }
 
-    fn description_template(&self) -> Option<String> {
+    fn description_template(&self) -> Option<Vec<u8>> {
         self.description_template.clone()
     }
 }
@@ -298,7 +298,9 @@ pub(crate) fn parse_explicit_object_handle_with_description(
 ) -> Result<ObjectHandle> {
     let mut input_source = SliceLiveInput::new(input);
     let mut detached_handles = DetachedHandles {
-        description_template: Some(format!("parsed object, {object_description} at offset $PO")),
+        description_template: Some(
+            format!("parsed object, {object_description} at offset $PO").into_bytes(),
+        ),
     };
     let parsed =
         parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false, None)?;
@@ -937,8 +939,10 @@ mod live_input_tests {
             Ok(())
         }
 
-        fn warn(&self, message: String) -> Result<()> {
-            self.warnings.borrow_mut().push(message);
+        fn warn(&self, message: Vec<u8>) -> Result<()> {
+            self.warnings
+                .borrow_mut()
+                .push(String::from_utf8_lossy(&message).into_owned());
             Ok(())
         }
     }
@@ -968,7 +972,7 @@ mod live_input_tests {
     #[test]
     fn detached_and_offset_handle_resolvers_preserve_reference_identity() {
         let mut detached_resolver = super::DetachedHandles {
-            description_template: Some("parsed object,  at offset $PO".to_owned()),
+            description_template: Some(b"parsed object,  at offset $PO".to_vec()),
         };
         let detached = detached_resolver.indirect_handle(ObjectRef::new(7, 2));
         assert_eq!(detached.object_ref(), Some(ObjectRef::new(7, 2)));
@@ -1795,7 +1799,7 @@ impl HandleResolver for OffsetHandleResolver<'_> {
         self.resolver.direct_handle_at(value, offset)
     }
 
-    fn description_template(&self) -> Option<String> {
+    fn description_template(&self) -> Option<Vec<u8>> {
         self.resolver.description_template()
     }
 }

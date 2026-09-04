@@ -275,6 +275,14 @@ eight-case qpdf 11.9.0 helper differential.
 | `QPDFObjectHandle::mergeResources` / `shallowCopy` | `QPDFObjectHandle.cc:431-434,1063-1153,2072-2079` | `object_handle.rs:5070` + `page_annotation_flatten.rs:666-740`（widget appearance の既定リソース consumer） | ✅ live `ObjectHandle::merge_resources` を使用し、receiver・other・各top-level resource categoryをqpdfの`isDictionary`/`isArray`相当で自己解決してから分岐する。missing category は top-level が direct の shallow copy になり、nested indirect child は handle を保持する。array の `isScalar` 判定と unique-name pool の second-level dictionary 判定は qpdf と同じく各 nested handle を解決し、解決エラーを伝播する。`acroform_document_helper.rs` の `DrMap` と `overlay_appearance_stream.rs` が name-conflict overlay merge を担う |
 | `QPDFObjectHandle::getResourceNames` | `QPDFObjectHandle.hh:831-835`; `QPDFObjectHandle.cc:1156-1170` | `object_handle.rs::ObjectHandle::get_resource_names` + `try_get_resource_names` | ✅ second-level keys from every dictionary-valued resource category are collected through the canonical handle resolver; the public facade is available to `flpdf-qtest-tools`, and resolver failures remain a `Result` at the Rust boundary. |
 
+`QPDFValue` の object description は qpdf の `std::string` 相当なので、flpdf の
+`ObjectDescription` と parser/resolver template も `Vec<u8>` を正本として保持する。
+`ObjectHandle` の object warning は `Diagnostic::raw_message` / `message_bytes()` と
+document logger の byte route を通り、UTF-8 変換は既存の表示用 `Diagnostic::message`
+や `Error` 境界に限定する。これにより `QPDFValue.cc:14-61` の `$OG` / `$PO` / `$VD`
+展開と、`QPDFObjectHandle.cc:2168-2212` の object warning は non-UTF-8 input source
+description を失わない。
+
 `qpdf/test_driver.cc:2139-2213` の test 60 は、`ObjectHandle::make_resources_indirect`、
 `merge_resources`、`get_unique_resource_name` とlive `Pdf::trailer`を通るqtest consumerとして
 実装済みである。4回のconflict merge結果とQDF/static-ID `a.pdf`をpinned qpdf 11.9.0の

@@ -185,6 +185,11 @@ fn append_encrypted_detail(output: &mut Vec<u8>, error: &EncryptedError) {
 
 fn write_diagnostic(output: &mut Vec<u8>, path: &Path, diagnostic: &flpdf::Diagnostic) {
     output.extend_from_slice(b"WARNING: ");
+    if diagnostic.is_object_warning() {
+        output.extend_from_slice(diagnostic.message_bytes());
+        output.push(b'\n');
+        return;
+    }
     append_path(output, path);
     if diagnostic.message.starts_with('(') {
         output.push(b' ');
@@ -582,6 +587,23 @@ mod tests {
         assert_eq!(
             display_error(path, &MetadataError::from(error)),
             b"open missing-\xff.pdf: No such file or directory"
+        );
+    }
+
+    #[test]
+    fn object_warning_diagnostics_preserve_raw_message_bytes() {
+        let mut output = Vec::new();
+        write_diagnostic(
+            &mut output,
+            Path::new("destination.pdf"),
+            &Diagnostic::object_warning_bytes(
+                b"/tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array",
+            ),
+        );
+
+        assert_eq!(
+            output,
+            b"WARNING: /tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array\n"
         );
     }
 }
