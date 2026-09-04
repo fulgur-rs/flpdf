@@ -3316,6 +3316,30 @@ fn write_objstm_dictionary(
     out.extend_from_slice(b" >>");
 }
 
+/// Write the QDF-formatted dictionary used by qpdf's
+/// `QPDFWriter::writeObjectStream` (`QPDFWriter.cc:1716-1743`). Structural
+/// entries are deliberately emitted here instead of through an
+/// ObjectHandle, since `/Extends` is already in output-number space during
+/// rewrite and must not be resolved against the source document.
+fn write_qdf_objstm_dictionary(
+    out: &mut Vec<u8>,
+    stream_length: usize,
+    member_count: usize,
+    first_offset: usize,
+    extends: Option<ObjectRef>,
+) {
+    out.extend_from_slice(b"<<\n  /Type /ObjStm\n");
+    out.extend_from_slice(format!("  /Length {stream_length}\n").as_bytes());
+    out.extend_from_slice(format!("  /N {member_count}\n").as_bytes());
+    out.extend_from_slice(format!("  /First {first_offset}\n").as_bytes());
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b">>");
+}
+
 pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
@@ -5053,14 +5077,24 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let identity_map = |object_ref: ObjectRef| Ok(object_ref);
         let no_removed_refs = BTreeSet::new();
         if let Some(ctx) = &encrypt_ctx {
-            write_objstm_dictionary(
-                &mut bytes,
-                stream_length,
-                matches!(objstm_compression, CompressStreams::Yes),
-                body.n_members,
-                objstm_first,
-                extends,
-            );
+            if options.qdf {
+                write_qdf_objstm_dictionary(
+                    &mut bytes,
+                    stream_length,
+                    body.n_members,
+                    objstm_first,
+                    extends,
+                );
+            } else {
+                write_objstm_dictionary(
+                    &mut bytes,
+                    stream_length,
+                    matches!(objstm_compression, CompressStreams::Yes),
+                    body.n_members,
+                    objstm_first,
+                    extends,
+                );
+            }
             write_stream_payload_with_pipeline(
                 &mut bytes,
                 &stream_data,
@@ -5071,16 +5105,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 None,
             )?; // cov:ignore: the encrypted ObjStm route executes; this call continuation has no counter.
         } else if options.qdf {
-            bytes.extend_from_slice(b"<<\n  /Type /ObjStm\n");
-            bytes.extend_from_slice(format!("  /Length {stream_length}\n").as_bytes());
-            bytes.extend_from_slice(format!("  /N {}\n", body.n_members).as_bytes());
-            bytes.extend_from_slice(format!("  /First {objstm_first}\n").as_bytes());
-            if let Some(extends) = extends {
-                bytes.extend_from_slice(
-                    format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
-                );
-            }
-            bytes.extend_from_slice(b">>");
+            write_qdf_objstm_dictionary(
+                &mut bytes,
+                stream_length,
+                body.n_members,
+                objstm_first,
+                extends,
+            );
             serialize::write_stream_payload_with_qdf(
                 &mut bytes,
                 &stream_data,
