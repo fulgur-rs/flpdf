@@ -64,7 +64,7 @@ fn json_output_pages_selection_rebuilds_the_live_page_tree() {
             output.to_str().unwrap(),
         ])
         .assert()
-        .success();
+        .code(3);
 
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
@@ -82,7 +82,7 @@ fn json_output_pages_selection_rebuilds_the_live_page_tree() {
 
 Run `cargo test -p flpdf-cli --test cli_json json_output_pages_selection_rebuilds_the_live_page_tree -- --exact --nocapture`.
 
-Expected: the command exits successfully but the assertion for `pushedinheritedpageresources == true` or the flattened `/Kids` array fails, proving that the test observes the missing production behavior rather than a setup error.
+Expected: the command exits with qpdf's warning status 3 (the fixture's duplicate page leaf triggers a repair warning) but the assertion for `pushedinheritedpageresources == true` or the flattened `/Kids` array fails, proving that the test observes the missing production behavior rather than a setup error.
 
 ### Task 2: Implement qpdf's inherited-page observation and JSON page route
 
@@ -137,69 +137,24 @@ Run the exact focused test from Task 1, then:
 
 ```text
 cargo test -p flpdf-cli --test cli_json
-cargo test -p flpdf --test page_document_helper_tests
+cargo test -p flpdf --test page_document_helper_qpdf_tests
 cargo test -p flpdf --test document_json_tests
 cargo test -p flpdf --test json_document_tests
 ```
 
 Expected: the new regression and all existing focused suites pass; the JSON route uses the existing page selection and inherited-attribute mutation code.
 
-### Task 3: Add qpdf-ctest 42–47 RED coverage
+### Task 3 and Task 4: qpdf-ctest 42–47 (completed by the merged prerequisite)
 
-**Files:**
-- Modify: `crates/flpdf-qtest-tools/tests/qpdf_ctest_cli.rs`
-
-- [ ] **Step 1: Add process tests for the currently absent test numbers.**
-
-Use `tempfile::tempdir`, the existing JSON fixtures under `tests/fixtures/compat/json-input`, and `Command::cargo_bin("qpdf-ctest")`. Add tests asserting that test 42 with a complete JSON file, test 44 with a PDF and update JSON, and test 46 with a PDF and JSON output path currently return the adapter's unsupported-test error. These tests must assert status and stderr, not only that a process was spawned.
-
-- [ ] **Step 2: Run the new tests and verify RED.**
-
-Run `cargo test -p flpdf-qtest-tools --test qpdf_ctest_cli qpdf_ctest_json -- --nocapture`.
-
-Expected: the new tests fail because the current dispatch accepts only tests 1, 2, and 11–20 (the qtest baseline independently showed invalid test number/usage for 42–47).
-
-### Task 4: Implement qpdf-ctest JSON 42–47
-
-**Files:**
-- Modify: `crates/flpdf-qtest-tools/src/bin/qpdf_ctest.rs`
-- Modify: `crates/flpdf-qtest-tools/tests/qpdf_ctest_cli.rs`
-
-- [ ] **Step 1: Extend argument validation and dispatch.**
-
-Accept qpdf's required five-argument form and the optional sixth `xarg` form. Dispatch 42, 43, 44, 45, 46, and 47 to separate functions, while preserving the existing test 1/2/11–20 behavior and the `--version` output.
-
-- [ ] **Step 2: Implement tests 42 and 43 with canonical JSON create.**
-
-Test 42 opens the JSON path with `Pdf::create_from_json_file`, writes the output through `PdfWriter`, enables `set_static_id(true)`, and prints `C test 42 done` only after a successful write. Test 43 reads the input bytes and calls `Pdf::create_from_json(Cursor::new(bytes), path_description)`, then uses the identical writer sequence and success output. File-open, parse, and writer errors return before the success line.
-
-- [ ] **Step 3: Implement tests 44 and 45 with canonical JSON update.**
-
-Both tests open the primary PDF with the existing single-password `open_input` path. Test 44 calls `update_from_json_file` with the optional update path; test 45 reads that update file into bytes and calls `update_from_json(Cursor::new(bytes), path_description)`. Both then write a static-ID PDF through `PdfWriter` and emit their exact success line only after completion.
-
-- [ ] **Step 4: Implement test 46 through the existing JSON Pipeline.**
-
-Open the input PDF, create the output file, wrap it in the existing `PlOStream`/`Pipeline` boundary, and call the canonical JSON v2 writer with `DecodeLevel::None`, `StreamDataMode::Inline`, and an empty selector list. Preserve qpdf's complete document framing and finish lifecycle; do not hand-build JSON bytes.
-
-- [ ] **Step 5: Implement test 47 with selected object and file stream mode.**
-
-Open the input PDF, create the JSON output file, select object 4 generation 0 and the trailer with `JsonObjectSelector`, and call the canonical JSON writer with `DecodeLevel::Specialized` and `StreamDataMode::File { prefix: xarg bytes }`. The side file must be created by the existing `write_json_stream_file` route as `auto-4` when the qtest argument is `auto`; the helper prints `C test 47 done` only after JSON and side-file completion.
-
-- [ ] **Step 6: Replace the RED assertions with behavior assertions.**
-
-Assert status 0, empty stderr, exact `C test N done\n`, output-file existence, and valid output parsing. For the JSON output cases, compare the produced bytes and side-file bytes with qpdf 11.9.0 from a test-owned temporary oracle invocation only when the binary reports exactly 11.9.0; the authoritative qtest comparison remains the full qpdf-json.test run.
-
-- [ ] **Step 7: Run the adapter tests and focused quality checks.**
-
-Run:
-
-```text
-cargo test -p flpdf-qtest-tools --test qpdf_ctest_cli
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-```
-
-Expected: all qpdf-ctest adapter tests, including existing test 1/2/11–20 coverage, pass without warnings.
+**Status:** Already implemented and merged in flpdf PR #1506 (`qpdf_ctest.rs` dispatches
+tests 42–47 through the canonical `Pdf::create_from_json_file`/`create_from_json`/
+`update_from_json_file`/`update_from_json` and JSON-writer routes; `qpdf_ctest_cli.rs`
+already contains `qpdf_ctest_json_cases_42_through_47_match_qpdf`, a live-qpdf-11.9.0
+byte-identical differential covering all six cases including the `auto-4` file-backed
+stream side-file). Do not re-add an "unsupported test" RED phase for these test numbers —
+the dispatch already accepts them. If further work on qpdf-ctest 42–47 is needed, treat
+this merged state as the baseline and write new RED coverage only for behavior that is
+still actually missing.
 
 ### Task 5: Verify qpdf-json.test and reconcile evidence
 
