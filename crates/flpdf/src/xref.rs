@@ -564,12 +564,11 @@ impl BootstrapHandleDocument {
                     ResolvedStreamLength::Invalid
                 }
             }
-            // `resolve_indirect` above catches every resolution failure and
-            // falls back to a warned Null rather than propagating Err, so
-            // try_as_integer never actually returns Err for a handle from
-            // this resolver; kept only for symmetry with the general
-            // ObjectHandle contract, matching the prior `.ok()` fallback.
-            Err(_) => ResolvedStreamLength::Missing, // cov:ignore: this resolver's resolve_indirect never propagates Err
+            // A reconstruction trigger lets `resolve_indirect` propagate a
+            // parse error so the caller can rebuild the xref table. Treat a
+            // failed indirect length as missing for this framing attempt,
+            // preserving the stream-boundary recovery fallback.
+            Err(_) => ResolvedStreamLength::Missing,
         }
     }
 
@@ -2769,9 +2768,6 @@ fn find_xref_stream_trailer_candidate(
             Some(cached)
         } else {
             read_xref_candidate(&mut context, bytes, start, window_end, offset, object_ref).or_else(
-                // cov:ignore-start: bounded candidate recovery is a defensive
-                // retry for false next-object offsets; valid qpdf candidates
-                // are fully parsed by the first bounded read.
                 || {
                     if window_end >= bytes.len() {
                         return None;
@@ -2784,7 +2780,6 @@ fn find_xref_stream_trailer_candidate(
                         .map_or(bytes.len(), |&next| next as usize);
                     read_xref_candidate(&mut context, bytes, start, wide_end, offset, object_ref)
                 },
-                // cov:ignore-end
             )
         };
         append_new_context_diagnostics(
@@ -2859,13 +2854,21 @@ fn read_xref_candidate(
         return None;
     }
     let _ = completed.remove_included_recovery_eol_for_decryption();
-    for diagnostic in completed.diagnostics {
+    // A bounded reconstruction read can recover an incomplete container as a
+    // null handle while retaining tokenizer/EOF diagnostics. That cannot be a
+    // /Type /XRef candidate, but the caller may recover the real object by
+    // retrying with the wider offset window.
+    let reject_recovered_null = completed.object.is_null() && !completed.diagnostics.is_empty();
+    for diagnostic in &completed.diagnostics {
         context.diagnostics.push(xref_file_object_diagnostic(
             XrefObjectDescription::Ordinary,
             object_ref,
             offset,
-            diagnostic,
+            diagnostic.clone(),
         ));
+    }
+    if reject_recovered_null {
+        return None;
     }
     let canonical = context.document.handle_for_reference(object_ref);
     let value = completed.object.into_direct_value()?.0;
@@ -3179,7 +3182,6 @@ fn parse_xref_stream(
             XrefObjectDescription::XrefStream,
         ) {
             Ok(completed) => completed,
-            // cov:ignore-start: raw and handle framing read the same bytes; this is a defensive divergence arm
             Err(error) => {
                 context.append_diagnostics_to(&mut repair_diagnostics);
                 if let Some(sink) = error_diagnostics_sink {
@@ -3188,7 +3190,7 @@ fn parse_xref_stream(
                     }
                 }
                 return Err(error.rebase_offset(xref_pos));
-            } // cov:ignore-end
+            }
         };
         // Xref streams are not encrypted, but filter decoding still requires
         // the logical payload rather than qpdf's raw recovery EOL.
@@ -4116,6 +4118,55 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn xref_candidate_retry_widens_a_literal_truncated_by_a_false_header() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let first_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 /Info (prefix\n",
+        );
+        let false_header_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\nsuffix) >>\nstream\nabcd\nendstream\nendobj\n");
+
+        let first_ref = ObjectRef::new(1, 0);
+        let false_ref = ObjectRef::new(2, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            first_ref,
+            XrefEntry::Uncompressed {
+                offset: first_offset as u64,
+            },
+        );
+        entries.insert(
+            false_ref,
+            XrefEntry::Uncompressed {
+                offset: false_header_offset as u64,
+            },
+        );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
+
+        let (candidate, _) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &reference_offsets,
+        );
+
+        let candidate = candidate.expect("wide retry must recover the xref stream candidate");
+        assert_eq!(candidate.max_offset, first_offset as u64);
+        assert_eq!(
+            candidate
+                .trailer
+                .try_get_key(b"/Type")
+                .expect("candidate dictionary has a /Type key")
+                .as_name(),
+            Some(b"XRef".to_vec())
+        );
+    }
+
+    #[test]
     fn reconstruction_reference_read_retries_a_narrow_window_that_recovers_nonempty_but_truncated_data(
     ) {
         // A narrow window's heuristic search can accept a *non-empty* but
@@ -4521,6 +4572,26 @@ mod final_handle_tests {
         assert!(error
             .to_string()
             .contains("trailer dictionary lacks /Size key"));
+    }
+
+    #[test]
+    fn malformed_xref_stream_framing_error_is_forwarded() {
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+        let error = parse_xref_stream(
+            b"not an indirect object",
+            0,
+            0,
+            "1.5".to_owned(),
+            XrefLoadOptions::default(),
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a malformed xref-stream object header must fail framing");
+
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(diagnostics.entries().is_empty());
     }
 
     #[test]
@@ -4949,6 +5020,28 @@ mod final_handle_tests {
         let mut diagnostics = Diagnostics::default();
         context.append_diagnostics_to(&mut diagnostics);
         assert_eq!(diagnostics.entries().len(), 1);
+    }
+
+    #[test]
+    fn resolve_length_maps_a_reconstruction_trigger_error_to_missing() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 1 });
+        let state = Rc::new(RefCell::new(BootstrapHandleState {
+            reconstruction_trigger: Some((1, "header mismatch".to_owned())),
+            ..BootstrapHandleState::default()
+        }));
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(b"x"),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            state,
+        );
+
+        assert_eq!(
+            document.resolve_length(object_ref),
+            ResolvedStreamLength::Missing
+        );
     }
 
     #[test]
