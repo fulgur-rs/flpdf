@@ -43,7 +43,7 @@ use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_qpdf_writer_version, PdfVersion, QpdfVersionParts, PDF_1_5};
 use crate::pipeline::{flate::Flate, Pipeline, PlString};
 use crate::{filters, Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
@@ -3501,6 +3501,37 @@ fn write_pclm<R: Read + Seek, W: Write>(
         }
     }
 
+    // qpdf's PCLm queue does not enqueue other trailer values before the body
+    // queue is written (`QPDFWriter.cc:2928-2954`). When writeTrailer later
+    // unparses one of those indirect values, unparseChild calls enqueueObject,
+    // which assigns a number after the xref size has already been fixed. Keep
+    // that observable late-numbering behavior local to PCLm trailer emission:
+    // the value is remapped, but no body or xref entry is added for it.
+    let late_trailer_refs = RefCell::new(HashMap::<ObjectRef, ObjectRef>::new());
+    // cov:ignore-start: PCLm output numbers originate in a u32 queue, so an object count that does not fit u32 is not constructible on supported targets.
+    let next_late_trailer_number = Cell::new(u32::try_from(object_count).map_err(|_| {
+        crate::Error::Unsupported("PCLm trailer object number does not fit in u32".to_string())
+    })?);
+    // cov:ignore-end
+    let trailer_map = |object_ref: ObjectRef| {
+        if let Some(output) = plan.old_to_new.get(&object_ref).copied() {
+            return Ok(output);
+        }
+        if let Some(output) = late_trailer_refs.borrow().get(&object_ref).copied() {
+            return Ok(output);
+        }
+        let output_number = next_late_trailer_number.get();
+        // cov:ignore-start: reaching the next-number overflow requires a u32::MAX-sized emitted object queue.
+        let next_number = output_number.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported("PCLm trailer object number overflow".to_string())
+        })?;
+        // cov:ignore-end
+        let output = ObjectRef::new(output_number, 0);
+        late_trailer_refs.borrow_mut().insert(object_ref, output);
+        next_late_trailer_number.set(next_number);
+        Ok(output)
+    };
+
     match plan.root {
         None => {
             let root = plan.direct_root.as_ref().ok_or_else(|| {
@@ -3523,17 +3554,6 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 options.deterministic_id,
                 generated_id.as_ref(),
             )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup.
-            let map = |object_ref: ObjectRef| {
-                plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
-                    // cov:ignore-start: the direct Catalog traversal that
-                    // creates the plan also creates every live reference map
-                    // entry reached by this serializer.
-                    crate::Error::Unsupported(format!(
-                        "PCLm direct /Root reference {object_ref} absent from renumber map"
-                    ))
-                    // cov:ignore-end
-                }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
-            };
             if options.deterministic_id {
                 let info_suffix = deterministic_id_info_suffix(pdf);
                 let mut id_writer = |out: &mut Vec<u8>| {
@@ -3544,13 +3564,19 @@ fn write_pclm<R: Read + Seek, W: Write>(
                     false,
                     false,
                     Some(&mut id_writer),
-                    &map,
+                    &trailer_map,
                     &removed,
                     true,
                 )?; // cov:ignore: deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
             } else {
                 trailer.write_trailer_with_ref_map(
-                    &mut bytes, false, false, None, &map, &removed, true,
+                    &mut bytes,
+                    false,
+                    false,
+                    None,
+                    &trailer_map,
+                    &removed,
+                    true,
                 )?; // cov:ignore: non-deterministic direct-root trailer emission is exercised; LLVM maps this continuation to the call setup.
             }
         }
@@ -3569,15 +3595,6 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 options.deterministic_id,
                 generated_id.as_ref(),
             )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
-            let map = |object_ref| {
-                // cov:ignore-start: the complete PCLm plan makes a missing trailer mapping unreachable
-                plan.old_to_new.get(&object_ref).copied().ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "PCLm trailer reference {object_ref} absent from renumber map"
-                    ))
-                }) // cov:ignore: PCLm trailer references are covered by the canonical plan
-                   // cov:ignore-end
-            };
             if options.deterministic_id {
                 let info_suffix = deterministic_id_info_suffix(pdf);
                 let mut id_writer = |out: &mut Vec<u8>| {
@@ -3588,13 +3605,19 @@ fn write_pclm<R: Read + Seek, W: Write>(
                     false,
                     false,
                     Some(&mut id_writer),
-                    &map,
+                    &trailer_map,
                     &removed,
                     true,
                 )?; // cov:ignore: validated deterministic PCLm trailer emission; LLVM maps this continuation to the call setup
             } else {
                 trailer.write_trailer_with_ref_map(
-                    &mut bytes, false, false, None, &map, &removed, true,
+                    &mut bytes,
+                    false,
+                    false,
+                    None,
+                    &trailer_map,
+                    &removed,
+                    true,
                 )?; // cov:ignore: validated PCLm trailer emission; LLVM maps this continuation to the call setup
             }
         }
