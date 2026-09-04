@@ -598,7 +598,17 @@ identity ごとに `/Filter` / `/DecodeParms` edge を除外する。probe と e
 （flpdf-p045）。D27 の pre-write sweep 撤去後もこの probe は全 object の事前走査へ戻さず、
 `Optimization::update_object_maps` の page/trailer/root 起点 callback 内でだけ実行する。
 そのため qpdf と同じ到達範囲外の stream の source bytes や間接 `/Length` holder を
-linearization planning が解決しない（`flpdf-3yn9.44.1`）。
+linearization planning が解決しない（`flpdf-3yn9.44.1`）。同じ境界を ObjStm
+eligibility にも適用し、`QPDF::getCompressibleObjGens`
+（`QPDF.cc:2393-2474`）の到達可能 walk から `/Length` 除外集合を返す。
+非 linearized の Preserve/Generate planner もこの結果だけを使い、xref 全件の
+事前走査を行わない（`flpdf-3yn9.44.1.1`）。ただし qpdf の writer setup 自体は
+`getObjectCount`（`QPDF.cc:1271-1283`）で xref 全体を解決し、`resolve`
+（`QPDF.cc:1699-1753`）の warning/null 回復を適用するため、「qpdf が orphan を
+一切解決しない」とは一般化しない。
+また、linearization optimizer callback の indirect parameter 判定は最初の
+`willFilterStream` 相当 probe の結果をそのまま使い、同一 callback 内の二重 probe
+を避ける（qpdf の retry を含む一回の probe と後段 emission は別である）。
 
 `flpdf-xrgz` では producer の Part 4/first-half routing でも qpdf の `is_root`
 precedence (`QPDF_linearization.cc:1090-1127`) を保持し、page からも参照される

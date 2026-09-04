@@ -609,6 +609,15 @@ deletable route の独立 symbol にはせず、D21 の canonical owner
 「linearized planning も page/trailer/root 起点の到達範囲だけを解決する」境界を
 `d-writer.md` と §7.3 の follow-up 記録で追跡する。
 
+**P1 follow-up（`flpdf-3yn9.44.1.1`）:** ObjStm planning の `/Length` 除外集合も
+`QPDF::getCompressibleObjGens` 相当の到達可能 walk から供給するよう統一した。
+`pdf.object_refs()` による全 xref の事前解決は削除し、非 linearized の
+Preserve/Generate と linearized Preserve の各回帰テストで orphan の reader-level
+failure を越えないことを確認する。qpdf の writer setup が `getObjectCount` で全 xref
+を解決して warning/null 回復する責務とは別なので、qpdf が orphan を常に無視すると
+いう意味ではない。malformed orphan の live qpdf 比較は `--warning-exit-0` と warning
+出力を検証する。
+
 **(b) baseline denominator には `--expect-zero` を当てない。** その行の完了判定は
 「canonical owner に収束したか」であって「caller が 0 になったか」ではない。
 

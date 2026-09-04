@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{build_pdf, write_linearized_with_settings, WriterTestSettings};
+use common::{build_pdf, write_linearized_with_settings, write_with_settings, WriterTestSettings};
 use flpdf::{DecodeLevel, NewlineBeforeEndstream, ObjectStreamMode, Pdf};
 use std::cell::Cell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -26,9 +26,9 @@ fn qpdf_available() -> bool {
 }
 
 /// A valid one-page document with an orphaned stream whose indirect `/Length`
-/// holder points to an unreadable source range. qpdf's linearization optimizer
-/// never resolves this stream because it is not reachable from the page, root,
-/// or trailer keys.
+/// holder is a genuinely malformed object on disk. qpdf's optimization walk
+/// does not use that orphan as a reachable stream edge, while qpdf's general
+/// writer setup may still diagnose it while resolving the xref universe.
 fn pdf_with_unreachable_stream() -> (Vec<u8>, u64, u64) {
     let bytes = build_pdf(
         &[
@@ -39,7 +39,7 @@ fn pdf_with_unreachable_stream() -> (Vec<u8>, u64, u64) {
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>".to_owned(),
             ),
             (4, "<< /Length 5 0 R >>\nstream\n\nendstream".to_owned()),
-            (5, "0".to_owned()),
+            (5, "<< /Broken [ >>".to_owned()),
         ],
         1,
     );
@@ -102,7 +102,7 @@ impl Seek for FailingObjectReader {
 }
 
 #[test]
-fn linearization_ignores_an_unreachable_unreadable_stream_like_qpdf() {
+fn linearization_does_not_resolve_an_unreachable_unreadable_stream() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let input = temp.path().join("unreachable-unreadable.pdf");
     let flpdf_output = temp.path().join("flpdf-linearized.pdf");
@@ -141,7 +141,7 @@ fn linearization_ignores_an_unreachable_unreadable_stream_like_qpdf() {
 
     let qpdf_output = temp.path().join("qpdf-linearized.pdf");
     let qpdf = Command::new("qpdf")
-        .args(["--linearize"])
+        .args(["--warning-exit-0", "--linearize"])
         .arg(&input)
         .arg(&qpdf_output)
         .output()
@@ -149,10 +149,26 @@ fn linearization_ignores_an_unreachable_unreadable_stream_like_qpdf() {
     assert_eq!(
         qpdf.status.code(),
         Some(0),
-        "qpdf must ignore an unreachable unreadable stream: {}",
+        "qpdf warning-exit-0 linearization must complete: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("object 5"),
+        "qpdf must diagnose the genuinely malformed orphan object: {}",
         String::from_utf8_lossy(&qpdf.stderr)
     );
     assert!(qpdf_output.exists(), "qpdf must create linearized output");
+    let qpdf_check = Command::new("qpdf")
+        .args(["--check"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf 11.9.0 must check its output");
+    assert_eq!(
+        qpdf_check.status.code(),
+        Some(0),
+        "qpdf warning-exit-0 output must remain valid: {}",
+        String::from_utf8_lossy(&qpdf_check.stderr)
+    );
 
     let flpdf_check = Command::new("qpdf")
         .args(["--check"])
@@ -165,4 +181,39 @@ fn linearization_ignores_an_unreachable_unreadable_stream_like_qpdf() {
         "flpdf linearized output must remain valid: {}",
         String::from_utf8_lossy(&flpdf_check.stderr)
     );
+}
+
+#[test]
+fn object_stream_planning_does_not_resolve_an_unreachable_unreadable_stream() {
+    for (mode, linearized) in [
+        (ObjectStreamMode::Preserve, false),
+        (ObjectStreamMode::Generate, false),
+        (ObjectStreamMode::Preserve, true),
+        (ObjectStreamMode::Generate, true),
+    ] {
+        let (bytes, fail_start, fail_end) = pdf_with_unreachable_stream();
+        let (reader, fail_enabled) = FailingObjectReader::new(bytes, fail_start, fail_end);
+        let mut pdf = Pdf::open(reader).expect("flpdf should open the lazy fixture");
+        fail_enabled.set(true);
+        let settings = WriterTestSettings {
+            decode_level: DecodeLevel::None,
+            deterministic_id: true,
+            object_streams: mode,
+            // QDF selects the specialized non-linearized coordinator, whose
+            // Preserve/Generate planner used to scan the whole xref universe.
+            qdf: !linearized,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterTestSettings::default()
+        };
+        let result = if linearized {
+            write_linearized_with_settings(&mut pdf, &settings)
+        } else {
+            write_with_settings(&mut pdf, Vec::new(), &settings).map(|()| Vec::new())
+        };
+        assert!(
+            result.is_ok(),
+            "{mode:?} {} write must ignore the unreachable unreadable stream: {result:?}",
+            if linearized { "linearized" } else { "standard" }
+        );
+    }
 }
