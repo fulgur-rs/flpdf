@@ -7,7 +7,10 @@
 **調査日:** 2026-07-29（初版）/ 2026-08-02（Phase 2 着手時の再測 — `flpdf-1e5g`）/
 2026-08-16（`flpdf-egzr`/`flpdf-3yn9` 大量クローズ後の再測）
 **関連:** `flpdf-qxba`（部品積み上げによる責務分割）/
-[設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md)
+[設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md) /
+[route matrix](qpdf-route-matrix/README.md)（`flpdf-3yn9.41`。本表の「責務対応」の上に
+「その責務へ至る経路が 1 本か」の軸を足した canonical / bridge / mixed / unknown の棚卸しと
+cutover 計画。本表の行を置き換えず、引用は `scripts/check-qpdf-route-matrix.py --check` で検証する）
 
 pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の責務分割が qpdf と
 どこまで対応しているかのスナップショット。`flpdf-qxba` の work-list であり、Phase 1

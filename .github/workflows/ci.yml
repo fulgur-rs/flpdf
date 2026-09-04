@@ -48,6 +48,19 @@ jobs:
       - name: Check qpdf-deviation markers
         run: python3 scripts/check-qpdf-deviation-markers.py --check
 
+      - name: Test qpdf route matrix citation checker
+        run: python3 -m unittest scripts/tests/test_check_qpdf_route_matrix.py
+
+      # The pinned qpdf source tree is a local developer convenience
+      # (scripts/fetch-qpdf-source.sh is deliberately not a CI gate), so CI
+      # validates citation syntax, flpdf symbol existence, and classification
+      # values only; qpdf line ranges are checked locally before a PR.
+      - name: Check qpdf route matrix citations
+        run: python3 scripts/check-qpdf-route-matrix.py --check --no-qpdf
+
+      - name: Test qpdf route caller tracker
+        run: python3 -m unittest scripts/tests/test_qpdf_route_callers.py
+
       - name: Test patch-coverage gate contract
         run: bash scripts/tests/patch-coverage-contract.sh
 
