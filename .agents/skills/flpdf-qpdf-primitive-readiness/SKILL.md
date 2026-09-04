@@ -193,14 +193,19 @@ report. If context does not contain that report and approval, rerun phase 1.
    that qpdf evidence contradicts, and update the parent epic's and the
    dependent side's description, per
    `.claude/rules/qpdf-port-design-patterns.md` rule 4.
-7. Run `bd dolt push` and report its result. If it fails, stop here: do not
-   add `primitive-audited` (a label added before successful persistence
-   would mark an unpersisted audit complete). Follow Partial Failure and
-   Retry below.
-8. Only after `bd dolt push` succeeds, add `primitive-audited` with
+7. Run `bd dolt push` to persist the notes and dependency changes. If it
+   fails, stop here: do not add `primitive-audited` (a label added before
+   the notes it describes are even persisted would be worse than
+   premature). Follow Partial Failure and Retry below.
+8. Only after that push succeeds, add `primitive-audited` with
    `bd update <audited> --add-label primitive-audited`.
-9. Read back the audited issue, prerequisite issues, dependency tree, notes,
-   and labels.
+9. Run `bd dolt push` again to persist the label itself. If this second
+   push fails, the notes and dependencies are already persisted but the
+   label is only local — report exactly this state; the only remaining
+   retry step is re-running `bd dolt push` (idempotent) until it succeeds.
+   Do not report the audit as complete until this push succeeds.
+10. Read back the audited issue, prerequisite issues, dependency tree,
+    notes, and labels.
 
 This skill's own Beads mutations do not by themselves require `git push` —
 they change no git-tracked implementation files. That does not override the
