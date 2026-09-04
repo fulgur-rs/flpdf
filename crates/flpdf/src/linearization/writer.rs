@@ -4637,10 +4637,12 @@ mod tests {
         let root_ref = pdf.root_ref().expect("Catalog present");
         assert!(!pdf.is_dirty(root_ref), "fresh source must start clean");
 
-        let mut options = WriterOptions::default();
-        options.progress_reporter = Some(ProgressReporter::new(Box::new(|_| {
-            Err(crate::Error::System("test progress failure".to_owned()))
-        })));
+        let options = WriterOptions {
+            progress_reporter: Some(ProgressReporter::new(Box::new(|_| {
+                Err(crate::Error::System("test progress failure".to_owned()))
+            }))),
+            ..WriterOptions::default()
+        };
         let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
             .expect_err("canonical progress reporter failure must abort writing");
         assert!(
