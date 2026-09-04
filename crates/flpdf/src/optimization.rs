@@ -2,7 +2,7 @@
 
 pub(crate) mod inherited_attrs;
 
-use crate::object_handle::MAX_INLINE_DEPTH;
+use crate::parser::MAX_PARSE_DEPTH;
 use crate::{ObjectHandle, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -251,9 +251,9 @@ impl Optimization {
         }];
 
         while let Some(pending) = stack.pop() {
-            if pending.inline_depth > MAX_INLINE_DEPTH {
+            if pending.inline_depth > MAX_PARSE_DEPTH {
                 return Err(crate::Error::Unsupported(format!(
-                    "optimization: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+                    "optimization: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
                 )));
             }
 

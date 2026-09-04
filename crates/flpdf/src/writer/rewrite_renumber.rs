@@ -31,7 +31,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
-use crate::object_handle::MAX_INLINE_DEPTH;
 use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::ObjectStreamGroup;
@@ -384,7 +383,7 @@ fn ensure_canonical_owner<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when the trailer has no `/Root` or inline
-/// nesting exceeds [`MAX_INLINE_DEPTH`] (via the canonical enqueue collector), and propagates
+/// nesting exceeds [`MAX_PARSE_DEPTH`] (via the canonical enqueue collector), and propagates
 /// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
 /// objects during the walk.
 pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
@@ -471,7 +470,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
 /// ([`crate::writer::object_streams::get_compressible_objgens`]) and must not append
 /// this set a second time.
 ///
-/// Propagates resolve errors and the [`MAX_INLINE_DEPTH`] guard from the walk.
+/// Propagates resolve errors and the [`MAX_PARSE_DEPTH`] guard from the walk.
 /// Null-resolving references to retain, minus any identities removed by the
 /// current qpdf operation's compressible-object walk.
 ///
@@ -549,9 +548,9 @@ fn walk_resurrectable_handle(
     edge_context: bool,
     state: &mut ResurrectableWalkState<'_>,
 ) -> crate::Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
-            "linearization: inline nesting exceeds MAX_INLINE_DEPTH during resurrectable walk"
+            "linearization: inline nesting exceeds MAX_PARSE_DEPTH during resurrectable walk"
                 .to_string(),
         ));
     }

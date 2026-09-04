@@ -33,7 +33,7 @@
 
 use crate::linearization::renumber::RenumberMap;
 use crate::object_handle::ObjectHandle;
-use crate::object_handle::MAX_INLINE_DEPTH;
+use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::{
     compressible_objgens_qpdf_plan, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
@@ -194,9 +194,9 @@ fn collect_direct_handle_refs(
     depth: usize,
     out: &mut Vec<ObjectRef>,
 ) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
         )));
     }
     let mut contextual = Vec::new();
@@ -233,9 +233,9 @@ fn collect_direct_handle_refs_with_context(
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
 ) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
         )));
     }
     if let Some(object_ref) = handle.object_ref() {
@@ -259,9 +259,9 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
     out: &mut Vec<(ObjectRef, bool)>,
     skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
         )));
     }
     if let Some(object_ref) = handle.object_ref() {
