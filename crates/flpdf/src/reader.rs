@@ -214,6 +214,12 @@ pub struct PdfOpenOptions {
     /// Logger that receives document warnings as they occur. `None` selects
     /// the process-global qpdf-compatible default logger.
     pub logger: Option<crate::QPDFLogger>,
+    /// Emit qpdf job-level informational messages while opening the document.
+    /// This carries `QPDFJob::doIfVerbose` policy into the reader-owned
+    /// authentication retry boundary.
+    pub verbose: bool,
+    /// Message prefix used for qpdf job-level informational messages.
+    pub message_prefix: Vec<u8>,
     /// Suppress warning delivery to the logger without removing warnings from
     /// [`Pdf::repair_diagnostics`].
     pub suppress_warnings: bool,
@@ -238,6 +244,8 @@ impl Default for PdfOpenOptions {
             suppress_password_recovery: false,
             password_is_hex_key: false,
             logger: None,
+            verbose: false,
+            message_prefix: b"qpdf".to_vec(),
             suppress_warnings: false,
             description: Vec::new(),
         }
@@ -660,6 +668,11 @@ impl<R: Read + Seek> Pdf<R> {
         // supplied password's wording and context (`QPDFJob.cc:1752-1790`).
         let original = candidates[0].clone();
         let mut final_bad_password = None;
+        let logger = options
+            .logger
+            .clone()
+            .unwrap_or_else(crate::QPDFLogger::default_logger);
+        let mut warned = false;
         for candidate in candidates.into_iter().chain(std::iter::once(original)) {
             let mut attempt = options.clone();
             // Candidates are already decoded bytes. Mark them as bytes so a
@@ -671,6 +684,18 @@ impl<R: Read + Seek> Pdf<R> {
                 Ok(()) => return Ok(()),
                 Err(error) if matches!(error, Error::Encrypted(EncryptedError::BadPassword)) => {
                     final_bad_password = Some(error);
+                    if options.verbose && !warned {
+                        warned = true;
+                        let mut message = if options.message_prefix.is_empty() {
+                            b"qpdf".to_vec()
+                        } else {
+                            options.message_prefix.clone()
+                        };
+                        message.extend_from_slice(
+                            b": supplied password didn't work; trying other passwords based on interpreting password with different string encodings\n",
+                        );
+                        logger.info(message)?;
+                    }
                 }
                 Err(error) => return Err(error),
             }

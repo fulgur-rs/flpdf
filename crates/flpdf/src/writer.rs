@@ -5788,9 +5788,19 @@ mod final_handle_writer_tests {
         }
         let mut invalid = WriterConfiguration::default();
         invalid.set_encryption_parameters(EncryptParams::v5_r6(b"75", b"not-hex"));
-        assert!(invalid
-            .normalize_encryption_passwords(PasswordMode::HexBytes)
-            .is_err());
+        assert_eq!(
+            invalid
+                .normalize_encryption_passwords(PasswordMode::HexBytes)
+                .unwrap(),
+            0
+        );
+        let params = invalid
+            .settings
+            .encryption_parameters
+            .as_ref()
+            .expect("hex password parameters remain configured");
+        assert_eq!(params.user_password, vec![0x75]);
+        assert_eq!(params.owner_password, vec![0xe0]);
     }
 
     #[test]

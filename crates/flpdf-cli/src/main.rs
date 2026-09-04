@@ -2062,6 +2062,8 @@ struct RecoveryArgs {
 struct PasswordArgs {
     #[command(flatten)]
     recovery: RecoveryArgs,
+    #[arg(skip)]
+    verbose: bool,
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
     password: Option<OsString>,
@@ -2288,7 +2290,13 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let args = cli_parse_from(residual_args);
+    let mut args = cli_parse_from(residual_args);
+    // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
+    // the reader owns the authentication retry boundary in flpdf. Carry the
+    // job policy through the existing PasswordArgs copy used by every open
+    // helper so the qpdf retry diagnostic is emitted before the alternate
+    // candidate is attempted.
+    args.password.verbose = args.verbose;
     validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
         emit_logger_error(format!("flpdf: {error}\n"));
@@ -7493,6 +7501,8 @@ fn pdf_open_options_with_password_bytes(
         password_mode: password.password_mode.into(),
         suppress_password_recovery: password.suppress_password_recovery,
         password_is_hex_key: password.password_is_hex_key,
+        verbose: password.verbose,
+        message_prefix: progname().into_bytes(),
         ..PdfOpenOptions::default()
     }
 }

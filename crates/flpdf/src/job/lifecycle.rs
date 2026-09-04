@@ -1696,6 +1696,8 @@ impl QPDFJob {
             password_mode: self.configuration.password_mode,
             suppress_password_recovery: self.configuration.suppress_password_recovery,
             password_is_hex_key: self.configuration.password_is_hex_key,
+            verbose: self.configuration.verbose,
+            message_prefix: self.message_prefix.as_bytes().to_vec(),
             ..PdfOpenOptions::default()
         }
     }
@@ -2362,6 +2364,8 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        options.verbose |= self.configuration.verbose;
+        options.message_prefix = self.message_prefix.as_bytes().to_vec();
         // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
         // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
         // opens (`QPDFJob.cc:663-665`), not just the final completion
@@ -3521,6 +3525,8 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        options.verbose |= self.configuration.verbose;
+        options.message_prefix = self.message_prefix.as_bytes().to_vec();
         // qpdf's `setQPDFOptions` applies `noWarn` to every ordinary QPDF
         // immediately after construction and before `processFile`
         // (`QPDFJob.cc:650-666,1695-1711`). Preserve an explicit caller
