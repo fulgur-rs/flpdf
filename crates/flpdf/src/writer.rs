@@ -3290,21 +3290,54 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
 /// Write the fixed-order dictionary used by qpdf's non-QDF
 /// `QPDFWriter::writeObjectStream` (`QPDFWriter.cc:1714-1743`). The generic
 /// ObjectHandle stream serializer sorts dictionary keys for ordinary streams,
-/// but qpdf writes ObjStm's structural keys in this explicit order so the
-/// encrypted Generate route can remain byte-identical.
-fn write_generated_objstm_dictionary(
+/// but qpdf writes ObjStm's structural keys in this explicit order. `/Extends`
+/// is an output-space reference and is therefore emitted as a token here,
+/// rather than as an unresolved ObjectHandle that the generic null-visibility
+/// walk would try to resolve against the source PDF.
+fn write_objstm_dictionary(
     out: &mut Vec<u8>,
     stream_length: usize,
     compressed: bool,
     member_count: usize,
     first_offset: usize,
+    extends: Option<ObjectRef>,
 ) {
     out.extend_from_slice(b"<< /Type /ObjStm");
     out.extend_from_slice(format!(" /Length {stream_length}").as_bytes());
     if compressed {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
-    out.extend_from_slice(format!(" /N {member_count} /First {first_offset} >>").as_bytes());
+    out.extend_from_slice(format!(" /N {member_count} /First {first_offset}").as_bytes());
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b" >>");
+}
+
+/// Write the QDF-formatted dictionary used by qpdf's
+/// `QPDFWriter::writeObjectStream` (`QPDFWriter.cc:1716-1743`). Structural
+/// entries are deliberately emitted here instead of through an
+/// ObjectHandle. `/Extends` is already in output-number space during rewrite
+/// and is emitted as a token rather than resolved against the source PDF.
+fn write_qdf_objstm_dictionary(
+    out: &mut Vec<u8>,
+    stream_length: usize,
+    member_count: usize,
+    first_offset: usize,
+    extends: Option<ObjectRef>,
+) {
+    out.extend_from_slice(b"<<\n  /Type /ObjStm\n");
+    out.extend_from_slice(format!("  /Length {stream_length}\n").as_bytes());
+    out.extend_from_slice(format!("  /N {member_count}\n").as_bytes());
+    out.extend_from_slice(format!("  /First {first_offset}\n").as_bytes());
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b">>");
 }
 
 pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
@@ -4248,15 +4281,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             }
 
             // Determine whether this object is a real stream (needs a holder),
-            // a non-stream object, or a structural stream that the main loop
-            // skips (XRef / ObjStm).
+            // a non-stream object, or the XRef structural stream that the QDF
+            // pre-scan skips because it is rebuilt separately.
             let object_handle = pdf.get_object_handle(*old_ref);
             pdf.resolve(&object_handle)?;
             let is_real_stream = if object_handle.as_stream_dict().is_some() {
-                let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                    || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
+                let is_structural = object_handle.try_is_stream_of_type(b"XRef", b"")?;
                 if is_structural {
-                    None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
+                    None // cov:ignore: the rebuilt XRef stream is excluded from CF renumber by skip_length=true
                 } else {
                     Some(true)
                 }
@@ -4264,7 +4296,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 Some(false)
             };
             let Some(is_stream) = is_real_stream else {
-                continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
+                continue; // cov:ignore: None only when the rebuilt XRef stream is excluded from renumbered by skip_length=true
             };
 
             next_emission = next_emission.checked_add(1).ok_or_else(|| {
@@ -4540,13 +4572,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // both QDF and normalization modes because a generic child serializer
         // intentionally emits only a direct stream's dictionary.
         let content_container = content_container_refs.contains(old_ref);
-        // Skip xref-stream and ObjStm container objects — we'll rebuild the
-        // structural streams from scratch below. Handle predicates preserve
+        // Skip an xref stream or a source ObjStm that has a dedicated rebuild
+        // batch; an unretained source ObjStm remains an ordinary source stream,
+        // as qpdf's `/Extends` enqueue path requires. Handle predicates preserve
         // qpdf's live dictionary lookup without resolving a legacy `Object`.
-        if is_stream
-            && (object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?)
-        {
+        let is_rebuilt_objstm = qpdf_preserve_source_objstm
+            && source_container_to_batch.contains_key(old_ref)
+            && object_handle.try_is_stream_of_type(b"ObjStm", b"")?;
+        if is_stream && (object_handle.try_is_stream_of_type(b"XRef", b"")? || is_rebuilt_objstm) {
             continue; // cov:ignore: structural streams are rebuilt by their dedicated loops below
         }
 
@@ -5044,34 +5077,23 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let identity_map = |object_ref: ObjectRef| Ok(object_ref);
         let no_removed_refs = BTreeSet::new();
         if let Some(ctx) = &encrypt_ctx {
-            if qpdf_generate_encrypted {
-                write_generated_objstm_dictionary(
+            if options.qdf {
+                write_qdf_objstm_dictionary(
+                    &mut bytes,
+                    stream_length,
+                    body.n_members,
+                    objstm_first,
+                    extends,
+                );
+            } else {
+                write_objstm_dictionary(
                     &mut bytes,
                     stream_length,
                     matches!(objstm_compression, CompressStreams::Yes),
                     body.n_members,
                     objstm_first,
+                    extends,
                 );
-            } else if let Some(emitter) = encrypted_strings.as_mut() {
-                emitter.write_handle_stream_dict_with_ref_map(
-                    &mut bytes,
-                    container_ref,
-                    None,
-                    &stream_dict,
-                    encrypted_strings::StreamDictOptions::new(false, false, true),
-                    &identity_map,
-                    &no_removed_refs,
-                    None,
-                )?; // cov:ignore: encrypted ObjStm dictionary route; LLVM maps the call continuation here
-            } else {
-                // cov:ignore-start: encrypted output always constructs the handle-aware emitter
-                stream_dict.write_stream_body_with_ref_map_and_removed(
-                    &mut bytes,
-                    false,
-                    &identity_map,
-                    &no_removed_refs,
-                )?;
-                // cov:ignore-end
             }
             write_stream_payload_with_pipeline(
                 &mut bytes,
@@ -5083,16 +5105,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 None,
             )?; // cov:ignore: the encrypted ObjStm route executes; this call continuation has no counter.
         } else if options.qdf {
-            bytes.extend_from_slice(b"<<\n  /Type /ObjStm\n");
-            bytes.extend_from_slice(format!("  /Length {stream_length}\n").as_bytes());
-            bytes.extend_from_slice(format!("  /N {}\n", body.n_members).as_bytes());
-            bytes.extend_from_slice(format!("  /First {objstm_first}\n").as_bytes());
-            if let Some(extends) = extends {
-                bytes.extend_from_slice(
-                    format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
-                );
-            }
-            bytes.extend_from_slice(b">>");
+            write_qdf_objstm_dictionary(
+                &mut bytes,
+                stream_length,
+                body.n_members,
+                objstm_first,
+                extends,
+            );
             serialize::write_stream_payload_with_qdf(
                 &mut bytes,
                 &stream_data,

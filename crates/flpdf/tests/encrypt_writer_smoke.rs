@@ -244,6 +244,39 @@ fn assert_qpdf_check(bytes: &[u8]) {
     );
 }
 
+fn qpdf_qdf_encrypted_rewrite(input: &[u8]) -> Option<Vec<u8>> {
+    if Command::new("qpdf").arg("--version").output().is_err() {
+        return None;
+    }
+
+    let directory = tempfile::tempdir().expect("create qpdf rewrite directory");
+    let input_path = directory.path().join("input.pdf");
+    let output_path = directory.path().join("output.pdf");
+    fs::write(&input_path, input).expect("write qpdf rewrite input");
+    let result = Command::new("qpdf")
+        .args([
+            "--static-id",
+            "--qdf",
+            "--object-streams=generate",
+            "--allow-weak-crypto",
+            "--encrypt",
+            "",
+            "x",
+            "128",
+            "--",
+        ])
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .expect("run qpdf encrypted QDF rewrite");
+    assert!(
+        result.status.success(),
+        "qpdf encrypted QDF rewrite failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Some(fs::read(output_path).expect("read qpdf encrypted QDF rewrite"))
+}
+
 #[test]
 fn qpdf_check_helper_rejects_recoverable_xref_warnings_and_errors() {
     let mut warning_only = nested_string_fixture(INFO_PLAINTEXT);
@@ -710,6 +743,32 @@ fn encrypted_qdf_generate_objstm_remains_checkable() {
     let reopened = open_encrypted(&bytes, b"");
     assert!(reopened.is_encrypted());
     assert!(reopened.root_ref().is_some());
+}
+
+#[test]
+fn encrypted_qdf_objstm_dictionary_matches_qpdf() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    let options = WriterTestSettings {
+        static_id: true,
+        qdf: true,
+        object_streams: ObjectStreamMode::Generate,
+        encrypt: Some(EncryptParams::rc4(
+            EncryptMethod::V2Rc4128,
+            Vec::new(),
+            b"x".to_vec(),
+        )),
+        ..WriterTestSettings::default()
+    };
+    let actual = rewrite_fixture(&input, &options);
+    let Some(expected) = qpdf_qdf_encrypted_rewrite(&input) else {
+        eprintln!("qpdf not available; skipping encrypted QDF byte parity");
+        return;
+    };
+
+    assert_eq!(
+        actual, expected,
+        "encrypted QDF ObjStm output must be byte-identical to qpdf 11.9.0"
+    );
 }
 
 #[test]

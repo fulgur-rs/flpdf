@@ -2233,6 +2233,7 @@ fn recover_xref_from_linear_scan(
     }
     let mut parsed_xref_streams = BTreeMap::new();
     let mut extra_trailer_references = BTreeSet::new();
+    let mut bootstrap_cache = empty_bootstrap_cache();
 
     // qpdf's `reconstruct_xref` (`QPDF.cc:564-616`) gates BOTH its `trailer`
     // keyword scan (`!m->trailer.isInitialized() && t1.isWord("trailer")`)
@@ -2267,10 +2268,18 @@ fn recover_xref_from_linear_scan(
                     &mut repair_diagnostics,
                     &mut extra_trailer_references,
                 ) {
-                    Ok((trailer, max_offset, form, _deleted_objects, first_xref_item_offset)) => {
+                    Ok((
+                        trailer,
+                        max_offset,
+                        form,
+                        _deleted_objects,
+                        first_xref_item_offset,
+                        candidate_bootstrap_cache,
+                    )) => {
                         // Candidate re-entry has already consumed its local
                         // tombstones while filtering `entries`; never retain
                         // them past this recovery operation.
+                        bootstrap_cache = candidate_bootstrap_cache;
                         (trailer, max_offset, form, first_xref_item_offset)
                     }
                     Err(candidate_error) => {
@@ -2302,7 +2311,7 @@ fn recover_xref_from_linear_scan(
         pending_reconstruction_trigger: None,
         trailer_references,
         parsed_xref_streams,
-        bootstrap_cache: empty_bootstrap_cache(),
+        bootstrap_cache,
         header_offset: 0,
         already_reconstructed: true,
     })
@@ -2480,7 +2489,14 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, ObjectHandle>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
-) -> Result<(ObjectHandle, u64, XrefForm, BTreeSet<u32>, u64)> {
+) -> Result<(
+    ObjectHandle,
+    u64,
+    XrefForm,
+    BTreeSet<u32>,
+    u64,
+    SharedBootstrapCache,
+)> {
     // All bootstrap contexts below resolve against this same line-scan map
     // until the candidate chain has been merged. Build the sorted offset
     // index once and pass cheap Rc clones through each context instead of
@@ -2666,6 +2682,7 @@ fn recover_trailer_from_xref_stream_candidate(
         reentry.loaded.last_xref_form,
         deleted_objects,
         first_xref_item_offset,
+        candidate.bootstrap_cache,
     ))
 }
 
