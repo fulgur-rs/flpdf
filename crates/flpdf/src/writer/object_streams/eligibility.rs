@@ -2,7 +2,9 @@
 //! ObjStm eligibility predicate — decides whether an indirect object may be
 //! stored inside an object stream (PDF 1.5+, ISO 32000-1 §7.5.7).
 //! The traversal preserves qpdf's depth-first eligibility order and records
-//! stale generations that the writer must serialize as null.
+//! stale generations that the writer must serialize as null. It also records
+//! indirect `/Length` targets from the same reachable walk; it never scans the
+//! full xref/object universe just to compute an ObjStm planning exclusion.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -88,6 +90,13 @@ pub(crate) fn get_compressible_objgens<R: std::io::Read + std::io::Seek>(
 pub(crate) struct CompressiblePlan {
     pub eligible: Vec<ObjectRef>,
     pub removed_refs: BTreeSet<ObjectRef>,
+    /// Indirect `/Length` targets of reachable ObjStm streams. qpdf's
+    /// compressible-object walk does not follow a stream's `/Length` edge,
+    /// but the writer still needs this set to keep those holders out of a
+    /// different ObjStm when they are reachable through another edge. This is
+    /// intentionally separate from qpdf's writer-setup `getObjectCount`
+    /// resolution of the complete xref table (`QPDF.cc:1271-1283`).
+    pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }
 
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
@@ -96,6 +105,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut result: Vec<ObjectRef> = Vec::new();
     let mut removed_refs = BTreeSet::new();
+    let mut indirect_objstm_length_refs = BTreeSet::new();
     // qpdf's obj_cache upper_bound test is operation-specific. Build the
     // highest LIVE generation index once so null edges are O(1), and exclude
     // free/deleted generations from superseding a lower live object.
@@ -139,7 +149,18 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
         }
 
         object.try_dereference()?;
-        let is_stream = object.as_stream_dict().is_some();
+        let stream_dict = object.as_stream_dict();
+        let is_stream = stream_dict.is_some();
+        if let Some(stream_dict) = stream_dict {
+            if stream_dict
+                .try_get_key(b"/Type")
+                .and_then(|type_value| type_value.try_is_name_and_equals(b"ObjStm"))?
+            {
+                if let Some(length_ref) = stream_dict.try_get_key(b"/Length")?.object_ref() {
+                    indirect_objstm_length_refs.insert(length_ref);
+                }
+            }
+        }
         let is_signature = !is_stream && is_qpdf_signature_dict(pdf, &object)?;
         // Streams, signature value dictionaries, and the encryption dictionary
         // cannot be stored inside an object stream, so they are excluded from
@@ -154,6 +175,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     Ok(CompressiblePlan {
         eligible: result,
         removed_refs,
+        indirect_objstm_length_refs,
     })
 }
 
@@ -246,30 +268,48 @@ fn push_handle_dict_children(
     Ok(())
 }
 
-/// Collect the set of ObjectRefs that serve as indirect /Length targets of any
-/// ObjStm stream in the document.  ISO 32000-1 §7.5.7 prohibits those objects
-/// from being stored inside an ObjStm themselves.
-pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-) -> crate::Result<BTreeSet<ObjectRef>> {
-    let mut excluded = BTreeSet::new();
-    let refs: Vec<ObjectRef> = pdf.object_refs();
-    for r in refs {
-        let object = pdf.get_object_handle(r);
-        object.try_dereference()?;
-        let Some(dict) = object.as_stream_dict() else {
-            continue;
-        };
-        if !dict
-            .try_get_key(b"/Type")
-            .and_then(|type_value| type_value.try_is_name_and_equals(b"ObjStm"))?
-        {
-            continue;
-        }
-        let length = dict.try_get_key(b"/Length")?;
-        if let Some(length_ref) = length.object_ref() {
-            excluded.insert(length_ref);
-        }
+#[cfg(test)]
+mod tests {
+    use super::compressible_objgens_qpdf_plan;
+    use crate::{ObjectRef, Pdf};
+    use std::io::Cursor;
+
+    fn reachable_objstm_with_indirect_length() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let catalog_offset = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /ObjStm 4 0 R >>\nendobj\n");
+        let objstm_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 5 0 R >>\nstream\n\nendstream\nendobj\n",
+        );
+        let length_offset = pdf.len();
+        pdf.extend_from_slice(b"5 0 obj\n0\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{objstm_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{length_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
     }
-    Ok(excluded)
+
+    #[test]
+    fn compressible_plan_records_reachable_objstm_length_targets_without_following_them() {
+        let mut pdf = Pdf::open(Cursor::new(reachable_objstm_with_indirect_length()))
+            .expect("open indirect-length ObjStm fixture");
+        let plan = compressible_objgens_qpdf_plan(&mut pdf).expect("build compressible plan");
+        let holder = ObjectRef::new(5, 0);
+        assert!(
+            plan.indirect_objstm_length_refs.contains(&holder),
+            "reachable ObjStm length holder must be recorded"
+        );
+        assert!(
+            !plan.eligible.contains(&holder),
+            "the stream's /Length edge must not make its holder eligible"
+        );
+    }
 }

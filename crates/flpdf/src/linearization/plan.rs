@@ -35,7 +35,7 @@ use crate::linearization::renumber::RenumberMap;
 use crate::object_handle::ObjectHandle;
 use crate::object_handle::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
-    collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm_handle,
+    compressible_objgens_qpdf_plan, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
 };
 use crate::{ObjectRef, Pdf, Result};
@@ -1019,30 +1019,37 @@ impl LinearizationPlan {
                     return Ok(2);
                 }
                 let has_indirect_parameter = stream_has_indirect_parameter_edge(stream)?;
-                let parameters_removed = has_indirect_parameter
-                    && stream_parameters_removed_for_linearization(
+                // The parameter-edge helper is itself the qpdf-shaped
+                // `willFilterStream` probe. Reuse its result when the stream
+                // has an indirect parameter edge; a second probe here would
+                // consume a stateful provider/filter a second time within the
+                // same optimization callback.
+                let refiltered = if has_indirect_parameter {
+                    stream_parameters_removed_for_linearization(
                         stream,
                         stream_ref,
                         options,
                         &content_normalize_refs,
-                    )?; // cov:ignore: LLVM attributes this covered reachable-stream branch continuation to the call opening line
-                if parameters_removed {
-                    if let Some(object_ref) = stream_ref {
-                        skipped_stream_parameter_streams.insert(object_ref);
+                    )? // cov:ignore: LLVM attributes this covered reachable-stream branch continuation to the call opening line
+                } else {
+                    crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
+                        stream,
+                        options,
+                        stream_ref
+                            .is_some_and(|object_ref| content_normalize_refs.contains(&object_ref)),
+                    )? // cov:ignore: LLVM attributes this covered reachable-stream branch continuation to the call opening line
+                };
+                if refiltered {
+                    if has_indirect_parameter {
+                        if let Some(object_ref) = stream_ref {
+                            skipped_stream_parameter_streams.insert(object_ref);
+                        }
                     }
                     // The probe above already consumed qpdf's stateful filter
                     // check; the optimization callback must not run it again.
                     Ok(2)
                 } else {
-                    let refiltered =
-                        crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
-                            stream,
-                            options,
-                            stream_ref.is_some_and(|object_ref| {
-                                content_normalize_refs.contains(&object_ref)
-                            }),
-                        )?; // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
-                    Ok(if refiltered { 2 } else { 1 })
+                    Ok(1)
                 }
             },
         )?;
@@ -2371,7 +2378,12 @@ impl LinearizationPlan {
         })?;
 
         let ctx = eligibility_context(pdf)?;
-        let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
+        let length_exclusions =
+            if config.mode == ObjectStreamMode::Preserve && config.preserve_unreferenced_objects {
+                BTreeSet::new()
+            } else {
+                compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs
+            };
 
         let plan = match config.mode {
             ObjectStreamMode::Disable => unreachable!(),
@@ -2936,7 +2948,9 @@ mod tests {
     use crate::Pdf;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
+    use std::cell::Cell;
     use std::io::{Cursor, Write};
+    use std::rc::Rc;
 
     fn flate(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -3001,6 +3015,18 @@ mod tests {
         pdf
     }
 
+    struct PassThroughTokenFilter;
+
+    impl crate::token_filter::TokenFilter for PassThroughTokenFilter {
+        fn handle_token(
+            &mut self,
+            token: &crate::tokenizer::Token,
+            output: &mut crate::token_filter::TokenFilterOutput<'_>,
+        ) -> crate::pipeline::PipelineResult<()> {
+            output.write_token(token)
+        }
+    }
+
     #[test]
     fn qpdf_linearization_probe_consumes_modified_and_parameterized_streams() {
         let mut pdf = Pdf::open(Cursor::new(parameter_probe_fixture())).expect("parse fixture");
@@ -3021,6 +3047,49 @@ mod tests {
             plan.all_assigned_refs()
                 .contains(&crate::ObjectRef::new(10, 0)),
             "inline resource and ancestor array references must reach the plan"
+        );
+    }
+
+    #[test]
+    fn qpdf_linearization_parameter_probe_runs_once_before_raw_retry() {
+        let mut pdf = Pdf::open(Cursor::new(parameter_probe_fixture())).expect("parse fixture");
+        let stream = pdf.get_object_handle(crate::ObjectRef::new(4, 0));
+        pdf.resolve(&stream).expect("resolve page content");
+
+        let token = crate::tokenizer::Token::new(crate::tokenizer::TokenType::Word, b"q".to_vec());
+        let mut filter = PassThroughTokenFilter;
+        let mut output = crate::token_filter::TokenFilterOutput::new(None);
+        crate::token_filter::TokenFilter::handle_token(&mut filter, &token, &mut output)
+            .expect("pass-through filter token");
+
+        let provider_calls = Rc::new(Cell::new(0));
+        let provider_calls_for_callback = Rc::clone(&provider_calls);
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |_pipeline, _suppress_warnings, _will_retry| {
+                    provider_calls_for_callback.set(provider_calls_for_callback.get() + 1);
+                    Ok(false)
+                },
+                None,
+                None,
+            )
+            .expect("install stateful stream provider");
+        stream
+            .add_token_filter(Rc::new(std::cell::RefCell::new(PassThroughTokenFilter)))
+            .expect("register token filter");
+        pdf.mark_object_handle_dirty(&stream)
+            .expect("mark modified content");
+
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..WriterOptions::default()
+        };
+        LinearizationPlan::from_pdf_with_writer_options(&mut pdf, &options)
+            .expect("build linearization plan");
+        assert_eq!(
+            provider_calls.get(),
+            2,
+            "one qpdf parameter probe may retry once with raw data, but the optimization callback must not probe the same stream again"
         );
     }
 }

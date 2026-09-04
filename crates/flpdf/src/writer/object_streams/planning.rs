@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use super::eligibility::{
-    collect_indirect_objstm_length_refs, compressible_objgens_qpdf_plan, eligibility_context,
-    even_split_into_streams_with_cap, is_eligible_for_objstm_handle, EligibilityContext,
+    compressible_objgens_qpdf_plan, eligibility_context, even_split_into_streams_with_cap,
+    is_eligible_for_objstm_handle, EligibilityContext,
 };
 use crate::writer::WriterOptions;
 use crate::ObjectRef;
@@ -43,6 +43,10 @@ pub(crate) struct PlannerConfig {
     pub mode: ObjectStreamMode,
     /// Maximum number of members per ObjStm batch. qpdf default is 100.
     pub batch_size_cap: NonZeroUsize,
+    /// Whether qpdf should retain source objects that are not reachable from
+    /// the trailer/root graph. This is a Preserve-only policy; Generate still
+    /// takes its members from `getCompressibleObjGens`.
+    pub preserve_unreferenced_objects: bool,
 }
 
 impl Default for PlannerConfig {
@@ -50,6 +54,7 @@ impl Default for PlannerConfig {
         Self {
             mode: ObjectStreamMode::Preserve,
             batch_size_cap: DEFAULT_BATCH_SIZE_CAP,
+            preserve_unreferenced_objects: false,
         }
     }
 }
@@ -115,6 +120,7 @@ pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerCon
     PlannerConfig {
         mode: options.object_streams,
         batch_size_cap: DEFAULT_BATCH_SIZE_CAP,
+        preserve_unreferenced_objects: options.preserve_unreferenced_objects,
     }
 }
 
@@ -134,7 +140,10 @@ pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerCon
 /// The specialized writer uses this only for Generate combined with
 /// `preserveUnreferencedObjects`: qpdf's `generateObjectStreams` always takes
 /// its members from `getCompressibleObjGens` and never lets the preserve flag
-/// expand that set (`QPDFWriter.cc:1970-2006`).
+/// expand that set (`QPDFWriter.cc:1970-2006`). All `/Length` exclusions come
+/// from that same qpdf-shaped reachable walk; Preserve with
+/// `preserveUnreferencedObjects` deliberately has no such intersection
+/// (`QPDFWriter.cc:1939-1967`).
 pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     config: &PlannerConfig,
@@ -145,7 +154,15 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
     }
 
     let ctx = eligibility_context(pdf)?;
-    let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
+    let length_exclusions =
+        if config.mode == ObjectStreamMode::Preserve && config.preserve_unreferenced_objects {
+            // QPDFWriter::preserveObjectStreams keeps every source member when
+            // preserveUnreferencedObjects is set; it does not run the
+            // getCompressibleObjGens intersection in that branch.
+            BTreeSet::new()
+        } else {
+            compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs
+        };
 
     match config.mode {
         ObjectStreamMode::Disable => {
@@ -202,11 +219,14 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
     pdf: &mut crate::Pdf<R>,
     preserve_unreferenced: bool,
 ) -> crate::Result<ObjectStreamPlan> {
-    let ctx = eligibility_context(pdf)?;
-    let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
     let compressible = (!preserve_unreferenced)
         .then(|| compressible_objgens_qpdf_plan(pdf))
         .transpose()?;
+    let ctx = eligibility_context(pdf)?;
+    let length_exclusions = compressible
+        .as_ref()
+        .map(|plan| plan.indirect_objstm_length_refs.clone())
+        .unwrap_or_default();
     let eligible: BTreeSet<ObjectRef> = compressible
         .as_ref()
         .map(|plan| plan.eligible.iter().copied().collect())
@@ -342,4 +362,17 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         batches,
         removed_refs: compressible.removed_refs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP};
+
+    #[test]
+    fn planner_config_default_uses_qpdf_defaults() {
+        let config = PlannerConfig::default();
+        assert_eq!(config.mode, ObjectStreamMode::Preserve);
+        assert_eq!(config.batch_size_cap, DEFAULT_BATCH_SIZE_CAP);
+        assert!(!config.preserve_unreferenced_objects);
+    }
 }
