@@ -51,7 +51,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 | 分類 | 定義 |
 |---|---|
 | **canonical** | flpdf の当該 entrypoint がその qpdf 責務の唯一の正本で、アルゴリズム・呼び出し順序が cite した qpdf code と 1:1 に対応し、production caller が全てここを通る。 |
-| **bridge** | 旧表現と canonical 表現を翻訳するためだけに存在し、それ自体に qpdf 対応物が無い経路。残 caller を全列挙する（ゼロなら削除候補）。bridge に qpdf semantics を足さない。 |
+| **bridge** | それ自体に qpdf 対応物が無く、canonical route が全 consumer に行き渡れば不要になる経路。2 形がある: (i) 旧表現と canonical 表現を翻訳するためだけに存在する層、(ii) qpdf に対応する処理が無い flpdf 固有の補助経路（CLAUDE.md 逸脱分類 (C) — 例: 明示的 `Pdf::resolve` による解決タイミング補正、dirty 追跡、retry 予算）。どちらも削除対象であり、残 caller を列挙する（ゼロなら削除候補）。caller が 20 を超える場合は、再現可能な `rg` コマンドとファイル別件数で列挙に代える。責務レベルでは qpdf 対応物があっても、経路（入口）としての対応物が無ければ bridge になりうる（例: qpdf が公開しない private 処理を `pub` で包んだ死んだ wrapper）。bridge に qpdf semantics を足さない。 |
 | **mixed** | 1 つの qpdf 責務が flpdf 側で 2 つ以上の経路に分かれ、順序・採番・診断のいずれかが経路間で異なりうる状態。または 1 つの flpdf 経路が 2 つ以上の qpdf 責務を畳んでいる状態。 |
 | **unknown** | qpdf source / 既存 probe では責務境界を決められない。必要な追加 source 箇所か probe コマンドを書き、推測で分類しない。 |
 
