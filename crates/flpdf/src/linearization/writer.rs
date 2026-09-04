@@ -4596,3 +4596,68 @@ fn write_linearized_impl<R: Read + Seek>(
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn one_page_pdf_with_direct_outlines_and_deep_resource() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines << /Count 0 >> >>\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources ",
+        );
+        let depth = crate::object_handle::MAX_INLINE_DEPTH + 1;
+        pdf.extend(std::iter::repeat_n(b'[', depth));
+        pdf.extend(std::iter::repeat_n(b']', depth));
+        pdf.extend_from_slice(b" >>\nendobj\n");
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn linearized_writer_keeps_catalog_dirty_after_canonical_planning_failure() {
+        // The canonical optimization pass promotes direct /Outlines before
+        // its object-user walk reaches the over-deep page resource. The later
+        // planning error must not let restoration clear that permanent change.
+        let mut pdf = Pdf::open(Cursor::new(
+            one_page_pdf_with_direct_outlines_and_deep_resource(),
+        ))
+        .expect("source parses");
+        let root_ref = pdf.root_ref().expect("Catalog present");
+        assert!(!pdf.is_dirty(root_ref), "fresh source must start clean");
+
+        let error = write_linearized_for_pdf_writer(&mut pdf, &WriterOptions::default(), None)
+            .expect_err("deep canonical resource must fail planning");
+        assert!(
+            error.to_string().contains("inline object nesting exceeds"),
+            "unexpected planning error: {error}"
+        );
+
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root).expect("Catalog resolves");
+        assert!(
+            root.try_get_key(b"/Outlines")
+                .expect("Outlines lookup")
+                .is_indirect(),
+            "planning must keep qpdf's direct /Outlines promotion"
+        );
+        assert!(
+            pdf.is_dirty(root_ref),
+            "a permanent planning mutation must keep the Catalog dirty after failure"
+        );
+    }
+}
