@@ -3947,9 +3947,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         } else {
             vec![None; plan.batches.len()]
         };
-    let qpdf_preserve_source_objstm = !options.qdf
-        && options.object_streams == ObjectStreamMode::Preserve
-        && !plan.batches.is_empty();
+    let qpdf_preserve_source_objstm =
+        options.object_streams == ObjectStreamMode::Preserve && !plan.batches.is_empty();
 
     // Xref form selection: ObjStm-resident objects need type-2 xref entries,
     // which can only live in xref streams.  When the planner emits any batch
@@ -4243,9 +4242,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
     if options.qdf {
         // qpdf's standard enqueue walk assigns a container as soon as it first
-        // reaches one of that container's members, then reserves the complete
-        // sorted member set immediately (`QPDFWriter.cc:1057-1069,1088-1115`).
-        // The same rule applies to generated and source-preserved groups.
+        // reaches one of that container's members, or the source container
+        // itself, then reserves the complete sorted member set immediately
+        // (`QPDFWriter.cc:1057-1069,1088-1115`). The same rule applies to
+        // generated and source-preserved groups.
         // Ordinary objects and their QDF length holders are numbered in this
         // same walk.
         let mut next_emission = 0_u32;
@@ -4254,7 +4254,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             if old_ref.number == 0 || skip_refs.contains(old_ref) {
                 continue; // cov:ignore: free/deleted refs don't appear in renumbered
             }
-            if let Some(&batch_idx) = member_batch_index.get(old_ref) {
+            let batch_idx = source_container_to_batch
+                .get(old_ref)
+                .or_else(|| member_batch_index.get(old_ref))
+                .copied();
+            if let Some(batch_idx) = batch_idx {
                 if !assigned_batches[batch_idx] {
                     next_emission = next_emission.checked_add(1).ok_or_else(|| {
                         // cov:ignore-start: requires > 2^32 objects — impossible in practice
@@ -4265,6 +4269,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     })?; // cov:ignore: the supported PDF object space cannot overflow u32
                     container_refs[batch_idx] = ObjectRef::new(next_emission, 0);
                     assigned_batches[batch_idx] = true;
+                    if let Some(source) = source_container_for_batch[batch_idx] {
+                        // A source-backed container is still an indirect
+                        // object in qpdf's output-number map even though its
+                        // body is rebuilt by the dedicated ObjStm emitter.
+                        qdf_emission_renumber.insert(source, container_refs[batch_idx]);
+                    }
 
                     for member in &plan.batches[batch_idx] {
                         next_emission = next_emission.checked_add(1).ok_or_else(|| {
@@ -5161,7 +5171,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         };
 
         for (_, old_ref) in &renumbered {
-            if let Some(&batch_idx) = member_batch_index.get(old_ref) {
+            let batch_idx = source_container_to_batch
+                .get(old_ref)
+                .or_else(|| member_batch_index.get(old_ref))
+                .copied();
+            if let Some(batch_idx) = batch_idx {
                 if appended_batches.insert(batch_idx) {
                     if let Some(&(start, end)) = qdf_container_chunks.get(&batch_idx) {
                         append_chunk(start, end);
