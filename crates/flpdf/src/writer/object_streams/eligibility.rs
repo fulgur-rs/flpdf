@@ -267,3 +267,49 @@ fn push_handle_dict_children(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::compressible_objgens_qpdf_plan;
+    use crate::{ObjectRef, Pdf};
+    use std::io::Cursor;
+
+    fn reachable_objstm_with_indirect_length() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        let catalog_offset = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /ObjStm 4 0 R >>\nendobj\n");
+        let objstm_offset = pdf.len();
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 5 0 R >>\nstream\n\nendstream\nendobj\n",
+        );
+        let length_offset = pdf.len();
+        pdf.extend_from_slice(b"5 0 obj\n0\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{objstm_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{length_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn compressible_plan_records_reachable_objstm_length_targets_without_following_them() {
+        let mut pdf = Pdf::open(Cursor::new(reachable_objstm_with_indirect_length()))
+            .expect("open indirect-length ObjStm fixture");
+        let plan = compressible_objgens_qpdf_plan(&mut pdf).expect("build compressible plan");
+        let holder = ObjectRef::new(5, 0);
+        assert!(
+            plan.indirect_objstm_length_refs.contains(&holder),
+            "reachable ObjStm length holder must be recorded"
+        );
+        assert!(
+            !plan.eligible.contains(&holder),
+            "the stream's /Length edge must not make its holder eligible"
+        );
+    }
+}

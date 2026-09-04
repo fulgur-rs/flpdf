@@ -363,3 +363,16 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         removed_refs: compressible.removed_refs,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP};
+
+    #[test]
+    fn planner_config_default_uses_qpdf_defaults() {
+        let config = PlannerConfig::default();
+        assert_eq!(config.mode, ObjectStreamMode::Preserve);
+        assert_eq!(config.batch_size_cap, DEFAULT_BATCH_SIZE_CAP);
+        assert!(!config.preserve_unreferenced_objects);
+    }
+}

@@ -3056,6 +3056,12 @@ mod tests {
         let stream = pdf.get_object_handle(crate::ObjectRef::new(4, 0));
         pdf.resolve(&stream).expect("resolve page content");
 
+        let token = crate::tokenizer::Token::new(crate::tokenizer::TokenType::Word, b"q".to_vec());
+        let mut filter = PassThroughTokenFilter;
+        let mut output = crate::token_filter::TokenFilterOutput::new(None);
+        crate::token_filter::TokenFilter::handle_token(&mut filter, &token, &mut output)
+            .expect("pass-through filter token");
+
         let provider_calls = Rc::new(Cell::new(0));
         let provider_calls_for_callback = Rc::clone(&provider_calls);
         stream
