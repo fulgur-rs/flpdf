@@ -42,6 +42,8 @@
 
 use flpdf::{AcroFormDocumentHelper, NewlineBeforeEndstream, Pdf};
 use std::path::Path;
+#[cfg(feature = "qpdf-zlib-compat")]
+use std::process::Command;
 
 /// Full-rewrite `fixture` after `disable_digital_signatures`, with the
 /// qpdf-matching option set, and return the bytes.
@@ -59,6 +61,31 @@ fn remove_restrictions_qpdf_equivalent(fixture: &str) -> Vec<u8> {
 
     let opts = WriterTestSettings {
         static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+
+    let mut out = Vec::new();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
+    out
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+fn remove_restrictions_qpdf_equivalent_preserving_unreferenced(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
+
+    AcroFormDocumentHelper::new(&mut pdf)
+        .unwrap()
+        .disable_digital_signatures()
+        .unwrap();
+
+    let opts = WriterTestSettings {
+        static_id: true,
+        preserve_unreferenced_objects: true,
         newline_before_endstream: NewlineBeforeEndstream::Never,
         ..WriterTestSettings::default()
     };
@@ -189,6 +216,52 @@ fn indirect_fields_array_preserved_byte_identical_to_qpdf() {
     assert_parity(
         "acroform-sig-indirect-fields.pdf",
         "acroform-sig-indirect-fields",
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn preserve_unreferenced_signature_dictionary_matches_qpdf() {
+    let qpdf_version = Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("qpdf should be installed for the qpdf-zlib compatibility gate");
+    assert!(qpdf_version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&qpdf_version.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim(),
+        "qpdf version 11.9.0"
+    );
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/acroform-sig-field-only.pdf");
+    let qpdf_output = directory.path().join("qpdf.pdf");
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--static-id",
+            "--remove-restrictions",
+            "--preserve-unreferenced",
+        ])
+        .arg(&fixture)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf =
+        remove_restrictions_qpdf_equivalent_preserving_unreferenced("acroform-sig-field-only.pdf");
+    let qpdf = std::fs::read(&qpdf_output).expect("read qpdf output");
+    assert_eq!(
+        flpdf, qpdf,
+        "--remove-restrictions --preserve-unreferenced must retain the signature dictionary like qpdf"
     );
 }
 

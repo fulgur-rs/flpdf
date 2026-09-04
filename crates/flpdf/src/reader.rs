@@ -26,7 +26,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use crate::pdf::{CompressedMemberProvenance, Pdf};
+use crate::pdf::Pdf;
 
 /// A seekable, owned input source that can cross a qpdf job's document
 /// boundary without exposing the concrete reader kind to its consumers.
@@ -1015,139 +1015,6 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    /// Preserve resolved compressed members when their source ObjStm is
-    /// replaced or removed. qpdf's `replaceObject` and `removeObject` mutate
-    /// only the requested cache slot (`QPDF.cc:1980-2005`); a member already
-    /// materialized in `m->obj_cache` remains available through its own
-    /// `QPDFObject` handle. The legacy reader cache and the canonical handle
-    /// graph are separate during this migration, so mirror either side's
-    /// resolved value before changing the source slot. A planner can resolve
-    /// a member canonically while the old body consumer still sees a
-    /// `Compressed` cache entry; leaving that entry untouched would make the
-    /// body consumer reparse through the source after it has been replaced.
-    fn promote_resolved_object_stream_members(
-        &mut self,
-        object_stream_ref: ObjectRef,
-    ) -> Result<()> {
-        if object_stream_ref.generation != 0 {
-            return Ok(());
-        }
-        if !matches!(
-            self.cache.entry(object_stream_ref),
-            Some(CacheEntry::Resolved(stream)) if stream.as_stream_dict().is_some()
-        ) {
-            // A compressed member can only have been resolved after its source
-            // stream was loaded into the compatibility cache. Avoid scanning
-            // the complete xref/cache for ordinary object mutations.
-            return Ok(());
-        }
-
-        let mut members = Vec::new();
-        for (member_ref, entry) in self.resolver.source_xref_entries() {
-            let XrefEntry::Compressed { stream, index: _ } = entry else {
-                continue;
-            };
-            if stream != object_stream_ref.number || self.qpdf_removed_refs.contains(&member_ref) {
-                continue;
-            }
-
-            let cache_state = match self.cache.entry(member_ref) {
-                Some(CacheEntry::Compressed { stream, index }) => {
-                    Some((Some((*stream, *index)), None))
-                }
-                Some(CacheEntry::Resolved(handle)) => Some((None, Some(handle.clone()))),
-                Some(CacheEntry::Missing | CacheEntry::Deleted)
-                | Some(CacheEntry::Unresolved { .. } | CacheEntry::Reserved)
-                | None => None,
-            };
-            let Some((compressed_entry, cached_handle)) = cache_state else {
-                continue;
-            };
-
-            // Prefer the canonical value when the planner has already
-            // resolved the member. This preserves direct ObjectHandle
-            // mutations while the compatibility cache is being reconciled.
-            let canonical_handle = self
-                .resolver
-                .registered_handle(member_ref)
-                .filter(ObjectHandle::is_resolved)
-                .or(cached_handle);
-            let Some(handle) = canonical_handle else {
-                continue;
-            };
-            members.push((member_ref, compressed_entry, handle));
-        }
-
-        for (member_ref, compressed_entry, handle) in members {
-            if let Some((stream, index)) = compressed_entry {
-                self.record_compressed_member_provenance(member_ref, stream, index);
-            }
-            self.cache.set_resolved(member_ref, handle);
-        }
-        Ok(())
-    }
-
-    fn record_compressed_member_provenance(
-        &mut self,
-        object_ref: ObjectRef,
-        source_stream: u32,
-        source_index: u32,
-    ) {
-        self.compressed_member_parents.insert(
-            object_ref,
-            CompressedMemberProvenance {
-                source_stream,
-                source_index,
-            },
-        );
-    }
-
-    /// Remove `object_ref`, marking it deleted.
-    ///
-    /// Subsequent canonical handle lookups for `object_ref` observe
-    /// a null handle, matching the behavior for any
-    /// other unknown or freed reference.
-    pub fn delete_object(&mut self, object_ref: ObjectRef) {
-        if object_ref.number != 0 {
-            // The cache early return below must see the reconstructed live xref;
-            // qpdf removes the corresponding cached object when a mutation
-            // removes it (`libqpdf/QPDF.cc:1996-2004`).
-            self.synchronize_cache_with_resolver_xref();
-        }
-        if object_ref.number != 0 {
-            self.qpdf_removed_refs.insert(object_ref);
-        }
-        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
-        self.qpdf_dangling_refs.remove(&object_ref);
-        if object_ref.number == 0 {
-            return;
-        }
-
-        // qpdf erases the source xref row and canonical object-cache entry
-        // while nullifying every outstanding handle (`QPDF.cc:1996-2004`).
-        // Keep the indirect identity for this legacy public API, but remove
-        // the source row and resolve the retained handle to null. The qpdf-facing
-        // object snapshot filters this compatibility slot below.
-        self.promote_resolved_object_stream_members(object_ref)
-            .expect("a parsed ObjStm member must be representable as an ObjectHandle");
-        self.resolver
-            .remove_object_preserving_handle(object_ref)
-            .expect("canonical resolver object removal is infallible");
-
-        self.handle_mutated_object_refs.remove(&object_ref);
-        self.get_object_handle(object_ref)
-            .set_resolved(ObjectValue::Null);
-
-        if matches!(
-            self.cache.entry(object_ref),
-            Some(CacheEntry::Deleted | CacheEntry::Missing)
-        ) {
-            return;
-        }
-        self.cache.set_deleted(object_ref);
-        self.dirty_object_refs.insert(object_ref);
-    }
-
     /// Number of objects currently resolved in the cache. Useful when you want to
     /// confirm that lazy resolution actually deferred work.
     pub fn resolved_count(&self) -> usize {
@@ -1164,7 +1031,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// `true` when `object_ref` is currently marked dirty (i.e. has been
-    /// mutated via [`Self::replace_object`] or [`Self::delete_object`] since the
+    /// mutated via [`Self::replace_object`] since the
     /// Pdf was opened). Used by the full-rewrite writer to detect whether a
     /// pre-existing dirty flag existed before an output-only Catalog mutation
     /// so the flag can be preserved through a restore.
@@ -1208,7 +1075,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Object refs that the cross-reference table marks as live.
     ///
     /// Excludes:
-    /// - `Deleted` — explicit `delete_object()` calls,
+    /// - `Deleted` — legacy test-only cache tombstones,
     /// - `Missing` — referenced but never present in any xref,
     /// - `Reserved` — forward-reference placeholders that
     ///   the canonical handle returns as null (no real indirect
@@ -1577,9 +1444,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.synchronize_cache_with_resolver_xref();
         // qpdf's removeObject changes only the requested cache slot; already
         // resolved members of an ObjStm remain live in their own cache slots.
-        // Promote those compatibility-cache values before the removal drops
-        // the source container.
-        self.promote_resolved_object_stream_members(object_ref)?;
         self.resolver.remove_object(object_ref)?;
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1743,7 +1607,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Mark `object_ref` dirty so canonical writer preparation and other live
     /// document consumers observe an in-place handle mutation.
     ///
-    /// [`Self::replace_object`] and [`Self::delete_object`] already do this
+    /// [`Self::replace_object`] already does this
     /// internally. Calling this after an in-place [`ObjectHandle`] mutation
     /// invalidates any materialized snapshot before scheduling the canonical
     /// live handle for writing, matching qpdf's single shared object state.

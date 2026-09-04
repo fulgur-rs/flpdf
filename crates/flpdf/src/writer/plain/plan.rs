@@ -1588,21 +1588,6 @@ mod tests {
     }
 
     #[test]
-    fn build_rejects_explicitly_deleted_root_before_placement() {
-        let path = fixture_path("three-page.pdf");
-        let mut pdf =
-            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
-        let root = pdf.root_ref().unwrap();
-        pdf.delete_object(root);
-
-        let err =
-            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap_err();
-
-        assert!(matches!(err, crate::Error::Unsupported(ref message)
-            if message.contains("/Root absent from renumber map")));
-    }
-
-    #[test]
     fn preserve_without_source_objstm_uses_catalog_first_placement() {
         let plan = build("three-page.pdf", ObjectStreamMode::Preserve);
 
@@ -1641,37 +1626,35 @@ mod tests {
     }
 
     #[test]
-    fn disable_explicit_deletion_is_excluded_before_placement() {
+    fn disable_public_null_replacement_remains_in_the_object_universe() {
         let path = fixture_path("null-visible-matrix.pdf");
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let deleted = ObjectRef::new(5, 0);
-        pdf.delete_object(deleted);
+        pdf.replace_object(deleted, ObjectHandle::null())
+            .expect("replace the unreferenced object with null");
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
 
-        assert!(plan.removed_refs.contains(&deleted));
-        assert!(!plan.old_to_new.contains_key(&deleted));
-        assert!(plan.objects.iter().all(
-            |object| matches!(object, PlannedIndirectObject::Source { source, .. }
-                if *source != deleted)
-        ));
+        assert!(plan.old_to_new.contains_key(&deleted));
+        assert!(!plan.removed_refs.contains(&deleted));
     }
 
     #[test]
-    fn generate_explicit_deletion_is_excluded_before_placement() {
+    fn generate_public_null_replacement_remains_in_the_object_universe() {
         let path = fixture_path("null-visible-matrix.pdf");
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let deleted = ObjectRef::new(5, 0);
-        pdf.delete_object(deleted);
+        pdf.replace_object(deleted, ObjectHandle::null())
+            .expect("replace the unreferenced object with null");
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Generate)).unwrap();
 
-        assert!(plan.removed_refs.contains(&deleted));
-        assert!(!plan.old_to_new.contains_key(&deleted));
+        assert!(plan.old_to_new.contains_key(&deleted));
+        assert!(!plan.removed_refs.contains(&deleted));
         plan.validate().unwrap();
     }
 
@@ -1737,41 +1720,35 @@ mod tests {
     }
 
     #[test]
-    fn preserve_explicit_deletion_is_removed_from_membership() {
+    fn preserve_public_null_replacement_remains_in_the_object_stream() {
         let path = fixture_path("three-page-objstm.pdf");
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let deleted = ObjectRef::new(4, 0);
-        pdf.delete_object(deleted);
+        pdf.replace_object(deleted, ObjectHandle::null())
+            .expect("replace the object with null");
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Preserve)).unwrap();
 
-        assert!(plan.removed_refs.contains(&deleted));
-        assert!(plan.objects.iter().all(|object| match object {
-            PlannedIndirectObject::ObjectStream { members, .. } =>
-                members.iter().all(|member| member.source != deleted),
-            PlannedIndirectObject::Source { source, .. } => *source != deleted,
-        }));
+        assert!(plan.old_to_new.contains_key(&deleted));
+        assert!(!plan.removed_refs.contains(&deleted));
     }
 
     #[test]
-    fn preserve_classic_fallback_excludes_explicit_deletion_before_placement() {
+    fn preserve_classic_fallback_keeps_public_null_replacement() {
         let path = fixture_path("null-visible-matrix.pdf");
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let deleted = ObjectRef::new(5, 0);
-        pdf.delete_object(deleted);
+        pdf.replace_object(deleted, ObjectHandle::null())
+            .expect("replace the unreferenced object with null");
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Preserve)).unwrap();
 
-        assert!(plan.removed_refs.contains(&deleted));
-        assert!(!plan.old_to_new.contains_key(&deleted));
-        assert!(plan.objects.iter().all(
-            |object| matches!(object, PlannedIndirectObject::Source { source, .. }
-                if *source != deleted)
-        ));
+        assert!(plan.old_to_new.contains_key(&deleted));
+        assert!(!plan.removed_refs.contains(&deleted));
     }
 
     #[test]

@@ -1561,29 +1561,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(())
     }
 
-    /// Remove an object's source-xref row while retaining an outstanding
-    /// canonical handle's indirect identity for the legacy `delete_object`
-    /// contract. The qpdf-facing object snapshot filters the retained null
-    /// slot through `qpdf_removed_refs`; that Pdf-facing snapshot concern is
-    /// separate from both qpdf's local xref-registration suppression
-    /// (`QPDF.cc:1187-1210`) and `removeObject` cache mutation
-    /// (`QPDF.cc:1996-2005`). `remove_object` above remains the strict
-    /// cache-erasing transition used by canonical replacement APIs.
-    pub(crate) fn remove_object_preserving_handle(&self, object_ref: ObjectRef) -> Result<()> {
-        let cached = {
-            let mut core = self.core.borrow_mut();
-            core.source_xref_entries.remove(&object_ref);
-            core.default_xref_entries.remove(&object_ref);
-            core.fixed_dangling_refs = false;
-            core.allocated_object_refs.remove(&object_ref);
-            core.object_cache.get(&object_ref).cloned()
-        };
-        if let Some(handle) = cached {
-            handle.detach_value_to_null();
-        }
-        Ok(())
-    }
-
     /// Whether cross-reference table reconstruction has occurred during resolution.
     ///
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
@@ -12870,7 +12847,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_synchronizes_before_delete_object() {
+    fn reconstruction_synchronizes_before_replace_object() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
         pdf.cache = crate::cache::test_support::stale_deleted_entry(object_ref);
@@ -12878,15 +12855,16 @@ mod tests {
             .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
         pdf.resolver.core.borrow_mut().reconstructed_xref = true;
 
-        pdf.delete_object(object_ref);
+        pdf.replace_object(object_ref, ObjectHandle::null())
+            .expect("replace the reconstructed object with null");
 
         assert!(matches!(
             pdf.cache.entry(object_ref),
-            Some(crate::cache::CacheEntry::Deleted)
+            Some(crate::cache::CacheEntry::Unresolved { .. })
         ));
         assert!(
             pdf.dirty_object_refs.contains(&object_ref),
-            "delete_object must record a deletion after reconstruction refreshes a stale free entry"
+            "replace_object must record the mutation after reconstruction refreshes a stale entry"
         );
     }
 
