@@ -12815,7 +12815,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_reconciles_compressed_parent_provenance() {
+    fn reconstruction_reconciles_compressed_member_provenance() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let changed_type = ObjectRef::new(1, 0);
         let changed_parent = ObjectRef::new(2, 0);
@@ -12824,8 +12824,6 @@ mod tests {
         pdf.compressed_member_parents.insert(
             changed_type,
             crate::pdf::CompressedMemberProvenance {
-                parent_ref: ObjectRef::new(9, 0),
-                parent_index: 1,
                 source_stream: 9,
                 source_index: 1,
             },
@@ -12833,8 +12831,6 @@ mod tests {
         pdf.compressed_member_parents.insert(
             changed_parent,
             crate::pdf::CompressedMemberProvenance {
-                parent_ref: ObjectRef::new(9, 0),
-                parent_index: 1,
                 source_stream: 9,
                 source_index: 1,
             },
@@ -12842,8 +12838,6 @@ mod tests {
         pdf.compressed_member_parents.insert(
             unchanged,
             crate::pdf::CompressedMemberProvenance {
-                parent_ref: ObjectRef::new(9, 0),
-                parent_index: 3,
                 source_stream: 9,
                 source_index: 3,
             },
@@ -12868,11 +12862,13 @@ mod tests {
 
         pdf.synchronize_cache_with_resolver_xref();
 
-        assert_eq!(pdf.compressed_parent(changed_type), None);
-        assert_eq!(pdf.compressed_parent(changed_parent), None);
+        assert!(!pdf.compressed_member_parents.contains_key(&changed_type));
+        assert!(!pdf.compressed_member_parents.contains_key(&changed_parent));
         assert_eq!(
-            pdf.compressed_parent(unchanged),
-            Some((ObjectRef::new(9, 0), 3))
+            pdf.compressed_member_parents
+                .get(&unchanged)
+                .map(|provenance| (provenance.source_stream, provenance.source_index)),
+            Some((9, 3))
         );
     }
 
@@ -12925,8 +12921,6 @@ mod tests {
         pdf.compressed_member_parents.insert(
             object_ref,
             crate::pdf::CompressedMemberProvenance {
-                parent_ref: stream_ref,
-                parent_index: 0,
                 source_stream: stream_ref.number,
                 source_index: 0,
             },
@@ -12938,16 +12932,9 @@ mod tests {
 
         // This is the state immediately after editing a member that was
         // originally in an object stream: the canonical replacement records
-        // the dirty value and its old compressed-parent provenance.
+        // the dirty value and its old compressed-member provenance.
         pdf.replace_object(object_ref, ObjectHandle::integer(42))
             .unwrap();
-
-        // The pre-recovery edit must retain its original object-stream provenance.
-        assert_eq!(
-            pdf.compressed_parent(object_ref),
-            Some((stream_ref, 0)),
-            "the pre-recovery edit must retain its original object-stream provenance"
-        );
 
         // A later canonical recovery discovers that the same object is a
         // standalone type-1 object. The writer must observe this live xref

@@ -11,8 +11,6 @@ pub(crate) mod object_streams;
 pub(crate) mod pclm;
 #[path = "writer/plain/mod.rs"]
 pub(crate) mod plain;
-#[path = "writer/reachability.rs"]
-pub(crate) mod reachability;
 #[path = "writer/rewrite_renumber.rs"]
 pub(crate) mod rewrite_renumber;
 #[path = "writer/serialize.rs"]

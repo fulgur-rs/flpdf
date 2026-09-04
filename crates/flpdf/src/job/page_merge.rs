@@ -42,7 +42,6 @@ use crate::page_extract::{append_selection_kids, null_copied_removed_pages, targ
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
 use crate::pdf_string::{new_unicode_string, utf8_value};
-use crate::writer::reachability::sweep_unreachable_objects_except;
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,
     Pdf, Result,
@@ -871,11 +870,6 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
     // `/DA` through the canonical foreign map.
     let mut kept_fields: Vec<KeptField> = Vec::new();
     let mut primary_acroform = PrimaryAcroForm::default();
-    // Target-side refs of the primary's preserved orphan objects
-    // (`--preserve-unreferenced`), protected from the final sweep below.
-    // Empty, and therefore a no-op, when preservation is disabled.
-    let mut preserved_target_refs: BTreeSet<ObjectRef> = BTreeSet::new();
-
     // /PageLabels merge state (qpdf `handlePageSpecs` parity). Unlike outlines
     // and named destinations, which are inherited from the primary input
     // only, page labels accumulate across EVERY input: qpdf calls
@@ -1066,21 +1060,12 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // target writer rather than copied as source streams
         // (`QPDFWriter.cc:1093-1103,1955-2003`).
         if is_primary && preserve_primary_unreferenced {
-            let target_catalog_ref = target
-                .root_ref()
-                .expect("Pdf::empty always populates a root catalog");
             for object_ref in input.source.live_object_refs() {
                 let source_object = input.source.get_object_handle(object_ref);
                 if source_object.try_is_stream_of_type(b"ObjStm", b"")? {
                     continue;
                 }
-                let copied = copy_foreign_object_for_preserve(&mut target, &source_object)?;
-                let Some(target_ref) = copied.object_ref() else {
-                    continue; // cov:ignore: an indirect live source always maps to an indirect target
-                };
-                if target_ref != target_catalog_ref && target_ref != pages_root_ref {
-                    preserved_target_refs.insert(target_ref);
-                }
+                copy_foreign_object_for_preserve(&mut target, &source_object)?;
             }
         }
 
@@ -1212,16 +1197,6 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         let folded = merge_adjacent_ranges(label_entries);
         target.page_labels().write_reconstructed_labels(&folded)?;
     }
-
-    // Drop the copied ancestor /Pages node(s) and any objects only they
-    // referenced before handing the graph to the canonical writer. Run this
-    // sweep unconditionally — qpdf's writer only skips reachability pruning
-    // for objects the caller explicitly asked to preserve
-    // (`QPDFWriter.cc:2907-2913`), not for the rest of the graph — and
-    // protect exactly `preserved_target_refs` (empty, so a no-op, when
-    // preservation is disabled) so the primary's preserved orphan objects
-    // survives while incidental merge artifacts still do not.
-    sweep_unreachable_objects_except(&mut target, &preserved_target_refs)?;
 
     Ok(target)
 }
