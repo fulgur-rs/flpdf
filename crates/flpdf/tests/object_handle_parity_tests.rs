@@ -644,39 +644,42 @@ fn recovery_resolves_catalog_when_root_lives_in_object_stream() {
 
 #[test]
 fn encrypted_preserve_rebuilds_source_object_streams() {
-    let mut pdf =
-        Pdf::open(Cursor::new(compressed_entry_with_extends_pdf())).expect("open ObjStm fixture");
-    let mut output = Vec::new();
-    let settings = WriterTestSettings {
-        static_id: true,
-        object_streams: flpdf::ObjectStreamMode::Preserve,
-        encrypt: Some(EncryptParams::rc4(
-            EncryptMethod::V2Rc4128,
-            Vec::new(),
-            b"owner".to_vec(),
-        )),
-        ..WriterTestSettings::default()
-    };
+    for qdf in [false, true] {
+        let mut pdf = Pdf::open(Cursor::new(compressed_entry_with_extends_pdf()))
+            .expect("open ObjStm fixture");
+        let mut output = Vec::new();
+        let settings = WriterTestSettings {
+            static_id: true,
+            qdf,
+            object_streams: flpdf::ObjectStreamMode::Preserve,
+            encrypt: Some(EncryptParams::rc4(
+                EncryptMethod::V2Rc4128,
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriterTestSettings::default()
+        };
 
-    write_with_settings(&mut pdf, &mut output, &settings)
-        .expect("encrypted Preserve must rebuild the source ObjStm");
-    assert!(!output.is_empty());
-    assert_eq!(
-        output
-            .windows(b"/Type /ObjStm".len())
-            .filter(|window| *window == b"/Type /ObjStm")
-            .count(),
-        2,
-        "encrypted Preserve must emit exactly the two rebuilt source ObjStms"
-    );
-    assert_eq!(
-        output
-            .windows(b"/Extends ".len())
-            .filter(|window| *window == b"/Extends ")
-            .count(),
-        1,
-        "encrypted Preserve must retain one output-space /Extends edge"
-    );
+        write_with_settings(&mut pdf, &mut output, &settings)
+            .expect("encrypted Preserve must rebuild the source ObjStm");
+        assert!(!output.is_empty());
+        assert_eq!(
+            output
+                .windows(b"/Type /ObjStm".len())
+                .filter(|window| *window == b"/Type /ObjStm")
+                .count(),
+            2,
+            "qdf={qdf}: encrypted Preserve must emit exactly the two rebuilt source ObjStms"
+        );
+        assert_eq!(
+            output
+                .windows(b"/Extends ".len())
+                .filter(|window| *window == b"/Extends ")
+                .count(),
+            1,
+            "qdf={qdf}: encrypted Preserve must retain one output-space /Extends edge"
+        );
+    }
 }
 
 #[test]
