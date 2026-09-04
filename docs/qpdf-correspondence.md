@@ -872,6 +872,17 @@ qtest-driver の output boundary が non-UTF-8 Unix path を再変換なしで�
 qpdf 11.9.0 の `qpdf --check` に byte `0xff` を含む path を渡した実測でも、各
 warning line はその byte を保持する。
 
+E-29（`flpdf-3yn9.47`）では、qpdf の `doProcessOnce` が `QPDF` 構築直後に
+`setQPDFOptions` を呼び、`noWarn` をその文書へ適用してから `processFile` を始める境界
+（`QPDFJob.cc:650-666,1695-1711`）を、`QPDFJob::open_with_description`、
+`open_document_with_description`、`open_for_encryption_inspection_with_description`、
+`open_job_source` と JSON seed に揃えた。CLI の overlay/underlay、copy-encryption、
+encryption probe、attachment copy、page source、JSON input もこの policy を受ける。
+page-spec の source だけは qpdf の close/reopen 相当の reopenable reader が必要なため
+`open_page_source` が direct `Pdf::open_file_with_options` を残すが、open 前に同じ
+`PdfOpenOptions::suppress_warnings` を設定する。qpdf の suppression は logger への配送だけを
+止め、warning collection と completion/exit status は保持する（`QPDF.cc:328-331,488-504`）。
+
 `--encrypt` の引数表も qpdf と同じ遷移を保つ。qpdf は3番目の positional
 引数または `--bits` を消費した時点で `40-bit encryption`、`128-bit encryption`、
 `256-bit encryption` の option tableへ切り替え、未知・非対応引数の診断にその名前を

@@ -2429,6 +2429,7 @@ fn main() {
             args.input.as_deref(),
             args.output.as_deref(),
             &args.password,
+            args.no_warn,
         )
     } else if json_input_inspection {
         run_json_input_inspection(&args)
@@ -2441,7 +2442,7 @@ fn main() {
             run_empty_document_encryption_status()
         } else {
             match args.input.as_ref() {
-                Some(input) => run_is_encrypted(input, args.repair, &args.password),
+                Some(input) => run_is_encrypted(input, args.repair, &args.password, args.no_warn),
                 None => Err("--is-encrypted requires an input file".into()),
             }
         }
@@ -2450,7 +2451,9 @@ fn main() {
             run_empty_document_encryption_status()
         } else {
             match args.input.as_ref() {
-                Some(input) => run_requires_password(input, args.repair, &args.password),
+                Some(input) => {
+                    run_requires_password(input, args.repair, &args.password, args.no_warn)
+                }
                 None => Err("--requires-password requires an input file".into()),
             }
         }
@@ -2462,13 +2465,20 @@ fn main() {
             object_ref,
             args.raw_stream_data,
             args.filtered_stream_data,
+            args.no_warn,
         )
     } else if args.show_npages {
-        run_show_npages(args.input, args.repair, &args.password)
+        run_show_npages(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_pages {
-        run_show_pages(args.input, args.repair, &args.password, args.with_images)
+        run_show_pages(
+            args.input,
+            args.repair,
+            &args.password,
+            args.with_images,
+            args.no_warn,
+        )
     } else if args.show_xref {
-        run_show_xref(args.input, args.repair, &args.password)
+        run_show_xref(args.input, args.repair, &args.password, args.no_warn)
     } else if args.check_linearization {
         run_check_linearization(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_linearization {
@@ -2493,9 +2503,15 @@ fn main() {
             args.show_encryption_key,
         )
     } else if args.list_attachments {
-        run_list_attachments(args.input, args.repair, &args.password, args.verbose)
+        run_list_attachments(
+            args.input,
+            args.repair,
+            &args.password,
+            args.verbose,
+            args.no_warn,
+        )
     } else if let Some(key) = args.show_attachment {
-        run_show_attachment(args.input, args.repair, &args.password, &key)
+        run_show_attachment(args.input, args.repair, &args.password, &key, args.no_warn)
     } else if let Some(key) = args.remove_attachment {
         run_remove_attachment(
             args.input,
@@ -2509,6 +2525,7 @@ fn main() {
             args.progress,
             args.recompress_flate,
             top_level_compression_level,
+            args.no_warn,
             &top_level_version_options,
         )
     } else if !args.add_attachment.is_empty() {
@@ -2525,6 +2542,7 @@ fn main() {
             args.recompress_flate,
             top_level_compression_level,
             args.verbose,
+            args.no_warn,
             &top_level_version_options,
         )
     } else if !args.copy_attachments_from.is_empty() {
@@ -2541,6 +2559,7 @@ fn main() {
             args.recompress_flate,
             top_level_compression_level,
             args.verbose,
+            args.no_warn,
             &top_level_version_options,
         )
     } else if args.linearize {
@@ -2601,6 +2620,7 @@ fn main() {
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             &args.password,
+            args.no_warn,
         );
         let result = run_rewrite(
             args.input,
@@ -2699,6 +2719,7 @@ fn main() {
                     options,
                     args.optimize_images.then_some(top_level_image_options),
                     args.verbose,
+                    args.no_warn,
                 ),
                 None => Err("--empty page operations require an output file".into()),
             }
@@ -2718,6 +2739,7 @@ fn main() {
                         options.clone(),
                         args.optimize_images.then_some(top_level_image_options),
                         args.verbose,
+                        args.no_warn,
                     )
                 } else {
                     if !overlay_specs.is_empty() {
@@ -2739,6 +2761,7 @@ fn main() {
                         options.clone(),
                         args.optimize_images.then_some(top_level_image_options),
                         args.verbose,
+                        args.no_warn,
                     )
                 }
             };
@@ -2795,6 +2818,7 @@ fn main() {
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             &args.password,
+            args.no_warn,
         );
         run_rewrite(
             args.input,
@@ -2879,11 +2903,13 @@ fn run_job_json_file(
     input: Option<&Path>,
     output: Option<&Path>,
     password: &PasswordArgs,
+    suppress_warnings: bool,
 ) -> CliResult<()> {
     let json = std::fs::read(path)
         .map_err(|error| error_with_file(path, Box::new(error) as Box<dyn std::error::Error>))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
+    job.set_suppress_warnings(suppress_warnings);
 
     job.initialize_from_json_partial_bytes(&json)
         .map_err(|error| {
@@ -3057,6 +3083,7 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(cli.no_warn);
 
     // 5. Open the input once and retain an identity handle for the output
     // check. JSON input uses the canonical complete-document importer; a
@@ -3102,7 +3129,8 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
             &json_objects,
         )
     } else {
-        let mut pdf = open_pdf_from_file(input, input_file, cli.repair, &cli.password)?;
+        let mut pdf =
+            open_pdf_from_file(input, input_file, cli.repair, &cli.password, cli.no_warn)?;
         job.record_document_warnings(&pdf);
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
         if cli.optimize_images {
@@ -3308,14 +3336,18 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::CheckLinearization(cmd) => {
             run_check_linearization(Some(cmd.input), false, &PasswordArgs::default(), false)
         }
-        Commands::DumpObject(cmd) => {
-            run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
-        }
+        Commands::DumpObject(cmd) => run_dump_object(
+            Some(cmd.input),
+            cmd.repair,
+            &cmd.password,
+            &cmd.object_ref,
+            false,
+        ),
         Commands::Pages(cmd) => {
             if cmd.show_npages {
-                run_show_npages(Some(cmd.input), cmd.repair, &cmd.password)
+                run_show_npages(Some(cmd.input), cmd.repair, &cmd.password, false)
             } else {
-                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password, false)
+                run_show_pages(Some(cmd.input), cmd.repair, &cmd.password, false, false)
             }
         }
         Commands::Qdf(cmd) => run_qdf(
@@ -3344,10 +3376,10 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 recovery: cmd.recovery,
                 ..PasswordArgs::default()
             };
-            run_is_encrypted(&cmd.input, cmd.repair, &password)
+            run_is_encrypted(&cmd.input, cmd.repair, &password, false)
         }
         Commands::RequiresPassword(cmd) => {
-            run_requires_password(&cmd.input, cmd.repair, &cmd.password)
+            run_requires_password(&cmd.input, cmd.repair, &cmd.password, false)
         }
         Commands::ShowEncryptionKey(cmd) => {
             run_show_encryption_key(&cmd.input, cmd.repair, &cmd.password)
@@ -3416,6 +3448,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.copy_encryption.as_deref(),
                 cmd.encryption_file_password.as_deref(),
                 &cmd.password,
+                false,
             );
             let normalize_content = matches!(cmd.normalize_content, Some(CliYesNo::Yes));
             options.content_normalization = normalize_content;
@@ -3532,6 +3565,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         options,
                         cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
+                        false,
                     )
                 } else if !cmd.page_ops.pages.is_empty() {
                     run_page_extraction(
@@ -3547,6 +3581,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         options,
                         cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
+                        false,
                     )
                 } else {
                     run_rewrite_with_page_ops(
@@ -3560,6 +3595,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         options,
                         cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
+                        false,
                     )
                 };
             }
@@ -3652,6 +3688,7 @@ fn apply_encryption_options(
     copy_encryption: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
     password_args: &PasswordArgs,
+    suppress_warnings: bool,
 ) {
     if let Some(encrypt) = encrypt {
         match parse_encrypt_segment(encrypt, password_args.allow_weak_crypto) {
@@ -3671,7 +3708,12 @@ fn apply_encryption_options(
         }
     }
     if let Some(donor_path) = copy_encryption {
-        match build_copy_encryption_source(donor_path, encryption_file_password, password_args) {
+        match build_copy_encryption_source(
+            donor_path,
+            encryption_file_password,
+            password_args,
+            suppress_warnings,
+        ) {
             Ok(src) => {
                 options.copy_encryption = Some(src);
             }
@@ -3697,6 +3739,7 @@ fn build_copy_encryption_source(
     path: &std::path::Path,
     password: Option<&str>,
     password_args: &PasswordArgs,
+    suppress_warnings: bool,
 ) -> CliResult<CopyEncryptionSource> {
     let file =
         File::open(path).map_err(|e| format!("--copy-encryption: cannot open {:?}: {e}", path))?;
@@ -3705,10 +3748,14 @@ fn build_copy_encryption_source(
     let mut donor_password = password_args.clone();
     donor_password.password = Some(password.unwrap_or("").to_owned());
     donor_password.password_file = None;
-    let mut opts = pdf_open_options(true, &donor_password)
+    let opts = pdf_open_options(true, &donor_password)
         .map_err(|error| format!("--copy-encryption: failed to configure {:?}: {error}", path))?;
-    configure_document_logger(&mut opts, path);
-    let mut donor = Pdf::open_with_options(reader, opts)
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
+    let mut donor = job
+        .open_with_description(reader, path_description(path), opts)
         .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
     donor
         .root_handle()
@@ -4226,6 +4273,7 @@ fn run_rewrite(
         json_input,
         update_from_json,
         false,
+        no_warn,
     )?;
     match opened {
         JobPdf::File(pdf) => run_rewrite_opened(
@@ -4463,7 +4511,8 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // source documents until after the destination writer has consumed
         // every copied Form stream, not just until page stacking returns.
         let _built_overlay_specs = if !overlay_specs.is_empty() {
-            let mut built = build_overlay_specs(overlay_specs, repair, password)?;
+            let mut built =
+                build_overlay_specs_with_suppression(overlay_specs, repair, password, no_warn)?;
 
             // Propagate qpdf's max input version and Adobe
             // extension level to the writer (QPDFJob.cc:1714 and :2913),
@@ -4925,10 +4974,20 @@ fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<V
 /// stored page-range string fails to parse (already validated by
 /// [`parse_overlay_segment`], so a parse failure here would be an internal
 /// inconsistency).
+#[cfg(test)]
 fn build_overlay_specs(
     specs: &[OverlaySpec],
     repair: bool,
     password: &PasswordArgs,
+) -> CliResult<Vec<flpdf::OverlaySpec<BufReader<File>>>> {
+    build_overlay_specs_with_suppression(specs, repair, password, false)
+}
+
+fn build_overlay_specs_with_suppression(
+    specs: &[OverlaySpec],
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
 ) -> CliResult<Vec<flpdf::OverlaySpec<BufReader<File>>>> {
     let mut built = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -4941,9 +5000,13 @@ fn build_overlay_specs(
         let mut source_password = password.clone();
         source_password.password = spec.password.clone();
         source_password.password_file = None;
-        let mut options = pdf_open_options(repair, &source_password)?;
-        configure_document_logger(&mut options, &path);
-        let mut source = Pdf::open_with_options(BufReader::new(file), options)
+        let options = pdf_open_options(repair, &source_password)?;
+        let mut source_job = QPDFJob::new();
+        source_job.set_logger(cli_logger());
+        source_job.set_message_prefix(progname());
+        source_job.set_suppress_warnings(suppress_warnings);
+        let mut source = source_job
+            .open_with_description(BufReader::new(file), path_description(&path), options)
             .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
         source
             .root_handle()
@@ -5070,6 +5133,7 @@ fn run_page_extraction(
     options: WriterOptions,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
+    no_warn: bool,
 ) -> CliResult<()> {
     // `--split-pages` writes one numbered file per output page rather than a
     // single `output` path, so `output` is a naming template here, not a
@@ -5156,6 +5220,7 @@ fn run_page_extraction(
             json_input,
             update_from_json,
             false,
+            no_warn,
         )?;
         return match opened {
             JobPdf::File(pdf) => run_page_extraction_from_single_source(
@@ -5174,6 +5239,7 @@ fn run_page_extraction(
                 creates_output,
                 &inputs,
                 &distinct,
+                no_warn,
             ),
             JobPdf::Json(pdf) => run_page_extraction_from_single_source(
                 pdf,
@@ -5191,6 +5257,7 @@ fn run_page_extraction(
                 creates_output,
                 &inputs,
                 &distinct,
+                no_warn,
             ),
         };
     }
@@ -5211,6 +5278,7 @@ fn run_page_extraction(
             options,
             image_options,
             verbose,
+            no_warn,
             standard_output,
             creates_output,
             inputs,
@@ -5218,7 +5286,7 @@ fn run_page_extraction(
     }
 
     run_page_extraction_from_single_source(
-        open_pdf(&primary_input.to_path_buf(), repair, password)?,
+        open_pdf_with_suppression(&primary_input.to_path_buf(), repair, password, no_warn)?,
         primary_input,
         output,
         repair,
@@ -5233,6 +5301,7 @@ fn run_page_extraction(
         creates_output,
         &inputs,
         &distinct,
+        no_warn,
     )
 }
 
@@ -5254,6 +5323,7 @@ fn run_empty_page_extraction(
     options: WriterOptions,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
+    no_warn: bool,
 ) -> CliResult<()> {
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     let creates_output = standard_output.is_none();
@@ -5284,6 +5354,7 @@ fn run_empty_page_extraction(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
     let keep_files_open = job.keep_files_open_for_page_specs(&specs);
     if verbose && page_ops.keep_files_open.is_none() {
@@ -5317,6 +5388,7 @@ fn run_empty_page_extraction(
             repair,
             &source_password,
             keep_files_open,
+            no_warn,
         )?);
     }
 
@@ -5397,6 +5469,7 @@ fn run_empty_page_extraction(
         None,
         combined_pages,
         image_options,
+        no_warn,
     )
 }
 
@@ -5420,6 +5493,7 @@ fn run_page_extraction_from_multiple_sources(
     options: WriterOptions,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
+    no_warn: bool,
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
     inputs: Vec<InputSpec>,
@@ -5427,8 +5501,14 @@ fn run_page_extraction_from_multiple_sources(
     // qpdf inherits output encryption from the primary input for page
     // operations. Keep this probe separate from the mutable source vector so
     // source opening below can use the same top-level password policy.
-    let primary_encrypted =
-        open_page_source(&primary_input.to_path_buf(), repair, password, true)?.is_encrypted();
+    let primary_encrypted = open_page_source(
+        &primary_input.to_path_buf(),
+        repair,
+        password,
+        true,
+        no_warn,
+    )?
+    .is_encrypted();
 
     // Build literal-path source identity and one qpdf page specification per
     // occurrence. `.` was already normalized to primary_input by
@@ -5455,6 +5535,7 @@ fn run_page_extraction_from_multiple_sources(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
     let keep_files_open = job.keep_files_open_for_page_specs(&specs);
     if verbose && page_ops.keep_files_open.is_none() {
@@ -5468,6 +5549,7 @@ fn run_page_extraction_from_multiple_sources(
         repair,
         password,
         true,
+        no_warn,
     )?);
     for (source_index, path) in source_paths.iter().enumerate().skip(1) {
         let mut source_password = password.clone();
@@ -5489,6 +5571,7 @@ fn run_page_extraction_from_multiple_sources(
             repair,
             &source_password,
             keep_files_open,
+            no_warn,
         )?);
     }
 
@@ -5589,6 +5672,7 @@ fn run_page_extraction_from_multiple_sources(
         None,
         combined_pages,
         image_options,
+        no_warn,
     )
 }
 
@@ -5609,6 +5693,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     creates_output: bool,
     inputs: &[InputSpec],
     distinct: &[PathBuf],
+    no_warn: bool,
 ) -> CliResult<()> {
     let primary_encrypted = pdf.is_encrypted();
     let primary_copy_encryption = pdf.writer_copy_encryption_source()?;
@@ -5619,6 +5704,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
     if verbose && page_ops.keep_files_open.is_none() {
         let mut message = format!(
@@ -5702,6 +5788,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 Some((result, prune_mode)),
                 combined_pages,
                 image_options,
+                no_warn,
             )
         }
         PageSpecJobOutput::Merged(mut merged) => {
@@ -5743,6 +5830,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 None,
                 combined_pages,
                 image_options,
+                no_warn,
             )
         }
     }
@@ -5768,7 +5856,9 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     page_job_result: Option<(RebuildResult, RemoveUnreferencedResources)>,
     combined_pages: Vec<CombinedPage>,
     image_options: Option<ImageOptimizationOptions>,
+    no_warn: bool,
 ) -> CliResult<()> {
+    pdf.set_suppress_warnings(no_warn);
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
 
     let (result, prune_mode) = if let Some((result, prune_mode)) = page_job_result {
@@ -5843,7 +5933,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the opened
     // source documents through the in-memory writer for the same reason.
     let _built_overlay_specs = if !overlay_specs.is_empty() {
-        let mut built = build_overlay_specs(overlay_specs, repair, password)?;
+        let mut built =
+            build_overlay_specs_with_suppression(overlay_specs, repair, password, no_warn)?;
         update_input_version_floor(&mut options.input_version_floor, pdf)?;
         for spec in built.iter_mut() {
             update_input_version_floor(&mut options.input_version_floor, &mut spec.source)?;
@@ -6027,8 +6118,17 @@ fn run_rewrite_with_page_ops(
     options: WriterOptions,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
+    no_warn: bool,
 ) -> CliResult<()> {
-    let opened = open_job_pdf(input, repair, password, json_input, update_from_json, false)?;
+    let opened = open_job_pdf(
+        input,
+        repair,
+        password,
+        json_input,
+        update_from_json,
+        false,
+        no_warn,
+    )?;
     match opened {
         JobPdf::File(pdf) => run_rewrite_with_page_ops_opened(
             pdf,
@@ -6535,14 +6635,16 @@ fn run_dump_object(
     repair: bool,
     password: &PasswordArgs,
     object_ref: &str,
+    suppress_warnings: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let object_ref = ObjectRef::parse(object_ref)?;
 
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     finish_job_exit_status(job.dump_object(&mut pdf, object_ref)?)
 }
 
@@ -6629,16 +6731,18 @@ fn run_show_object(
     selector: &str,
     raw_stream_data: bool,
     filtered_stream_data: bool,
+    suppress_warnings: bool,
 ) -> CliResult<()> {
     // qpdf's Config::showObject callback parses the selector during argv
     // parsing, before QPDFJob::run() ever opens the input file, so a usage
     // error in the selector must surface even when no input file is given.
     let selector = parse_show_object_selector(selector)?;
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     let object = match selector {
         ShowObjectSelector::Trailer => pdf.trailer(),
         ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
@@ -6671,12 +6775,18 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     finish_job_exit_status(job.show_stream(&mut pdf, object_ref, cmd.raw_stream_data)?)
 }
 
-fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+fn run_show_npages(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     finish_job_exit_status(job.show_npages(&mut pdf)?)
 }
 
@@ -6685,22 +6795,30 @@ fn run_show_pages(
     repair: bool,
     password: &PasswordArgs,
     with_images: bool,
+    suppress_warnings: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     job.set_with_images(with_images);
     finish_job_exit_status(job.show_pages(&mut pdf)?)
 }
 
-fn run_show_xref(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+fn run_show_xref(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     finish_job_exit_status(job.show_xref(&mut pdf)?)
 }
 
@@ -6769,11 +6887,15 @@ fn probe_encryption(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
+    suppress_warnings: bool,
 ) -> CliResult<EncryptionProbe> {
     let file = File::open(input)?;
-    let mut options = pdf_open_options(repair, password)?;
-    configure_document_logger(&mut options, input);
-    match Pdf::open_with_options(BufReader::new(file), options) {
+    let options = pdf_open_options(repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
+    match job.open_with_description(BufReader::new(file), path_description(input), options) {
         Ok(mut pdf) => {
             pdf.root_handle()
                 .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
@@ -6785,7 +6907,7 @@ fn probe_encryption(
         // just have not authenticated it. qpdf treats this as "encrypted,
         // password required".
         Err(error) if is_bad_password_error(&error) => Ok(EncryptionProbe::EncryptedAuthFailed),
-        Err(other) => Err(other.into()),
+        Err(other) => Err(error_with_file(input, actionable_password_error(other))),
     }
 }
 
@@ -6817,8 +6939,13 @@ fn run_empty_document_encryption_status() -> CliResult<()> {
 /// supplied password is still forwarded because qpdf passes its configured
 /// password to `processFile`; it does not change the classification of an
 /// encrypted input, but password-file parsing and diagnostics remain visible.
-fn run_is_encrypted(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    let encrypted = match probe_encryption(input, repair, password)? {
+fn run_is_encrypted(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<()> {
+    let encrypted = match probe_encryption(input, repair, password, suppress_warnings)? {
         EncryptionProbe::Opened { encrypted } => encrypted,
         EncryptionProbe::EncryptedAuthFailed => true,
     };
@@ -6845,8 +6972,13 @@ fn run_is_encrypted(input: &PathBuf, repair: bool, password: &PasswordArgs) -> C
 /// Weak-crypto (RC4 / R=5) files are answered purely on the password, matching
 /// qpdf: a correct password yields 3 and a wrong/absent one yields 0, with no
 /// `--allow-weak-crypto` opt-in required (see `probe_encryption`).
-fn run_requires_password(input: &PathBuf, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    match probe_encryption(input, repair, password)? {
+fn run_requires_password(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<()> {
+    match probe_encryption(input, repair, password, suppress_warnings)? {
         EncryptionProbe::Opened { encrypted: false } => {
             // Exit 2 — qpdf_exit_is_not_encrypted: file is not encrypted.
             Err(Box::new(CliExitError {
@@ -7021,23 +7153,37 @@ fn open_job_pdf(
     json_input: bool,
     update_from_json: Option<&Path>,
     check_inspection: bool,
+    suppress_warnings: bool,
 ) -> CliResult<JobPdf> {
     if json_input {
-        Ok(JobPdf::Json(open_json_pdf(input, update_from_json)?))
+        Ok(JobPdf::Json(open_json_pdf(
+            input,
+            update_from_json,
+            suppress_warnings,
+        )?))
     } else {
         let mut pdf = if check_inspection {
             open_pdf_for_check_inspection(&input.to_path_buf(), repair, password)?
         } else {
-            open_pdf(&input.to_path_buf(), repair, password)?
+            open_pdf_with_suppression(&input.to_path_buf(), repair, password, suppress_warnings)?
         };
         apply_json_update(&mut pdf, update_from_json)?;
         Ok(JobPdf::File(pdf))
     }
 }
 
-fn open_json_pdf(input: &Path, update_from_json: Option<&Path>) -> CliResult<Pdf<Cursor<Vec<u8>>>> {
+fn open_json_pdf(
+    input: &Path,
+    update_from_json: Option<&Path>,
+    suppress_warnings: bool,
+) -> CliResult<Pdf<Cursor<Vec<u8>>>> {
     let source = File::open(input).map_err(|error| qpdf_json_input_open_error(input, error))?;
-    let mut pdf = Pdf::create_from_json(source, input.display().to_string())
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
+    let mut pdf = job
+        .create_from_json(source, input.display().to_string())
         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     apply_json_update(&mut pdf, update_from_json)?;
     Ok(pdf)
@@ -7051,6 +7197,15 @@ fn open_pdf(
     open_pdf_impl(input, repair, password, false)
 }
 
+fn open_pdf_with_suppression(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+    suppress_warnings: bool,
+) -> CliResult<Pdf<BufReader<File>>> {
+    open_pdf_impl(input, repair, password, suppress_warnings)
+}
+
 /// Open a secondary page-spec source through the same file-backed reader
 /// boundary as qpdf's `QPDFJob::handlePageSpecs`.
 fn open_page_source(
@@ -7058,10 +7213,11 @@ fn open_page_source(
     repair: bool,
     password: &PasswordArgs,
     stay_open: bool,
+    suppress_warnings: bool,
 ) -> CliResult<Pdf<Box<dyn flpdf::ReadSeek>>> {
     let mut options = pdf_open_options(repair, password)?;
-    options.logger = Some(cli_logger());
-    options.description = path_description(input);
+    configure_document_logger(&mut options, input);
+    options.suppress_warnings = suppress_warnings;
     let mut pdf = Pdf::<Box<dyn flpdf::ReadSeek>>::open_file_with_options(input, options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     pdf.root_handle()
@@ -7075,8 +7231,9 @@ fn open_pdf_from_file(
     file: File,
     repair: bool,
     password: &PasswordArgs,
+    suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_file_impl(input, file, repair, password, false, false)
+    open_pdf_file_impl(input, file, repair, password, suppress_warnings, false)
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,
@@ -7139,6 +7296,7 @@ fn open_pdf_file_impl(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     let pdf = if encryption_inspection {
         job.open_for_encryption_inspection_with_description(
             BufReader::new(file),
@@ -7330,7 +7488,7 @@ fn finish_operation_warnings_with_prior<R: Read + Seek>(
     finish_warning_state(
         prior_warnings || !pdf.repair_diagnostics().entries().is_empty(),
         creates_output,
-        false,
+        pdf.suppress_warnings(),
     )
 }
 
@@ -7638,6 +7796,7 @@ fn run_add_attachment(
     recompress_flate: bool,
     compression_level: Option<i32>,
     verbose: bool,
+    suppress_warnings: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
@@ -7668,6 +7827,7 @@ fn run_add_attachment(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
@@ -7716,12 +7876,13 @@ fn run_remove_attachment(
     progress: bool,
     recompress_flate: bool,
     compression_level: Option<i32>,
+    suppress_warnings: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
 
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
 
     let found = pdf.embedded_files().remove_embedded_file(key.as_bytes())?;
     if !found {
@@ -7757,12 +7918,14 @@ fn run_list_attachments(
     repair: bool,
     password: &PasswordArgs,
     verbose: bool,
+    suppress_warnings: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--list-attachments: missing input PDF")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     job.set_input_name_bytes(path_description(&input));
     let status = job.list_attachments(&mut pdf, verbose)?;
     finish_job_exit_status(status)
@@ -7774,12 +7937,14 @@ fn run_show_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &str,
+    suppress_warnings: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--show-attachment: missing input PDF")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     job.set_input_name_bytes(path_description(&input));
     let status = job
         .show_attachment(&mut pdf, key.as_bytes())
@@ -7807,6 +7972,7 @@ fn run_copy_attachments_from(
     recompress_flate: bool,
     compression_level: Option<i32>,
     verbose: bool,
+    suppress_warnings: bool,
     version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
@@ -7818,6 +7984,7 @@ fn run_copy_attachments_from(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(suppress_warnings);
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
@@ -7830,12 +7997,16 @@ fn run_copy_attachments_from(
     let mut source_password = password.clone();
     source_password.password = None;
     source_password.password_file = None;
-    let mut src_options =
+    let src_options =
         pdf_open_options_with_password_bytes(repair, &source_password, args.password.clone());
-    configure_document_logger(&mut src_options, &args.file);
     let src_file =
         File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
-    let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
+    let mut src = job
+        .open_with_description(
+            BufReader::new(src_file),
+            path_description(&args.file),
+            src_options,
+        )
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
     src.root_handle()
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
@@ -8078,6 +8249,7 @@ mod tests {
                 password: Some("wrong".to_owned()),
                 ..PasswordArgs::default()
             },
+            false,
         );
 
         assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
@@ -8090,7 +8262,7 @@ mod tests {
         let path = directory.path().join("missing-root.pdf");
         std::fs::write(&path, input).expect("write missing-root fixture");
 
-        let Err(error) = probe_encryption(&path, false, &PasswordArgs::default()) else {
+        let Err(error) = probe_encryption(&path, false, &PasswordArgs::default(), false) else {
             panic!("a missing /Root must be a hard error");
         };
 
@@ -9433,6 +9605,7 @@ mod tests {
             false,
             &PasswordArgs::default(),
             "2147483648",
+            false,
             false,
             false,
         )
