@@ -127,56 +127,58 @@ fn linearization_content_normalize_refs<R: Read + Seek>(
     Ok(refs)
 }
 
-fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    options: &crate::writer::WriterOptions,
-    content_normalize_refs: &BTreeSet<ObjectRef>,
-) -> Result<BTreeSet<ObjectRef>> {
-    let mut skipped_streams = BTreeSet::new();
-    for object_ref in pdf.object_refs() {
-        let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve(&handle)?;
-        let Some(stream_dict) = handle.as_stream_dict() else {
-            continue;
-        };
-        // Avoid a filter probe for the common case where this stream has no
-        // indirect parameter edge that the reachability walk could drop.
-        let mut has_indirect_parameter = false;
-        for key in [b"/Filter".as_slice(), b"/DecodeParms".as_slice()] {
-            let value = stream_dict.try_get_key(key)?;
-            let mut refs = Vec::new();
-            collect_direct_handle_refs(&value, 0, &mut refs)?;
-            has_indirect_parameter |= !refs.is_empty();
-        }
-        // qpdf's linearization optimizer probes a token-filtered stream even
-        // when its /Filter and /DecodeParms entries are direct. That probe is
-        // observable because ValueSetter is stateful; use the linearization
-        // probe for modified streams so the first body pass sees qpdf's
-        // already-consumed filter. Unmodified streams retain the plain-writer
-        // cache-aware probe used to decide whether parameter edges disappear.
-        let parameters_removed = if has_indirect_parameter {
-            if handle.is_data_modified() {
-                crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
-                    &handle,
-                    options,
-                    content_normalize_refs.contains(&object_ref),
-                )? // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
-            } else {
-                crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
-                    &handle,
-                    options,
-                    true,
-                    content_normalize_refs.contains(&object_ref),
-                )? // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
-            }
-        } else {
-            false
-        };
-        if has_indirect_parameter && parameters_removed {
-            skipped_streams.insert(object_ref);
+/// Return whether a stream's `/Filter` or `/DecodeParms` value contains an
+/// indirect edge that the linearized writer may remove after refiltering.
+///
+/// This inspects only the stream dictionary already supplied by qpdf's
+/// optimization walk. It deliberately does not resolve the parameter object:
+/// qpdf's `skip_stream_parameters` callback runs before those edges are
+/// traversed (`QPDF_optimization.cc:306-333`).
+fn stream_has_indirect_parameter_edge(handle: &ObjectHandle) -> Result<bool> {
+    let Some(stream_dict) = handle.as_stream_dict() else {
+        return Ok(false); // cov:ignore: Optimization invokes the callback only for resolved stream handles
+    };
+    for key in [b"/Filter".as_slice(), b"/DecodeParms".as_slice()] {
+        let value = stream_dict.try_get_key(key)?;
+        let mut refs = Vec::new();
+        collect_direct_handle_refs(&value, 0, &mut refs)?;
+        if !refs.is_empty() {
+            return Ok(true);
         }
     }
-    Ok(skipped_streams)
+    Ok(false)
+}
+
+/// Probe one stream using the same policy as qpdf's linearized writer and
+/// report whether `/Filter` and `/DecodeParms` will be removed.
+fn stream_parameters_removed_for_linearization(
+    handle: &ObjectHandle,
+    stream_ref: Option<ObjectRef>,
+    options: &crate::writer::WriterOptions,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
+) -> Result<bool> {
+    // qpdf's linearization optimizer probes a token-filtered stream even when
+    // its /Filter and /DecodeParms entries are direct. That probe is
+    // observable because ValueSetter is stateful; use the linearization probe
+    // for modified streams so the first body pass sees qpdf's already-consumed
+    // filter. Unmodified streams retain the plain-writer cache-aware probe used
+    // to decide whether parameter edges disappear.
+    let normalize_content =
+        stream_ref.is_some_and(|object_ref| content_normalize_refs.contains(&object_ref));
+    if handle.is_data_modified() {
+        crate::writer::plain::body::canonical_stream_filter_probe_for_linearization(
+            handle,
+            options,
+            normalize_content,
+        ) // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
+    } else {
+        crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
+            handle,
+            options,
+            true,
+            normalize_content,
+        ) // cov:ignore: LLVM attributes the covered qpdf probe continuation to the call opening line
+    }
 }
 
 /// Collect indirect references from a live qpdf-shaped handle graph without
@@ -996,16 +998,40 @@ impl LinearizationPlan {
                 None)?;
         }
         let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
-        let skipped_stream_parameter_streams =
-            stream_refs_to_skip_parameter_edges(pdf, options, &content_normalize_refs)?;
+        let mut skipped_stream_parameter_streams = BTreeSet::new();
         let mut optimization = crate::optimization::Optimization::optimize(
             pdf,
             &BTreeMap::new(),
             true,
             |stream_ref, stream| {
+                // qpdf invokes this callback only while traversing objects
+                // reachable from a page, trailer key, or root key. Keep the
+                // stream-parameter probe inside that callback so an orphaned
+                // stream cannot make linearization read its source data.
                 if stream_ref.is_some_and(|object_ref| {
                     skipped_stream_parameter_streams.contains(&object_ref)
                 }) {
+                    // A stream can be visited by more than one object user.
+                    // Preserve the old prepass's one-probe state boundary:
+                    // once the first reachable visit established that qpdf
+                    // removes the parameter edges, later visits must not
+                    // consume a stateful token filter again.
+                    return Ok(2);
+                }
+                let has_indirect_parameter = stream_has_indirect_parameter_edge(stream)?;
+                let parameters_removed = has_indirect_parameter
+                    && stream_parameters_removed_for_linearization(
+                        stream,
+                        stream_ref,
+                        options,
+                        &content_normalize_refs,
+                    )?; // cov:ignore: LLVM attributes this covered reachable-stream branch continuation to the call opening line
+                if parameters_removed {
+                    if let Some(object_ref) = stream_ref {
+                        skipped_stream_parameter_streams.insert(object_ref);
+                    }
+                    // The probe above already consumed qpdf's stateful filter
+                    // check; the optimization callback must not run it again.
                     Ok(2)
                 } else {
                     let refiltered =
@@ -1074,6 +1100,13 @@ impl LinearizationPlan {
             if r.number == 0 {
                 continue;
             }
+            if !reachable.contains(&r) {
+                // Unreachable from the trailer roots — qpdf drops it before
+                // any linearization part is formed. Check this before
+                // resolving so a discarded object cannot make planning read
+                // its source bytes.
+                continue;
+            }
             let object_handle = pdf.get_object_handle(r);
             pdf.resolve(&object_handle)?;
             // Both `/Type /XRef` and `/Type /ObjStm` objects are required to
@@ -1087,13 +1120,6 @@ impl LinearizationPlan {
             if object_handle.try_is_stream_of_type(b"XRef", b"")?
                 || object_handle.try_is_stream_of_type(b"ObjStm", b"")?
             {
-                continue;
-            }
-            if !reachable.contains(&r) {
-                // Unreachable from the trailer roots — qpdf drops it. This also
-                // drops an orphaned indirect `/Length` holder: the reachability
-                // walk does not follow the dead `/Length` edge, so a holder
-                // reachable only through it is absent from `reachable`.
                 continue;
             }
             all_refs.push(r);

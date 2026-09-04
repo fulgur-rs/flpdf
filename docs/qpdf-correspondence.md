@@ -595,7 +595,10 @@ reservation order に interleave し、trailer と `/Extends` の参照も同じ
 identity ごとに `/Filter` / `/DecodeParms` edge を除外する。probe と emission
 は同じ `willFilterStream` 相当の metadata/content-normalization policy を使い、
 共有 parameter object は保存される別 stream から引き続き到達可能にする
-（flpdf-p045）。
+（flpdf-p045）。D27 の pre-write sweep 撤去後もこの probe は全 object の事前走査へ戻さず、
+`Optimization::update_object_maps` の page/trailer/root 起点 callback 内でだけ実行する。
+そのため qpdf と同じ到達範囲外の stream の source bytes や間接 `/Length` holder を
+linearization planning が解決しない（`flpdf-3yn9.44.1`）。
 
 `flpdf-xrgz` では producer の Part 4/first-half routing でも qpdf の `is_root`
 precedence (`QPDF_linearization.cc:1090-1127`) を保持し、page からも参照される
