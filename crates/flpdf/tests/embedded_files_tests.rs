@@ -1911,3 +1911,34 @@ fn create_ef_stream_from_provider_finalizes_the_deferred_payload() {
     );
     assert_eq!(wrapper.get_size().expect("computed /Params /Size"), 16);
 }
+
+#[test]
+fn setting_embedded_file_date_creates_missing_params_dictionary() {
+    let mut pdf = open(build_no_names_pdf());
+    let stream = pdf.new_stream().expect("embedded-file stream");
+    stream.replace_stream_data(
+        Rc::new(b"payload".to_vec()),
+        Some(ObjectHandle::null()),
+        Some(ObjectHandle::null()),
+    );
+    assert!(stream
+        .as_stream_dict()
+        .expect("stream dictionary")
+        .get_key(b"/Params")
+        .is_null());
+
+    let filespec_handle =
+        FileSpec::create_file_spec(&mut pdf, b"date.txt", stream).expect("create filespec");
+    let mut filespec = FileSpec::new(filespec_handle, &mut pdf).expect("wrap filespec");
+    let mut embedded_file = filespec
+        .embedded_file()
+        .expect("embedded file lookup")
+        .expect("embedded file stream");
+    embedded_file
+        .set_creation_date(b"D:20260101000000Z")
+        .expect("set creation date");
+    assert_eq!(
+        embedded_file.creation_date().expect("read creation date"),
+        Some(b"D:20260101000000Z".to_vec())
+    );
+}
