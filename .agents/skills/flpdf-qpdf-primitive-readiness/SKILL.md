@@ -279,8 +279,9 @@ actual readiness result.
 On any phase-2 failure:
 
 1. Stop further mutations.
-2. Read back the target, any newly created issue, dependencies, notes, and
-   labels.
+2. Read back the target, any newly created or reopened issue, dependencies,
+   notes, labels, and any issue whose text was repaired (parent epic,
+   dependent side).
 3. Report exactly what succeeded and failed.
 4. On retry, reuse matching issues and existing edges, skip identical notes,
    and add an existing label idempotently.
