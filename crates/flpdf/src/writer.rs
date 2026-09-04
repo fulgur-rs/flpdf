@@ -4275,17 +4275,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             }
 
             // Determine whether this object is a real stream (needs a holder),
-            // a non-stream object, or a structural stream that the main loop
-            // skips because it will be rebuilt (XRef / source ObjStm).
+            // a non-stream object, or the XRef structural stream that the QDF
+            // pre-scan skips because it is rebuilt separately.
             let object_handle = pdf.get_object_handle(*old_ref);
             pdf.resolve(&object_handle)?;
             let is_real_stream = if object_handle.as_stream_dict().is_some() {
-                let is_structural = object_handle.try_is_stream_of_type(b"XRef", b"")?
-                    || (qpdf_preserve_source_objstm
-                        && source_container_to_batch.contains_key(old_ref)
-                        && object_handle.try_is_stream_of_type(b"ObjStm", b"")?);
+                let is_structural = object_handle.try_is_stream_of_type(b"XRef", b"")?;
                 if is_structural {
-                    None // cov:ignore: rebuilt structural containers are excluded from CF renumber by skip_length=true
+                    None // cov:ignore: the rebuilt XRef stream is excluded from CF renumber by skip_length=true
                 } else {
                     Some(true)
                 }
@@ -4293,7 +4290,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 Some(false)
             };
             let Some(is_stream) = is_real_stream else {
-                continue; // cov:ignore: None only when a rebuilt XRef/source ObjStm is excluded from renumbered by skip_length=true
+                continue; // cov:ignore: None only when the rebuilt XRef stream is excluded from renumbered by skip_length=true
             };
 
             next_emission = next_emission.checked_add(1).ok_or_else(|| {
