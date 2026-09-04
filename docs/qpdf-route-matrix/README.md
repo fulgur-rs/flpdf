@@ -873,12 +873,13 @@ D27 と独立に進められる hygiene 2 slice（§7.4）と E-29（§7.2.6 の
 
 | 位置づけ | 内容 | issue ID |
 |---|---|---|
-| 前提（hygiene、ゼロリスク） | §6.4 (a-i) の prod 0 かつ test 0 の 4 symbol（C19 `per_object_key` / C28 `decode_stream_data_with_limits` / E-27 の qtest offset 入口 2 つ）を削除し、`crates/flpdf/src/encryption/keys.rs` の `#![allow(dead_code)]` を外す。ゲートは各 leaf の `--expect-zero` | （issue ID は controller が登録後に記入） |
-| 前提（hygiene、test 移行あり） | §6.4 (a-ii) の 3 symbol（C23 `apply_stream_compress_policy` / E-9 `format_attachment_list` / E-9 `list_attachment_info`）の test を canonical route 経由へ移してから削除。`flpdf-xsq1` と範囲が重なる | （issue ID は controller が登録後に記入） |
-| 本体 | 最初の bounded cutover（§7.3）。D27 の pre-write sweep 撤去 | （issue ID は controller が登録後に記入） |
-| 後続 | A14 `Pdf::delete_object` の撤去（残り 1 consumer）。§7.2.1 の 4 | （issue ID は controller が登録後に記入） |
-| 後続 | E-29 の `suppress_warnings` OR 追加（§7.2.6 の 1）。RED は §7.1 の probe | （issue ID は controller が登録後に記入） |
-| 記録の訂正 | D27 行が `sweep_unreachable_objects_except`（`crates/flpdf/src/job/page_merge.rs:1224`）を数えていない件。§7.3 完了後は `tracked-symbols.txt` の D27 行が実在しない symbol を指すことになるので、同 leaf へ張り替える。B14 の「診断を二重に push する」という主張が probe で再現しない件（§7.1）。B27 / E-7 の warning flush 位置（qpdf は `checking <file>` の前、flpdf は後）が本表のどの行にも記録されていない件 | （issue ID は controller が登録後に記入） |
+| 前提（hygiene、ゼロリスク） | §6.4 (a-i) の prod 0 かつ test 0 の 4 symbol（C19 `per_object_key` / C28 `decode_stream_data_with_limits` / E-27 の qtest offset 入口 2 つ）を削除し、`crates/flpdf/src/encryption/keys.rs` の `#![allow(dead_code)]` を外す。ゲートは各 leaf の `--expect-zero` | `flpdf-3yn9.42` |
+| 前提（hygiene、test 移行あり） | §6.4 (a-ii) の 3 symbol（C23 `apply_stream_compress_policy` / E-9 `format_attachment_list` / E-9 `list_attachment_info`）の test を canonical route 経由へ移してから削除。`flpdf-xsq1` と範囲が重なる | `flpdf-3yn9.43`（D27 と writer 周辺の test 移行が衝突しないよう D27 の後） |
+| 本体 | 最初の bounded cutover（§7.3）。D27 の pre-write sweep 撤去 | `flpdf-3yn9.44` |
+| 後続（D27 の本体側） | `sweep_unreachable_objects_except`（`crates/flpdf/src/job/page_merge.rs:1224`、multi-source `--pages`）の撤去。byte gate は D3/D11 の採番統合後にしか GREEN にできないので writer family の順序に従う。A14 の着手条件 | `flpdf-3yn9.45`（`flpdf-3yn9.44` に blocked） |
+| 後続 | A14 `Pdf::delete_object` の撤去（残り 1 consumer）。§7.2.1 の 4 | `flpdf-3yn9.46`（`flpdf-3yn9.45` に blocked。§7.3「次の cutover へ進む条件」参照） |
+| 後続 | E-29 の `suppress_warnings` OR 追加（§7.2.6 の 1）。RED は §7.1 の probe | `flpdf-3yn9.47` |
+| 記録の訂正 | D27 行が `sweep_unreachable_objects_except`（`crates/flpdf/src/job/page_merge.rs:1224`）を数えていない件。§7.3 完了後は `tracked-symbols.txt` の D27 行が実在しない symbol を指すことになるので、同 leaf へ張り替える。B14 の「診断を二重に push する」という主張が probe で再現しない件（§7.1）。B27 / E-7 の warning flush 位置（qpdf は `checking <file>` の前、flpdf は後）が本表のどの行にも記録されていない件 | issue 化せず本 PR 内で反映済み — d-writer.md D27 行の `_except` 追記、`tracked-symbols.txt` への `sweep_unreachable_objects_except` 追加、B14 行と P1 の probe 結果、README §8 X-8 |
 
 ## 8. unknown と必要 probe 一覧
 
