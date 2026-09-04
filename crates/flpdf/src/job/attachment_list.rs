@@ -252,6 +252,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn info_capture_exposes_the_pipeline_lifecycle() {
+        let mut capture = InfoCapture {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(capture.identifier(), "attachment-list test capture");
+        capture.write(b"lifecycle").expect("capture write");
+        capture.finish().expect("capture finish");
+    }
+
     // ── Minimal PDF fixture ───────────────────────────────────────────────────
 
     fn minimal_pdf_bytes() -> Vec<u8> {
