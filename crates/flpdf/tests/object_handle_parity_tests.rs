@@ -10,6 +10,8 @@ use common::{write_with_settings, WriterTestSettings};
 use flpdf::{EncryptMethod, EncryptParams, ObjectHandle, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
+#[cfg(feature = "qpdf-zlib-compat")]
+use std::process::Command;
 
 fn minimal_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf")
@@ -730,6 +732,94 @@ fn encrypted_preserve_emits_an_unretained_extends_target_as_a_stream() {
             .get(&ObjectRef::new(target_number, 0)),
         Some(flpdf::XrefEntry::Uncompressed { .. })
     ));
+}
+
+#[test]
+fn qdf_preserve_emits_an_unretained_extends_target_as_a_stream() {
+    let mut pdf = Pdf::open(Cursor::new(compressed_entry_with_unretained_extends_pdf()))
+        .expect("open ObjStm extends fixture");
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        static_id: true,
+        qdf: true,
+        object_streams: flpdf::ObjectStreamMode::Preserve,
+        ..WriterTestSettings::default()
+    };
+
+    write_with_settings(&mut pdf, &mut output, &settings)
+        .expect("QDF Preserve must emit the unretained /Extends target");
+    assert!(
+        output
+            .windows(b"/Type /ObjStm\n  /Length".len())
+            .any(|window| window == b"/Type /ObjStm\n  /Length"),
+        "the rebuilt child ObjStm must be present"
+    );
+    assert!(
+        output
+            .windows(b"/First 4\n  /N 1\n  /Type /ObjStm\n".len())
+            .any(|window| window == b"/First 4\n  /N 1\n  /Type /ObjStm\n"),
+        "the ordinary /Extends target ObjStm stream must be present"
+    );
+    assert_eq!(
+        output
+            .windows(b"/Extends ".len())
+            .filter(|window| *window == b"/Extends ")
+            .count(),
+        1,
+        "the rebuilt child ObjStm must retain one /Extends edge"
+    );
+}
+
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn qdf_preserve_unretained_extends_target_matches_qpdf() {
+    let qpdf_version = Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .expect("qpdf 11.9.0 must be installed for byte parity");
+    assert!(qpdf_version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&qpdf_version.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim(),
+        "qpdf version 11.9.0"
+    );
+
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let input = temporary.path().join("input.pdf");
+    let qpdf_output = temporary.path().join("qpdf.pdf");
+    std::fs::write(&input, compressed_entry_with_unretained_extends_pdf())
+        .expect("write ObjStm extends fixture");
+    let qpdf = Command::new("qpdf")
+        .args(["--static-id", "--qdf", "--object-streams=preserve"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("run qpdf 11.9.0");
+    assert!(
+        qpdf.status.success(),
+        "qpdf QDF Preserve failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(compressed_entry_with_unretained_extends_pdf()))
+        .expect("open ObjStm extends fixture");
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        static_id: true,
+        qdf: true,
+        object_streams: flpdf::ObjectStreamMode::Preserve,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings).expect("write flpdf QDF Preserve");
+
+    assert_eq!(
+        output,
+        std::fs::read(&qpdf_output).expect("read qpdf QDF Preserve output"),
+        "flpdf QDF Preserve output must match qpdf 11.9.0 byte-for-byte"
+    );
 }
 
 /// Repeated `get_object_handle` calls for the same already-resolved
