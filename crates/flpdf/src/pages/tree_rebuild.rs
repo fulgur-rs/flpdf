@@ -13,8 +13,9 @@
 //!   `/Rotate`) that were inherited from an ancestor `/Pages` node are pushed
 //!   onto each leaf as live handles **before** the leaf is reparented, so the
 //!   leaf no longer depends on the old ancestor chain. Direct non-scalar values
-//!   are promoted once through the canonical object registry; scalar values and
-//!   existing indirect values retain qpdf's copy/identity behavior.
+//!   are promoted in place through the canonical object registry, preserving
+//!   qpdf's shared-handle identity; scalar values and existing indirect values
+//!   retain qpdf's copy/identity behavior.
 //! - After that push, the retained root no longer carries those four inheritable
 //!   keys, matching `QPDF_optimization.cc:159-228`; its page-tree mutation keeps
 //!   `/Type`, `/Kids`, and `/Count` as the structural keys.
@@ -78,7 +79,7 @@ use crate::pages::{
     resolve_inherited_handle_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -122,21 +123,15 @@ pub struct RebuildResult {
 // ---------------------------------------------------------------------------
 
 /// Promote one direct non-scalar inherited value through the canonical PDF
-/// object registry, reusing an earlier promotion of the same live handle.
+/// object registry without cloning its live allocation.
 ///
 /// qpdf's `QPDF_optimization.cc:179-190` promotes direct arrays, dictionaries,
 /// and streams before attaching them to leaves, while scalar values are copied
-/// directly. The shared direct-handle cache keeps several selected leaves from
-/// minting separate objects for one ancestor value.
-#[allow(
-    clippy::mutable_key_type,
-    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
-)]
+/// directly. `makeIndirectObject` updates the shared value in place, so every
+/// alias observes the same indirect object number.
 fn promote_inherited_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: ObjectHandle,
-    // qpdf-deviation: flpdf-only identity-keyed promotion cache over the legacy clone allocator make_indirect_object_handle; qpdf (QPDF_optimization.cc:159-239) sets `og` in place on the shared QPDFObject inside makeIndirectObject (QPDF.cc:1836-1840,1883-1897), so aliases outside the page-tree walk also become indirect there but stay direct here
-    promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<ObjectHandle> {
     value.try_dereference()?;
     let non_scalar = value.as_array().is_some()
@@ -145,12 +140,15 @@ fn promote_inherited_value<R: Read + Seek>(
     if !value.is_direct() || !non_scalar {
         return Ok(value);
     }
-    let identity = value.identity_key();
-    if let Some(indirect) = promoted.get(&identity) {
-        return Ok(indirect.clone());
+    // Promotion changes how every containing indirect dictionary serializes
+    // this shared value. Capture and dirty those owners while the value is
+    // still direct; after promotion mark the newly allocated object itself,
+    // matching the qpdf-native page-repair helper.
+    if value.belongs_to_pdf(pdf.unique_id) {
+        pdf.mark_object_handle_dirty(&value)?;
     }
-    let indirect = pdf.make_indirect_object_handle(value.clone())?;
-    promoted.insert(identity, indirect.clone());
+    let indirect = pdf.make_indirect_from_object_handle(value)?;
+    pdf.mark_object_handle_dirty(&indirect)?;
     Ok(indirect)
 }
 
@@ -174,24 +172,19 @@ fn install_inherited_value<R: Read + Seek>(
 /// Resolve and prepare an inherited value only when the page has no visible
 /// own value. A leaf-owned non-scalar must not be promoted merely because the
 /// canonical walk returns that same leaf handle.
-#[allow(
-    clippy::mutable_key_type,
-    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
-)]
 fn resolve_inherited_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     page: &ObjectHandle,
     key: &[u8],
     max_depth: usize,
-    promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<Option<ObjectHandle>> {
     let value = resolve_inherited_handle_with_max_depth(pdf, page_ref, key, max_depth)?;
     if page.try_has_key(key)? {
         return Ok(None);
     }
     value
-        .map(|value| promote_inherited_value(pdf, value, promoted))
+        .map(|value| promote_inherited_value(pdf, value))
         .transpose()
 }
 
@@ -251,16 +244,10 @@ fn collect_page_tree_nodes(
 /// dictionary, and stream promotion therefore also runs for a branch whose
 /// pages will not be selected; the later page-selection operation can discard
 /// that branch while `--preserve-unreferenced` still serializes the promoted
-/// object. Keep the existing promotion cache so a value later inherited by a
-/// selected leaf retains one canonical identity.
-#[allow(
-    clippy::mutable_key_type,
-    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
-)]
+/// object.
 fn promote_page_tree_inheritable_values<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     nodes: &[ObjectHandle],
-    promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<()> {
     let inheritable_keys = [
         b"/CropBox".as_slice(),
@@ -275,11 +262,7 @@ fn promote_page_tree_inheritable_values<R: Read + Seek>(
                 continue;
             }
             let value = node.try_get_key(key)?;
-            let promoted_value = promote_inherited_value(pdf, value.clone(), promoted)?;
-            if !promoted_value.is_same_object_as(&value) {
-                node.replace_key(key, promoted_value)?;
-                pdf.mark_object_handle_dirty(node)?;
-            }
+            promote_inherited_value(pdf, value)?;
         }
     }
     Ok(())
@@ -448,8 +431,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // qpdf promotes direct non-scalar values on every original /Pages node
     // before page selection discards an unselected branch. Keep these objects
     // in the canonical registry so preserve-unreferenced can serialize them.
-    let mut promoted_inherited: HashMap<ObjectHandleIdentity, ObjectHandle> = HashMap::new();
-    promote_page_tree_inheritable_values(pdf, &page_tree_nodes, &mut promoted_inherited)?;
+    promote_page_tree_inheritable_values(pdf, &page_tree_nodes)?;
 
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
     // Any original leaf absent from ref_map is a removed page.
@@ -475,30 +457,12 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             // parent chain before the final /Parent replacement. Resolve in
             // qpdf's key order so direct non-scalar promotions have the same
             // deterministic allocation order as QPDF_optimization.cc.
-            let inherited_cropbox = resolve_inherited_for_page(
-                pdf,
-                src,
-                &page,
-                b"/CropBox",
-                max_depth,
-                &mut promoted_inherited,
-            )?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
-            let inherited_mediabox = resolve_inherited_for_page(
-                pdf,
-                src,
-                &page,
-                b"/MediaBox",
-                max_depth,
-                &mut promoted_inherited,
-            )?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
-            let inherited_resources = resolve_inherited_for_page(
-                pdf,
-                src,
-                &page,
-                b"/Resources",
-                max_depth,
-                &mut promoted_inherited,
-            )?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
+            let inherited_cropbox =
+                resolve_inherited_for_page(pdf, src, &page, b"/CropBox", max_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
+            let inherited_mediabox =
+                resolve_inherited_for_page(pdf, src, &page, b"/MediaBox", max_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
+            let inherited_resources =
+                resolve_inherited_for_page(pdf, src, &page, b"/Resources", max_depth)?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_rotate =
                 resolve_inherited_handle_with_max_depth(pdf, src, b"/Rotate", max_depth)?;
 
@@ -514,7 +478,10 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             // Duplicate occurrence: shallow-copy the post-materialization
             // live page and allocate only the page dictionary. Indirect child
             // handles (`/Contents`, `/Resources`, ...) remain shared.
-            pdf.make_indirect_object_handle(page.shallow_copy()?)?
+            let copy = page.shallow_copy()?;
+            let promoted = pdf.make_indirect_from_object_handle(copy)?;
+            pdf.mark_object_handle_dirty(&promoted)?;
+            promoted
         };
         let target_ref = target
             .object_ref()
@@ -1016,6 +983,70 @@ mod tests {
         assert!(
             page_resources.is_same_object_as(&resources),
             "inherited /Resources must retain its live indirect handle"
+        );
+    }
+
+    #[test]
+    fn rebuild_promotes_a_catalog_alias_with_the_inherited_value_in_place() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let catalog = pdf.root_handle().expect("empty PDF catalog");
+        let pages = resolved_handle(&mut pdf, ObjectRef::new(2, 0));
+        let shared =
+            ObjectHandle::dictionary(vec![(b"/Marker".to_vec(), ObjectHandle::integer(7))]);
+        let page = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (b"/Parent".to_vec(), pages.clone()),
+            ]))
+            .expect("page object allocation");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page allocation must be dirty");
+        let page_ref = page.object_ref().expect("page object reference");
+
+        catalog
+            .replace_key(b"/Foo", shared.clone())
+            .expect("Catalog alias insertion");
+        pages
+            .replace_key(b"/Resources", shared.clone())
+            .expect("Pages alias insertion");
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![page]))
+            .expect("Pages kids insertion");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(1))
+            .expect("Pages count insertion");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog mutation must be dirty");
+        pdf.mark_object_handle_dirty(&pages)
+            .expect("Pages mutation must be dirty");
+
+        rebuild_page_tree(&mut pdf, &[page_ref]).expect("page-selection rebuild");
+
+        let foo = catalog.try_get_key(b"/Foo").expect("Catalog alias lookup");
+        let page_resources = pdf
+            .get_object_handle(page_ref)
+            .try_get_key(b"/Resources")
+            .expect("page inherited resources lookup");
+        assert!(
+            shared.is_indirect(),
+            "qpdf promotion must update the aliased direct allocation in place"
+        );
+        assert!(
+            foo.is_indirect(),
+            "Catalog alias must become an indirect reference"
+        );
+        assert!(
+            page_resources.is_indirect(),
+            "inherited /Resources must become an indirect reference"
+        );
+        assert_eq!(
+            foo.object_ref(),
+            page_resources.object_ref(),
+            "Catalog /Foo and page /Resources must use the same object number"
+        );
+        assert!(
+            foo.is_same_object_as(&page_resources),
+            "Catalog /Foo and page /Resources must retain the same live object identity"
         );
     }
 
@@ -1540,7 +1571,7 @@ mod tests {
             ObjectHandle::dictionary(Vec::new()),
             Rc::new(b"stream".to_vec()),
         );
-        let promoted = promote_inherited_value(&mut pdf, stream, &mut HashMap::new())
+        let promoted = promote_inherited_value(&mut pdf, stream)
             .expect("direct stream promotion must succeed");
 
         assert!(promoted.is_indirect());
@@ -1548,22 +1579,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
-    )]
-    fn promote_inherited_value_reuses_a_same_identity_promotion_from_a_map() {
+    fn promote_inherited_value_preserves_a_same_identity_alias_in_place() {
         let mut pdf = Pdf::empty().expect("empty PDF");
         let value = ObjectHandle::dictionary(vec![(b"Marker".to_vec(), ObjectHandle::integer(7))]);
-        let mut promoted = std::collections::HashMap::new();
+        let alias = value.clone();
 
-        let first = promote_inherited_value(&mut pdf, value.clone(), &mut promoted)
-            .expect("first promotion must succeed");
-        let second = promote_inherited_value(&mut pdf, value, &mut promoted)
-            .expect("same-identity promotion must reuse the cached object");
+        let promoted =
+            promote_inherited_value(&mut pdf, value).expect("first promotion must succeed");
 
-        assert!(first.is_indirect());
-        assert!(first.is_same_object_as(&second));
-        assert_eq!(promoted.len(), 1);
+        assert!(promoted.is_indirect());
+        assert!(alias.is_indirect());
+        assert!(promoted.is_same_object_as(&alias));
     }
 }
