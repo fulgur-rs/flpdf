@@ -953,8 +953,10 @@ fn enqueue(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_canonical_owner;
-    use crate::{Error, Pdf};
+    use super::{ensure_canonical_owner, walk_resurrectable_handle, ResurrectableWalkState};
+    use crate::parser::MAX_PARSE_DEPTH;
+    use crate::{Error, ObjectHandle, Pdf};
+    use std::collections::BTreeSet;
 
     #[test]
     fn writer_foreign_owner_is_a_qpdf_logic_error() {
@@ -970,5 +972,26 @@ mod tests {
             Error::Internal(message)
                 if message == "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
         ));
+    }
+
+    #[test]
+    fn resurrectable_walk_rejects_programmatic_depth_beyond_parser_limit() {
+        let mut follow = Vec::new();
+        let mut result = BTreeSet::new();
+        let removed_refs = BTreeSet::new();
+        let mut state = ResurrectableWalkState {
+            follow: &mut follow,
+            result: &mut result,
+            removed_refs: &removed_refs,
+        };
+        let error = walk_resurrectable_handle(
+            &ObjectHandle::null(),
+            MAX_PARSE_DEPTH + 1,
+            false,
+            false,
+            &mut state,
+        )
+        .expect_err("the resurrectable walk has a parser-depth guard");
+        assert!(error.to_string().contains("MAX_PARSE_DEPTH"));
     }
 }
