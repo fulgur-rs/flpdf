@@ -22,6 +22,20 @@ pub(super) fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
     }
 }
 
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 // qpdf's `QUtil::safe_fopen` reports `"open " + filename + ": " +
 // strerror(errno)` (`libqpdf/QUtil.cc:512-515`, `QPDFSystemError.cc:12-27`),
 // with no numeric error code. `std::io::Error`'s `Display` appends a
@@ -32,6 +46,8 @@ pub(super) fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
 // native Win32 FormatMessage text ("The system cannot find the file
 // specified."). Keep this diagnostic helper available to the JSON input
 // path without coupling that path to either qpdf-shaped object helper.
+// The byte-carrying error keeps the path intact for the CLI renderer; ordinary
+// Display callers still receive the lossy projection.
 pub(crate) fn qpdf_style_open_error(path: &Path, error: std::io::Error) -> Error {
     let rendered = error.to_string();
     let message = if error.kind() == std::io::ErrorKind::NotFound {
@@ -42,7 +58,11 @@ pub(crate) fn qpdf_style_open_error(path: &Path, error: std::io::Error) -> Error
             .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
             .unwrap_or(&rendered)
     };
-    Error::System(format!("open {}: {message}", path.display()))
+    let mut raw_message = b"open ".to_vec();
+    raw_message.extend_from_slice(&path_bytes(path));
+    raw_message.extend_from_slice(b": ");
+    raw_message.extend_from_slice(message.as_bytes());
+    Error::SystemBytes(raw_message)
 }
 
 /// Encode a Unicode filename as UTF-16BE with a BOM.

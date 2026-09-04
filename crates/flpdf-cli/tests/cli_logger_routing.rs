@@ -641,6 +641,69 @@ fn cli_reports_a_non_utf8_missing_path_without_panicking() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_attachment_segment_open_error_matches_qpdf_for_non_utf8_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping attachment-segment differential");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary attachment directory");
+    let input = directory.path().join("input.pdf");
+    let qpdf_output = directory.path().join("qpdf-output.pdf");
+    let flpdf_output = directory.path().join("flpdf-output.pdf");
+    let attachment = directory
+        .path()
+        .join(OsString::from_vec(b"attach-\xff.bin".to_vec()));
+    std::fs::copy(MINIMAL, &input).expect("copy input fixture");
+
+    let args = |output: &Path| {
+        vec![
+            input.as_os_str().to_os_string(),
+            output.as_os_str().to_os_string(),
+            OsString::from("--add-attachment"),
+            attachment.as_os_str().to_os_string(),
+            OsString::from("--"),
+        ]
+    };
+    let qpdf_args = args(&qpdf_output);
+    let qpdf = ProcessCommand::new("qpdf")
+        .args(&qpdf_args)
+        .output()
+        .expect("run qpdf");
+    let flpdf_args = args(&flpdf_output);
+    let flpdf = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(&flpdf_args)
+        .output()
+        .expect("run flpdf");
+
+    assert_eq!(
+        qpdf.status.code(),
+        Some(2),
+        "qpdf stderr: {:?}",
+        qpdf.stderr
+    );
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "status");
+    assert_eq!(flpdf.stdout, qpdf.stdout, "stdout");
+    assert_eq!(flpdf.stderr, qpdf.stderr, "stderr");
+    assert!(
+        qpdf.stderr
+            .windows(attachment.as_os_str().as_bytes().len())
+            .any(|window| window == attachment.as_os_str().as_bytes()),
+        "qpdf must preserve the raw attachment path: {:?}",
+        qpdf.stderr
+    );
+    assert!(!qpdf
+        .stderr
+        .windows(3)
+        .any(|window| window == b"\xef\xbf\xbd"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_preserves_a_non_utf8_page_source_path_through_the_qpdf_segment_parser() {
     use std::os::unix::ffi::OsStringExt;
 
