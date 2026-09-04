@@ -3,7 +3,7 @@ use common::PdfCanonicalTestExt;
 
 use flpdf::job::QPDFJob;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
+use flpdf::{DecodeLevel, Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -115,6 +115,34 @@ fn two_lazy_warning_objects() -> Vec<u8> {
     pdf
 }
 
+fn malformed_filter_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, body) in [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>",
+        ),
+        (4, b"<< /Length 3 /Filter 7 >>\nstream\nabc\nendstream"),
+    ] {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 #[test]
 fn open_options_default_to_the_process_logger_unsuppressed_and_unnamed() {
     let options = PdfOpenOptions::default();
@@ -140,6 +168,59 @@ fn open_options_clone_and_compare_an_explicit_logger_by_identity() {
     assert_eq!(options, options.clone());
     let pdf = Pdf::open_with_options(Cursor::new(MINIMAL_PDF), options).unwrap();
     assert_eq!(pdf.logger(), logger);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn object_warning_preserves_a_non_utf8_file_description() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let directory = tempfile::tempdir().expect("temporary source directory");
+    let path = directory.path().join(std::ffi::OsString::from_vec(
+        b"object-warning-\xff.pdf".to_vec(),
+    ));
+    std::fs::write(&path, malformed_filter_pdf()).expect("write malformed filter PDF");
+    let (logger, output) = recording_logger();
+    let description = path.as_os_str().as_bytes().to_vec();
+    let mut pdf = Pdf::open_file_with_options(
+        &path,
+        PdfOpenOptions {
+            logger: Some(logger),
+            description: description.clone(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open malformed filter PDF");
+
+    let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve(&stream).expect("resolve content stream");
+    let _ = stream.get_stream_data(DecodeLevel::All);
+
+    let output = output.lock().expect("capture output");
+    assert!(
+        output
+            .windows(description.len())
+            .any(|window| window == description),
+        "object warning must retain the raw source description: {output:?}"
+    );
+    assert!(
+        !output.windows(3).any(|window| window == b"\xef\xbf\xbd"),
+        "object warning must not contain U+FFFD: {output:?}"
+    );
+    let diagnostics = pdf.repair_diagnostics();
+    let diagnostic = diagnostics
+        .entries()
+        .last()
+        .expect("object warning diagnostic");
+    assert!(diagnostic.is_object_warning());
+    assert!(
+        diagnostic
+            .message_bytes()
+            .windows(description.len())
+            .any(|window| window == description),
+        "diagnostic must retain the raw object warning bytes: {:?}",
+        diagnostic.message_bytes()
+    );
 }
 
 #[test]

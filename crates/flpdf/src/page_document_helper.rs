@@ -273,7 +273,8 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             // filename (`QPDF_pages.cc:304-316`). Keep the complete exception
             // text on the canonical page-helper error so callers do not need
             // to reconstruct it at the driver boundary.
-            let description = self.pdf.resolver.input_description();
+            let description_bytes = self.pdf.resolver.input_description();
+            let description = String::from_utf8_lossy(&description_bytes);
             let object = format!("page object: object {} {}", page.number, page.generation);
             let message = format_qpdf_exception_what(
                 &description,

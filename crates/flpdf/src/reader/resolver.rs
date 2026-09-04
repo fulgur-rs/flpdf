@@ -516,6 +516,20 @@ fn route_warning(
     logger.warn(line)
 }
 
+fn route_object_warning(
+    logger: &crate::QPDFLogger,
+    suppress_warnings: bool,
+    message: &[u8],
+) -> Result<()> {
+    if suppress_warnings {
+        return Ok(());
+    }
+    let mut line = b"WARNING: ".to_vec();
+    line.extend_from_slice(message);
+    line.push(b'\n');
+    logger.warn(line)
+}
+
 impl<R: Read + Seek> ResolverCore<R> {
     /// Position the input source at qpdf-logical `offset`.
     ///
@@ -830,7 +844,7 @@ struct ParsedObjectAtOffset {
     /// cache boundary so legacy tree consumers can preserve their error path.
     malformed: bool,
     parsed_offset: i64,
-    description: String,
+    description: Vec<u8>,
     end_before_space: i64,
     end_after_space: i64,
     /// The tokenizer start of the token after the parsed object value. qpdf's
@@ -1210,7 +1224,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<ObjectHandle> {
         let mut handles = ChildHandles {
             resolver: self,
-            description_template: format!("parsed object, {object_description} at offset $PO"),
+            description_template: format!("parsed object, {object_description} at offset $PO")
+                .into_bytes(),
         };
         let parsed = parse_object_handle_with_context(input, &mut handles)?;
         for diagnostic in &parsed.diagnostics {
@@ -1227,22 +1242,30 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(parsed.value)
     }
 
-    pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> String {
+    pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> Vec<u8> {
         let core = self.core.borrow();
-        let input_description = String::from_utf8_lossy(&core.description);
-        format!(
-            "{}, object {} {} at offset $PO",
-            input_description, object_ref.number, object_ref.generation
-        )
+        let mut description = core.description.clone();
+        description.extend_from_slice(
+            format!(
+                ", object {} {} at offset $PO",
+                object_ref.number, object_ref.generation
+            )
+            .as_bytes(),
+        );
+        description
     }
 
-    pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> String {
+    pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> Vec<u8> {
         let core = self.core.borrow();
-        let input_description = String::from_utf8_lossy(&core.description);
-        format!(
-            "{}, stream object {} {}",
-            input_description, object_ref.number, object_ref.generation
-        )
+        let mut description = core.description.clone();
+        description.extend_from_slice(
+            format!(
+                ", stream object {} {}",
+                object_ref.number, object_ref.generation
+            )
+            .as_bytes(),
+        );
+        description
     }
 
     /// Keep qpdf's current object description for later generic damaged-PDF
@@ -1951,15 +1974,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///
     /// Same borrow discipline as [`Self::push_warning`]: the `borrow_mut()`
     /// is taken and dropped before the logger write.
-    pub(crate) fn push_object_warning(&self, message: impl Into<String>) -> Result<()> {
-        let message = message.into();
+    pub(crate) fn push_object_warning(&self, message: impl AsRef<[u8]>) -> Result<()> {
+        let message = message.as_ref().to_vec();
         let (logger, suppress_warnings) = {
             let mut core = self.core.borrow_mut();
             core.repair_diagnostics
-                .push(Diagnostic::object_warning(message.clone()));
+                .push(Diagnostic::object_warning_bytes(&message));
             (core.logger.clone(), core.suppress_warnings)
         };
-        route_warning(&logger, suppress_warnings, &[], None, &message)
+        route_object_warning(&logger, suppress_warnings, &message)
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
@@ -1972,6 +1995,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )
         };
         for diagnostic in diagnostics.entries() {
+            if diagnostic.is_object_warning() {
+                route_object_warning(&logger, suppress_warnings, diagnostic.message_bytes())?;
+                continue;
+            }
             let description = diagnostic
                 .description
                 .as_deref()
@@ -2137,13 +2164,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
         &self,
         stream_number: u32,
         object_ref: ObjectRef,
-    ) -> String {
+    ) -> Vec<u8> {
         let core = self.core.borrow();
-        let input_description = String::from_utf8_lossy(&core.description);
-        format!(
-            "{input_description} object stream {stream_number}, object {} {} at offset $PO",
-            object_ref.number, object_ref.generation
-        )
+        let mut description = core.description.clone();
+        description.extend_from_slice(
+            format!(
+                " object stream {stream_number}, object {} {} at offset $PO",
+                object_ref.number, object_ref.generation
+            )
+            .as_bytes(),
+        );
+        description
     }
 
     fn resolve_object_stream_with_failure_kind(
@@ -3129,7 +3160,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 value,
                 malformed: false,
                 parsed_offset,
-                description: String::new(),
+                description: Vec::new(),
                 end_before_space,
                 end_after_space,
                 trailing_start,
@@ -3247,7 +3278,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         &self,
         dict: ObjectValue,
         dict_offset: i64,
-        dict_description: String,
+        dict_description: Vec<u8>,
         object_header_offset: u64,
         object_ref: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
@@ -4178,7 +4209,7 @@ fn stream_copy_dictionary_value(dictionary: &ObjectHandle, key: &[u8]) -> Result
 /// this hands back is unresolved.
 struct ChildHandles<'a, R: Read + Seek + 'static> {
     resolver: &'a ResolverHandle<R>,
-    description_template: String,
+    description_template: Vec<u8>,
 }
 
 fn qpdf_exception_what(filename: &str, object: &str, offset: usize, message: &str) -> String {
@@ -4219,7 +4250,7 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
         self.resolver.parsed_direct_object_handle(value)
     }
 
-    fn description_template(&self) -> Option<String> {
+    fn description_template(&self) -> Option<Vec<u8>> {
         Some(self.description_template.clone())
     }
 }
@@ -4229,8 +4260,8 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         Some(self.pdf_unique_id)
     }
 
-    fn input_description(&self) -> String {
-        String::from_utf8_lossy(&self.core.borrow().description).into_owned()
+    fn input_description(&self) -> Vec<u8> {
+        self.core.borrow().description.clone()
     }
 
     fn new_stream(&self) -> Result<ObjectHandle> {
@@ -4271,7 +4302,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         self.pclm_mode()
     }
 
-    fn warn(&self, message: String) -> Result<()> {
+    fn warn(&self, message: Vec<u8>) -> Result<()> {
         self.push_object_warning(message)
     }
 
@@ -4608,7 +4639,9 @@ mod tests {
     use super::CLOSED_INPUT_SOURCE_ERROR;
     use crate::encryption::state::{EncryptionMode, EncryptionState};
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
-    use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
+    use crate::{
+        Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::Cursor;
@@ -5396,14 +5429,14 @@ mod tests {
         let root = resolver.get_object_handle(ObjectRef::new(1, 0));
         root.try_dereference().expect("live object should resolve");
 
-        assert_eq!(root.description(), "input.pdf, object 1 0 at offset 11");
+        assert_eq!(root.description(), b"input.pdf, object 1 0 at offset 11");
         let level_one = root
             .as_dictionary()
             .and_then(|values| values.get(b"/L1".as_slice()).cloned())
             .expect("level one dictionary");
         assert_eq!(
             level_one.description(),
-            "input.pdf, object 1 0 at offset 18"
+            b"input.pdf, object 1 0 at offset 18"
         );
 
         let level_two = level_one
@@ -5412,27 +5445,27 @@ mod tests {
             .expect("level two dictionary");
         assert_eq!(
             level_two.description(),
-            "input.pdf, object 1 0 at offset 25"
+            b"input.pdf, object 1 0 at offset 25"
         );
 
         let value = level_two
             .as_dictionary()
             .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("deep scalar");
-        assert_eq!(value.description(), "input.pdf, object 1 0 at offset 33");
+        assert_eq!(value.description(), b"input.pdf, object 1 0 at offset 33");
 
         let items = root
             .as_dictionary()
             .and_then(|values| values.get(b"/Items".as_slice()).cloned())
             .expect("array value");
-        assert_eq!(items.description(), "input.pdf, object 1 0 at offset 49");
+        assert_eq!(items.description(), b"input.pdf, object 1 0 at offset 49");
         let array_scalar = items
             .as_array()
             .and_then(|values| values.first().cloned())
             .expect("array scalar");
         assert_eq!(
             array_scalar.description(),
-            "input.pdf, object 1 0 at offset 49"
+            b"input.pdf, object 1 0 at offset 49"
         );
         let array_null = items
             .as_array()
@@ -5523,14 +5556,14 @@ mod tests {
             .expect("live stream should resolve");
         let stream_dict = stream.as_stream_dict().expect("stream dictionary");
 
-        assert_eq!(stream.description(), "input.pdf, stream object 1 0");
+        assert_eq!(stream.description(), b"input.pdf, stream object 1 0");
         assert!(
             stream.get_parsed_offset() > stream_dict.get_parsed_offset(),
             "the stream description must retain the stream-data offset"
         );
         let dictionary_description = stream_dict.description();
         assert!(
-            dictionary_description.starts_with("input.pdf, object 1 0 at offset "),
+            dictionary_description.starts_with(b"input.pdf, object 1 0 at offset "),
             "the stream dictionary must retain its parser description, got {dictionary_description:?}"
         );
 
@@ -5540,8 +5573,10 @@ mod tests {
         stream_dict
             .object_warning("stream dictionary warning")
             .expect("stream dictionary warning should reach the resolver");
-        let expected_dictionary_warning =
-            format!("{dictionary_description}: stream dictionary warning");
+        let expected_dictionary_warning = format!(
+            "{}: stream dictionary warning",
+            String::from_utf8_lossy(&dictionary_description)
+        );
         assert_eq!(
             resolver
                 .repair_diagnostics()
@@ -5597,6 +5632,22 @@ mod tests {
             output.lock().unwrap().as_slice(),
             b"WARNING: input.pdf: from the document\n\
               WARNING: from the object\n"
+        );
+    }
+
+    #[test]
+    fn replaying_an_object_warning_preserves_raw_message_bytes() {
+        let (resolver, output) = named_resolver_with_captured_warnings();
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.push(Diagnostic::object_warning_bytes(
+            b"object-warning-\xff.pdf: malformed object",
+        ));
+
+        resolver.replay_warnings(&diagnostics).unwrap();
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: object-warning-\xff.pdf: malformed object\n"
         );
     }
 
@@ -8270,7 +8321,10 @@ mod tests {
             Some(1)
         );
         assert_eq!(member.get_parsed_offset(), 9);
-        assert!(member.description().contains("object 7 0 at offset"));
+        assert!(member
+            .description()
+            .windows(b"object 7 0 at offset".len())
+            .any(|window| window == b"object 7 0 at offset"));
         assert_eq!(
             member_alias.get_parsed_offset(),
             member.get_parsed_offset(),

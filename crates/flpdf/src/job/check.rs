@@ -878,6 +878,13 @@ fn emit_diagnostics_with_suppression(
                 if suppress_warnings {
                     continue;
                 }
+                if diagnostic.is_object_warning() {
+                    let mut line = b"WARNING: ".to_vec();
+                    line.extend_from_slice(diagnostic.message_bytes());
+                    line.push(b'\n');
+                    logger.warn(line)?;
+                    continue;
+                }
                 if is_contextless_object_warning(&diagnostic.message) {
                     logger.warn(format!("WARNING: {}\n", diagnostic.message))?;
                     continue;
@@ -1081,6 +1088,24 @@ mod tests {
             Some(PipelineHandle::new(Capture { bytes })),
         );
         logger
+    }
+
+    #[test]
+    fn object_warning_diagnostic_replay_preserves_raw_description_bytes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.push(Diagnostic::object_warning_bytes(
+            b"/tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array",
+        ));
+
+        let result = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", "destination.pdf")
+            .expect("object warning replay");
+        assert_eq!(result, (true, false));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"WARNING: /tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array\n"
+        );
     }
 
     fn missing_root_pdf_bytes() -> Vec<u8> {

@@ -1328,7 +1328,7 @@ pub(crate) fn write_warning(
     }
     if diagnostic.is_object_warning() {
         let mut line = b"WARNING: ".to_vec();
-        line.extend_from_slice(message.as_bytes());
+        line.extend_from_slice(diagnostic.message_bytes());
         return write_stderr_bytes(stdout, stderr, &line);
     }
     let offset = diagnostic.offset;
@@ -1612,6 +1612,24 @@ requested value of integer is too big; returning INT_MAX\n"
 
         assert!(stdout.is_empty());
         assert_eq!(stderr, b"WARNING: offset 17: warning without a filename\n");
+    }
+
+    #[test]
+    fn object_warning_output_preserves_raw_description_bytes() {
+        let diagnostic = Diagnostic::object_warning_bytes(
+            b"/tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning(b"destination.pdf", &diagnostic, &mut stdout, &mut stderr)
+            .expect("warning output");
+
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            b"WARNING: /tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array\n"
+        );
     }
 
     #[test]
