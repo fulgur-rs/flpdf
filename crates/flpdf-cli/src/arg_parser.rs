@@ -427,6 +427,17 @@ fn canonical_top_level_non_utf8_option(
             return arg;
         };
         let name = name.to_owned();
+        // A single-dash abbreviation only reaches the qpdf-shaped `--name`
+        // grammar when the ASCII path (`canonical_top_level_option`) would
+        // also promote it: either the argument was already `--name` form, or
+        // `known_long_options` recognizes the abbreviated name. Gating the
+        // bare-value discard below on that same condition keeps this raw-byte
+        // path's decisions identical to the ASCII path for every name;
+        // otherwise a name present in `QPDF_BARE_LONG_OPTIONS` but absent
+        // from `known_long_options` would have its attached value silently
+        // discarded here while the ASCII path leaves the same argument
+        // untouched.
+        let promoted = is_double_dash || known_long_options.contains(&name);
         let canonical = if is_double_dash {
             arg
         } else if known_long_options.contains(&name) {
@@ -437,7 +448,7 @@ fn canonical_top_level_non_utf8_option(
         } else {
             arg
         };
-        if bare_long_options.contains(&name) {
+        if promoted && bare_long_options.contains(&name) {
             let bytes = canonical.as_bytes();
             if let Some(equal_pos) = bytes.iter().position(|byte| *byte == b'=') {
                 let value = &bytes[equal_pos + 1..];
@@ -640,5 +651,47 @@ mod tests {
             parsed.residual_args,
             [OsString::from("flpdf"), OsString::from("--check")]
         );
+    }
+
+    #[test]
+    fn parser_leaves_a_single_dash_attached_value_unchanged_for_a_bare_option_not_registered_with_clap(
+    ) {
+        // "warning-exit-0" is in QPDF_BARE_LONG_OPTIONS but is not registered
+        // as a clap long flag anywhere in the real CLI, so it is absent from
+        // `known_long_options`: the single-dash abbreviation is never
+        // promoted to `--warning-exit-0`, and `option_name` on the
+        // unpromoted single-dash argument returns None, so
+        // canonical_top_level_option returns the argument untouched.
+        let command = clap::Command::new("flpdf");
+        let parsed = ArgParser::from_command(command)
+            .parse(vec!["flpdf".into(), "-warning-exit-0=1".into()])
+            .expect("unrecognized single-dash option should pass through unchanged");
+
+        assert_eq!(parsed.residual_args, ["flpdf", "-warning-exit-0=1"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_matches_the_ascii_path_for_a_non_utf8_attached_value_on_a_bare_option_not_registered_with_clap(
+    ) {
+        use std::os::unix::ffi::OsStringExt;
+
+        // Same option as
+        // parser_leaves_a_single_dash_attached_value_unchanged_for_a_bare_option_not_registered_with_clap,
+        // but with a non-UTF-8 attached value so the raw-byte
+        // canonical_top_level_non_utf8_option path runs instead of
+        // canonical_top_level_option. Before this fix, that path applied the
+        // bare-value discard unconditionally on bare_long_options
+        // membership, without also requiring the promotion that
+        // known_long_options gates in the ASCII path -- collapsing this
+        // argument to bare `--warning-exit-0` even though the equivalent
+        // ASCII-valued argument above passes through untouched.
+        let command = clap::Command::new("flpdf");
+        let input = OsString::from_vec(b"-warning-exit-0=\xff".to_vec());
+        let parsed = ArgParser::from_command(command)
+            .parse_os(vec![OsString::from("flpdf"), input.clone()])
+            .expect("unrecognized single-dash option should pass through unchanged");
+
+        assert_eq!(parsed.residual_args, [OsString::from("flpdf"), input]);
     }
 }
