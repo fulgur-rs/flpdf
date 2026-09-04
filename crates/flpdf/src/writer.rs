@@ -354,10 +354,14 @@ impl WriterConfiguration {
         self.settings.copy_encryption = None;
     }
 
-    pub(crate) fn normalize_encryption_passwords(
-        &mut self,
-        password_mode: PasswordMode,
-    ) -> Result<usize> {
+    /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
+    /// encryption passwords before a writer emits its encryption dictionary.
+    ///
+    /// The returned count is the number of qpdf auto-mode fallback warnings
+    /// that the owning job should send through its error logger. Password
+    /// validation and conversion stay in the encryption password module so
+    /// direct CLI writers and `QPDFJob` share one implementation.
+    pub fn normalize_encryption_passwords(&mut self, password_mode: PasswordMode) -> Result<usize> {
         let Some(params) = self.settings.encryption_parameters.as_mut() else {
             return Ok(0);
         };

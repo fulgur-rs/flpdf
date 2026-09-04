@@ -35,6 +35,37 @@ fn encrypted_fixture_with_password(password: &[u8]) -> Vec<u8> {
     writer.get_buffer().unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn top_level_encrypt_unicode_mode_rejects_invalid_utf8_password() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = temp.path().join("encrypted.pdf");
+    let invalid_password = std::ffi::OsString::from_vec(b"bad\xff".to_vec());
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password-mode=unicode",
+            "--allow-weak-crypto",
+            "--encrypt",
+        ])
+        .arg(invalid_password)
+        .args(["owner", "128", "--"])
+        .arg(input)
+        .arg(output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    assert_eq!(
+        result.stderr,
+        b"flpdf: supplied password is not valid UTF-8\n"
+    );
+}
+
 #[test]
 fn auto_mode_authenticates_composed_nfc_password() {
     // The fixture was qpdf-encrypted with user password "café" (NFC composed).
