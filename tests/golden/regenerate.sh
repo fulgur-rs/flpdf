@@ -2219,6 +2219,18 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/missing-mediabox-leaf.pdf" "$REF/missing-mediabox-leaf/linearize.pdf"
 echo "missing-mediabox-leaf/linearize.pdf"
 
+# --- deep-nesting-257-resources: one page whose direct /Resources is a
+# 257-level nested array (below qpdf's parser limit, QPDFParser.cc:290
+# `stack.size() > 499`) and a direct Catalog /Outlines that optimization
+# promotes. qpdf 11.9.0 has no writer/optimization nesting limit, so it
+# linearizes this input; pins the removal of flpdf's former 256-level
+# graph-walker cap (flpdf-njiz). ---
+mkdir -p "$REF/deep-nesting-257-resources"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/deep-nesting-257-resources.pdf" \
+    "$REF/deep-nesting-257-resources/linearize.pdf"
+echo "deep-nesting-257-resources/linearize.pdf"
+
 # --- shared-leaf-mediabox-default: a /Page leaf shared by two /Pages parents
 # where only parent A carries a /MediaBox. This makes qpdf 11.9.0's
 # MediaBox-default-BEFORE-clone ordering observable (QPDF_pages.cc:104-112 before
