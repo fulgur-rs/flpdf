@@ -186,6 +186,28 @@ mod tests {
         .expect("fixture must open")
     }
 
+    fn one_page_fixture_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .expect("one-page fixture must open")
+    }
+
+    fn one_page_fixture_with_unplanned_trailer_refs() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = one_page_fixture_pdf();
+        let probe = pdf
+            .make_indirect_from_object_handle(ObjectHandle::string(b"unreachable".to_vec()))
+            .expect("allocate the trailer-only object");
+        assert_eq!(probe.object_ref(), Some(ObjectRef::new(8, 0)));
+        pdf.trailer()
+            .replace_key(b"/Probe", probe.clone())
+            .expect("add a live trailer reference");
+        pdf.trailer()
+            .replace_key(b"/ProbeAgain", probe)
+            .expect("add a repeated live trailer reference");
+        pdf
+    }
+
     #[test]
     fn plan_rejects_a_missing_root() {
         let mut pdf = Pdf::open(Cursor::new(
@@ -275,5 +297,46 @@ mod tests {
             .items
             .iter()
             .any(|item| matches!(item, Item::Synthetic { .. })));
+    }
+
+    #[test]
+    fn writer_emits_unplanned_trailer_refs_with_qpdf_late_numbers() {
+        let mut pdf = one_page_fixture_with_unplanned_trailer_refs();
+
+        let options = crate::writer::WriterOptions {
+            pclm: true,
+            deterministic_id: true,
+            ..crate::writer::WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        let result = crate::writer::write_pclm(&mut pdf, &mut output, &options);
+
+        assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("xref\n0 7\n"));
+        assert!(output.contains("/Info 7 0 R"));
+        assert!(output.contains("/Probe 8 0 R"));
+        assert!(output.contains("/ProbeAgain 8 0 R"));
+        assert!(!output.contains("7 0 obj\n"));
+        assert!(!output.contains("8 0 obj\n"));
+    }
+
+    #[test]
+    fn writer_emits_unplanned_trailer_refs_with_generated_id() {
+        let mut pdf = one_page_fixture_with_unplanned_trailer_refs();
+        let options = crate::writer::WriterOptions {
+            pclm: true,
+            ..crate::writer::WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        let result = crate::writer::write_pclm(&mut pdf, &mut output, &options);
+
+        assert!(result.is_ok(), "qpdf-compatible PCLm output: {result:?}");
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("/Info 7 0 R"));
+        assert!(output.contains("/Probe 8 0 R"));
+        assert!(output.contains("/ProbeAgain 8 0 R"));
+        assert!(!output.contains("7 0 obj\n"));
+        assert!(!output.contains("8 0 obj\n"));
     }
 }
