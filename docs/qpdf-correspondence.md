@@ -596,7 +596,21 @@ qpdf 11.9.0 の `pushInheritedAttributesToPageInternal` は
 `key_ancestors` の key ごとの stack を top-down に管理し、各 `/Pages` node
 の direct non-scalar value を `makeIndirectObject` で一度 indirect 化してから
 その handle を子へ渡すだけで、この identity-keyed cache を持たない
-（`QPDF_optimization.cc:159-239`）。この map は qpdf に対応物のない
+（`QPDF_optimization.cc:159-239`）。qpdf で同じ direct な `QPDFObject` を
+複数の `/Pages` slot が共有する形（API で同一 handle を `replaceKey` した
+場合。`QPDF_Dictionary::replaceKey` は handle をそのまま格納する、
+`QPDF_Dictionary.cc:136-146`）でも、最初の `makeIndirectObject` が
+`makeIndirectFromQPDFObject` → `newIndirect` → `setDefaultDescription` で
+共有 `QPDFObject` 自身に `og` を in-place で書き込む
+（`QPDF.cc:1836-1840,1883-1897`、`QPDFValue.hh:68-72`）ため、後続 node
+では `oh.isIndirect()` が真になって再割り当てされず、全 slot が同じ 1 つの
+indirect object を参照する。flpdf の `Pdf::make_indirect_object_handle`
+（`reader.rs`）は既存 handle を in-place で indirect 化せず新しい handle を
+割り当てるので、この map はその in-place `og` 代入の side table として
+「live な direct 値 1 つにつき indirect object 1 つ」という同じ結果を
+再現する。parse 由来のグラフでは direct 値の identity が出現箇所ごとに
+異なるため cache hit は起きない。したがって shared-identity の形でも
+出力バイトは qpdf と一致する。この map 自体は qpdf に対応する構造を持たない
 flpdf 固有の、出力バイトを変えない category-(C) の allocation reuse であり、
 実装の誤差ではないことを source-near `qpdf-deviation` marker に記録する。
 

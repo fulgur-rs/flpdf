@@ -135,7 +135,7 @@ pub struct RebuildResult {
 fn promote_inherited_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: ObjectHandle,
-    // qpdf's key_ancestors stack has no identity-keyed cache; this flpdf-only map reuses direct inherited-value promotions across page selection (QPDF_optimization.cc:159-239)
+    // qpdf-deviation: flpdf-only identity-keyed promotion cache; qpdf (QPDF_optimization.cc:159-239) instead sets `og` in place on the shared QPDFObject inside makeIndirectObject (QPDF.cc:1836-1840,1883-1897), so both yield one indirect object per live direct value
     promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<ObjectHandle> {
     value.try_dereference()?;
