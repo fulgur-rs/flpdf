@@ -373,24 +373,49 @@ fn emit_show_attachment<R: Read + Seek>(
         let mut embedded_files = pdf.embedded_files();
         embedded_files.get_embedded_file(key)?
     }
-    .ok_or_else(|| {
-        Error::Unsupported(format!(
-            "attachment {:?} not found",
-            String::from_utf8_lossy(key)
-        ))
-    })?;
+    .ok_or_else(|| raw_attachment_error(key, b" not found"))?;
     let mut filespec = FileSpec::new(filespec, pdf)?;
-    let embedded_file = filespec.embedded_file()?.ok_or_else(|| {
-        Error::Unsupported(format!(
-            "attachment {:?} has no resolvable /EmbeddedFile stream",
-            String::from_utf8_lossy(key)
-        ))
-    })?;
+    let embedded_file = filespec
+        .embedded_file()?
+        .ok_or_else(|| raw_attachment_error(key, b" has no resolvable /EmbeddedFile stream"))?;
     logger.save_to_standard_output(true)?;
     let save = logger.get_save()?;
     let mut sink = PipelineHandleSink(save);
     let _ = embedded_file.pipe_stream_data(&mut sink)?;
     Ok(())
+}
+
+fn raw_attachment_error(key: &[u8], suffix: &[u8]) -> Error {
+    let mut message = b"unsupported PDF feature: attachment ".to_vec();
+    append_debug_quoted_bytes(&mut message, key);
+    message.extend_from_slice(suffix);
+    Error::SystemBytes(message)
+}
+
+/// Append `bytes` in the crate's byte-safe debug-quoting convention: quotes,
+/// backslashes, and ASCII control bytes are escaped so a raw newline or
+/// terminal control sequence in an attachment key cannot corrupt a
+/// single-line diagnostic; every other byte (including non-UTF-8 high bytes)
+/// passes through unchanged. This mirrors the CLI's
+/// `append_debug_quoted_bytes` (`crates/flpdf-cli/src/main.rs`), which
+/// replaced the same crate's pre-existing `{bytes:?}` debug-quoting of a
+/// lossy `String` once the key itself became raw bytes.
+fn append_debug_quoted_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.push(b'"');
+    for &byte in bytes {
+        match byte {
+            b'"' => output.extend_from_slice(b"\\\""),
+            b'\\' => output.extend_from_slice(b"\\\\"),
+            b'\n' => output.extend_from_slice(b"\\n"),
+            b'\r' => output.extend_from_slice(b"\\r"),
+            b'\t' => output.extend_from_slice(b"\\t"),
+            byte if byte.is_ascii_control() => {
+                output.extend_from_slice(format!("\\x{byte:02x}").as_bytes());
+            }
+            byte => output.push(byte),
+        }
+    }
+    output.push(b'"');
 }
 
 /// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +
@@ -774,6 +799,32 @@ mod tests {
 
         assert!(error.to_string().contains("not found"));
         assert!(save.lock().expect("save capture").is_empty());
+    }
+
+    #[test]
+    fn show_attachment_error_escapes_control_bytes_and_quotes_in_the_key() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.as_slice()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let key = b"quote-\"-\\-\r-\t-\x01-\xff";
+        let error = job
+            .show_attachment(&mut pdf, key)
+            .expect_err("missing attachment must fail");
+
+        assert_eq!(
+            error.raw_message(),
+            Some(b"unsupported PDF feature: attachment \"quote-\\\"-\\\\-\\r-\\t-\\x01-\xff\" not found".as_slice())
+        );
     }
 
     #[test]

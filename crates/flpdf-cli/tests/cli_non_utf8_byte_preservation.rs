@@ -340,6 +340,173 @@ fn attachment_lookup_options_preserve_non_utf8_key_bytes() {
 }
 
 #[test]
+fn missing_show_attachment_diagnostic_preserves_non_utf8_key_bytes() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let key = b"missing-\xff";
+    fs::copy(ONE_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from_vec([b"--show-attachment=".as_slice(), key].concat()),
+        input.into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(&output, key, "missing show-attachment diagnostic");
+    let mut expected = b"qpdf: --show-attachment: key \"missing-".to_vec();
+    expected.push(0xff);
+    expected.extend_from_slice(
+        b"\" not found or unreadable: unsupported PDF feature: attachment \"missing-",
+    );
+    expected.push(0xff);
+    expected.extend_from_slice(b"\" not found\n");
+    assert_eq!(output.stderr, expected);
+}
+
+#[test]
+fn missing_remove_attachment_diagnostic_preserves_non_utf8_key_bytes() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let output_path = raw_path(directory.path(), b"output.pdf");
+    let key = b"missing-\xff";
+    fs::copy(ONE_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from_vec([b"--remove-attachment=".as_slice(), key].concat()),
+        input.into_os_string(),
+        output_path.into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(&output, key, "missing remove-attachment diagnostic");
+    let mut expected = b"qpdf: --remove-attachment: key \"missing-".to_vec();
+    expected.push(0xff);
+    expected.extend_from_slice(b"\" not found in document\n");
+    assert_eq!(output.stderr, expected);
+}
+
+#[test]
+fn missing_show_attachment_diagnostic_escapes_control_bytes_in_the_inner_message() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let key = b"bad\nkey-\xff";
+    fs::copy(ONE_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from_vec([b"--show-attachment=".as_slice(), key].concat()),
+        input.into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    // The control byte must not split the single-line diagnostic in two: the
+    // key's raw `\n` is escaped in both the outer CLI-level quoting and the
+    // inner library-level "attachment ... not found" message.
+    assert_eq!(
+        output.stderr.iter().filter(|&&byte| byte == b'\n').count(),
+        1,
+        "stderr={:?}",
+        output.stderr
+    );
+    let mut expected = b"qpdf: --show-attachment: key \"bad\\nkey-".to_vec();
+    expected.push(0xff);
+    expected.extend_from_slice(
+        b"\" not found or unreadable: unsupported PDF feature: attachment \"bad\\nkey-",
+    );
+    expected.push(0xff);
+    expected.extend_from_slice(b"\" not found\n");
+    assert_eq!(output.stderr, expected);
+}
+
+#[test]
+fn attachment_diagnostic_uses_byte_safe_debug_quoting() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let output_path = raw_path(directory.path(), b"output.pdf");
+    let key = b"quote-\"-\n-\r-\t-\x01-\\-\xff";
+    fs::copy(ONE_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from_vec([b"--remove-attachment=".as_slice(), key].concat()),
+        input.into_os_string(),
+        output_path.into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    let mut expected =
+        b"qpdf: --remove-attachment: key \"quote-\\\"-\\n-\\r-\\t-\\x01-\\\\-".to_vec();
+    expected.push(0xff);
+    expected.extend_from_slice(b"\" not found in document\n");
+    assert_eq!(output.stderr, expected);
+}
+
+#[test]
+fn json_input_failure_preserves_non_utf8_input_name() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input-\xff.json");
+    fs::write(&input, b"{").expect("write malformed JSON");
+
+    let output = run([
+        OsString::from("--json-input"),
+        OsString::from("--json-output=2"),
+        input.clone().into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(&output, input.as_os_str().as_bytes(), "JSON input failure");
+}
+
+#[test]
+fn json_input_validation_failure_preserves_non_utf8_input_name() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"validation-\xff.json");
+    fs::write(&input, b"{}").expect("write invalid complete JSON");
+
+    let output = run([
+        OsString::from("--json-input"),
+        OsString::from("--json-output=2"),
+        input.clone().into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(
+        &output,
+        input.as_os_str().as_bytes(),
+        "JSON input validation failure",
+    );
+}
+
+#[test]
+fn json_side_file_open_failure_preserves_non_utf8_path() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let output_path = raw_path(directory.path(), b"output.json");
+    let prefix = directory.path().join(raw(b"missing-\xff")).join("stream");
+    let prefix_arg = OsString::from_vec(
+        [
+            b"--json-stream-prefix=".as_slice(),
+            prefix.as_os_str().as_bytes(),
+        ]
+        .concat(),
+    );
+    fs::copy(ONE_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from("--json-output=2"),
+        OsString::from("--json-stream-data=file"),
+        prefix_arg,
+        input.into_os_string(),
+        output_path.into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(
+        &output,
+        prefix.as_os_str().as_bytes(),
+        "JSON side-file open failure",
+    );
+}
+
+#[test]
 fn attachment_empty_report_preserves_non_utf8_input_name() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = raw_path(directory.path(), b"input-\xff.pdf");

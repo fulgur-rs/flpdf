@@ -2863,6 +2863,14 @@ fn main() {
         if let Some(usage_error) = find_usage_error(error.as_ref()) {
             usage_exit(usage_error);
         }
+        if let Some(message) = find_raw_error_message(error.as_ref()) {
+            let mut line = progname().into_bytes();
+            line.extend_from_slice(b": ");
+            line.extend_from_slice(message);
+            line.push(b'\n');
+            emit_logger_error(line);
+            std::process::exit(2);
+        }
         if let Some(path_error) = error.downcast_ref::<CliPathError>() {
             let mut line = progname().into_bytes();
             line.extend_from_slice(b": ");
@@ -2886,6 +2894,15 @@ fn find_usage_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<
         return Some(usage_error);
     }
     error.source().and_then(find_usage_error)
+}
+
+fn find_raw_error_message<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a [u8]> {
+    if let Some(error) = error.downcast_ref::<Error>() {
+        if let Some(message) = error.raw_message() {
+            return Some(message);
+        }
+    }
+    error.source().and_then(find_raw_error_message)
 }
 
 fn usage_exit(error: &UsageError) -> ! {
@@ -3328,7 +3345,7 @@ fn run_json_document<R: Read + Seek>(
                 message: String::new(),
             }))
         }
-        Err(JsonJobError::Output(error)) => return Err(Box::new(error)),
+        Err(JsonJobError::Output(error)) => return Err(Box::new(Error::from(error))),
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
         Err(JsonJobError::Completion(error)) => return Err(Box::new(error)),
     }
@@ -7851,6 +7868,28 @@ fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
         .map(arg_parser::os_bytes)
 }
 
+/// Append the existing attachment diagnostic's quoted key without converting
+/// arbitrary argv bytes through UTF-8. Printable non-UTF-8 bytes stay raw;
+/// quotes, backslashes, and ASCII control bytes retain the old debug-style
+/// quoting convention in an unambiguous form.
+fn append_debug_quoted_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.push(b'"');
+    for &byte in bytes {
+        match byte {
+            b'"' => output.extend_from_slice(b"\\\""),
+            b'\\' => output.extend_from_slice(b"\\\\"),
+            b'\n' => output.extend_from_slice(b"\\n"),
+            b'\r' => output.extend_from_slice(b"\\r"),
+            b'\t' => output.extend_from_slice(b"\\t"),
+            byte if byte.is_ascii_control() => {
+                output.extend_from_slice(format!("\\x{byte:02x}").as_bytes())
+            }
+            byte => output.push(byte),
+        }
+    }
+    output.push(b'"');
+}
+
 /// `--add-attachment FILE [sub-flags] -- output.pdf`
 #[allow(clippy::too_many_arguments)]
 fn run_add_attachment(
@@ -7957,11 +7996,10 @@ fn run_remove_attachment(
     let key = arg_parser::os_bytes(key);
     let found = pdf.embedded_files().remove_embedded_file(&key)?;
     if !found {
-        return Err(format!(
-            "--remove-attachment: key {:?} not found in document",
-            String::from_utf8_lossy(&key)
-        )
-        .into());
+        let mut message = b"--remove-attachment: key ".to_vec();
+        append_debug_quoted_bytes(&mut message, &key);
+        message.extend_from_slice(b" not found in document");
+        return Err(Error::SystemBytes(message).into());
     }
 
     let mut options = WriterOptions {
@@ -8023,10 +8061,14 @@ fn run_show_attachment(
     job.set_input_name_bytes(path_description(&input));
     let key = arg_parser::os_bytes(key);
     let status = job.show_attachment(&mut pdf, &key).map_err(|error| {
-        format!(
-            "--show-attachment: key {:?} not found or unreadable: {error}",
-            String::from_utf8_lossy(&key)
-        )
+        let detail = error
+            .raw_message()
+            .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
+        let mut message = b"--show-attachment: key ".to_vec();
+        append_debug_quoted_bytes(&mut message, &key);
+        message.extend_from_slice(b" not found or unreadable: ");
+        message.extend_from_slice(&detail);
+        Error::SystemBytes(message)
     })?;
     finish_job_exit_status(status)
 }

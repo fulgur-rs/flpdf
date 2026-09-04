@@ -573,6 +573,16 @@ pub enum JsonJobError {
     Completion(#[from] crate::Error),
 }
 
+impl From<JsonJobError> for crate::Error {
+    fn from(error: JsonJobError) -> Self {
+        match error {
+            JsonJobError::Usage(error) => Self::Usage(error),
+            JsonJobError::Output(error) => error.into(),
+            JsonJobError::Completion(error) => error,
+        }
+    }
+}
+
 /// Write qpdf JSON v2 output after resolving command-level stream options.
 ///
 /// This is the `QPDFJob::writeJSON` orchestration boundary: it resolves the
@@ -755,6 +765,26 @@ mod tests {
         });
 
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn json_job_error_conversion_preserves_usage_output_and_completion() {
+        let usage: crate::Error = JsonJobError::Usage(UsageError::new("usage")).into();
+        assert!(matches!(usage, crate::Error::Usage(error) if error.to_string() == "usage"));
+
+        let output: crate::Error = JsonJobError::Output(JsonOutputError::UnsupportedVersion).into();
+        assert!(matches!(
+            output,
+            crate::Error::System(message)
+                if message == "QPDF::writeJSON: only version 2 is supported"
+        ));
+
+        let completion: crate::Error =
+            JsonJobError::Completion(crate::Error::System("completion".to_owned())).into();
+        assert!(matches!(
+            completion,
+            crate::Error::System(message) if message == "completion"
+        ));
     }
 
     #[test]

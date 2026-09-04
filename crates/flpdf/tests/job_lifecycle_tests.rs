@@ -203,6 +203,16 @@ fn qpdfjob_error_report_matches_the_qpdf_c_wrapper_boundary() {
         state.lock().unwrap().bytes,
         b"qpdfjob json: an output file name is required; use - for standard output\n"
     );
+
+    state.lock().unwrap().bytes.clear();
+    job.report_job_error(&Error::SystemBytes(
+        b"json-input-\xff: errors found in JSON".to_vec(),
+    ))
+    .unwrap();
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdfjob json: json-input-\xff: errors found in JSON\n"
+    );
 }
 
 #[test]

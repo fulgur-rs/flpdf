@@ -414,10 +414,8 @@ fn write_file_mode_object_entry<R: Read + Seek>(
 
         let side_path = format_json_side_file_path(prefix, object_ref.number);
         let side_path_fs = path_from_bytes(&side_path);
-        let mut side_file = File::create(&side_path_fs).map_err(|source| {
-            let rendered = String::from_utf8_lossy(&side_path);
-            side_file_io_error("open", &rendered, source)
-        })?;
+        let mut side_file = File::create(&side_path_fs)
+            .map_err(|source| side_file_io_error("open", &side_path, source))?;
         write_json_stream_file(&handle, decode_level, &side_path, &mut side_file, out)?;
         Json::write_dictionary_close(out, object_first, 3)?;
         return Ok(());
