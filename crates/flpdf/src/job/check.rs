@@ -92,11 +92,13 @@ impl QPDFJob {
         pdf: &mut Pdf<R>,
     ) -> Result<()> {
         let logger = self.logger();
-        let input_name = self.input_name().to_owned();
+        let input_name = self.input_name_bytes().to_owned();
         pdf.set_logger(logger.clone());
 
         if !pdf.is_linearized()? {
-            logger.info(format!("{input_name} is not linearized\n"))?;
+            let mut line = input_name.clone();
+            line.extend_from_slice(b" is not linearized\n");
+            logger.info(line)?;
             self.record_document_warnings(pdf);
             return Ok(());
         }
@@ -111,7 +113,9 @@ impl QPDFJob {
         if linearization_warnings {
             self.record_warnings();
         } else {
-            logger.info(format!("{input_name}: no linearization errors\n"))?;
+            let mut line = input_name.clone();
+            line.extend_from_slice(b": no linearization errors\n");
+            logger.info(line)?;
         }
         self.record_document_warnings(pdf);
         Ok(())
@@ -133,7 +137,7 @@ impl QPDFJob {
         };
         let logger = self.logger();
         let message_prefix = self.message_prefix().to_owned();
-        let input_name = self.input_name().to_owned();
+        let input_name = self.input_name_bytes().to_owned();
         emit_diagnostics(diagnostics, 0, &logger, &message_prefix, &input_name)?;
         Ok(())
     }
@@ -158,7 +162,7 @@ impl QPDFJob {
         pdf: &mut Pdf<R>,
     ) -> std::result::Result<(), CheckError> {
         let logger = self.logger();
-        let input_name = self.input_name().to_owned();
+        let input_name = self.input_name_bytes().to_owned();
         let message_prefix = self.message_prefix().to_owned();
 
         // The top-level `--check` route suppresses document warnings while
@@ -233,14 +237,22 @@ fn check_document<R: Read + Seek + 'static>(
     message_prefix: &str,
     input_name: &str,
 ) -> std::result::Result<CheckOutcome, CheckError> {
-    check_document_with_suppression(pdf, logger, message_prefix, input_name, false, false, true)
+    check_document_with_suppression(
+        pdf,
+        logger,
+        message_prefix,
+        input_name.as_bytes(),
+        false,
+        false,
+        true,
+    )
 }
 
 fn check_document_with_suppression<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     suppress_warnings: bool,
     show_encryption_key: bool,
     replay_diagnostics: bool,
@@ -268,7 +280,10 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
         ));
     }
 
-    logger.info(format!("checking {input_name}\n"))?;
+    let mut checking_line = b"checking ".to_vec();
+    checking_line.extend_from_slice(input_name);
+    checking_line.push(b'\n');
+    logger.info(checking_line)?;
     let extension_diagnostics_seen = diagnostic_count(pdf);
     let extension_level = match pdf.adobe_extension_level() {
         Ok(level) => level,
@@ -440,7 +455,7 @@ fn inspect_new_diagnostics<R: Read + Seek>(
     seen: usize,
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     suppress_warnings: bool,
     replay_diagnostics: bool,
 ) -> std::result::Result<(bool, bool), CheckError> {
@@ -604,7 +619,8 @@ fn show_bool(value: bool) -> &'static str {
     }
 }
 
-fn linearization_parameter_error_message(input_name: &str, message: &str, offset: u64) -> String {
+fn linearization_parameter_error_message(input_name: &[u8], message: &str, offset: u64) -> String {
+    let input_name = String::from_utf8_lossy(input_name);
     for object in ["linearization dictionary", "linearization hint table"] {
         let prefix = format!("{object}: ");
         if let Some(detail) = message.strip_prefix(&prefix) {
@@ -643,7 +659,7 @@ fn linearization_parameter_offset<R: Read + Seek + 'static>(
 fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
-    input_name: &str,
+    input_name: &[u8],
     suppress_warnings: bool,
 ) -> Result<bool> {
     let mut warnings = false;
@@ -722,7 +738,7 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     source_bytes: &[u8],
     logger: &QPDFLogger,
-    input_name: &str,
+    input_name: &[u8],
     skip_first_page_warning: bool,
     suppress_warnings: bool,
 ) -> Result<bool> {
@@ -770,7 +786,7 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
 fn map_page_tree_error(
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     error: crate::Error,
     logger_failure: bool,
 ) -> CheckError {
@@ -806,7 +822,7 @@ fn take_logger_failure<R: Read + Seek>(
 fn map_check_error(
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     error: crate::Error,
     logger_failure: bool,
 ) -> CheckError {
@@ -826,7 +842,7 @@ fn emit_new_diagnostics<R: Read + Seek>(
     seen: usize,
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
 ) -> std::result::Result<(bool, bool), CheckError> {
     emit_new_diagnostics_with_suppression(pdf, seen, logger, message_prefix, input_name, false)
 }
@@ -836,7 +852,7 @@ fn emit_new_diagnostics_with_suppression<R: Read + Seek>(
     seen: usize,
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     suppress_warnings: bool,
 ) -> std::result::Result<(bool, bool), CheckError> {
     let diagnostics = pdf.repair_diagnostics();
@@ -856,7 +872,7 @@ fn emit_diagnostics(
     seen: usize,
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
 ) -> Result<(bool, bool)> {
     emit_diagnostics_with_suppression(diagnostics, seen, logger, message_prefix, input_name, false)
 }
@@ -866,7 +882,7 @@ fn emit_diagnostics_with_suppression(
     seen: usize,
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     suppress_warnings: bool,
 ) -> Result<(bool, bool)> {
     let mut warnings = false;
@@ -922,21 +938,23 @@ fn is_contextless_object_warning(message: &str) -> bool {
         .any(|prefix| message.starts_with(prefix))
 }
 
-fn emit_warning(logger: &QPDFLogger, input_name: &str, message: impl AsRef<str>) -> Result<()> {
+fn emit_warning(logger: &QPDFLogger, input_name: &[u8], message: impl AsRef<str>) -> Result<()> {
     let message = message.as_ref();
-    logger.warn(format!("WARNING: {input_name}: {message}\n"))
+    let mut line = b"WARNING: ".to_vec();
+    line.extend_from_slice(input_name);
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(message.as_bytes());
+    line.push(b'\n');
+    logger.warn(line)
 }
 
-fn diagnostic_location(input_name: &str, diagnostic: &crate::Diagnostic) -> Vec<u8> {
+fn diagnostic_location(input_name: &[u8], diagnostic: &crate::Diagnostic) -> Vec<u8> {
     // A diagnostic raised while piping a copied foreign stream carries the
     // source document's own description (qpdf retains the source
     // InputSource's name in the QPDFExc even though the destination QPDF
     // owns warning collection; see Diagnostic::description). Prefer that
     // over the checked document's own name so the location matches qpdf.
-    let input_name = diagnostic
-        .description
-        .as_deref()
-        .unwrap_or(input_name.as_bytes());
+    let input_name = diagnostic.description.as_deref().unwrap_or(input_name);
     if diagnostic.message.starts_with("(object ") || diagnostic.message.starts_with("(trailer,") {
         input_name.to_vec()
     } else {
@@ -956,7 +974,7 @@ fn diagnostic_location(input_name: &str, diagnostic: &crate::Diagnostic) -> Vec<
 fn emit_error_diagnostic(
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     diagnostic: &crate::Diagnostic,
 ) -> Result<()> {
     let mut line = message_prefix.as_bytes().to_vec();
@@ -971,10 +989,16 @@ fn emit_error_diagnostic(
 fn emit_error(
     logger: &QPDFLogger,
     message_prefix: &str,
-    input_name: &str,
+    input_name: &[u8],
     error: &impl fmt::Display,
 ) -> Result<()> {
-    logger.error(format!("{message_prefix}: {input_name}: {error}\n"))
+    let mut line = message_prefix.as_bytes().to_vec();
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(input_name);
+    line.extend_from_slice(b": ");
+    line.extend_from_slice(error.to_string().as_bytes());
+    line.push(b'\n');
+    logger.error(line)
 }
 
 #[cfg(test)]
@@ -1099,7 +1123,7 @@ mod tests {
             b"/tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array",
         ));
 
-        let result = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", "destination.pdf")
+        let result = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", b"destination.pdf")
             .expect("object warning replay");
         assert_eq!(result, (true, false));
         assert_eq!(
@@ -1320,15 +1344,15 @@ mod tests {
         ));
         diagnostics.push(Diagnostic::error("bad xref", Some(13)));
 
-        let (warnings, errors) = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", "input.pdf")
+        let (warnings, errors) = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", b"input.pdf")
             .expect("diagnostics should be delivered");
         assert!(warnings);
         assert!(errors);
-        emit_warning(&logger, "input.pdf", "linearization warning").unwrap();
+        emit_warning(&logger, b"input.pdf", "linearization warning").unwrap();
         emit_error(
             &logger,
             "qpdf",
-            "input.pdf",
+            b"input.pdf",
             &Error::Internal("fatal".to_owned()),
         )
         .unwrap();
@@ -1881,7 +1905,7 @@ mod tests {
         let mapped = map_page_tree_error(
             &logger,
             "qpdf",
-            "page-tree-failure.pdf",
+            b"page-tree-failure.pdf",
             Error::Internal("page tree failure".to_owned()),
             false,
         );
@@ -1891,7 +1915,7 @@ mod tests {
         let mapped = map_page_tree_error(
             &failing_logger,
             "qpdf",
-            "page-tree-failure.pdf",
+            b"page-tree-failure.pdf",
             Error::Internal("page tree failure".to_owned()),
             true,
         );
@@ -1912,7 +1936,7 @@ mod tests {
         let logger = QPDFLogger::create();
         logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
 
-        let result = emit_new_diagnostics(&pdf, 0, &logger, "qpdf", "broken.pdf");
+        let result = emit_new_diagnostics(&pdf, 0, &logger, "qpdf", b"broken.pdf");
 
         assert!(matches!(
             result,
@@ -2107,7 +2131,7 @@ mod tests {
             &mut pdf,
             &source_bytes,
             &report_logger,
-            "linearized.pdf",
+            b"linearized.pdf",
             false,
             false,
         );
@@ -2147,7 +2171,7 @@ mod tests {
             &mut pdf,
             source_bytes,
             &logger,
-            "linearized.pdf",
+            b"linearized.pdf",
             false,
             false,
         );
@@ -2187,7 +2211,7 @@ mod tests {
         let mapped = map_check_error(
             &failing_logger,
             "qpdf",
-            "input.pdf",
+            b"input.pdf",
             Error::parse(0, "malformed"),
             false,
         );
@@ -2457,7 +2481,7 @@ WARNING: open-repair-failure.pdf: Attempting to reconstruct cross-reference tabl
         );
 
         assert_eq!(
-            diagnostic_location("destination.pdf", &diagnostic),
+            diagnostic_location(b"destination.pdf", &diagnostic),
             b"source.pdf (offset 3627)"
         );
     }
@@ -2467,7 +2491,7 @@ WARNING: open-repair-failure.pdf: Attempting to reconstruct cross-reference tabl
         let diagnostic = crate::Diagnostic::warning("plain repair warning", Some(17));
 
         assert_eq!(
-            diagnostic_location("destination.pdf", &diagnostic),
+            diagnostic_location(b"destination.pdf", &diagnostic),
             b"destination.pdf (offset 17)"
         );
     }
