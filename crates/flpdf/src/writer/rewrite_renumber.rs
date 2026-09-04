@@ -31,7 +31,6 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
-use crate::object_handle::MAX_INLINE_DEPTH;
 use crate::object_ref::ObjectRef;
 use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::ObjectStreamGroup;
@@ -384,7 +383,7 @@ fn ensure_canonical_owner<R: Read + Seek>(
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when the trailer has no `/Root` or inline
-/// nesting exceeds [`MAX_INLINE_DEPTH`] (via the canonical enqueue collector), and propagates
+/// nesting exceeds [`MAX_PARSE_DEPTH`] (via the canonical enqueue collector), and propagates
 /// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
 /// objects during the walk.
 pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
@@ -471,7 +470,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
 /// ([`crate::writer::object_streams::get_compressible_objgens`]) and must not append
 /// this set a second time.
 ///
-/// Propagates resolve errors and the [`MAX_INLINE_DEPTH`] guard from the walk.
+/// Propagates resolve errors and the [`MAX_PARSE_DEPTH`] guard from the walk.
 /// Null-resolving references to retain, minus any identities removed by the
 /// current qpdf operation's compressible-object walk.
 ///
@@ -549,9 +548,9 @@ fn walk_resurrectable_handle(
     edge_context: bool,
     state: &mut ResurrectableWalkState<'_>,
 ) -> crate::Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
-            "linearization: inline nesting exceeds MAX_INLINE_DEPTH during resurrectable walk"
+            "linearization: inline nesting exceeds MAX_PARSE_DEPTH during resurrectable walk"
                 .to_string(),
         ));
     }
@@ -954,8 +953,10 @@ fn enqueue(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_canonical_owner;
-    use crate::{Error, Pdf};
+    use super::{ensure_canonical_owner, walk_resurrectable_handle, ResurrectableWalkState};
+    use crate::parser::MAX_PARSE_DEPTH;
+    use crate::{Error, ObjectHandle, Pdf};
+    use std::collections::BTreeSet;
 
     #[test]
     fn writer_foreign_owner_is_a_qpdf_logic_error() {
@@ -971,5 +972,26 @@ mod tests {
             Error::Internal(message)
                 if message == "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
         ));
+    }
+
+    #[test]
+    fn resurrectable_walk_rejects_programmatic_depth_beyond_parser_limit() {
+        let mut follow = Vec::new();
+        let mut result = BTreeSet::new();
+        let removed_refs = BTreeSet::new();
+        let mut state = ResurrectableWalkState {
+            follow: &mut follow,
+            result: &mut result,
+            removed_refs: &removed_refs,
+        };
+        let error = walk_resurrectable_handle(
+            &ObjectHandle::null(),
+            MAX_PARSE_DEPTH + 1,
+            false,
+            false,
+            &mut state,
+        )
+        .expect_err("the resurrectable walk has a parser-depth guard");
+        assert!(error.to_string().contains("MAX_PARSE_DEPTH"));
     }
 }

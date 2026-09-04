@@ -33,7 +33,7 @@
 
 use crate::linearization::renumber::RenumberMap;
 use crate::object_handle::ObjectHandle;
-use crate::object_handle::MAX_INLINE_DEPTH;
+use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::{
     compressible_objgens_qpdf_plan, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
@@ -194,9 +194,9 @@ fn collect_direct_handle_refs(
     depth: usize,
     out: &mut Vec<ObjectRef>,
 ) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
         )));
     }
     let mut contextual = Vec::new();
@@ -233,9 +233,9 @@ fn collect_direct_handle_refs_with_context(
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
 ) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
         )));
     }
     if let Some(object_ref) = handle.object_ref() {
@@ -259,9 +259,9 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
     out: &mut Vec<(ObjectRef, bool)>,
     skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
-            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+            "linearization plan: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
         )));
     }
     if let Some(object_ref) = handle.object_ref() {
@@ -2942,13 +2942,19 @@ fn is_thumbnail_user(user: &crate::optimization::ObjectUser) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::LinearizationPlan;
+    use super::{
+        collect_direct_handle_refs, collect_direct_handle_refs_with_context,
+        collect_direct_handle_refs_with_stream_parameters_context, LinearizationPlan,
+    };
     use crate::acroform_document_helper::AcroFormDocumentHelper;
+    use crate::object_handle::ObjectHandle;
+    use crate::parser::MAX_PARSE_DEPTH;
     use crate::writer::{ObjectStreamMode, WriterOptions};
     use crate::Pdf;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::cell::Cell;
+    use std::collections::BTreeSet;
     use std::io::{Cursor, Write};
     use std::rc::Rc;
 
@@ -3091,5 +3097,35 @@ mod tests {
             2,
             "one qpdf parameter probe may retry once with raw data, but the optimization callback must not probe the same stream again"
         );
+    }
+
+    #[test]
+    fn direct_reference_walkers_reject_depth_beyond_parser_limit() {
+        let handle = ObjectHandle::null();
+        let mut refs = Vec::new();
+        let error = collect_direct_handle_refs(&handle, MAX_PARSE_DEPTH + 1, &mut refs)
+            .expect_err("the direct reference walk has a parser-depth guard");
+        assert!(error.to_string().contains("maximum of 500"));
+
+        let mut contextual = Vec::new();
+        let error = collect_direct_handle_refs_with_context(
+            &handle,
+            MAX_PARSE_DEPTH + 1,
+            false,
+            &mut contextual,
+        )
+        .expect_err("the contextual reference walk has a parser-depth guard");
+        assert!(error.to_string().contains("maximum of 500"));
+
+        let mut stream_contextual = Vec::new();
+        let error = collect_direct_handle_refs_with_stream_parameters_context(
+            &handle,
+            MAX_PARSE_DEPTH + 1,
+            false,
+            &mut stream_contextual,
+            &BTreeSet::new(),
+        )
+        .expect_err("the stream-policy reference walk has a parser-depth guard");
+        assert!(error.to_string().contains("maximum of 500"));
     }
 }

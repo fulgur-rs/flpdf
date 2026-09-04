@@ -2,7 +2,7 @@
 
 pub(crate) mod inherited_attrs;
 
-use crate::object_handle::MAX_INLINE_DEPTH;
+use crate::parser::MAX_PARSE_DEPTH;
 use crate::{ObjectHandle, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -251,9 +251,9 @@ impl Optimization {
         }];
 
         while let Some(pending) = stack.pop() {
-            if pending.inline_depth > MAX_INLINE_DEPTH {
+            if pending.inline_depth > MAX_PARSE_DEPTH {
                 return Err(crate::Error::Unsupported(format!(
-                    "optimization: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+                    "optimization: inline object nesting exceeds maximum of {MAX_PARSE_DEPTH}"
                 )));
             }
 
@@ -380,12 +380,51 @@ fn empty_object_users() -> &'static BTreeSet<ObjectUser> {
 
 #[cfg(test)]
 mod tests {
-    use super::ObjectUser;
+    use super::{ObjectUser, Optimization};
+    use crate::object_handle::ObjectHandle;
+    use crate::parser::MAX_PARSE_DEPTH;
+    use crate::{ObjectRef, Result};
+    use std::rc::Rc;
+
+    fn nested_direct_array(depth: usize) -> ObjectHandle {
+        let mut value = ObjectHandle::null();
+        for _ in 0..depth {
+            value = ObjectHandle::array(vec![value]);
+        }
+        value
+    }
+
+    fn no_stream_parameter_skip(
+        _object_ref: Option<ObjectRef>,
+        _handle: &ObjectHandle,
+    ) -> Result<u8> {
+        Ok(0)
+    }
 
     #[test]
     fn non_page_users_have_no_page_number() {
         assert_eq!(ObjectUser::Root.page_number(), 0);
         assert_eq!(ObjectUser::RootKey(b"Root".to_vec()).page_number(), 0);
         assert_eq!(ObjectUser::TrailerKey(b"Info".to_vec()).page_number(), 0);
+    }
+
+    #[test]
+    fn object_user_walk_rejects_programmatic_depth_beyond_parser_limit() {
+        let mut optimization = Optimization::default();
+        optimization
+            .update_object_maps(
+                ObjectUser::Root,
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+                &mut no_stream_parameter_skip,
+            )
+            .expect("the test callback must be exercised by a stream");
+        let error = optimization
+            .update_object_maps(
+                ObjectUser::Root,
+                nested_direct_array(MAX_PARSE_DEPTH + 1),
+                &mut no_stream_parameter_skip,
+            )
+            .expect_err("the object-user walk has a parser-depth guard");
+        assert!(error.to_string().contains("maximum of 500"));
     }
 }

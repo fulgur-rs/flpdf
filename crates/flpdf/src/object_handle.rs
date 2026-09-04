@@ -141,9 +141,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
-/// Maximum inline structural nesting depth used by canonical graph walkers.
-pub(crate) const MAX_INLINE_DEPTH: usize = 256;
-
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
 type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
 

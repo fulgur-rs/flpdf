@@ -317,7 +317,7 @@ fn non_dictionary_leaf_parent_is_ignored_by_user_traversal() {
 }
 
 #[test]
-fn deeply_nested_direct_page_value_is_rejected_by_optimization_traversal() {
+fn deeply_nested_direct_page_value_is_accepted_by_optimization_up_to_parser_limit() {
     let nested = format!("{}{}", "[".repeat(257), "]".repeat(257));
     let bytes = pdf_from_object_bodies(&[
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
@@ -325,12 +325,8 @@ fn deeply_nested_direct_page_value_is_rejected_by_optimization_traversal() {
         format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Nested {nested} >>"),
     ]);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let err = LinearizationPlan::from_pdf(&mut pdf, false).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("optimization: inline object nesting exceeds maximum of 256"),
-        "unexpected error: {err}"
-    );
+    LinearizationPlan::from_pdf(&mut pdf, false)
+        .expect("qpdf accepts direct nesting below its parser limit");
 }
 
 #[test]

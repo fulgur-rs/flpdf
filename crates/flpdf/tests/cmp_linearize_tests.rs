@@ -177,6 +177,18 @@ fn three_page_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("three-page.pdf", "three-page");
 }
 
+/// qpdf 11.9.0 has no writer/optimization nesting limit beyond its parser's
+/// (`QPDFParser.cc:290`), so a 257-level direct `/Resources` array linearizes
+/// like any other value; this pins the removal of flpdf's former 256-level
+/// graph-walker cap byte-for-byte.
+#[test]
+fn deep_nesting_257_resources_linearized_is_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "deep-nesting-257-resources.pdf",
+        "deep-nesting-257-resources",
+    );
+}
+
 // A degenerate first page — the 3-object catalog/pages/page shape
 // with NO /Contents and NO /Resources (no content stream, no inheritable
 // resources to push down). The one/two/three-page corpus above all carry a page
