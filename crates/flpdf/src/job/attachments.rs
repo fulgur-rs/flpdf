@@ -802,6 +802,32 @@ mod tests {
     }
 
     #[test]
+    fn show_attachment_error_escapes_control_bytes_and_quotes_in_the_key() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.as_slice()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let key = b"quote-\"-\\-\r-\t-\x01-\xff";
+        let error = job
+            .show_attachment(&mut pdf, key)
+            .expect_err("missing attachment must fail");
+
+        assert_eq!(
+            error.raw_message(),
+            Some(b"unsupported PDF feature: attachment \"quote-\\\"-\\\\-\\r-\\t-\\x01-\xff\" not found".as_slice())
+        );
+    }
+
+    #[test]
     fn list_attachments_writes_qpdf_header_to_job_info_pipeline() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
