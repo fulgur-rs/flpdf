@@ -165,7 +165,7 @@ done | sort | uniq -c
 ## 6. 二重正本トラッカー
 
 追跡対象の symbol manifest は [`tracked-symbols.txt`](tracked-symbols.txt)。`bridge` / `mixed` の
-97 行のうち entrypoint に flpdf symbol が現れる 96 行から、**170 個**の symbol を列挙する
+97 行のうち entrypoint に flpdf symbol が現れる 96 行から、**172 個**の symbol を列挙する
 （`canonical` 行は対象外。`bridge` / `mixed` で唯一 entrypoint が `absent` の B7 も対象外 —
 qpdf の `QPDF::readToken` が保証する不変条件に対応する flpdf の集約点が存在せず、判断が
 呼び出し元 16 箇所に分散しているため、追跡すべき symbol が無い。もう 1 つの `absent` である
