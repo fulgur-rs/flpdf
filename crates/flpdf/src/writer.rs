@@ -3290,21 +3290,30 @@ pub(crate) fn write_stream_payload_with_pipeline_qdf(
 /// Write the fixed-order dictionary used by qpdf's non-QDF
 /// `QPDFWriter::writeObjectStream` (`QPDFWriter.cc:1714-1743`). The generic
 /// ObjectHandle stream serializer sorts dictionary keys for ordinary streams,
-/// but qpdf writes ObjStm's structural keys in this explicit order so the
-/// encrypted Generate route can remain byte-identical.
-fn write_generated_objstm_dictionary(
+/// but qpdf writes ObjStm's structural keys in this explicit order. `/Extends`
+/// is an output-space reference and is therefore emitted as a token here,
+/// rather than as an unresolved ObjectHandle that the generic null-visibility
+/// walk would try to resolve against the source PDF.
+fn write_objstm_dictionary(
     out: &mut Vec<u8>,
     stream_length: usize,
     compressed: bool,
     member_count: usize,
     first_offset: usize,
+    extends: Option<ObjectRef>,
 ) {
     out.extend_from_slice(b"<< /Type /ObjStm");
     out.extend_from_slice(format!(" /Length {stream_length}").as_bytes());
     if compressed {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
-    out.extend_from_slice(format!(" /N {member_count} /First {first_offset} >>").as_bytes());
+    out.extend_from_slice(format!(" /N {member_count} /First {first_offset}").as_bytes());
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b" >>");
 }
 
 pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
@@ -4253,8 +4262,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             let object_handle = pdf.get_object_handle(*old_ref);
             pdf.resolve(&object_handle)?;
             let is_real_stream = if object_handle.as_stream_dict().is_some() {
-                let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                    || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
+                let is_structural = object_handle.try_is_stream_of_type(b"XRef", b"")?
+                    || object_handle.try_is_stream_of_type(b"ObjStm", b"")?;
                 if is_structural {
                     None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
                 } else {
@@ -4544,8 +4553,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // structural streams from scratch below. Handle predicates preserve
         // qpdf's live dictionary lookup without resolving a legacy `Object`.
         if is_stream
-            && (object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?)
+            && (object_handle.try_is_stream_of_type(b"XRef", b"")?
+                || object_handle.try_is_stream_of_type(b"ObjStm", b"")?)
         {
             continue; // cov:ignore: structural streams are rebuilt by their dedicated loops below
         }
@@ -5044,35 +5053,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let identity_map = |object_ref: ObjectRef| Ok(object_ref);
         let no_removed_refs = BTreeSet::new();
         if let Some(ctx) = &encrypt_ctx {
-            if qpdf_generate_encrypted {
-                write_generated_objstm_dictionary(
-                    &mut bytes,
-                    stream_length,
-                    matches!(objstm_compression, CompressStreams::Yes),
-                    body.n_members,
-                    objstm_first,
-                );
-            } else if let Some(emitter) = encrypted_strings.as_mut() {
-                emitter.write_handle_stream_dict_with_ref_map(
-                    &mut bytes,
-                    container_ref,
-                    None,
-                    &stream_dict,
-                    encrypted_strings::StreamDictOptions::new(false, false, true),
-                    &identity_map,
-                    &no_removed_refs,
-                    None,
-                )?; // cov:ignore: encrypted ObjStm dictionary route; LLVM maps the call continuation here
-            } else {
-                // cov:ignore-start: encrypted output always constructs the handle-aware emitter
-                stream_dict.write_stream_body_with_ref_map_and_removed(
-                    &mut bytes,
-                    false,
-                    &identity_map,
-                    &no_removed_refs,
-                )?;
-                // cov:ignore-end
-            }
+            write_objstm_dictionary(
+                &mut bytes,
+                stream_length,
+                matches!(objstm_compression, CompressStreams::Yes),
+                body.n_members,
+                objstm_first,
+                extends,
+            );
             write_stream_payload_with_pipeline(
                 &mut bytes,
                 &stream_data,

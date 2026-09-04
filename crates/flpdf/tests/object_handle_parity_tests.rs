@@ -4,9 +4,12 @@
 //! parsed offsets, and repeated `get_object_handle` calls through the live
 //! handle graph.
 
-use flpdf::{ObjectHandle, ObjectRef, Pdf};
+mod common;
+
+use common::{write_with_settings, WriterTestSettings};
+use flpdf::{EncryptMethod, EncryptParams, ObjectHandle, ObjectRef, Pdf};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 
 fn minimal_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf")
@@ -107,6 +110,104 @@ fn compressed_entry_pdf() -> Vec<u8> {
     bytes.extend_from_slice(&xref_entries);
     bytes.extend_from_slice(b"\nendstream\nendobj\n");
     bytes.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// A valid two-container source ObjStm graph. The second container extends the
+/// first, so encrypted Preserve output must carry `/Extends` as an output-space
+/// reference in the rebuilt structural dictionary.
+fn compressed_entry_with_extends_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extra 4 0 R >>\nendobj\n");
+
+    let first_objstm_offset = bytes.len();
+    let first_body = b"2 0 << /Type /Pages /Kids [] /Count 0 >>";
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            first_body.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(first_body);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let second_objstm_offset = bytes.len();
+    let second_body = b"4 0 << /Marker /Value >>";
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} /Extends 3 0 R >>\nstream\n",
+            second_body.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(second_body);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, catalog_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, first_objstm_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 5, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, second_objstm_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(
+        format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+/// A damaged xref-stream-only PDF whose Catalog is an explicit ObjStm member.
+/// Recovery must discover the physical `/Type /XRef` object, merge its type-2
+/// entry for object 2, and let the canonical resolver reach the Catalog.
+fn recovered_compressed_catalog_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+
+    let object_stream_offset = bytes.len();
+    let object_stream_body = b"2 0 << /Type /Catalog /Pages 3 0 R >>";
+    bytes.extend_from_slice(
+        format!(
+            "1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            object_stream_body.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(object_stream_body);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+
+    let xref_offset = bytes.len();
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, object_stream_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 1, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, pages_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Type /XRef /Size 5 /Root 2 0 R /W [1 3 1] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n%%EOF\n");
     bytes
 }
 
@@ -431,6 +532,94 @@ fn resolve_resolves_a_compressed_object_stream_member() {
     pdf.resolve(&handle).expect("resolve compressed member");
 
     assert_eq!(handle.as_integer(), Some(42));
+}
+
+#[test]
+fn recovery_resolves_catalog_when_root_lives_in_object_stream() {
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        recovered_compressed_catalog_pdf(),
+        flpdf::PdfOpenOptions {
+            repair: true,
+            ..flpdf::PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf-style xref recovery must open the object-stream fixture");
+
+    assert_eq!(
+        pdf.root_ref(),
+        Some(ObjectRef::new(2, 0)),
+        "recovered trailer must preserve the indirect /Root identity"
+    );
+
+    assert_eq!(
+        pdf.get_xref_table().get(&ObjectRef::new(2, 0)),
+        Some(&flpdf::XrefEntry::Compressed {
+            stream: 1,
+            index: 0,
+        })
+    );
+    let root = pdf
+        .root_handle()
+        .expect("recovered type-2 /Root must resolve to the Catalog");
+    assert_eq!(
+        root.get_key(b"/Type").as_name().as_deref(),
+        Some(b"Catalog".as_slice())
+    );
+    assert_eq!(
+        root.get_key(b"/Pages").object_ref(),
+        Some(ObjectRef::new(3, 0))
+    );
+    let repair_diagnostics = pdf.repair_diagnostics();
+    let diagnostics: Vec<_> = repair_diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![
+            "file is damaged",
+            "can't find startxref",
+            "Attempting to reconstruct cross-reference table",
+        ]
+    );
+}
+
+#[test]
+fn encrypted_preserve_rebuilds_source_object_streams() {
+    let mut pdf =
+        Pdf::open(Cursor::new(compressed_entry_with_extends_pdf())).expect("open ObjStm fixture");
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        static_id: true,
+        object_streams: flpdf::ObjectStreamMode::Preserve,
+        encrypt: Some(EncryptParams::rc4(
+            EncryptMethod::V2Rc4128,
+            Vec::new(),
+            b"owner".to_vec(),
+        )),
+        ..WriterTestSettings::default()
+    };
+
+    write_with_settings(&mut pdf, &mut output, &settings)
+        .expect("encrypted Preserve must rebuild the source ObjStm");
+    assert!(!output.is_empty());
+    assert_eq!(
+        output
+            .windows(b"/Type /ObjStm".len())
+            .filter(|window| *window == b"/Type /ObjStm")
+            .count(),
+        2,
+        "encrypted Preserve must emit exactly the two rebuilt source ObjStms"
+    );
+    assert_eq!(
+        output
+            .windows(b"/Extends ".len())
+            .filter(|window| *window == b"/Extends ")
+            .count(),
+        1,
+        "encrypted Preserve must retain one output-space /Extends edge"
+    );
 }
 
 /// Repeated `get_object_handle` calls for the same already-resolved
