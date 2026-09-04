@@ -5,9 +5,11 @@ description: Use when inspecting a flpdf Beads issue before qpdf-port implementa
 
 # flpdf qpdf Primitive Readiness
 
-Ported for Claude Code at
-`.claude/skills/flpdf-qpdf-primitive-readiness/SKILL.md`. Content is
-identical; keep both in sync when editing either.
+Claude Code port of the Codex skill at
+`.agents/skills/flpdf-qpdf-primitive-readiness/SKILL.md`. Content is
+identical; only the skill-directory convention differs between agents. Keep
+both in sync — this file has no `agents/openai.yaml` counterpart because
+Claude Code does not use that metadata mechanism.
 
 ## Overview
 
@@ -264,9 +266,9 @@ Stop if you are about to:
 
 | Temptation | Required response |
 |---|---|
-| “Unblock it quickly; create the issue now.” | Finish phase 1, show the exact plan, and wait for approval. |
-| “The existing dependency probably has the right direction.” | Derive direction from qpdf responsibility and verify the graph. |
-| “Search flpdf first to find the nearest shape.” | Read qpdf structure and call order first, then map flpdf. |
-| “The audit is done, so close the target.” | Leave status and claim untouched; append notes and label only. |
-| “A local special case is cheaper.” | Stop and isolate the missing prerequisite responsibility. |
-| “Evidence is probably sufficient.” | Return `unknown`, make no Beads change, and state the missing evidence. |
+| "Unblock it quickly; create the issue now." | Finish phase 1, show the exact plan, and wait for approval. |
+| "The existing dependency probably has the right direction." | Derive direction from qpdf responsibility and verify the graph. |
+| "Search flpdf first to find the nearest shape." | Read qpdf structure and call order first, then map flpdf. |
+| "The audit is done, so close the target." | Leave status and claim untouched; append notes and label only. |
+| "A local special case is cheaper." | Stop and isolate the missing prerequisite responsibility. |
+| "Evidence is probably sufficient." | Return `unknown`, make no Beads change, and state the missing evidence. |
