@@ -213,6 +213,7 @@ crates/flpdf/src/linearization/writer.rs::write_linearized               # D19 t
 crates/flpdf/src/writer.rs::snapshot_catalog_extensions                  # D25 qpdf 非対応の復元機構
 crates/flpdf/src/writer.rs::restore_catalog_extensions                   # D25
 crates/flpdf/src/writer/reachability.rs::sweep_unreachable_objects       # D27 qpdf に削除パス無し
+crates/flpdf/src/writer/reachability.rs::sweep_unreachable_objects_except # D27 本体（multi-source --pages の page_merge.rs:1224 が直接呼ぶ）
 # crates/flpdf/src/writer.rs::qpdf_preserve_source_objstm                # D29（PR #1486 のみ。main には無いので
 #                                                                          #  checker を通すため merge までコメントアウト）
 crates/flpdf/src/writer.rs::write_qpdf_to_memory                         # D30 test-only + CLI 同名衝突
