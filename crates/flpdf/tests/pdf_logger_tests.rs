@@ -302,6 +302,28 @@ fn warning_initial_replay_failure_is_returned_by_open() {
 }
 
 #[test]
+fn job_open_applies_warning_suppression_before_parsing() {
+    let (logger, output) = recording_logger();
+    let (bytes, _) = warnings_only_corrupt_xref_bytes();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.set_suppress_warnings(true);
+
+    let pdf = job
+        .open(
+            Cursor::new(bytes),
+            "suppressed.pdf",
+            PdfOpenOptions::default(),
+        )
+        .expect("warning-bearing PDF should still open");
+
+    assert!(pdf.suppress_warnings());
+    assert!(output.lock().unwrap().is_empty());
+    assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
+    assert!(job.has_warnings());
+}
+
+#[test]
 fn check_with_repair_propagates_warning_delivery_failure() {
     let logger = QPDFLogger::create();
     logger.set_warn(Some(PipelineHandle::new(FailingSink)));

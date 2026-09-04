@@ -3470,6 +3470,7 @@ impl QPDFJob {
             input_name,
             PdfOpenOptions {
                 logger: Some(self.logger.clone()),
+                suppress_warnings: self.suppress_warnings,
                 ..PdfOpenOptions::default()
             },
         )?;
@@ -3513,6 +3514,11 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        // qpdf's `setQPDFOptions` applies `noWarn` to every ordinary QPDF
+        // immediately after construction and before `processFile`
+        // (`QPDFJob.cc:650-666,1695-1711`). Preserve an explicit caller
+        // suppression request while adding the job-wide policy.
+        options.suppress_warnings |= self.suppress_warnings;
         let mut pdf = Pdf::open_with_options(source, options)?;
         // qpdf's createQPDF calls getVersionAsPDFVersion immediately after
         // processFile; that path enters getExtensionLevel and therefore
@@ -3555,6 +3561,10 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        // The encryption-inspection creation path is still a qpdf input
+        // QPDF, so `noWarn` must be applied before authentication/parsing just
+        // like the ordinary `doProcessOnce` path.
+        options.suppress_warnings |= self.suppress_warnings;
         let mut pdf = Pdf::open_for_encryption_inspection(source, options)?;
         // `--password-is-hex-key` (raw key) authentication intentionally
         // leaves both user/owner password-match flags false on success --
