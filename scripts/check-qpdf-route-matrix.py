@@ -22,6 +22,10 @@ prose alike):
   must be inside it.
 * In any table whose header has a ``classification`` column, every data row's
   cell in that column must be exactly one of the four classifications.
+* In ``docs/qpdf-route-matrix/*.txt`` (the caller-tracker symbol manifests),
+  every non-comment line that names a ``crates/<crate>/src/<path>.rs::Sym``
+  symbol must resolve exactly like the backticked form above, so a stale
+  manifest entry fails the same way a stale citation does.
 
 The pinned qpdf tree is optional at the call site: ``--qpdf-root`` names it,
 otherwise ``scripts/fetch-qpdf-source.sh --print-path`` is consulted, and
@@ -49,6 +53,9 @@ FLPDF_SYMBOL_RE = re.compile(
     r"`(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)`"
 )
 FLPDF_RANGE_RE = re.compile(r"`(crates/[A-Za-z0-9_./-]+\.rs):(\d+(?:-\d+)?)`")
+MANIFEST_SYMBOL_RE = re.compile(
+    r"^\s*(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:#.*)?$"
+)
 DECLARATION_KEYWORDS = r"(?:fn|struct|enum|trait|type|const|static|mod|macro_rules!)"
 
 
@@ -152,6 +159,22 @@ class Checker:
         relative, spec = match.group(1), match.group(2)
         self._check_ranges(doc, line_number, f"{relative}:{spec}", self.root / relative, spec)
 
+    def check_manifest(self, manifest: Path) -> None:
+        for line_number, raw_line in enumerate(
+            manifest.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = MANIFEST_SYMBOL_RE.match(raw_line)
+            if match is None:
+                if stripped.split("#", 1)[0].strip().startswith("crates/"):
+                    self.report.error(
+                        manifest, line_number, "manifest entry is not `crates/<path>.rs::Symbol`"
+                    )
+                continue
+            self.check_flpdf_symbol(manifest, line_number, match)
+
     def check_document(self, doc: Path) -> None:
         classification_column: int | None = None
         for line_number, raw_line in enumerate(
@@ -244,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     checker = Checker(root, qpdf_root, report)
     for doc in sorted(matrix_dir.glob("*.md")):
         checker.check_document(doc)
+    for manifest in sorted(matrix_dir.glob("*.txt")):
+        checker.check_manifest(manifest)
 
     for error in report.errors:
         print(error)

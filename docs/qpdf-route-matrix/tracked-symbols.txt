@@ -1,0 +1,283 @@
+# flpdf ↔ qpdf route matrix — 二重正本トラッカーの symbol manifest
+#
+# 対象: docs/qpdf-route-matrix/{a..e}-*.md の 162 行のうち、classification が
+# `bridge` または `mixed` の 97 行の「flpdf current entrypoint」に現れる flpdf symbol
+# （170 個）。`canonical` 行は対象外。bridge/mixed で唯一 entrypoint が `absent` の
+# B7 も対象外（qpdf の `QPDF::readToken` に対応する flpdf の集約点が存在せず、
+# 追跡すべき symbol が無い）。B29 も `absent` だが `unknown` なので元から対象外。
+#
+# 使い方:
+#   python3 scripts/qpdf-route-callers.py --root .            # 全件を数える
+#   python3 scripts/qpdf-route-callers.py --symbol <leaf> --expect-zero
+#
+# 数え方の規約は scripts/qpdf-route-callers.py の module docstring が正本
+# （コメント専用行・宣言行・use 行・impl ヘッダ・文字列リテラルを除外し、
+# 呼び出し箇所と型位置を数える。test = tests//benches//examples/ 配下、
+# *_tests.rs、および #[cfg(test)] guarded 項目）。tracker は symbol の
+# 最後の `::` セグメント（leaf）を whole-word で照合するため、leaf が
+# 一致する複数 symbol は 1 つの数字に合流する。
+#
+# ---------------------------------------------------------------------------
+# 2 つのカテゴリを混ぜないこと（README.md §6 参照）
+#
+#   (a) deletable route — canonical owner が全 consumer に行き渡れば
+#       production caller が 0 になる経路。`--expect-zero` が完了判定として
+#       意味を持つのはこの群だけ。
+#
+#   (b) baseline denominator — mixed 行の canonical 側 entrypoint、複数行が
+#       共有する primitive、および leaf が総称的で他 symbol と衝突するもの。
+#       0 になることは想定されておらず、`--expect-zero` を当ててはいけない。
+#       cutover 後に「数が減ったか / 変わらなかったか」を読むための分母。
+#
+# ---------------------------------------------------------------------------
+# 曖昧な leaf（(b) 固定。tracker の数字は行セルを再現しない）
+#
+#   resolve  (A7)  — `Pdf::resolve` 以外に `PageRange::resolve` 等が同じ leaf。
+#                    A7 の行は「`\.resolve\(` 全件 − 非 Pdf receiver 23 件」で数えている。
+#   write    (D1, D26) — `PdfWriter::write` 以外に `Pipeline::write` / `write!` 等。
+#   Error    (B32) — `crate::Error` の全 variant 参照。行は
+#                    `Error::Internal(` / `Error::System(` / `Error::parse(` を個別に数えている。
+#   run      (E-1) — `QPDFJob::run` 以外に `driver::run`（E-28）等。
+#   check    (E-8) — `QPDFJob::check` 以外に `linearization::check` 等。
+#   parse    — 使用不能（prod 292）。E-14 `RotateSpec::parse` と E-15 `PageRange::parse` は
+#              leaf ではなく **型名**（`RotateSpec` / `PageRange`）を登録して代用している。
+#   main     (E-21) — `fn main` は宣言行なので除外され、prod 0 になる（degenerate）。
+#   Plan     (D24) — `writer/pclm.rs::Plan` 以外の `Plan` も拾う。
+#
+# leaf を共有する行（1 つの数字が複数の行セルに対応する）
+#   compute_data_key            C17（reader 側 canonical）+ C18（writer 側の複製）
+#   write                       D1 + D26
+#   write_qpdf                  E-3 + E-4
+#   write_qpdf_to_memory        D30（writer.rs, test-only）+ E-4（flpdf-cli の同名別関数）
+#   write_json_with_version     E-6（QPDFJob メソッド）+ E-24（free 関数）
+#   finish_file_object_handle   B9 + B10
+#   append_xref_and_trailer     D12 + D13
+#   prune_acroform_after_subset E-26（free 関数と QPDFJob メソッドが同名）
+#   recover_stream_length       B11（mixed、2 実装）+ C42（unknown、「実装は 1 本」）
+#                               — 領域間の矛盾。README.md §8 の X-1 参照
+#   RecoveryPolicy              B11 + B26
+#   objstm_membership_linearized_with_eligibility  D6 + D23
+#
+# 登録しない entrypoint
+#   Pdf::drop（A20） — `impl Drop for Pdf` は leaf `drop` が総称的で数えられない。
+#                    A20 は `BootstrapCache` / `disconnect_all` / `ObjectHandle::disconnect`
+#                    の 3 symbol で追跡する。
+#
+# 実在しない symbol
+#   qpdf_preserve_source_objstm (D29) — PR #1486 の diff にのみ存在し、
+#   main（本 worktree）では 0 hit。0 は「cutover 済み」ではなく「未マージ」を意味する。
+# ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# A. ObjectHandle / Resolver
+# ===========================================================================
+
+# --- (a) deletable route ---
+crates/flpdf/src/cache.rs::ObjectCache                                   # A2
+crates/flpdf/src/cache.rs::CacheEntry                                    # A2
+crates/flpdf/src/object_handle.rs::ObjectHandle::as_dictionary           # A6 非解決族
+crates/flpdf/src/object_handle.rs::ObjectHandle::as_array                # A6
+crates/flpdf/src/object_handle.rs::ObjectHandle::as_integer              # A6
+crates/flpdf/src/object_handle.rs::ObjectHandle::as_name                 # A6
+crates/flpdf/src/object_handle.rs::ObjectHandle::as_string               # A6
+crates/flpdf/src/object_handle.rs::ObjectHandle::as_real                 # A6
+crates/flpdf/src/object_handle.rs::ObjectHandle::is_null                 # A6
+crates/flpdf/src/reader.rs::Pdf::resolve                                 # A7（曖昧 leaf）
+crates/flpdf/src/reader.rs::Pdf::resolve_handle                          # A7
+crates/flpdf/src/reader.rs::Pdf::resolve_handle_ref                      # A7
+crates/flpdf/src/reader.rs::Pdf::resolve_qpdf_json_handle                # A7
+crates/flpdf/src/object_handle.rs::ObjectHandle::get_key                 # A8 panic 版
+crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8
+crates/flpdf/src/reader.rs::Pdf::get_all_objects                         # A9
+crates/flpdf/src/reader.rs::Pdf::object_refs                             # A10
+crates/flpdf/src/reader.rs::Pdf::live_object_refs                        # A10
+crates/flpdf/src/reader.rs::Pdf::resolved_count                          # A10
+crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
+crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 shallow copy 版
+crates/flpdf/src/reader/resolver.rs::remove_object_preserving_handle     # A13
+crates/flpdf/src/reader.rs::Pdf::delete_object                           # A14
+crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref    # A15
+crates/flpdf/src/pdf.rs::legacy_resolution_state_synced                  # A15（フィールド）
+crates/flpdf/src/reader.rs::Pdf::mark_object_handle_dirty                # A18
+crates/flpdf/src/reader.rs::Pdf::mark_object_dirty                       # A18
+crates/flpdf/src/reader.rs::Pdf::mark_object_handle_mutated              # A18
+crates/flpdf/src/pdf.rs::dirty_object_refs                               # A18（フィールド）
+crates/flpdf/src/pdf.rs::handle_mutated_object_refs                      # A18（フィールド）
+crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
+crates/flpdf/src/reader/resolver.rs::read_window                         # A22
+crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23
+crates/flpdf/src/reader.rs::Pdf::promote_resolved_object_stream_members  # A24
+crates/flpdf/src/pdf.rs::compressed_member_parents                       # A24（フィールド）
+
+# --- (b) baseline denominator ---
+crates/flpdf/src/reader/resolver.rs::ResolverCore                        # A1/A24 canonical
+crates/flpdf/src/reader/resolver.rs::object_cache                        # A1（フィールド）
+crates/flpdf/src/object_handle.rs::ObjectHandle::try_as_integer          # A6 canonical
+crates/flpdf/src/object_handle.rs::ObjectHandle::try_get_key             # A8 canonical
+crates/flpdf/src/reader/resolver.rs::get_object_count                    # A11（facade+canonical 合流）
+crates/flpdf/src/reader/resolver.rs::next_obj_gen                        # A11 canonical
+crates/flpdf/src/reader/resolver.rs::make_indirect_from_object_handle    # A12 canonical
+crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 到達不能）
+crates/flpdf/src/reader.rs::Pdf::replace_object                          # A16（facade+canonical 合流）
+crates/flpdf/src/reader.rs::Pdf::swap_objects                            # A17（facade+canonical 合流）
+crates/flpdf/src/reader/resolver.rs::disconnect_all                      # A20 canonical
+crates/flpdf/src/object_handle.rs::ObjectHandle::disconnect              # A20
+crates/flpdf/src/object_handle.rs::canonical_dictionary_key              # A23 canonical 側（legacy_dictionary_key と対）
+
+# ===========================================================================
+# B. parser / xref recovery / warning・error・diagnostics
+#    B7 / B29 は entrypoint が absent のため対象外
+# ===========================================================================
+
+# --- (a) deletable route ---
+crates/flpdf/src/parser.rs::ContentHandleParser                          # B2 第 2 の parser
+crates/flpdf/src/parser.rs::content_good_count                           # B4
+crates/flpdf/src/parser.rs::content_give_up                              # B4
+crates/flpdf/src/xref.rs::read_uncompressed_object                       # B8 bootstrap 側
+crates/flpdf/src/reader/file_object.rs::finish_file_object_handle        # B9/B10 legacy・bootstrap 側
+crates/flpdf/src/reader/file_object.rs::recover_stream_boundary          # B11 第 2 実装
+crates/flpdf/src/reader/file_object.rs::RecoveryPolicy                   # B11/B26 第 3 の表現
+crates/flpdf/src/xref.rs::resolve_objects_in_stream                      # B12 bootstrap 側
+crates/flpdf/src/xref.rs::parse_xref_from_start                          # B14 初段の直呼び
+crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry          # B22 resolve 側
+crates/flpdf/src/xref.rs::XrefLoadOptions                                # B26 open 時の第 2 表現
+crates/flpdf/src/xref.rs::LoadedXref                                     # B27 staging
+crates/flpdf/src/xref.rs::BootstrapHandleState                           # B27/B12 並行 document 状態
+crates/flpdf/src/reader/resolver.rs::qpdf_exception_what                 # B30 第 2 実装
+crates/flpdf/src/reader/resolver.rs::route_warning                       # B30 第 3 実装
+crates/flpdf/src/pdf.rs::resolution_fallbacks_remaining                  # B34（フィールド）
+crates/flpdf/src/engine.rs::MAX_RESOLUTION_FALLBACKS                     # B34
+crates/flpdf/src/reader.rs::parse_source_file_object_at                  # B34
+
+# --- (b) baseline denominator ---
+crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 canonical
+crates/flpdf/src/reader/resolver.rs::read_object_at_offset_with_description  # B8 canonical
+crates/flpdf/src/reader/file_object.rs::parse_file_object_handle_syntax  # B9 canonical
+crates/flpdf/src/reader/resolver.rs::validate_stream_line_end            # B10 canonical
+crates/flpdf/src/reader/resolver.rs::recover_stream_length               # B11 canonical / C42 unknown
+crates/flpdf/src/reader/resolver.rs::resolve_object_stream_with_failure_kind # B12 canonical
+crates/flpdf/src/xref.rs::parse_trailer_candidate                        # B13 canonical
+crates/flpdf/src/xref.rs::merge_previous_xref_sections_with_observer     # B14 canonical
+crates/flpdf/src/xref.rs::scan_object_header_after_first_token           # B20
+crates/flpdf/src/xref.rs::merge_recovered_qpdf_state                     # B20 事後 filter
+crates/flpdf/src/xref.rs::recover_xref_from_linear_scan                  # B22 canonical
+crates/flpdf/src/reader/resolver.rs::reconstructed_xref                  # B25 canonical
+crates/flpdf/src/reader/resolver.rs::attempt_recovery                    # B26 canonical
+crates/flpdf/src/reader/resolver.rs::repair_diagnostics                  # B27 単一 sink
+crates/flpdf/src/object_handle.rs::format_qpdf_exception_what            # B30 canonical
+crates/flpdf/src/error.rs::Error                                         # B32（曖昧 leaf）
+crates/flpdf/src/xref.rs::push_repair_diagnostics                        # B33 canonical
+
+# ===========================================================================
+# C. stream data provider / decode / retry / filter / encryption / /Length
+# ===========================================================================
+
+# --- (a) deletable route ---
+crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream    # C4
+crates/flpdf/src/filters.rs::stream_filter_capabilities                  # C8 filterable 第 2 実装
+crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle       # C9 filterable 第 3 実装
+crates/flpdf/src/encryption/keys.rs::per_object_key                      # C19 第 3 実装・caller 0
+crates/flpdf/src/writer.rs::apply_stream_compress_policy                 # C23 pub bridge
+crates/flpdf/src/writer.rs::apply_stream_compress_policy_with_decode_level  # C23
+crates/flpdf/src/json_inspect.rs::stream_payload_with_decode_status      # C25 第 2 実装
+crates/flpdf/src/filters.rs::decode_stream_data                          # C26
+crates/flpdf/src/filters.rs::decode_stream_data_from_handle              # C27
+crates/flpdf/src/filters.rs::decode_stream_data_recovering               # C28
+crates/flpdf/src/filters.rs::decode_stream_data_recovering_with_limits   # C28
+crates/flpdf/src/filters.rs::decode_stream_data_with_limits              # C28
+crates/flpdf/src/filters.rs::encode_stream_data                          # C29
+crates/flpdf/src/filters.rs::encode_stream_data_from_handle              # C29
+crates/flpdf/src/filters.rs::is_decoded_filter                           # C43
+crates/flpdf/src/filters.rs::passthrough_codec_label                     # C43
+
+# --- (b) baseline denominator ---
+crates/flpdf/src/encryption/state.rs::compute_data_key                   # C17 canonical + C18 複製
+crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe     # C22
+crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe_for_linearization  # C22
+crates/flpdf/src/writer/plain/body.rs::canonical_stream_will_be_refiltered_with_policy  # C22
+crates/flpdf/src/object_handle.rs::write_stream_json                     # C44 canonical
+
+# ===========================================================================
+# D. writer
+# ===========================================================================
+
+# --- (a) deletable route ---
+crates/flpdf/src/writer/rewrite_renumber.rs::CanonicalCatalogFirstRenumber  # D3
+crates/flpdf/src/writer/object_streams/planning.rs::plan_object_streams_with_reachability  # D6 legacy
+crates/flpdf/src/linearization/plan.rs::objstm_membership_linearized_with_eligibility      # D6/D23
+crates/flpdf/src/writer/object_streams/eligibility.rs::get_compressible_objgens            # D8 薄い層
+crates/flpdf/src/writer.rs::source_objstm_container_for_batch            # D9 呼び出し側の再実装
+crates/flpdf/src/writer/object.rs::write_trailer_with_ref_map            # D14 第 2 の trailer 書き出し
+crates/flpdf/src/linearization/writer.rs::write_linearized               # D19 test-only 入口
+crates/flpdf/src/writer.rs::snapshot_catalog_extensions                  # D25 qpdf 非対応の復元機構
+crates/flpdf/src/writer.rs::restore_catalog_extensions                   # D25
+crates/flpdf/src/writer/reachability.rs::sweep_unreachable_objects       # D27 qpdf に削除パス無し
+# crates/flpdf/src/writer.rs::qpdf_preserve_source_objstm                # D29（PR #1486 のみ。main には無いので
+#                                                                          #  checker を通すため merge までコメントアウト）
+crates/flpdf/src/writer.rs::write_qpdf_to_memory                         # D30 test-only + CLI 同名衝突
+
+# --- (b) baseline denominator ---
+crates/flpdf/src/writer.rs::PdfWriter::write                             # D1/D26（曖昧 leaf `write`）
+crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber        # D2 canonical
+crates/flpdf/src/writer/object_streams/planning.rs::ObjectStreamGroup    # D5
+crates/flpdf/src/writer/object_streams/planning.rs::plan_qpdf_preserve_object_streams_with_unreferenced  # D6 canonical
+crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D8 canonical
+crates/flpdf/src/reader/resolver.rs::source_xref_entries                 # D9 canonical
+crates/flpdf/src/writer/plain/body.rs::emit_bodies                       # D11 canonical
+crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer           # D12/D13 canonical
+crates/flpdf/src/writer/plain/plan.rs::canonical_trailer_entries_with_visibility           # D14
+crates/flpdf/src/writer.rs::build_writer_trailer_handle                  # D14 canonical
+crates/flpdf/src/writer.rs::EncryptionContext                            # D16
+crates/flpdf/src/writer/object_streams/planning.rs::filter_objstm_batches_for_output       # D23 canonical
+crates/flpdf/src/writer/pclm.rs::Plan                                    # D24（曖昧 leaf）
+crates/flpdf/src/writer.rs::write_pclm                                   # D24
+crates/flpdf/src/writer.rs::inject_adbe_extension                        # D25
+crates/flpdf/src/writer.rs::strip_adbe_extension                         # D25
+crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members              # D28
+
+# ===========================================================================
+# E. QPDFJob / CLI / C API
+# ===========================================================================
+
+# --- (a) deletable route ---
+crates/flpdf-cli/src/main.rs::write_with_pdf_writer                      # E-4 CLI 直書き出し
+crates/flpdf/src/job/attachment_list.rs::format_attachment_list          # E-9 prod caller 0
+crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink # E-9
+crates/flpdf/src/job/attachment_list.rs::list_attachment_info            # E-9
+crates/flpdf/src/job/attachment_list.rs::AttachmentInfo                  # E-9
+crates/flpdf/src/job/json.rs::write_json                                 # E-24 free pub, prod caller 0
+crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（free+method 合流）
+crates/flpdf/src/reader.rs::Pdf::qtest_object_value_source_offsets       # E-27
+crates/flpdf/src/reader.rs::Pdf::qtest_array_item_source_offsets         # E-27
+crates/flpdf/src/reader.rs::Pdf::qtest_decode_parms_source_offset        # E-27
+crates/flpdf/src/reader.rs::Pdf::qtest_object_value_source_offset        # E-27 caller 0（単数形）
+crates/flpdf/src/reader.rs::Pdf::qtest_array_item_source_offset          # E-27 caller 0（単数形）
+
+# --- (b) baseline denominator ---
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::run                          # E-1（曖昧 leaf）
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::create_qpdf                  # E-2
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::write_qpdf                   # E-3/E-4
+crates/flpdf/src/job/page_split.rs::QPDFJob::split_pages                 # E-5
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::write_json_with_version      # E-6 + E-24 free 関数と合流
+crates/flpdf/src/job/lifecycle.rs::write_configured_json                 # E-6
+crates/flpdf/src/job/lifecycle.rs::run_configured_inspection             # E-7
+crates/flpdf/src/job/check.rs::QPDFJob::check                            # E-8（曖昧 leaf）
+crates/flpdf/src/job/attachments.rs::QPDFJob::list_attachments           # E-9
+crates/flpdf/src/job/page_specs.rs::QPDFJob::handle_page_specs           # E-10
+crates/flpdf/src/job/overlay.rs::apply_overlay_specs                     # E-11
+crates/flpdf/src/job/overlay.rs::overlay_verbose_report                  # E-11
+crates/flpdf/src/job/lifecycle.rs::run_document_stages                   # E-12
+crates/flpdf/src/job/image_optimization.rs::optimize_images              # E-12 CLI 直呼び
+crates/flpdf/src/job/rotate.rs::flatten_rotation_on_pages                # E-12 CLI 直呼び
+crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations            # E-13
+crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages                    # E-13
+crates/flpdf/src/job/rotate_spec.rs::RotateSpec                          # E-14（leaf `parse` 使用不能）
+crates/flpdf/src/job/page_range.rs::PageRange                            # E-15（leaf `parse` 使用不能）
+crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources  # E-16
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv         # E-17
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::complete                     # E-19
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::has_warnings                 # E-19
+crates/flpdf-cli/src/main.rs::main                                       # E-21（degenerate）
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_document                # E-29
+crates/flpdf/src/job/lifecycle.rs::QPDFJob::open                         # E-29（曖昧 leaf `open`）

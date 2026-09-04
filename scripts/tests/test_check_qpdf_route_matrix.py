@@ -171,6 +171,29 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertIn("QPDF.cc:0", result.stdout)
 
+    def test_manifest_symbols_are_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write("a.md", HEADER)
+            repo.write(
+                "tracked-symbols.txt",
+                "# comment\n"
+                "crates/flpdf/src/reader.rs::Pdf::resolve   # ok\n"
+                "bare_leaf_only\n"
+                "crates/flpdf/src/reader.rs::Pdf::nope\n"
+                "crates/flpdf/src/gone.rs::resolve\n"
+                "crates/flpdf/src/reader.rs:12   # not a symbol form\n",
+            )
+            result = repo.check()
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("tracked-symbols.txt:4:", result.stdout)
+            self.assertIn("nope", result.stdout)
+            self.assertIn("tracked-symbols.txt:5:", result.stdout)
+            self.assertIn("gone.rs", result.stdout)
+            self.assertIn("tracked-symbols.txt:6:", result.stdout)
+            self.assertNotIn("tracked-symbols.txt:2:", result.stdout)
+            self.assertNotIn("tracked-symbols.txt:3:", result.stdout)
+
     def test_missing_matrix_directory_is_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo = SyntheticRepository(Path(temporary_directory))
