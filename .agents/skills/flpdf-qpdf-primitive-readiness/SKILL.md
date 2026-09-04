@@ -260,15 +260,20 @@ report. If context does not contain that report and approval, rerun phase 1.
    `.claude/rules/qpdf-port-design-patterns.md` rule 4.
 7. Before this step's push, read back every issue actually named in the
    approved plan (`<audited>`, each prerequisite, and each issue-text
-   repair target) and confirm each one matches the plan exactly — this
-   also means checking each ID against the plan character-for-character
-   before running any `bd dep add`/`bd update`/`bd create` command in
-   steps 2–6, since a mistyped-but-otherwise-valid ID silently mutates an
-   unrelated issue that this readback would not otherwise think to
-   inspect. If anything is missing, unexpected, or wrong, correct it and
-   re-verify before proceeding — do not push unverified content. If a
-   command already reached an unintended issue, revert that specific
-   mutation before continuing.
+   repair target) and confirm each one matches the plan exactly. For an
+   issue whose ID the plan already states (`<audited>`, and any reused or
+   reopened prerequisite) this means checking that ID against the plan
+   character-for-character before running each `bd dep add`/`bd
+   update`/`bd create` command in steps 2–6, since a mistyped-but-
+   otherwise-valid ID silently mutates an unrelated issue that this
+   readback would not otherwise think to inspect. A prerequisite the plan
+   only gave as a complete issue draft has no ID to check against until
+   step 3 establishes one by exact-title lookup — for that issue, confirm
+   every later command in steps 4–6 targets the exact ID step 3 read
+   back, not a guessed or re-derived one. If anything is missing,
+   unexpected, or wrong, correct it and re-verify before proceeding — do
+   not push unverified content. If a command already reached an
+   unintended issue, revert that specific mutation before continuing.
 8. Only after that local verification passes, run `bd dolt push` to
    persist the notes and dependency changes. If it fails, stop here: do
    not add `primitive-audited` (a label added before the notes it
@@ -327,8 +332,14 @@ On any phase-2 failure:
 2. Read back the target, any newly created or reopened issue, dependencies,
    notes, labels, and any issue whose text was repaired (parent epic,
    dependent side).
-3. Report exactly what succeeded and failed.
-4. On retry, reuse matching issues and existing edges, skip identical notes,
+3. Correct or revert any mutation whose recorded content does not exactly
+   match the approved plan — do not leave a known-wrong local state for a
+   later retry to notice. The mandatory session-close `bd dolt push`
+   (AGENTS.md's session-close policy) publishes whatever is locally
+   recorded regardless of whether this audit ever retries, so this step
+   runs even if no retry follows.
+4. Report exactly what succeeded and failed.
+5. On retry, reuse matching issues and existing edges, skip identical notes,
    and add an existing label idempotently.
 
 Do not label an inconclusive or partially recorded audit complete.
