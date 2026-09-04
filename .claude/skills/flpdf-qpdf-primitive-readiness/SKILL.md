@@ -153,9 +153,14 @@ Return this structure with concrete content:
   description corrections required by
   .claude/rules/qpdf-port-design-patterns.md rule 4 when qpdf evidence
   reverses or contradicts recorded text, or none>
-- Notes: <exact complete block to append>
-- Label: bd update <audited> --add-label primitive-audited (only after
-  phase 2's pre-label readback and the first `bd dolt push` succeed)
+- Notes: <exact complete block to append, or `none` for an `unknown`
+  verdict>
+- Label: <for `ready` or `missing`: bd update <audited> --add-label
+  primitive-audited, applied only after phase 2's pre-label readback and
+  the first `bd dolt push` succeed. For `unknown`: `none` — the
+  classification table requires no Beads mutation at all for `unknown`,
+  so this line must never contain the literal `bd update` command in
+  that case>
 
 ### Evidence gaps
 
@@ -169,6 +174,8 @@ testable failure paths, and explicit non-goals.
 After emitting the report, **stop**. Ask for approval. A request to investigate
 or assess readiness is not approval to mutate Beads. If the proposed change
 set changes materially after approval, present the revision and ask again.
+An `unknown` verdict has no approved change set to apply — never enter
+phase 2 for it; report the evidence gap and stop there.
 
 ## Phase 2: Apply Only the Approved Plan
 
@@ -183,21 +190,26 @@ report. If context does not contain that report and approval, rerun phase 1.
    docs, so re-run the relevant phase-1 correspondence checks (or confirm
    the audited flpdf revision is unchanged) before resuming, especially
    after any gap between approval and phase 2.
-2. For a plain `ready` audit with no prerequisite, skip to step 5. For each
-   approved prerequisite (there may be zero, one, or several — one per
-   missing qpdf responsibility unit, never collapsed into a single issue):
-   reuse it only if it is open. If the only match is closed and flpdf
-   inspection still shows the primitive missing, follow the approved
+2. For each approved prerequisite (there may be zero, one, or several — one
+   per missing qpdf responsibility unit, never collapsed into a single
+   issue): reuse it only if it is open. If the only match is closed and
+   flpdf inspection still shows the primitive missing, follow the approved
    plan's explicit choice: reopen that issue or create a new one — never
    treat a closed match as an unresolved prerequisite by default.
    Otherwise create only that approved prerequisite issue, one qpdf
    responsibility unit each; keep consumer migration in the audited issue.
+   Skip this step entirely only when the approved plan creates or reuses
+   no prerequisite at all.
 3. Locate each created or reopened issue by its exact title and read it
    back with `bd show`. Never treat warning-laden `bd create` stdout as a
-   bare ID.
-4. Check the current dependency tree and `bd dep cycles`. Apply only approved
-   removals, reversals, and additions. The audited consumer depends on each
-   prerequisite:
+   bare ID. Skip this step when step 2 was skipped.
+4. Check the current dependency tree and `bd dep cycles`. Apply every
+   approved graph change — removals, reversals, and additions alike, not
+   only additions for a newly created prerequisite. A `ready` audit whose
+   only correction is an approved dependency reversal or removal (no new
+   prerequisite at all) still applies that change here; do not skip this
+   step just because there was no prerequisite to create in step 2. The
+   audited consumer depends on each prerequisite:
    `bd dep add <audited> <prerequisite>`.
 5. Run `bd dep cycles` again. Stop on a cycle; do not invent a graph repair.
 6. Inspect existing notes. Skip an identical audit. If evidence supersedes an
@@ -211,11 +223,14 @@ report. If context does not contain that report and approval, rerun phase 1.
    fails, stop here: do not add `primitive-audited` (a label added before
    the notes it describes are even persisted would be worse than
    premature). Follow Partial Failure and Retry below.
-8. Read back the audited issue, prerequisite issues, dependency tree, and
-   notes now, before adding the label. Confirm they match the approved
-   plan exactly. If anything is missing, unexpected, or wrong, stop here
-   and do not add the label — the completion marker must not be published
-   ahead of a plan that failed verification.
+8. Read back the audited issue, prerequisite issues, dependency tree,
+   notes, and every issue whose text step 6 repaired (the parent epic
+   and/or the dependent-side issue, when applicable) now, before adding
+   the label. Confirm they all match the approved plan exactly. If
+   anything is missing, unexpected, or wrong — including an omitted or
+   incorrect parent-epic or dependent-side text repair — stop here and do
+   not add the label — the completion marker must not be published ahead
+   of a plan that failed verification.
 9. Only after that verification passes, add `primitive-audited` with
    `bd update <audited> --add-label primitive-audited`.
 10. Read back the label locally to confirm it was actually applied, before
@@ -228,13 +243,13 @@ report. If context does not contain that report and approval, rerun phase 1.
     succeeds. Do not report the audit as complete until this push
     succeeds.
 
-This skill's own Beads mutations do not by themselves require `git push` —
-they change no git-tracked implementation files. That does not override the
-repository's mandatory session-close policy: if the current session has any
-other git-tracked changes, `git push` for those remains required at session
-close regardless of this skill's own scope. Do not close the audited issue.
-A `missing` audit is complete even though its implementation remains blocked
-by the recorded prerequisite.
+This skill's own phase-2 steps make no git-tracked changes, so they include
+no `git push` of their own. That does not exempt the session from AGENTS.md's
+session-close policy, which requires `git push` unconditionally at session
+close regardless of whether this skill's own scope touched git-tracked
+files — do not skip it because this audit was Beads-only. Do not close the
+audited issue. A `missing` audit is complete even though its implementation
+remains blocked by the recorded prerequisite.
 
 ## Notes Contract
 
