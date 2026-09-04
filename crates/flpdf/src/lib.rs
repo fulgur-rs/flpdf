@@ -181,12 +181,11 @@ pub use form_field_object_helper::FormFieldObjectHelper;
 pub use job::{
     add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback,
     copy_duplicate_page_annotations, extract_attachment, extract_attachment_to_path,
-    format_attachment_list, format_attachment_list_with_sink, list_attachment_info,
-    merge_documents, overlay_verbose_report, prune_acroform_after_subset,
-    prune_acroform_after_subset_with_max_depth, write_attachment, AttachmentInfo, CombinedPage,
-    CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage,
-    OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, PageSpecJobOutput, Parity,
-    RotateSpec, SelectedPage, DEFAULT_MAX_ACROFORM_DEPTH,
+    format_attachment_list_with_sink, merge_documents, overlay_verbose_report,
+    prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth, write_attachment,
+    AttachmentInfo, CombinedPage, CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind,
+    OverlaySpec, OverlayVerbosePage, OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry,
+    PageSpecJobOutput, Parity, RotateSpec, SelectedPage, DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use job::{
     optimize_images, should_remove_unreferenced_resources, ImageOptimizationOptions,
@@ -234,8 +233,8 @@ pub use tokenizer::{Token as ContentToken, TokenType as ContentTokenType};
 #[doc(hidden)]
 pub use writer::V5Randomness;
 pub use writer::{
-    apply_stream_compress_policy, write_stream_to_buf, CompressStreams, DecodeLevel,
-    NewlineBeforeEndstream, ObjectStreamMode, PdfWriter, StreamDataMode, WriterConfiguration,
+    write_stream_to_buf, CompressStreams, DecodeLevel, NewlineBeforeEndstream, ObjectStreamMode,
+    PdfWriter, StreamDataMode, WriterConfiguration,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
