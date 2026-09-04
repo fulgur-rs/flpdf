@@ -108,6 +108,13 @@ required primitive must be conclusively assessed (as `equivalent`,
 or `missing` is a legal verdict; any unresolved primitive makes the whole
 audit `unknown`.
 
+For an `unknown` verdict, the entire proposed-change section is a no-op:
+`Create/reuse`, `Dependency`, `Remove/reverse`, `Issue-text repairs`,
+`Notes`, and `Label` must each be `none`. Do not list or apply a prerequisite
+for a conclusively divergent primitive while another required primitive is
+unresolved; record that known gap under `Evidence gaps` and stop before phase
+2.
+
 These are mandatory stop signals; they cannot produce `ready`:
 
 - sentinel values such as an empty buffer or zero standing for absence;
@@ -161,21 +168,24 @@ Return this structure with concrete content:
 - Create/reuse: <one line per primitive that needs prerequisite work —
   missing, wrong-responsibility, or otherwise divergent — never one for a
   primitive already assessed `equivalent` in the flpdf correspondence
-  table above; `none` when every required primitive is already
-  equivalent (including a plain `ready` audit with no prerequisite).
+  table above; `none` for an `unknown` verdict or when every required
+  primitive is already equivalent (including a plain `ready` audit with no
+  prerequisite).
   Never invent a dependency to fill this slot, and never collapse two
   independent missing primitives into one entry; each keeps its own
   line: complete issue draft, or existing OPEN issue ID, or
   create-new/reopen-<ID> when the only match is closed>
 - Dependency: <one `bd dep add <audited> <prerequisite>` line per created
-  or reused prerequisite above, or `none`>
+  or reused prerequisite above, or `none` for an `unknown` verdict or when
+  there is no prerequisite>
 - Remove/reverse: <exact approved edge changes or none>
 - Issue-text repairs: <exact acceptance-criteria/parent-epic/dependent-side
   description corrections required by
   .claude/rules/qpdf-port-design-patterns.md rule 4 when qpdf evidence
   reverses or contradicts recorded text, or none>
-- Notes: <exact complete block to append, or `none` for an `unknown`
-  verdict>
+- Notes: <exact complete block to append, or `none` only for an `unknown`
+  verdict or when an identical audit block is already present; in the latter
+  case state `identical audit already present`>
 - Label: <for `ready` or `missing`: bd update <audited> --add-label
   primitive-audited, applied only after phase 2's pre-label readback and
   the first `bd dolt push` succeed. For `unknown`: `none` — the
@@ -219,6 +229,20 @@ report. If context does not contain that report and approval, rerun phase 1.
    are not that kind of change: resuming into them is the retry this
    skill requires (see Partial Failure and Retry), not new drift to
    revise the plan for.
+   Re-run `scripts/fetch-qpdf-source.sh --print-path` as part of this
+   revalidation and confirm that it still resolves to the same pinned qpdf
+   11.9.0 commit with a read-only, verifiable git state and no tracked edits.
+   If it fails, resolves elsewhere, or reports dirty or unverifiable metadata,
+   stop and present a revised plan; do not use phase-1 oracle evidence or
+   discard edits in the shared tree.
+   Before step 2 performs any prerequisite create/reuse mutation, repeat the
+   complete phase-1 Beads candidate search for qpdf symbols, flpdf symbols,
+   responsibility names, and module names, including closed results. Compare
+   the results with the approved report. A new matching open candidate that
+   was not created or reopened by this same approved plan is external drift:
+   stop and present a revised plan before creating a duplicate or adding an
+   edge. A prerequisite created or reopened by this approved plan is retry
+   state and may be reused under step 2.
 2. For each approved prerequisite (there may be zero, one, or several — one
    per missing qpdf responsibility unit, never collapsed into a single
    issue): reuse it only if it is open. If the only match is closed and
@@ -251,9 +275,13 @@ report. If context does not contain that report and approval, rerun phase 1.
    stop and report the conflict — do not invent a different graph repair,
    and do not leave the newly cyclic graph in place for the mandatory
    session-close push to persist.
-6. Inspect existing notes. Skip an identical audit. If evidence supersedes an
-   older audit, name that entry explicitly. Append the approved block with
-   `bd update <audited> --append-notes ...`; never overwrite unrelated notes.
+6. Inspect existing notes. If an identical audit block already exists, treat
+   the notes action as `none (identical audit already present)` and skip the
+   append. This is a successful no-op, including a retry after the notes
+   append and its push succeeded but a later phase-2 mutation failed. If
+   evidence supersedes an older audit, name that entry explicitly. Otherwise,
+   append the approved block with `bd update <audited> --append-notes ...`;
+   never overwrite unrelated notes.
    Apply any approved issue-text repairs now: correct acceptance criteria
    that qpdf evidence contradicts, and update the parent epic's and the
    dependent side's description, per
@@ -279,8 +307,13 @@ report. If context does not contain that report and approval, rerun phase 1.
    not add `primitive-audited` (a label added before the notes it
    describes are even persisted would be worse than premature). Follow
    Partial Failure and Retry below.
-9. Add `primitive-audited` with
-   `bd update <audited> --add-label primitive-audited`.
+9. Immediately before this label mutation, read back the plan-stated target
+   with `bd show <audited>` and confirm its ID and title still match the
+   approved target. Then compare the literal ID operand in the following
+   command character-for-character with that approved target ID. Only after
+   both checks pass, add `primitive-audited` with
+   `bd update <audited> --add-label primitive-audited` — a label readback
+   cannot repair a command sent to another valid issue.
 10. Read back the label locally to confirm it was actually applied, before
     pushing it. If it is missing or wrong, correct it before proceeding —
     do not push an unverified label state.
@@ -328,7 +361,12 @@ actual readiness result.
 
 On any phase-2 failure:
 
-1. Stop further mutations.
+1. Stop all further forward-plan mutations immediately. This stop applies
+   only to new approved-plan actions; it does not prohibit the cleanup
+   mutations required by steps 3 and 5. Rollback, revert, or repair only the
+   failed attempt's incorrect state or the newly introduced cycle, including
+   an edge or issue field this attempt changed, and do not use cleanup as an
+   opportunity for a new forward-plan change.
 2. Read back the target, any newly created or reopened issue, dependencies,
    notes, labels, and any issue whose text was repaired (parent epic,
    dependent side).
@@ -339,8 +377,9 @@ On any phase-2 failure:
    recorded regardless of whether this audit ever retries, so this step
    runs even if no retry follows.
 4. Report exactly what succeeded and failed.
-5. On retry, reuse matching issues and existing edges, skip identical notes,
-   and add an existing label idempotently.
+5. On retry, reuse matching issues and existing edges, represent an already
+   present identical audit as `Notes: none (identical audit already present)`
+   and skip that append, and add an existing label idempotently.
 
 Do not label an inconclusive or partially recorded audit complete.
 
