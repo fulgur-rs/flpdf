@@ -1,18 +1,20 @@
 //! qpdf correspondence: `QPDFWriter` reachability and unreferenced-object emission.
 //!
-//! This module owns the document-wide mark-and-sweep used by page-selection
-//! and attachment-removal mutations. It follows the canonical `ObjectHandle`
-//! graph from `/Root`, trailer entries, and explicit protection seeds, while
-//! leaving page-local `/Resources` pruning to `PageObjectHelper` and
-//! `PageDocumentHelper`.
+//! This module owns an explicit document-wide mark-and-sweep used by the
+//! multi-source merge's protected orphan cleanup. Ordinary page selection,
+//! attachment removal, and page extraction defer the same decision to the
+//! writer. It follows the canonical `ObjectHandle` graph from `/Root`, trailer
+//! entries, and explicit protection seeds, while leaving page-local
+//! `/Resources` pruning to `PageObjectHelper` and `PageDocumentHelper`.
 //!
 //! qpdf's writer does not have a separate delete pass: `QPDFWriter::enqueueObject`
 //! (`libqpdf/QPDFWriter.cc:1072-1157`) only enqueues objects reachable through
 //! visible dictionary and array children, and
 //! `enqueueObjectsStandard` (`:2907-2925`) adds every input object only when
 //! `preserveUnreferencedObjects` is enabled. flpdf's in-memory page and
-//! attachment mutations need the same reachability boundary before a later
-//! writer invocation, so this module provides the explicit equivalent.
+//! attachment mutations defer the same decision to the writer. The explicit
+//! sweep remains available for the separate merge boundary; it is not a
+//! replacement for the writer's emission-time reachability decision.
 
 use crate::object_handle::ObjectHandle;
 use crate::object_handle::MAX_INLINE_DEPTH;
@@ -20,18 +22,13 @@ use crate::{ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-/// Mark and sweep every indirect object not reachable from `/Root` or the
-/// PDF trailer.
+/// Mark and sweep every indirect object not reachable from `/Root` or the PDF
+/// trailer, treating every reference in `protect` as an additional
+/// reachability seed.
 ///
-/// The writer's normal rewrite would omit these objects implicitly. Callers
-/// that need to inspect the live object table before writing use this explicit
-/// in-memory equivalent.
-pub(crate) fn sweep_unreachable_objects<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<usize> {
-    sweep_unreachable_objects_except(pdf, &BTreeSet::new())
-}
-
-/// Like [`sweep_unreachable_objects`], but treats every reference in `protect`
-/// as an additional reachability seed.
+/// The writer's normal rewrite would omit these objects implicitly. The
+/// multi-source merge uses this explicit in-memory cleanup while it protects
+/// objects copied from the primary document.
 pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     protect: &BTreeSet<ObjectRef>,
@@ -297,7 +294,10 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless PDF should parse");
         let before = pdf.live_object_refs();
 
-        assert_eq!(sweep_unreachable_objects(&mut pdf).unwrap(), 0);
+        assert_eq!(
+            sweep_unreachable_objects_except(&mut pdf, &BTreeSet::new()).unwrap(),
+            0
+        );
         assert_eq!(pdf.live_object_refs(), before);
     }
 
@@ -310,7 +310,8 @@ mod tests {
         ]))
         .expect("null-edge fixture should parse");
 
-        sweep_unreachable_objects(&mut pdf).expect("reachability sweep should succeed");
+        sweep_unreachable_objects_except(&mut pdf, &BTreeSet::new())
+            .expect("reachability sweep should succeed");
 
         assert!(pdf.live_object_refs().contains(&ObjectRef::new(1, 0)));
         assert!(!pdf.live_object_refs().contains(&ObjectRef::new(2, 0)));
@@ -326,7 +327,8 @@ mod tests {
 
         // The member is intentionally left unresolved. Its current type-2
         // xref entry must make the source ObjStm reachable before resolution.
-        sweep_unreachable_objects(&mut pdf).expect("reachability sweep should succeed");
+        sweep_unreachable_objects_except(&mut pdf, &BTreeSet::new())
+            .expect("reachability sweep should succeed");
 
         assert!(pdf.live_object_refs().contains(&ObjectRef::new(1, 0)));
         assert!(pdf.live_object_refs().contains(&ObjectRef::new(2, 0)));

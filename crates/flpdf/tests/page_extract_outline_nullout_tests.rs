@@ -4,7 +4,7 @@
 //! -> `QPDFJob::prune_after_subset` -> `write_pdf`) and asserts the qpdf 11.9.0 behaviour:
 //! no nav entry is dropped, surviving-page dests are remapped, a removed page
 //! still referenced by a kept dest is emitted as `null` (and stays live), and a
-//! removed page referenced by nothing is garbage-collected (absent). This is a
+//! removed page referenced by nothing is omitted by the writer. This is a
 //! structural parity check, not a byte-compare against qpdf (qpdf renumbers).
 
 use flpdf::job::{remap_outline_and_dests, QPDFJob};
@@ -33,6 +33,9 @@ fn build_fixture() -> Vec<u8> {
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
         );
     }
+    let page5 = objs.get_mut(&7).expect("page 5 fixture object");
+    let closing = page5.rfind(" >>").expect("page 5 dictionary close");
+    page5.insert_str(closing, " /Secret (UNREFERENCED_PAGE5)");
     objs.insert(
         10,
         "<< /Type /Outlines /First 20 0 R /Last 21 0 R /Count 2 >>".into(),
@@ -200,10 +203,25 @@ fn referenced_removed_pages_nulled_unreferenced_absent() {
         "nulled-but-referenced page 4 stays live"
     );
 
-    // The page referenced by nothing is garbage-collected entirely (absent).
+    // The page referenced by nothing remains in memory until the writer owns
+    // the reachability decision.
     assert!(
-        !live.contains(&ObjectRef::new(7, 0)),
-        "removed page 5 (referenced by nothing) must be swept, not nulled"
+        live.contains(&ObjectRef::new(7, 0)),
+        "unreferenced page 5 remains in memory before writing"
+    );
+
+    let mut out = Vec::new();
+    write_default(&mut pdf, &mut out).expect("write subset");
+    assert!(
+        !out.windows(b"UNREFERENCED_PAGE5".len())
+            .any(|window| window == b"UNREFERENCED_PAGE5"),
+        "writer must omit the unreferenced page 5"
+    );
+    let mut written = Pdf::open(Cursor::new(out)).expect("reopen subset");
+    assert_eq!(
+        flpdf::pages::page_refs(&mut written).unwrap().len(),
+        2,
+        "writer output must retain only the two selected pages"
     );
 }
 

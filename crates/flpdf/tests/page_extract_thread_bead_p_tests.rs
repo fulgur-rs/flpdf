@@ -7,7 +7,7 @@
 //! asserts the qpdf 11.9.0 behaviour for the structural-reference *drop* family:
 //! a bead whose `/P` points at a removed page has the `/P` key dropped (not
 //! nulled), the bead and its ring links are kept, and the page — once
-//! unreferenced — is garbage-collected entirely. This is the opposite of the
+//! unreferenced — is omitted by the writer. This is the opposite of the
 //! annotation/outline null-out family, where the reference is kept verbatim and
 //! the page object becomes `null`.
 
@@ -54,7 +54,9 @@ fn build_fixture_inner(with_threads: bool) -> Vec<u8> {
     );
     objs.insert(
         4,
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [12 0 R] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /B [12 0 R] \
+         /Secret (UNREFERENCED_PAGE2) >>"
+            .into(),
     );
     objs.insert(
         5,
@@ -110,6 +112,22 @@ fn run_subset_bytes(bytes: Vec<u8>, pages: &[ObjectRef]) -> Pdf<Cursor<Vec<u8>>>
     QPDFJob::complete_in_place_page_selection(&mut pdf, &result, RemoveUnreferencedResources::Yes)
         .expect("complete in-place page selection");
     pdf
+}
+
+fn assert_unreferenced_page_is_omitted_by_writer(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+    let mut out = Vec::new();
+    write_default(pdf, &mut out).expect("write subset");
+    assert!(
+        !out.windows(b"UNREFERENCED_PAGE2".len())
+            .any(|window| window == b"UNREFERENCED_PAGE2"),
+        "writer must omit the unreferenced page 2"
+    );
+    let mut written = Pdf::open(Cursor::new(out)).expect("reopen subset");
+    assert_eq!(
+        pages::page_refs(&mut written).unwrap().len(),
+        2,
+        "writer output must retain only the selected pages"
+    );
 }
 
 #[test]
@@ -196,12 +214,12 @@ fn dangling_bead_p_dropped_and_page_gced() {
         "bead 12 /N must be kept"
     );
 
-    // The /P drop leaves the removed page unreferenced, so the existing GC
-    // sweeps it: absent from the output, not emitted as `null` (qpdf parity).
+    // The /P drop leaves the removed page unreferenced. It remains in memory
+    // until the writer owns the reachability decision.
     let live = pdf.live_object_refs();
     assert!(
-        !live.contains(&ObjectRef::new(4, 0)),
-        "removed page 2 must be garbage-collected after bead /P drop"
+        live.contains(&ObjectRef::new(4, 0)),
+        "unreferenced page 2 remains in memory before writing"
     );
     // The bead, by contrast, is still live (kept in the thread ring).
     assert!(
@@ -217,6 +235,8 @@ fn dangling_bead_p_dropped_and_page_gced() {
         bead.get_key(b"/P").object_ref() == Some(ObjectRef::new(3, 0)),
         "bead 11 /P (surviving page 1) must be kept"
     );
+
+    assert_unreferenced_page_is_omitted_by_writer(&mut pdf);
 }
 
 #[test]
@@ -269,8 +289,8 @@ fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
     // Same parity, but the catalog has no /Threads: the bead ring is reachable
     // only through the surviving pages' /B arrays. Without dropping the
     // removed-page bead's /P here, the removed page would stay reachable via the
-    // kept page's /B ring and the prune could not collect it (qpdf 11.9.0
-    // garbage-collects it).
+    // kept page's /B ring and the writer could not omit it (qpdf 11.9.0
+    // garbage-collects it during output).
     let mut pdf = run_subset_bytes(
         build_fixture_b_only(),
         &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
@@ -286,11 +306,16 @@ fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
 
     let live = pdf.live_object_refs();
     assert!(
-        !live.contains(&ObjectRef::new(4, 0)),
-        "removed page 2 must be garbage-collected after the /B-seeded bead /P drop"
+        live.contains(&ObjectRef::new(4, 0)),
+        "unreferenced page 2 remains in memory before writing"
     );
     assert!(
         live.contains(&ObjectRef::new(12, 0)),
         "bead 12 must stay live in the ring after its /P drop"
     );
+
+    assert_unreferenced_page_is_omitted_by_writer(&mut pdf);
 }
+
+mod common;
+use common::write_default;

@@ -274,8 +274,7 @@ impl<R: Read + Seek> Pdf<R> {
 
 // ── remove_attachment ─────────────────────────────────────────────────────────
 
-/// Remove an attachment by name-tree key and garbage-collect unreachable
-/// payload objects.
+/// Remove an attachment by name-tree key.
 ///
 /// # Behaviour
 ///
@@ -288,19 +287,10 @@ impl<R: Read + Seek> Pdf<R> {
 ///    (an `/AF` entry, a `/Dests` / `/JavaScript` name tree, another
 ///    Filespec). Associated-files (`/AF`) arrays are not modified, so an
 ///    `/AF` entry that pointed at the removed Filespec now points at null.
-/// 3. **Mark-and-sweep GC** through the writer-owned reachability pass:
-///    every indirect object no longer reachable from `/Root` or the trailer
-///    is physically deleted. This always drops the Filespec's original
-///    content — its `/EF` streams (including a filespec carrying distinct
-///    streams under several `/EF` keys) and any sub-objects reachable only
-///    through it become unreachable the instant step 2 nulls the Filespec,
-///    so the sweep removes them regardless of what else is live. The null
-///    object *slot* the Filespec occupied is a separate question: it
-///    survives the sweep, still emitted as `null`, if something else (most
-///    commonly `/AF`) still holds an indirect reference to that object
-///    number; otherwise the slot itself is swept away too. The sweep also
-///    drops the orphan ghost name-tree nodes left by the rebuild — all in
-///    one pass, with no per-feature reachability heuristics.
+/// 3. Leaves document-wide reachability to the later writer. Ordinary rewrites
+///    omit the detached Filespec and its `/EF` streams because they are no
+///    longer reachable, while `preserve_unreferenced` can retain the null slot
+///    and other unreferenced objects as qpdf does.
 ///
 /// The conservative-share semantics only protect content that was never
 /// routed through the removed Filespec in the first place: an `/EmbeddedFile`
@@ -310,32 +300,24 @@ impl<R: Read + Seek> Pdf<R> {
 /// being removed does **not** preserve it — step 2 nulls that object
 /// unconditionally, so the other name tree ends up pointing at null too.
 ///
-/// # Blast radius
-///
-/// The sweep is **document-wide**, not scoped to the removed attachment: any
-/// *pre-existing* object that was already unreachable from `/Root` is also
-/// collected. This matches qpdf's complete-rewrite behaviour (its writer only
-/// emits reachable objects) and flpdf's own page-subset pruning, so the
-/// observable output is qpdf-aligned rather than a targeted in-place edit.
+/// The wrapper itself does not delete any pre-existing unreachable object.
+/// The later writer determines the document-wide output set, including whether
+/// `preserve_unreferenced` retains such objects.
 ///
 /// # Limitation
 ///
 /// When the name-tree value is a *direct* `/Filespec` dictionary (not an
 /// indirect reference), qpdf has no object slot to replace; the name-tree
-/// entry is removed and the sweep still runs.
+/// entry is removed; the later writer decides which indirect objects to emit.
 ///
 /// # Errors
 ///
-/// Propagates any error from the canonical embedded-files helper or the sweep.
+/// Propagates any error from the canonical embedded-files helper.
 pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
     let removed = pdf.embedded_files().remove_embedded_file(key)?;
     if !removed {
         return Ok(false);
     }
-
-    // The null Filespec remains reachable through any existing `/AF` array,
-    // while its embedded streams and name-tree ghosts become unreachable.
-    crate::writer::reachability::sweep_unreachable_objects(pdf)?;
 
     Ok(true)
 }
@@ -346,10 +328,7 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
 /// reachable via `/EF /UF`, `/EF /F`, `/EF /Unix`, `/EF /Mac`, `/EF /DOS` (in
 /// that priority order).  Returns `None` if not found or on any soft error.
 ///
-/// Test-only helper for single-stream fixtures. Production code no longer
-/// resolves `/EF` streams explicitly: [`remove_attachment`] relies on the
-/// `/Root` mark-and-sweep, which drops every `/EF` stream of a removed
-/// filespec transitively.
+/// Test-only helper for single-stream fixtures.
 #[cfg(test)]
 fn embedded_file_stream_ref<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
@@ -546,6 +525,38 @@ mod tests {
     fn catalog_handle(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> ObjectHandle {
         let catalog_ref = pdf.root_ref().expect("root");
         resolved_handle(pdf, catalog_ref)
+    }
+
+    fn rewritten(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let bytes = crate::writer::write_qpdf_to_memory(pdf, |_| {}).expect("rewrite PDF");
+        Pdf::open(std::io::Cursor::new(bytes)).expect("reopen rewritten PDF")
+    }
+
+    fn count_streams(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
+        let objects = pdf.get_all_objects().expect("enumerate rewritten objects");
+        objects
+            .into_iter()
+            .filter(|object| {
+                pdf.resolve(object).expect("resolve rewritten object");
+                object.as_stream_dict().is_some()
+            })
+            .count()
+    }
+
+    fn count_embedded_file_streams(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> usize {
+        let objects = pdf.get_all_objects().expect("enumerate rewritten objects");
+        objects
+            .into_iter()
+            .filter(|object| {
+                pdf.resolve(object).expect("resolve rewritten object");
+                let Some(dict) = object.as_stream_dict() else {
+                    return false;
+                };
+                let kind = dict.get_key(b"/Type");
+                pdf.resolve(&kind).expect("resolve embedded stream type");
+                kind.as_name().as_deref() == Some(b"EmbeddedFile")
+            })
+            .count()
     }
 
     fn replace_catalog_key(
@@ -943,13 +954,12 @@ mod tests {
         );
     }
 
-    // ── Test: transitively-unreachable subgraph is swept ───────────────
+    // ── Test: transitively-unreachable subgraph is swept by the writer ─────
     //
-    // The old ad-hoc GC only ever considered the filespec ref and its `/EF`
-    // streams, so an object reachable *only* through the filespec dictionary
-    // (e.g. an indirect `/CI` collection-item stream) was left behind as an
-    // orphan after removal. A proper mark-and-sweep from `/Root` + trailer —
-    // the qpdf rewrite model — drops the whole now-unreachable subgraph.
+    // An object reachable *only* through the filespec dictionary (e.g. an
+    // indirect `/CI` collection-item stream) is not deleted by this mutation;
+    // the qpdf rewrite model drops the now-unreachable subgraph at the writer
+    // boundary.
     #[test]
     fn remove_attachment_sweeps_transitively_unreachable_subgraph() {
         let mut pdf = open_minimal();
@@ -979,10 +989,20 @@ mod tests {
         remove_attachment(&mut pdf, b"trans.txt").expect("remove");
 
         let live = pdf.live_object_refs();
-        assert!(!live.contains(&fs_ref), "filespec must be swept");
         assert!(
-            !live.contains(&sidecar_ref),
-            "object reachable only via the filespec must be transitively swept (mark-and-sweep)"
+            live.contains(&fs_ref),
+            "filespec remains in memory until the writer runs"
+        );
+        assert!(
+            live.contains(&sidecar_ref),
+            "side-car remains in memory until the writer runs"
+        );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(
+            count_streams(&mut written),
+            0,
+            "writer must drop the stream reachable only through the removed filespec"
         );
     }
 
@@ -1010,7 +1030,7 @@ mod tests {
         assert!(pdf.object_refs().contains(&stream_ref));
     }
 
-    // ── Test: removed filespec and stream are no longer live ─────────────────
+    // ── Test: removed filespec and stream are dropped by the writer ──────────
 
     #[test]
     fn remove_attachment_gc_deletes_filespec_and_stream() {
@@ -1028,22 +1048,28 @@ mod tests {
 
         remove_attachment(&mut pdf, b"gc.txt").expect("remove");
 
-        // Both filespec and stream must be absent from live objects.
+        // Both objects remain available for the writer's policy decision.
         let live = pdf.live_object_refs();
         assert!(
-            !live.contains(&fs_ref),
-            "filespec ref must not be in live_object_refs after GC"
+            live.contains(&fs_ref),
+            "filespec remains in memory before writer output"
         );
         assert!(
-            !live.contains(&stream_ref),
-            "stream ref must not be in live_object_refs after GC"
+            live.contains(&stream_ref),
+            "stream remains in memory before writer output"
         );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 0);
+        assert!(list_embedded_files(&mut written)
+            .expect("list rewritten attachments")
+            .is_empty());
     }
 
     // ── Test: indirect /AF array retains the null Filespec reference ─────────
     //
     // qpdf keeps an indirect /AF array and its reference to the nulled
-    // Filespec, while the embedded stream becomes unreachable and is swept.
+    // Filespec, while the embedded stream is dropped by the writer.
     #[test]
     fn remove_attachment_with_indirect_af_array_gcs_filespec_and_stream() {
         let mut pdf = open_minimal();
@@ -1080,8 +1106,8 @@ mod tests {
             "null Filespec must remain reachable through the indirect /AF array"
         );
         assert!(
-            !live.contains(&stream_ref),
-            "embedded stream must be GC-deleted alongside the filespec"
+            live.contains(&stream_ref),
+            "embedded stream remains in memory before writer output"
         );
         assert!(
             live.contains(&af_array_ref),
@@ -1099,6 +1125,9 @@ mod tests {
             resolved_handle(&mut pdf, fs_ref).is_null(),
             "Filespec must be nulled, not removed"
         );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 0);
     }
 
     // ── Test: indirect /AF shared by catalog + page retains null Filespec ────
@@ -1241,11 +1270,14 @@ mod tests {
         );
 
         // The Filespec is null, so its embedded stream is no longer reachable
-        // through that object and is swept.
+        // through that object and the writer drops it.
         assert!(
-            !live.contains(&stream_ref),
-            "embedded stream must be GC-deleted after the Filespec is nulled"
+            live.contains(&stream_ref),
+            "embedded stream remains in memory before writer output"
         );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 0);
     }
 
     // ── Test: live object referencing the stream (with stream back-ref) ──────
@@ -1253,7 +1285,7 @@ mod tests {
     // qpdf replaces the removed Filespec with null. The externally referenced
     // stream survives, but its dictionary's back-reference resolves to null
     // and is not a writer reachability edge (`QPDFWriter.cc:1131-1135`), so the
-    // Filespec itself is still collected.
+    // Filespec itself is omitted by the ordinary writer.
     #[test]
     fn remove_attachment_keeps_external_stream_but_collects_nulled_filespec() {
         let mut pdf = open_minimal();
@@ -1291,16 +1323,22 @@ mod tests {
         let live = pdf.live_object_refs();
         assert!(
             live.contains(&stream_ref),
-            "externally-referenced stream must be preserved"
+            "externally-referenced stream remains in memory"
         );
-        assert!(!live.contains(&fs_ref), "nulled filespec must be collected");
+        assert!(live.contains(&fs_ref), "nulled filespec remains in memory");
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 1);
+        assert!(list_embedded_files(&mut written)
+            .expect("list rewritten attachments")
+            .is_empty());
     }
 
-    // ── Test: shared embedded stream is preserved, removed filespec GC'd ──────
+    // ── Test: shared embedded stream is preserved by the writer ───────────────
     //
     // Two filespecs share one /EmbeddedFile stream.  Removing one attachment
-    // must GC its (otherwise-unreferenced) filespec but keep the shared stream
-    // and the other filespec intact.  Guards against an over-conservative
+    // must let the writer drop its otherwise-unreferenced filespec but keep the
+    // shared stream and the other filespec intact. Guards against an over-conservative
     // "pair-or-nothing" handling would incorrectly discard the shared stream.
     #[test]
     fn remove_attachment_with_shared_stream_keeps_stream_and_other_filespec() {
@@ -1331,15 +1369,15 @@ mod tests {
         insert_embedded_file(&mut pdf, b"b.txt", fs_b).expect("insert b");
 
         // Remove attachment "a": its filespec is otherwise unreferenced and
-        // must be GC'd; the stream is still used by fs_b and must survive,
-        // and fs_b itself must remain intact.
+        // must be omitted by ordinary writer output; the stream is still used
+        // by fs_b and must survive, and fs_b itself must remain intact.
         let removed = remove_attachment(&mut pdf, b"a.txt").expect("remove a");
         assert!(removed);
 
         let live = pdf.live_object_refs();
         assert!(
-            !live.contains(&fs_a),
-            "removed attachment's filespec must be GC-deleted"
+            live.contains(&fs_a),
+            "removed attachment's nulled filespec remains in memory"
         );
         assert!(
             live.contains(&shared_stream),
@@ -1349,9 +1387,15 @@ mod tests {
             live.contains(&fs_b),
             "the other filespec sharing the stream must remain intact"
         );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 1);
+        let entries = list_embedded_files(&mut written).expect("list rewritten attachments");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"b.txt");
     }
 
-    // ── Test: filespec with distinct /EF streams GCs all of them ─────────────
+    // ── Test: filespec with distinct /EF streams is GC'd by the writer ───────
     //
     // Every stream under an /EF key must be collected when the filespec is
     // deleted; resolving only the first stream would leave sibling streams
@@ -1395,15 +1439,18 @@ mod tests {
         assert!(removed);
 
         let live = pdf.live_object_refs();
-        assert!(!live.contains(&fs_ref), "filespec must be GC-deleted");
+        assert!(live.contains(&fs_ref), "filespec remains in memory");
+        assert!(live.contains(&stream_f), "primary stream remains in memory");
         assert!(
-            !live.contains(&stream_f),
-            "primary /EF /F stream must be GC-deleted"
+            live.contains(&stream_uf),
+            "sibling stream remains in memory"
         );
-        assert!(
-            !live.contains(&stream_uf),
-            "distinct /EF /UF sibling stream must also be GC-deleted (not orphaned)"
-        );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 0);
+        assert!(list_embedded_files(&mut written)
+            .expect("list rewritten attachments")
+            .is_empty());
     }
 
     // ── Test: empty/target-absent indirect /AF array is left untouched ───────
@@ -1538,12 +1585,13 @@ mod tests {
         assert_eq!(page_af[0].object_ref(), Some(fs_ref));
     }
 
-    // ── Test: shared stream is preserved under conservative GC ───────────────
+    // ── Test: shared stream is preserved by the writer ──────────────────────
 
     #[test]
     fn conservative_gc_preserves_shared_stream() {
         // Build two /Filespec dicts that share the same /EmbeddedFile stream.
-        // When one filespec is removed, the shared stream must NOT be GC'd.
+        // When one filespec is removed, the shared stream must survive the
+        // writer because the other filespec still references it.
         let mut pdf = open_minimal();
 
         // Allocate the shared EmbeddedFile stream object.
@@ -1600,10 +1648,10 @@ mod tests {
             "shared stream must NOT be GC'd while fs_ref2 still references it"
         );
 
-        // fs_ref1 itself should be gone (it is no longer referenced).
+        // fs_ref1 is nulled in memory and is omitted by ordinary writer output.
         assert!(
-            !live.contains(&fs_ref1),
-            "removed filespec ref must be GC'd"
+            live.contains(&fs_ref1),
+            "removed filespec ref remains in memory before writer output"
         );
 
         // fs_ref2 must still be alive.
@@ -1611,6 +1659,12 @@ mod tests {
             live.contains(&fs_ref2),
             "surviving filespec ref must remain alive"
         );
+
+        let mut written = rewritten(&mut pdf);
+        assert_eq!(count_embedded_file_streams(&mut written), 1);
+        let entries = list_embedded_files(&mut written).expect("list rewritten attachments");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"shared2.txt");
     }
 
     // ── Test: /Names present but /EmbeddedFiles absent → empty ────────────────
@@ -1689,8 +1743,8 @@ mod tests {
             .get_key(b"/Names")
             .shallow_copy()
             .expect("copy direct names");
-        // /Dests as a small inline dict: survives the post-removal sweep because
-        // it is owned by the (still-reachable) terminal names dict.
+        // /Dests as a small inline dict: survives writer output because it is
+        // owned by the (still-reachable) terminal names dict.
         terminal
             .replace_key(
                 b"/Dests",

@@ -1165,8 +1165,8 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // only through a dropped widget's `/P`. This mirrors the removed-dest
         // null-out above: the page never appears in `/Kids`, and nulling its
         // body (rather than leaving a live `/Type /Page`) keeps the merged form
-        // internally consistent. `sweep_unreachable_objects` later GCs the
-        // placeholder once no surviving reference points at it.
+        // internally consistent. The merge-only reachability sweep later GCs
+        // the placeholder once no surviving reference points at it.
         for src_page_ref in &orphan_pages {
             if let Some(&new_ref) = map.get(src_page_ref) {
                 target.replace_object(new_ref, ObjectHandle::null())?;

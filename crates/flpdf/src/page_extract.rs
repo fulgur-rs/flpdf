@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only.
-//! Page extraction into a fresh minimal document.
+//! Page extraction into a fresh document.
 //!
-//! [`extract_pages`] builds a brand-new minimal [`Pdf`] (via [`Pdf::empty`])
+//! [`extract_pages`] builds a brand-new [`Pdf`] (via [`Pdf::empty`])
 //! containing the selected pages from `source` plus their reachable object
 //! graph, copied across documents; [`extract_page`] is the single-page
 //! convenience form. This mirrors the qpdf *library* pattern of
@@ -53,13 +53,12 @@
 
 use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::pages::page_refs;
-use crate::writer::reachability::sweep_unreachable_objects;
 use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
 /// Extract the pages at `page_indices` (0-based) from `source` into a
-/// brand-new minimal document.
+/// brand-new document.
 ///
 /// Returns an owned in-memory [`Pdf`] whose catalog has a single-level
 /// `/Pages` tree with one `/Kids` entry per selected index, in **selection
@@ -74,11 +73,10 @@ use std::io::{Cursor, Read, Seek};
 /// `/Resources`, `/Annots`, `/B`) stay shared between the duplicates,
 /// matching qpdf 11.9.0's observed duplicate-page output.
 ///
-/// The returned document is already minimal: the canonical foreign copier's
-/// `/Pages` boundary is attached to the fresh single-level root, and a
-/// mark-and-sweep from the new catalog removes any other unreachable
-/// construction objects before returning. Write it with [`crate::PdfWriter`],
-/// which always emits a fresh qpdf-style document rewrite.
+/// The returned document has the selected page graph attached to a fresh
+/// single-level root. Construction-only objects may remain in its in-memory
+/// object table until [`crate::PdfWriter`] serializes it; the writer then
+/// emits only the objects allowed by its qpdf-style reachability policy.
 ///
 /// See also [`extract_page`] for the single-page form, and the [module
 /// documentation](self) for qpdf's source-side inherited-attribute
@@ -212,11 +210,6 @@ pub fn extract_pages<R: Read + Seek>(
         }
     }
 
-    // The canonical handle mutations above built the fresh single-level
-    // /Pages root. Drop any objects that were made unreachable by that rebuild
-    // before handing the graph to the canonical writer.
-    sweep_unreachable_objects(&mut target)?;
-
     Ok(target)
 }
 
@@ -241,8 +234,7 @@ pub(crate) fn null_copied_removed_pages<R: Read + Seek>(
     Ok(())
 }
 
-/// Extract page `page_index` (0-based) from `source` into a brand-new minimal
-/// document.
+/// Extract page `page_index` (0-based) from `source` into a brand-new document.
 ///
 /// Single-page convenience form of [`extract_pages`]: the returned document's
 /// catalog has a single-level `/Pages` tree with a single entry in `/Kids`.
