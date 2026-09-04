@@ -682,7 +682,6 @@ mod tests {
     use super::extract_attachment;
     use super::AttachmentAddOptions;
     use super::PipelineHandleSink;
-    use crate::job::attachment_list::list_attachment_info;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
     use crate::{Pdf, PdfOpenOptions, QPDFLogger};
@@ -972,31 +971,22 @@ mod tests {
 
         assert_eq!(page_mode(&mut pdf), Some(b"UseAttachments".to_vec()));
 
-        let attachments = list_attachment_info(&mut pdf).expect("list attachments");
-        assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].key, b"payload-key");
-        assert_eq!(attachments[0].display_name.as_deref(), Some("renamed.txt"));
         assert_eq!(
-            attachments[0].mimetype.as_deref(),
-            Some(b"text/plain".as_slice())
-        );
-        assert_eq!(
-            attachments[0].description.as_deref(),
-            Some(b"test description".as_slice())
-        );
-        assert_eq!(
-            attachments[0].creation_date.as_deref(),
-            Some(b"D:20240101120000Z".as_slice())
-        );
-        assert_eq!(
-            attachments[0].modification_date.as_deref(),
-            Some(b"D:20240102130000Z".as_slice())
+            job.list_attachments(&mut pdf, true)
+                .expect("list attachments"),
+            JobExitCode::Success
         );
 
         let info = info.lock().expect("info capture");
         let info = String::from_utf8_lossy(&info);
         assert!(info.contains("qpdf: attached "));
         assert!(info.contains(" as renamed.txt with key payload-key\n"));
+        assert!(info.contains("payload-key -> "));
+        assert!(info.contains("  description: test description\n"));
+        assert!(info.contains("  preferred name: renamed.txt\n"));
+        assert!(info.contains("      mime type: text/plain\n"));
+        assert!(info.contains("      creation date: D:20240101120000Z\n"));
+        assert!(info.contains("      modification date: D:20240102130000Z\n"));
     }
 
     #[cfg(unix)]
@@ -1074,7 +1064,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let attachment = dir.path().join("payload.txt");
         std::fs::write(&attachment, b"payload").expect("write payload");
-        let (mut job, _, _) = job_with_captures();
+        let (mut job, info, _) = job_with_captures();
         let mut pdf = job
             .open(
                 Cursor::new(bytes.to_vec()),
@@ -1099,15 +1089,15 @@ mod tests {
 
         assert_eq!(page_mode(&mut pdf), Some(b"UseNone".to_vec()));
 
-        let attachments = list_attachment_info(&mut pdf).expect("list attachments");
-        assert!(attachments[0]
-            .creation_date
-            .as_deref()
-            .is_some_and(|date| date.starts_with(b"D:")));
         assert_eq!(
-            attachments[0].creation_date, attachments[0].modification_date,
-            "qpdf uses one current timestamp for both default dates"
+            job.list_attachments(&mut pdf, true)
+                .expect("list attachments"),
+            JobExitCode::Success
         );
+        let info = info.lock().expect("info capture");
+        let info = String::from_utf8_lossy(&info);
+        assert!(info.contains("      creation date: D:"), "{info:?}");
+        assert!(info.contains("      modification date: D:"), "{info:?}");
     }
 
     #[test]
@@ -1170,7 +1160,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let attachment = dir.path().join("payload.txt");
         std::fs::write(&attachment, b"payload").expect("write payload");
-        let (mut job, _, _) = job_with_captures();
+        let (mut job, info, _) = job_with_captures();
         let mut pdf = job
             .open(
                 Cursor::new(bytes.to_vec()),
@@ -1183,11 +1173,14 @@ mod tests {
 
         job.add_attachment(&mut pdf, options)
             .expect("library boundary must not validate mimetype syntax");
-        let attachments = list_attachment_info(&mut pdf).expect("list attachments");
         assert_eq!(
-            attachments[0].mimetype.as_deref(),
-            Some(b"textplain".as_slice())
+            job.list_attachments(&mut pdf, true)
+                .expect("list attachments"),
+            JobExitCode::Success
         );
+        let info = info.lock().expect("info capture");
+        let info = String::from_utf8_lossy(&info);
+        assert!(info.contains("      mime type: textplain\n"), "{info:?}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams, Pass
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_qpdf_writer_version, PdfVersion, QpdfVersionParts, PDF_1_5};
 use crate::pipeline::{flate::Flate, Pipeline, PlString};
-use crate::{filters, Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -1036,7 +1036,7 @@ pub enum CompressStreams {
 ///
 /// | Variant      | Equivalent `CompressStreams` | Behaviour |
 /// |-------------|-------------------------------|-----------|
-/// | `Preserve`  | bypass (no decode/re-encode)  | Pass dict + raw data verbatim; `apply_stream_compress_policy` is not called |
+/// | `Preserve`  | bypass (no decode/re-encode)  | Pass dict + raw data verbatim; the canonical writer filter route is not called |
 /// | `Uncompress`| `CompressStreams::No`         | Decode through all declared filters, emit raw bytes without any `/Filter` |
 /// | `Compress`  | `CompressStreams::Yes`        | Decode, then re-encode with a single `/FlateDecode` filter |
 ///
@@ -1063,7 +1063,7 @@ pub enum StreamDataMode {
     /// Pass streams through verbatim — no decode or re-encode.
     ///
     /// The stream dictionary and raw data bytes are emitted unchanged.  This
-    /// bypasses [`apply_stream_compress_policy`] entirely, so a stream carrying
+    /// bypasses the canonical stream filter route entirely, so a stream carrying
     /// `/Filter /FlateDecode` will still carry that filter in the output.
     Preserve,
     /// Decode and emit raw bytes without any `/Filter`.
@@ -1081,9 +1081,9 @@ pub enum StreamDataMode {
 
 /// Compute the effective stream policy for regular indirect streams.
 ///
-/// Returns `Some(policy)` meaning "call `apply_stream_compress_policy` with
-/// this policy", or `None` meaning "preserve mode: skip decode/re-encode and
-/// emit the stream verbatim".
+/// Returns `Some(policy)` meaning "the canonical writer stream route should
+/// apply this policy", or `None` meaning "preserve mode: skip decode/re-encode
+/// and emit the stream verbatim".
 ///
 /// # Priority
 ///
@@ -5528,231 +5528,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     Ok(WriterResult::new(emitted_old_to_new, written_xref))
 }
 
-/// Apply the stream compression policy to a single stream object.
-///
-/// This is the choke-point for re-emitting **regular indirect stream
-/// objects** in the canonical rewrite path. The cross-reference stream and
-/// object-stream (ObjStm) containers apply the same `CompressStreams`
-/// policy on their own dedicated branches (the xref-stream branch below
-/// and `object_streams::wrap_objstm_body`); they do not flow through
-/// this function. QDF mode is exempt because it has its own stream framing and
-/// decode policy.
-///
-/// # Policy: `CompressStreams::Yes` (default)
-///
-/// Decode the stream through its declared filter pipeline and re-encode with a
-/// single `/FlateDecode` filter.  This matches qpdf's default passthrough mode.
-///
-/// Streams whose decode succeeds but re-encode fails (vanishingly rare for
-/// in-memory zlib) are returned verbatim.
-///
-/// # Policy: `CompressStreams::No`
-///
-/// Decode the stream and emit the raw bytes without any `/Filter`.  The
-/// filter-related keys (`/Filter`, `/DecodeParms`, `/F`, `/FFilter`,
-/// `/FDecodeParms`) are stripped from the output dictionary.
-///
-/// # Fallback for unsupported / corrupt inputs
-///
-/// When `decode_stream_data` returns an error — e.g. because the declared
-/// filter is a lossy codec below `DecodeLevel::All`, an unsupported image
-/// codec, or because the stream data is corrupt — the stream's `/Filter`
-/// chain and data bytes are returned **verbatim**.  This preserves
-/// readability: a PDF reader that understands the codec can still decode the
-/// stream, and we do not corrupt the data by emitting uninterpreted bytes
-/// under a wrong (or missing) filter declaration.  The one normalization
-/// applied even on this path is `/Length`: qpdf writes every emitted stream's
-/// `/Length` as a direct integer (the raw byte count), never an indirect
-/// reference, so a source carrying `/Length M G R` has it directized to
-/// `data.len()` here (the data bytes are untouched, so the value is unchanged
-/// for a well-formed direct length).
-///
-/// # Byte-vs-observable note
-///
-/// For `CompressStreams::Yes`, flpdf's FlateDecode output uses
-/// `flate2::Compression::default()`, which selects different compression
-/// parameters than qpdf's internal zlib build.  The decoded bytes are
-/// identical to qpdf's, but the raw compressed bytes differ.  This is
-/// intentional: byte-identical agreement with qpdf is not a goal for this
-/// toggle.
-/// See [`CompressStreams`] for the full policy statement.
-pub fn apply_stream_compress_policy(
-    stream: &ObjectHandle,
-    policy: CompressStreams,
-) -> Result<ObjectHandle> {
-    // This public helper predates PdfWriter's decode-level setting. Preserve
-    // its contract of decoding every filter implemented by flpdf; only the
-    // private PdfWriter bridge applies the configured qpdf decode-level gate.
-    apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All, false)
-}
-
-fn apply_stream_compress_policy_with_decode_level(
-    stream: &ObjectHandle,
-    policy: CompressStreams,
-    decode_level: DecodeLevel,
-    normalize_content: bool,
-) -> Result<ObjectHandle> {
-    let stream_dict = stream
-        .as_stream_dict()
-        .ok_or_else(|| Error::Unsupported("object is not a stream".to_owned()))?;
-    let data = stream.get_raw_stream_data()?;
-    let decodable =
-        filter_chain_is_decodable(&stream_dict, policy, decode_level, normalize_content)?;
-    if !decodable {
-        let dict = stream_dictionary_copy(&stream_dict);
-        dict.replace_key(
-            b"/Length",
-            ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
-        )?; // cov:ignore: LLVM maps this covered passthrough replacement continuation to cleanup
-        return Ok(ObjectHandle::stream(dict, data));
-    }
-
-    // A filter above the selected level has already returned through the raw
-    // chain-preservation branch above, matching qpdf's all-or-nothing gate.
-    // For an in-level chain, `decode_stream_data` is the single owner of
-    // `/DecodeParms` shape alignment and per-filter parameter validation (the
-    // responsibility corresponding to QPDF_Stream::filterable). Keep that
-    // validation in the existing decoder instead of duplicating its parser
-    // here; any resulting Err takes the raw-preservation fallback below.
-    let decoded = match filters::decode_stream_data(&stream_dict, &data) {
-        Ok(d) => d,
-        Err(_) => {
-            // Decode failure (unsupported codec or corrupt data): emit the data
-            // and /Filter chain verbatim so downstream readers (e.g. image
-            // renderers) can still interpret the stream correctly. qpdf, however,
-            // writes EVERY emitted stream's /Length as a direct integer, never an
-            // indirect reference; directize it here so a source carrying
-            // `/Length M G R` does not leak an indirect /Length (and a renumbered
-            // holder reference) into the output — a byte divergence from qpdf for
-            // passthrough/non-decodable streams whose length holder is kept live
-            // by another reference. The data bytes are untouched, so
-            // /Length equals stream.data.len().
-            let dict = stream_dictionary_copy(&stream_dict);
-            dict.replace_key(
-                b"/Length",
-                ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
-            )?; // cov:ignore: LLVM maps this covered decode-failure replacement continuation to cleanup
-            return Ok(ObjectHandle::stream(dict, data));
-        }
-    };
-    let decoded = if normalize_content {
-        crate::normalize_content_stream(&decoded).into_bytes()
-    } else {
-        decoded
-    };
-
-    // Build a new dict: strip all filter-related keys, update /Length.
-    // `/F` carries an external-file reference for the stream data, so we
-    // strip it as well — otherwise readers may try to load the old external
-    // file instead of the new embedded stream we just produced.
-    let new_dict = stream_dictionary_copy(&stream_dict);
-    new_dict.remove_key(b"/Filter");
-    new_dict.remove_key(b"/DecodeParms");
-    new_dict.remove_key(b"/F");
-    new_dict.remove_key(b"/FFilter");
-    new_dict.remove_key(b"/FDecodeParms");
-
-    match policy {
-        CompressStreams::Yes => {
-            // Re-encode with a minimal FlateDecode dict.  If encoding fails
-            // (vanishingly rare for in-memory zlib), keep the original stream
-            // verbatim — declaring /FlateDecode on uncompressed bytes would
-            // produce an unreadable PDF.
-            let encode_dict = ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            )]);
-            let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
-                Ok(e) => e,
-                Err(_) => return Ok(ObjectHandle::stream(new_dict, data)), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
-            };
-
-            // Always apply FlateDecode — even if the encoded result is larger
-            // than the raw data (which can happen for small streams).  This
-            // guarantees a single well-known filter regardless of stream size.
-            new_dict.replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))?;
-            new_dict.replace_key(
-                b"/Length",
-                ObjectHandle::integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
-            )?; // cov:ignore: LLVM maps this covered Flate length replacement continuation to cleanup
-            Ok(ObjectHandle::stream(new_dict, Rc::new(encoded)))
-        }
-        CompressStreams::No => {
-            // Emit raw (decoded) bytes without any filter.
-            new_dict.replace_key(
-                b"/Length",
-                ObjectHandle::integer(i64::try_from(decoded.len()).unwrap_or(i64::MAX)),
-            )?; // cov:ignore: LLVM maps this covered uncompressed length replacement continuation to cleanup
-            Ok(ObjectHandle::stream(new_dict, Rc::new(decoded)))
-        }
-    }
-}
-
-fn stream_dictionary_copy(dictionary: &ObjectHandle) -> ObjectHandle {
-    ObjectHandle::dictionary(
-        dictionary
-            .as_dictionary()
-            .unwrap_or_default()
-            .into_iter()
-            .collect(),
-    )
-}
-
-/// Apply qpdf's decode-level gate to the entire filter chain. qpdf does not
-/// partially decode a chain: one filter above the selected level, or one
-/// filter it cannot filter, makes the complete chain non-filterable.
-///
-/// `QPDF_Stream.cc:504-512,537-542` makes one important distinction: a
-/// compress or content-normalization request supplies an encode flag, so
-/// generalized filters are filterable even at decode level `none`; a plain
-/// uncompress request at `none` preserves them. Specialized filters remain
-/// gated by the selected level in every policy. Lossy `/DCTDecode` is admitted
-/// only at `DecodeLevel::All`, matching `QPDF_Stream::pipeStreamData`.
-fn filter_chain_is_decodable(
-    dictionary: &ObjectHandle,
-    policy: CompressStreams,
-    decode_level: DecodeLevel,
-    normalize_content: bool,
-) -> Result<bool> {
-    let filter = dictionary.try_get_key(b"/Filter")?;
-    if filter.is_null() {
-        return Ok(true);
-    }
-    let filters = if let Some(name) = filter.try_as_name()? {
-        vec![ObjectHandle::name(name)]
-    } else if let Some(filters) = filter.try_as_array()? {
-        filters
-    } else {
-        return Ok(false);
-    };
-
-    filters.iter().try_fold(true, |allowed, filter| {
-        let Some(name) = filter.try_as_name()? else {
-            return Ok(false);
-        };
-        let name = match name.as_slice() {
-            b"Fl" => b"FlateDecode".as_slice(),
-            b"LZW" => b"LZWDecode".as_slice(),
-            b"A85" => b"ASCII85Decode".as_slice(),
-            b"AHx" => b"ASCIIHexDecode".as_slice(),
-            b"RL" => b"RunLengthDecode".as_slice(),
-            b"DCT" => b"DCTDecode".as_slice(),
-            name => name,
-        };
-        match name {
-            b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode" | b"ASCIIHexDecode" => Ok(allowed
-                && (!matches!(decode_level, DecodeLevel::None)
-                    || policy == CompressStreams::Yes
-                    || normalize_content)),
-            b"RunLengthDecode" => {
-                Ok(allowed && matches!(decode_level, DecodeLevel::Specialized | DecodeLevel::All))
-            }
-            b"DCTDecode" => Ok(allowed && matches!(decode_level, DecodeLevel::All)),
-            _ => Ok(false),
-        }
-    })
-}
-
 /// Collect the immediate `/Contents` containers that can hold direct streams.
 /// Indirect streams are tracked separately by [`collect_content_stream_refs`].
 /// The qpdf writer inspects the page value and one array level; it does not
@@ -5822,17 +5597,6 @@ mod final_handle_writer_tests {
     use crate::encryption::standard::ObjectKeyAlg;
     use crate::encryption::CopyEncryptionSource;
     use std::io::Cursor;
-
-    fn stream_with_filter(filter: Option<&[u8]>, data: Vec<u8>) -> ObjectHandle {
-        let mut entries = vec![(
-            b"/Length".to_vec(),
-            ObjectHandle::integer(data.len() as i64),
-        )];
-        if let Some(filter) = filter {
-            entries.push((b"/Filter".to_vec(), ObjectHandle::name(filter.to_vec())));
-        }
-        ObjectHandle::stream(ObjectHandle::dictionary(entries), Rc::new(data))
-    }
 
     #[test]
     fn minimum_version_replaces_an_unusable_existing_internal_value() {
@@ -6065,101 +5829,6 @@ mod final_handle_writer_tests {
     }
 
     #[test]
-    fn stream_compression_policy_handles_public_and_private_routes() {
-        let plain = stream_with_filter(None, b"q 1 0 cm\n".to_vec());
-        let uncompressed = apply_stream_compress_policy(&plain, CompressStreams::No)
-            .expect("an unfiltered stream can be emitted without compression");
-        assert!(uncompressed
-            .as_stream_dict()
-            .expect("stream dictionary")
-            .try_get_key(b"/Filter")
-            .expect("filter lookup")
-            .is_null());
-        assert_eq!(
-            uncompressed
-                .get_raw_stream_data()
-                .expect("stream data")
-                .as_ref(),
-            b"q 1 0 cm\n"
-        );
-
-        let compressed = apply_stream_compress_policy(&plain, CompressStreams::Yes)
-            .expect("an unfiltered stream can be compressed");
-        assert_eq!(
-            compressed
-                .as_stream_dict()
-                .expect("stream dictionary")
-                .try_get_key(b"/Filter")
-                .expect("filter lookup")
-                .as_name(),
-            Some(b"FlateDecode".to_vec())
-        );
-        assert_eq!(
-            filters::decode_stream_data(
-                &compressed.as_stream_dict().expect("stream dictionary"),
-                &compressed.get_raw_stream_data().expect("stream data"),
-            )
-            .expect("compressed payload decodes"),
-            b"q 1 0 cm\n"
-        );
-
-        let flate_dictionary = ObjectHandle::dictionary(vec![
-            (
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            ),
-            (b"/Length".to_vec(), ObjectHandle::integer(8)),
-        ]);
-        let encoded =
-            filters::encode_stream_data(&flate_dictionary, b"decoded").expect("flate encoder");
-        let flate = ObjectHandle::stream(flate_dictionary, Rc::new(encoded));
-        let preserved = apply_stream_compress_policy_with_decode_level(
-            &flate,
-            CompressStreams::No,
-            DecodeLevel::None,
-            false,
-        )
-        .expect("decode-level none preserves a gated filter chain");
-        assert_eq!(
-            preserved
-                .as_stream_dict()
-                .expect("stream dictionary")
-                .try_get_key(b"/Filter")
-                .expect("filter lookup")
-                .as_name(),
-            Some(b"FlateDecode".to_vec())
-        );
-
-        let corrupt = stream_with_filter(Some(b"FlateDecode"), b"not-flate".to_vec());
-        let passthrough = apply_stream_compress_policy_with_decode_level(
-            &corrupt,
-            CompressStreams::No,
-            DecodeLevel::All,
-            false,
-        )
-        .expect("corrupt data follows qpdf's raw-preservation path");
-        assert_eq!(
-            passthrough
-                .get_raw_stream_data()
-                .expect("raw stream data")
-                .as_ref(),
-            b"not-flate"
-        );
-
-        let normalized = apply_stream_compress_policy_with_decode_level(
-            &plain,
-            CompressStreams::No,
-            DecodeLevel::None,
-            true,
-        )
-        .expect("content normalization remains available on an unfiltered stream");
-        assert!(!normalized
-            .get_raw_stream_data()
-            .expect("normalized stream data")
-            .is_empty());
-    }
-
-    #[test]
     fn pdf_writer_compression_level_changes_recompressed_output() {
         let _guard = crate::pipeline::flate::lock_compression_level_for_tests();
 
@@ -6284,128 +5953,6 @@ mod final_handle_writer_tests {
             "querying get_final_version on one writer must not change another \
              default writer's compressed output"
         );
-    }
-
-    #[test]
-    fn filter_chain_gate_covers_qpdf_filter_aliases_and_levels() {
-        for name in [
-            b"FlateDecode".as_slice(),
-            b"Fl".as_slice(),
-            b"LZWDecode".as_slice(),
-            b"LZW".as_slice(),
-            b"ASCII85Decode".as_slice(),
-            b"A85".as_slice(),
-            b"ASCIIHexDecode".as_slice(),
-            b"AHx".as_slice(),
-        ] {
-            let dictionary = ObjectHandle::dictionary(vec![(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(name.to_vec()),
-            )]);
-            assert!(filter_chain_is_decodable(
-                &dictionary,
-                CompressStreams::No,
-                DecodeLevel::Generalized,
-                false,
-            )
-            .expect("generalized filter gate"));
-        }
-
-        let run_length = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"RL".to_vec()),
-        )]);
-        assert!(!filter_chain_is_decodable(
-            &run_length,
-            CompressStreams::No,
-            DecodeLevel::Generalized,
-            false,
-        )
-        .expect("run-length generalized gate"));
-        assert!(filter_chain_is_decodable(
-            &run_length,
-            CompressStreams::No,
-            DecodeLevel::Specialized,
-            false,
-        )
-        .expect("run-length specialized gate"));
-
-        let dct = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"DCT".to_vec()),
-        )]);
-        assert!(!filter_chain_is_decodable(
-            &dct,
-            CompressStreams::No,
-            DecodeLevel::Specialized,
-            false,
-        )
-        .expect("DCT specialized gate"));
-        assert!(
-            filter_chain_is_decodable(&dct, CompressStreams::No, DecodeLevel::All, false,)
-                .expect("DCT all gate")
-        );
-
-        let none = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"UnknownDecode".to_vec()),
-        )]);
-        assert!(
-            !filter_chain_is_decodable(&none, CompressStreams::No, DecodeLevel::All, false,)
-                .expect("unknown filter gate")
-        );
-
-        let malformed =
-            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
-        assert!(!filter_chain_is_decodable(
-            &malformed,
-            CompressStreams::No,
-            DecodeLevel::All,
-            false,
-        )
-        .expect("malformed filter gate"));
-
-        let array = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::array(vec![ObjectHandle::name(b"Fl".to_vec())]),
-        )]);
-        assert!(filter_chain_is_decodable(
-            &array,
-            CompressStreams::No,
-            DecodeLevel::Generalized,
-            false,
-        )
-        .expect("array filter gate"));
-        let array_with_scalar = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
-        )]);
-        assert!(!filter_chain_is_decodable(
-            &array_with_scalar,
-            CompressStreams::No,
-            DecodeLevel::All,
-            false,
-        )
-        .expect("array scalar filter gate"));
-
-        let generalized = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"FlateDecode".to_vec()),
-        )]);
-        assert!(filter_chain_is_decodable(
-            &generalized,
-            CompressStreams::Yes,
-            DecodeLevel::None,
-            false,
-        )
-        .expect("compression enables generalized filtering at decode none"));
-        assert!(filter_chain_is_decodable(
-            &generalized,
-            CompressStreams::No,
-            DecodeLevel::None,
-            true,
-        )
-        .expect("normalization enables generalized filtering at decode none"));
     }
 
     #[test]

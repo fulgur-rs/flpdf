@@ -1,12 +1,9 @@
 //! qpdf correspondence: QPDFJob.cc attachment enumeration and display formatting.
 //! Structured enumeration and formatted display of PDF attachments.
 //!
-//! Two independent views of a document's embedded files live here:
-//!
-//! * [`list_attachment_info`] returns a structured [`AttachmentInfo`] per
-//!   attachment, for programs that want the metadata rather than a rendering.
-//! * [`format_attachment_list`] reproduces the listing `qpdf
-//!   --list-attachments [--verbose]` writes to its info log.
+//! `QPDFJob::list_attachments` owns the public inspection route. It delegates
+//! the qpdf-compatible byte rendering to [`format_attachment_list_with_sink`],
+//! which is retained as the sink boundary for the job's logger.
 //!
 //! # Listing format
 //!
@@ -38,23 +35,11 @@
 //! Absent values render as an empty string after the label — the label and its
 //! single trailing space are still written, as in the `mime type:` line above.
 //!
-//! # Example
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::{BufReader, Write};
-//! use flpdf::{format_attachment_list, Pdf};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("with-attachments.pdf")?))?;
-//! match format_attachment_list(&mut pdf, false)? {
-//!     Some(listing) => std::io::stdout().write_all(&listing)?,
-//!     None => println!("with-attachments.pdf has no embedded files"),
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! The structured [`AttachmentInfo`] type remains for the separate public API
+//! visibility decision tracked by `flpdf-xsq1`; the qpdf job listing itself is
+//! intentionally the only supported inspection consumer here.
 
 use super::checksum_to_hex;
-use crate::embedded_files::list_embedded_files;
 use crate::filespec_helper::{EmbeddedFileStream, FileSpec};
 use crate::object_handle::ObjectHandle;
 use crate::{ObjectRef, Pdf, Result};
@@ -96,157 +81,13 @@ pub struct AttachmentInfo {
     pub checksum: Option<Vec<u8>>,
 }
 
-// ── UTF-16BE decoder ──────────────────────────────────────────────────────────
-
-/// Decode a PDF text string (ISO 32000-1 §7.9.2) to a UTF-8 `String` for
-/// display.
-///
-/// Delegates to the single canonical decoder
-/// [`crate::json_inspect::decode_pdf_text_string`], which handles UTF-16BE /
-/// UTF-16LE BOM-prefixed strings **and** the full PDFDocEncoding table
-/// (ISO 32000-1 Annex D.3) — so non-ASCII `/F`, `/UF`, and `/Desc` values are
-/// decoded correctly instead of being mangled by a lossy UTF-8 fallback
-/// (roborev #953).  If the bytes cannot be interpreted as a PDF text string,
-/// fall back to lossy UTF-8 so the listing still shows *something* rather than
-/// failing.
-fn decode_pdf_text_string(bytes: &[u8]) -> String {
-    crate::json_inspect::decode_pdf_text_string(bytes)
-        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
-}
-
-// ── list_attachment_info ──────────────────────────────────────────────────────
-
-/// Enumerate all attachments in `pdf` and return their structured metadata.
-///
-/// Iterates the `/Names /EmbeddedFiles` name tree via
-/// [`list_embedded_files`], then reads each `/Filespec` dictionary and its
-/// associated `/EmbeddedFile` stream for metadata.
-///
-/// An empty list is returned — without error — when the document has no
-/// embedded files.
-///
-/// For a runnable walkthrough see `examples/pull_attachments.rs`.
-///
-/// # Errors
-///
-/// Propagates any error from [`Pdf::resolve`] or the embedded-files walker.
-pub fn list_attachment_info<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Vec<AttachmentInfo>> {
-    let entries = list_embedded_files(pdf)?;
-    let mut out = Vec::with_capacity(entries.len());
-
-    for (key, filespec_ref) in entries {
-        let info = collect_one(pdf, key, filespec_ref)?;
-        out.push(info);
-    }
-
-    Ok(out)
-}
-
-/// Build an [`AttachmentInfo`] for a single `(key, filespec_ref)` pair.
-fn collect_one<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    key: Vec<u8>,
-    filespec_ref: ObjectRef,
-) -> Result<AttachmentInfo> {
-    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
-
-    // ── Display name: /UF preferred, fall back to /F ─────────────────────
-    let display_name: Option<String> = {
-        let uf_raw = fs.uf()?;
-        let f_raw = fs.filename()?;
-        match (uf_raw, f_raw) {
-            (Some(uf), _) => Some(decode_pdf_text_string(&uf)),
-            (None, Some(f)) => Some(decode_pdf_text_string(&f)),
-            (None, None) => None,
-        }
-    };
-
-    // ── Verbose fields from /Filespec ─────────────────────────────────────
-    let description = fs.description()?;
-    let af_relationship = fs.af_relationship()?;
-
-    // ── Metadata from /EmbeddedFile stream ────────────────────────────────
-    let (size, mimetype, creation_date, modification_date, checksum) = match fs.embedded_file()? {
-        Some(ef) => (
-            ef.size()?,
-            ef.mimetype()?,
-            ef.creation_date()?,
-            ef.modification_date()?,
-            ef.checksum()?,
-        ),
-        None => (None, None, None, None, None),
-    };
-
-    Ok(AttachmentInfo {
-        key,
-        filespec_ref,
-        display_name,
-        size,
-        mimetype,
-        creation_date,
-        modification_date,
-        description,
-        af_relationship,
-        checksum,
-    })
-}
-
-// ── format_attachment_list ────────────────────────────────────────────────────
-
-/// Render the `qpdf --list-attachments [--verbose]` listing for `pdf`.
-///
-/// Returns `None` when the document catalog has no `/Names /EmbeddedFiles`
-/// dictionary; callers report that case with the input file name, the way
-/// `qpdf` prints `<file> has no embedded files`.  A document that *does* carry
-/// an `/EmbeddedFiles` name tree returns `Some`, even when the tree is empty —
-/// an empty tree lists nothing and is not the "no embedded files" case.
-///
-/// The listing is returned as bytes, not [`String`]: names, descriptions and
-/// dates go through the same UTF-8 view qpdf uses for PDF strings, which may
-/// carry an explicit UTF-8 BOM followed by bytes that are not valid UTF-8.
-///
-/// Without `verbose` each attachment contributes only its header line, naming
-/// the name-tree key and the object/generation of the embedded file stream
-/// selected by [`FileSpec::get_embedded_file_stream`].  A filespec with no
-/// usable stream reports `0,0`.
-///
-/// With `verbose` the header is followed by `/Desc` (only when non-empty), the
-/// preferred name, every recognized name key, and one block per `/EF` entry
-/// carrying that stream's creation date, modification date, MIME type and
-/// hex-encoded checksum.  Absent values leave the text after the label empty.
-///
-/// # Errors
-///
-/// Propagates any error from the embedded-files name-tree walker or from
-/// resolving a `/Filespec`, `/EF` entry or embedded file stream.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use std::fs::File;
-/// # use std::io::{BufReader, Write};
-/// # use flpdf::{format_attachment_list, Pdf};
-/// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-/// if let Some(listing) = format_attachment_list(&mut pdf, true)? {
-///     std::io::stdout().write_all(&listing)?;
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn format_attachment_list<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    verbose: bool,
-) -> Result<Option<Vec<u8>>> {
-    format_attachment_list_with_sink(pdf, verbose, |_| Ok(()))
-}
-
 /// Format the attachment list while forwarding each emitted fragment to a
 /// caller-owned sink.
 ///
 /// qpdf writes attachment output directly to its info pipeline.  Keeping the
 /// sink boundary here lets the CLI preserve output already written when a
 /// later verbose metadata accessor throws (for example, the `creation date:`
-/// prefix before `getDict()` rejects a non-stream `/EF` value), while the
-/// ordinary [`format_attachment_list`] API continues to return one buffer.
+/// prefix before `getDict()` rejects a non-stream `/EF` value).
 pub fn format_attachment_list_with_sink<R, F>(
     pdf: &mut Pdf<R>,
     verbose: bool,
@@ -381,12 +222,45 @@ fn object_generation(handle: &ObjectHandle) -> String {
 mod tests {
     use super::*;
     use crate::embedded_files::insert_embedded_file;
-    use crate::filespec_helper::{
-        encode_utf16be, format_pdf_date, FileParamDates, FileSpecBuilder,
-    };
-    use crate::{ObjectHandle, ObjectRef, Pdf};
-    use std::io::Cursor;
+    use crate::filespec_helper::{encode_utf16be, FileParamDates, FileSpecBuilder};
+    use crate::job::QPDFJob;
+    use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
+    use crate::{Error, ObjectHandle, ObjectRef, Pdf, QPDFLogger};
+    use std::io::{Cursor, Read, Seek};
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    struct InfoCapture {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Pipeline for InfoCapture {
+        fn identifier(&self) -> &str {
+            "attachment-list test capture"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.bytes
+                .lock()
+                .map_err(|_| PipelineError::runtime("attachment-list capture mutex poisoned"))?
+                .extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn info_capture_exposes_the_pipeline_lifecycle() {
+        let mut capture = InfoCapture {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(capture.identifier(), "attachment-list test capture");
+        capture.write(b"lifecycle").expect("capture write");
+        capture.finish().expect("capture finish");
+    }
 
     // ── Minimal PDF fixture ───────────────────────────────────────────────────
 
@@ -456,16 +330,10 @@ mod tests {
             return;
         }
         let mut pdf = Pdf::open(std::io::BufReader::new(f.unwrap())).expect("open fixture");
-        let infos = list_attachment_info(&mut pdf).expect("list");
+        let listed = as_text(&listing(&mut pdf, false));
         assert!(
-            !infos.is_empty(),
-            "fixture must have at least one attachment"
-        );
-        // First entry must have a display name
-        let first = &infos[0];
-        assert!(
-            first.display_name.is_some(),
-            "display_name must be present for fixture attachment"
+            listed.contains("attachment.txt -> "),
+            "fixture must list at least one attachment: {listed:?}"
         );
     }
 
@@ -474,8 +342,11 @@ mod tests {
     #[test]
     fn empty_document_returns_empty_list() {
         let mut pdf = open_minimal();
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert!(infos.is_empty(), "no attachments → empty list");
+        assert_eq!(
+            listing(&mut pdf, false),
+            b"test.pdf has no embedded files\n",
+            "qpdf's canonical job route owns the no-attachments message"
+        );
     }
 
     // ── Filespec construction helpers ─────────────────────────────────────────
@@ -571,10 +442,27 @@ mod tests {
         params
     }
 
-    fn listing(pdf: &mut Pdf<Cursor<Vec<u8>>>, verbose: bool) -> Vec<u8> {
-        format_attachment_list(pdf, verbose)
-            .expect("format")
-            .expect("document has an EmbeddedFiles name tree")
+    fn run_listing<R: Read + Seek>(pdf: &mut Pdf<R>, verbose: bool) -> Result<Vec<u8>> {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(InfoCapture {
+            bytes: Arc::clone(&bytes),
+        })));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_input_name("test.pdf");
+        job.list_attachments(pdf, verbose)?;
+        let captured = bytes
+            .lock()
+            .map_err(|_| Error::Internal("attachment-list capture mutex poisoned".to_owned()))?
+            .clone();
+        Ok(captured)
+    }
+
+    fn listing<R: Read + Seek>(pdf: &mut Pdf<R>, verbose: bool) -> Vec<u8> {
+        run_listing(pdf, verbose).expect("list attachments")
     }
 
     fn as_text(bytes: &[u8]) -> String {
@@ -838,7 +726,7 @@ mod tests {
         filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"g.txt", filespec);
 
-        let error = format_attachment_list(&mut pdf, true)
+        let error = run_listing(&mut pdf, true)
             .expect_err("qpdf reads stream metadata after listing a raw non-stream /EF value");
         assert_eq!(
             error.to_string(),
@@ -852,11 +740,10 @@ mod tests {
     #[test]
     fn document_without_name_tree_returns_none() {
         let mut pdf = open_minimal();
-        assert!(
-            format_attachment_list(&mut pdf, true)
-                .expect("format")
-                .is_none(),
-            "no /Names /EmbeddedFiles is the caller's `has no embedded files` case"
+        assert_eq!(
+            listing(&mut pdf, true),
+            b"test.pdf has no embedded files\n",
+            "the canonical job route owns the no-embedded-files branch"
         );
     }
 
@@ -877,8 +764,8 @@ mod tests {
             .expect("mark catalog dirty");
 
         assert_eq!(
-            format_attachment_list(&mut pdf, true).expect("format"),
-            Some(Vec::new()),
+            listing(&mut pdf, true),
+            Vec::<u8>::new(),
             "an empty tree lists nothing, but the document does have the tree"
         );
     }
@@ -1029,14 +916,6 @@ mod tests {
         fs_dict.insert("EF", HandleDict::into_handle(ef_sub));
         attach(&mut pdf, b"only-f.txt", fs_dict);
 
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert_eq!(infos.len(), 1);
-        assert_eq!(
-            infos[0].display_name.as_deref(),
-            Some("only-f.txt"),
-            "/F must be used as display name when /UF is absent"
-        );
-
         let listed = as_text(&listing(&mut pdf, true));
         assert!(
             listed.contains("  preferred name: only-f.txt\n"),
@@ -1056,12 +935,10 @@ mod tests {
             .expect("build");
         insert_embedded_file(&mut pdf, b"hello.txt", fs_ref).expect("insert");
 
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert_eq!(infos.len(), 1);
-        assert_eq!(
-            infos[0].display_name.as_deref(),
-            Some("hello.txt"),
-            "/UF must decode to the original filename"
+        let listed = as_text(&listing(&mut pdf, true));
+        assert!(
+            listed.contains("  preferred name: hello.txt\n"),
+            "/UF must decode to the preferred display name: {listed:?}"
         );
     }
 
@@ -1076,9 +953,6 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
         insert_embedded_file(&mut pdf, b"chk.txt", fs_ref).expect("insert");
-
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert_eq!(infos.len(), 1);
 
         let verbose = as_text(&listing(&mut pdf, true));
         // The checksum line must contain lowercase hex, not raw bytes.
@@ -1118,33 +992,6 @@ mod tests {
             .expect("build");
         insert_embedded_file(&mut pdf, b"full.txt", fs_ref).expect("insert");
 
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-
-        assert_eq!(info.key, b"full.txt");
-        assert_eq!(info.display_name.as_deref(), Some("full.txt"));
-        assert_eq!(info.size, Some(12));
-        assert_eq!(
-            info.mimetype.as_deref(),
-            Some(b"text/plain".as_ref()),
-            "mimetype must match"
-        );
-        assert_eq!(
-            info.creation_date.as_deref(),
-            Some(format_pdf_date(2026, 1, 1, 0, 0, 0).as_slice()),
-        );
-        assert_eq!(
-            info.modification_date.as_deref(),
-            Some(format_pdf_date(2026, 6, 15, 12, 30, 0).as_slice()),
-        );
-        assert_eq!(
-            info.description.as_deref(),
-            Some(b"Full test attachment".as_ref())
-        );
-        assert_eq!(info.af_relationship.as_deref(), Some(b"Data".as_ref()));
-        assert!(info.checksum.is_some(), "checksum must be present");
-
         // The listing renders the same document through qpdf's layout.
         let formatted = as_text(&listing(&mut pdf, true));
         assert!(
@@ -1167,33 +1014,6 @@ mod tests {
             !formatted.contains("af relationship"),
             "qpdf's listing has no /AFRelationship line: {formatted:?}"
         );
-    }
-
-    // ── decode_pdf_text_string ────────────────────────────────────────────────
-
-    #[test]
-    fn decode_utf16be_bom() {
-        let bytes = encode_utf16be("hello");
-        assert_eq!(decode_pdf_text_string(&bytes), "hello");
-    }
-
-    #[test]
-    fn decode_ascii_fallback() {
-        let bytes = b"plain ascii".to_vec();
-        assert_eq!(decode_pdf_text_string(&bytes), "plain ascii");
-    }
-
-    // Non-ASCII PDFDocEncoding must decode via
-    // the canonical ISO 32000-1 Annex D.3 table, not a lossy UTF-8 cast.
-    #[test]
-    fn decode_non_ascii_pdfdocencoding() {
-        // 0x18 → U+02D8 BREVE (a PDF-specific PDFDocEncoding code point).
-        assert_eq!(decode_pdf_text_string(&[0x18]), "\u{02D8}");
-        // 0xE9 → U+00E9 'é' (PDFDocEncoding follows ISO-8859-1 in 0xA0..=0xFF).
-        assert_eq!(decode_pdf_text_string(&[0xE9]), "é");
-        // Mixed ASCII + non-ASCII PDFDocEncoding round-trips correctly rather
-        // than emitting U+FFFD replacement characters.
-        assert_eq!(decode_pdf_text_string(b"caf\xE9"), "café");
     }
 
     // The /Desc verbose output must decode PDF text

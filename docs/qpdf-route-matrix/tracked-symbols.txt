@@ -175,8 +175,6 @@ crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream    # C4
 crates/flpdf/src/filters.rs::stream_filter_capabilities                  # C8 filterable 第 2 実装
 crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle       # C9 filterable 第 3 実装
 crates/flpdf/src/encryption/keys.rs::per_object_key                      # C19 第 3 実装・caller 0
-crates/flpdf/src/writer.rs::apply_stream_compress_policy                 # C23 pub bridge
-crates/flpdf/src/writer.rs::apply_stream_compress_policy_with_decode_level  # C23
 crates/flpdf/src/json_inspect.rs::stream_payload_with_decode_status      # C25 第 2 実装
 crates/flpdf/src/filters.rs::decode_stream_data                          # C26
 crates/flpdf/src/filters.rs::decode_stream_data_from_handle              # C27
@@ -237,9 +235,7 @@ crates/flpdf/src/writer/plain/plan.rs::retain_reachable_object_stream_members   
 
 # --- (a) deletable route ---
 crates/flpdf-cli/src/main.rs::write_with_pdf_writer                      # E-4 CLI 直書き出し
-crates/flpdf/src/job/attachment_list.rs::format_attachment_list          # E-9 prod caller 0
 crates/flpdf/src/job/attachment_list.rs::format_attachment_list_with_sink # E-9
-crates/flpdf/src/job/attachment_list.rs::list_attachment_info            # E-9
 crates/flpdf/src/job/attachment_list.rs::AttachmentInfo                  # E-9
 crates/flpdf/src/job/json.rs::write_json                                 # E-24 free pub, prod caller 0
 crates/flpdf/src/job/acroform_field_prune.rs::prune_acroform_after_subset # E-26（free+method 合流）

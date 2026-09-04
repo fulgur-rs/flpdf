@@ -8,9 +8,8 @@ mod common;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 
-use flpdf::{
-    extract_attachment, insert_embedded_file, list_attachment_info, FileSpecBuilder, Pdf, PdfWriter,
-};
+use flpdf::job::QPDFJob;
+use flpdf::{extract_attachment, insert_embedded_file, FileSpecBuilder, Pdf, PdfWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build a base PDF, then attach two files using the library's own API.
@@ -36,12 +35,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .collect();
 
     // Re-open and pull each attachment back out, asserting the round-trip.
-    let mut pdf = Pdf::open(BufReader::new(File::open(&with_files)?))?;
-    let infos = list_attachment_info(&mut pdf)?;
+    let mut job = QPDFJob::new();
+    let mut pdf = job.open(
+        BufReader::new(File::open(&with_files)?),
+        "attach-src.pdf",
+        flpdf::PdfOpenOptions::default(),
+    )?;
+    let _status = job.list_attachments(&mut pdf, false)?;
     let mut pulled = 0usize;
-    for info in &infos {
-        let bytes = extract_attachment(&mut pdf, &info.key)?;
-        let name = info.display_name.as_deref().unwrap_or("<unnamed>");
+    for name in expected.keys().copied() {
+        let bytes = extract_attachment(&mut pdf, name.as_bytes())?;
         let want = expected
             .get(name)
             .unwrap_or_else(|| panic!("unexpected attachment name {name:?}"));
@@ -67,8 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// `FileSpecBuilder::build` only creates the `/Filespec` + `/EmbeddedFile`
 /// objects; the caller must register the returned ref in the document's
-/// `/Names /EmbeddedFiles` name tree (via `insert_embedded_file`) so that
-/// `list_attachment_info` finds it after a rewrite + re-open.
+/// `/Names /EmbeddedFiles` name tree (via `insert_embedded_file`) so that the
+/// canonical `QPDFJob::list_attachments` route finds it after a rewrite + re-open.
 fn attach<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     name: &str,
