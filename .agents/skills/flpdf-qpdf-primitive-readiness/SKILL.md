@@ -57,10 +57,13 @@ After reading the rule file:
    (no arguments), then retry `--print-path`. A tree with local edits or
    unverifiable git metadata exits 1 too, but the plain install form
    refuses that exact same tree for the same reason — do not retry it in
-   a loop. Follow the script's own printed remediation instead (it names
-   the exact recovery command for that case, such as discarding edits or
-   `--force`), or return `unknown` if that remediation is not something
-   this audit should perform unattended.
+   a loop. That tree is a shared reference repository outside the flpdf
+   tree, and discarding its local edits (via `--force` or any other
+   discard command the script names) destroys another developer's
+   uncommitted qpdf work; never run a discard command unattended. Stop
+   and ask the user for explicit approval of that specific destructive
+   command before running it, or return `unknown` if approval is not
+   available in this context.
 3. Read qpdf first. Identify the relevant classes, fields, public contracts,
    ownership, call order, default implementations, errors, and consumer
    boundary. Many audits are fully conclusive from source alone — a live
@@ -155,12 +158,15 @@ Return this structure with concrete content:
 
 ### Proposed Beads changes
 
-- Create/reuse: <one line per required primitive, or `none` for a plain
-  `ready` audit with no prerequisite — never invent a dependency to fill
-  this slot, and never collapse two independent missing primitives into
-  one entry; each primitive keeps its own line: complete issue draft, or
-  existing OPEN issue ID, or create-new/reopen-<ID> when the only match is
-  closed>
+- Create/reuse: <one line per primitive that needs prerequisite work —
+  missing, wrong-responsibility, or otherwise divergent — never one for a
+  primitive already assessed `equivalent` in the flpdf correspondence
+  table above; `none` when every required primitive is already
+  equivalent (including a plain `ready` audit with no prerequisite).
+  Never invent a dependency to fill this slot, and never collapse two
+  independent missing primitives into one entry; each keeps its own
+  line: complete issue draft, or existing OPEN issue ID, or
+  create-new/reopen-<ID> when the only match is closed>
 - Dependency: <one `bd dep add <audited> <prerequisite>` line per created
   or reused prerequisite above, or `none`>
 - Remove/reverse: <exact approved edge changes or none>
@@ -206,7 +212,13 @@ report. If context does not contain that report and approval, rerun phase 1.
    actual code, tests, and `docs/qpdf-correspondence.md`, not only the
    Beads issue text, and checking only a recorded revision hash would
    miss uncommitted working-tree edits to those tracked files. If
-   anything relevant changed, stop and present a revised plan.
+   anything changed that the approved plan does not already account for,
+   stop and present a revised plan. A prior phase-2 attempt's own partial
+   mutations — a prerequisite it already created, an edge it already
+   applied, notes it already appended, matching this same approved plan —
+   are not that kind of change: resuming into them is the retry this
+   skill requires (see Partial Failure and Retry), not new drift to
+   revise the plan for.
 2. For each approved prerequisite (there may be zero, one, or several — one
    per missing qpdf responsibility unit, never collapsed into a single
    issue): reuse it only if it is open. If the only match is closed and
@@ -220,10 +232,14 @@ report. If context does not contain that report and approval, rerun phase 1.
 3. Locate each created or reopened issue by its exact title and read it
    back with `bd show`. Never treat warning-laden `bd create` stdout as a
    bare ID. Skip this step when step 2 was skipped.
-4. Check the current dependency tree and `bd dep cycles`. Apply every
-   approved graph change — removals, reversals, and additions alike, not
-   only additions for a newly created prerequisite. A `ready` audit whose
-   only correction is an approved dependency reversal or removal (no new
+4. Check the current dependency tree and `bd dep cycles`. If this initial
+   check already reports a cycle, stop here and report it instead of
+   applying any graph change — a pre-existing cycle is not this audit's
+   approved change to fix, and applying more edges on top of it risks
+   compounding an already-broken graph. Otherwise apply every approved
+   graph change — removals, reversals, and additions alike, not only
+   additions for a newly created prerequisite. A `ready` audit whose only
+   correction is an approved dependency reversal or removal (no new
    prerequisite at all) still applies that change here; do not skip this
    step just because there was no prerequisite to create in step 2. The
    audited consumer depends on each prerequisite:
