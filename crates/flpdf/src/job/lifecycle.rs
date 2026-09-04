@@ -36,6 +36,19 @@ use std::rc::Rc;
 type ProgressHandler = Box<dyn FnMut(u8) -> Result<()> + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
 
+fn path_description_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 /// qpdf's `flattenAnnotations` job setting.
 ///
 /// The three modes map to the `required` and `forbidden` annotation flag masks
@@ -1227,6 +1240,7 @@ impl JobExitCode {
 pub struct QPDFJob {
     logger: QPDFLogger,
     input_name: String,
+    input_name_bytes: Vec<u8>,
     message_prefix: String,
     warnings: bool,
     suppress_warnings: bool,
@@ -1294,6 +1308,7 @@ impl QPDFJob {
         Self {
             logger: QPDFLogger::default_logger(),
             input_name: String::new(),
+            input_name_bytes: Vec::new(),
             message_prefix: "qpdf".to_owned(),
             warnings: false,
             suppress_warnings: false,
@@ -1346,13 +1361,31 @@ impl QPDFJob {
     /// using its own source name only for the update source. Callers that open
     /// a document outside this job may set it explicitly before an inspection.
     pub fn set_input_name(&mut self, input_name: impl Into<String>) {
-        self.input_name = input_name.into();
+        let input_name = input_name.into();
+        self.input_name_bytes = input_name.as_bytes().to_vec();
+        self.input_name = input_name;
     }
 
     /// Return the input name retained by this job.
     #[must_use]
     pub fn input_name(&self) -> &str {
         &self.input_name
+    }
+
+    /// Return the qpdf input name without a UTF-8 projection.
+    #[must_use]
+    pub fn input_name_bytes(&self) -> &[u8] {
+        &self.input_name_bytes
+    }
+
+    /// Set the qpdf input name from the byte-preserving argv/input boundary.
+    ///
+    /// The existing [`Self::input_name`] accessor remains a lossy display
+    /// projection for text-only callers; logger/report paths use this raw form
+    /// so Unix filenames are reproduced exactly.
+    pub fn set_input_name_bytes(&mut self, input_name: impl AsRef<[u8]>) {
+        self.input_name_bytes = input_name.as_ref().to_vec();
+        self.input_name = String::from_utf8_lossy(&self.input_name_bytes).into_owned();
     }
 
     /// Supply an input filename from the surrounding argv boundary before or
@@ -1364,7 +1397,7 @@ impl QPDFJob {
             )));
         }
         let input_file = input_file.into();
-        self.input_name = input_file.display().to_string();
+        self.set_input_name_bytes(path_description_bytes(&input_file));
         self.configuration.input_file = Some(input_file);
         Ok(())
     }
@@ -1586,11 +1619,12 @@ impl QPDFJob {
         }
 
         self.configuration = configuration;
-        self.input_name = self
+        let input_name = self
             .configuration
             .input_file
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
+        self.set_input_name(input_name);
         self.warnings = false;
         Ok(())
     }
@@ -1691,11 +1725,12 @@ impl QPDFJob {
         self.dispatch_job_json_document(&mut configuration, &value, &mut BTreeSet::new())?;
 
         self.configuration = configuration;
-        self.input_name = self
+        let input_name = self
             .configuration
             .input_file
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
+        self.set_input_name(input_name);
         self.warnings = false;
         if !partial {
             self.check_configuration()?;
@@ -2304,15 +2339,29 @@ impl QPDFJob {
         &mut self,
         source: R,
         input_name: impl Into<String>,
-        mut options: PdfOpenOptions,
+        options: PdfOpenOptions,
     ) -> Result<JobDocument>
     where
         R: Read + Seek + 'static,
     {
         let input_name = input_name.into();
-        self.input_name = input_name.clone();
+        self.open_document_with_description(source, input_name.as_bytes(), options)
+    }
+
+    /// Open a job-owned document with a byte-preserving input description.
+    pub fn open_document_with_description<R>(
+        &mut self,
+        source: R,
+        input_name: impl AsRef<[u8]>,
+        mut options: PdfOpenOptions,
+    ) -> Result<JobDocument>
+    where
+        R: Read + Seek + 'static,
+    {
+        let input_name = input_name.as_ref().to_vec();
+        self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
-        options.description = input_name.into_bytes();
+        options.description = input_name;
         // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
         // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
         // opens (`QPDFJob.cc:663-665`), not just the final completion
@@ -2350,6 +2399,7 @@ impl QPDFJob {
         options.description = b"empty PDF".to_vec();
         let mut pdf = crate::engine::open_empty_with_options_erased(options)?;
         self.input_name.clear();
+        self.input_name_bytes.clear();
         pdf.root_handle()?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
@@ -2366,7 +2416,7 @@ impl QPDFJob {
         S: Read + Seek + 'static,
     {
         let input_name = input_name.into();
-        self.input_name = input_name.clone();
+        self.set_input_name(input_name.clone());
         // See `create_empty_document`: qpdf applies `noWarn` to every
         // creation kind uniformly, including JSON-input.
         let mut options = self.configured_open_options(Vec::new());
@@ -2413,9 +2463,9 @@ impl QPDFJob {
                 }
             };
         }
-        match self.open_document(
+        match self.open_document_with_description(
             BufReader::new(file),
-            input.display().to_string(),
+            path_description_bytes(&input),
             self.configured_open_options(self.configuration.password.clone()),
         ) {
             Ok(pdf) => Ok(Some(pdf)),
@@ -2586,9 +2636,9 @@ impl QPDFJob {
             }
         };
         let options = self.configured_open_options(self.configuration.password.clone());
-        let pdf = match self.open_for_encryption_inspection(
+        let pdf = match self.open_for_encryption_inspection_with_description(
             BufReader::new(file),
-            input.display().to_string(),
+            path_description_bytes(&input),
             options,
         ) {
             Ok(pdf) => pdf,
@@ -3052,7 +3102,7 @@ impl QPDFJob {
     fn open_job_source(&mut self, path: &Path, password: &[u8]) -> Result<JobDocument> {
         let mut options = self.configured_open_options(password.to_vec());
         options.logger = Some(self.logger.clone());
-        options.description = path.display().to_string().into_bytes();
+        options.description = path_description_bytes(path);
         // `open_file_with_options` installs the qpdf-shaped reopenable source;
         // keep the job's warning policy on this secondary document exactly as
         // `open_document` does for the primary.
@@ -3414,7 +3464,7 @@ impl QPDFJob {
         S: Read + Seek + 'static,
     {
         let input_name = input_name.into();
-        self.input_name = input_name.clone();
+        self.set_input_name(input_name.clone());
         let pdf = Pdf::create_from_json_with_options(
             source,
             input_name,
@@ -3439,15 +3489,30 @@ impl QPDFJob {
         &mut self,
         source: R,
         input_name: impl Into<String>,
-        mut options: PdfOpenOptions,
+        options: PdfOpenOptions,
     ) -> Result<Pdf<R>>
     where
         R: Read + Seek,
     {
         let input_name = input_name.into();
-        self.input_name = input_name.clone();
+        self.open_with_description(source, input_name.as_bytes(), options)
+    }
+
+    /// Open a document with a qpdf input description that may contain raw
+    /// Unix argv/path bytes.
+    pub fn open_with_description<R>(
+        &mut self,
+        source: R,
+        input_name: impl AsRef<[u8]>,
+        mut options: PdfOpenOptions,
+    ) -> Result<Pdf<R>>
+    where
+        R: Read + Seek,
+    {
+        let input_name = input_name.as_ref().to_vec();
+        self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
-        options.description = input_name.into_bytes();
+        options.description = input_name;
         let mut pdf = Pdf::open_with_options(source, options)?;
         // qpdf's createQPDF calls getVersionAsPDFVersion immediately after
         // processFile; that path enters getExtensionLevel and therefore
@@ -3466,15 +3531,30 @@ impl QPDFJob {
         &mut self,
         source: R,
         input_name: impl Into<String>,
-        mut options: PdfOpenOptions,
+        options: PdfOpenOptions,
     ) -> Result<Pdf<R>>
     where
         R: Read + Seek,
     {
         let input_name = input_name.into();
-        self.input_name = input_name.clone();
+        self.open_for_encryption_inspection_with_description(source, input_name.as_bytes(), options)
+    }
+
+    /// Open for encryption inspection with a byte-preserving input
+    /// description.
+    pub fn open_for_encryption_inspection_with_description<R>(
+        &mut self,
+        source: R,
+        input_name: impl AsRef<[u8]>,
+        mut options: PdfOpenOptions,
+    ) -> Result<Pdf<R>>
+    where
+        R: Read + Seek,
+    {
+        let input_name = input_name.as_ref().to_vec();
+        self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
-        options.description = input_name.into_bytes();
+        options.description = input_name;
         let mut pdf = Pdf::open_for_encryption_inspection(source, options)?;
         // `--password-is-hex-key` (raw key) authentication intentionally
         // leaves both user/owner password-match flags false on success --

@@ -553,3 +553,161 @@ fn qpdf_differential_classifies_existing_native_open_error_text_gap() {
         "native I/O error formatting is an existing oracle mismatch, not a logger route mismatch"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_accepts_a_non_utf8_input_path_without_panicking() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let directory = tempfile::tempdir().expect("temporary source directory");
+    let input = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"input-\xff.pdf".to_vec()));
+    std::fs::copy(MINIMAL, &input).expect("copy fixture to non-UTF-8 path");
+
+    let output = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--check")
+        .arg(&input)
+        .output()
+        .expect("run flpdf");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "non-UTF-8 argv must not panic: {:?}",
+        output.stderr
+    );
+    let input_bytes = input.as_os_str().as_bytes();
+    assert!(
+        output
+            .stdout
+            .windows(input_bytes.len())
+            .any(|window| window == input_bytes),
+        "check output must preserve the raw input path: {:?}",
+        output.stdout
+    );
+    assert!(
+        !output
+            .stdout
+            .windows(3)
+            .any(|window| window == b"\xef\xbf\xbd"),
+        "check output must not replace the raw input path with U+FFFD: {:?}",
+        output.stdout
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_reports_a_non_utf8_missing_path_without_panicking() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let directory = tempfile::tempdir().expect("temporary source directory");
+    let input = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"missing-\xff.pdf".to_vec()));
+
+    let output = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg("--check")
+        .arg(&input)
+        .output()
+        .expect("run flpdf");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing input must be a CLI error, not a panic: {:?}",
+        output.stderr
+    );
+    let input_bytes = input.as_os_str().as_bytes();
+    assert!(
+        output
+            .stderr
+            .windows(input_bytes.len())
+            .any(|window| window == input_bytes),
+        "open errors must preserve the raw input path: {:?}",
+        output.stderr
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(3)
+            .any(|window| window == b"\xef\xbf\xbd"),
+        "open errors must not replace the raw input path with U+FFFD: {:?}",
+        output.stderr
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preserves_a_non_utf8_page_source_path_through_the_qpdf_segment_parser() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = tempfile::tempdir().expect("temporary source directory");
+    let primary = directory.path().join("primary.pdf");
+    let secondary = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"secondary-\xff.pdf".to_vec()));
+    let output_path = directory.path().join("output.pdf");
+    std::fs::copy(ONE_PAGE, &primary).expect("copy primary fixture");
+    std::fs::copy(ONE_PAGE, &secondary).expect("copy secondary fixture");
+
+    let output = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&primary)
+        .arg("--pages")
+        .arg(".")
+        .arg(&secondary)
+        .arg("--")
+        .arg(&output_path)
+        .output()
+        .expect("run flpdf");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "non-UTF-8 page-source argv must not panic: {:?}",
+        output.stderr
+    );
+    assert!(
+        output_path.is_file(),
+        "page operation must create its output"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preserves_a_non_utf8_overlay_path_through_the_qpdf_segment_parser() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = tempfile::tempdir().expect("temporary source directory");
+    let primary = directory.path().join("primary.pdf");
+    let overlay = directory
+        .path()
+        .join(std::ffi::OsString::from_vec(b"overlay-\xff.pdf".to_vec()));
+    let output_path = directory.path().join("output.pdf");
+    std::fs::copy(ONE_PAGE, &primary).expect("copy primary fixture");
+    std::fs::copy(ONE_PAGE, &overlay).expect("copy overlay fixture");
+
+    let output = ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(&primary)
+        .arg("--overlay")
+        .arg(&overlay)
+        .arg("--")
+        .arg(&output_path)
+        .output()
+        .expect("run flpdf");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "non-UTF-8 overlay argv must not panic: {:?}",
+        output.stderr
+    );
+    assert!(
+        output_path.is_file(),
+        "overlay operation must create its output"
+    );
+}
