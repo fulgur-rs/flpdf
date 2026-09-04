@@ -9,6 +9,20 @@ use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
 struct PipelineHandleSink(PipelineHandle);
 
 impl Pipeline for PipelineHandleSink {
@@ -147,7 +161,7 @@ impl QPDFJob {
                 let mut message = Vec::new();
                 message.extend_from_slice(self.message_prefix().as_bytes());
                 message.extend_from_slice(b": attached ");
-                message.extend_from_slice(option.path.display().to_string().as_bytes());
+                message.extend_from_slice(&path_bytes(&option.path));
                 message.extend_from_slice(b" as ");
                 message.extend_from_slice(&option.filename);
                 message.extend_from_slice(b" with key ");
@@ -292,7 +306,7 @@ impl QPDFJob {
         verbose: bool,
     ) -> Result<JobExitCode> {
         let logger = self.logger();
-        let input_name = self.input_name().to_owned();
+        let input_name = self.input_name_bytes().to_owned();
         self.inspect(pdf, |pdf| {
             emit_list_attachments(pdf, &logger, &input_name, verbose)
         })
@@ -305,7 +319,7 @@ impl QPDFJob {
         verbose: bool,
     ) -> Result<()> {
         let logger = self.logger();
-        let input_name = self.input_name().to_owned();
+        let input_name = self.input_name_bytes().to_owned();
         emit_list_attachments(pdf, &logger, &input_name, verbose)
     }
 
@@ -338,12 +352,14 @@ impl QPDFJob {
 fn emit_list_attachments<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     logger: &crate::QPDFLogger,
-    input_name: &str,
+    input_name: &[u8],
     verbose: bool,
 ) -> Result<()> {
     let listing = format_attachment_list_with_sink(pdf, verbose, |data| logger.info(data))?;
     if listing.is_none() {
-        logger.info(format!("{input_name} has no embedded files\n"))?;
+        let mut message = input_name.to_vec();
+        message.extend_from_slice(b" has no embedded files\n");
+        logger.info(message)?;
     }
     Ok(())
 }

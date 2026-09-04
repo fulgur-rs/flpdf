@@ -77,9 +77,9 @@ pub enum ShowLinearizationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowLinearizationOutput {
     /// The qpdf-compatible dump written to stdout.
-    pub dump: String,
+    pub dump: Vec<u8>,
     /// Ordered warning messages emitted by qpdf's linearization checker.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Vec<u8>>,
 }
 
 impl fmt::Display for ShowLinearizationError {
@@ -700,9 +700,9 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
 /// Format a qpdf `damagedPDF` warning raised while loading linearization data.
 fn linearization_parameter_warning(
     pdf: &mut Pdf<impl Read + Seek>,
-    display_name: &str,
+    display_name: &[u8],
     message: &str,
-) -> ShowResult<String> {
+) -> ShowResult<Vec<u8>> {
     for object in ["linearization dictionary", "linearization hint table"] {
         let prefix = format!("{object}: ");
         if let Some(detail) = message.strip_prefix(&prefix) {
@@ -718,14 +718,36 @@ fn linearization_parameter_warning(
             } else {
                 pdf.source_last_offset()
             };
-            return Ok(format!(
-                "{display_name} ({object}, offset {offset}): {detail}"
+            return Ok(linearization_damage_warning(
+                display_name,
+                object,
+                offset,
+                detail,
             ));
         }
     }
     // The checker supplies only the two qpdf damagedPDF categories above;
     // keep a stable fallback for future diagnostics.
-    Ok(format!("{display_name}: {message}")) // cov:ignore: unreachable fallback for unknown qpdf category
+    let mut result = display_name.to_vec();
+    result.extend_from_slice(b": ");
+    result.extend_from_slice(message.as_bytes());
+    Ok(result) // cov:ignore: unreachable fallback for unknown qpdf category
+}
+
+fn linearization_damage_warning(
+    display_name: &[u8],
+    object: &str,
+    offset: u64,
+    detail: &str,
+) -> Vec<u8> {
+    let mut result = display_name.to_vec();
+    result.extend_from_slice(b" (");
+    result.extend_from_slice(object.as_bytes());
+    result.extend_from_slice(b", offset ");
+    result.extend_from_slice(offset.to_string().as_bytes());
+    result.extend_from_slice(b"): ");
+    result.extend_from_slice(detail.as_bytes());
+    result
 }
 
 /// Extract the Shared Object (`/S`) and optional Outline (`/O`) section offsets
@@ -770,7 +792,7 @@ pub(crate) fn read_hint_offsets(hint_dict: &ObjectHandle) -> ShowResult<(usize, 
 fn show_with_pdf<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     file_bytes: &[u8],
-    display_name: &str,
+    display_name: &[u8],
 ) -> ShowResult<ShowLinearizationOutput> {
     let file_size = file_bytes.len() as u64;
 
@@ -781,8 +803,10 @@ fn show_with_pdf<R: Read + Seek>(
     //    linearized, qpdf's `--show-linearization` prints "<name> is not
     //    linearized" to stdout and exits 0 — we return that line as Ok.
     let not_linearized = || {
+        let mut dump = display_name.to_vec();
+        dump.extend_from_slice(b" is not linearized\n");
         Ok(ShowLinearizationOutput {
-            dump: format!("{display_name} is not linearized\n"),
+            dump,
             warnings: Vec::new(),
         })
     };
@@ -811,10 +835,10 @@ fn show_with_pdf<R: Read + Seek>(
     // preserves that order; the CLI owns logger emission and exit-3 completion.
     let mut warnings = match check_linearization_parameters(pdf)? {
         LinearizationParameterCheck::Clean => Vec::new(),
-        LinearizationParameterCheck::Warning(message) => vec![message.to_owned()],
+        LinearizationParameterCheck::Warning(message) => vec![message.as_bytes().to_vec()],
         LinearizationParameterCheck::Error(message) => {
             return Ok(ShowLinearizationOutput {
-                dump: String::new(),
+                dump: Vec::new(),
                 warnings: vec![linearization_parameter_warning(pdf, display_name, message)?],
             });
         }
@@ -911,7 +935,7 @@ fn show_with_pdf<R: Read + Seek>(
             // also important for the qpdf damage offset: a failed first load
             // must not be retried after its object has entered the cache.
             match check_linearization_warnings(pdf, file_bytes, true) {
-                Ok(messages) => warnings.extend(messages),
+                Ok(messages) => warnings.extend(messages.into_iter().map(String::into_bytes)),
                 // cov:ignore-start: a Cursor<Vec<u8>> cannot produce a source I/O error;
                 // retain the defensive mapping for the generic checker contract.
                 Err(LinearizationCheckError::Io(error)) => {
@@ -926,7 +950,7 @@ fn show_with_pdf<R: Read + Seek>(
                 // hint data has been read successfully; the arm is retained as a defensive
                 // mapping for the shared standalone-checker contract.
                 Err(LinearizationCheckError::InvalidParam { message }) => {
-                    warnings.push(message);
+                    warnings.push(message.into_bytes());
                 }
                 // cov:ignore-end
                 // cov:ignore-start: show_with_pdf already confirmed
@@ -959,14 +983,17 @@ fn show_with_pdf<R: Read + Seek>(
             offset,
             detail,
         }) => Ok(ShowLinearizationOutput {
-            dump: String::new(),
-            warnings: vec![format!(
-                "{display_name} ({object}, offset {offset}): {detail}"
+            dump: Vec::new(),
+            warnings: vec![linearization_damage_warning(
+                display_name,
+                object,
+                offset,
+                &detail,
             )],
         }),
         Err(ShowTablesError::Other(ShowLinearizationError::Malformed { message })) => {
             Ok(ShowLinearizationOutput {
-                dump: String::new(),
+                dump: Vec::new(),
                 // cov:ignore-start: linearization_parameter_warning's only Err
                 // arm is a source I/O failure from linearization_candidate_ref,
                 // and a Cursor<Vec<u8>> cannot produce one (see the identical
@@ -985,17 +1012,18 @@ fn show_with_pdf<R: Read + Seek>(
 
 /// Assemble the complete dump string (qpdf's `dumpLinearizationDataInternal`).
 fn format_dump(
-    display_name: &str,
+    display_name: &[u8],
     p: &LinParameters,
     page_offset: &HPageOffset,
     shared_object: &HSharedObject,
     outline: Option<&HGeneric>,
-) -> String {
+) -> Vec<u8> {
     use std::fmt::Write;
-    let mut out = String::new();
-    let _ = write!(out, "{display_name}: linearization data:\n\n");
+    let mut out = display_name.to_vec();
+    out.extend_from_slice(b": linearization data:\n\n");
+    let mut body = String::new();
     let _ = write!(
-        out,
+        body,
         "file_size: {}\n\
          first_page_object: {}\n\
          first_page_end: {}\n\
@@ -1014,18 +1042,19 @@ fn format_dump(
         p.h_length,
     );
 
-    out.push_str("Page Offsets Hint Table\n\n");
-    dump_page_offset(&mut out, p, page_offset);
-    out.push_str("\nShared Objects Hint Table\n\n");
-    dump_shared_object(&mut out, p, shared_object);
+    body.push_str("Page Offsets Hint Table\n\n");
+    dump_page_offset(&mut body, p, page_offset);
+    body.push_str("\nShared Objects Hint Table\n\n");
+    dump_shared_object(&mut body, p, shared_object);
 
     if let Some(g) = outline {
         if g.nobjects > 0 {
-            out.push_str("\nOutlines Hint Table\n\n");
-            dump_generic(&mut out, p, g);
+            body.push_str("\nOutlines Hint Table\n\n");
+            dump_generic(&mut body, p, g);
         }
     }
 
+    out.extend_from_slice(body.as_bytes());
     out
 }
 
@@ -1111,19 +1140,20 @@ fn parse_obj_header(window: &[u8]) -> Option<ObjectRef> {
 /// in-memory bytes or resolving an object fails.
 pub fn show_linearization_bytes(
     file_bytes: &[u8],
-    display_name: &str,
+    display_name: impl AsRef<[u8]>,
 ) -> std::result::Result<String, ShowLinearizationError> {
-    show_linearization_bytes_with_warnings(file_bytes, display_name).map(|result| result.dump)
+    show_linearization_bytes_with_warnings(file_bytes, display_name)
+        .map(|result| String::from_utf8_lossy(&result.dump).into_owned())
 }
 
 /// Decode linearization data and retain qpdf's ordered soft-check warnings.
 pub fn show_linearization_bytes_with_warnings(
     file_bytes: &[u8],
-    display_name: &str,
+    display_name: impl AsRef<[u8]>,
 ) -> std::result::Result<ShowLinearizationOutput, ShowLinearizationError> {
     let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
-    show_with_pdf(&mut pdf, file_bytes, display_name)
+    show_with_pdf(&mut pdf, file_bytes, display_name.as_ref())
 }
 
 /// Decode linearization data from an already-open document and retain the
@@ -1137,12 +1167,12 @@ pub fn show_linearization_bytes_with_warnings(
 /// logger, warning-suppression state, or source description.
 pub fn show_linearization_pdf_with_warnings<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    display_name: &str,
+    display_name: impl AsRef<[u8]>,
 ) -> std::result::Result<ShowLinearizationOutput, ShowLinearizationError> {
     let file_bytes = pdf
         .source_bytes()
         .map_err(|error| ShowLinearizationError::Io(Box::new(error)))?;
-    show_with_pdf(pdf, &file_bytes, display_name)
+    show_with_pdf(pdf, &file_bytes, display_name.as_ref())
 }
 
 /// Decode the linearization data of the PDF at `path` and format it like qpdf
@@ -1160,7 +1190,8 @@ pub fn show_linearization_pdf_with_warnings<R: Read + Seek>(
 pub fn show_linearization_path(
     path: &std::path::Path,
 ) -> std::result::Result<String, ShowLinearizationError> {
-    show_linearization_path_with_warnings(path).map(|result| result.dump)
+    show_linearization_path_with_warnings(path)
+        .map(|result| String::from_utf8_lossy(&result.dump).into_owned())
 }
 
 /// Decode linearization data at `path` and retain qpdf's ordered soft-check
@@ -1171,8 +1202,21 @@ pub fn show_linearization_path_with_warnings(
     let file_bytes = std::fs::read(path)?;
     let mut pdf = Pdf::open(Cursor::new(file_bytes.clone()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
-    let display_name = path.to_string_lossy();
-    show_with_pdf(&mut pdf, &file_bytes, &display_name)
+    show_with_pdf(&mut pdf, &file_bytes, &path_description_bytes(path))
+}
+
+fn path_description_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,8 +1538,10 @@ mod tests {
             nobjects: 0,
             group_length: 0,
         };
-        let dump_no_outline = format_dump("f.pdf", &p, &po, &so, Some(&empty_outline));
-        assert!(!dump_no_outline.contains("Outlines Hint Table"));
+        let dump_no_outline = format_dump(b"f.pdf", &p, &po, &so, Some(&empty_outline));
+        assert!(!dump_no_outline
+            .windows(b"Outlines Hint Table".len())
+            .any(|window| { window == b"Outlines Hint Table" }));
 
         // nobjects > 0 → Outlines section present with adjusted offset.
         let outline = HGeneric {
@@ -1504,12 +1550,22 @@ mod tests {
             nobjects: 2,
             group_length: 99,
         };
-        let dump_outline = format_dump("f.pdf", &p, &po, &so, Some(&outline));
-        assert!(dump_outline.contains("\nOutlines Hint Table\n\n"));
-        assert!(dump_outline.contains("first_object: 30\n"));
-        assert!(dump_outline.contains("first_object_offset: 170\n"));
-        assert!(dump_outline.contains("nobjects: 2\n"));
-        assert!(dump_outline.contains("group_length: 99\n"));
+        let dump_outline = format_dump(b"f.pdf", &p, &po, &so, Some(&outline));
+        assert!(dump_outline
+            .windows(b"\nOutlines Hint Table\n\n".len())
+            .any(|window| window == b"\nOutlines Hint Table\n\n"));
+        assert!(dump_outline
+            .windows(b"first_object: 30\n".len())
+            .any(|window| window == b"first_object: 30\n"));
+        assert!(dump_outline
+            .windows(b"first_object_offset: 170\n".len())
+            .any(|window| window == b"first_object_offset: 170\n"));
+        assert!(dump_outline
+            .windows(b"nobjects: 2\n".len())
+            .any(|window| window == b"nobjects: 2\n"));
+        assert!(dump_outline
+            .windows(b"group_length: 99\n".len())
+            .any(|window| window == b"group_length: 99\n"));
     }
 
     // -----------------------------------------------------------------------
@@ -2321,12 +2377,18 @@ mod tests {
 
         let result = show_linearization_bytes_with_warnings(&bytes, "badT.pdf")
             .expect("a /T position mismatch is a warning, not a hard error");
-        assert!(result.dump.starts_with("badT.pdf: linearization data:\n\n"));
-        assert!(result.dump.contains("\nPage Offsets Hint Table\n\n"));
+        assert!(result
+            .dump
+            .starts_with(b"badT.pdf: linearization data:\n\n"));
+        assert!(result
+            .dump
+            .windows(b"\nPage Offsets Hint Table\n\n".len())
+            .any(|window| window == b"\nPage Offsets Hint Table\n\n"));
         assert_eq!(result.warnings.len(), 1);
         assert!(
-            result.warnings[0].contains("space before first xref item (/T) mismatch")
-                && result.warnings[0].contains("file = 0"),
+            String::from_utf8_lossy(&result.warnings[0])
+                .contains("space before first xref item (/T) mismatch")
+                && String::from_utf8_lossy(&result.warnings[0]).contains("file = 0"),
             "unexpected warning: {:?}",
             result.warnings
         );
@@ -2366,7 +2428,7 @@ mod tests {
         assert!(result.dump.is_empty());
         assert_eq!(
             result.warnings,
-            ["badS.pdf (linearization hint table, offset 568): /S (shared object) offset is out of bounds".to_owned()]
+            [b"badS.pdf (linearization hint table, offset 568): /S (shared object) offset is out of bounds".to_vec()]
         );
     }
 
@@ -2380,7 +2442,7 @@ mod tests {
         assert!(result.dump.is_empty());
         assert_eq!(
             result.warnings,
-            ["compatS.pdf (linearization hint table, offset 660): /S (shared object) offset is out of bounds".to_owned()]
+            [b"compatS.pdf (linearization hint table, offset 660): /S (shared object) offset is out of bounds".to_vec()]
         );
     }
 
@@ -2397,7 +2459,7 @@ mod tests {
         assert!(result.dump.is_empty());
         assert_eq!(
             result.warnings,
-            ["badH.pdf (linearization hint stream, offset 999): expected n n obj".to_owned()]
+            [b"badH.pdf (linearization hint stream, offset 999): expected n n obj".to_vec()]
         );
     }
 
@@ -2416,8 +2478,8 @@ mod tests {
         assert_eq!(
             result.warnings,
             [
-                "badHn.pdf (linearization dictionary, offset 594): hint table is not a stream"
-                    .to_owned()
+                b"badHn.pdf (linearization dictionary, offset 594): hint table is not a stream"
+                    .to_vec()
             ]
         );
     }
@@ -2440,8 +2502,8 @@ mod tests {
         assert_eq!(
             result.warnings,
             [
-                "short-trailing.pdf (linearization dictionary, offset 660): hint table is not a stream"
-                    .to_owned()
+                b"short-trailing.pdf (linearization dictionary, offset 660): hint table is not a stream"
+                    .to_vec()
             ]
         );
     }
@@ -2486,8 +2548,8 @@ mod tests {
         assert_eq!(
             result.warnings,
             [
-                "uncached-trailing.pdf (linearization dictionary, offset 939): hint table is not a stream"
-                    .to_owned()
+                b"uncached-trailing.pdf (linearization dictionary, offset 939): hint table is not a stream"
+                    .to_vec()
             ]
         );
     }
@@ -2504,7 +2566,7 @@ mod tests {
         assert!(result.dump.is_empty());
         assert_eq!(
             result.warnings,
-            ["noN.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type".to_owned()]
+            [b"noN.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type".to_vec()]
         );
     }
 

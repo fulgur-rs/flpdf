@@ -904,6 +904,21 @@ page-spec の source だけは qpdf の close/reopen 相当の reopenable reader
 確定し、`unrecognized_encrypt_argument` から同じ suffixを生成する。key length確定前は
 qpdfの `encryption options must be terminated with --` を維持する。
 
+`flpdf-sikc.2` では、この argv の raw `std::string` 境界を password・JSON・報告出力の
+下流にも延長した。qpdf の `QPDFJob_config` は top-level/`--encrypt`/page・overlay
+segment・donor password を文字列 bytes のまま保持し（`QPDFJob_config.cc:169-172,
+450-453,684-697,994-1007,1088-1097`）、flpdf は CLI の `OsString` と
+`PdfOpenOptions::password: Vec<u8>` へ直接渡す。JSON input の source description と
+JSON stream side-file prefix は `QPDF_json.cc:796-849` の raw filename boundary に
+合わせ、overlay/add-attachment verbose line は `QPDFJob.cc:1937-1982,2057-2070`、
+show-linearization の dump/warning は `QPDFJob.cc:1658-1674` と
+`QPDF_linearization.cc:838-860` に合わせて byte pipeline で構成する。attachment の
+show/remove は qpdf の `std::string` key（`QPDFJob_config.cc:507-547`）を
+`QPDFEmbeddedFileDocumentHelper` の name-tree lookup（`QPDFEmbeddedFileDocumentHelper.cc:73-82,106-119`）へ
+同じ正規化で渡し、`--split-pages` の `%d`/stem/extension 合成も
+`QPDFJob.cc:2940-3025` の raw output string を保つ。UTF-8 が必要な option grammar の
+部分だけは従来どおり境界で検証する。
+
 `QPDFJob::Config::keepFilesOpen` / `keepFilesOpenThreshold` は `job/lifecycle.rs` の job configuration と `job/page_specs.rs::QPDFJob::handle_page_specs` に接続した。未指定時は qpdf の `page_specs` 上の異なる source index 数を閾値（既定200）と比較し、明示 y/n はその値を優先する。CLIとjob JSONのpage-spec callerは全specのsource identity/policyを先に確定し、各secondary sourceのparse直後・次sourceを開く前に `Pdf::set_input_source_stay_open(false)` を適用する。primaryはqpdfと同じくkeep-openのまま保持する。file source は `Pdf::open_file_with_options` の reopenable readerを使い、qpdfの `ClosedFileInputSource::before`/`after` 相当で secondary source を close/reopen する（`QPDFJob_config.cc:342-353`, `QPDFJob.cc:2374-2427`, `ClosedFileInputSource.cc:18-35,97-104`）。
 
 `--job-json-file` の page-transform fields `splitPages`、`rotate`、`removeRestrictions` は、qpdf の生成 JSON handler (`QPDFJob_json.cc:611-624`, `auto_job_json_init.hh`) と Config/Job call order (`QPDFJob_config.cc:535-540,597-609`; `QPDFJob.cc:369-411,428-520,2137-2150,2635-2651,2940-3025`) に対応して `job/lifecycle.rs` の canonical configuration から page split、rotation、security/signature mutation へ接続した。 |

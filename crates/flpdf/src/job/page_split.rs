@@ -365,7 +365,10 @@ fn chunk_output_path(
         return split_output_path(template, first_page, last_page, width);
     }
     let (parent, stem, ext) = split_template(template);
-    let new_filename = format!("{stem}-{first_page:0>width$}{ext}", width = width);
+    let mut new_filename = stem;
+    new_filename.push(b'-');
+    new_filename.extend_from_slice(format!("{first_page:0>width$}", width = width).as_bytes());
+    new_filename.extend_from_slice(&ext);
     join_parent(parent, new_filename)
 }
 
@@ -401,8 +404,10 @@ fn split_output_path(template: &Path, first_page: u32, last_page: u32, width: us
         return path;
     }
     let (parent, stem, ext) = split_template(template);
-
-    let new_filename = format!("{stem}-{range}{ext}");
+    let mut new_filename = stem;
+    new_filename.push(b'-');
+    new_filename.extend_from_slice(range.as_bytes());
+    new_filename.extend_from_slice(&ext);
 
     join_parent(parent, new_filename)
 }
@@ -410,28 +415,29 @@ fn split_output_path(template: &Path, first_page: u32, last_page: u32, width: us
 /// Split a template path into `(parent, stem, ext)` where `ext` includes the
 /// leading `.` (empty when the filename has no `.`). Shared by
 /// [`split_output_path`] and [`chunk_output_path`].
-fn split_template(template: &Path) -> (&Path, String, String) {
+fn split_template(template: &Path) -> (&Path, Vec<u8>, Vec<u8>) {
     let parent = template.parent().unwrap_or(Path::new(""));
     let filename = template
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(path_component_bytes)
         .unwrap_or_default();
 
-    let (stem, ext) = match filename.rfind('.') {
+    let (stem, ext) = match filename.iter().rposition(|byte| *byte == b'.') {
         Some(dot_pos) => {
             let (s, e) = filename.split_at(dot_pos);
-            (s.to_string(), e.to_string()) // e includes the leading '.'
+            (s.to_vec(), e.to_vec()) // e includes the leading '.'
         }
-        None => (filename.clone(), String::new()),
+        None => (filename, Vec::new()),
     };
     (parent, stem, ext)
 }
 
 /// Join `filename` onto `parent`, returning a bare `PathBuf` when there is no
 /// parent component.
-fn join_parent(parent: &Path, filename: String) -> PathBuf {
+fn join_parent(parent: &Path, filename: Vec<u8>) -> PathBuf {
+    let filename = path_from_bytes(&filename);
     if parent == Path::new("") {
-        PathBuf::from(filename)
+        filename
     } else {
         parent.join(filename)
     }
@@ -444,13 +450,46 @@ fn join_parent(parent: &Path, filename: String) -> PathBuf {
 /// stem/extension naming path allocation-free for templates without a
 /// placeholder.
 fn replace_first_percent_d(template: &Path, replacement: &str) -> Option<PathBuf> {
-    let template = template.to_string_lossy();
-    let position = template.find("%d")?;
-    let mut output = String::with_capacity(template.len() + replacement.len());
-    output.push_str(&template[..position]);
-    output.push_str(replacement);
-    output.push_str(&template[position + 2..]);
-    Some(PathBuf::from(output))
+    let template = path_bytes(template);
+    let position = template.windows(2).position(|window| window == b"%d")?;
+    let mut output = Vec::with_capacity(template.len() + replacement.len());
+    output.extend_from_slice(&template[..position]);
+    output.extend_from_slice(replacement.as_bytes());
+    output.extend_from_slice(&template[position + 2..]);
+    Some(path_from_bytes(&output))
+}
+
+fn path_component_bytes(component: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        component.as_bytes().to_vec()
+    }
+
+    #[cfg(not(unix))]
+    {
+        component.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path_component_bytes(path.as_os_str())
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Return the number of decimal digits needed to represent `n`.

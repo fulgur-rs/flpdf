@@ -32,6 +32,7 @@ use crate::ObjectRef;
 use crate::Pdf;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
 
 /// The only qpdf JSON version whose serialization is defined here.
 const SUPPORTED_JSON_VERSION: i32 = 2;
@@ -138,8 +139,11 @@ pub(crate) fn write_json_v1_objectinfo_key<R: Read + Seek>(
 /// qpdf 11.9.0 names side files `<prefix>-<obj_num>` — the bare object
 /// number with no zero-padding. Centralized here so the JSON `datafile`
 /// value and the side-file writer always produce the same name.
-pub fn format_json_side_file_path(prefix: &str, obj_num: u32) -> String {
-    format!("{prefix}-{obj_num}")
+pub fn format_json_side_file_path(prefix: &[u8], obj_num: u32) -> Vec<u8> {
+    let mut path = prefix.to_vec();
+    path.push(b'-');
+    path.extend_from_slice(obj_num.to_string().as_bytes());
+    path
 }
 
 /// Write a complete JSON document containing only the `qpdf` key.
@@ -390,7 +394,7 @@ fn write_file_mode_object_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
     decode_level: DecodeLevel,
-    prefix: &str,
+    prefix: &[u8],
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
@@ -409,8 +413,11 @@ fn write_file_mode_object_entry<R: Read + Seek>(
         Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
 
         let side_path = format_json_side_file_path(prefix, object_ref.number);
-        let mut side_file = File::create(&side_path)
-            .map_err(|source| side_file_io_error("open", &side_path, source))?;
+        let side_path_fs = path_from_bytes(&side_path);
+        let mut side_file = File::create(&side_path_fs).map_err(|source| {
+            let rendered = String::from_utf8_lossy(&side_path);
+            side_file_io_error("open", &rendered, source)
+        })?;
         write_json_stream_file(&handle, decode_level, &side_path, &mut side_file, out)?;
         Json::write_dictionary_close(out, object_first, 3)?;
         return Ok(());
@@ -442,7 +449,7 @@ fn write_non_stream_value_entry(
 pub(crate) fn write_json_stream_file(
     handle: &ObjectHandle,
     decode_level: DecodeLevel,
-    side_path: &str,
+    side_path: &[u8],
     side_file: &mut dyn Write,
     out: &mut dyn Pipeline,
 ) -> Result<(), JsonOutputError> {
@@ -460,6 +467,21 @@ pub(crate) fn write_json_stream_file(
     )?;
     terminal.finish()?;
     Ok(())
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

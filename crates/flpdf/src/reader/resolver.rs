@@ -1770,6 +1770,58 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    /// Format the `QPDFExc::what()` bytes emitted by qpdf's JSON reactor.
+    fn format_json_warning_what(
+        description: &[u8],
+        input_name: &[u8],
+        object: &str,
+        offset: i64,
+        message: &[u8],
+    ) -> Vec<u8> {
+        let mut object = object.as_bytes().to_vec();
+        if input_name != description {
+            object.extend_from_slice(b" from ");
+            object.extend_from_slice(input_name);
+        }
+        let offset_text = if offset > 0 {
+            let mut text = b", offset ".to_vec();
+            text.extend_from_slice(offset.to_string().as_bytes());
+            text
+        } else {
+            Vec::new()
+        };
+        let mut what = Vec::new();
+        if object.is_empty() {
+            if offset > 0 {
+                if description.is_empty() {
+                    what.extend_from_slice(b"offset ");
+                    what.extend_from_slice(offset.to_string().as_bytes());
+                    what.extend_from_slice(b": ");
+                } else {
+                    what.extend_from_slice(description);
+                    what.extend_from_slice(b" (offset ");
+                    what.extend_from_slice(offset.to_string().as_bytes());
+                    what.extend_from_slice(b"): ");
+                }
+            } else if !description.is_empty() {
+                what.extend_from_slice(description);
+                what.extend_from_slice(b": ");
+            }
+        } else if description.is_empty() {
+            what.extend_from_slice(&object);
+            what.extend_from_slice(&offset_text);
+            what.extend_from_slice(b": ");
+        } else {
+            what.extend_from_slice(description);
+            what.extend_from_slice(b" (");
+            what.extend_from_slice(&object);
+            what.extend_from_slice(&offset_text);
+            what.extend_from_slice(b"): ");
+        }
+        what.extend_from_slice(message);
+        what
+    }
+
     /// Emit a warning from qpdf's JSON input reactor.
     ///
     /// `QPDF::warn(qpdf_e_json, object, offset, message)` formats the PDF
@@ -1780,86 +1832,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// dedicated routing door here.
     pub(crate) fn push_json_warning(
         &self,
-        input_name: &str,
+        input_name: impl AsRef<[u8]>,
         object: &str,
         offset: i64,
         message: impl Into<String>,
     ) -> Result<()> {
+        let input_name = input_name.as_ref().to_vec();
         let message = message.into();
-        let (logger, suppress_warnings, description) = {
+        let (logger, suppress_warnings, what) = {
             let mut core = self.core.borrow_mut();
-            let mut object = object.to_owned();
-            if input_name.as_bytes() != core.description.as_slice() {
-                object.push_str(" from ");
-                object.push_str(input_name);
-            }
-            let offset_text = if offset > 0 {
-                format!(", offset {offset}")
-            } else {
-                String::new()
-            };
-            let detail = if object.is_empty() {
-                if offset > 0 {
-                    format!("offset {offset}: {message}")
-                } else {
-                    message.clone()
-                }
-            } else {
-                format!("{object}{offset_text}: {message}")
-            };
-            core.repair_diagnostics.push(Diagnostic::warning(
-                detail,
-                (offset >= 0).then_some(offset as u64),
-            ));
-            (
-                core.logger.clone(),
-                core.suppress_warnings,
-                core.description.clone(),
-            )
+            let what = Self::format_json_warning_what(
+                &core.description,
+                &input_name,
+                object,
+                offset,
+                message.as_bytes(),
+            );
+            let mut diagnostic = Diagnostic::object_warning_bytes(&what);
+            diagnostic.offset = (offset >= 0).then_some(offset as u64);
+            core.repair_diagnostics.push(diagnostic);
+            (core.logger.clone(), core.suppress_warnings, what)
         };
         if suppress_warnings {
             return Ok(());
         }
 
-        let mut object = object.to_owned();
-        if input_name.as_bytes() != description.as_slice() {
-            object.push_str(" from ");
-            object.push_str(input_name);
-        }
-        let offset_text = if offset > 0 {
-            format!(", offset {offset}")
-        } else {
-            String::new()
-        };
-        let mut what = Vec::new();
-        if object.is_empty() {
-            if offset > 0 {
-                if description.is_empty() {
-                    what.extend_from_slice(b"offset ");
-                    what.extend_from_slice(offset.to_string().as_bytes());
-                    what.extend_from_slice(b": ");
-                } else {
-                    what.extend_from_slice(&description);
-                    what.extend_from_slice(b" (offset ");
-                    what.extend_from_slice(offset.to_string().as_bytes());
-                    what.extend_from_slice(b"): ");
-                }
-            } else if !description.is_empty() {
-                what.extend_from_slice(&description);
-                what.extend_from_slice(b": ");
-            }
-        } else if description.is_empty() {
-            what.extend_from_slice(object.as_bytes());
-            what.extend_from_slice(offset_text.as_bytes());
-            what.extend_from_slice(b": ");
-        } else {
-            what.extend_from_slice(&description);
-            what.extend_from_slice(b" (");
-            what.extend_from_slice(object.as_bytes());
-            what.extend_from_slice(offset_text.as_bytes());
-            what.extend_from_slice(b"): ");
-        }
-        what.extend_from_slice(message.as_bytes());
         let mut line = b"WARNING: ".to_vec();
         line.extend_from_slice(&what);
         line.push(b'\n');

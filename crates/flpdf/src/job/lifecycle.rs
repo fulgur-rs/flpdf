@@ -244,7 +244,7 @@ struct JobConfiguration {
     json_objects: Vec<JsonObjectSelector>,
     json_stream_data: JsonStreamData,
     json_stream_data_set: bool,
-    json_stream_prefix: Option<String>,
+    json_stream_prefix: Option<Vec<u8>>,
     test_json_schema: bool,
     show_encryption_key: bool,
     show_encryption: bool,
@@ -2092,7 +2092,7 @@ impl QPDFJob {
             configuration.json_keys.push(JsonKey::Qpdf);
         }
         if let Some(value) = job_json_string(&members, b"jsonStreamPrefix")? {
-            configuration.json_stream_prefix = Some(String::from_utf8_lossy(&value).into_owned());
+            configuration.json_stream_prefix = Some(value);
         }
         if let Some(value) = job_json_choice(
             &members,
@@ -2410,13 +2410,13 @@ impl QPDFJob {
     pub fn create_from_json_document<S>(
         &mut self,
         source: S,
-        input_name: impl Into<String>,
+        input_name: impl AsRef<[u8]>,
     ) -> Result<JobDocument>
     where
         S: Read + Seek + 'static,
     {
-        let input_name = input_name.into();
-        self.set_input_name(input_name.clone());
+        let input_name = input_name.as_ref().to_vec();
+        self.set_input_name_bytes(&input_name);
         // See `create_empty_document`: qpdf applies `noWarn` to every
         // creation kind uniformly, including JSON-input.
         let mut options = self.configured_open_options(Vec::new());
@@ -2455,7 +2455,7 @@ impl QPDFJob {
             }
         };
         if self.configuration.json_input {
-            return match self.create_from_json_document(file, input.display().to_string()) {
+            return match self.create_from_json_document(file, path_description_bytes(&input)) {
                 Ok(pdf) => Ok(Some(pdf)),
                 Err(error) => {
                     self.report_job_error(&error)?;
@@ -2683,7 +2683,7 @@ impl QPDFJob {
             self.update_from_json(
                 &mut primary,
                 BufReader::new(update_file),
-                update_path.display().to_string(),
+                path_description_bytes(update_path),
             )?; // cov:ignore: llvm-cov attributes this successful update continuation to its opening call lines
         }
 
@@ -3084,15 +3084,19 @@ impl QPDFJob {
         let suppress_warnings = pdf.suppress_warnings() || self.suppress_warnings;
         pdf.set_logger(self.logger.clone());
         pdf.set_suppress_warnings(suppress_warnings);
-        let input_name = self.input_name.clone();
+        let input_name = self.input_name_bytes().to_owned();
         let output = show_linearization_pdf_with_warnings(pdf, &input_name)
             .map_err(map_show_linearization_error)?;
         for warning in output.warnings {
             self.record_warnings();
             // cov:ignore-start: warning-sink propagation is an injected logger edge; the data warning and status branches are covered separately
             if !suppress_warnings {
-                self.logger
-                    .warn(format!("WARNING: {input_name}: {warning}\n"))?;
+                let mut line = b"WARNING: ".to_vec();
+                line.extend_from_slice(&input_name);
+                line.extend_from_slice(b": ");
+                line.extend_from_slice(&warning);
+                line.push(b'\n');
+                self.logger.warn(line)?;
             }
             // cov:ignore-end
         }
@@ -3458,13 +3462,13 @@ impl QPDFJob {
     pub fn create_from_json<S>(
         &mut self,
         source: S,
-        input_name: impl Into<String>,
+        input_name: impl AsRef<[u8]>,
     ) -> Result<Pdf<Cursor<Vec<u8>>>>
     where
         S: Read + Seek + 'static,
     {
-        let input_name = input_name.into();
-        self.set_input_name(input_name.clone());
+        let input_name = input_name.as_ref().to_vec();
+        self.set_input_name_bytes(&input_name);
         let pdf = Pdf::create_from_json_with_options(
             source,
             input_name,
@@ -3593,13 +3597,13 @@ impl QPDFJob {
         &mut self,
         pdf: &mut Pdf<R>,
         source: S,
-        input_name: impl Into<String>,
+        input_name: impl AsRef<[u8]>,
     ) -> Result<()>
     where
         R: Read + Seek,
         S: Read + Seek + 'static,
     {
-        let input_name = input_name.into();
+        let input_name = input_name.as_ref().to_vec();
         pdf.set_logger(self.logger.clone());
         pdf.update_from_json(source, input_name)?;
         self.record_document_warnings(pdf);

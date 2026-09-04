@@ -448,7 +448,7 @@ where
 {
     pdf: &'a mut Pdf<P>,
     source: Rc<RefCell<S>>,
-    input_name: String,
+    input_name: Vec<u8>,
     must_be_complete: bool,
     fatal_error: Option<String>,
     errors: bool,
@@ -480,7 +480,7 @@ where
     pub(crate) fn new(
         pdf: &'a mut Pdf<P>,
         source: Rc<RefCell<S>>,
-        input_name: impl Into<String>,
+        input_name: impl AsRef<[u8]>,
         must_be_complete: bool,
     ) -> Self {
         let reserved = pdf
@@ -493,7 +493,7 @@ where
         Self {
             pdf,
             source,
-            input_name: input_name.into(),
+            input_name: input_name.as_ref().to_vec(),
             must_be_complete,
             fatal_error: None,
             errors: false,
