@@ -301,28 +301,6 @@ fn replay_strict_decode_event(
     }
 }
 
-/// Decode a stream's filter chain like [`decode_stream_data`], enforcing the
-/// opt-in [`DecodeLimits`].
-///
-/// # Errors
-///
-/// Returns [`Error::Unsupported`] for the same reasons as [`decode_stream_data`],
-/// plus when a supported filter stage's decoded output exceeds
-/// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds
-/// [`DecodeLimits::max_filter_chain`].
-pub fn decode_stream_data_with_limits(
-    stream_dict: &ObjectHandle,
-    stream_data: &[u8],
-    limits: DecodeLimits,
-) -> Result<Vec<u8>> {
-    decode_stream_data_with_limits_and_warnings(
-        stream_dict,
-        stream_data,
-        limits,
-        &mut reject_decode_warning,
-    )
-}
-
 /// Encode `stream_data` by applying the stream dictionary's write-supported
 /// `/Filter` chain.
 ///
@@ -392,8 +370,8 @@ fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec
     Err(Error::Unsupported(CRYPT_STAGE_UNSUPPORTED.to_string()))
 }
 
-/// Decode a stream's data from its `ObjectHandle` stream dictionary — the
-/// `ObjectHandle`-native counterpart of [`decode_stream_data_with_limits`].
+/// Decode a stream's data from its `ObjectHandle` stream dictionary, honoring
+/// the supplied [`DecodeLimits`].
 ///
 /// `/Filter` and `/DecodeParms` are read off `stream_dict` the way
 /// `QPDF_Stream::filterable` reads them, through `stream_dict.getKey`
@@ -411,7 +389,8 @@ fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] on the same filter-chain, decode-parameter,
-/// and codec conditions as [`decode_stream_data_with_limits`], and
+/// and codec conditions as [`decode_stream_data`], including the supplied
+/// decode limits, and
 /// [`Error::Internal`] when any handle resolved on this path — `stream_dict`
 /// itself as well as a `/Filter` or `/DecodeParms` child — is indirect and its
 /// document has been dropped (`ObjectHandle::try_dereference`).

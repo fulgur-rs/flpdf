@@ -115,12 +115,12 @@ are not treated as vulnerabilities on their own:
   test driver does so to reproduce qpdf's uncapped `qpdf_dl_all` behavior.
   An opt-in decode-output limit comparable to qpdf's
   `Pl_Flate::setMemoryLimit` is available via `filters::DecodeLimits` /
-  `filters::decode_stream_data_with_limits` (default unbounded; embedders set
+  `filters::decode_stream_data_recovering_with_limits` (default unbounded; embedders set
   `max_output` to bound each `FlateDecode` / `LZWDecode` stage). qpdf's CLI has
   no corresponding flag, so `flpdf-cli` does not expose this cap either; a
   content stream that exceeds a caller-supplied limit is reported as a
   warning, not as corruption. The cap is only reachable by calling
-  `filters::decode_stream_data_with_limits` (or its `_recovering` variant)
+  `filters::decode_stream_data_recovering_with_limits`
   directly with a caller-supplied `DecodeLimits`; the ordinary document
   paths (`Pdf::resolve`, the page/resource/attachment helpers, `PdfWriter`,
   and `job::QPDFJob::check` / the `--check` route) all hard-code
@@ -202,7 +202,7 @@ by the 2026-06-11 audit. IDs refer to the in-repo beads tracker
 | Object parser recursion (`Parser::object` → `dictionary`/`array`) has no depth limit; deeply nested input (`<</A <</B …>>>>`, `[[[…]]]`) can overflow the stack and abort. Same shape as qpdf CVE-2018-9918. | (b) no panic/abort | `flpdf-hn1g.1` |
 | No fuzz harness exists; guarantees (b)/(c) are asserted but not continuously exercised. | verification | `flpdf-hn1g.2` |
 | `inherited_field_value` `/Parent` walks in `signatures.rs` and `json_inspect.rs` rely on visited sets only (terminating, but no depth cap unlike their `annotation_object_helper.rs` counterpart). | (c) bounded traversal | `flpdf-hn1g.3` |
-| Decode-side resource-exhaustion mitigations are now in place (was: no opt-in decode-output limit and no `/Filter` chain length cap). The ordinary decode APIs cap `/Filter` chains at 16 stages by default through `DecodeLimits::default()`. Callers must explicitly set `DecodeLimits::max_filter_chain` to `None` to opt out; the qpdf compatibility test driver does so to reproduce qpdf's uncapped `qpdf_dl_all` behavior. An opt-in output limit is provided via `filters::DecodeLimits` / `decode_stream_data_with_limits` (default unbounded). Compression bombs remain out of scope by default per §4. | §4 mitigation (delivered) | `flpdf-hn1g.4` |
+| Decode-side resource-exhaustion mitigations are now in place (was: no opt-in decode-output limit and no `/Filter` chain length cap). The ordinary decode APIs cap `/Filter` chains at 16 stages by default through `DecodeLimits::default()`. Callers must explicitly set `DecodeLimits::max_filter_chain` to `None` to opt out; the qpdf compatibility test driver does so to reproduce qpdf's uncapped `qpdf_dl_all` behavior. An opt-in output limit is provided via `filters::DecodeLimits` / `decode_stream_data_recovering_with_limits` (default unbounded). Compression bombs remain out of scope by default per §4. | §4 mitigation (delivered) | `flpdf-hn1g.4` |
 | `#![forbid(unsafe_code)]` not yet declared (no `unsafe` exists in `crates/flpdf/src/`; the attribute would make that mechanical). | (a) enforcement | `flpdf-hn1g.6` |
 
 ## Appendix A: attack surface inventory

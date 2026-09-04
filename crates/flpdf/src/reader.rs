@@ -826,27 +826,6 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(value_offset.map(|value_offset| offset.saturating_add(value_offset as u64)))
     }
 
-    /// Return the source offset of an indirect object's own direct value.
-    ///
-    /// This compatibility hook is compiled only for `flpdf-test-driver`. It
-    /// locates the position immediately after `N G obj`, matching qpdf's
-    /// warning offset when a `/DecodeParms` reference chain terminates on a
-    /// non-dictionary object: qpdf records this position once, before
-    /// parsing the object's value, rather than the value token's own
-    /// (whitespace/comment-skipped) start.
-    #[doc(hidden)]
-    #[cfg(feature = "qtest-driver")]
-    pub fn qtest_object_value_source_offset(
-        &mut self,
-        object_ref: ObjectRef,
-    ) -> Result<Option<u64>> {
-        Ok(self
-            .qtest_object_value_source_offsets(&[object_ref])?
-            .into_iter()
-            .next()
-            .flatten())
-    }
-
     /// Return source offsets for the direct values of multiple indirect
     /// objects, reading each distinct source object at most once.
     ///
@@ -894,23 +873,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// at this position is not itself a reference: qpdf attributes the
     /// warning to the array's own indirect object, at that item's precise
     /// (whitespace/comment-skipped) token position — unlike
-    /// [`Self::qtest_object_value_source_offset`], which reports the
+    /// [`Self::qtest_object_value_source_offsets`], which reports the
     /// coarser "right after `obj`" position for a value that is the
     /// object's entire body.
-    #[doc(hidden)]
-    #[cfg(feature = "qtest-driver")]
-    pub fn qtest_array_item_source_offset(
-        &mut self,
-        object_ref: ObjectRef,
-        array_index: usize,
-    ) -> Result<Option<u64>> {
-        Ok(self
-            .qtest_array_item_source_offsets(object_ref, &[array_index])?
-            .into_iter()
-            .next()
-            .flatten())
-    }
-
     /// Return source offsets for multiple items in one indirect array, using
     /// one bounded read and at most one full-source retry for the container.
     /// Duplicate indices therefore cannot consume duplicate fallback budget.

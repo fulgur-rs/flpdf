@@ -53,6 +53,25 @@ fi
 [[ "${test_output}" == *"PASS (no executable changed lines)"* ]]
 
 {
+  IFS= read -r declaration_repo
+  IFS= read -r declaration_base
+} < <(
+  make_fixture_repo \
+    declaration-only \
+    crates/flpdf/src/encryption/keys.rs \
+    $'//! qpdf correspondence\npub enum ObjectKeyAlg {\n    Rc4,\n    Aes,\n}'
+)
+if ! declaration_output="$(
+  cd "${declaration_repo}"
+  scripts/patch-coverage.sh --base "${declaration_base}" --lcov report.lcov 2>&1
+)"; then
+  printf '%s\n' "${declaration_output}" >&2
+  echo "patch coverage should ignore files containing only type declarations" >&2
+  exit 1
+fi
+[[ "${declaration_output}" == *"PASS (no executable changed lines)"* ]]
+
+{
   IFS= read -r production_repo
   IFS= read -r production_base
 } < <(

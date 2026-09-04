@@ -136,12 +136,6 @@ impl EncryptionState {
 
     /// qpdf `QPDF::compute_data_key` (`QPDF_encryption.cc:325-357`),
     /// Algorithm 3.1 from the PDF 1.7 Reference Manual.
-    ///
-    /// Not the same function as [`super::keys::per_object_key`], which
-    /// truncates to `min(file_key.len() + 5, 16)` and so drops the four salt
-    /// bytes from the length qpdf takes the minimum against. The two agree for
-    /// every `/V` and `/R` pair the standard handler actually admits, because
-    /// AES requires a 128-bit key and `min(21, 16) == min(25, 16)`.
     pub(crate) fn compute_data_key(&self, og: ObjectRef, use_aes: bool) -> Vec<u8> {
         let mut result = self.file_key.clone();
         if self.encryption_v >= 5 {
