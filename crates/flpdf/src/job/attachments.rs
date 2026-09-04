@@ -465,6 +465,10 @@ fn append_debug_quoted_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
 /// # Ok(())
 /// # }
 /// ```
+#[allow(deprecated)]
+#[deprecated(
+    note = "no qpdf counterpart; this library-level path attachment convenience wrapper is flpdf-specific (QPDFJob.cc:2046-2087) -- do not add new callers"
+)]
 pub fn add_attachment_from_path<R, P>(pdf: &mut Pdf<R>, key: &[u8], path: P) -> Result<ObjectRef>
 where
     R: Read + Seek,
@@ -508,6 +512,9 @@ where
 }
 
 /// Return an ASCII-safe `/F` fallback while preserving readable ASCII filename parts.
+#[deprecated(
+    note = "no qpdf counterpart; qpdf accepts an explicit compatibility filename instead of deriving this fallback (QPDFFileSpecObjectHelper.cc:118-130) -- do not add new callers"
+)]
 pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
     let fallback: String = filename
         .chars()
@@ -568,6 +575,9 @@ pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
 /// # Ok(())
 /// # }
 /// ```
+#[deprecated(
+    note = "no qpdf counterpart; QPDFJob::doShowAttachment streams to its save pipeline instead of returning a library Vec (QPDFJob.cc:914-926) -- do not add new callers"
+)]
 pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<Vec<u8>> {
     // Look up all entries in the name tree.
     let entries = crate::embedded_files::list_embedded_files(pdf)?;
@@ -633,6 +643,10 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
 /// # Ok(())
 /// # }
 /// ```
+#[allow(deprecated)]
+#[deprecated(
+    note = "no qpdf counterpart; QPDFJob::doShowAttachment owns its output pipeline instead of accepting a generic Write sink (QPDFJob.cc:914-926) -- do not add new callers"
+)]
 pub fn write_attachment<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     key: &[u8],
@@ -667,6 +681,10 @@ pub fn write_attachment<R: Read + Seek, W: Write>(
 /// # Ok(())
 /// # }
 /// ```
+#[allow(deprecated)]
+#[deprecated(
+    note = "no qpdf counterpart; QPDFJob::doShowAttachment writes through its save pipeline instead of exposing a path helper (QPDFJob.cc:914-926) -- do not add new callers"
+)]
 pub fn extract_attachment_to_path<R, P>(pdf: &mut Pdf<R>, key: &[u8], path: P) -> Result<()>
 where
     R: Read + Seek,
@@ -677,6 +695,7 @@ where
     Ok(())
 }
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::super::{JobExitCode, QPDFJob};
     use super::extract_attachment;

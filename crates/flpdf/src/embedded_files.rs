@@ -448,6 +448,7 @@ pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Res
 // ── Tests for remove_attachment ───────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::filespec_helper::FileSpecBuilder;

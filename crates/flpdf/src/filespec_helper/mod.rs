@@ -92,6 +92,7 @@ pub use shared::{encode_utf16be, format_pdf_date, md5_checksum};
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::embedded_files::{insert_embedded_file, list_embedded_files};
