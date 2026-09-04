@@ -113,11 +113,11 @@ fn record_field_name(cache: &mut AcroFormCache, field: ObjectHandle, name: Strin
             if let Some(fields) = cache.name_to_fields.get_mut(&old_name) {
                 fields.retain(|candidate| !candidate.is_same_object_as(&field));
                 remove_name = fields.is_empty();
-            } // cov:ignore: structural close of the qpdf old-name entry branch
+            } // cov:ignore: LLVM assigns the covered old-name map branch closing brace to a zero-hit region; the rename regression executes the branch
             if remove_name {
                 cache.name_to_fields.remove(&old_name);
             }
-        } // cov:ignore: structural close of the qpdf old-name change branch
+        } // cov:ignore: LLVM assigns the covered old-name change branch closing brace to a zero-hit region; the rename regression executes the branch
     }
 
     let fields = cache.name_to_fields.entry(name).or_default();
@@ -2414,7 +2414,7 @@ fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
 mod final_handle_tests {
     use super::{AcroFormDocumentHelper, InheritedFieldOverrides};
     use crate::{ObjectHandle, ObjectRef, Pdf};
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::io::Cursor;
 
     fn fixture(name: &str) -> Pdf<Cursor<Vec<u8>>> {
@@ -2475,5 +2475,60 @@ mod final_handle_tests {
         assert!(!infos
             .iter()
             .any(|info| info.object_ref == ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn renaming_warm_fields_updates_both_old_name_buckets() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        for field_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
+            let field = pdf.get_object_handle(field_ref);
+            pdf.resolve(&field).expect("field dictionary");
+            field
+                .replace_key(b"/T", ObjectHandle::string(b"same".to_vec()))
+                .expect("set initial shared field name");
+            pdf.mark_object_handle_dirty(&field)
+                .expect("mark field name dirty");
+        }
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        let shared: BTreeSet<_> = [ObjectRef::new(3, 0), ObjectRef::new(4, 0)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("same")
+                .expect("shared name lookup"),
+            shared
+        );
+
+        helper
+            .set_form_field_name(ObjectRef::new(3, 0), "renamed")
+            .expect("rename one field");
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("same")
+                .expect("remaining old name lookup"),
+            [ObjectRef::new(4, 0)].into_iter().collect()
+        );
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("renamed")
+                .expect("new name lookup"),
+            [ObjectRef::new(3, 0)].into_iter().collect()
+        );
+
+        helper
+            .set_form_field_name(ObjectRef::new(4, 0), "final")
+            .expect("rename remaining old field");
+        assert!(helper
+            .get_fields_with_qualified_name("same")
+            .expect("empty old name lookup")
+            .is_empty());
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("final")
+                .expect("final name lookup"),
+            [ObjectRef::new(4, 0)].into_iter().collect()
+        );
     }
 }

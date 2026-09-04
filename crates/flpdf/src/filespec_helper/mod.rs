@@ -91,7 +91,6 @@ pub use shared::{encode_utf16be, format_pdf_date, md5_checksum};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-// cov:ignore-start: test-only compatibility coverage moved with the module; integration suites exercise the production owners
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,4 +678,3 @@ mod tests {
         );
     }
 }
-// cov:ignore-end

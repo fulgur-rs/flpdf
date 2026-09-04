@@ -510,7 +510,7 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
         let root = pdf.root_handle()?;
         root.try_get_key(b"/AcroForm")?.warn_if_possible(
             "document does not have updated appearance streams, so form fields will not be flattened",
-        )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+        )?;
     }
     let default_resources = acroform_default_resources(pdf)?;
     // qpdf resolves the Widget's field helper from one cached
@@ -806,7 +806,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         }
         pdf.resolve(&appearance)?;
         let Some(appearance_dict) = appearance.as_stream_dict() else {
-            continue; // cov:ignore: selected appearance must be a stream
+            continue; // cov:ignore: get_appearance_stream returns null for every non-stream AP/N value before this defensive type gate
         };
         let resources = appearance_dict.try_get_key(b"/Resources")?;
         // qpdf privatizes an indirect appearance /Resources before merging DR
@@ -846,7 +846,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // it earlier than this would touch a value flattening may not need.
         let default_resources = pdf.resolve_handle(default_resources)?;
         if default_resources.as_dictionary().is_none() {
-            continue; // cov:ignore: malformed AcroForm DR is ignored like qpdf
+            continue;
         }
         // See resolve_matched_category_handles's doc for why this resolves
         // source and matching-destination categories interleaved, one DR
@@ -945,6 +945,7 @@ fn annotation_is_marked_for_removal(annotation: &ObjectHandle, to_remove: &[Obje
 mod tests {
     use super::*;
     use crate::pages::{page_content_bytes, page_refs};
+    use crate::pipeline::PipelineHandle;
     use crate::writer::write_qpdf_to_memory;
     use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
@@ -1001,6 +1002,36 @@ mod tests {
             diagnostic.message
                 == "document does not have updated appearance streams, so form fields will not be flattened"
         }));
+    }
+
+    #[test]
+    fn qpdf_document_flatten_propagates_need_appearances_warning_sink_failure() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        let acroform_ref = ObjectRef::new(4, 0);
+        pdf.replace_object(
+            acroform_ref,
+            ObjectHandle::dictionary(vec![(
+                b"/NeedAppearances".to_vec(),
+                ObjectHandle::boolean(true),
+            )]),
+        )
+        .unwrap();
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).unwrap();
+        root.replace_key(b"/AcroForm", pdf.get_object_handle(acroform_ref))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
+
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(logger);
+
+        assert!(matches!(
+            flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3),
+            Err(Error::System(message)) if message == "sink write failure 1"
+        ));
     }
 
     #[test]
@@ -1982,6 +2013,66 @@ mod tests {
         pdf.resolve(&annots).unwrap();
         let annots = annots.as_array().unwrap();
         assert_eq!(annots.len(), 1);
+    }
+
+    #[test]
+    fn qpdf_flatten_ignores_non_stream_appearance_and_malformed_default_resources() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R 6 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
+
+        pdf.replace_object(ObjectRef::new(5, 0), ObjectHandle::integer(7))
+            .unwrap();
+        let non_stream_widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object(ObjectRef::new(4, 0), non_stream_widget)
+            .unwrap();
+
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(Vec::new()),
+            )]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object(ObjectRef::new(7, 0), stream).unwrap();
+        let malformed_resources_widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(7, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object(ObjectRef::new(6, 0), malformed_resources_widget)
+            .unwrap();
+
+        let malformed_default_resources = ObjectHandle::integer(11);
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &malformed_default_resources,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pdf.get_object_handle(ObjectRef::new(5, 0)).as_integer(),
+            Some(7)
+        );
+        let appearance = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve(&appearance).unwrap();
+        let resources = appearance.as_stream_dict().unwrap().get_key(b"/Resources");
+        assert!(resources.as_dictionary().is_some());
+        assert!(resources.try_get_keys().unwrap().is_empty());
     }
 
     #[test]

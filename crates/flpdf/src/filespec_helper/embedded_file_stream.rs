@@ -439,7 +439,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 canonical_dictionary_key(key.as_bytes()),
                 ObjectHandle::string(value),
             )]),
-        )?; // cov:ignore: the factory-created parameter value is always unowned
+        )?; // cov:ignore: LLVM maps this covered multiline /Params creation call to its argument lines, not this terminator
         Ok(())
     }
 
