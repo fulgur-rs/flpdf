@@ -237,7 +237,7 @@ pub fn write_json_key<R: Read + Seek>(
         out,
         &mut metadata_first,
         b"pushedinheritedpageresources",
-        &Json::make_bool(false),
+        &Json::make_bool(pdf.ever_pushed_inherited_attributes_to_pages()),
         3,
     )?;
     Json::write_dictionary_item(
