@@ -43,6 +43,15 @@ fn json_parser_error_retains_raw_input_name() {
 }
 
 #[test]
+fn json_parser_error_retains_raw_offending_byte() {
+    let error = import_error(b"\xff");
+    assert_eq!(
+        error.raw_message(),
+        Some(b"json-input-\xff: JSON: offset 0: unexpected character \xff".as_slice())
+    );
+}
+
+#[test]
 fn json_validation_error_retains_raw_input_name() {
     let error = import_error(b"{}");
     assert_eq!(

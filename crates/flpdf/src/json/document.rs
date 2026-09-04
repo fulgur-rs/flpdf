@@ -5,7 +5,7 @@
 //! qpdf rootless bootstrap, source lifetime, and exception/error boundary.
 
 use super::input::JsonReactor;
-use super::parse_reader;
+use super::{parse_reader, JsonError};
 use crate::{Error, Pdf, PdfOpenOptions, Result};
 use std::cell::RefCell;
 use std::fs::File;
@@ -193,8 +193,10 @@ where
             return Err(raw_system_error(&input_name, error.as_bytes()));
         }
         if let Err(error) = parsed {
-            let detail = error.to_string();
-            return Err(raw_system_error(&input_name, detail.as_bytes()));
+            let detail: &[u8] = match &error {
+                JsonError::Type(message) | JsonError::Parse(message) => message.as_bytes(),
+            };
+            return Err(raw_system_error(&input_name, detail));
         }
         if reactor.any_errors() {
             return Err(raw_system_error(&input_name, b"errors found in JSON"));
