@@ -4125,7 +4125,14 @@ mod final_handle_tests {
             b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 /Info (prefix\n",
         );
         let false_header_offset = bytes.len();
-        bytes.extend_from_slice(b"2 0 obj\nsuffix) >>\nstream\nabcd\nendstream\nendobj\n");
+        // Keep bytes after the final `endobj`: qpdf's `readObjectAtOffset`
+        // throws `EOF after endobj` when only whitespace follows it
+        // (`QPDF.cc:1652-1660`) and `resolve` turns that into a warned
+        // null (`QPDF.cc:1738-1748`), so an object that ends the file is
+        // never an xref-stream candidate in qpdf. With a trailing `%%EOF`
+        // line qpdf 11.9.0 accepts this object as its candidate and only
+        // fails later while decoding it.
+        bytes.extend_from_slice(b"2 0 obj\nsuffix) >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n");
 
         let first_ref = ObjectRef::new(1, 0);
         let false_ref = ObjectRef::new(2, 0);
