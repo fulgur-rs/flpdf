@@ -620,7 +620,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStringExt;
 
     struct CurrentDirGuard(PathBuf);
@@ -729,7 +729,7 @@ mod tests {
         bytes
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn secondary_foreign_stream_warning_preserves_non_utf8_path_bytes() {
         let directory = tempfile::tempdir().expect("create test directory");
