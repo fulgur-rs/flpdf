@@ -1015,18 +1015,6 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
-        self.compressed_member_parents
-            .get(&object_ref)
-            .map(|provenance| (provenance.parent_ref, provenance.parent_index))
-    }
-
-    /// Return the current source xref entry for `object_ref` without cloning
-    /// the complete xref table.
-    pub(crate) fn source_xref_entry(&self, object_ref: ObjectRef) -> Option<XrefEntry> {
-        self.resolver.xref_entry(object_ref)
-    }
-
     /// Preserve resolved compressed members when their source ObjStm is
     /// replaced or removed. qpdf's `replaceObject` and `removeObject` mutate
     /// only the requested cache slot (`QPDF.cc:1980-2005`); a member already
@@ -1105,12 +1093,9 @@ impl<R: Read + Seek> Pdf<R> {
         source_stream: u32,
         source_index: u32,
     ) {
-        let stream_ref = ObjectRef::new(source_stream, 0);
         self.compressed_member_parents.insert(
             object_ref,
             CompressedMemberProvenance {
-                parent_ref: stream_ref,
-                parent_index: source_index,
                 source_stream,
                 source_index,
             },

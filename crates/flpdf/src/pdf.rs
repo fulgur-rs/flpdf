@@ -15,16 +15,11 @@ use std::rc::Rc;
 /// Provenance for a legacy object-stream member that has already been
 /// materialized.
 ///
-/// `parent_ref` identifies the direct object-stream container named by the
-/// type-2 xref field1. `parent_index` is the raw type-2 field2 retained as
-/// provenance; it is not a positional member selected through an `/Extends`
-/// chain. `source_stream`/`source_index` preserve the live xref identity so
+/// `source_stream`/`source_index` preserve the live xref identity so
 /// resolution-time xref reconstruction can distinguish a still-valid
 /// compressed member from a stale mapping.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CompressedMemberProvenance {
-    pub(crate) parent_ref: ObjectRef,
-    pub(crate) parent_index: u32,
     pub(crate) source_stream: u32,
     pub(crate) source_index: u32,
 }

@@ -159,7 +159,6 @@
 | `crates/flpdf/src/writer/plain/mod.rs` | correspondence | QPDFWriter.cc standard write pipeline split across plain writer modules |
 | `crates/flpdf/src/writer/plain/plan.rs` | correspondence | QPDFWriter.cc standard-write object placement and renumber planning |
 | `crates/flpdf/src/writer/plain/xref.rs` | correspondence | QPDFWriter.cc classic and stream xref emission for the plain writer |
-| `crates/flpdf/src/writer/reachability.rs` | correspondence | \`QPDFWriter\` reachability and unreferenced-object emission |
 | `crates/flpdf/src/writer/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/writer/serialize.rs` | correspondence | QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives |
 | `crates/flpdf/src/writer/settings.rs` | correspondence | QPDFWriter.cc writer-setting state and conversion to emission options |

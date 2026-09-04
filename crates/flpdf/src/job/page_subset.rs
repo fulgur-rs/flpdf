@@ -2,8 +2,9 @@
 //!
 //! This module owns the job-level composition of the page-document resource
 //! pass. The page/Form resource algorithm remains in `resources.rs`, while
-//! document-wide reachability remains a writer-time concern in
-//! `writer::reachability`.
+//! document-wide reachability remains a writer-time concern: the writer's
+//! own enqueue walk determines which objects survive, matching qpdf's
+//! `QPDFWriter::enqueueObject` (`libqpdf/QPDFWriter.cc:1072-1157`).
 //!
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has restructured the
 //! document so that only the selected pages remain reachable from `/Root`,

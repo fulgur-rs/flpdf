@@ -83,6 +83,31 @@ fn normalize_qdf(input: &Path, output: &Path) -> Vec<u8> {
     std::fs::read(output).expect("normalized QDF should be readable")
 }
 
+/// Return the normalized object section of a QDF file.
+///
+/// Multi-source page copying still has an unrelated object-number ordering
+/// difference (D3/D11), so the control compares object count and content while
+/// treating object headers and indirect references as identity-independent.
+fn normalized_qdf_objects(qdf: &[u8]) -> String {
+    let text = String::from_utf8_lossy(qdf);
+    let object_section = text
+        .split_once("\nxref\n")
+        .map_or(text.as_ref(), |(objects, _)| objects);
+    let headers = regex::Regex::new(r"(?m)^\d+ 0 obj$").unwrap();
+    let references = regex::Regex::new(r"\b\d+ 0 R\b").unwrap();
+    let headers_normalized = headers.replace_all(object_section, "N 0 obj");
+    references
+        .replace_all(&headers_normalized, "REF")
+        .into_owned()
+}
+
+fn qdf_object_count(qdf: &[u8]) -> usize {
+    regex::Regex::new(r"(?m)^\d+ 0 obj$")
+        .unwrap()
+        .find_iter(&String::from_utf8_lossy(qdf))
+        .count()
+}
+
 fn has_primary_orphan_marker(qdf: &[u8]) -> bool {
     qdf.windows(b"unreachable root".len())
         .any(|window| window == b"unreachable root")
@@ -258,6 +283,17 @@ fn multi_source_pages_preserve_orphan_reference_to_primary_catalog_resolves_to_t
     let flpdf_qdf_path = temp.path().join("flpdf-qdf.pdf");
     let qpdf_qdf = normalize_qdf(&qpdf_output, &qpdf_qdf_path);
     let flpdf_qdf = normalize_qdf(&flpdf_output, &flpdf_qdf_path);
+
+    assert_eq!(
+        qdf_object_count(&flpdf_qdf),
+        qdf_object_count(&qpdf_qdf),
+        "multi-source preserve control must keep the qpdf object count"
+    );
+    assert_eq!(
+        normalized_qdf_objects(&flpdf_qdf),
+        normalized_qdf_objects(&qpdf_qdf),
+        "multi-source preserve control must keep qpdf object contents, ignoring D3/D11 numbers"
+    );
 
     for (label, qdf) in [("qpdf", &qpdf_qdf), ("flpdf", &flpdf_qdf)] {
         assert!(
