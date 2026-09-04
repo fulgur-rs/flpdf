@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use flpdf::Pdf;
 use std::fs;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 fn minimal_pdf() -> std::path::PathBuf {
@@ -21,6 +22,35 @@ fn objstm_fixture() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("tests/fixtures/compat/three-page-objstm.pdf")
+}
+
+fn json_input_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("tests/fixtures/compat/json-input")
+        .join(name)
+}
+
+fn create_qpdf_json_source(directory: &Path) -> PathBuf {
+    let source = directory.join("json-source.pdf");
+    let result = ProcessCommand::new("qpdf")
+        .args(["--json-input", "--static-id"])
+        .arg(json_input_fixture("complete.json"))
+        .arg(&source)
+        .output()
+        .expect("qpdf should spawn for the JSON source fixture");
+    assert!(
+        result.status.success(),
+        "qpdf JSON source creation failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    source
+}
+
+fn run_qpdf_ctest(directory: &Path, args: &[String]) -> std::process::Output {
+    let mut command = Command::cargo_bin("qpdf-ctest").expect("qpdf-ctest binary");
+    command.current_dir(directory).args(args);
+    command.output().expect("qpdf-ctest should spawn")
 }
 
 #[test]
@@ -304,6 +334,209 @@ fn qpdf_ctest_version_reports_the_pinned_qpdf_version() {
         .success()
         .stdout("qpdf-ctest version 11.9.0\n")
         .stderr("");
+}
+
+#[test]
+fn qpdf_ctest_json_cases_42_through_47_match_qpdf() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let complete = json_input_fixture("complete.json");
+    let update = json_input_fixture("update.json");
+    let complete_str = complete.to_str().expect("fixture path is UTF-8");
+    let update_str = update.to_str().expect("fixture path is UTF-8");
+
+    let output42 = directory.path().join("ctest-42.pdf");
+    let result42 = run_qpdf_ctest(
+        directory.path(),
+        &[
+            "42".to_owned(),
+            complete_str.to_owned(),
+            String::new(),
+            output42.to_str().unwrap().to_owned(),
+        ],
+    );
+    assert!(
+        result42.status.success(),
+        "qpdf-ctest 42 failed: {}",
+        String::from_utf8_lossy(&result42.stderr)
+    );
+    assert_eq!(result42.stdout, b"C test 42 done\n");
+    assert!(result42.stderr.is_empty());
+
+    let output43 = directory.path().join("ctest-43.pdf");
+    let result43 = run_qpdf_ctest(
+        directory.path(),
+        &[
+            "43".to_owned(),
+            complete_str.to_owned(),
+            String::new(),
+            output43.to_str().unwrap().to_owned(),
+        ],
+    );
+    assert!(
+        result43.status.success(),
+        "qpdf-ctest 43 failed: {}",
+        String::from_utf8_lossy(&result43.stderr)
+    );
+    assert_eq!(result43.stdout, b"C test 43 done\n");
+    assert!(result43.stderr.is_empty());
+
+    let qpdf_create = directory.path().join("qpdf-create.pdf");
+    let qpdf_create_result = ProcessCommand::new("qpdf")
+        .args(["--json-input", "--static-id"])
+        .arg(&complete)
+        .arg(&qpdf_create)
+        .output()
+        .expect("qpdf should spawn for test42 oracle");
+    assert!(qpdf_create_result.status.success());
+    assert_eq!(
+        fs::read(&output42).unwrap(),
+        fs::read(&qpdf_create).unwrap()
+    );
+    assert_eq!(
+        fs::read(&output43).unwrap(),
+        fs::read(&qpdf_create).unwrap()
+    );
+
+    let source = create_qpdf_json_source(directory.path());
+    let source_str = source.to_str().expect("source path is UTF-8");
+    let output44 = directory.path().join("ctest-44.pdf");
+    let result44 = run_qpdf_ctest(
+        directory.path(),
+        &[
+            "44".to_owned(),
+            source_str.to_owned(),
+            String::new(),
+            output44.to_str().unwrap().to_owned(),
+            update_str.to_owned(),
+        ],
+    );
+    assert!(
+        result44.status.success(),
+        "qpdf-ctest 44 failed: {}",
+        String::from_utf8_lossy(&result44.stderr)
+    );
+    assert_eq!(result44.stdout, b"C test 44 done\n");
+    assert!(result44.stderr.is_empty());
+
+    let output45 = directory.path().join("ctest-45.pdf");
+    let result45 = run_qpdf_ctest(
+        directory.path(),
+        &[
+            "45".to_owned(),
+            source_str.to_owned(),
+            String::new(),
+            output45.to_str().unwrap().to_owned(),
+            update_str.to_owned(),
+        ],
+    );
+    assert!(
+        result45.status.success(),
+        "qpdf-ctest 45 failed: {}",
+        String::from_utf8_lossy(&result45.stderr)
+    );
+    assert_eq!(result45.stdout, b"C test 45 done\n");
+    assert!(result45.stderr.is_empty());
+
+    let qpdf_update = directory.path().join("qpdf-update.pdf");
+    let qpdf_update_result = ProcessCommand::new("qpdf")
+        .arg("--static-id")
+        .arg(format!("--update-from-json={update_str}"))
+        .arg(&source)
+        .arg(&qpdf_update)
+        .output()
+        .expect("qpdf should spawn for test44 oracle");
+    assert!(qpdf_update_result.status.success());
+    assert_eq!(
+        fs::read(&output44).unwrap(),
+        fs::read(&qpdf_update).unwrap()
+    );
+    assert_eq!(
+        fs::read(&output45).unwrap(),
+        fs::read(&qpdf_update).unwrap()
+    );
+
+    let output46 = directory.path().join("ctest-46.json");
+    let result46 = run_qpdf_ctest(
+        directory.path(),
+        &[
+            "46".to_owned(),
+            source_str.to_owned(),
+            String::new(),
+            output46.to_str().unwrap().to_owned(),
+        ],
+    );
+    assert!(
+        result46.status.success(),
+        "qpdf-ctest 46 failed: {}",
+        String::from_utf8_lossy(&result46.stderr)
+    );
+    assert_eq!(result46.stdout, b"C test 46 done\n");
+    assert!(result46.stderr.is_empty());
+
+    let qpdf_json46 = directory.path().join("qpdf-46.json");
+    let qpdf_json46_result = ProcessCommand::new("qpdf")
+        .args([
+            "--json-output=2",
+            "--json-stream-data=inline",
+            "--decode-level=none",
+        ])
+        .arg(&source)
+        .arg(&qpdf_json46)
+        .output()
+        .expect("qpdf should spawn for test46 oracle");
+    assert!(qpdf_json46_result.status.success());
+    assert_eq!(
+        fs::read(&output46).unwrap(),
+        fs::read(&qpdf_json46).unwrap()
+    );
+
+    let adapter47 = directory.path().join("adapter-47");
+    let oracle47 = directory.path().join("oracle-47");
+    fs::create_dir(&adapter47).unwrap();
+    fs::create_dir(&oracle47).unwrap();
+    let output47 = adapter47.join("ctest-47.json");
+    let result47 = run_qpdf_ctest(
+        &adapter47,
+        &[
+            "47".to_owned(),
+            source_str.to_owned(),
+            String::new(),
+            output47.to_str().unwrap().to_owned(),
+            "auto".to_owned(),
+        ],
+    );
+    assert!(
+        result47.status.success(),
+        "qpdf-ctest 47 failed: {}",
+        String::from_utf8_lossy(&result47.stderr)
+    );
+    assert_eq!(result47.stdout, b"C test 47 done\n");
+    assert!(result47.stderr.is_empty());
+
+    let qpdf_json47 = oracle47.join("qpdf-47.json");
+    let qpdf_json47_result = ProcessCommand::new("qpdf")
+        .current_dir(&oracle47)
+        .args([
+            "--json-output=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix=auto",
+            "--decode-level=specialized",
+            "--json-object=4",
+            "--json-object=trailer",
+        ])
+        .arg(&source)
+        .arg(&qpdf_json47)
+        .output()
+        .expect("qpdf should spawn for test47 oracle");
+    assert!(qpdf_json47_result.status.success());
+    assert_eq!(
+        fs::read(&output47).unwrap(),
+        fs::read(&qpdf_json47).unwrap()
+    );
+    assert_eq!(
+        fs::read(adapter47.join("auto-4")).unwrap(),
+        fs::read(oracle47.join("auto-4")).unwrap()
+    );
 }
 
 #[test]

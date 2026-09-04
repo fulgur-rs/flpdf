@@ -1,19 +1,22 @@
 //! Portable Rust process adapter for the qpdf C test helper's selected cases.
 //!
-//! qpdf's `qpdf-ctest.c:test19` (`qpdf-ctest.c:435-442`) and test20
-//! (`qpdf-ctest.c:445-455`) intentionally test C API lifecycles rather than
+//! qpdf's `qpdf-ctest.c:test19` (`qpdf-ctest.c:435-442`), test20
+//! (`qpdf-ctest.c:445-455`), and JSON tests 42–47
+//! (`qpdf-ctest.c:1252-1320`) intentionally test C API lifecycles rather than
 //! requiring callers to link a C symbol. Keep this adapter at the qtest-tools
 //! process boundary; the PDF read/write responsibilities stay in the canonical
-//! `flpdf::Pdf` and `flpdf::PdfWriter` APIs.
+//! `flpdf::Pdf`, `flpdf::PdfWriter`, and JSON job APIs.
 
+use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
+use flpdf::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use flpdf::{
     DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error, Pdf, PdfOpenOptions,
     PdfWriter, Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig, Result,
 };
 use std::env;
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Cursor, Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Extract the raw password bytes from an argv entry the way qpdf's C API
@@ -58,12 +61,13 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         println!("qpdf-ctest version {}", flpdf::qpdf_version());
         return Ok(());
     }
-    if args.len() != 5 {
+    if args.len() < 5 {
         return Err(flpdf::Error::Unsupported(
             "usage: qpdf-ctest n infile password outfile".to_owned(),
         ));
     }
 
+    let extra_arg = args.get(5).map(|arg| arg.as_os_str());
     match args[1].to_str() {
         Some("1") => run_test1(&args[2], &args[3]),
         Some("2") => run_test2(&args[2], &args[3], &args[4]),
@@ -75,11 +79,43 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         Some("18") => run_test18(&args[2], &args[3], &args[4]),
         Some("19") => run_test19(&args[2], &args[3], &args[4]),
         Some("20") => run_test20(&args[2], &args[3], &args[4]),
+        Some("42") => run_test42(&args[2], &args[4]),
+        Some("43") => run_test43(&args[2], &args[4]),
+        Some("44") => run_test44(
+            &args[2],
+            &args[3],
+            &args[4],
+            required_extra_arg("44", extra_arg)?,
+        ),
+        Some("45") => run_test45(
+            &args[2],
+            &args[3],
+            &args[4],
+            required_extra_arg("45", extra_arg)?,
+        ),
+        Some("46") => run_test46(&args[2], &args[3], &args[4]),
+        Some("47") => run_test47(
+            &args[2],
+            &args[3],
+            &args[4],
+            required_extra_arg("47", extra_arg)?,
+        ),
         Some(test_number) => Err(flpdf::Error::Unsupported(format!(
             "invalid test number {test_number}"
         ))),
         None => Err(flpdf::Error::Unsupported("invalid test number".to_owned())),
     }
+}
+
+fn required_extra_arg<'a>(
+    test_number: &str,
+    value: Option<&'a std::ffi::OsStr>,
+) -> Result<&'a std::ffi::OsStr> {
+    value.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "usage: qpdf-ctest test {test_number} requires an extra JSON argument"
+        ))
+    })
 }
 
 fn read_options(input: &std::path::Path, password: Vec<u8>) -> PdfOpenOptions {
@@ -440,6 +476,143 @@ fn write_encrypted_observations(
     Ok(())
 }
 
+fn write_static_id_pdf<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file(PathBuf::from(output_arg))?;
+    writer.set_static_id(true);
+    writer.write()
+}
+
+fn run_test42(input_arg: &std::ffi::OsStr, output_arg: &std::ffi::OsStr) -> Result<()> {
+    let input = PathBuf::from(input_arg);
+    let mut pdf = Pdf::create_from_json_file(&input)?;
+    write_static_id_pdf(&mut pdf, output_arg)?;
+    println!("C test 42 done");
+    Ok(())
+}
+
+fn run_test43(input_arg: &std::ffi::OsStr, output_arg: &std::ffi::OsStr) -> Result<()> {
+    let input = PathBuf::from(input_arg);
+    let json = std::fs::read(&input)?;
+    let mut pdf = Pdf::create_from_json(Cursor::new(json), path_description(&input))?;
+    write_static_id_pdf(&mut pdf, output_arg)?;
+    println!("C test 43 done");
+    Ok(())
+}
+
+fn run_test44(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+    update_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let update = PathBuf::from(update_arg);
+    let mut pdf = open_input(input_arg, password_arg)?;
+    pdf.update_from_json_file(&update)?;
+    write_static_id_pdf(&mut pdf, output_arg)?;
+    println!("C test 44 done");
+    Ok(())
+}
+
+fn run_test45(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+    update_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let update = PathBuf::from(update_arg);
+    let json = std::fs::read(&update)?;
+    let mut pdf = open_input(input_arg, password_arg)?;
+    pdf.update_from_json(Cursor::new(json), path_description(&update))?;
+    write_static_id_pdf(&mut pdf, output_arg)?;
+    println!("C test 45 done");
+    Ok(())
+}
+
+fn write_json_test_output<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    output_arg: &std::ffi::OsStr,
+    decode_level: JsonDecodeLevel,
+    stream_data: JsonStreamData,
+    stream_prefix: Option<&[u8]>,
+    objects: &[JsonObjectSelector],
+) -> Result<()> {
+    let output = PathBuf::from(output_arg);
+    let mut file = File::create(&output)?;
+    let keys = [JsonKey::Qpdf];
+    let options = JsonJobOptions {
+        decode_level,
+        stream_data,
+        stream_prefix,
+        keys: &keys,
+        objects,
+    };
+    let mut job = QPDFJob::new();
+    let _status = job
+        .write_json_with_version(
+            pdf,
+            2,
+            false,
+            true,
+            false,
+            options,
+            JsonJobOutput::File {
+                filename: &output,
+                writer: &mut file,
+            },
+        )
+        .map_err(Error::from)?;
+    Ok(())
+}
+
+fn run_test46(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let mut pdf = open_input(input_arg, password_arg)?;
+    write_json_test_output(
+        &mut pdf,
+        output_arg,
+        JsonDecodeLevel::None,
+        JsonStreamData::Inline,
+        None,
+        &[],
+    )?;
+    println!("C test 46 done");
+    Ok(())
+}
+
+fn run_test47(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+    prefix_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let prefix = path_description(Path::new(prefix_arg));
+    let objects = [
+        JsonObjectSelector::Object {
+            number: 4,
+            generation: 0,
+        },
+        JsonObjectSelector::Trailer,
+    ];
+    let mut pdf = open_input(input_arg, password_arg)?;
+    write_json_test_output(
+        &mut pdf,
+        output_arg,
+        JsonDecodeLevel::Specialized,
+        JsonStreamData::File,
+        Some(&prefix),
+        &objects,
+    )?;
+    println!("C test 47 done");
+    Ok(())
+}
+
 fn run_test19(
     input_arg: &std::ffi::OsStr,
     password_arg: &std::ffi::OsStr,
@@ -505,11 +678,17 @@ fn run_test20(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    use super::run;
+    use std::ffi::OsString;
+
+    #[cfg(unix)]
     use super::password_bytes;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
 
+    #[cfg(unix)]
     #[test]
     fn password_bytes_preserves_non_utf8_argv_bytes_on_unix() {
         // qpdf's C API receives argv as raw bytes and never validates them as
@@ -519,5 +698,27 @@ mod tests {
         let raw = [b'p', b'w', 0xe9, b'!'];
         let arg = std::ffi::OsStr::from_bytes(&raw);
         assert_eq!(password_bytes(arg), raw.to_vec());
+    }
+
+    #[test]
+    fn run_rejects_missing_common_arguments() {
+        let args = vec![OsString::from("qpdf-ctest"), OsString::from("42")];
+        let error = run(&args).expect_err("qpdf-ctest requires the common arguments");
+        assert!(error.to_string().contains("usage: qpdf-ctest"));
+    }
+
+    #[test]
+    fn run_rejects_missing_json_extra_argument() {
+        let args = vec![
+            OsString::from("qpdf-ctest"),
+            OsString::from("44"),
+            OsString::from("input.pdf"),
+            OsString::new(),
+            OsString::from("output.pdf"),
+        ];
+        let error = run(&args).expect_err("test44 requires its update JSON argument");
+        assert!(error
+            .to_string()
+            .contains("requires an extra JSON argument"));
     }
 }
