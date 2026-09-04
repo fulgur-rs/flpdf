@@ -49,10 +49,16 @@ QPDF_CITATION_RE = re.compile(
     r"`((?:libqpdf|include/qpdf|qpdf)/[A-Za-z0-9_./+-]+\.(?:cc|hh|h))"
     r":(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)`"
 )
+QPDF_CITATION_TOKEN_RE = re.compile(
+    r"`((?:libqpdf|include/qpdf|qpdf)/[A-Za-z0-9_./+-]+\.(?:cc|hh|h)):([^`\n]*)`"
+)
+QPDF_CITATION_PLACEHOLDER_RE = re.compile(r"(?:N(?:-M)?|NNN)")
 FLPDF_SYMBOL_RE = re.compile(
     r"`(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)`"
 )
-FLPDF_RANGE_RE = re.compile(r"`(crates/[A-Za-z0-9_./-]+\.rs):(\d+(?:-\d+)?)`")
+FLPDF_RANGE_RE = re.compile(
+    r"`(crates/[A-Za-z0-9_./-]+\.rs):(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*)`"
+)
 MANIFEST_SYMBOL_RE = re.compile(
     r"^\s*(crates/[A-Za-z0-9_./-]+\.rs)::([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:#.*)?$"
 )
@@ -85,6 +91,104 @@ def _parse_ranges(spec: str) -> list[tuple[int, int]]:
 def _line_count(path: Path) -> int:
     with path.open("rb") as handle:
         return sum(1 for _ in handle)
+
+
+def mask_rust_source(text: str) -> str:
+    """Blank Rust comments and string literals while preserving line layout."""
+    masked = list(text)
+    length = len(text)
+    index = 0
+
+    def blank(start: int, end: int) -> None:
+        for position in range(start, end):
+            if masked[position] != "\n":
+                masked[position] = " "
+
+    while index < length:
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            if end < 0:
+                end = length
+            blank(index, end)
+            index = end
+            continue
+        if text.startswith("/*", index):
+            end = index + 2
+            depth = 1
+            while end < length and depth:
+                if text.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif text.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            blank(index, end)
+            index = end
+            continue
+
+        raw_marker = index
+        if text.startswith("br", index):
+            raw_marker = index + 1
+        if text[raw_marker : raw_marker + 1] == "r":
+            cursor = raw_marker + 1
+            while cursor < length and text[cursor] == "#":
+                cursor += 1
+            hashes = text[raw_marker + 1 : cursor]
+            if cursor < length and text[cursor] == '"':
+                delimiter = '"' + hashes
+                close = text.find(delimiter, cursor + 1)
+                end = length if close < 0 else close + len(delimiter)
+                blank(index, end)
+                index = end
+                continue
+
+        if text[index] == '"':
+            end = index + 1
+            escaped = False
+            while end < length:
+                character = text[end]
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    end += 1
+                    break
+                end += 1
+            blank(index, end)
+            index = end
+            continue
+
+        index += 1
+
+    return "".join(masked)
+
+
+def split_markdown_row(row: str) -> list[str]:
+    """Split a Markdown table row without treating an escaped pipe as a cell boundary."""
+    stripped = row.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in stripped:
+        if character == "|" and not escaped:
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(character)
+        if character == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    cells.append("".join(current).strip())
+    return cells
 
 
 class Checker:
@@ -158,7 +262,7 @@ class Checker:
             rf"|\blet\s+(?:mut\s+)?{escaped}\b",
             re.MULTILINE,
         )
-        if pattern.search(self._text(target)) is None:
+        if pattern.search(mask_rust_source(self._text(target))) is None:
             self.report.error(
                 doc,
                 line_number,
@@ -191,8 +295,20 @@ class Checker:
         for line_number, raw_line in enumerate(
             doc.read_text(encoding="utf-8").splitlines(), start=1
         ):
-            for match in QPDF_CITATION_RE.finditer(raw_line):
-                self.check_qpdf_citation(doc, line_number, match)
+            for match in QPDF_CITATION_TOKEN_RE.finditer(raw_line):
+                # The checker documentation itself contains illustrative
+                # forms such as `libqpdf/X.cc:N-M`; only numeric-looking
+                # tokens are citations that can be validated.
+                if QPDF_CITATION_PLACEHOLDER_RE.fullmatch(match.group(2)):
+                    continue
+                if QPDF_CITATION_RE.fullmatch(match.group(0)):
+                    self.check_qpdf_citation(doc, line_number, match)
+                else:
+                    self.report.error(
+                        doc,
+                        line_number,
+                        f"`{match.group(1)}:{match.group(2)}`: malformed qpdf citation",
+                    )
             for match in FLPDF_SYMBOL_RE.finditer(raw_line):
                 self.check_flpdf_symbol(doc, line_number, match)
             for match in FLPDF_RANGE_RE.finditer(raw_line):
@@ -202,7 +318,7 @@ class Checker:
             if not stripped.startswith("|"):
                 classification_column = None
                 continue
-            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            cells = split_markdown_row(stripped)
             lowered = [cell.lower() for cell in cells]
             if "classification" in lowered:
                 classification_column = lowered.index("classification")

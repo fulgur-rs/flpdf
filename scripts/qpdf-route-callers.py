@@ -9,15 +9,17 @@ after every cutover with one convention. This script is that convention:
 
 * An occurrence is a whole-word match of the symbol's last ``::`` segment.
 * Excluded occurrences (they are not callers): comment-only lines
-  (``//``, ``///``, ``//!``), declaration lines (``fn``/``struct``/``enum``/
-  ``trait``/``type``/``const``/``static``/``mod`` + the symbol), ``use`` lines
-  including the continuation lines of a multi-line ``use {…}``, ``impl``
-  header lines, and mentions inside string literals.
+  (``//``, ``///``, ``//!``), item declaration lines (``fn``/``struct``/
+  ``enum``/``trait``/``type``/``const``/``static``/``mod`` + the symbol),
+  struct field declaration lines, ``use`` lines including the continuation
+  lines of a multi-line ``use {…}``, ``impl`` header lines, and mentions inside
+  normal or raw string literals.
 * Type-position references (argument, return, field types) are counted --
   they are real references that a cutover must migrate.
 * ``test`` = files under ``tests/``, ``benches/`` or ``examples/``, files whose
   basename ends in ``_tests.rs``, and every line inside an item that is
-  guarded by ``#[cfg(test)]`` (a ``mod … { … }`` block, a ``fn``/``impl``
+  guarded by ``#[cfg(test)]`` or a test-only compound cfg such as
+  ``#[cfg(all(test, feature = "qtest-driver"))]`` (a ``mod … { … }`` block, a ``fn``/``impl``
   body, or a single-line item). Guarded blocks are tracked by brace depth,
   so a file that interleaves production code with several column-0
   ``#[cfg(test)] mod`` blocks (``object_handle.rs`` has 21) is split
@@ -55,35 +57,77 @@ class SymbolCount:
     test_files: dict[str, int] = field(default_factory=dict)
 
 
-def mask_strings(line: str) -> str:
-    """Replace the contents of string literals with spaces (same length)."""
-    out: list[str] = []
-    in_string = False
-    escaped = False
-    for ch in line:
-        if in_string:
-            if escaped:
-                escaped = False
-                out.append(" ")
-            elif ch == "\\":
-                escaped = True
-                out.append(" ")
-            elif ch == '"':
-                in_string = False
-                out.append(ch)
-            else:
-                out.append(" ")
-        elif ch == '"':
-            in_string = True
-            out.append(ch)
-        else:
-            out.append(ch)
-    return "".join(out)
+def mask_rust_source(text: str) -> str:
+    """Blank Rust comments and normal/raw string literals, preserving lines."""
+    masked = list(text)
+    length = len(text)
+    index = 0
 
+    def blank(start: int, end: int) -> None:
+        for position in range(start, end):
+            if masked[position] != "\n":
+                masked[position] = " "
 
-def strip_line_comment(masked: str) -> str:
-    index = masked.find("//")
-    return masked if index < 0 else masked[:index]
+    while index < length:
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            if end < 0:
+                end = length
+            blank(index, end)
+            index = end
+            continue
+        if text.startswith("/*", index):
+            end = index + 2
+            depth = 1
+            while end < length and depth:
+                if text.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif text.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            blank(index, end)
+            index = end
+            continue
+
+        raw_marker = index
+        if text.startswith("br", index):
+            raw_marker = index + 1
+        if text[raw_marker : raw_marker + 1] == "r":
+            cursor = raw_marker + 1
+            while cursor < length and text[cursor] == "#":
+                cursor += 1
+            hashes = text[raw_marker + 1 : cursor]
+            if cursor < length and text[cursor] == '"':
+                delimiter = '"' + hashes
+                close = text.find(delimiter, cursor + 1)
+                end = length if close < 0 else close + len(delimiter)
+                blank(index, end)
+                index = end
+                continue
+
+        if text[index] == '"':
+            end = index + 1
+            escaped = False
+            while end < length:
+                character = text[end]
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    end += 1
+                    break
+                end += 1
+            blank(index, end)
+            index = end
+            continue
+
+        index += 1
+
+    return "".join(masked)
 
 
 def is_test_file(relative: Path) -> bool:
@@ -92,14 +136,19 @@ def is_test_file(relative: Path) -> bool:
     return relative.name.endswith("_tests.rs")
 
 
-def cfg_test_lines(lines: list[str]) -> set[int]:
+def cfg_test_lines(lines: list[str], masked_lines: list[str]) -> set[int]:
     """Return the 0-based line indexes that belong to a ``#[cfg(test)]`` item."""
     guarded: set[int] = set()
     i = 0
     while i < len(lines):
-        if lines[i].strip() == "#[cfg(test)]":
+        attribute = masked_lines[i].strip()
+        is_test_cfg = bool(
+            re.fullmatch(r"#\[cfg\(test\)\]", attribute)
+            or re.fullmatch(r"#\[cfg\(all\([^)]*\btest\b[^)]*\)\)\]", attribute)
+        )
+        if is_test_cfg:
             j = i + 1
-            while j < len(lines) and lines[j].strip().startswith("#["):
+            while j < len(lines) and masked_lines[j].strip().startswith("#["):
                 j += 1
             if j >= len(lines):
                 break
@@ -109,7 +158,7 @@ def cfg_test_lines(lines: list[str]) -> set[int]:
             opened = False
             k = j
             while k < len(lines):
-                code = strip_line_comment(mask_strings(lines[k]))
+                code = masked_lines[k]
                 for ch in code:
                     if ch == "{":
                         depth += 1
@@ -128,11 +177,42 @@ def cfg_test_lines(lines: list[str]) -> set[int]:
     return guarded
 
 
+def struct_body_lines(masked_lines: list[str]) -> set[int]:
+    """Return line indexes inside Rust struct bodies."""
+    body_lines: set[int] = set()
+    body_depths: list[int] = []
+    brace_depth = 0
+    pending_struct = False
+
+    for index, line in enumerate(masked_lines):
+        if body_depths:
+            body_lines.add(index)
+        if re.search(r"\bstruct\b", line):
+            pending_struct = True
+        opened_struct = False
+        for character in line:
+            if character == "{":
+                brace_depth += 1
+                if pending_struct and not opened_struct:
+                    body_depths.append(brace_depth)
+                    opened_struct = True
+                    pending_struct = False
+            elif character == "}":
+                brace_depth -= 1
+                while body_depths and brace_depth < body_depths[-1]:
+                    body_depths.pop()
+        if pending_struct and not opened_struct and ";" in line:
+            pending_struct = False
+    return body_lines
+
+
 def count_file(path: Path, relative: Path, leafs: dict[str, str], totals: dict[str, SymbolCount]) -> None:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.split("\n")
+    masked_lines = mask_rust_source(text).split("\n")
     file_is_test = is_test_file(relative)
-    guarded = set() if file_is_test else cfg_test_lines(lines)
+    guarded = set() if file_is_test else cfg_test_lines(lines, masked_lines)
+    struct_lines = struct_body_lines(masked_lines)
     in_use_block = False
     patterns = {
         symbol: re.compile(rf"(?<![A-Za-z0-9_]){re.escape(leaf)}(?![A-Za-z0-9_])")
@@ -143,24 +223,30 @@ def count_file(path: Path, relative: Path, leafs: dict[str, str], totals: dict[s
         for symbol, leaf in leafs.items()
     }
     for index, raw in enumerate(lines):
-        stripped = raw.strip()
+        masked = masked_lines[index]
+        stripped = masked.strip()
         if in_use_block:
-            if "}" in strip_line_comment(mask_strings(raw)):
+            if "}" in masked:
                 in_use_block = False
             continue
-        if re.match(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?use\b", raw):
-            code = strip_line_comment(mask_strings(raw))
+        if re.match(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\b", masked):
+            code = masked
             if "{" in code and "}" not in code:
                 in_use_block = True
             continue
-        if stripped.startswith("//"):
+        if not stripped:
             continue
-        if re.match(r"^\s*impl\b", raw):
+        if re.match(r"^\s*impl\b", masked):
             continue
-        masked = strip_line_comment(mask_strings(raw))
         is_test_line = file_is_test or index in guarded
         for symbol, pattern in patterns.items():
-            if decl_patterns[symbol].match(raw):
+            leaf = leafs[symbol]
+            if decl_patterns[symbol].match(masked):
+                continue
+            if index in struct_lines and re.match(
+                rf"^\s*(?:pub(?:\([^)]*\))?\s+)?{re.escape(leaf)}\s*:",
+                masked,
+            ):
                 continue
             hits = len(pattern.findall(masked))
             if hits == 0:
@@ -214,6 +300,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
         count_file(path, path.relative_to(root), leafs, totals)
 
+    failing = [symbol for symbol, c in totals.items() if c.prod > 0]
+    absent = [symbol for symbol, c in totals.items() if c.prod == 0 and c.test == 0]
+
     if args.json:
         payload = {
             "symbols": {
@@ -226,6 +315,12 @@ def main(argv: list[str] | None = None) -> int:
                 for symbol, c in totals.items()
             }
         }
+        if args.expect_zero:
+            payload["expect_zero"] = {
+                "ok": not failing,
+                "failing": failing,
+                "absent": absent,
+            }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         for symbol, c in totals.items():
@@ -235,16 +330,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    {files}")
 
     if args.expect_zero:
-        failing = [symbol for symbol, c in totals.items() if c.prod > 0]
         if failing:
+            if args.json:
+                return 1
             print("FAILED: production callers remain for: " + ", ".join(f"{s}: prod {totals[s].prod}" for s in failing))
             return 1
         # A symbol with no occurrence at all passes vacuously: it may have been
         # deleted (the intended end state) or misspelled. Say so, so the gate
         # cannot be mistaken for evidence that the route was ever tracked.
-        absent = [symbol for symbol, c in totals.items() if c.prod == 0 and c.test == 0]
         if absent:
+            if args.json:
+                return 0
             print("note: no occurrence at all (deleted, or misspelled?): " + ", ".join(absent))
+        if args.json:
+            return 0
         print("OK: no production callers remain")
     return 0
 

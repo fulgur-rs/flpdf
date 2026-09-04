@@ -74,6 +74,62 @@ class ExclusionRules(unittest.TestCase):
             )
             self.assertEqual(1, counts(root, "legacy_thing")["prod"])
 
+    def test_raw_string_with_embedded_quote_is_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            write(root, "crates/flpdf/src/a.rs", 'let s = r#"foo " legacy_thing bar"#;\n')
+            c = counts(root, "legacy_thing")
+            self.assertEqual(0, c["prod"], c)
+            self.assertEqual(0, c["test"], c)
+
+    def test_struct_field_declaration_is_not_a_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            write(
+                root,
+                "crates/flpdf/src/a.rs",
+                "struct State {\n    pub(crate) legacy_resolution_state_synced: bool,\n}\n",
+            )
+            c = counts(root, "legacy_resolution_state_synced")
+            self.assertEqual(0, c["prod"], c)
+            self.assertEqual(0, c["test"], c)
+
+    def test_struct_literal_field_is_a_caller(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            write(
+                root,
+                "crates/flpdf/src/a.rs",
+                "struct State {\n"
+                "    legacy_resolution_state_synced: bool,\n"
+                "}\n"
+                "fn make() {\n"
+                "    let _ = State {\n"
+                "        legacy_resolution_state_synced: true,\n"
+                "    };\n"
+                "}\n",
+            )
+            c = counts(root, "legacy_resolution_state_synced")
+            self.assertEqual(1, c["prod"], c)
+            self.assertEqual(0, c["test"], c)
+
+    def test_unit_struct_does_not_make_following_function_a_struct_body(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            write(
+                root,
+                "crates/flpdf/src/a.rs",
+                "struct Marker;\n"
+                "fn make() {\n"
+                "    let _ = State {\n"
+                "        legacy_resolution_state_synced: true,\n"
+                "    };\n"
+                "}\n",
+            )
+            c = counts(root, "legacy_resolution_state_synced")
+            self.assertEqual(1, c["prod"], c)
+            self.assertEqual(0, c["test"], c)
+
     def test_qualified_symbol_matches_last_segment_only(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
@@ -142,6 +198,21 @@ class ProdTestSplit(unittest.TestCase):
             self.assertEqual(1, c["prod"], c)
             self.assertEqual(1, c["test"], c)
 
+    def test_compound_cfg_test_item_is_test(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            write(
+                root,
+                "crates/flpdf/src/a.rs",
+                '#[cfg(all(test, feature = "qtest-driver"))]\n'
+                "mod tests {\n"
+                "    fn t() { legacy_thing(); }\n"
+                "}\n",
+            )
+            c = counts(root, "legacy_thing")
+            self.assertEqual(0, c["prod"], c)
+            self.assertEqual(1, c["test"], c)
+
 
 class ManifestAndGate(unittest.TestCase):
     def test_manifest_and_expect_zero_gate(self) -> None:
@@ -180,6 +251,24 @@ class ManifestAndGate(unittest.TestCase):
             result = run(root)
             self.assertNotEqual(0, result.returncode)
             self.assertIn("tracked-symbols.txt", result.stdout + result.stderr)
+
+    def test_json_expect_zero_pass_output_is_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            result = run(root, "--symbol", "dead_fn", "--json", "--expect-zero")
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["expect_zero"]["ok"])
+
+    def test_json_expect_zero_failure_output_is_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            write(root, "crates/flpdf/src/a.rs", "alive_fn();\n")
+            result = run(root, "--symbol", "alive_fn", "--json", "--expect-zero")
+            self.assertNotEqual(0, result.returncode)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["expect_zero"]["ok"])
+            self.assertIn("alive_fn", payload["expect_zero"]["failing"])
 
 
 if __name__ == "__main__":
