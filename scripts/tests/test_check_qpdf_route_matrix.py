@@ -32,7 +32,9 @@ class SyntheticRepository:
         src.mkdir(parents=True)
         (src / "reader.rs").write_text(
             "impl<R> Pdf<R> {\n    pub fn resolve(&mut self) {}\n}\n"
-            "pub(crate) struct ObjectCache;\n",
+            "pub(crate) struct ObjectCache;\n"
+            "pub struct Pdf {\n    pub(crate) legacy_state_synced: bool,\n}\n"
+            "pub enum CacheEntry {\n    Resolved(u8),\n    Deleted,\n}\n",
             encoding="utf-8",
         )
         (root / "docs" / "qpdf-route-matrix").mkdir(parents=True)
@@ -170,6 +172,19 @@ class CheckQpdfRouteMatrixTests(unittest.TestCase):
             result = repo.check("--no-qpdf")
             self.assertNotEqual(0, result.returncode)
             self.assertIn("QPDF.cc:0", result.stdout)
+
+    def test_field_and_variant_declarations_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = SyntheticRepository(Path(temporary_directory))
+            repo.write(
+                "a.md",
+                HEADER
+                + "| 1 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::Pdf::legacy_state_synced` | z | bridge | w | - |\n"
+                "| 2 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::CacheEntry::Deleted` | z | mixed | w | - |\n"
+                "| 3 | x | `libqpdf/QPDF.cc:1` | `crates/flpdf/src/reader.rs::CacheEntry::Resolved` | z | mixed | w | - |\n",
+            )
+            result = repo.check()
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
     def test_manifest_symbols_are_validated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

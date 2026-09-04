@@ -146,7 +146,17 @@ class Checker:
             self.report.error(doc, line_number, f"`{relative}::{symbol}`: file not found")
             return
         leaf = symbol.rsplit("::", 1)[-1]
-        pattern = re.compile(rf"\b{DECLARATION_KEYWORDS}\s+{re.escape(leaf)}\b")
+        escaped = re.escape(leaf)
+        # Item declarations (`fn x`, `struct X`, …), struct fields
+        # (`pub(crate) x: T,`), and enum variants (`X,` / `X(` / `X {`) all
+        # count as a declaration of the leaf: the route matrix tracks fields
+        # (`legacy_resolution_state_synced`) and variants as routes too.
+        pattern = re.compile(
+            rf"\b{DECLARATION_KEYWORDS}\s+{escaped}\b"
+            rf"|^\s*(?:pub(?:\([a-z]+\))?\s+)?{escaped}\s*:"
+            rf"|^\s*{escaped}\s*(?:[,({{]|$)",
+            re.MULTILINE,
+        )
         if pattern.search(self._text(target)) is None:
             self.report.error(
                 doc,
