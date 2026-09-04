@@ -564,12 +564,11 @@ impl BootstrapHandleDocument {
                     ResolvedStreamLength::Invalid
                 }
             }
-            // `resolve_indirect` above catches every resolution failure and
-            // falls back to a warned Null rather than propagating Err, so
-            // try_as_integer never actually returns Err for a handle from
-            // this resolver; kept only for symmetry with the general
-            // ObjectHandle contract, matching the prior `.ok()` fallback.
-            Err(_) => ResolvedStreamLength::Missing, // cov:ignore: this resolver's resolve_indirect never propagates Err
+            // A reconstruction trigger lets `resolve_indirect` propagate a
+            // parse error so the caller can rebuild the xref table. Treat a
+            // failed indirect length as missing for this framing attempt,
+            // preserving the stream-boundary recovery fallback.
+            Err(_) => ResolvedStreamLength::Missing,
         }
     }
 
@@ -2768,24 +2767,30 @@ fn find_xref_stream_trailer_candidate(
         let parsed = if let Some(cached) = context.cache.get(&object_ref) {
             Some(cached)
         } else {
-            read_xref_candidate(&mut context, bytes, start, window_end, offset, object_ref).or_else(
-                // cov:ignore-start: bounded candidate recovery is a defensive
-                // retry for false next-object offsets; valid qpdf candidates
-                // are fully parsed by the first bounded read.
-                || {
-                    if window_end >= bytes.len() {
-                        return None;
-                    }
-                    let wide_index = next_offset_index
-                        .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
-                        .min(reference_offsets.len());
-                    let wide_end = reference_offsets
-                        .get(wide_index)
-                        .map_or(bytes.len(), |&next| next as usize);
-                    read_xref_candidate(&mut context, bytes, start, wide_end, offset, object_ref)
-                },
-                // cov:ignore-end
-            )
+            let narrow =
+                read_xref_candidate(&mut context, bytes, start, window_end, offset, object_ref);
+            // Retry through the wider window when the bounded read failed or
+            // only recovered a null. The narrow attempt is dropped together
+            // with its diagnostics so the accepted read alone speaks for the
+            // object, as `read_uncompressed_object` does for its own retry:
+            // qpdf reads each candidate once, to EOF (`QPDF.cc:580-607`), and
+            // never sees the window boundary that produced them.
+            let retry =
+                window_end < bytes.len() && narrow.as_ref().is_none_or(is_recovered_null_candidate);
+            let accepted = if retry {
+                let wide_index = next_offset_index
+                    .saturating_add(XREF_RECONSTRUCTION_FALLBACK_SPAN)
+                    .min(reference_offsets.len());
+                let wide_end = reference_offsets
+                    .get(wide_index)
+                    .map_or(bytes.len(), |&next| next as usize);
+                read_xref_candidate(&mut context, bytes, start, wide_end, offset, object_ref)
+            } else {
+                narrow
+            };
+            accepted.and_then(|completed| {
+                commit_xref_candidate(&mut context, completed, offset, object_ref)
+            })
         };
         append_new_context_diagnostics(
             &context,
@@ -2838,6 +2843,10 @@ fn find_xref_stream_trailer_candidate(
     (candidate, discovery_diagnostics)
 }
 
+/// Read one reconstruction candidate through `start..end` without touching
+/// the shared context: diagnostics and the canonical cache are committed by
+/// [`commit_xref_candidate`] only for the attempt
+/// [`find_xref_stream_trailer_candidate`] finally accepts.
 fn read_xref_candidate(
     context: &mut XrefReadContext,
     bytes: &[u8],
@@ -2845,7 +2854,7 @@ fn read_xref_candidate(
     end: usize,
     offset: u64,
     object_ref: ObjectRef,
-) -> Option<ObjectHandle> {
+) -> Option<HandleFileObjectRead> {
     let input = bytes.get(start..end)?;
     let mut completed = context
         .read_file_object_handle(
@@ -2859,6 +2868,29 @@ fn read_xref_candidate(
         return None;
     }
     let _ = completed.remove_included_recovery_eol_for_decryption();
+    Some(completed)
+}
+
+/// A bounded reconstruction read can recover an incomplete container as a
+/// null handle while retaining tokenizer/EOF diagnostics. That cannot be a
+/// /Type /XRef candidate, but the caller may recover the real object by
+/// retrying with the wider offset window.
+fn is_recovered_null_candidate(completed: &HandleFileObjectRead) -> bool {
+    completed.object.is_null() && !completed.diagnostics.is_empty()
+}
+
+/// Commit the accepted candidate read: record its diagnostics and cache the
+/// parsed handle. A recovered null is cached as well -- qpdf's `resolve`
+/// caches the null it substitutes for a failed read (`QPDF.cc:1738-1748`),
+/// so a later reference to the object neither re-reads it nor repeats its
+/// diagnostics; the caller's `/Type /XRef` check is what excludes it as a
+/// candidate.
+fn commit_xref_candidate(
+    context: &mut XrefReadContext,
+    completed: HandleFileObjectRead,
+    offset: u64,
+    object_ref: ObjectRef,
+) -> Option<ObjectHandle> {
     for diagnostic in completed.diagnostics {
         context.diagnostics.push(xref_file_object_diagnostic(
             XrefObjectDescription::Ordinary,
@@ -3179,7 +3211,6 @@ fn parse_xref_stream(
             XrefObjectDescription::XrefStream,
         ) {
             Ok(completed) => completed,
-            // cov:ignore-start: raw and handle framing read the same bytes; this is a defensive divergence arm
             Err(error) => {
                 context.append_diagnostics_to(&mut repair_diagnostics);
                 if let Some(sink) = error_diagnostics_sink {
@@ -3188,7 +3219,7 @@ fn parse_xref_stream(
                     }
                 }
                 return Err(error.rebase_offset(xref_pos));
-            } // cov:ignore-end
+            }
         };
         // Xref streams are not encrypted, but filter decoding still requires
         // the logical payload rather than qpdf's raw recovery EOL.
@@ -4116,6 +4147,169 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn xref_candidate_retry_widens_a_literal_truncated_by_a_false_header() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let first_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 /Info (prefix\n",
+        );
+        let false_header_offset = bytes.len();
+        // Keep bytes after the final `endobj`: qpdf's `readObjectAtOffset`
+        // throws `EOF after endobj` when only whitespace follows it
+        // (`QPDF.cc:1652-1660`) and `resolve` turns that into a warned
+        // null (`QPDF.cc:1738-1748`), so an object that ends the file is
+        // never an xref-stream candidate in qpdf. With a trailing `%%EOF`
+        // line qpdf 11.9.0 accepts this object as its candidate and only
+        // fails later while decoding it.
+        bytes.extend_from_slice(b"2 0 obj\nsuffix) >>\nstream\nabcd\nendstream\nendobj\n%%EOF\n");
+
+        let first_ref = ObjectRef::new(1, 0);
+        let false_ref = ObjectRef::new(2, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            first_ref,
+            XrefEntry::Uncompressed {
+                offset: first_offset as u64,
+            },
+        );
+        entries.insert(
+            false_ref,
+            XrefEntry::Uncompressed {
+                offset: false_header_offset as u64,
+            },
+        );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
+
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &reference_offsets,
+        );
+
+        let candidate = candidate.expect("wide retry must recover the xref stream candidate");
+        assert_eq!(candidate.max_offset, first_offset as u64);
+        assert_eq!(
+            candidate
+                .trailer
+                .try_get_key(b"/Type")
+                .expect("candidate dictionary has a /Type key")
+                .as_name(),
+            Some(b"XRef".to_vec())
+        );
+        // qpdf reads the candidate once, to EOF, so the literal spanning the
+        // false header never yields a warning for object 1; the narrow
+        // attempt's tokenizer/EOF diagnostics must be dropped with it.
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .all(|diagnostic| !diagnostic.message.starts_with("(object 1 0,")),
+            "the discarded narrow attempt's diagnostics must not leak once the \
+             wider retry recovers the candidate: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn xref_candidate_scan_keeps_the_diagnostics_of_an_unretryable_recovered_null() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let first_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Info (unterminated");
+
+        let first_ref = ObjectRef::new(1, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            first_ref,
+            XrefEntry::Uncompressed {
+                offset: first_offset as u64,
+            },
+        );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
+
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &reference_offsets,
+        );
+
+        assert!(
+            candidate.is_none(),
+            "a null recovered from a truncated object is not an xref-stream candidate"
+        );
+        // The bounded window already reaches EOF, so no wider retry exists and
+        // this read is the single to-EOF read qpdf itself performs
+        // (`QPDF.cc:580-607`); its diagnostics are the accepted attempt's and
+        // must be reported.
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.starts_with("(object 1 0,")),
+            "the accepted recovered-null read must keep its diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn xref_candidate_scan_commits_the_wide_retry_s_recovered_null_with_its_diagnostics() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let first_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /XRef /Info (prefix\n");
+        let false_header_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\nsuffix) /Deep ");
+        bytes.extend(std::iter::repeat_n(
+            b'[',
+            crate::parser::MAX_PARSE_DEPTH + 1,
+        ));
+        bytes.extend_from_slice(b"\n%%EOF\n");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            ObjectRef::new(1, 0),
+            XrefEntry::Uncompressed {
+                offset: first_offset as u64,
+            },
+        );
+        entries.insert(
+            ObjectRef::new(2, 0),
+            XrefEntry::Uncompressed {
+                offset: false_header_offset as u64,
+            },
+        );
+        let reference_offsets = reconstructed_reference_offsets(&entries);
+
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &reference_offsets,
+        );
+
+        assert!(candidate.is_none());
+        // The wider retry recovers only a null again (under
+        // `RecoveryPolicy::Bounded` the over-deep array is recovered, not
+        // rejected), and that accepted read is committed with its
+        // diagnostics: qpdf warns once and caches the substituted null for a
+        // failed read (`QPDF.cc:1738-1748`) instead of dropping the object.
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.starts_with("(object 1 0,")),
+            "a wide retry that recovers a null must keep its diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn reconstruction_reference_read_retries_a_narrow_window_that_recovers_nonempty_but_truncated_data(
     ) {
         // A narrow window's heuristic search can accept a *non-empty* but
@@ -4521,6 +4715,26 @@ mod final_handle_tests {
         assert!(error
             .to_string()
             .contains("trailer dictionary lacks /Size key"));
+    }
+
+    #[test]
+    fn malformed_xref_stream_framing_error_is_forwarded() {
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+        let error = parse_xref_stream(
+            b"not an indirect object",
+            0,
+            0,
+            "1.5".to_owned(),
+            XrefLoadOptions::default(),
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a malformed xref-stream object header must fail framing");
+
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(diagnostics.entries().is_empty());
     }
 
     #[test]
@@ -4952,6 +5166,28 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn resolve_length_maps_a_reconstruction_trigger_error_to_missing() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut entries = BTreeMap::new();
+        entries.insert(object_ref, XrefEntry::Uncompressed { offset: 1 });
+        let state = Rc::new(RefCell::new(BootstrapHandleState {
+            reconstruction_trigger: Some((1, "header mismatch".to_owned())),
+            ..BootstrapHandleState::default()
+        }));
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(b"x"),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            state,
+        );
+
+        assert_eq!(
+            document.resolve_length(object_ref),
+            ResolvedStreamLength::Missing
+        );
+    }
+
+    #[test]
     fn classic_xref_validation_covers_non_dictionary_and_invalid_hybrid_trailers() {
         let (bytes, xref) = classic_xref_with_trailer("42");
         let mut registration = XrefRegistration::default();
@@ -5019,10 +5255,34 @@ mod final_handle_tests {
             &registration,
             XrefLoadOptions::default(),
         );
-        assert!(
-            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(1, 0),)
-                .is_some()
+        let completed =
+            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(1, 0))
+                .expect("a well-framed object is read before it is committed");
+        assert!(context.diagnostics.entries().is_empty());
+        assert!(commit_xref_candidate(&mut context, completed, 0, ObjectRef::new(1, 0)).is_some());
+        assert!(!context.diagnostics.entries().is_empty());
+
+        let bytes = b"1 0 obj\n<< /Info (unterminated";
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
         );
+        let completed =
+            read_xref_candidate(&mut context, bytes, 0, bytes.len(), 0, ObjectRef::new(1, 0))
+                .expect("a truncated object is recovered as a null read");
+        assert!(is_recovered_null_candidate(&completed));
+        // qpdf caches the null it substitutes for a failed read
+        // (`QPDF.cc:1738-1748`); the recovered null stays cached so a later
+        // reference neither re-reads the object nor repeats its diagnostics.
+        let cached = commit_xref_candidate(&mut context, completed, 0, ObjectRef::new(1, 0))
+            .expect("a recovered null is still committed to the cache");
+        assert!(cached.is_null());
+        assert!(context.cache.get(&ObjectRef::new(1, 0)).is_some());
         assert!(!context.diagnostics.entries().is_empty());
 
         let malformed = vec![b'['; crate::parser::MAX_PARSE_DEPTH + 1];

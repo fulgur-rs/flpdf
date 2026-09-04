@@ -3728,11 +3728,9 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             ),
         )?;
         let mut encryption = encryption_parameters.borrow_mut();
-        // cov:ignore-start: the selection above proves the shared state is present
         if let Some(encryption) = encryption.as_mut() {
             encryption.commit_stream_method(inspection.method);
         }
-        // cov:ignore-end
     }
 
     let decryption = {
@@ -5822,6 +5820,16 @@ mod tests {
             handle.set_resolved(ObjectValue::Name(b"Metadata".to_vec()));
             Ok(())
         }
+
+        fn warn_stream_data(
+            &self,
+            _offset: u64,
+            _description_override: Option<&[u8]>,
+            _message: String,
+        ) -> crate::Result<()> {
+            *self.target.encryption_parameters().borrow_mut() = None;
+            Ok(())
+        }
     }
 
     struct FailingStreamWarningResolver;
@@ -6402,6 +6410,40 @@ mod tests {
     /// A bare `/Crypt` only overrides `/StmF` when its dictionary has qpdf's
     /// required `/Type /CryptFilterDecodeParms` marker
     /// (`QPDF_encryption.cc:1067-1074`).
+    #[test]
+    fn unknown_stream_filter_warning_can_clear_state_before_commit() {
+        let resolver = resolver_over(Vec::new());
+        *resolver.encryption_parameters().borrow_mut() =
+            Some(v4_encryption(EncryptionMode::Unknown));
+        let input = resolver.stream_input();
+        let encryption_parameters = resolver.encryption_parameters();
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let warning_sink = EncryptionClearingResolver {
+            target: resolver.clone(),
+        };
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(pipe_stream_data_from_input(
+            &input,
+            &encryption_parameters,
+            0,
+            &warning_sink,
+            None,
+            ObjectRef::new(4, 0),
+            0,
+            0,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        )
+        .expect("a warning sink may clear the shared state before commit"));
+        assert!(
+            resolver.encryption_parameters().borrow().is_none(),
+            "commit must tolerate a state cleared while warning delivery ran"
+        );
+    }
+
     #[test]
     fn a_typed_bare_crypt_filter_can_select_identity_over_an_rc4_stmf() {
         let object_ref = ObjectRef::new(4, 0);
@@ -7677,7 +7719,7 @@ mod tests {
             b"<< /Title (TopSecretTitle) >>",
             crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
-        // cov:ignore-start: fixture setup failures are reported only by this parser-error regression test
+        // cov:ignore-start: encrypted fixture construction is a shared test precondition; only its success path is meaningful to the parser regressions
         let pdf = Pdf::open_with_options(
             Cursor::new(encrypted),
             crate::PdfOpenOptions {
