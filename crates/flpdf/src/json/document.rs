@@ -161,9 +161,9 @@ where
         // read for a `Seek` implementation whose relative `stream_position`
         // fails while absolute seeks still succeed.
         let mut source = source;
-        let base_offset = source.stream_position().map_err(|error| {
-            Error::System(format!("{}: {error}", String::from_utf8_lossy(&input_name)))
-        })?;
+        let base_offset = source
+            .stream_position()
+            .map_err(|error| raw_system_error(&input_name, error.to_string().as_bytes()))?;
         let source = Rc::new(RefCell::new(source));
         let mut reactor = JsonReactor::new(
             self,
@@ -190,25 +190,24 @@ where
         // reported, before any later-and-therefore-qpdf-unreachable parser
         // error `parsed` might carry from continuing past that point.
         if let Some(error) = reactor.fatal_error() {
-            return Err(Error::System(format!(
-                "{}: {error}",
-                String::from_utf8_lossy(&input_name)
-            )));
+            return Err(raw_system_error(&input_name, error.as_bytes()));
         }
         if let Err(error) = parsed {
-            return Err(Error::System(format!(
-                "{}: {error}",
-                String::from_utf8_lossy(&input_name)
-            )));
+            let detail = error.to_string();
+            return Err(raw_system_error(&input_name, detail.as_bytes()));
         }
         if reactor.any_errors() {
-            return Err(Error::System(format!(
-                "{}: errors found in JSON",
-                String::from_utf8_lossy(&input_name)
-            )));
+            return Err(raw_system_error(&input_name, b"errors found in JSON"));
         }
         Ok(())
     }
+}
+
+fn raw_system_error(input_name: &[u8], detail: &[u8]) -> Error {
+    let mut message = input_name.to_vec();
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(detail);
+    Error::SystemBytes(message)
 }
 
 fn open_json_file(path: &PathBuf) -> Result<File> {

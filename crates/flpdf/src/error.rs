@@ -41,6 +41,8 @@ impl UsageError {
 /// error.
 /// [`Error::Internal`] and [`Error::System`] mirror qpdf's public classification
 /// of `std::logic_error` and `std::runtime_error`, respectively.
+/// [`Error::SystemBytes`] is the byte-preserving counterpart for qpdf runtime
+/// messages whose source description may contain non-UTF-8 bytes.
 /// [`Error::OpenFailure`] preserves the terminal source error and accumulated
 /// repair diagnostics from a failed permissive open; callers can retrieve both
 /// through [`Error::open_failure`].
@@ -86,6 +88,13 @@ pub enum Error {
 
     #[error("{0}")]
     System(String),
+
+    /// A qpdf runtime error whose complete message must retain arbitrary
+    /// source-name bytes. `Display` uses qpdf's lossy text projection for
+    /// ordinary Rust callers; byte-oriented command boundaries should use
+    /// [`Self::raw_message`].
+    #[error("{}", String::from_utf8_lossy(.0))]
+    SystemBytes(Vec<u8>),
 
     /// A terminal permissive-open failure with the qpdf-compatible repair
     /// warnings accumulated before reconstruction failed.
@@ -153,6 +162,19 @@ impl Error {
                 source,
                 diagnostics,
             } => Some((source.as_ref(), diagnostics)),
+            _ => None,
+        }
+    }
+
+    /// Return the complete qpdf message when this error carries raw bytes.
+    ///
+    /// A permissive JSON import may wrap the terminal error in
+    /// [`Error::OpenFailure`], so this accessor follows that one source edge
+    /// while leaving ordinary string errors unchanged.
+    pub fn raw_message(&self) -> Option<&[u8]> {
+        match self {
+            Self::SystemBytes(message) => Some(message),
+            Self::OpenFailure { source, .. } => source.raw_message(),
             _ => None,
         }
     }
@@ -311,6 +333,24 @@ mod tests {
         assert!(matches!(error, Error::Parse { offset: 9, .. }));
         assert!(error.open_failure().is_none());
         assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn system_bytes_preserves_raw_message_and_open_failure_source() {
+        let raw = b"raw-error-\xff".to_vec();
+        let error = Error::SystemBytes(raw.clone());
+        assert_eq!(error.raw_message(), Some(raw.as_slice()));
+        assert_eq!(error.to_string(), "raw-error-�");
+
+        let mut diagnostics = crate::Diagnostics::default();
+        diagnostics.push(Diagnostic::warning("preceding warning", None));
+        let wrapped = Error::with_open_diagnostics(error, diagnostics);
+        assert_eq!(wrapped.raw_message(), Some(raw.as_slice()));
+    }
+
+    #[test]
+    fn ordinary_errors_have_no_raw_message() {
+        assert!(Error::System("ordinary".to_owned()).raw_message().is_none());
     }
 
     #[test]

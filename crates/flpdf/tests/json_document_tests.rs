@@ -145,8 +145,9 @@ fn import_propagates_a_stream_position_failure_instead_of_assuming_zero() {
 
     assert!(matches!(
         error,
-        Error::System(ref message)
-            if message.starts_with("flaky.json: ") && message.contains("relative seek unsupported")
+        Error::SystemBytes(ref message)
+            if message.starts_with(b"flaky.json: ")
+                && message.ends_with(b"relative seek unsupported")
     ));
 }
 
@@ -308,7 +309,7 @@ fn import_parser_errors_are_wrapped_with_the_input_description() {
         .expect_err("malformed JSON must fail");
 
     assert!(
-        matches!(error, Error::System(message) if message == "broken.json: JSON: premature end of input")
+        matches!(error, Error::SystemBytes(message) if message == b"broken.json: JSON: premature end of input")
     );
 }
 
@@ -319,7 +320,9 @@ fn import_reader_errors_are_wrapped_with_the_input_description() {
         .update_from_json(FailingReader, "reader.json")
         .expect_err("reader errors must fail the import");
 
-    assert!(matches!(error, Error::System(message) if message == "reader.json: reader exploded"));
+    assert!(
+        matches!(error, Error::SystemBytes(message) if message == b"reader.json: reader exploded")
+    );
 }
 
 #[test]
@@ -330,7 +333,7 @@ fn import_fatal_reactor_errors_use_the_same_qpdf_exception_boundary() {
         .expect_err("top-level scalar must fail");
 
     assert!(
-        matches!(error, Error::System(message) if message == "scalar.json: QPDF JSON must be a dictionary")
+        matches!(error, Error::SystemBytes(message) if message == b"scalar.json: QPDF JSON must be a dictionary")
     );
 }
 
@@ -350,7 +353,7 @@ fn import_reports_a_recorded_fatal_over_a_later_parser_error() {
 
     assert!(matches!(
         error,
-        Error::System(message) if message == "malformed.json: QPDF JSON must be a dictionary"
+        Error::SystemBytes(message) if message == b"malformed.json: QPDF JSON must be a dictionary"
     ));
 }
 
@@ -396,7 +399,7 @@ fn import_aggregates_semantic_errors_after_incremental_parsing() {
         .expect_err("object without value or stream must fail");
 
     assert!(
-        matches!(error, Error::System(message) if message == "semantic.json: errors found in JSON")
+        matches!(error, Error::SystemBytes(message) if message == b"semantic.json: errors found in JSON")
     );
     assert!(pdf
         .repair_diagnostics()
@@ -426,7 +429,7 @@ fn create_from_json_wraps_a_semantic_failure_with_its_accumulated_diagnostics() 
         .open_failure()
         .expect("a semantic import failure with recorded warnings wraps as OpenFailure");
     assert!(
-        matches!(source, Error::System(message) if message == "semantic.json: errors found in JSON")
+        matches!(source, Error::SystemBytes(message) if message == b"semantic.json: errors found in JSON")
     );
     assert!(diagnostics
         .entries()

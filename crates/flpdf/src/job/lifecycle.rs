@@ -3166,7 +3166,7 @@ impl QPDFJob {
                         writer: &mut file,
                     },
                 )
-                .map_err(|error| Error::System(error.to_string()));
+                .map_err(Error::from);
         }
 
         self.logger.save_to_standard_output(true)?;
@@ -3180,7 +3180,7 @@ impl QPDFJob {
             options,
             JsonJobOutput::Stdout(&mut output),
         )
-        .map_err(|error| Error::System(error.to_string()))
+        .map_err(Error::from)
     }
 
     fn apply_page_label_transformations<R>(
@@ -3430,12 +3430,15 @@ impl QPDFJob {
             .map_err(Error::from)?;
         pipeline.write(b": ").map_err(Error::from)?;
         pipeline
-            .write(Self::job_error_message(error).as_bytes())
+            .write(&Self::job_error_message(error))
             .map_err(Error::from)?;
         pipeline.write(b"\n").map_err(Error::from)
     }
 
-    fn job_error_message(error: &Error) -> String {
+    fn job_error_message(error: &Error) -> Vec<u8> {
+        if let Some(message) = error.raw_message() {
+            return message.to_vec();
+        }
         match error {
             Error::FileIo {
                 operation,
@@ -3446,9 +3449,9 @@ impl QPDFJob {
                 let source = source
                     .split_once(" (os error ")
                     .map_or(source.as_str(), |(message, _)| message);
-                format!("{operation} {}: {source}", path.display())
+                format!("{operation} {}: {source}", path.display()).into_bytes()
             }
-            _ => error.to_string(),
+            _ => error.to_string().into_bytes(),
         }
     }
 

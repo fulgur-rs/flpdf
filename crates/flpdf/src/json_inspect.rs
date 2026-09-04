@@ -486,6 +486,7 @@ pub enum JsonOutputError {
     SideFileIo {
         operation: &'static str,
         path: String,
+        raw_path: Vec<u8>,
         message: String,
         #[source]
         source: std::io::Error,
@@ -505,9 +506,10 @@ pub enum JsonOutput<'a> {
 
 pub(crate) fn side_file_io_error(
     operation: &'static str,
-    path: &str,
+    path: &[u8],
     source: std::io::Error,
 ) -> JsonOutputError {
+    let raw_path = path.to_vec();
     let rendered = source.to_string();
     let message = source
         .raw_os_error()
@@ -516,9 +518,35 @@ pub(crate) fn side_file_io_error(
         .to_owned();
     JsonOutputError::SideFileIo {
         operation,
-        path: path.to_owned(),
+        path: String::from_utf8_lossy(&raw_path).into_owned(),
+        raw_path,
         message,
         source,
+    }
+}
+
+impl From<JsonOutputError> for crate::Error {
+    fn from(error: JsonOutputError) -> Self {
+        match error {
+            JsonOutputError::Convert(error) => crate::Error::System(error.to_string()),
+            JsonOutputError::Pipeline(error) => crate::Error::from(error),
+            JsonOutputError::SideFileIo {
+                operation,
+                raw_path,
+                message,
+                ..
+            } => {
+                let mut raw_message = operation.as_bytes().to_vec();
+                raw_message.push(b' ');
+                raw_message.extend_from_slice(&raw_path);
+                raw_message.extend_from_slice(b": ");
+                raw_message.extend_from_slice(message.as_bytes());
+                crate::Error::SystemBytes(raw_message)
+            }
+            JsonOutputError::UnsupportedVersion => {
+                crate::Error::System("QPDF::writeJSON: only version 2 is supported".to_owned())
+            }
+        }
     }
 }
 
@@ -629,6 +657,49 @@ mod tests {
             JsonOutputError::from(ObjectJsonError::UnsupportedVersion(3)),
             JsonOutputError::Convert(ConvertError::PdfError(message))
                 if message.contains("only version 1 or 2")
+        ));
+    }
+
+    #[test]
+    fn side_file_error_conversion_retains_raw_path_bytes() {
+        let error = super::side_file_io_error(
+            "open",
+            b"side-\xff-7",
+            std::io::Error::other("instrumented side-file failure"),
+        );
+        assert_eq!(
+            error.to_string(),
+            "open side-�-7: instrumented side-file failure"
+        );
+
+        let error: crate::Error = error.into();
+        assert_eq!(
+            error.raw_message(),
+            Some(b"open side-\xff-7: instrumented side-file failure".as_slice())
+        );
+    }
+
+    #[test]
+    fn json_output_error_conversion_preserves_all_error_categories() {
+        let converted: crate::Error =
+            JsonOutputError::Convert(ConvertError::JsonError("invalid output".to_owned())).into();
+        assert!(matches!(
+            converted,
+            crate::Error::System(message) if message == "JSON error: invalid output"
+        ));
+
+        let piped: crate::Error =
+            JsonOutputError::Pipeline(PipelineError::runtime("pipeline")).into();
+        assert!(matches!(
+            piped,
+            crate::Error::System(message) if message == "pipeline"
+        ));
+
+        let unsupported: crate::Error = JsonOutputError::UnsupportedVersion.into();
+        assert!(matches!(
+            unsupported,
+            crate::Error::System(message)
+                if message == "QPDF::writeJSON: only version 2 is supported"
         ));
     }
 

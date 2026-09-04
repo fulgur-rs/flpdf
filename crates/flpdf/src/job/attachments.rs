@@ -373,24 +373,23 @@ fn emit_show_attachment<R: Read + Seek>(
         let mut embedded_files = pdf.embedded_files();
         embedded_files.get_embedded_file(key)?
     }
-    .ok_or_else(|| {
-        Error::Unsupported(format!(
-            "attachment {:?} not found",
-            String::from_utf8_lossy(key)
-        ))
-    })?;
+    .ok_or_else(|| raw_attachment_error(key, b" not found"))?;
     let mut filespec = FileSpec::new(filespec, pdf)?;
-    let embedded_file = filespec.embedded_file()?.ok_or_else(|| {
-        Error::Unsupported(format!(
-            "attachment {:?} has no resolvable /EmbeddedFile stream",
-            String::from_utf8_lossy(key)
-        ))
-    })?;
+    let embedded_file = filespec
+        .embedded_file()?
+        .ok_or_else(|| raw_attachment_error(key, b" has no resolvable /EmbeddedFile stream"))?;
     logger.save_to_standard_output(true)?;
     let save = logger.get_save()?;
     let mut sink = PipelineHandleSink(save);
     let _ = embedded_file.pipe_stream_data(&mut sink)?;
     Ok(())
+}
+
+fn raw_attachment_error(key: &[u8], suffix: &[u8]) -> Error {
+    let mut message = b"unsupported PDF feature: attachment ".to_vec();
+    message.extend_from_slice(key);
+    message.extend_from_slice(suffix);
+    Error::SystemBytes(message)
 }
 
 /// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +
