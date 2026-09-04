@@ -9,6 +9,22 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::process::Command;
 use std::rc::Rc;
 
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+fn qpdf_available() -> bool {
+    Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
+        .unwrap_or(false)
+}
+
 /// A valid one-page document with an orphaned stream whose indirect `/Length`
 /// holder points to an unreadable source range. qpdf's linearization optimizer
 /// never resolves this stream because it is not reachable from the page, root,
@@ -89,25 +105,14 @@ impl Seek for FailingObjectReader {
 fn linearization_ignores_an_unreachable_unreadable_stream_like_qpdf() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let input = temp.path().join("unreachable-unreadable.pdf");
-    let qpdf_output = temp.path().join("qpdf-linearized.pdf");
     let flpdf_output = temp.path().join("flpdf-linearized.pdf");
     let (bytes, fail_start, fail_end) = pdf_with_unreachable_stream();
     std::fs::write(&input, &bytes).expect("write fixture");
 
-    let qpdf = Command::new("qpdf")
-        .args(["--linearize"])
-        .arg(&input)
-        .arg(&qpdf_output)
-        .output()
-        .expect("qpdf 11.9.0 must be available");
-    assert_eq!(
-        qpdf.status.code(),
-        Some(0),
-        "qpdf must ignore an unreachable unreadable stream: {}",
-        String::from_utf8_lossy(&qpdf.stderr)
-    );
-    assert!(qpdf_output.exists(), "qpdf must create linearized output");
-
+    // The flpdf-only regression proof always runs: FailingObjectReader
+    // injects a controlled I/O failure only while resolving the orphaned
+    // stream, so a successful write proves flpdf's own reachability
+    // scoping regardless of whether qpdf is installed here.
     let (reader, fail_enabled) = FailingObjectReader::new(bytes, fail_start, fail_end);
     let mut pdf = Pdf::open(reader).expect("flpdf should open the lazy fixture");
     fail_enabled.set(true);
@@ -125,6 +130,30 @@ fn linearization_ignores_an_unreachable_unreadable_stream_like_qpdf() {
     );
     let bytes = result.expect("successful linearization output");
     std::fs::write(&flpdf_output, &bytes).expect("write flpdf output for qpdf check");
+
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping qpdf comparison: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let qpdf_output = temp.path().join("qpdf-linearized.pdf");
+    let qpdf = Command::new("qpdf")
+        .args(["--linearize"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf 11.9.0 must run");
+    assert_eq!(
+        qpdf.status.code(),
+        Some(0),
+        "qpdf must ignore an unreachable unreadable stream: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(qpdf_output.exists(), "qpdf must create linearized output");
+
     let flpdf_check = Command::new("qpdf")
         .args(["--check"])
         .arg(&flpdf_output)
