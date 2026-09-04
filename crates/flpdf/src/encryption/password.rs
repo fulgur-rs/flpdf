@@ -9,7 +9,6 @@
 //! first attempt fails, qpdf retries the same bytes through alternate
 //! encodings from `QUtil::possible_repaired_encodings` (`QUtil.cc:1821-1900`).
 
-use crate::error::EncryptedError;
 use crate::Result;
 
 /// How a raw `--password` byte string should be interpreted.
@@ -37,7 +36,7 @@ pub enum PasswordMode {
 /// security handler, just as it is in qpdf's authentication functions.
 pub(crate) fn password_bytes_for_read(raw: &[u8], mode: PasswordMode) -> Result<Vec<u8>> {
     if mode == PasswordMode::HexBytes {
-        decode_hex(raw)
+        Ok(decode_hex(raw))
     } else {
         Ok(raw.to_vec())
     }
@@ -65,7 +64,7 @@ pub(crate) fn password_bytes_for_write(
 ) -> Result<(Vec<u8>, bool)> {
     match mode {
         PasswordMode::Bytes => Ok((raw.to_vec(), false)),
-        PasswordMode::HexBytes => Ok((decode_hex(raw)?, false)),
+        PasswordMode::HexBytes => Ok((decode_hex(raw), false)),
         PasswordMode::Unicode => {
             if std::str::from_utf8(raw).is_err() {
                 return Err(crate::Error::System(
@@ -411,18 +410,34 @@ fn encode_mac_roman(codepoint: u32) -> Option<u8> {
         .map(|index| index as u8 + 0x80)
 }
 
-fn decode_hex(raw: &[u8]) -> Result<Vec<u8>> {
-    let trimmed: Vec<u8> = raw
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    hex::decode(&trimmed).map_err(|err| {
-        EncryptedError::Malformed {
-            reason: format!("--password-mode=hex-bytes: invalid hex input ({err})"),
+/// Decode bytes with qpdf's `QUtil::hex_decode` behavior. Invalid characters
+/// are ignored, and a final high nibble is emitted with a zero low nibble.
+pub(crate) fn decode_hex(raw: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut high = None;
+    for &byte in raw {
+        let Some(nibble) = hex_decode_nibble(byte) else {
+            continue;
+        };
+        if let Some(high) = high.take() {
+            result.push((high << 4) | nibble);
+        } else {
+            high = Some(nibble);
         }
-        .into()
-    })
+    }
+    if let Some(high) = high {
+        result.push(high << 4);
+    }
+    result
+}
+
+fn hex_decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -460,9 +475,15 @@ mod tests {
     }
 
     #[test]
-    fn hex_bytes_rejects_invalid_hex() {
-        let err = password_bytes_for_read(b"zz", PasswordMode::HexBytes).unwrap_err();
-        assert!(err.to_string().contains("invalid hex input"));
+    fn hex_bytes_ignores_non_hex_and_pads_an_odd_nibble() {
+        assert_eq!(
+            password_bytes_for_read(b"zA-1", PasswordMode::HexBytes).unwrap(),
+            vec![0xa1]
+        );
+        assert_eq!(
+            password_bytes_for_read(b"zF", PasswordMode::HexBytes).unwrap(),
+            vec![0xf0]
+        );
     }
 
     #[test]

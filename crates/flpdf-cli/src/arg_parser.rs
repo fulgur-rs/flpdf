@@ -695,7 +695,10 @@ mod tests {
 
         assert_eq!(
             parsed.residual_args,
-            vec![OsString::from("flpdf"), OsString::from_vec(b"input-\xff.pdf".to_vec())]
+            vec![
+                OsString::from("flpdf"),
+                OsString::from_vec(b"input-\xff.pdf".to_vec())
+            ]
         );
     }
 

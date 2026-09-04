@@ -4,7 +4,7 @@ use super::crypt_filters::{
     crypt_filter_method_from_handle, crypt_filter_modes_from_handle,
     interpret_cf_selector_from_handle,
 };
-use super::password::{password_bytes_for_read, PasswordMode};
+use super::password::{decode_hex, password_bytes_for_read, PasswordMode};
 use super::permissions::Permissions;
 use super::standard::{
     check_owner_password_r5, check_owner_password_r6, check_owner_password_v4_with_user_password,
@@ -677,14 +677,7 @@ fn map_uo_length_to_bad_password(err: crate::Error) -> crate::Error {
 }
 
 fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
-    let trimmed: Vec<u8> = raw
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    let key = hex::decode(&trimmed).map_err(|err| crate::error::EncryptedError::Malformed {
-        reason: format!("--password-is-hex-key: --password is not valid hex ({err})"),
-    })?;
+    let key = decode_hex(raw);
     if key.len() > 32 {
         return Err(crate::error::EncryptedError::Malformed {
             reason: format!(
@@ -936,7 +929,7 @@ pub(crate) fn first_file_id_handle(id: &ObjectHandle) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_inspection_state;
+    use super::{decode_hex_file_key, parse_inspection_state};
     use crate::ObjectHandle;
 
     #[test]
@@ -954,5 +947,11 @@ mod tests {
         let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
 
         assert_eq!(state.length_bits, 128);
+    }
+
+    #[test]
+    fn raw_key_hex_decoding_matches_qpdf_ignored_characters_and_odd_nibbles() {
+        assert_eq!(decode_hex_file_key(b"zA-1").unwrap(), vec![0xa1]);
+        assert_eq!(decode_hex_file_key(b"F").unwrap(), vec![0xf0]);
     }
 }
