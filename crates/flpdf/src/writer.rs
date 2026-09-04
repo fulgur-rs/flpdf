@@ -4276,14 +4276,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
             // Determine whether this object is a real stream (needs a holder),
             // a non-stream object, or a structural stream that the main loop
-            // skips (XRef / ObjStm).
+            // skips because it will be rebuilt (XRef / source ObjStm).
             let object_handle = pdf.get_object_handle(*old_ref);
             pdf.resolve(&object_handle)?;
             let is_real_stream = if object_handle.as_stream_dict().is_some() {
                 let is_structural = object_handle.try_is_stream_of_type(b"XRef", b"")?
-                    || object_handle.try_is_stream_of_type(b"ObjStm", b"")?;
+                    || (qpdf_preserve_source_objstm
+                        && source_container_to_batch.contains_key(old_ref)
+                        && object_handle.try_is_stream_of_type(b"ObjStm", b"")?);
                 if is_structural {
-                    None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
+                    None // cov:ignore: rebuilt structural containers are excluded from CF renumber by skip_length=true
                 } else {
                     Some(true)
                 }
@@ -4291,7 +4293,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 Some(false)
             };
             let Some(is_stream) = is_real_stream else {
-                continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
+                continue; // cov:ignore: None only when a rebuilt XRef/source ObjStm is excluded from renumbered by skip_length=true
             };
 
             next_emission = next_emission.checked_add(1).ok_or_else(|| {
@@ -4567,13 +4569,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // both QDF and normalization modes because a generic child serializer
         // intentionally emits only a direct stream's dictionary.
         let content_container = content_container_refs.contains(old_ref);
-        // Skip xref-stream and ObjStm container objects — we'll rebuild the
-        // structural streams from scratch below. Handle predicates preserve
+        // Skip an xref stream or a source ObjStm that has a dedicated rebuild
+        // batch; an unretained source ObjStm remains an ordinary source stream,
+        // as qpdf's `/Extends` enqueue path requires. Handle predicates preserve
         // qpdf's live dictionary lookup without resolving a legacy `Object`.
-        if is_stream
-            && (object_handle.try_is_stream_of_type(b"XRef", b"")?
-                || object_handle.try_is_stream_of_type(b"ObjStm", b"")?)
-        {
+        let is_rebuilt_objstm = qpdf_preserve_source_objstm
+            && source_container_to_batch.contains_key(old_ref)
+            && object_handle.try_is_stream_of_type(b"ObjStm", b"")?;
+        if is_stream && (object_handle.try_is_stream_of_type(b"XRef", b"")? || is_rebuilt_objstm) {
             continue; // cov:ignore: structural streams are rebuilt by their dedicated loops below
         }
 

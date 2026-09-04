@@ -170,6 +170,63 @@ fn compressed_entry_with_extends_pdf() -> Vec<u8> {
     bytes
 }
 
+/// A source ObjStm chain whose `/Extends` target has no eligible retained
+/// members. qpdf still emits that target as an ordinary stream because it is
+/// reached by the preserved child container's `/Extends` edge.
+fn compressed_entry_with_unretained_extends_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 4 0 R >>\nendobj\n");
+
+    let first_objstm_offset = bytes.len();
+    let first_body = b"2 0 << /Type /ObjStm >>";
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+            first_body.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(first_body);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let second_objstm_offset = bytes.len();
+    let second_body = b"4 0 << /Type /Pages /Kids [] /Count 0 >>";
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} /Extends 3 0 R >>\nstream\n",
+            second_body.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(second_body);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, catalog_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 3, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, first_objstm_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 5, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, second_objstm_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_offset as u32, 0);
+
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
+            xref_entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(
+        format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 /// A damaged xref-stream-only PDF whose Catalog is an explicit ObjStm member.
 /// Recovery must discover the physical `/Type /XRef` object, merge its type-2
 /// entry for object 2, and let the canonical resolver reach the Catalog.
@@ -620,6 +677,56 @@ fn encrypted_preserve_rebuilds_source_object_streams() {
         1,
         "encrypted Preserve must retain one output-space /Extends edge"
     );
+}
+
+#[test]
+fn encrypted_preserve_emits_an_unretained_extends_target_as_a_stream() {
+    let mut pdf = Pdf::open(Cursor::new(compressed_entry_with_unretained_extends_pdf()))
+        .expect("open ObjStm extends fixture");
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        static_id: true,
+        object_streams: flpdf::ObjectStreamMode::Preserve,
+        encrypt: Some(EncryptParams::rc4(
+            EncryptMethod::V2Rc4128,
+            Vec::new(),
+            b"owner".to_vec(),
+        )),
+        ..WriterTestSettings::default()
+    };
+
+    write_with_settings(&mut pdf, &mut output, &settings)
+        .expect("encrypted Preserve must emit the unretained /Extends target");
+    assert_eq!(
+        output
+            .windows(b"/Type /ObjStm".len())
+            .filter(|window| *window == b"/Type /ObjStm")
+            .count(),
+        2,
+        "the rebuilt child and ordinary /Extends target must both be present"
+    );
+    let extends_marker = b"/Extends ";
+    let extends_start = output
+        .windows(extends_marker.len())
+        .position(|window| window == extends_marker)
+        .expect("rebuilt child ObjStm must retain /Extends");
+    let target_start = extends_start + extends_marker.len();
+    let target_end = target_start
+        + output[target_start..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .expect("/Extends target must be space-terminated");
+    let target_number: u32 = std::str::from_utf8(&output[target_start..target_end])
+        .expect("/Extends target number is ASCII")
+        .parse()
+        .expect("/Extends target number is decimal");
+    let reopened = Pdf::open(Cursor::new(output)).expect("reopen encrypted Preserve output");
+    assert!(matches!(
+        reopened
+            .get_xref_table()
+            .get(&ObjectRef::new(target_number, 0)),
+        Some(flpdf::XrefEntry::Uncompressed { .. })
+    ));
 }
 
 /// Repeated `get_object_handle` calls for the same already-resolved
