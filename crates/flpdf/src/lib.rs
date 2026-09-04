@@ -178,6 +178,7 @@ pub use filespec_helper::{
     FileSpecBuilder,
 };
 pub use form_field_object_helper::FormFieldObjectHelper;
+#[allow(deprecated)]
 pub use job::{
     add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback,
     copy_duplicate_page_annotations, extract_attachment, extract_attachment_to_path,

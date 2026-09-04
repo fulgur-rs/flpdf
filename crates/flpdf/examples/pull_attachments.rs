@@ -2,6 +2,8 @@
 //!
 //! Run with: `cargo run --example pull_attachments -p flpdf`
 
+#![allow(deprecated)]
+
 #[path = "common/mod.rs"]
 mod common;
 

@@ -1201,6 +1201,7 @@ CLI の qpdf 11.9.0 differential test、および fixture の live probe で確�
 |---|---|---|
 | `signatures.rs` の**検査 API のみ** | — | 署名の読み取り検査。qpdf に相当機能なし |
 | `qdf_fix.rs` | 1,219 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ）。object stream (`/Type /ObjStm`) / cross-reference stream (`/Type /XRef`) 形式の QDF 入力にも対応（`st_in_ostream_*` / `st_in_xref_stream_dict` 相当、flpdf-9hc.43） |
+| `job/attachments.rs` の library-level convenience helpers（`add_attachment_from_path` / `ascii_filename_fallback` / `extract_attachment` / `write_attachment` / `extract_attachment_to_path`） | 469-696 | qpdf の `QPDFJob::addAttachments` / `doShowAttachment`（`QPDFJob.cc:914-926,2046-2087`）は Job/CLI の設定・logger pipeline を所有し、これらの crate-level path/buffer/fallback API に直接対応する公開 API はない。5関数は flpdf 固有の category-(C) として `#[deprecated]` で記録し、qpdf の canonical attachment helpers（`QPDFEmbeddedFileDocumentHelper` / `QPDFFileSpecObjectHelper`）の代替とは扱わない |
 
 
 `object_copy.rs` の `copy_foreign_object` / `copy_foreign_value` は `QPDF.cc` の
