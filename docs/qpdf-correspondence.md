@@ -1007,6 +1007,14 @@ flpdfは `job/lifecycle.rs::QPDFJob::write_json` / `QPDFJob::inspect` と、未�
 success summaryを出さない。JSONの `--json-output PATH` はqpdfの出力ファイル相当として
 resulting-file suffixを持ち、stdout JSONはinspection suffixを持つ。
 
+`QPDFJob::handleTransformations` の `remove_restrictions` 分岐は
+`QPDFAcroFormDocumentHelper::disableDigitalSignatures` を呼ぶだけで、成功時の独自
+メッセージを出さない（`QPDFJob.cc:2137-2150`、`QPDFAcroFormDocumentHelper.cc:419-439`）。
+flpdf CLIもこのmutationを保持し、`--remove-restrictions` による `removed restrictions`
+や `removed signatures` の補助メッセージは発行しない。実際の文書warningだけが
+`QPDF::warn` のcollectionと通常のcompletion summaryへ進み、`--no-warn` はその表示だけを
+抑止する（`QPDF.cc:487-504`）。
+
 ### `QPDFLogger` の CLI consumer cutover と retained direct routes
 
 qpdf の route ownership は `QPDFJob.cc:343,498-502,625,709-925,2934,3051-3054,3094-3115`
@@ -1018,7 +1026,7 @@ logger consumer に移行済みである。
   相当を設定し、独立した stdout terminal を作らない
 - `info`: check summary、show object、show pages/npages、attachment listing、encryption /
   linearization inspection、rewrite/page-operation verbose output
-- `warn`: document warning、warning completion summary、normalization/signature warning
+- `warn`: document warning、warning completion summary、normalization warning
 - `error`: check error と top-level の通常 fatal error
 - `usage`: `UsageError` を `usage_exit` へ直接渡し、qpdf の空行・help block付き exit-2 を再現
 
@@ -1036,8 +1044,8 @@ loggerで再openする経路はtop-level CLIから除去し、`--show-linearizat
 
 - `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
   unfilterable stream を同じ marker へ変換しない
-- native `rewrite --static-id` warning、`--remove-restrictions` intent diagnostic:
-  flpdf-only surface（出力先は qpdf-compatible logger error route）
+- native `rewrite --static-id` warning: qpdf-compatible CLI surfaceではないため残る
+  flpdf-only test diagnostic（出力先は qpdf-compatible logger error route）
 - clap 自身が parse/usage のために直接終了する help・構文エラー、および logger の
   stderr sink 自体が失敗した場合の last-resort diagnostic: qpdf job logger の
   command-boundary より前後にある irreducible CLI fallback。その他の CLI text

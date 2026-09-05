@@ -279,7 +279,7 @@ fn remove_restrictions_allows_signed_linearized_rewrite() {
     // Regression for the --linearize path: the destructive opt-in must apply
     // to the linearize branch too. The branch strips the signatures
     // (clear_sig_flags + strip_signature_values) before writing, so the
-    // rewrite succeeds and warns instead of being refused.
+    // rewrite succeeds silently instead of being refused.
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("signed.pdf");
     let output = temp.path().join("out.pdf");
@@ -295,7 +295,7 @@ fn remove_restrictions_allows_signed_linearized_rewrite() {
     ])
     .assert()
     .success()
-    .stderr(predicate::str::contains("removed signatures"));
+    .stderr(predicate::str::contains("removed signatures").not());
 
     assert!(output.exists());
     assert!(std::fs::metadata(&output).unwrap().len() > 0);

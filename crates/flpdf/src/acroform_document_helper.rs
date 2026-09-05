@@ -743,8 +743,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// is not deleted eagerly; the writer's reachability pass drops it only
     /// when no other reference, such as catalog `/DSS`, keeps it alive.
     ///
-    /// The boolean is an flpdf convenience for the CLI warning path. qpdf's
-    /// corresponding helper returns `void`.
+    /// The boolean is an flpdf convenience reporting whether the document
+    /// changed; qpdf's corresponding helper returns `void`, and the CLI emits
+    /// no diagnostic from it (qpdf's `--remove-restrictions` is silent).
     ///
     /// # Errors
     ///

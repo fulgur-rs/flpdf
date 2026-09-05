@@ -58,23 +58,22 @@ the `rewrite` subcommand:
 flpdf rewrite --remove-restrictions input.pdf output.pdf
 ```
 
-When signatures are removed, flpdf prints a warning so the loss is never
-silent:
+Like qpdf, flpdf prints no diagnostic when signatures are removed this way:
+the loss is opted into explicitly by the flag, and only ordinary document
+warnings (if any) reach stderr and the exit status.
 
-```text
-flpdf: warning: removed signatures; signatures are now invalidated
-```
-
-`--remove-restrictions` is the qpdf `--remove-restrictions` equivalent: it
-strips encryption and advisory permission restrictions, and clears signature
-fields' `/V` and `/SigFlags`. It does **not** bypass authentication — an
-auth-requiring input without a working `--password` is rejected exactly as a
-plain `rewrite` would reject it.
+`--remove-restrictions` is the qpdf `--remove-restrictions` equivalent
+(`QPDFAcroFormDocumentHelper::disableDigitalSignatures`): it removes the
+catalog `/Perms` dictionary, zeroes `/AcroForm /SigFlags`, and strips
+signature fields (`/FT`, `/V`, `/SV`, `/Lock`) from the field tree. Source
+encryption is preserved; combine with `--decrypt` to remove it. It does
+**not** bypass authentication — an auth-requiring input without a working
+`--password` is rejected exactly as a plain `rewrite` would reject it.
 
 ## Summary
 
 | Operation                                                    | Signatures                  |
 | ------------------------------------------------------------ | --------------------------- |
 | `flpdf rewrite` (fresh canonical rewrite)                     | **Preserved, invalidated**  |
-| `flpdf rewrite --remove-restrictions`                         | Stripped (warned)           |
+| `flpdf rewrite --remove-restrictions`                         | Stripped (silent, like qpdf) |
 | Signature generation                                          | Not supported               |

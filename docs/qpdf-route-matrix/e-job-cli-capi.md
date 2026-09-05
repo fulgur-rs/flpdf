@@ -94,6 +94,16 @@ if (pdf) { writeQPDF(*pdf); }
 9. `handleTransformations(pdf)`（`libqpdf/QPDFJob.cc:2137-2248`）。
 10. `page_heap` の各 foreign QPDF に warning があれば `m->warnings = true`。
 
+`handleTransformations` の `remove_restrictions` は
+`QPDFAcroFormDocumentHelper::disableDigitalSignatures()` を呼ぶだけで、成功時の
+custom warning/messageは生成しない（`libqpdf/QPDFJob.cc:2137-2150`、
+`libqpdf/QPDFAcroFormDocumentHelper.cc:419-439`）。CLIの
+`--remove-restrictions` も同じくmutation後に独自の `removed restrictions` /
+`removed signatures` 行を追加せず、document warningがある場合だけ通常の
+`writeQPDF` completion boundaryへ委譲する。`--no-warn` は `QPDF::warn` の表示を
+抑止するがwarning collectionと終了statusは保持する
+（`libqpdf/QPDF.cc:487-504`、`libqpdf/QPDFJob.cc:650-666`）。
+
 入力側の共通足場は `doProcessOnce`（`libqpdf/QPDFJob.cc:1695-1716`）で、**`QPDF` を作った直後に
 `setQPDFOptions(*pdf)`**（`libqpdf/QPDFJob.cc:650-666`）を呼び、その後で `emptyPDF()` /
 `createFromJSON()` / `processFile()` のいずれかを選ぶ。password recovery のリトライは
