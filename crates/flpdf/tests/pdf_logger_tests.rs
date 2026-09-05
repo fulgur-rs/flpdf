@@ -99,6 +99,18 @@ fn unknown_second_xref_entry_type_bytes() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 2 /Length 4 >>\nstream\n\x01\x00a\x00\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
 }
 
+fn indirect_xref_filter_bytes(array_value: bool) -> Vec<u8> {
+    let filter = if array_value {
+        "[ /ASCIIHexDecode ]"
+    } else {
+        "/ASCIIHexDecode"
+    };
+    format!(
+        "%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Filter 2 0 R /Length 9 >>\nstream\n00000000>\nendstream\nendobj\n2 0 obj\n{filter}\nstartxref\n9\n%%EOF\n"
+    )
+    .into_bytes()
+}
+
 fn two_lazy_warning_objects() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -467,6 +479,42 @@ fn unknown_second_xref_entry_type_reports_the_payload_offset_like_qpdf() {
          WARNING: input.pdf (xref stream, offset 71): unknown xref stream entry type 97\n\
          WARNING: input.pdf: Attempting to reconstruct cross-reference table\n"
     );
+}
+
+#[test]
+fn indirect_xref_filter_keeps_cached_null_through_reconstruction() {
+    for array_value in [false, true] {
+        let (logger, output) = recording_logger();
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(indirect_xref_filter_bytes(array_value)),
+            PdfOpenOptions {
+                repair: true,
+                logger: Some(logger),
+                description: b"input.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf-compatible reconstruction should return the candidate trailer");
+
+        let error = pdf
+            .root_handle()
+            .expect_err("the recovered candidate has no /Root dictionary");
+        assert!(matches!(
+            error,
+            Error::System(ref message) if message == "unable to find /Root dictionary"
+        ));
+        let expected = b"WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 9\n\
+             WARNING: input.pdf: file is damaged\n\
+             WARNING: input.pdf (xref stream, offset 85): unknown xref stream entry type 48\n\
+             WARNING: input.pdf: Attempting to reconstruct cross-reference table\n\
+             WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 9\n\
+             WARNING: input.pdf: reported number of objects (1) is not one plus the highest object number (2)\n";
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            expected,
+            "array_value={array_value}: an unresolved indirect filter must remain a cached null"
+        );
+    }
 }
 
 #[test]

@@ -1336,6 +1336,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     let mut registration = XrefRegistration::default();
     let mut initial_parse_diagnostics = Diagnostics::default();
     let mut observed_first_xref_item_offset = None;
+    let initial_bootstrap_cache = empty_bootstrap_cache();
     let mut loaded = match parse_xref_from_start(
         bytes,
         xref_pos,
@@ -1344,7 +1345,9 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         options,
         &mut registration,
         Some(&mut initial_parse_diagnostics),
-        XrefReadContextSpec::ActiveSection,
+        XrefReadContextSpec::ActiveSectionWithCache {
+            bootstrap_cache: &initial_bootstrap_cache,
+        },
         Some(&mut observed_first_xref_item_offset),
         true,
     )
@@ -1372,6 +1375,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 }
             }
             let preexisting_entries = (startxref != 0).then_some(&registration.entries);
+            let preexisting_bootstrap_cache = (startxref != 0).then_some(&initial_bootstrap_cache);
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
                 version,
@@ -1379,6 +1383,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 trigger,
                 None,
                 preexisting_entries,
+                preexisting_bootstrap_cache,
                 options,
                 initial_diagnostics,
                 observed_first_xref_item_offset,
@@ -1404,6 +1409,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             trigger,
             Some(&loaded.loaded.trailer),
             Some(&registration.entries),
+            Some(&loaded.bootstrap_cache),
             options,
             diagnostics,
             Some(loaded.first_xref_item_offset),
@@ -1435,6 +1441,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 trigger,
                 Some(&loaded.loaded.trailer),
                 Some(&registration.entries),
+                Some(&loaded.bootstrap_cache),
                 options,
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
@@ -1489,6 +1496,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             error,
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
+            Some(&loaded.bootstrap_cache), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
             options,
             diagnostics,
             None,
@@ -2225,6 +2233,7 @@ fn recover_xref_from_linear_scan(
     trigger_error: Error,
     fallback_trailer: Option<&ObjectHandle>,
     preexisting_entries: Option<&BTreeMap<ObjectRef, XrefEntry>>,
+    preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
     observed_first_xref_item_offset: Option<u64>,
@@ -2257,7 +2266,9 @@ fn recover_xref_from_linear_scan(
     }
     let mut parsed_xref_streams = BTreeMap::new();
     let mut extra_trailer_references = BTreeSet::new();
-    let mut bootstrap_cache = empty_bootstrap_cache();
+    let mut bootstrap_cache = preexisting_bootstrap_cache
+        .map(Rc::clone)
+        .unwrap_or_else(empty_bootstrap_cache);
 
     // qpdf's `reconstruct_xref` (`QPDF.cc:564-616`) gates BOTH its `trailer`
     // keyword scan (`!m->trailer.isInitialized() && t1.isWord("trailer")`)
@@ -2291,6 +2302,7 @@ fn recover_xref_from_linear_scan(
                     &mut parsed_xref_streams,
                     &mut repair_diagnostics,
                     &mut extra_trailer_references,
+                    preexisting_bootstrap_cache,
                 ) {
                     Ok((
                         trailer,
@@ -2519,6 +2531,7 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, ObjectHandle>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
+    preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
 ) -> Result<(
     ObjectHandle,
     u64,
@@ -2532,8 +2545,13 @@ fn recover_trailer_from_xref_stream_candidate(
     // index once and pass cheap Rc clones through each context instead of
     // sorting the full map again for every `/Prev` lookup.
     let reference_offsets = reconstructed_reference_offsets(entries);
-    let (candidate, discovery_diagnostics) =
-        find_xref_stream_trailer_candidate(bytes, entries, options, &reference_offsets);
+    let (candidate, discovery_diagnostics) = find_xref_stream_trailer_candidate(
+        bytes,
+        entries,
+        options,
+        &reference_offsets,
+        preexisting_bootstrap_cache,
+    );
     // qpdf's candidate search resolves every type-1 entry unconditionally
     // (`getObjectByObjGen(iter.first)` runs before the `isStreamOfType`
     // check, `QPDF.cc:585-589`), warning immediately as each is read, in
@@ -2769,20 +2787,24 @@ fn find_xref_stream_trailer_candidate(
     entries: &BTreeMap<ObjectRef, XrefEntry>,
     options: XrefLoadOptions,
     reference_offsets: &Rc<[u64]>,
+    preexisting_bootstrap_cache: Option<&SharedBootstrapCache>,
 ) -> (Option<XrefStreamCandidate>, Diagnostics) {
     let mut max_offset = 0u64;
     let mut trailer: Option<ObjectHandle> = None;
     let mut discovery_diagnostics = Diagnostics::default();
     let empty_registration = XrefRegistration::default();
-    let mut context = XrefReadContext::new(
-        bytes,
-        XrefReadContextSpec::Reconstruction {
+    let context_spec = match preexisting_bootstrap_cache {
+        Some(bootstrap_cache) => XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries: entries,
+            reference_offsets,
+            bootstrap_cache,
+        },
+        None => XrefReadContextSpec::Reconstruction {
             line_scan_entries: entries,
             reference_offsets,
         },
-        &empty_registration,
-        options,
-    );
+    };
+    let mut context = XrefReadContext::new(bytes, context_spec, &empty_registration, options);
     let mut emitted_diagnostics = 0usize;
     for (&object_ref, entry) in entries {
         let XrefEntry::Uncompressed { offset } = *entry else {
@@ -4253,6 +4275,7 @@ mod final_handle_tests {
                 ..XrefLoadOptions::default()
             },
             &reference_offsets,
+            None,
         );
 
         let candidate = candidate.expect("wide retry must recover the xref stream candidate");
@@ -4302,6 +4325,7 @@ mod final_handle_tests {
                 ..XrefLoadOptions::default()
             },
             &reference_offsets,
+            None,
         );
 
         assert!(
@@ -4357,6 +4381,7 @@ mod final_handle_tests {
                 ..XrefLoadOptions::default()
             },
             &reference_offsets,
+            None,
         );
 
         assert!(candidate.is_none());
@@ -5181,6 +5206,7 @@ mod final_handle_tests {
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
             &mut trailer_references,
+            None,
         )
         .expect("the scanned xref-stream candidate must be recoverable");
 
