@@ -33,8 +33,11 @@ fn cli_transformation_order_matches_qpdf_job() {
     let coalesce = source
         .find("PageObjectHelper::new(page_ref, &mut pdf).coalesce_content_streams()?")
         .expect("coalesce route");
+    // The linearized rewrite path has its own earlier flatten-rotation call;
+    // select the ordinary rewrite pipeline below, whose order this contract
+    // is checking.
     let rotation = source
-        .find("flatten_rotation_on_pages(&mut pdf, &page_refs)?")
+        .rfind("flatten_rotation_on_pages(&mut pdf, &page_refs)?")
         .expect("rotation route");
     let normalize = source
         .rfind("normalize_page_contents(&mut pdf)?")

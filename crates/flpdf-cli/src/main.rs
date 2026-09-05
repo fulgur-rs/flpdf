@@ -294,6 +294,7 @@ fn image_optimization_options(
 fn writer_configuration(
     options: &WriterOptions,
     linearize: bool,
+    linearize_pass1: Option<&Path>,
 ) -> CliResult<WriterConfiguration> {
     let mut configuration = WriterConfiguration::default();
     configuration.set_object_stream_mode(options.object_streams);
@@ -311,6 +312,10 @@ fn writer_configuration(
         configuration.set_compression_level(level);
     }
     configuration.set_qdf_mode(options.qdf && !linearize);
+    configuration.set_linearization(linearize);
+    if let Some(path) = linearize_pass1 {
+        configuration.set_linearization_pass1_filename(path.to_path_buf());
+    }
     if options.content_normalization_set {
         configuration.set_content_normalization(options.content_normalization);
     }
@@ -356,11 +361,7 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
 ) -> CliResult<()> {
-    writer_configuration(options, linearize)?.apply_to(writer);
-    writer.set_linearization(linearize);
-    if let Some(path) = linearize_pass1 {
-        writer.set_linearization_pass1_filename(path.to_path_buf());
-    }
+    writer_configuration(options, linearize, linearize_pass1)?.apply_to(writer);
     Ok(())
 }
 
@@ -410,9 +411,20 @@ fn write_qpdf_to_memory<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     output: &Path,
     options: &WriterOptions,
+    chunks_linearized: bool,
 ) -> CliResult<Vec<u8>> {
     let mut writer = PdfWriter::new(pdf);
-    configure_pdf_writer(&mut writer, options, false, None)?;
+    // qpdf's linearized writers clear QDF mode before deriving QDF's
+    // decode/uncompress defaults (`QPDFWriter.cc:2068-2080`). This memory
+    // rewrite is flpdf's internal preparation for split chunks, so when those
+    // chunks will be linearized it must not apply QDF either; otherwise a
+    // `--stream-data=preserve` chunk would lose the source filters the QDF
+    // pass decoded.
+    let intermediate = WriterOptions {
+        qdf: options.qdf && !chunks_linearized,
+        ..options.clone()
+    };
+    configure_pdf_writer(&mut writer, &intermediate, false, None)?;
     configure_cli_progress(&mut writer, output, options.progress)?;
     writer.set_output_memory()?;
     writer.write()?;
@@ -2616,8 +2628,8 @@ fn main() {
     // being dropped. The top-level predicate mirrors the dispatch chain below
     // (the rewrite branch is the final `else`, reached only when no inspection,
     // attachment, json, or page-op mode is selected) and must stay in sync with
-    // it; `--pages`/`--linearize` combinations are rejected later with their own
-    // specific diagnostics.
+    // it; page-operation output is dispatched to the page-operation writer
+    // boundary, including when `--linearize` is present.
     if !overlay_specs.is_empty() {
         let target_is_rewrite = match &args.command {
             Some(Commands::Rewrite(_)) => true,
@@ -2814,19 +2826,7 @@ fn main() {
             args.linearize_pass1.as_deref(),
             options,
         )
-    } else if args.linearize {
-        // --linearize is incompatible with the page-extraction pipeline:
-        // extraction produces a normalized, non-linearized document. Without
-        // this guard the linearize branch would win the dispatch chain and
-        // silently ignore --pages/--rotate/--split-pages (wrong output, no
-        // diagnostic). Mirror the same rejection the `rewrite` subcommand
-        // performs.
-        if page_ops_active(&args.page_ops) {
-            emit_logger_error(
-                "flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages\n",
-            );
-            std::process::exit(1);
-        }
+    } else if args.linearize && !page_ops_active(&args.page_ops) {
         let options = top_level_writer_options(
             &args,
             normalize_content,
@@ -2932,6 +2932,8 @@ fn main() {
                     &args.page_ops,
                     &overlay_specs,
                     options,
+                    args.linearize,
+                    args.linearize_pass1.as_deref(),
                     args.optimize_images.then_some(top_level_image_options),
                     args.verbose,
                     args.no_warn,
@@ -2952,6 +2954,8 @@ fn main() {
                         &overlay_specs,
                         CliRemoveUnreferencedResources::Auto,
                         options.clone(),
+                        args.linearize,
+                        args.linearize_pass1.as_deref(),
                         args.optimize_images.then_some(top_level_image_options),
                         args.verbose,
                         args.no_warn,
@@ -2974,6 +2978,8 @@ fn main() {
                         args.update_from_json.as_deref(),
                         &args.page_ops,
                         options.clone(),
+                        args.linearize,
+                        args.linearize_pass1.as_deref(),
                         args.optimize_images.then_some(top_level_image_options),
                         args.verbose,
                         args.no_warn,
@@ -3695,28 +3701,12 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.ii_min_bytes.as_deref(),
             )?;
 
-            // --flatten-rotation remains unsupported on the linearize path;
-            // qpdf accepts --generate-appearances before its linearized writer
-            // and the shared run_rewrite route now preserves that ordering.
-            if cmd.linearize && cmd.flatten_rotation {
-                emit_logger_error(
-                    "flpdf: --linearize cannot be combined with --flatten-rotation\n",
-                );
-                std::process::exit(1);
-            }
-
             // Page-operation dispatch. When --pages is set
             // the extraction pipeline owns the write; otherwise --rotate /
-            // --split-pages decorate a plain rewrite. --linearize with page
-            // ops is rejected (the extraction path produces a normalized,
-            // non-linearized document).
+            // --split-pages decorate a plain rewrite. Linearization is a
+            // writer setting applied after the page-operation mutations, just
+            // as qpdf applies `setWriterOptions` after `createQPDF`.
             if page_ops_active(&cmd.page_ops) {
-                if cmd.linearize {
-                    emit_logger_error(
-                        "flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages\n",
-                    );
-                    std::process::exit(1);
-                }
                 // The --rotate/--split-pages-only path does not run overlay
                 // stacking; only --pages does (via run_page_extraction below).
                 if cmd.page_ops.pages.is_empty() && !overlay_specs.is_empty() {
@@ -3795,6 +3785,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.page_ops,
                         overlay_specs,
                         options,
+                        cmd.linearize,
+                        None,
                         cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                         false,
@@ -3811,6 +3803,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         overlay_specs,
                         remove_unref,
                         options,
+                        cmd.linearize,
+                        None,
                         cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                         false,
@@ -3825,6 +3819,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         None,
                         &cmd.page_ops,
                         options,
+                        cmd.linearize,
+                        None,
                         cmd.optimize_images.then_some(image_options),
                         cmd.verbose,
                         false,
@@ -4669,6 +4665,15 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             PageDocumentHelper::new(&mut pdf)
                 .flatten_annotations(required_flags, forbidden_flags)?;
         }
+        // qpdf applies --flatten-rotation after annotation flattening and
+        // before the writer plans the linearized output
+        // (`QPDFJob.cc:2183-2194`). Keep the transformed page graph visible
+        // to the linearization planner rather than silently dropping the
+        // option on this branch.
+        if flatten_rotation {
+            let page_refs = pages::page_refs(&mut pdf)?;
+            flatten_rotation_on_pages(&mut pdf, &page_refs)?;
+        }
         // Apply content normalization before the writer plans and emits the
         // linearized document.
         let normalization_last_bad = if normalize_content {
@@ -5447,6 +5452,8 @@ fn run_page_extraction(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     no_warn: bool,
@@ -5550,6 +5557,8 @@ fn run_page_extraction(
                 overlay_specs,
                 remove_unref,
                 options,
+                linearize,
+                linearize_pass1,
                 image_options,
                 verbose,
                 standard_output,
@@ -5568,6 +5577,8 @@ fn run_page_extraction(
                 overlay_specs,
                 remove_unref,
                 options,
+                linearize,
+                linearize_pass1,
                 image_options,
                 verbose,
                 standard_output,
@@ -5593,6 +5604,8 @@ fn run_page_extraction(
             overlay_specs,
             remove_unref,
             options,
+            linearize,
+            linearize_pass1,
             image_options,
             verbose,
             no_warn,
@@ -5612,6 +5625,8 @@ fn run_page_extraction(
         overlay_specs,
         remove_unref,
         options,
+        linearize,
+        linearize_pass1,
         image_options,
         verbose,
         standard_output,
@@ -5638,6 +5653,8 @@ fn run_empty_page_extraction(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     no_warn: bool,
@@ -5778,6 +5795,8 @@ fn run_empty_page_extraction(
         overlay_specs,
         CliRemoveUnreferencedResources::No,
         options,
+        linearize,
+        linearize_pass1,
         verbose,
         standard_output,
         creates_output,
@@ -5809,6 +5828,8 @@ fn run_page_extraction_from_multiple_sources(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     no_warn: bool,
@@ -5981,6 +6002,8 @@ fn run_page_extraction_from_multiple_sources(
         // final reachability cleanup.
         CliRemoveUnreferencedResources::No,
         options,
+        linearize,
+        linearize_pass1,
         verbose,
         standard_output,
         creates_output,
@@ -6005,6 +6028,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     standard_output: Option<PipelineWriter>,
@@ -6097,6 +6122,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 overlay_specs,
                 CliRemoveUnreferencedResources::No,
                 options,
+                linearize,
+                linearize_pass1,
                 verbose,
                 standard_output,
                 creates_output,
@@ -6139,6 +6166,8 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 // not run the document-wide resource pass a second time.
                 CliRemoveUnreferencedResources::No,
                 options,
+                linearize,
+                linearize_pass1,
                 verbose,
                 standard_output,
                 creates_output,
@@ -6165,6 +6194,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     verbose: bool,
     mut standard_output: Option<PipelineWriter>,
     creates_output: bool,
@@ -6277,7 +6308,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         options.progress = false;
     }
     if let Some(n) = split_pages.filter(|size| *size > 0) {
-        let bytes = write_qpdf_to_memory(pdf, output, &options)?;
+        let bytes = write_qpdf_to_memory(pdf, output, &options, linearize)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -6287,7 +6318,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             no_warn,
-            writer_configuration(&options, false)?,
+            writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
         // The intermediate rewrite may already have repaired the condition
         // that produced a warning in the original source (e.g. --repair's
@@ -6303,7 +6334,14 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         return finish_job_exit_status(split_job.complete(true)?);
     } else {
         let announce_file = standard_output.is_none();
-        write_with_pdf_writer(pdf, output, &mut standard_output, &options, false, None)?;
+        write_with_pdf_writer(
+            pdf,
+            output,
+            &mut standard_output,
+            &options,
+            linearize,
+            linearize_pass1,
+        )?;
         if verbose && announce_file {
             logger_info(wrote_file_message("flpdf", output))?;
         }
@@ -6427,6 +6465,8 @@ fn run_rewrite_with_page_ops(
     update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
     no_warn: bool,
@@ -6447,6 +6487,8 @@ fn run_rewrite_with_page_ops(
             output,
             page_ops,
             options,
+            linearize,
+            linearize_pass1,
             image_options,
             verbose,
         ),
@@ -6456,18 +6498,23 @@ fn run_rewrite_with_page_ops(
             output,
             page_ops,
             options,
+            linearize,
+            linearize_pass1,
             image_options,
             verbose,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     mut pdf: Pdf<R>,
     input: &Path,
     output: &std::path::Path,
     page_ops: &PageOpArgs,
     options: WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
     image_options: Option<ImageOptimizationOptions>,
     verbose: bool,
 ) -> CliResult<()> {
@@ -6512,7 +6559,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(n) = split_pages.filter(|size| *size > 0) {
         let suppress_warnings = pdf.suppress_warnings();
-        let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
+        let bytes = write_qpdf_to_memory(&mut pdf, output, &options, linearize)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -6522,7 +6569,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             suppress_warnings,
-            writer_configuration(&options, false)?,
+            writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
         // The intermediate rewrite may already have repaired the condition
         // that produced a warning on the original `pdf` (e.g. --repair's
@@ -6537,8 +6584,8 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             output,
             &mut standard_output,
             &options,
-            false,
-            None,
+            linearize,
+            linearize_pass1,
         )?;
         if verbose && announce_file {
             logger_info(wrote_file_message("flpdf", output))?;
