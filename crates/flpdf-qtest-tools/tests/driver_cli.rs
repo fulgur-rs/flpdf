@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use flpdf::{PageDocumentHelper, Pdf, PdfOpenOptions};
 use std::{ffi::CStr, fs};
 
 #[cfg(unix)]
@@ -907,6 +908,80 @@ fn test_56_writes_the_form_xobject_overlay_output() {
             .any(|window| window == b"/Fx1"),
         "test 56 output must contain the imported source Form XObject resource"
     );
+}
+
+#[test]
+fn test_55_writes_two_form_xobjects_per_page_with_qpdf_variants() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = form_xobject_fixture();
+
+    driver()
+        .args(["55", fixture])
+        .current_dir(directory.path())
+        .assert()
+        .code(0)
+        .stdout("test 55 done\n")
+        .stderr("");
+
+    let output_bytes = fs::read(directory.path().join("a.pdf"))
+        .expect("test 55 must write the qpdf-shaped output");
+    assert!(output_bytes
+        .windows(b"%QDF-1.0".len())
+        .any(|window| window == b"%QDF-1.0"));
+
+    let mut output = Pdf::open_mem_owned_with_options(
+        output_bytes,
+        PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open test 55 output");
+    let page_count = PageDocumentHelper::new(&mut output)
+        .get_all_pages()
+        .expect("enumerate output pages")
+        .len();
+    let qtest = output.trailer_key_handle(b"QTest");
+    output.resolve(&qtest).expect("resolve /QTest");
+    let entries = qtest.as_array().expect("/QTest must be an array");
+    assert_eq!(entries.len(), page_count * 2);
+
+    let mut transformed_pages = 0;
+    for pair in entries.chunks_exact(2) {
+        for form in pair {
+            output.resolve(form).expect("resolve Form XObject");
+            assert!(form.is_form_xobject().expect("classify Form XObject"));
+        }
+
+        let transformed_dict = pair[0]
+            .as_stream_dict()
+            .expect("transformed Form XObject must have a stream dictionary");
+        let transformed_matrix = transformed_dict
+            .try_get_key(b"/Matrix")
+            .expect("read transformed Form XObject matrix");
+        output
+            .resolve(&transformed_matrix)
+            .expect("resolve transformed Form XObject matrix");
+        if !transformed_matrix.is_null() {
+            transformed_pages += 1;
+        }
+
+        let untransformed_dict = pair[1]
+            .as_stream_dict()
+            .expect("untransformed Form XObject must have a stream dictionary");
+        let untransformed_matrix = untransformed_dict
+            .try_get_key(b"/Matrix")
+            .expect("read untransformed Form XObject matrix");
+        output
+            .resolve(&untransformed_matrix)
+            .expect("resolve untransformed Form XObject matrix");
+        assert!(untransformed_matrix.is_null());
+    }
+    assert!(transformed_pages > 0);
+
+    let id = output.trailer_key_handle(b"ID");
+    output.resolve(&id).expect("resolve static /ID");
+    assert_eq!(id.as_array().expect("/ID must be an array").len(), 2);
 }
 
 #[test]
