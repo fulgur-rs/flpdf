@@ -5143,8 +5143,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
         // stream's encryption covers them all.
-        let identity_map = |object_ref: ObjectRef| Ok(object_ref);
-        let no_removed_refs = BTreeSet::new();
         if let Some(ctx) = &encrypt_ctx {
             if options.qdf {
                 write_qdf_objstm_dictionary(
@@ -5188,12 +5186,18 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 true,
             );
         } else {
-            stream_dict.write_stream_body_with_ref_map_and_removed(
+            // qpdf's writeObjectStream emits the container dictionary in the
+            // fixed order /Type /Length [/Filter] /N /First
+            // (`QPDFWriter.cc:1714-1730`); serializing the handle would sort
+            // the keys instead.
+            write_objstm_dictionary(
                 &mut bytes,
-                false,
-                &identity_map,
-                &no_removed_refs,
-            )?; // cov:ignore: plain ObjStm payload route; LLVM maps the call continuation here
+                stream_length,
+                matches!(objstm_compression, CompressStreams::Yes),
+                body.n_members,
+                objstm_first,
+                extends,
+            );
             serialize::write_stream_payload(
                 &mut bytes,
                 &stream_data,

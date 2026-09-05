@@ -754,6 +754,51 @@ fn decrypting_encrypted_source_generate_uses_container_first_numbering() {
         1,
         "qpdf assigns the generated ObjStm before ordinary objects for decrypted encrypted input"
     );
+    // qpdf's writeObjectStream emits the container dictionary in the fixed
+    // order /Type /Length /N /First (`QPDFWriter.cc:1714-1730`); the plain
+    // (non-encrypted, non-QDF) container branch must not fall back to a
+    // key-sorted handle serialization.
+    assert!(
+        bytes
+            .windows(b"1 0 obj\n<< /Type /ObjStm /Length ".len())
+            .any(|part| part == b"1 0 obj\n<< /Type /ObjStm /Length "),
+        "decrypted-source ObjStm container must use qpdf's fixed dictionary order"
+    );
+}
+
+/// The same fixed dictionary order applies when the source encryption is
+/// preserved: qpdf writes `/Type /ObjStm /Length ... /N ... /First ...`
+/// regardless of whether the container payload is then encrypted.
+#[test]
+fn preserving_encrypted_source_generate_uses_qpdf_container_dictionary_order() {
+    let input = fixture("tests/fixtures/compat/one-page-enc-u.pdf");
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(input),
+        PdfOpenOptions {
+            password: b"u".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open encrypted source");
+    let options = WriterTestSettings {
+        static_id: true,
+        object_streams: ObjectStreamMode::Generate,
+        preserve_encryption: true,
+        ..WriterTestSettings::default()
+    };
+    let bytes = {
+        let mut output = Vec::new();
+        write_with_settings(&mut pdf, &mut output, &options).expect("preserve and generate");
+        output
+    };
+
+    assert_eq!(object_number_before_marker(&bytes, b"/Type /ObjStm"), 1);
+    assert!(
+        bytes
+            .windows(b"1 0 obj\n<< /Type /ObjStm /Length ".len())
+            .any(|part| part == b"1 0 obj\n<< /Type /ObjStm /Length "),
+        "preserved-encryption ObjStm container must use qpdf's fixed dictionary order"
+    );
 }
 
 /// Keep the existing QDF encrypted ObjStm serializer covered while the
