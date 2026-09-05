@@ -241,6 +241,14 @@ public/private 境界の 2 つ目の witness になる。
 | E-29 | `QPDFJob::createQPDF` の入力オープン側（`processFile` → `doProcess` → `doProcessOnce`。`QPDF` 構築直後に必ず `setQPDFOptions` を適用してから読む） | `libqpdf/QPDFJob.cc:428-481`, `libqpdf/QPDFJob.cc:1793-1804`, `libqpdf/QPDFJob.cc:1695-1716`, `libqpdf/QPDFJob.cc:650-666`（`noWarn` → `setSuppressWarnings` は `libqpdf/QPDFJob.cc:663-665`） | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_document_with_description`、`open_with_description`、`open_for_encryption_inspection_with_description`、`open_job_source`。CLI の通常入力と secondary source はこれらの job boundary または同じ `PdfOpenOptions` policy を使う。reopenable な page source は `crates/flpdf-cli/src/main.rs::open_page_source`、JSON input は `QPDFJob::create_from_json` を通る | 旧 `Pdf::open_with_options` / `Pdf::create_from_json` route: job boundary からは prod 0 / test 0 だが、direct `Pdf::open_with_options` は2つの意図的な exception route が残る（`python3 scripts/qpdf-route-callers.py --symbol open_with_options` は `crates/flpdf-cli/src/main.rs` に production caller 1 を報告する）。job の各 open boundary は job suppression を open 前に OR 済み。`open_page_source` は reopenable source のため direct `open_file_with_options` を残す。`run_copy_attachments_from` の attachment donor open も同じく direct `Pdf::open_with_options` を使う — qpdf の `doCopyAttachments`（`libqpdf/QPDFJob.cc:2100`）が donor を `processFile(other, ...)` で job 本体の main input slot と独立に開いており、donor を job 経由（`job.open_with_description`）で開くと `job.input_name()` が donor のパスで上書きされ、後続の duplicate-key エラー（`self.input_name()` を使用、qpdf の `pdf.getFilename()` @ `QPDFJob.cc:2127` に対応）が target ではなく donor を誤って名指すため。両 route とも同じ `suppress_warnings` option を明示適用する | mixed | `crates/flpdf/src/job/lifecycle.rs::QPDFJob::open_with_description` | qpdf の `doProcessOnce` 境界に合わせ、ordinary open、overlay/underlay、copy-encryption、encryption probe、attachment copy、page source、JSON input の open-time warning delivery を `--no-warn` で抑止する。warning collection と completion/exit status は保持する。 |
 
 
+`flpdf-5nle` で attachment mutation の output boundary を更新した。`QPDFJob::handleTransformations` の
+`addAttachments` / `removeEmbeddedFile` 相当の mutation 後、`run_add_attachment` と
+`run_remove_attachment` は共通の `top_level_writer_options` を
+`writer_configuration` → `write_with_pdf_writer` へ渡す。content normalization は mutation 後に
+行い、linearization と `linearize_pass1` も同じ writer に渡す。これは qpdf の
+`writeQPDF` → `writeOutfile` → `setWriterOptions` の順序
+（`libqpdf/QPDFJob.cc:484-507,2137-2248,2847-2945,3029-3058`）に対応する。
+
 ### 分類別件数
 
 | 分類 | 件数 | 行 |

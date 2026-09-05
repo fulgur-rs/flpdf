@@ -183,9 +183,10 @@ fn apply_cli_decode_level(options: &mut WriterOptions, decode_level: Option<CliD
 /// Build the writer settings shared by top-level rewrite-shaped routes.
 ///
 /// qpdf applies these settings after each top-level transformation, including
-/// `--copy-attachments-from` (`QPDFJob.cc:484-507,2847-2945`). Keeping the
-/// assembly here prevents an operation-specific writer from silently dropping
-/// a setting that the canonical rewrite path already honors.
+/// `--add-attachment`, `--remove-attachment`, and `--copy-attachments-from`
+/// (`QPDFJob.cc:484-507,2046-2248,2847-2945`). Keeping the assembly here
+/// prevents an operation-specific writer from silently dropping a setting
+/// that the canonical rewrite path already honors.
 fn top_level_writer_options(
     args: &Cli,
     normalize_content: bool,
@@ -2612,35 +2613,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Attachment add/remove operations rewrite through their own serializers
-    // before the shared rewrite branch. qpdf applies writer normalization to
-    // those outputs, but flpdf cannot yet do so without duplicating the
-    // consumer. Reject effective `y` until those serializers delegate to the
-    // shared rewrite path; list/show and copy use their own supported writer
-    // boundaries, matching qpdf.
-    if normalize_content && (args.remove_attachment.is_some() || !args.add_attachment.is_empty()) {
-        emit_logger_error(
-            "flpdf: --normalize-content is not applied by attachment mutation operations; \
-             rerun with --normalize-content=n or without the attachment operation\n",
-        );
-        std::process::exit(1);
-    }
-
-    // Same rationale as the --normalize-content guard above: the add/remove
-    // serializers build their own minimal WriterOptions and never call
-    // apply_cli_decode_level, so a non-`none` --decode-level would silently
-    // be dropped rather than applied. The copy route uses the full top-level
-    // WriterOptions bridge below.
-    if matches!(args.decode_level, Some(level) if level != CliDecodeLevel::None)
-        && (args.remove_attachment.is_some() || !args.add_attachment.is_empty())
-    {
-        emit_logger_error(
-            "flpdf: --decode-level is not applied by attachment mutation operations; \
-             rerun with --decode-level=none or without the attachment operation\n",
-        );
-        std::process::exit(1);
-    }
-
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
     // `preprocess_qpdf_args`, so a stripped group leaves no trace for the
     // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
@@ -2784,38 +2756,44 @@ fn main() {
         )
     } else if let Some(key) = args.show_attachment {
         run_show_attachment(args.input, args.repair, &args.password, &key, args.no_warn)
-    } else if let Some(key) = args.remove_attachment {
+    } else if let Some(ref key) = args.remove_attachment {
+        let options = top_level_writer_options(
+            &args,
+            normalize_content,
+            top_level_compression_level,
+            &top_level_version_options,
+        );
         run_remove_attachment(
             args.input,
             args.output,
             args.repair,
             &args.password,
-            &key,
-            args.deterministic_id,
-            args.static_id,
-            args.preserve_unreferenced,
-            args.progress,
-            args.recompress_flate,
-            top_level_compression_level,
+            key,
             args.no_warn,
-            &top_level_version_options,
+            args.remove_restrictions,
+            args.linearize,
+            args.linearize_pass1.as_deref(),
+            options,
         )
     } else if !args.add_attachment.is_empty() {
+        let options = top_level_writer_options(
+            &args,
+            normalize_content,
+            top_level_compression_level,
+            &top_level_version_options,
+        );
         run_add_attachment(
             args.input,
             args.output,
             args.repair,
             &args.password,
             attachment_segments,
-            args.deterministic_id,
-            args.static_id,
-            args.preserve_unreferenced,
-            args.progress,
-            args.recompress_flate,
-            top_level_compression_level,
             args.verbose,
             args.no_warn,
-            &top_level_version_options,
+            args.remove_restrictions,
+            args.linearize,
+            args.linearize_pass1.as_deref(),
+            options,
         )
     } else if !args.copy_attachments_from.is_empty() {
         let copy_groups = args
@@ -8187,15 +8165,12 @@ fn run_add_attachment(
     repair: bool,
     password: &PasswordArgs,
     segments: Vec<Vec<Vec<u8>>>,
-    deterministic_id: bool,
-    static_id: bool,
-    preserve_unreferenced: bool,
-    progress: bool,
-    recompress_flate: bool,
-    compression_level: Option<i32>,
     verbose: bool,
     suppress_warnings: bool,
-    version_options: &CliVersionOptions,
+    remove_restrictions: bool,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    writer_options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
@@ -8229,32 +8204,42 @@ fn run_add_attachment(
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    pdf.set_suppress_warnings(suppress_warnings);
 
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
+    if remove_restrictions {
+        AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+    }
     job.add_attachments(&mut pdf, &attachment_options)?;
 
-    let mut options = WriterOptions {
-        deterministic_id,
-        static_id,
-        preserve_unreferenced_objects: preserve_unreferenced,
-        progress,
-        recompress_flate,
-        compression_level,
-        ..WriterOptions::default()
+    // qpdf's writer applies content normalization after all transformations
+    // have updated the document graph. The direct writer API requires the
+    // equivalent page-content prepass before it emits the final PDF.
+    let normalization_warnings = if writer_options.content_normalization {
+        normalize_page_contents(&mut pdf)?
+    } else {
+        Vec::new()
     };
-    apply_cli_version_options(&mut options, version_options);
     write_with_pdf_writer(
         &mut pdf,
         &output,
         &mut standard_output,
-        &options,
-        false,
-        None,
+        &writer_options,
+        linearize,
+        linearize_pass1,
     )?;
     if verbose && output.as_os_str() != "-" {
         job.logger()
             .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+    }
+    if !suppress_warnings {
+        for &warning in &normalization_warnings {
+            emit_content_normalization_warnings(&input, warning)?;
+        }
+    }
+    if !normalization_warnings.is_empty() {
+        job.record_warnings();
     }
     job.record_document_warnings(&pdf);
     finish_job_exit_status(job.complete(true)?)
@@ -8268,20 +8253,20 @@ fn run_remove_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &OsStr,
-    deterministic_id: bool,
-    static_id: bool,
-    preserve_unreferenced: bool,
-    progress: bool,
-    recompress_flate: bool,
-    compression_level: Option<i32>,
     suppress_warnings: bool,
-    version_options: &CliVersionOptions,
+    remove_restrictions: bool,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    writer_options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
 
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
 
+    if remove_restrictions {
+        AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+    }
     let key = arg_parser::os_bytes(key);
     let found = pdf.embedded_files().remove_embedded_file(&key)?;
     if !found {
@@ -8291,27 +8276,28 @@ fn run_remove_attachment(
         return Err(Error::SystemBytes(message).into());
     }
 
-    let mut options = WriterOptions {
-        deterministic_id,
-        static_id,
-        preserve_unreferenced_objects: preserve_unreferenced,
-        progress,
-        recompress_flate,
-        compression_level,
-        ..WriterOptions::default()
+    let normalization_warnings = if writer_options.content_normalization {
+        normalize_page_contents(&mut pdf)?
+    } else {
+        Vec::new()
     };
-    apply_cli_version_options(&mut options, version_options);
     let mut standard_output = prepare_pdf_standard_output(&output)?;
     let creates_output = standard_output.is_none();
     write_with_pdf_writer(
         &mut pdf,
         &output,
         &mut standard_output,
-        &options,
-        false,
-        None,
+        &writer_options,
+        linearize,
+        linearize_pass1,
     )?;
-    finish_operation_warnings(&pdf, creates_output)
+    finish_rewrite_warnings(
+        &input,
+        &pdf,
+        &normalization_warnings,
+        creates_output,
+        suppress_warnings,
+    )
 }
 
 /// `--list-attachments [--verbose] input`
