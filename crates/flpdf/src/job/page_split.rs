@@ -39,8 +39,8 @@
 //!   (confirmed with `two.dots.pdf` → `two.dots-1-2.pdf`).
 
 use super::resource_pruning::{
-    should_remove_unreferenced_resources_with_report, RemoveUnreferencedResources,
-    SharedResourceFinding,
+    shared_resource_finding_message, should_remove_unreferenced_resources_with_report,
+    RemoveUnreferencedResources,
 };
 use super::QPDFJob;
 use crate::{
@@ -141,26 +141,6 @@ fn qpdf_split_page_size(value: i32) -> Result<usize> {
             std::mem::size_of::<usize>(),
         ))
     })
-}
-
-fn shared_resource_finding_message(finding: SharedResourceFinding) -> Vec<u8> {
-    match finding {
-        SharedResourceFinding::NonLeaf { node } => format!(
-            "  found resources in non-leaf page node {} {}\n",
-            node.number, node.generation
-        )
-        .into_bytes(),
-        SharedResourceFinding::Resources { node, resources } => format!(
-            "  found shared resources in leaf node {} {}: {} {}\n",
-            node.number, node.generation, resources.number, resources.generation
-        )
-        .into_bytes(),
-        SharedResourceFinding::XObject { node, xobject } => format!(
-            "  found shared xobject in leaf node {} {}: {} {}\n",
-            node.number, node.generation, xobject.number, xobject.generation
-        )
-        .into_bytes(),
-    }
 }
 
 impl QPDFJob {
@@ -596,6 +576,7 @@ fn digit_width(n: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::resource_pruning::SharedResourceFinding;
     use crate::pages::page_refs;
     use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
     use crate::{ObjectHandle, Pdf, PdfOpenOptions, QPDFLogger};

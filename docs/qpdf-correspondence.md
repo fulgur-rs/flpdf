@@ -1221,6 +1221,17 @@ qpdf と同じ shallow page copy とし、汎用 `merge_documents` の library-l
 `PageDocumentHelper::add_page(PageInput::Foreign)`、`PageObjectHelper::copy_annotations_from`、
 `PageLabelDocumentHelper::write_reconstructed_labels_with_prefix_presence` を通る fresh chunk
 生成を実装し、CLI の単一入力・複数入力 split 出力を同じ job route に切り替えた。
+`flpdf-h0a9` では、page-spec の verbose diagnostics も `QPDFJob` の canonical route へ接続した。
+qpdf は `Config::verbose` (`QPDFJob_config.cc:637-645`) を job に保持し、
+`handlePageSpecs` の source processing、raw filename をキーにした `std::map` 順の
+`shouldRemoveUnreferencedResources` preflight、primary page removal、page addition を
+`doIfVerbose` (`QPDFJob.cc:340-345,2360-2472`) から同じ info logger へ流す。
+flpdf は `Pdf` の caller-provided input description bytes と `QPDFJob` の message prefix/logger
+を使い、`resource_pruning.rs` の finding callback を一度だけ実行した結果を page merge へ渡す。
+これにより absolute/non-UTF-8 argv path、finding/no-finding の分岐、source preflight 順、
+`--pages` 後の split preflight を CLI 固有の synthetic template なしで qpdf と揃える
+（`QPDFJob.cc:2251-2339,2440-2565,2940-3025`; differential coverage:
+`crates/flpdf-cli/tests/cli_pages_verbose_diagnostics.rs`）。
 `.50qd.1` では secondary source の認証を `QPDFJob.cc:2400-2412` の
 `page_spec.password` 境界に合わせ、top-level primary password を distinct secondary の
 fallback にしない。global な password mode/weak-crypto policy は共有するが、credential

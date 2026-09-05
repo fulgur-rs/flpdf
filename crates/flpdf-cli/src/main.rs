@@ -4710,7 +4710,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             linearize_pass1,
         )?;
         if verbose && announce_file {
-            logger_info(wrote_file_message("flpdf", output))?;
+            logger_info(wrote_file_message(&progname(), output))?;
         }
         // On an encrypted input, `--decrypt` has already disabled
         // source-encryption preservation above.
@@ -4861,7 +4861,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         )?;
 
         if verbose && announce_file {
-            logger_info(wrote_file_message("flpdf", output))?;
+            logger_info(wrote_file_message(&progname(), output))?;
         }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
@@ -5417,14 +5417,6 @@ fn validate_collate_values(raw_values: &[String]) {
     }
 }
 
-/// Basename of `p` for `--verbose --pages` progress lines (qpdf uses the
-/// bare file name — e.g. `fxo-red.pdf`, not the absolute path or `.`).
-fn pages_progress_filename(p: &std::path::Path) -> String {
-    p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
-}
-
 /// Apply the page-job-owned keep-open configuration from the CLI surface.
 fn configure_keep_files_open(job: &mut QPDFJob, page_ops: &PageOpArgs) -> CliResult<()> {
     if let Some(value) = page_ops.keep_files_open {
@@ -5583,7 +5575,6 @@ fn run_page_extraction(
                 standard_output,
                 creates_output,
                 &inputs,
-                &distinct,
                 no_warn,
             ),
             JobPdf::Json(pdf) => run_page_extraction_from_single_source(
@@ -5603,7 +5594,6 @@ fn run_page_extraction(
                 standard_output,
                 creates_output,
                 &inputs,
-                &distinct,
                 no_warn,
             ),
         };
@@ -5651,7 +5641,6 @@ fn run_page_extraction(
         standard_output,
         creates_output,
         &inputs,
-        &distinct,
         no_warn,
     )
 }
@@ -5709,15 +5698,11 @@ fn run_empty_page_extraction(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_verbose(verbose);
     job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
     let keep_files_open = job.keep_files_open_for_page_specs(&specs);
-    if verbose && page_ops.keep_files_open.is_none() {
-        logger_info(format!(
-            "flpdf: selecting --keep-open-files={}\n",
-            if keep_files_open { "y" } else { "n" }
-        ))?;
-    }
+    job.report_page_spec_selection(&specs)?;
 
     let mut sources = Vec::with_capacity(source_paths.len() + 1);
     sources.push(job.create_empty_document()?);
@@ -5729,12 +5714,7 @@ fn run_empty_page_extraction(
     // errors (exit 2 on malformed JSON), it is not a silent no-op.
     apply_json_update_with_job(&mut job, &mut sources[0], update_from_json)?;
     for (source_index, path) in source_paths.iter().enumerate() {
-        if verbose {
-            logger_info(format!(
-                "flpdf: processing {}\n",
-                pages_progress_filename(path)
-            ))?;
-        }
+        job.report_page_source_processing(path_description(path))?;
         let mut source_password = password.clone();
         source_password.set_password_bytes(source_passwords[source_index].clone());
         source_password.password_file = None;
@@ -5745,32 +5725,6 @@ fn run_empty_page_extraction(
             keep_files_open,
             no_warn,
         )?);
-    }
-
-    if verbose {
-        let mut message = String::new();
-        // qpdf's shouldRemoveUnreferencedResources returns before any
-        // report for explicit yes/no (`QPDFJob.cc:2253-2258`); only the
-        // Auto heuristic announces the preflight.
-        if remove_unref == CliRemoveUnreferencedResources::Auto {
-            message.push_str(
-                "flpdf: empty PDF: checking for shared resources\nflpdf: no shared resources found\n",
-            );
-            for path in &source_paths {
-                let fname = pages_progress_filename(path);
-                message.push_str(&format!(
-                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-                ));
-            }
-        }
-        message.push_str("flpdf: removing unreferenced pages from primary input\n");
-        for path in &source_paths {
-            message.push_str(&format!(
-                "flpdf: adding pages from {}\n",
-                pages_progress_filename(path)
-            ));
-        }
-        logger_info(message)?;
     }
 
     // qpdf raises the output version floor from every source participating in
@@ -5900,15 +5854,11 @@ fn run_page_extraction_from_multiple_sources(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_verbose(verbose);
     job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
     let keep_files_open = job.keep_files_open_for_page_specs(&specs);
-    if verbose && page_ops.keep_files_open.is_none() {
-        logger_info(format!(
-            "flpdf: selecting --keep-open-files={}\n",
-            if keep_files_open { "y" } else { "n" }
-        ))?;
-    }
+    job.report_page_spec_selection(&specs)?;
     sources.push(open_page_source(
         &primary_input.to_path_buf(),
         repair,
@@ -5925,12 +5875,7 @@ fn run_page_extraction_from_multiple_sources(
         // fields with the per-source value, including an explicit empty value.
         source_password.set_password_bytes(source_passwords[source_index].clone());
         source_password.password_file = None;
-        if verbose {
-            logger_info(format!(
-                "flpdf: processing {}\n",
-                pages_progress_filename(path)
-            ))?;
-        }
+        job.report_page_source_processing(path_description(path))?;
         sources.push(open_page_source(
             path,
             repair,
@@ -5938,27 +5883,6 @@ fn run_page_extraction_from_multiple_sources(
             keep_files_open,
             no_warn,
         )?);
-    }
-
-    if verbose {
-        let mut message = String::new();
-        // Explicit yes/no skip qpdf's preflight report (`QPDFJob.cc:2253-2258`).
-        if remove_unref == CliRemoveUnreferencedResources::Auto {
-            for path in &source_paths {
-                let fname = pages_progress_filename(path);
-                message.push_str(&format!(
-                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-                ));
-            }
-        }
-        message.push_str("flpdf: removing unreferenced pages from primary input\n");
-        for path in &source_paths {
-            message.push_str(&format!(
-                "flpdf: adding pages from {}\n",
-                pages_progress_filename(path)
-            ));
-        }
-        logger_info(message)?;
     }
 
     // qpdf raises the writer floor from every input processed by the job
@@ -6064,7 +5988,6 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     standard_output: Option<PipelineWriter>,
     creates_output: bool,
     inputs: &[InputSpec],
-    distinct: &[PathBuf],
     no_warn: bool,
 ) -> CliResult<()> {
     let primary_encrypted = pdf.is_encrypted();
@@ -6076,39 +5999,10 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_verbose(verbose);
     job.set_suppress_warnings(no_warn);
     configure_keep_files_open(&mut job, page_ops)?;
-    if verbose && page_ops.keep_files_open.is_none() {
-        let mut message = format!(
-            "flpdf: selecting --keep-open-files={}\n",
-            if job.keep_files_open_for_page_specs(&specs) {
-                "y"
-            } else {
-                "n"
-            }
-        );
-        // Explicit yes/no skip qpdf's preflight report (`QPDFJob.cc:2253-2258`).
-        if remove_unref == CliRemoveUnreferencedResources::Auto {
-            for path in distinct {
-                let fname = pages_progress_filename(path);
-                message.push_str(&format!(
-                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-                ));
-            }
-        }
-        logger_info(message)?;
-    }
-
-    if verbose {
-        let mut message = String::from("flpdf: removing unreferenced pages from primary input\n");
-        for spec in inputs {
-            message.push_str(&format!(
-                "flpdf: adding pages from {}\n",
-                pages_progress_filename(&spec.path)
-            ));
-        }
-        logger_info(message)?;
-    }
+    job.report_page_spec_selection(&specs)?;
 
     let collate = parse_collate_values(&page_ops.collate)?;
     let mut sources = vec![pdf];
@@ -6377,7 +6271,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             linearize_pass1,
         )?;
         if verbose && announce_file {
-            logger_info(wrote_file_message("flpdf", output))?;
+            logger_info(wrote_file_message(&progname(), output))?;
         }
     }
     finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
@@ -6629,7 +6523,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             linearize_pass1,
         )?;
         if verbose && announce_file {
-            logger_info(wrote_file_message("flpdf", output))?;
+            logger_info(wrote_file_message(&progname(), output))?;
         }
     }
     finish_operation_warnings(&pdf, creates_output)

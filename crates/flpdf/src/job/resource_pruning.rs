@@ -48,6 +48,33 @@ pub(crate) enum SharedResourceFinding {
     XObject { node: ObjectRef, xobject: ObjectRef },
 }
 
+/// Format the first finding from qpdf's Auto shared-resource heuristic.
+///
+/// The finding is intentionally emitted without a job prefix: qpdf's
+/// `doIfVerbose` callback writes these indented continuation lines directly to
+/// the info pipeline (`libqpdf/QPDFJob.cc:2288-2320`). The owning
+/// [`QPDFJob`](super::QPDFJob) adds the prefix only to the surrounding
+/// source/checking and completion messages.
+pub(crate) fn shared_resource_finding_message(finding: SharedResourceFinding) -> Vec<u8> {
+    match finding {
+        SharedResourceFinding::NonLeaf { node } => format!(
+            "  found resources in non-leaf page node {} {}\n",
+            node.number, node.generation
+        )
+        .into_bytes(),
+        SharedResourceFinding::Resources { node, resources } => format!(
+            "  found shared resources in leaf node {} {}: {} {}\n",
+            node.number, node.generation, resources.number, resources.generation
+        )
+        .into_bytes(),
+        SharedResourceFinding::XObject { node, xobject } => format!(
+            "  found shared xobject in leaf node {} {}: {} {}\n",
+            node.number, node.generation, xobject.number, xobject.generation
+        )
+        .into_bytes(),
+    }
+}
+
 /// Decide whether qpdf's `--pages` Auto mode should run page-level resource
 /// pruning for this source document.
 ///

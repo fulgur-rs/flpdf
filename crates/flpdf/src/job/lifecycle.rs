@@ -1427,6 +1427,16 @@ impl QPDFJob {
         self.configuration.progress = value;
     }
 
+    /// Enable qpdf's verbose job diagnostics.
+    ///
+    /// Corresponds to `QPDFJob::Config::verbose` (`libqpdf/QPDFJob_config.cc:
+    /// 637-645`). The setting is consumed by the canonical page-spec and
+    /// writer routes, while the logger and message prefix remain owned by this
+    /// job.
+    pub fn set_verbose(&mut self, value: bool) {
+        self.configuration.verbose = value;
+    }
+
     /// Set qpdf's explicit secondary-source file lifetime policy.
     ///
     /// `false` selects the close-and-reopen source path used by qpdf when a
@@ -1462,6 +1472,48 @@ impl QPDFJob {
                     .keep_files_open_threshold
                     .unwrap_or(DEFAULT_KEEP_FILES_OPEN_THRESHOLD)
         })
+    }
+
+    /// Emit qpdf's automatic keep-open selection line for a page-spec job.
+    ///
+    /// qpdf reports this before opening foreign page sources and only when the
+    /// caller did not explicitly configure `--keep-files-open`
+    /// (`libqpdf/QPDFJob.cc:2374-2386`).
+    pub fn report_page_spec_selection(&self, specs: &[PageSpecInput]) -> Result<()> {
+        if !self.configuration.verbose || self.configuration.keep_files_open.is_some() {
+            return Ok(());
+        }
+        let mut message = self.message_prefix.as_bytes().to_vec();
+        message.extend_from_slice(b": selecting --keep-open-files=");
+        message.extend_from_slice(if self.keep_files_open_for_page_specs(specs) {
+            b"y\n"
+        } else {
+            b"n\n"
+        });
+        self.logger.info(message)
+    }
+
+    /// Emit qpdf's foreign-source processing line while a page source is
+    /// opened by the surrounding page-spec caller.
+    ///
+    /// `QPDFJob::handlePageSpecs` owns this diagnostic in qpdf, but the Rust
+    /// caller supplies already-opened `Pdf` values to the canonical job
+    /// method. Keeping this small facade on `QPDFJob` preserves the same
+    /// logger/prefix and raw filename boundary without a CLI-owned template.
+    pub fn report_page_source_processing(&self, source_name: impl AsRef<[u8]>) -> Result<()> {
+        if !self.configuration.verbose {
+            return Ok(());
+        }
+        let mut message = self.message_prefix.as_bytes().to_vec();
+        message.extend_from_slice(b": processing ");
+        message.extend_from_slice(source_name.as_ref());
+        message.push(b'\n');
+        self.logger.info(message)
+    }
+
+    /// Whether this job's qpdf verbose setting is enabled.
+    pub(crate) fn verbose(&self) -> bool {
+        self.configuration.verbose
     }
 
     /// Include the derived encryption key in check/show-encryption output.
@@ -2724,7 +2776,9 @@ impl QPDFJob {
                 specs.push(PageSpecInput::new(source_index, page.range.clone()));
             }
             let keep_files_open = self.keep_files_open_for_page_specs(&specs);
+            self.report_page_spec_selection(&specs)?;
             for (path, password) in source_paths.iter().zip(source_passwords.iter()) {
+                self.report_page_source_processing(path_description_bytes(path))?;
                 let source = self.open_job_source(path, password)?;
                 if !keep_files_open {
                     // qpdf calls ClosedFileInputSource::stayOpen(false)
@@ -3817,6 +3871,12 @@ impl QPDFJobConfig<'_> {
     /// Request qpdf writer progress reporting.
     pub fn progress(&mut self) -> &mut Self {
         self.job.set_progress(true);
+        self
+    }
+
+    /// Enable qpdf verbose diagnostics.
+    pub fn verbose(&mut self) -> &mut Self {
+        self.job.set_verbose(true);
         self
     }
 
