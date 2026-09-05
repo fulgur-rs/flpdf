@@ -752,8 +752,7 @@ mod tests {
                 ..WriterOptions::default()
             };
             let error = write_linearized(&plan, &renumber, &mut pdf2, &options)
-                .err()
-                .expect("deterministic ID with encryption must fail");
+                .expect_err("deterministic ID with encryption must fail");
             assert!(
                 matches!(error, crate::Error::Internal(ref message) if message.starts_with(expected)),
                 "static_id={static_id}: got {error:?}"
