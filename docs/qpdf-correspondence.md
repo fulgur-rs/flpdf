@@ -1248,6 +1248,18 @@ target 側で再構築する。
 `page_merge_tests.rs::merge_preserves_primary_catalog_and_trailer_metadata` と
 CLI の qpdf 11.9.0 differential test、および fixture の live probe で確認する。
 
+`.d499` では、同じ fresh target への変換が線形化時の part 6 の object order を
+失わせないようにした。qpdf は primary を元の `QPDFObjGen` のまま保持し、foreign
+page の graph は `copyForeignObject` の discovery 順で新しい object number を割り当て、
+`calculateLinearizationData` の first-page private/shared 集合を `std::set<QPDFObjGen>`
+で並べる（`QPDF.cc:2019-2213`; `QPDF_linearization.cc:963-1024,1188-1211`）。
+flpdf の `job/page_merge.rs` はこの primary source order と foreign allocation order を
+内部の linearization provenance として target object に対応付け、`linearization/plan.rs`
+の part 2/3 の sort key だけへ渡す。通常の merge/writer の object allocation と出力順は
+変更しない。qpdf 11.9.0 の `three-page.pdf` + `one-page.pdf` に対する
+`--static-id --stream-data=uncompress --linearize --pages` の全出力 bytes を比較する
+`cli_linearize_multi_source_qpdf.rs` でこの境界を固定する。
+
 ### C. qpdf に機能そのものが無いもの
 
 | flpdf | 行 | 備考 |

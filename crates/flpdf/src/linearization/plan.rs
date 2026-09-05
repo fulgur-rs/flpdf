@@ -663,7 +663,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                 // Sort by original object number: qpdf assigns first-page slots in
                 // ascending original-number order regardless of dict key alphabetical
                 // order (empirically verified; see discriminator-fixture analysis).
-                refs_raw.sort_by_key(|(r, _)| r.number);
+                refs_raw.sort_by_key(|(r, _)| pdf.linearization_object_order_key(*r));
                 for (r, va) in refs_raw {
                     if !visited.contains(&r) {
                         queue.push_back((r, va));
@@ -686,7 +686,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
             // Same number-ordering rule as the page-dict loop above: qpdf enqueues
             // a non-page object's children in ascending original-object-number order,
             // not in dict-key (alphabetical) order.
-            refs.sort_by_key(|(r, _)| r.number);
+            refs.sort_by_key(|(r, _)| pdf.linearization_object_order_key(*r));
             for (r, va) in refs {
                 if !visited.contains(&r) {
                     queue.push_back((r, va));
@@ -703,8 +703,12 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
     // (b) Page(orig 10) with Content(orig 3) → Page stays first despite having a
     //     higher original number, so a fully-global sort would misplace it.
     // Sorting only order[1..] satisfies both invariants simultaneously.
+    // A multi-source page-selection target carries qpdf's source/discovery
+    // order separately from its fresh references (see
+    // `Pdf::linearization_object_order_key`); ordinary documents resolve to
+    // the same ascending original-number order as before.
     if order.len() > 1 {
-        order[1..].sort_by_key(|r| r.number);
+        order[1..].sort_by_key(|r| pdf.linearization_object_order_key(*r));
     }
     // Deferred resurrectable refs: now that the full BFS is complete and
     // seen_as_array is exhaustive, admit those that turn out to be reachable
@@ -1377,22 +1381,25 @@ impl LinearizationPlan {
                 part2_objects.push(*obj_ref);
             }
         }
-        // qpdf packs first-half shared objects in ascending source object number
-        // order (observed against qpdf 11.9.0: ObjStm member ordering matches
-        // source number order, not the BFS discovery order which follows dict key
-        // alphabetical order). Mirror the same sort used in `fold_pages_tree_into_first_half`.
-        part3_objects.sort_unstable_by_key(|r| r.number);
+        // qpdf packs first-half shared objects in the source/discovery order
+        // assigned by the input document. A page-selection merge records that
+        // order separately because its fresh target references no longer carry
+        // the primary source's object numbers; ordinary parsed documents fall
+        // back to their live references. This is also the order used by qpdf's
+        // `std::set<QPDFObjGen>` part-6 packing after the primary/foreign
+        // provenance has been accounted for.
+        part3_objects.sort_unstable_by_key(|r| pdf.linearization_object_order_key(*r));
         // qpdf numbers the first-page section (qpdf part6) as: the first-page
         // object first, then the remaining first-page-private objects in
-        // ascending source object number order — NOT compute_closure's
-        // /Resources-DFS discovery order, which only coincides when resource
-        // streams are numbered below the page's content stream. Pin the page
-        // dict first (qpdf pushes the first-page object explicitly) and sort the
-        // rest by source number. Oracle: qpdf 11.9.0 on a 1-page image fixture
-        // orders Page, Contents, Image when Contents < Image by source number
-        // (and Page, Image, Contents when Image < Contents), in both generate
-        // and disable mode.
-        part2_objects.sort_unstable_by_key(|r| (Some(*r) != first_page_ref, r.number));
+        // source/discovery order. Pin the page dict first (qpdf pushes the
+        // first-page object explicitly), then apply that order key rather than
+        // the fresh merge target's allocation number.
+        part2_objects.sort_unstable_by_key(|r| {
+            (
+                Some(*r) != first_page_ref,
+                pdf.linearization_object_order_key(*r),
+            )
+        });
 
         // ----------------------------------------------------------------
         // Step 6: build Part 4 by removing Part 2 and Part 3 objects.

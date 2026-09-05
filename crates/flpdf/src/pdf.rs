@@ -24,6 +24,42 @@ pub(crate) struct CompressedMemberProvenance {
     pub(crate) source_index: u32,
 }
 
+/// Ordering key for objects that were imported into a fresh merge target.
+///
+/// qpdf keeps the primary input's objects in their original object-number
+/// space while `QPDF::copyForeignObject` allocates later-source objects in the
+/// destination's discovery order. A fresh flpdf merge necessarily gives both
+/// kinds of objects new local references, so the linearization planner carries
+/// this qpdf ordering separately from those references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LinearizationObjectOrderKey {
+    group: u8,
+    object_ref: ObjectRef,
+}
+
+impl LinearizationObjectOrderKey {
+    pub(crate) const fn primary(object_ref: ObjectRef) -> Self {
+        Self {
+            group: 0,
+            object_ref,
+        }
+    }
+
+    pub(crate) const fn foreign(object_ref: ObjectRef) -> Self {
+        Self {
+            group: 1,
+            object_ref,
+        }
+    }
+
+    pub(crate) const fn fresh(object_ref: ObjectRef) -> Self {
+        Self {
+            group: 2,
+            object_ref,
+        }
+    }
+}
+
 /// Lazily parsed PDF document handle.
 ///
 /// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
@@ -104,6 +140,12 @@ pub struct Pdf<R: Read + Seek + 'static> {
     // thread-safe for concurrent access to one document.
     /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
     pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
+    /// qpdf's original-object order for objects copied while building a
+    /// multi-source page-selection target. `None` means this is an ordinary
+    /// parsed document, for which the live object reference is already the
+    /// source order. `Some` also distinguishes merge-created objects, which
+    /// retain their target allocation order as a fallback.
+    pub(crate) linearization_object_order: Option<BTreeMap<ObjectRef, LinearizationObjectOrderKey>>,
     /// qpdf's `m->object_copiers[source unique_id].visiting` equivalent
     /// (`include/qpdf/QPDF.hh:891-897`). qpdf never rolls back
     /// `ObjCopier::object_map`/`visiting` when `copyForeignObject` fails
@@ -208,6 +250,31 @@ impl<R: Read + Seek> Drop for Pdf<R> {
 }
 
 impl<R: Read + Seek> Pdf<R> {
+    /// Return the qpdf-equivalent source/discovery order used by the
+    /// linearization planner. Ordinary parsed documents use their source
+    /// object references directly; fresh merge targets use the provenance
+    /// recorded by the page-selection copier and place later-created objects
+    /// after imported objects.
+    pub(crate) fn linearization_object_order_key(
+        &self,
+        object_ref: ObjectRef,
+    ) -> LinearizationObjectOrderKey {
+        match &self.linearization_object_order {
+            Some(order) => order
+                .get(&object_ref)
+                .copied()
+                .unwrap_or_else(|| LinearizationObjectOrderKey::fresh(object_ref)),
+            None => LinearizationObjectOrderKey::primary(object_ref),
+        }
+    }
+
+    pub(crate) fn set_linearization_object_order(
+        &mut self,
+        order: BTreeMap<ObjectRef, LinearizationObjectOrderKey>,
+    ) {
+        self.linearization_object_order = Some(order);
+    }
+
     /// Close the current qpdf input source while retaining the document's
     /// already-parsed object graph.
     ///
@@ -455,5 +522,37 @@ impl<R: Read + Seek> Pdf<R> {
     /// Enable or disable qpdf's enhanced root checks for a document check.
     pub(crate) fn set_check_mode(&mut self, enabled: bool) {
         self.check_mode = enabled;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinearizationObjectOrderKey, Pdf};
+    use crate::ObjectRef;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn linearization_order_uses_source_mapped_and_fresh_keys() {
+        let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
+        let source_ref = ObjectRef::new(3, 0);
+        assert_eq!(
+            pdf.linearization_object_order_key(source_ref),
+            LinearizationObjectOrderKey::primary(source_ref)
+        );
+
+        let mapped_ref = ObjectRef::new(7, 0);
+        let mut order = BTreeMap::new();
+        order.insert(mapped_ref, LinearizationObjectOrderKey::foreign(mapped_ref));
+        pdf.set_linearization_object_order(order);
+        assert_eq!(
+            pdf.linearization_object_order_key(mapped_ref),
+            LinearizationObjectOrderKey::foreign(mapped_ref)
+        );
+
+        let fresh_ref = ObjectRef::new(11, 0);
+        assert_eq!(
+            pdf.linearization_object_order_key(fresh_ref),
+            LinearizationObjectOrderKey::fresh(fresh_ref)
+        );
     }
 }
