@@ -301,10 +301,10 @@ fn append_objstm_container_object<R: Read + Seek>(
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
     removed_refs: &BTreeSet<ObjectRef>,
-    filtered: bool,
-    newline_before_endstream: NewlineBeforeEndstream,
+    options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<usize> {
+    let filtered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
     let map = |object_ref| {
         renumber.new_for_original(object_ref).ok_or_else(|| {
             crate::Error::Unsupported(format!(
@@ -382,14 +382,18 @@ fn append_objstm_container_object<R: Read + Seek>(
         crate::writer::write_stream_payload_with_pipeline(
             bytes,
             &data,
-            newline_before_endstream,
+            options.newline_before_endstream,
             object_ref,
             ctx,
             true,
             None,
         )?;
     } else {
-        crate::writer::serialize::write_stream_payload(bytes, &data, newline_before_endstream);
+        crate::writer::serialize::write_stream_payload(
+            bytes,
+            &data,
+            options.newline_before_endstream,
+        );
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -2327,8 +2331,7 @@ fn do_write_pass<R: Read + Seek>(
             renumber,
             pdf,
             &plan.removed_refs,
-            structural_streams_filtered,
-            options.newline_before_endstream,
+            options,
             encrypt_ctx,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
@@ -2457,8 +2460,7 @@ fn do_write_pass<R: Read + Seek>(
                     renumber,
                     pdf,
                     &plan.removed_refs,
-                    structural_streams_filtered,
-                    options.newline_before_endstream,
+                    options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
@@ -2555,8 +2557,7 @@ fn do_write_pass<R: Read + Seek>(
                     renumber,
                     pdf,
                     &plan.removed_refs,
-                    structural_streams_filtered,
-                    options.newline_before_endstream,
+                    options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
