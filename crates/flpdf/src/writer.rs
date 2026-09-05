@@ -3976,17 +3976,18 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // does not produce linearized output, so only output encryption applies.
     object_streams::filter_objstm_batches_for_output(pdf, &mut plan.batches, false, encrypting)?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
 
-    // qpdf's non-linearized standard writer assigns ObjStm numbers during the
-    // normal enqueue walk even when output encryption is enabled. The legacy
-    // coordinator historically used a Catalog-first map followed by
-    // containers-above-max; keep that route only for modes whose qpdf contract
-    // does not use source-backed or generated container-first placement.
-    let qpdf_generate_encrypted = encrypting
-        && !options.qdf
+    // qpdf's non-linearized standard writer assigns generated ObjStm numbers
+    // during the normal enqueue walk. This applies to a source-encrypted PDF
+    // that is being decrypted just as it does to output-encrypted PDFs. The
+    // legacy coordinator historically used a Catalog-first map followed by
+    // containers-above-max; route every specialized non-QDF Generate rewrite
+    // through the qpdf ObjStm-aware numbering instead
+    // (`QPDFWriter.cc:1057-1118`).
+    let qpdf_generate_standard = !options.qdf
         && options.object_streams == ObjectStreamMode::Generate
         && !plan.batches.is_empty();
     let mut qpdf_generate_removed_refs = removed_refs.clone();
-    if qpdf_generate_encrypted {
+    if qpdf_generate_standard {
         qpdf_generate_removed_refs.extend(plan.removed_refs.iter().copied());
     }
 
@@ -4081,7 +4082,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
     }
 
-    if (options.qdf || qpdf_generate_encrypted || qpdf_preserve_source_objstm)
+    if (options.qdf || qpdf_generate_standard || qpdf_preserve_source_objstm)
         && !plan.batches.is_empty()
     {
         // QPDFWriter's reverse object-stream map is a std::set<QPDFObjGen>, so
@@ -4099,7 +4100,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
     // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
     // Drive emission from the qpdf enqueue order: `(new_ref, old_ref)` pairs in
-    // ascending reservation order. QDF, encrypted non-QDF Generate, and
+    // ascending reservation order. QDF, specialized non-QDF Generate, and
     // non-QDF source-backed Preserve all use the ObjStm-aware walk; other
     // specialized routes retain Catalog-first numbering.
     use crate::writer::object_streams::ObjectStreamGroup;
@@ -4136,10 +4137,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             .collect::<Vec<_>>()
     };
     let object_stream_renumber = if (options.qdf && !plan.batches.is_empty())
-        || qpdf_generate_encrypted
+        || qpdf_generate_standard
         || qpdf_preserve_source_objstm
     {
-        let numbering_removed_refs = if qpdf_generate_encrypted {
+        let numbering_removed_refs = if qpdf_generate_standard {
             &qpdf_generate_removed_refs
         } else {
             &removed_refs
@@ -4169,8 +4170,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         .unwrap_or(&renumber);
 
     // The new /Root reference is looked up after selecting the final numbering
-    // route. In encrypted Generate mode the Catalog remains outside ObjStm,
-    // but the surrounding object numbers can be reserved by a container first.
+    // route. Output encryption keeps the Catalog outside ObjStm, while a
+    // decrypted source may compress it; either way surrounding object numbers
+    // can be reserved by a container first.
     let new_root = root_ref.and_then(|root_ref| renumber_lookup.new_for_original(root_ref));
     if root_ref.is_some() && new_root.is_none() {
         // cov:ignore-start: every canonical numbering route seeds the live
@@ -4195,7 +4197,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         } else {
             vec![ObjectRef::new(0, 0); plan.batches.len()]
         }
-    } else if qpdf_generate_encrypted || qpdf_preserve_source_objstm {
+    } else if qpdf_generate_standard || qpdf_preserve_source_objstm {
         let refs = (0..plan.batches.len())
             .map(|group_index| {
                 object_stream_renumber
@@ -4208,7 +4210,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // cov:ignore-start: every filtered encrypted group is reachable by
             // the same canonical walk that assigned its members.
             crate::Error::Internal(
-                "encrypted ObjStm group was not assigned a container number".to_string(),
+                "generated ObjStm group was not assigned a container number".to_string(),
             )
             // cov:ignore-end
         })? // cov:ignore: the canonical walk assigns every emitted Generate group
@@ -4229,9 +4231,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     };
 
     // For compact output this is the highest body object number, including
-    // interspersed synthetic containers. qpdf allocates /Encrypt lazily after
-    // the body queue, so it must follow this number rather than the old
-    // Catalog-first count.
+    // interspersed synthetic containers. When output encryption is enabled,
+    // qpdf allocates /Encrypt lazily after the body queue, so it must follow
+    // this number rather than the old Catalog-first count.
     let compact_body_max = renumbered
         .iter()
         .map(|(new_ref, _)| new_ref.number)
@@ -4286,7 +4288,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     //
     // `skip_refs` is also declared here (before the pre-scan) because the
     // pre-scan applies the same skip conditions as the main loop.
-    let skip_refs = if qpdf_generate_encrypted {
+    let skip_refs = if qpdf_generate_standard {
         &qpdf_generate_removed_refs
     } else {
         &removed_refs
@@ -4594,7 +4596,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
     let qdf_body_start = bytes.len();
     let merge_objstm_chunks = (options.qdf && !plan.batches.is_empty())
-        || qpdf_generate_encrypted
+        || qpdf_generate_standard
         || qpdf_preserve_source_objstm;
     let mut qdf_main_chunks = BTreeMap::<ObjectRef, (usize, usize)>::new();
     let mut qdf_container_chunks = BTreeMap::<usize, (usize, usize)>::new();

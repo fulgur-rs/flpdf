@@ -722,6 +722,40 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
     );
 }
 
+/// qpdf assigns the generated ObjStm container before the ordinary objects
+/// even when the source was encrypted and the output is decrypted. The
+/// source encryption state must not route this standard Generate rewrite
+/// through the catalog-first legacy placement.
+#[test]
+fn decrypting_encrypted_source_generate_uses_container_first_numbering() {
+    let input = fixture("tests/fixtures/compat/one-page-enc-u.pdf");
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(input),
+        PdfOpenOptions {
+            password: b"u".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open encrypted source");
+    let options = WriterTestSettings {
+        static_id: true,
+        object_streams: ObjectStreamMode::Generate,
+        preserve_encryption: false,
+        ..WriterTestSettings::default()
+    };
+    let bytes = {
+        let mut output = Vec::new();
+        write_with_settings(&mut pdf, &mut output, &options).expect("decrypt and generate");
+        output
+    };
+
+    assert_eq!(
+        object_number_before_marker(&bytes, b"/Type /ObjStm"),
+        1,
+        "qpdf assigns the generated ObjStm before ordinary objects for decrypted encrypted input"
+    );
+}
+
 /// Keep the existing QDF encrypted ObjStm serializer covered while the
 /// non-QDF Generate route adopts qpdf's container-first numbering.
 #[test]
