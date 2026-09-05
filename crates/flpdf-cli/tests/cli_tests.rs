@@ -1666,6 +1666,37 @@ fn top_level_add_attachment_normalization_preserves_warning_completion() {
 }
 
 #[test]
+fn top_level_add_attachment_no_warn_suppresses_normalization_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let attachment = temp.path().join("attachment.bin");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    std::fs::write(&attachment, b"payload").unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--no-warn", "--normalize-content=y", "--compress-streams=n"])
+        .arg("--add-attachment")
+        .arg(&attachment)
+        .arg("--")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(
+        output.exists(),
+        "warning exit must retain attachment output"
+    );
+    assert!(
+        result.stderr.is_empty(),
+        "--no-warn must suppress warning text"
+    );
+}
+
+#[test]
 fn top_level_linearize_accepts_compress_streams_and_pass1() {
     // Mirrors the COMMAND from upstream qpdf's linearize-pass1.test:
     //   qpdf --linearize --static-id --compress-streams=n \
