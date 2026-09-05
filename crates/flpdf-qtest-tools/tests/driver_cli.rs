@@ -925,9 +925,10 @@ fn test_55_writes_two_form_xobjects_per_page_with_qpdf_variants() {
 
     let output_bytes = fs::read(directory.path().join("a.pdf"))
         .expect("test 55 must write the qpdf-shaped output");
+    assert!(output_bytes.starts_with(b"%PDF-1.3\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n"));
     assert!(output_bytes
-        .windows(b"%QDF-1.0".len())
-        .any(|window| window == b"%QDF-1.0"));
+        .windows(b"<31415926535897932384626433832795>".len())
+        .any(|window| window == b"<31415926535897932384626433832795>"));
 
     let mut output = Pdf::open_mem_owned_with_options(
         output_bytes,
@@ -941,10 +942,11 @@ fn test_55_writes_two_form_xobjects_per_page_with_qpdf_variants() {
         .get_all_pages()
         .expect("enumerate output pages")
         .len();
+    assert_eq!(page_count, 16);
     let qtest = output.trailer_key_handle(b"QTest");
     output.resolve(&qtest).expect("resolve /QTest");
     let entries = qtest.as_array().expect("/QTest must be an array");
-    assert_eq!(entries.len(), page_count * 2);
+    assert_eq!(entries.len(), 32);
 
     let mut transformed_pages = 0;
     for pair in entries.chunks_exact(2) {
@@ -977,11 +979,12 @@ fn test_55_writes_two_form_xobjects_per_page_with_qpdf_variants() {
             .expect("resolve untransformed Form XObject matrix");
         assert!(untransformed_matrix.is_null());
     }
-    assert!(transformed_pages > 0);
+    assert_eq!(transformed_pages, 13);
 
     let id = output.trailer_key_handle(b"ID");
     output.resolve(&id).expect("resolve static /ID");
-    assert_eq!(id.as_array().expect("/ID must be an array").len(), 2);
+    let id_entries = id.as_array().expect("/ID must be an array");
+    assert_eq!(id_entries.len(), 2);
 }
 
 #[test]

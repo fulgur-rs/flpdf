@@ -585,24 +585,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
         dict.replace_key(b"/BBox", bbox)?;
 
-        if handle_transformations {
-            let rotate = self.get_attribute(b"/Rotate", false)?;
-            let user_unit = self.get_attribute(b"/UserUnit", false)?;
-            if !rotate.is_null() || !user_unit.is_null() {
-                let matrix = self.get_matrix_for_transformations(false)?;
-                dict.replace_key(
-                    b"/Matrix",
-                    ObjectHandle::array(
-                        matrix
-                            .get_as_matrix()
-                            .into_iter()
-                            .map(ObjectHandle::real)
-                            .collect(),
-                    ),
-                )?; // cov:ignore: canonical Matrix construction and dictionary replacement cannot fail after new_stream allocation
-            }
-        }
-
+        // qpdf installs the lazy provider before reading the transformation
+        // attributes (`QPDFPageObjectHelper.cc:716-729`). Both attributes are
+        // read even when `handle_transformations` is false; only matrix
+        // insertion is conditional.
         form.replace_stream_data_with_callback(
             move |pipeline| {
                 let mut all_description = String::new();
@@ -615,6 +601,23 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             None,
             None,
         )?; // cov:ignore: the provider closure is built from canonical page contents; this is only its defensive setup error edge
+
+        let rotate = self.get_attribute(b"/Rotate", false)?;
+        let user_unit = self.get_attribute(b"/UserUnit", false)?;
+        if handle_transformations && (!rotate.is_null() || !user_unit.is_null()) {
+            let matrix = self.get_matrix_for_transformations(false)?;
+            dict.replace_key(
+                b"/Matrix",
+                ObjectHandle::array(
+                    matrix
+                        .get_as_matrix()
+                        .into_iter()
+                        .map(ObjectHandle::real)
+                        .collect(),
+                ),
+            )?; // cov:ignore: canonical Matrix construction and dictionary replacement cannot fail after new_stream allocation
+        }
+
         self.pdf.mark_object_handle_dirty(&form)?;
         Ok(form)
     }
@@ -2419,6 +2422,44 @@ mod tests {
             .get_media_box(false)
             .expect("the 100th ancestor's /MediaBox must be reachable");
         assert!(!media_box.try_is_null().expect("resolved handle"));
+    }
+
+    #[test]
+    fn form_xobject_without_transformations_resolves_transform_attributes() {
+        // qpdf reads /Rotate and /UserUnit before checking whether the
+        // transformation matrix should be installed
+        // (QPDFPageObjectHelper.cc:722-729). A dangling /Rotate reference
+        // therefore still records its resolution warning for the false
+        // variant.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned(),
+                ),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Rotate 99 0 R /UserUnit 100 0 R >>".to_owned(),
+                ),
+                (4, "<< /Length 0 >>\nstream\n\nendstream".to_owned()),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let form = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf)
+            .get_form_xobject_for_page(false)
+            .expect("false transformation variant should still create a Form XObject");
+
+        assert!(form.is_form_xobject().expect("classify Form XObject"));
+        let rotate = pdf.get_object_handle(ObjectRef::new(99, 0));
+        assert!(rotate.is_resolved(), "false variant must resolve /Rotate");
+        let user_unit = pdf.get_object_handle(ObjectRef::new(100, 0));
+        assert!(
+            user_unit.is_resolved(),
+            "false variant must resolve /UserUnit"
+        );
     }
 
     #[test]

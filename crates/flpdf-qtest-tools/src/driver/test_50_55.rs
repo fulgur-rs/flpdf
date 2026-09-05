@@ -437,14 +437,20 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     // (`libqpdf/QPDFPageObjectHelper.cc:706-733`).
     let qtest = ObjectHandle::array(Vec::new());
     for page_ref in pages {
-        let (transformed, untransformed) = {
+        let transformed = {
             let mut page = PageObjectHelper::new(page_ref, pdf);
-            (
-                page.get_form_xobject_for_page(true)?,
-                page.get_form_xobject_for_page(false)?,
-            )
+            page.get_form_xobject_for_page(true)
         };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let transformed = transformed?;
         qtest.append_array_item(transformed)?;
+
+        let untransformed = {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            page.get_form_xobject_for_page(false)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let untransformed = untransformed?;
         qtest.append_array_item(untransformed)?;
     }
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -460,8 +466,10 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     writer.set_output_file("a.pdf")?;
     writer.set_qdf_mode(true);
     writer.set_static_id(true);
-    writer.write()?;
+    let write_result = writer.write();
+    drop(writer);
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    write_result?;
     Ok(())
 }
 
