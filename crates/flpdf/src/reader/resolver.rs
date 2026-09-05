@@ -226,6 +226,16 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
                 Err(error) => return Err(error.into()),
             }
         }
+        if filled == 0 && !buf.is_empty() {
+            // qpdf FileInputSource::read moves the cursor and last_offset to
+            // the physical source end after a zero-byte read at EOF
+            // (libqpdf/FileInputSource.cc:115-132). A seekable Rust reader
+            // may retain an attempted position beyond EOF, so reproduce that
+            // observable InputSource contract explicitly.
+            let end = reader.seek(SeekFrom::End(0))?;
+            self.last_offset
+                .set(end.saturating_sub(self.header_offset as u64));
+        }
         Ok(filled)
     }
 
@@ -514,6 +524,40 @@ fn route_warning(
     line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
     logger.warn(line)
+}
+
+/// Format the byte-preserving `QPDFExc::what()` shape for an input-source
+/// warning with an explicit object description (`QPDFExc.cc:19-50`).
+fn format_input_warning_what(
+    filename: &[u8],
+    object: &[u8],
+    offset: u64,
+    message: &[u8],
+) -> Vec<u8> {
+    let mut result = filename.to_vec();
+    if !(object.is_empty() && offset == 0) {
+        if !filename.is_empty() {
+            result.extend_from_slice(b" (");
+        }
+        if !object.is_empty() {
+            result.extend_from_slice(object);
+            if offset > 0 {
+                result.extend_from_slice(b", ");
+            }
+        }
+        if offset > 0 {
+            result.extend_from_slice(b"offset ");
+            result.extend_from_slice(offset.to_string().as_bytes());
+        }
+        if !filename.is_empty() {
+            result.push(b')');
+        }
+    }
+    if !result.is_empty() {
+        result.extend_from_slice(b": ");
+    }
+    result.extend_from_slice(message);
+    result
 }
 
 fn route_object_warning(
@@ -1255,6 +1299,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
         description
     }
 
+    fn parser_description_template_for_read(
+        &self,
+        object_ref: ObjectRef,
+        read_description: &[u8],
+    ) -> Vec<u8> {
+        let core = self.core.borrow();
+        let mut description = core.description.clone();
+        description.extend_from_slice(b", ");
+        description.extend_from_slice(read_description);
+        description.extend_from_slice(
+            format!(
+                ": object {} {} at offset $PO",
+                object_ref.number, object_ref.generation
+            )
+            .as_bytes(),
+        );
+        description
+    }
+
     pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> Vec<u8> {
         let core = self.core.borrow();
         let mut description = core.description.clone();
@@ -1667,7 +1730,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Some(XrefEntry::Uncompressed { offset: new_offset }) => {
                 // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
                 // any parse failure propagates as an exception (Err here).
-                self.read_object_at_offset_with_description(new_offset, object_ref, true, false)
+                self.read_object_at_offset_with_description(
+                    new_offset,
+                    object_ref,
+                    true,
+                    false,
+                    None,
+                )
                     .map(Some)
                     .map_err(ReadObjectAtOffsetError::into_error)
             }
@@ -2858,16 +2927,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// that skipped prefix rather than the attempted-read position.
     fn read_token_from_input(&self) -> Result<(Token, u64)> {
         let start = self.tell()?;
-        self.scan_forward(|bytes| {
+        let token = self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
             tokenizer.allow_eof();
             let token = tokenizer.read_token(true, 0)?;
             Ok((token, tokenizer.position()))
-        })
-        .map(|token| {
-            let token_start = start.saturating_add(token.start as u64);
-            (token, token_start)
-        })
+        })?;
+        let token_start = if token.token_type == TokenType::Eof {
+            // FileInputSource::read records the physical source end after a
+            // zero-byte read, even when the preceding seek requested a
+            // position beyond EOF (libqpdf/FileInputSource.cc:115-132).
+            let eof = self.last_offset();
+            self.seek(eof)?;
+            eof
+        } else {
+            start.saturating_add(token.start as u64)
+        };
+        Ok((token, token_start))
     }
 
     /// Read one byte from the current position, or `None` at EOF.
@@ -2924,7 +3000,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         expected: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
         let parsed = self
-            .read_object_at_offset_with_description(offset, expected, false, false)
+            .read_object_at_offset_with_description(offset, expected, false, false, None)
             .map_err(ReadObjectAtOffsetError::into_error)?;
         Ok((parsed.value, parsed.parsed_offset))
     }
@@ -2943,9 +3019,37 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         expected: ObjectRef,
     ) -> Result<(ObjectHandle, Option<u64>)> {
+        self.resolve_at_offset_with_optional_description(offset, expected, None)
+    }
+
+    /// Read an object at a physical offset using qpdf's caller-provided
+    /// description. `QPDF::readHintStream` supplies `linearization hint
+    /// stream` to `readObjectAtOffset`, so stream framing and recovery warnings
+    /// must retain that description instead of falling back to `object N G`
+    /// (`libqpdf/QPDF_linearization.cc:241-245` and
+    /// `libqpdf/QPDF.cc:1297-1339`).
+    pub(crate) fn resolve_at_offset_with_description(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+        description: impl AsRef<[u8]>,
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        self.resolve_at_offset_with_optional_description(
+            offset,
+            expected,
+            Some(description.as_ref().to_vec()),
+        )
+    }
+
+    fn resolve_at_offset_with_optional_description(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+        description: Option<Vec<u8>>,
+    ) -> Result<(ObjectHandle, Option<u64>)> {
         let was_resolved = self.get_object_handle(expected).is_resolved();
         let parsed = self
-            .read_object_at_offset_with_description(offset, expected, true, false)
+            .read_object_at_offset_with_description(offset, expected, true, false, description)
             .map_err(ReadObjectAtOffsetError::into_error)?;
         let damage_offset = if was_resolved {
             parsed.trailing_start
@@ -2963,6 +3067,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         expected: ObjectRef,
         capture_end_offsets: bool,
         try_recovery: bool,
+        read_description: Option<Vec<u8>>,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
         if expected.number != 0 {
             self.set_last_object_description(expected);
@@ -3015,7 +3120,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
             let mut minter = ChildHandles {
                 resolver: self,
-                description_template: self.parser_description_template(found.unwrap_or(expected)),
+                description_template: match read_description.as_deref() {
+                    Some(description) => self.parser_description_template_for_read(
+                        found.unwrap_or(expected),
+                        description,
+                    ),
+                    None => self.parser_description_template(found.unwrap_or(expected)),
+                },
             };
             let encryption_parameters = self.encryption_parameters();
             // qpdf reads and caches the `/Encrypt` dictionary before it marks
@@ -3164,6 +3275,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     description,
                     object_header_offset,
                     found,
+                    read_description.as_deref(),
                 )
                 .map_err(ReadObjectAtOffsetError::Body)?;
             let (end_before_space, end_after_space) = if capture_end_offsets {
@@ -3255,6 +3367,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         dict_description: Vec<u8>,
         object_header_offset: u64,
         object_ref: ObjectRef,
+        read_description: Option<&[u8]>,
     ) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
 
@@ -3278,9 +3391,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(&error, object_header_offset, object_ref)?;
+                self.warn_stream_failure(
+                    &error,
+                    object_header_offset,
+                    object_ref,
+                    read_description,
+                )?;
                 recovered = true;
-                self.recover_stream_length(stream_offset, object_ref)?
+                self.recover_stream_length(stream_offset, object_ref, read_description)?
             }
             Err(error) => return Err(error),
         };
@@ -3303,8 +3421,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(&error, object_header_offset, object_ref)?;
-                length = self.recover_stream_length(stream_offset, object_ref)?;
+                self.warn_stream_failure(
+                    &error,
+                    object_header_offset,
+                    object_ref,
+                    read_description,
+                )?;
+                length = self.recover_stream_length(stream_offset, object_ref, read_description)?;
             }
         }
 
@@ -3360,6 +3483,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         error: &Error,
         object_header_offset: u64,
         object_ref: ObjectRef,
+        read_description: Option<&[u8]>,
     ) -> Result<()> {
         let Error::Parse { offset, message } = error else {
             return Ok(());
@@ -3369,7 +3493,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             object_header_offset
         };
-        self.push_stream_warning(object_ref, warning_offset, message)
+        self.push_stream_warning_with_description(
+            object_ref,
+            warning_offset,
+            message,
+            read_description,
+        )
     }
 
     /// Port qpdf's `recoverStreamLength` (`libqpdf/QPDF.cc:1482-1524`).
@@ -3383,11 +3512,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// longer word remains discoverable. For `endobj`, qpdf rewinds to the
     /// token start so the outer `readObject` consumes it; for `endstream`, it
     /// leaves the input after the token.
-    fn recover_stream_length(&self, stream_offset: u64, object_ref: ObjectRef) -> Result<usize> {
-        let warning = self.push_stream_warning(
+    fn recover_stream_length(
+        &self,
+        stream_offset: u64,
+        object_ref: ObjectRef,
+        read_description: Option<&[u8]>,
+    ) -> Result<usize> {
+        let warning = self.push_stream_warning_with_description(
             object_ref,
             stream_offset,
             "attempting to recover stream length",
+            read_description,
         );
         warning?;
 
@@ -3418,14 +3553,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         if length == 0 {
-            self.push_stream_warning(
+            self.push_stream_warning_with_description(
                 object_ref,
                 stream_offset,
                 "unable to recover stream data; treating stream as empty",
+                read_description,
             )?;
         } else {
             let message = format!("recovered stream length: {length}");
-            self.push_stream_warning(object_ref, stream_offset, message)?;
+            self.push_stream_warning_with_description(
+                object_ref,
+                stream_offset,
+                message,
+                read_description,
+            )?;
         }
         Ok(length)
     }
@@ -3506,6 +3647,45 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 message.into()
             ),
         )
+    }
+
+    /// Emit a stream warning from an offset read that supplied qpdf's own
+    /// object description. qpdf stores the complete `QPDFExc::what()` in its
+    /// warning list and writes that same value to the logger
+    /// (`libqpdf/QPDF.cc:488-504`, `QPDFExc.cc:19-50`). Keeping the complete
+    /// bytes as an object-origin diagnostic makes live delivery and deferred
+    /// job replay identical, including arbitrary input-description bytes.
+    fn push_stream_warning_with_description(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        message: impl Into<String>,
+        read_description: Option<&[u8]>,
+    ) -> Result<()> {
+        let Some(read_description) = read_description else {
+            return self.push_stream_warning(object_ref, offset, message);
+        };
+        let message = message.into();
+        let mut object_description = read_description.to_vec();
+        object_description.extend_from_slice(
+            format!(": object {} {}", object_ref.number, object_ref.generation).as_bytes(),
+        );
+        let (logger, suppress_warnings, what) = {
+            let mut core = self.core.borrow_mut();
+            let what = format_input_warning_what(
+                &core.description,
+                &object_description,
+                offset,
+                message.as_bytes(),
+            );
+            core.repair_diagnostics
+                .push(Diagnostic::object_warning_bytes(&what));
+            (core.logger.clone(), core.suppress_warnings, what)
+        };
+        if suppress_warnings {
+            return Ok(());
+        }
+        route_object_warning(&logger, false, &what)
     }
 
     /// The `PatternFinder`/`findEndstream` pair used by qpdf's
@@ -4527,6 +4707,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     object_ref,
                     true,
                     attempt_recovery,
+                    None,
                 ) {
                     Ok(parsed) => {
                         let parsed_ref = parsed.object_ref;
@@ -9299,7 +9480,7 @@ mod tests {
             let resolver = resolver_over(payload.to_vec());
             assert_eq!(
                 resolver
-                    .recover_stream_length(0, ObjectRef::new(1, 0))
+                    .recover_stream_length(0, ObjectRef::new(1, 0), None)
                     .expect("recovery without a terminator"),
                 0,
                 "payload {payload:?} must not produce a terminator"
@@ -9319,7 +9500,7 @@ mod tests {
             resolver_over_with_failing_warning(b"payload without a framing token".to_vec(), 2);
         assert!(matches!(
             resolver
-                .recover_stream_length(0, ObjectRef::new(1, 0))
+                .recover_stream_length(0, ObjectRef::new(1, 0), None)
                 .expect_err("the empty-recovery warning must reach the sink"),
             Error::System(message) if message == "sink write failure 2"
         ));
@@ -9333,6 +9514,7 @@ mod tests {
                 &Error::Unsupported("not a parse failure".to_owned()),
                 7,
                 ObjectRef::new(1, 0),
+                None,
             )
             .expect("non-parse failures do not emit stream-recovery warnings");
         assert!(resolver.repair_diagnostics().entries().is_empty());
@@ -11024,6 +11206,71 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn stream_input_read_at_or_beyond_eof_records_source_end_like_qpdf() {
+        let resolver = resolver_over(b"abc".to_vec());
+        let input = resolver.stream_input();
+        input
+            .seek(100)
+            .expect("seek beyond the source is permitted");
+
+        let mut byte = [0u8; 1];
+        assert_eq!(input.read(&mut byte).expect("read at EOF"), 0);
+        assert_eq!(input.last_offset(), 3);
+        assert_eq!(input.tell().expect("EOF position"), 3);
+    }
+
+    #[test]
+    fn offset_read_preserves_qpdf_caller_description_in_stream_warnings() {
+        let bytes = b"2 0 obj\n<< /Length 100000 >>\nstream\nabc\nendstream\nendobj\n%%EOF\n";
+        let stream_offset = bytes
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .expect("stream keyword")
+            + b"stream\n".len();
+        let recovered_length = bytes
+            .windows(b"endstream".len())
+            .position(|window| window == b"endstream")
+            .expect("endstream keyword")
+            - stream_offset;
+
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes.to_vec()),
+            0,
+            BTreeMap::from([(ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 0 })]),
+            true,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, b"input.pdf".to_vec()),
+            0,
+        );
+
+        let (handle, _) = resolver
+            .resolve_at_offset_with_description(
+                0,
+                ObjectRef::new(2, 0),
+                b"linearization hint stream",
+            )
+            .expect("qpdf's described offset read resolves");
+        assert!(handle.as_stream_dict().is_some());
+
+        let expected = format!(
+            "WARNING: input.pdf (linearization hint stream: object 2 0, offset {}): expected endstream\n\
+             WARNING: input.pdf (linearization hint stream: object 2 0, offset {}): attempting to recover stream length\n\
+             WARNING: input.pdf (linearization hint stream: object 2 0, offset {}): recovered stream length: {}\n",
+            bytes.len(), stream_offset, stream_offset, recovered_length
+        );
+        assert_eq!(
+            output.lock().expect("warning output").as_slice(),
+            expected.as_bytes()
+        );
     }
 
     /// With repair disabled, qpdf rethrows an unusable `/Length` exception
