@@ -3341,10 +3341,10 @@ fn write_linearized_impl<R: Read + Seek>(
     // QPDFWriter::copyEncryptionParameters call generateID() before the
     // linearized pass can produce deterministic ID data. Translate that
     // qpdf logic_error rather than treating the combination as an unsupported
-    // feature.
+    // feature (with a static ID, qpdf's pushMD5Pipeline fails instead).
     if options.deterministic_id && (options.encrypt.is_some() || options.copy_encryption.is_some())
     {
-        return Err(crate::writer::generate_id_without_data());
+        return Err(crate::writer::deterministic_id_encryption_error(options));
     }
 
     // `plan`/`renumber` are built from a separate `Pdf` handle opened on the

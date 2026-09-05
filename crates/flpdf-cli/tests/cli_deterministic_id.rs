@@ -267,25 +267,27 @@ fn static_and_deterministic_id_remain_incompatible_with_encryption() {
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("out.pdf");
 
-    CargoCommand::cargo_bin("flpdf")
-        .expect("flpdf binary")
-        .args([
-            "--static-id",
-            "--deterministic-id",
-            "--encrypt",
-            "u",
-            "o",
-            "256",
-            "--",
-        ])
-        .arg(&input)
-        .arg(&output)
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicate::str::contains(
-            "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID",
-        ));
+    // With `--static-id`, qpdf's encryption setup generates the static `/ID`
+    // successfully, so the failure comes from `pushMD5Pipeline`
+    // (`QPDFWriter.cc:1011-1014`) rather than `generateID`:
+    // `qpdf: Deterministic ID computation enabled after ID generation has
+    // already occurred.` (exit 2), on both the plain and linearized routes.
+    for extra in [&[][..], &["--linearize"][..]] {
+        CargoCommand::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(["--static-id", "--deterministic-id"])
+            .args(extra)
+            .args(["--encrypt", "u", "o", "256", "--"])
+            .arg(&input)
+            .arg(&output)
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "flpdf: Deterministic ID computation enabled after ID generation has already occurred.",
+            ))
+            .stderr(predicate::str::contains("generateID has no data").not());
+    }
 }
 
 #[test]

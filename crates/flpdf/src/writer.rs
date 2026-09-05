@@ -875,11 +875,13 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // installing the encryption state (QPDFWriter.cc:619 and :656). A
         // deterministic ID has no data until the writer has emitted the bytes,
         // so qpdf reports generateID's logic_error for this combination before
-        // forced-version handling can disable encryption.
+        // forced-version handling can disable encryption. With a static ID
+        // that early generateID succeeds and pushMD5Pipeline rejects the
+        // already-generated ID instead (QPDFWriter.cc:1011-1014).
         if options.deterministic_id
             && (options.encrypt.is_some() || options.copy_encryption.is_some())
         {
-            return Err(generate_id_without_data());
+            return Err(deterministic_id_encryption_error(&options));
         }
 
         if forced_version_disables_encryption(&options) {
@@ -2853,6 +2855,34 @@ pub(crate) fn generate_id_without_data() -> crate::Error {
         "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID.  This may happen if deterministic ID and file encryption are requested together."
             .to_string(),
     )
+}
+
+/// Return qpdf's `QPDFWriter::pushMD5Pipeline` logic error for a deterministic
+/// digest enabled after the writer has already generated an `/ID`.
+///
+/// With `static_id`, `generateID` (`QPDFWriter.cc:1836`) succeeds during the
+/// encryption setup and fills `id2`, so the failure moves to
+/// `pushMD5Pipeline` (`QPDFWriter.cc:1011-1014`), which rejects a non-empty
+/// `id2` with this exact message.
+pub(crate) fn deterministic_id_after_id_generation() -> crate::Error {
+    crate::Error::Internal(
+        "Deterministic ID computation enabled after ID generation has already occurred."
+            .to_string(),
+    )
+}
+
+/// Select qpdf's logic error for deterministic ID mode combined with
+/// encryption.
+///
+/// Without `static_id`, `generateID` fails first because the deterministic
+/// digest has no data yet; with `static_id`, the encryption setup generates
+/// the static `/ID` and `pushMD5Pipeline` fails afterwards instead.
+pub(crate) fn deterministic_id_encryption_error(options: &WriterOptions) -> crate::Error {
+    if options.static_id {
+        deterministic_id_after_id_generation()
+    } else {
+        generate_id_without_data()
+    }
 }
 
 /// Build the `/Info`-derived suffix of qpdf's deterministic `/ID` seed.

@@ -407,8 +407,11 @@ checks `static_id` before entering the deterministic digest branch, so both opti
 accepted and produce the same identifier as `--static-id` alone (`libqpdf/QPDFJob.cc:2879-2882`,
 `libqpdf/QPDFWriter.cc:1836-1878`). flpdf's `uses_deterministic_id` applies the same effective
 selection in the plain, PCLm, and linearized writer routes. The deterministic setting remains
-active for encryption preflight, so the deterministic-plus-encryption rejection also remains
-unchanged when `static_id` is present.
+active for encryption preflight, so deterministic-plus-encryption is still rejected when
+`static_id` is present, but with qpdf's other logic error: the static `generateID` succeeds during
+the encryption setup, and `pushMD5Pipeline` (`libqpdf/QPDFWriter.cc:1011-1014`) then fails with
+"Deterministic ID computation enabled after ID generation has already occurred." instead of the
+`generateID has no data` message (`deterministic_id_encryption_error`).
 
 `parse_pdf_version` remains the strict `PDFVersion` value parser for validated input headers. Job options use the separate qpdf-shaped raw parser: a trailing dot remains part of the header, extra components after the second dot are consumed only as the extension-level integer prefix, and non-numeric raw version text is retained. `QUtil::string_to_int` overflow is a range error, not a clamp (`QPDFJob.cc:2833-2844`, `QPDFWriter.cc:744-757`, `QUtil.cc:371-393`).
 
