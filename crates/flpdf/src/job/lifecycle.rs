@@ -2438,6 +2438,13 @@ impl QPDFJob {
     /// Create qpdf's canonical empty document through the same job document
     /// boundary as file and JSON input.
     pub fn create_empty_document(&mut self) -> Result<JobDocument> {
+        // qpdf's `Config::emptyInput` uses the empty string as the page-spec
+        // source-map key while `QPDF::emptyPDF` names the diagnostic source
+        // "empty PDF" (`libqpdf/QPDFJob_config.cc:27-38`;
+        // `libqpdf/QPDF.cc:290-293`). Keep those two qpdf values distinct so
+        // page-source ordering can use the map key without changing output
+        // text.
+        self.configuration.empty_input = true;
         // qpdf's `setQPDFOptions` (`QPDFJob.cc:651-665`) runs unconditionally
         // right after `QPDF` construction, before dispatching to empty,
         // JSON-input, or file-based creation (`QPDFJob.cc:1701-1710`), so
@@ -2459,6 +2466,24 @@ impl QPDFJob {
         pdf.root_handle()?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
+    }
+
+    /// Return the qpdf page-spec source-map key for one opened source.
+    ///
+    /// Ordinary file sources use their raw input description as both the map
+    /// key and diagnostic filename. The empty primary is the qpdf exception:
+    /// its map key is empty while its `QPDF` diagnostic filename is `empty
+    /// PDF`.
+    pub(crate) fn page_spec_source_sort_key(
+        &self,
+        source_index: usize,
+        source_description: &[u8],
+    ) -> Vec<u8> {
+        if source_index == 0 && self.configuration.empty_input {
+            Vec::new()
+        } else {
+            source_description.to_vec()
+        }
     }
 
     /// Create a complete JSON-input document through the same job document

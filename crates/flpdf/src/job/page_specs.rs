@@ -205,8 +205,11 @@ fn report_page_spec_diagnostics<R: Read + Seek>(
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<Vec<bool>> {
     let source_names: Vec<Vec<u8>> = sources.iter().map(Pdf::input_source_description).collect();
-    let mut source_order: Vec<(usize, Vec<u8>)> =
-        source_names.iter().cloned().enumerate().collect();
+    let mut source_order: Vec<(usize, Vec<u8>)> = source_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (index, job.page_spec_source_sort_key(index, name)))
+        .collect();
     source_order.sort_by(|(left_index, left_name), (right_index, right_name)| {
         left_name
             .cmp(right_name)
@@ -217,7 +220,8 @@ fn report_page_spec_diagnostics<R: Read + Seek>(
     let logger = job.logger();
     let mut decisions = vec![false; sources.len()];
     let mut decisions_by_source_id = BTreeMap::new();
-    for (source_index, source_name) in source_order {
+    for (source_index, _source_sort_key) in source_order {
+        let source_name = &source_names[source_index];
         let source_id = sources[source_index].unique_id();
         if let Some(&decision) = decisions_by_source_id.get(&source_id) {
             decisions[source_index] = decision;
@@ -1119,6 +1123,17 @@ mod tests {
             Err(Error::Unsupported(message))
                 if message == "--pages: specification refers to missing source 1"
         ));
+    }
+
+    #[test]
+    fn empty_primary_keeps_qpdf_map_key_separate_from_display_name() {
+        let mut job = QPDFJob::new();
+        let empty = job.create_empty_document().expect("empty primary");
+        let description = empty.input_source_description();
+
+        assert_eq!(description, b"empty PDF");
+        assert!(job.page_spec_source_sort_key(0, &description).is_empty());
+        assert_eq!(job.page_spec_source_sort_key(1, b"empty PDF"), b"empty PDF");
     }
 
     #[test]

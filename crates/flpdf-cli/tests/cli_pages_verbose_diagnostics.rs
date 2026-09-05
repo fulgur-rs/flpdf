@@ -290,3 +290,43 @@ fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {
         qpdf.stdout
     );
 }
+
+#[test]
+fn verbose_empty_pages_source_preflights_match_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let first = fixture("three-page.pdf");
+    let second = fixture("inherited-resources-one-page.pdf");
+    let output = temp.path().join("empty-pages.pdf");
+    let args = vec![
+        "--verbose".to_owned(),
+        "--static-id".to_owned(),
+        "--empty".to_owned(),
+        "--pages".to_owned(),
+        first.to_str().unwrap().to_owned(),
+        "1".to_owned(),
+        second.to_str().unwrap().to_owned(),
+        "1".to_owned(),
+        "--".to_owned(),
+        output.to_str().unwrap().to_owned(),
+    ];
+
+    let qpdf = run_qpdf(&args);
+    assert_success(&qpdf, "qpdf verbose empty pages");
+    let flpdf = run_flpdf(&args);
+    assert_success(&flpdf, "flpdf verbose empty pages");
+
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "verbose --empty --pages stdout must match qpdf"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "verbose --empty --pages stderr must match qpdf"
+    );
+}
