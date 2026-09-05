@@ -65,7 +65,7 @@ fn verbose_pages_alone_emits_qpdf_parity_progress_block() {
             "flpdf: removing unreferenced pages from primary input{EOL}"
         )))
         .stdout(predicate::str::contains(format!(
-            "flpdf: adding pages from two-page.pdf{EOL}"
+            "flpdf: adding pages from {src}{EOL}"
         )))
         .stdout(predicate::str::contains("flpdf: wrote file"))
         .stderr(predicate::str::is_empty());

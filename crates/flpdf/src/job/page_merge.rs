@@ -818,9 +818,45 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
     resource_mode: RemoveUnreferencedResources,
     preserve_primary_unreferenced: bool,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    // qpdf computes this decision once per source in QPDFJob before entering
+    // the page-copy loop. Generic callers do not have a QPDFJob report
+    // boundary, so retain this wrapper's existing silent decision path.
+    let remove_resources: Vec<bool> = inputs
+        .iter_mut()
+        .map(|input| match resource_mode {
+            RemoveUnreferencedResources::No => Ok(false),
+            RemoveUnreferencedResources::Yes => Ok(true),
+            RemoveUnreferencedResources::Auto => should_remove_unreferenced_resources(input.source),
+        })
+        .collect::<Result<_>>()?;
+    merge_documents_with_resource_decisions_and_preserve_primary(
+        inputs,
+        &remove_resources,
+        preserve_primary_unreferenced,
+    )
+}
+
+/// Merge selected pages using decisions already made by qpdf's job-level
+/// resource heuristic.
+///
+/// `QPDFJob::handlePageSpecs` performs the Auto scan and its verbose side
+/// effects before entering the copy loop (`libqpdf/QPDFJob.cc:2442-2455`).
+/// Accepting the resulting per-source booleans here keeps that scan single and
+/// leaves this function responsible only for page copying and page-local
+/// mutation.
+pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    remove_resources: &[bool],
+    preserve_primary_unreferenced: bool,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
             "merge requires at least one input".to_string(),
+        ));
+    }
+    if inputs.len() != remove_resources.len() {
+        return Err(Error::Internal(
+            "page merge resource decisions do not match source count".to_owned(),
         ));
     }
 
@@ -840,18 +876,6 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             } else {
                 page_refs(input.source)
             }
-        })
-        .collect::<Result<_>>()?;
-
-    // qpdf computes the Auto decision once per source QPDF, before any page
-    // is copied or the source page tree is flattened. Keep the result by input
-    // index so duplicate page specifications share the same source decision.
-    let remove_resources: Vec<bool> = inputs
-        .iter_mut()
-        .map(|input| match resource_mode {
-            RemoveUnreferencedResources::No => Ok(false),
-            RemoveUnreferencedResources::Yes => Ok(true),
-            RemoveUnreferencedResources::Auto => should_remove_unreferenced_resources(input.source),
         })
         .collect::<Result<_>>()?;
 
@@ -1223,12 +1247,15 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 
 #[cfg(test)]
 mod tests {
+    use super::super::resource_pruning::RemoveUnreferencedResources;
     use super::{
         collect_retained_widget_refs, discover_primary_acroform, field_kid_refs, merge_documents,
-        resolve_field_partial_name, rewrite_field_kids, trim_field_kids, unique_field_name,
-        widget_page_ref, MergeInput, DEFAULT_MAX_ACROFORM_DEPTH,
+        merge_documents_with_resource_decisions_and_preserve_primary,
+        merge_documents_with_resource_mode_and_preserve_primary, resolve_field_partial_name,
+        rewrite_field_kids, trim_field_kids, unique_field_name, widget_page_ref, MergeInput,
+        DEFAULT_MAX_ACROFORM_DEPTH,
     };
-    use crate::{ObjectHandle, ObjectRef, Pdf};
+    use crate::{Error, ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
@@ -1332,6 +1359,52 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn precomputed_resource_decisions_must_cover_every_merge_input() {
+        let mut source = Pdf::empty().expect("empty source");
+        let mut inputs = [MergeInput {
+            source: &mut source,
+            pages: vec![0],
+        }];
+
+        assert!(matches!(
+            merge_documents_with_resource_decisions_and_preserve_primary(
+                &mut inputs,
+                &[],
+                false,
+            ),
+            Err(Error::Internal(message))
+                if message == "page merge resource decisions do not match source count"
+        ));
+    }
+
+    #[test]
+    fn resource_mode_wrapper_evaluates_yes_and_auto_decisions() {
+        for mode in [
+            RemoveUnreferencedResources::Yes,
+            RemoveUnreferencedResources::Auto,
+        ] {
+            let mut source = Pdf::open_mem_owned(build_pdf(
+                &[
+                    (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                    (2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+                    (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                ],
+                1,
+            ))
+            .expect("one-page source");
+            let mut inputs = [MergeInput {
+                source: &mut source,
+                pages: vec![0],
+            }];
+
+            let mut merged =
+                merge_documents_with_resource_mode_and_preserve_primary(&mut inputs, mode, false)
+                    .expect("resource mode merge");
+            assert_eq!(crate::pages::page_refs(&mut merged).unwrap().len(), 1);
+        }
     }
 
     #[test]

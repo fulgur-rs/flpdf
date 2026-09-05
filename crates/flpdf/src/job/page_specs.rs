@@ -7,11 +7,14 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use super::page_merge::{
-    merge_documents_with_resource_mode, merge_documents_with_resource_mode_and_preserve_primary,
-    source_top_level_field_names, MergeInput,
+    merge_documents_with_resource_decisions_and_preserve_primary, source_top_level_field_names,
+    MergeInput,
 };
 use super::page_plan::PagePlan;
-use super::resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
+use super::resource_pruning::{
+    shared_resource_finding_message, should_remove_unreferenced_resources_with_report,
+    RemoveUnreferencedResources,
+};
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::page_label_document_helper::LabelRange;
 use crate::pages::tree_rebuild::RebuildResult;
@@ -180,6 +183,102 @@ pub fn copy_duplicate_page_annotations<R: Read + Seek>(
 }
 
 /// Execute the qpdf-shaped in-place page-tree portion for one source.
+fn prefixed_info_line(job: &super::QPDFJob, body: &[u8]) -> Vec<u8> {
+    let mut message = job.message_prefix().as_bytes().to_vec();
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(body);
+    message
+}
+
+/// Run qpdf's per-source page-job resource preflight and emit the diagnostics
+/// that surround the page-copy phase.
+///
+/// qpdf performs this work after all page specifications have been parsed but
+/// before it removes the primary page tree (`libqpdf/QPDFJob.cc:2440-2472`).
+/// The source map is ordered by the raw filename, while the later page-add
+/// lines follow specification order. Return the decisions by source index so
+/// the merge primitive does not scan the same document a second time.
+fn report_page_spec_diagnostics<R: Read + Seek>(
+    job: &super::QPDFJob,
+    sources: &mut [Pdf<R>],
+    specs: &[PageSpecInput],
+    resource_mode: RemoveUnreferencedResources,
+) -> Result<Vec<bool>> {
+    let source_names: Vec<Vec<u8>> = sources.iter().map(Pdf::input_source_description).collect();
+    let mut source_order: Vec<(usize, Vec<u8>)> = source_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (index, job.page_spec_source_sort_key(index, name)))
+        .collect();
+    source_order.sort_by(|(left_index, left_name), (right_index, right_name)| {
+        left_name
+            .cmp(right_name)
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    let verbose = job.verbose();
+    let logger = job.logger();
+    let mut decisions = vec![false; sources.len()];
+    let mut decisions_by_source_id = BTreeMap::new();
+    for (source_index, _source_sort_key) in source_order {
+        let source_name = &source_names[source_index];
+        let source_id = sources[source_index].unique_id();
+        if let Some(&decision) = decisions_by_source_id.get(&source_id) {
+            decisions[source_index] = decision;
+            continue;
+        }
+
+        let decision = match resource_mode {
+            RemoveUnreferencedResources::No => false,
+            RemoveUnreferencedResources::Yes => true,
+            RemoveUnreferencedResources::Auto => {
+                if verbose {
+                    let mut message = prefixed_info_line(job, source_name.as_slice());
+                    message.extend_from_slice(b": checking for shared resources\n");
+                    logger.info(message)?;
+                }
+                let should_remove = should_remove_unreferenced_resources_with_report(
+                    &mut sources[source_index],
+                    |finding| {
+                        if verbose {
+                            logger.info(shared_resource_finding_message(finding))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?; // cov:ignore: llvm-cov attributes this executed generic preflight call to its closing delimiter
+                if verbose && !should_remove {
+                    logger.info(prefixed_info_line(job, b"no shared resources found\n"))?;
+                }
+                should_remove
+            }
+        };
+        decisions_by_source_id.insert(source_id, decision);
+        decisions[source_index] = decision;
+    }
+
+    if verbose {
+        logger.info(prefixed_info_line(
+            job,
+            b"removing unreferenced pages from primary input\n",
+        ))?; // cov:ignore: llvm-cov attributes this executed multiline logger call to its closing delimiter
+        for spec in specs {
+            let source_name = source_names.get(spec.source_index).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "--pages: specification refers to missing source {}",
+                    spec.source_index
+                ))
+            })?;
+            let mut message = prefixed_info_line(job, b"adding pages from ");
+            message.extend_from_slice(source_name);
+            message.push(b'\n');
+            logger.info(message)?;
+        }
+    }
+
+    Ok(decisions)
+}
+
 fn handle_single_source_page_specs<R: Read + Seek>(
     job: &mut super::QPDFJob,
     source: &mut Pdf<R>,
@@ -193,12 +292,12 @@ fn handle_single_source_page_specs<R: Read + Seek>(
     // cloned before the page range is resolved.
     crate::PageDocumentHelper::new(source).get_all_pages()?;
     let selected = select_single_source_pages(source, specs, collate)?;
-    let prune_mode = if resource_mode == RemoveUnreferencedResources::Auto
-        && !should_remove_unreferenced_resources(source)?
-    {
-        RemoveUnreferencedResources::No
-    } else {
+    let remove_resources =
+        report_page_spec_diagnostics(job, std::slice::from_mut(source), specs, resource_mode)?;
+    let prune_mode = if remove_resources[0] {
         resource_mode
+    } else {
+        RemoveUnreferencedResources::No
     };
     // QPDF::insertPage first flattens the source page tree, whose qpdf
     // implementation calls pushInheritedAttributesToPage before rebuilding
@@ -237,9 +336,9 @@ impl PageSpecInput {
 
 fn merge_preserving_primary<R: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
-    resource_mode: RemoveUnreferencedResources,
+    remove_resources: &[bool],
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
-    merge_documents_with_resource_mode_and_preserve_primary(inputs, resource_mode, true)
+    merge_documents_with_resource_decisions_and_preserve_primary(inputs, remove_resources, true)
 }
 
 /// A selected page represented by its source and its occurrence within the
@@ -623,6 +722,8 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         ));
     }
 
+    let remove_resources = report_page_spec_diagnostics(job, sources, specs, resource_mode)?;
+
     // qpdf's label accumulator is populated in final output order, not in
     // source-group order. Capture it before borrowing all sources for the
     // merge. When any source has labels, sources without labels still
@@ -684,9 +785,13 @@ fn handle_page_specs<R: Read + Seek + 'static>(
         })
         .collect();
     let mut merged = if preserve_unreferenced {
-        merge_preserving_primary(&mut merge_inputs, resource_mode)?
+        merge_preserving_primary(&mut merge_inputs, &remove_resources)?
     } else {
-        merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?
+        merge_documents_with_resource_decisions_and_preserve_primary(
+            &mut merge_inputs,
+            &remove_resources,
+            false,
+        )? // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
     };
     drop(merge_inputs);
 
@@ -887,8 +992,57 @@ mod tests {
     use super::*;
     use crate::job::QPDFJob;
     use crate::page_label_document_helper::LabelStyle;
-    use crate::ObjectHandle;
+    use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
+    use crate::{ObjectHandle, QPDFLogger};
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingInfoSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Pipeline for RecordingInfoSink {
+        fn identifier(&self) -> &str {
+            "page-spec info capture"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.bytes.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    fn verbose_job() -> (QPDFJob, Arc<Mutex<Vec<u8>>>) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: Arc::clone(&bytes),
+        })));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_message_prefix("qpdf");
+        job.set_verbose(true);
+        (job, bytes)
+    }
+
+    #[test]
+    fn recording_info_sink_implements_the_pipeline_contract() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = RecordingInfoSink {
+            bytes: Arc::clone(&bytes),
+        };
+
+        assert_eq!(sink.identifier(), "page-spec info capture");
+        sink.write(b"probe\n").unwrap();
+        sink.finish().unwrap();
+        assert_eq!(&*bytes.lock().unwrap(), b"probe\n");
+    }
 
     fn three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open_mem_owned(
@@ -910,6 +1064,100 @@ mod tests {
                 .to_vec(),
         )
         .expect("open inherited-resources fixture")
+    }
+
+    #[test]
+    fn page_spec_report_reuses_one_decision_per_source_identity() {
+        let (job, output) = verbose_job();
+        let inherited = inherited_resources_pdf();
+        let mut duplicate_identity = three_page_pdf();
+        duplicate_identity.unique_id = inherited.unique_id;
+        let range = PageRange::parse("1").expect("one-page range");
+        let specs = [
+            PageSpecInput::new(0, range.clone()),
+            PageSpecInput::new(1, range),
+        ];
+        let mut sources = [inherited, duplicate_identity];
+
+        let decisions = report_page_spec_diagnostics(
+            &job,
+            &mut sources,
+            &specs,
+            RemoveUnreferencedResources::Auto,
+        )
+        .expect("resource report");
+        assert_eq!(decisions, [true, true]);
+        let output = output.lock().unwrap().clone();
+        assert!(
+            output
+                .windows(b"found resources in non-leaf page node".len())
+                .any(|window| window == b"found resources in non-leaf page node"),
+            "verbose report must include the first finding: {output:?}"
+        );
+        assert_eq!(
+            output
+                .windows(b"checking for shared resources".len())
+                .filter(|window| window == b"checking for shared resources")
+                .count(),
+            1,
+            "a repeated source identity is preflighted once: {output:?}"
+        );
+    }
+
+    #[test]
+    fn page_spec_report_rejects_a_missing_source_after_reporting_preflight() {
+        let (job, _output) = verbose_job();
+        let mut source = three_page_pdf();
+        let specs = [PageSpecInput::new(
+            1,
+            PageRange::parse("1").expect("one-page range"),
+        )];
+
+        assert!(matches!(
+            report_page_spec_diagnostics(
+                &job,
+                std::slice::from_mut(&mut source),
+                &specs,
+                RemoveUnreferencedResources::Auto,
+            ),
+            Err(Error::Unsupported(message))
+                if message == "--pages: specification refers to missing source 1"
+        ));
+    }
+
+    #[test]
+    fn empty_primary_keeps_qpdf_map_key_separate_from_display_name() {
+        let mut job = QPDFJob::new();
+        let empty = job.create_empty_document().expect("empty primary");
+        let description = empty.input_source_description();
+
+        assert_eq!(description, b"empty PDF");
+        assert!(job.page_spec_source_sort_key(0, &description).is_empty());
+        assert_eq!(job.page_spec_source_sort_key(1, b"empty PDF"), b"empty PDF");
+    }
+
+    #[test]
+    fn page_spec_job_uses_the_non_preserving_merge_decision_route() {
+        let primary = three_page_pdf();
+        let secondary = inherited_resources_pdf();
+        let range = PageRange::parse("1").expect("one-page range");
+        let specs = [
+            PageSpecInput::new(0, range.clone()),
+            PageSpecInput::new(1, range),
+        ];
+        let mut sources = [primary, secondary];
+        let mut job = QPDFJob::new();
+
+        let output = job
+            .handle_page_specs(
+                &mut sources,
+                &specs,
+                None,
+                RemoveUnreferencedResources::Auto,
+                false,
+            )
+            .expect("multi-source page job");
+        assert!(matches!(output, PageSpecJobOutput::Merged(_)));
     }
 
     fn labelled_pdf() -> Pdf<Cursor<Vec<u8>>> {

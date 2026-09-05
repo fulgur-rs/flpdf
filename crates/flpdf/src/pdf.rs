@@ -3,6 +3,7 @@
 use crate::acroform_document_helper::AcroFormCache;
 use crate::cache::ObjectCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
+use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::InputSourceControl;
@@ -306,6 +307,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// PDF version header as written in the first line of the file (e.g. `"1.7"`).
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Return the raw qpdf input-source description retained for diagnostics.
+    ///
+    /// qpdf's page job uses each source QPDF's `getFilename()` value when it
+    /// formats verbose page-operation messages (`libqpdf/QPDFJob.cc:2271-2272,
+    /// 2400-2427`). Keep the caller-provided bytes rather than projecting the
+    /// description through UTF-8 so non-UTF-8 argv paths remain observable.
+    pub(crate) fn input_source_description(&self) -> Vec<u8> {
+        self.resolver.input_description()
     }
 
     /// Return the logical bytes of the input source, excluding any leading
