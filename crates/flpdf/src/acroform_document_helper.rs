@@ -215,6 +215,9 @@ struct AcroFormDefaults {
     default_appearance: Vec<u8>,
     quadding: i64,
     resources: Option<ObjectHandle>,
+    /// Source-side `/NeedAppearances`, propagated when qpdf lazily initializes
+    /// the destination `/DR` during a foreign field copy.
+    need_appearances: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1046,9 +1049,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         .copy_transform_object(&copied_source_top, &mut orig_to_copy)?
                         .expect("copy_transform_object always returns a non-stream clone");
                     if foreign_resources.is_none() {
-                        foreign_resources = Some(
-                            self.prepare_foreign_resource_plan(copied_source_resources.clone())?,
-                        ); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
+                        foreign_resources = Some(self.prepare_foreign_resource_plan(
+                            copied_source_resources.clone(),
+                            source_defaults.need_appearances,
+                        )?); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
                     }
                     let copied_top = self.copy_field_tree_with_copied_top(
                         &copied_source_top,
@@ -1559,6 +1563,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     fn prepare_foreign_resource_plan(
         &mut self,
         source_resources: Option<ObjectHandle>,
+        source_need_appearances: bool,
     ) -> Result<ForeignResourcePlan> {
         let destination_resources = self.canonical_get_or_create_acroform_resources()?;
         let mut conflicts = ResourceConflicts::new();
@@ -1569,6 +1574,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if let Some(source_resources) = source_resources {
             source_resources.make_resources_indirect(self.pdf)?;
             destination_resources.merge_resources(&source_resources, Some(&mut conflicts))?;
+        }
+        if source_need_appearances {
+            self.set_need_appearances(true)?;
         }
         self.pdf.mark_object_handle_dirty(&destination_resources)?;
         Ok(ForeignResourcePlan {
@@ -1615,6 +1623,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .unwrap_or_default(),
             quadding: quadding.as_integer().unwrap_or(0),
             resources: resources.as_dictionary().map(|_| resources),
+            need_appearances: self
+                .pdf
+                .resolve_handle(&acroform.try_get_key(b"/NeedAppearances")?)?
+                .as_boolean()
+                == Some(true),
         })
     }
 
