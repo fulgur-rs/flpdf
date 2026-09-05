@@ -5992,7 +5992,7 @@ mod tests {
             .expect_err("decryptStream stage-construction errors propagate");
         assert!(error
             .to_string()
-            .contains("Pl_AES_PDF: key must be 16 or 32 bytes"));
+            .contains("Pl_AES_PDF: key must be at least 16 bytes"));
         assert!(trace.borrow().calls.is_empty(), "the sink is untouched");
         assert!(resolver.repair_diagnostics().entries().is_empty());
     }
