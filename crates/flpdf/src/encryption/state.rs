@@ -186,12 +186,28 @@ impl EncryptionState {
 }
 
 pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
-    key.try_into().map_err(|_| {
-        EncryptedError::Malformed {
+    match key.len() {
+        16 => key.try_into().map_err(|_| unreachable!("length checked")),
+        // qpdf's providers map every key length other than 16/24/32 to
+        // AES-128 and hand the provider the first 16 bytes
+        // (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`).
+        // A 32-byte key is dispatched to AES-256 by the caller, and 24 bytes
+        // selects AES-192 in qpdf, which this port does not provide.
+        len if len > 16 && len != 24 && len != 32 => {
+            let mut object_key = [0u8; 16];
+            object_key.copy_from_slice(&key[..16]);
+            Ok(object_key)
+        }
+        24 => Err(EncryptedError::Malformed {
+            reason: "AES-192 (24-byte) raw keys are not supported".into(),
+        }
+        .into()),
+        // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
+        _ => Err(EncryptedError::Malformed {
             reason: "AES-128 object key is not 16 bytes".into(),
         }
-        .into()
-    })
+        .into()),
+    }
 }
 
 /// qpdf `QPDF::encryption_method_e` (`QPDF.hh:436`).
@@ -677,17 +693,12 @@ fn map_uo_length_to_bad_password(err: crate::Error) -> crate::Error {
 }
 
 fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
-    let key = decode_hex(raw);
-    if key.len() > 32 {
-        return Err(crate::error::EncryptedError::Malformed {
-            reason: format!(
-                "--password-is-hex-key: decoded key is {} bytes; the Standard security handler key is at most 32 bytes",
-                key.len()
-            ),
-        }
-        .into());
-    }
-    Ok(key)
+    // qpdf stores QUtil::hex_decode's result without imposing the normal
+    // Standard-handler key-size limit when --password-is-hex-key is active
+    // (QPDF_encryption.cc:933-934). V>=5 object-key derivation returns this
+    // raw value unchanged; the crypto provider chooses its own AES fallback
+    // when the length is not one of its supported AES sizes.
+    Ok(decode_hex(raw))
 }
 
 fn required_integer_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<i64> {

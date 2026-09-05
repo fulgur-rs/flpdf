@@ -171,7 +171,7 @@ fn show_encryption_key_wrong_password_is_not_reported_as_plaintext() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance 2: 32-byte hex works; non-hex / over-length → clear error, no panic
+// Acceptance 2: 32-byte hex works; non-hex / over-length follow qpdf
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -220,10 +220,13 @@ fn hex_key_ignores_non_hex_input_like_qpdf() {
 }
 
 #[test]
-fn hex_key_over_length_input_errors_cleanly() {
-    // 40 bytes (80 hex chars) > the 32-byte Standard-handler maximum.
+fn hex_key_over_length_input_is_used_as_is_like_qpdf() {
+    // qpdf keeps all 40 decoded bytes as the V=5 file key. The current qpdf
+    // crypto provider selects its AES-128 fallback for this unsupported
+    // provider key length, but the observable file-key length remains 320
+    // bits in the JSON encryption section.
     let too_long = "ab".repeat(40);
-    let assert = flpdf()
+    flpdf()
         .args([
             "check",
             &format!("--password={too_long}"),
@@ -231,15 +234,60 @@ fn hex_key_over_length_input_errors_cleanly() {
             V5_R6,
         ])
         .assert()
-        .failure();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+        .success();
+
+    let json = flpdf()
+        .args([
+            "--json=2",
+            "--json-key=encrypt",
+            &format!("--password={too_long}"),
+            "--password-is-hex-key",
+            V5_R6,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json = String::from_utf8(json).expect("JSON output should be UTF-8");
     assert!(
-        stderr.contains("--password-is-hex-key") && stderr.contains("at most 32 bytes"),
-        "expected a clear over-length error, got: {stderr}"
+        json.contains("\"bits\": 320"),
+        "qpdf reports the raw decoded key length, got: {json}"
     );
+}
+
+#[test]
+fn hex_key_between_16_and_32_bytes_is_used_as_is_like_qpdf() {
+    // 20 bytes: qpdf's providers select AES-128 with the first 16 bytes for
+    // any length other than 16/24/32; the reported key length stays 160 bits.
+    let twenty = "ab".repeat(20);
+    flpdf()
+        .args([
+            "check",
+            &format!("--password={twenty}"),
+            "--password-is-hex-key",
+            V5_R6,
+        ])
+        .assert()
+        .success();
+
+    let json = flpdf()
+        .args([
+            "--json=2",
+            "--json-key=encrypt",
+            &format!("--password={twenty}"),
+            "--password-is-hex-key",
+            V5_R6,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json = String::from_utf8(json).expect("JSON output should be UTF-8");
     assert!(
-        !stderr.contains("panicked"),
-        "must not panic, got: {stderr}"
+        json.contains("\"bits\": 160"),
+        "qpdf reports the raw decoded key length, got: {json}"
     );
 }
 

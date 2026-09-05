@@ -1510,6 +1510,25 @@ fn password_matched_flags_v5_r6_owner_password() {
 }
 
 #[test]
+fn overlength_raw_hex_key_preserves_qpdf_reported_key_bits() {
+    let bytes = std::fs::read("../../tests/fixtures/encrypted/v5-aes-256-r6.pdf")
+        .expect("read encrypted fixture");
+    let pdf = Pdf::open_with_options(
+        std::io::Cursor::new(bytes),
+        PdfOpenOptions {
+            password:
+                b"abababababababababababababababababababababababababababababababababababababababab"
+                    .to_vec(),
+            password_is_hex_key: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf accepts an overlength raw key for this inspection fixture");
+
+    assert_eq!(pdf.encryption_length_bits(), Some(320));
+}
+
+#[test]
 fn password_matched_flags_plaintext_document() {
     // Unencrypted document: both flags must always be false.
     let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
