@@ -6,6 +6,10 @@
 //! separate output file. The output-path naming helpers below are also
 //! qpdf-private (inlined in `doSplitPages`, not a separate qpdf function), so
 //! they stay `fn`-private here rather than a separate public module.
+//! Before page enumeration, the split route applies qpdf's job-level
+//! `shouldRemoveUnreferencedResources` Auto|Yes|No decision and sends its
+//! verbose finding messages through the same job logger
+//! (`QPDFJob.cc:2251-2340`; `QPDFJob.cc:340-345`).
 //!
 //! # Naming convention
 //!
@@ -34,6 +38,10 @@
 //! - The split is at the **last** `.` in the filename portion of the path
 //!   (confirmed with `two.dots.pdf` → `two.dots-1-2.pdf`).
 
+use super::resource_pruning::{
+    should_remove_unreferenced_resources_with_report, RemoveUnreferencedResources,
+    SharedResourceFinding,
+};
 use super::QPDFJob;
 use crate::{
     Error, PageDocumentHelper, PageInput, PageObjectHelper, Pdf, PdfWriter, Result,
@@ -60,6 +68,9 @@ pub struct SplitPageOptions {
     pub writer_configuration: WriterConfiguration,
     /// Report each chunk's real output path as it is written.
     pub verbose: bool,
+    /// Apply qpdf's job-level Auto|Yes|No resource-pruning policy before
+    /// copying the pages into fresh chunks.
+    remove_unreferenced_resources: RemoveUnreferencedResources,
 }
 
 impl SplitPageOptions {
@@ -74,6 +85,7 @@ impl SplitPageOptions {
             deterministic_id: false,
             writer_configuration: WriterConfiguration::default(),
             verbose: false,
+            remove_unreferenced_resources: RemoveUnreferencedResources::Auto,
         }
     }
 
@@ -112,6 +124,13 @@ impl SplitPageOptions {
         self.verbose = verbose;
         self
     }
+
+    /// Apply qpdf's job-level resource-pruning policy before splitting.
+    #[must_use]
+    pub fn with_remove_unreferenced_resources(mut self, mode: RemoveUnreferencedResources) -> Self {
+        self.remove_unreferenced_resources = mode;
+        self
+    }
 }
 
 fn qpdf_split_page_size(value: i32) -> Result<usize> {
@@ -122,6 +141,26 @@ fn qpdf_split_page_size(value: i32) -> Result<usize> {
             std::mem::size_of::<usize>(),
         ))
     })
+}
+
+fn shared_resource_finding_message(finding: SharedResourceFinding) -> Vec<u8> {
+    match finding {
+        SharedResourceFinding::NonLeaf { node } => format!(
+            "  found resources in non-leaf page node {} {}\n",
+            node.number, node.generation
+        )
+        .into_bytes(),
+        SharedResourceFinding::Resources { node, resources } => format!(
+            "  found shared resources in leaf node {} {}: {} {}\n",
+            node.number, node.generation, resources.number, resources.generation
+        )
+        .into_bytes(),
+        SharedResourceFinding::XObject { node, xobject } => format!(
+            "  found shared xobject in leaf node {} {}: {} {}\n",
+            node.number, node.generation, xobject.number, xobject.generation
+        )
+        .into_bytes(),
+    }
 }
 
 impl QPDFJob {
@@ -161,6 +200,40 @@ impl QPDFJob {
             return Err(Error::Unsupported(
                 "split_pages: chunk_size must be >= 1".to_owned(),
             ));
+        }
+        let remove_resources = match options.remove_unreferenced_resources {
+            RemoveUnreferencedResources::No => false,
+            RemoveUnreferencedResources::Yes => true,
+            RemoveUnreferencedResources::Auto => {
+                let verbose = options.verbose;
+                let logger = self.logger();
+                if verbose {
+                    let mut message = Vec::new();
+                    message.extend_from_slice(self.message_prefix().as_bytes());
+                    message.extend_from_slice(b": ");
+                    message.extend_from_slice(self.input_name_bytes());
+                    message.extend_from_slice(b": checking for shared resources\n");
+                    logger.info(message)?;
+                }
+                let should_remove =
+                    should_remove_unreferenced_resources_with_report(source, |finding| {
+                        if verbose {
+                            logger.info(shared_resource_finding_message(finding))
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+                if verbose && !should_remove {
+                    let mut message = Vec::new();
+                    message.extend_from_slice(self.message_prefix().as_bytes());
+                    message.extend_from_slice(b": no shared resources found\n");
+                    logger.info(message)?;
+                }
+                should_remove
+            }
+        };
+        if remove_resources {
+            PageDocumentHelper::new(source).remove_unreferenced_resources()?;
         }
         let pages = PageDocumentHelper::new(source).get_all_pages()?;
         let chunk_size = options
@@ -721,6 +794,9 @@ mod tests {
                 include_bytes!("../../../../tests/fixtures/json-diff/direct-outlines.pdf")
             }
             "three-page.pdf" => include_bytes!("../../../../tests/fixtures/compat/three-page.pdf"),
+            "inherited-resources-one-page.pdf" => {
+                include_bytes!("../../../../tests/fixtures/compat/inherited-resources-one-page.pdf")
+            }
             "objstm-lin-acroform-widget-page1-page2.pdf" => include_bytes!(
                 "../../../../tests/fixtures/compat/objstm-lin-acroform-widget-page1-page2.pdf"
             ),
@@ -759,11 +835,68 @@ mod tests {
     fn split_page_options_builder_keeps_qpdf_job_inputs() {
         let options = SplitPageOptions::new(2, "out-%d.pdf")
             .with_input_path("input.pdf")
-            .with_deterministic_id(true);
+            .with_deterministic_id(true)
+            .with_remove_unreferenced_resources(RemoveUnreferencedResources::No);
         assert_eq!(options.chunk_size, 2);
         assert_eq!(options.output_template, PathBuf::from("out-%d.pdf"));
         assert_eq!(options.input_path, Some(PathBuf::from("input.pdf")));
         assert!(options.deterministic_id);
+        assert_eq!(
+            options.remove_unreferenced_resources,
+            RemoveUnreferencedResources::No
+        );
+    }
+
+    #[test]
+    fn shared_resource_finding_messages_match_qpdf() {
+        let node = crate::ObjectRef::new(3, 0);
+        let resource = crate::ObjectRef::new(7, 0);
+        assert_eq!(
+            shared_resource_finding_message(SharedResourceFinding::NonLeaf { node }),
+            b"  found resources in non-leaf page node 3 0\n"
+        );
+        assert_eq!(
+            shared_resource_finding_message(SharedResourceFinding::Resources {
+                node,
+                resources: resource,
+            }),
+            b"  found shared resources in leaf node 3 0: 7 0\n"
+        );
+        assert_eq!(
+            shared_resource_finding_message(SharedResourceFinding::XObject {
+                node,
+                xobject: resource,
+            }),
+            b"  found shared xobject in leaf node 3 0: 7 0\n"
+        );
+    }
+
+    #[test]
+    fn split_pages_honors_explicit_resource_policies() {
+        for mode in [
+            RemoveUnreferencedResources::No,
+            RemoveUnreferencedResources::Yes,
+        ] {
+            let mut source = open_fixture("three-page.pdf");
+            let temp = tempfile::tempdir().expect("temporary directory");
+            let options = SplitPageOptions::new(1, temp.path().join("out-%d.pdf"))
+                .with_remove_unreferenced_resources(mode);
+            let written = QPDFJob::new()
+                .split_pages(&mut source, options)
+                .expect("explicit resource policy should split");
+            assert_eq!(written.len(), 3);
+        }
+    }
+
+    #[test]
+    fn split_pages_auto_resource_finding_without_verbose_still_prunes() {
+        let mut source = open_fixture("inherited-resources-one-page.pdf");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let options = SplitPageOptions::new(1, temp.path().join("out-%d.pdf"));
+        let written = QPDFJob::new()
+            .split_pages(&mut source, options)
+            .expect("Auto resource finding should split");
+        assert_eq!(written.len(), 1);
     }
 
     #[test]

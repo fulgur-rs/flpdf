@@ -1260,6 +1260,17 @@ flpdf の `job/page_merge.rs` はこの primary source order と foreign allocat
 `--static-id --stream-data=uncompress --linearize --pages` の全出力 bytes を比較する
 `cli_linearize_multi_source_qpdf.rs` でこの境界を固定する。
 
+`flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
+`shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
+接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの
+完了を `doIfVerbose` で info logger へ送り、その後に各 chunk の `wrote file` を出す
+（`QPDFJob.cc:340-345,2251-2340,2940-3025`）。flpdf は heuristic の BFS/policy を
+`job/resource_pruning.rs` に残したまま finding callback を `job/page_split.rs` の
+message prefix/logger へ渡し、`get_all_pages` と resource mutation より前に実行する。
+`SplitPageOptions` の Auto/Yes/No は job-JSON を含む全 split caller へ伝播し、
+`cli_split_pages_verbose_qpdf.rs` が qpdf 11.9.0 の stdout/stderr と chunk report の
+順序を比較する。
+
 ### C. qpdf に機能そのものが無いもの
 
 | flpdf | 行 | 備考 |

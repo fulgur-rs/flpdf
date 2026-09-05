@@ -2533,7 +2533,10 @@ impl QPDFJob {
                 let mut split_options = SplitPageOptions::new(1, output.clone())
                     .with_qpdf_chunk_size(split_pages)
                     .with_writer_configuration(writer_configuration.clone())
-                    .with_verbose(self.configuration.verbose);
+                    .with_verbose(self.configuration.verbose)
+                    .with_remove_unreferenced_resources(
+                        self.configuration.remove_unreferenced_resources,
+                    );
                 if let Some(input) = self.configuration.input_file.clone() {
                     split_options = split_options.with_input_path(input);
                 }
