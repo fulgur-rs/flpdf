@@ -4701,7 +4701,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             linearize_pass1,
         )?;
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
         // On an encrypted input, `--decrypt` has already disabled
         // source-encryption preservation above.
@@ -4852,7 +4852,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         )?;
 
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
@@ -6320,7 +6320,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(pdf, output, &mut standard_output, &options, false, None)?;
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
     }
     finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
@@ -6556,7 +6556,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             None,
         )?;
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
     }
     finish_operation_warnings(&pdf, creates_output)
@@ -7781,6 +7781,16 @@ fn path_description(input: &Path) -> Vec<u8> {
     input.to_string_lossy().into_owned().into_bytes()
 }
 
+/// Build qpdf's `<prefix>: wrote file <output>` line with the output name's
+/// raw bytes (`QPDFJob.cc:3059-3062`); `Path::display()` would replace
+/// non-UTF-8 bytes with U+FFFD.
+fn wrote_file_message(prefix: &str, output: &Path) -> Vec<u8> {
+    let mut message = format!("{prefix}: wrote file ").into_bytes();
+    message.extend_from_slice(&path_description(output));
+    message.push(b'\n');
+    message
+}
+
 /// Program name used in qpdf-parity diagnostic prefixes.
 ///
 /// `FLPDF_PROGNAME` overrides the default so the qpdf qtest harness shim can
@@ -8232,7 +8242,7 @@ fn run_add_attachment(
     )?;
     if verbose && output.as_os_str() != "-" {
         job.logger()
-            .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+            .info(wrote_file_message(&progname(), &output))?;
     }
     if !suppress_warnings {
         for &warning in &normalization_warnings {
@@ -8305,7 +8315,7 @@ fn run_remove_attachment(
         linearize_pass1,
     )?;
     if verbose && output.as_os_str() != "-" {
-        logger_info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+        logger_info(wrote_file_message(&progname(), &output))?;
     }
     finish_rewrite_warnings(
         &input,
@@ -8464,7 +8474,7 @@ fn run_copy_attachments_from(
     )?;
     if verbose && output.as_os_str() != "-" {
         job.logger()
-            .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+            .info(wrote_file_message(&progname(), &output))?;
     }
     // Same `--no-warn` boundary as `finish_rewrite_warnings`: the warning is
     // recorded (exit status 3) but its text is suppressed like `QPDF::warn`.
