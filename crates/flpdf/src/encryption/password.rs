@@ -9,7 +9,6 @@
 //! first attempt fails, qpdf retries the same bytes through alternate
 //! encodings from `QUtil::possible_repaired_encodings` (`QUtil.cc:1821-1900`).
 
-use crate::error::EncryptedError;
 use crate::Result;
 
 /// How a raw `--password` byte string should be interpreted.
@@ -37,7 +36,7 @@ pub enum PasswordMode {
 /// security handler, just as it is in qpdf's authentication functions.
 pub(crate) fn password_bytes_for_read(raw: &[u8], mode: PasswordMode) -> Result<Vec<u8>> {
     if mode == PasswordMode::HexBytes {
-        decode_hex(raw)
+        Ok(decode_hex(raw))
     } else {
         Ok(raw.to_vec())
     }
@@ -65,8 +64,16 @@ pub(crate) fn password_bytes_for_write(
 ) -> Result<(Vec<u8>, bool)> {
     match mode {
         PasswordMode::Bytes => Ok((raw.to_vec(), false)),
-        PasswordMode::HexBytes => Ok((decode_hex(raw)?, false)),
+        PasswordMode::HexBytes => Ok((decode_hex(raw), false)),
         PasswordMode::Unicode => {
+            // qpdf's `maybeFixWritePassword` shares one early return for
+            // `pm_unicode` and `pm_auto`: a password without 8-bit characters
+            // is used verbatim before any UTF-8 or PDFDoc check
+            // (`QPDFJob.cc:2671-2674`).
+            let (has_8bit_chars, _, _) = analyze_encoding(raw);
+            if !has_8bit_chars {
+                return Ok((raw.to_vec(), false));
+            }
             if std::str::from_utf8(raw).is_err() {
                 return Err(crate::Error::System(
                     "supplied password is not valid UTF-8".to_owned(),
@@ -411,18 +418,34 @@ fn encode_mac_roman(codepoint: u32) -> Option<u8> {
         .map(|index| index as u8 + 0x80)
 }
 
-fn decode_hex(raw: &[u8]) -> Result<Vec<u8>> {
-    let trimmed: Vec<u8> = raw
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    hex::decode(&trimmed).map_err(|err| {
-        EncryptedError::Malformed {
-            reason: format!("--password-mode=hex-bytes: invalid hex input ({err})"),
+/// Decode bytes with qpdf's `QUtil::hex_decode` behavior. Invalid characters
+/// are ignored, and a final high nibble is emitted with a zero low nibble.
+pub(crate) fn decode_hex(raw: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut high = None;
+    for &byte in raw {
+        let Some(nibble) = hex_decode_nibble(byte) else {
+            continue;
+        };
+        if let Some(high) = high.take() {
+            result.push((high << 4) | nibble);
+        } else {
+            high = Some(nibble);
         }
-        .into()
-    })
+    }
+    if let Some(high) = high {
+        result.push(high << 4);
+    }
+    result
+}
+
+fn hex_decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -460,9 +483,15 @@ mod tests {
     }
 
     #[test]
-    fn hex_bytes_rejects_invalid_hex() {
-        let err = password_bytes_for_read(b"zz", PasswordMode::HexBytes).unwrap_err();
-        assert!(err.to_string().contains("invalid hex input"));
+    fn hex_bytes_ignores_non_hex_and_pads_an_odd_nibble() {
+        assert_eq!(
+            password_bytes_for_read(b"zA-1", PasswordMode::HexBytes).unwrap(),
+            vec![0xa1]
+        );
+        assert_eq!(
+            password_bytes_for_read(b"zF", PasswordMode::HexBytes).unwrap(),
+            vec![0xf0]
+        );
     }
 
     #[test]
@@ -541,6 +570,19 @@ mod tests {
                 .0,
             "café".as_bytes()
         );
+    }
+
+    #[test]
+    fn write_password_unicode_keeps_ascii_control_characters_unchanged() {
+        // qpdf returns before the UTF-8 and PDFDoc checks when the password
+        // has no 8-bit characters (`QPDFJob.cc:2671-2674`), so an ASCII
+        // control byte PDFDoc cannot encode is still accepted verbatim.
+        let (bytes, warned) =
+            password_bytes_for_write(b"ab\x18cd", PasswordMode::Unicode, 4).unwrap();
+        assert_eq!(bytes, b"ab\x18cd");
+        assert!(!warned);
+        let (bytes, _) = password_bytes_for_write(b"ab\x7fcd", PasswordMode::Unicode, 4).unwrap();
+        assert_eq!(bytes, b"ab\x7fcd");
     }
 
     #[test]

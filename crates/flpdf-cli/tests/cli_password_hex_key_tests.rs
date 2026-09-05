@@ -207,8 +207,8 @@ fn hex_key_16_byte_key_works_on_v4() {
 }
 
 #[test]
-fn hex_key_non_hex_input_errors_cleanly() {
-    let assert = flpdf()
+fn hex_key_ignores_non_hex_input_like_qpdf() {
+    flpdf()
         .args([
             "check",
             "--password=not-hex-zz",
@@ -216,18 +216,7 @@ fn hex_key_non_hex_input_errors_cleanly() {
             V5_R6,
         ])
         .assert()
-        .failure();
-    let out = assert.get_output();
-    // Clear, attributed error — and definitely not a panic.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("--password-is-hex-key") && stderr.contains("not valid hex"),
-        "expected a clear non-hex error, got: {stderr}"
-    );
-    assert!(
-        !stderr.contains("panicked"),
-        "must not panic, got: {stderr}"
-    );
+        .success();
 }
 
 #[test]

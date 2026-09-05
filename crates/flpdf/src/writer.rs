@@ -354,10 +354,14 @@ impl WriterConfiguration {
         self.settings.copy_encryption = None;
     }
 
-    pub(crate) fn normalize_encryption_passwords(
-        &mut self,
-        password_mode: PasswordMode,
-    ) -> Result<usize> {
+    /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
+    /// encryption passwords before a writer emits its encryption dictionary.
+    ///
+    /// The returned count is the number of qpdf auto-mode fallback warnings
+    /// that the owning job should send through its error logger. Password
+    /// validation and conversion stay in the encryption password module so
+    /// direct CLI writers and `QPDFJob` share one implementation.
+    pub fn normalize_encryption_passwords(&mut self, password_mode: PasswordMode) -> Result<usize> {
         let Some(params) = self.settings.encryption_parameters.as_mut() else {
             return Ok(0);
         };
@@ -5784,9 +5788,19 @@ mod final_handle_writer_tests {
         }
         let mut invalid = WriterConfiguration::default();
         invalid.set_encryption_parameters(EncryptParams::v5_r6(b"75", b"not-hex"));
-        assert!(invalid
-            .normalize_encryption_passwords(PasswordMode::HexBytes)
-            .is_err());
+        assert_eq!(
+            invalid
+                .normalize_encryption_passwords(PasswordMode::HexBytes)
+                .unwrap(),
+            0
+        );
+        let params = invalid
+            .settings
+            .encryption_parameters
+            .as_ref()
+            .expect("hex password parameters remain configured");
+        assert_eq!(params.user_password, vec![0x75]);
+        assert_eq!(params.owner_password, vec![0xe0]);
     }
 
     #[test]

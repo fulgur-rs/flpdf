@@ -81,6 +81,7 @@ struct WriterOptions {
     encrypt: Option<EncryptParams>,
     copy_encryption: Option<CopyEncryptionSource>,
     preserve_encryption: bool,
+    password_mode: PasswordMode,
 }
 
 impl Default for WriterOptions {
@@ -111,6 +112,7 @@ impl Default for WriterOptions {
             encrypt: None,
             copy_encryption: None,
             preserve_encryption: true,
+            password_mode: PasswordMode::default(),
         }
     }
 }
@@ -227,7 +229,10 @@ fn image_optimization_options(
 
 /// Translate the CLI's effective writer options into the reusable library
 /// configuration that qpdf reapplies to every split-page output writer.
-fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfiguration {
+fn writer_configuration(
+    options: &WriterOptions,
+    linearize: bool,
+) -> CliResult<WriterConfiguration> {
     let mut configuration = WriterConfiguration::default();
     configuration.set_object_stream_mode(options.object_streams);
     if let Some(mode) = options.stream_data {
@@ -273,7 +278,14 @@ fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfi
     if let Some(source) = options.copy_encryption.clone() {
         configuration.copy_encryption_parameters(source);
     }
-    configuration
+    let warning_count = configuration.normalize_encryption_passwords(options.password_mode)?;
+    for _ in 0..warning_count {
+        emit_logger_error(format!(
+            "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
+            progname()
+        ));
+    }
+    Ok(configuration)
 }
 
 fn configure_pdf_writer<R: Read + Seek + 'static>(
@@ -282,7 +294,7 @@ fn configure_pdf_writer<R: Read + Seek + 'static>(
     linearize: bool,
     linearize_pass1: Option<&Path>,
 ) -> CliResult<()> {
-    writer_configuration(options, linearize).apply_to(writer);
+    writer_configuration(options, linearize)?.apply_to(writer);
     writer.set_linearization(linearize);
     if let Some(path) = linearize_pass1 {
         writer.set_linearization_pass1_filename(path.to_path_buf());
@@ -2050,6 +2062,8 @@ struct RecoveryArgs {
 struct PasswordArgs {
     #[command(flatten)]
     recovery: RecoveryArgs,
+    #[arg(skip)]
+    verbose: bool,
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
     password: Option<OsString>,
@@ -2276,7 +2290,13 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let args = cli_parse_from(residual_args);
+    let mut args = cli_parse_from(residual_args);
+    // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
+    // the reader owns the authentication retry boundary in flpdf. Carry the
+    // job policy through the existing PasswordArgs copy used by every open
+    // helper so the qpdf retry diagnostic is emitted before the alternate
+    // candidate is attempted.
+    args.password.verbose = args.verbose;
     validate_collate_values(&args.page_ops.collate);
     if let Err(error) = validate_keep_files_open_threshold(&args.page_ops) {
         emit_logger_error(format!("flpdf: {error}\n"));
@@ -2588,6 +2608,7 @@ fn main() {
             stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
+            password_mode: args.password.password_mode.into(),
             ..WriterOptions::default()
         };
         apply_cli_decode_level(&mut options, args.decode_level);
@@ -2690,6 +2711,7 @@ fn main() {
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
+            password_mode: args.password.password_mode.into(),
             ..WriterOptions::default()
         };
         apply_cli_decode_level(&mut options, args.decode_level);
@@ -2785,6 +2807,7 @@ fn main() {
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
+            password_mode: args.password.password_mode.into(),
             ..WriterOptions::default()
         };
         apply_cli_decode_level(&mut options, args.decode_level);
@@ -3454,7 +3477,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::ShowEncryptionKey(cmd) => {
             run_show_encryption_key(&cmd.input, cmd.repair, &cmd.password)
         }
-        Commands::Rewrite(cmd) => {
+        Commands::Rewrite(mut cmd) => {
+            // qpdf keeps --verbose on QPDFJob, so the subcommand's copy of the
+            // password arguments must carry the job policy to the reader's
+            // retry boundary exactly like the top-level path does.
+            cmd.password.verbose = cmd.verbose;
             validate_collate_values(&cmd.page_ops.collate);
             validate_keep_files_open_threshold(&cmd.page_ops)?;
             let version_options = match parse_cli_version_options(
@@ -3486,6 +3513,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
+                password_mode: cmd.password.password_mode.into(),
                 object_streams: cmd.object_streams.into(),
                 compress_streams: cmd.compress_streams.map(|mode| match mode {
                     CliYesNo::Yes => CompressStreams::Yes,
@@ -6077,7 +6105,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             no_warn,
-            writer_configuration(&options, false),
+            writer_configuration(&options, false)?,
         )?;
         // The intermediate rewrite may already have repaired the condition
         // that produced a warning in the original source (e.g. --repair's
@@ -6312,7 +6340,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             suppress_warnings,
-            writer_configuration(&options, false),
+            writer_configuration(&options, false)?,
         )?;
         // The intermediate rewrite may already have repaired the condition
         // that produced a warning on the original `pdf` (e.g. --repair's
@@ -7477,6 +7505,8 @@ fn pdf_open_options_with_password_bytes(
         password_mode: password.password_mode.into(),
         suppress_password_recovery: password.suppress_password_recovery,
         password_is_hex_key: password.password_is_hex_key,
+        verbose: password.verbose,
+        message_prefix: progname().into_bytes(),
         ..PdfOpenOptions::default()
     }
 }

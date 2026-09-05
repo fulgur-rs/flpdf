@@ -1696,6 +1696,8 @@ impl QPDFJob {
             password_mode: self.configuration.password_mode,
             suppress_password_recovery: self.configuration.suppress_password_recovery,
             password_is_hex_key: self.configuration.password_is_hex_key,
+            verbose: self.configuration.verbose,
+            message_prefix: self.message_prefix.as_bytes().to_vec(),
             ..PdfOpenOptions::default()
         }
     }
@@ -2362,6 +2364,8 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        options.verbose |= self.configuration.verbose;
+        options.message_prefix = self.message_prefix.as_bytes().to_vec();
         // qpdf's noWarn (`Config::noWarn`, `QPDFJob_config.cc:407-410`)
         // applies `pdf.setSuppressWarnings(true)` to every QPDF this job
         // opens (`QPDFJob.cc:663-665`), not just the final completion
@@ -3521,6 +3525,8 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        options.verbose |= self.configuration.verbose;
+        options.message_prefix = self.message_prefix.as_bytes().to_vec();
         // qpdf's `setQPDFOptions` applies `noWarn` to every ordinary QPDF
         // immediately after construction and before `processFile`
         // (`QPDFJob.cc:650-666,1695-1711`). Preserve an explicit caller
@@ -3568,6 +3574,12 @@ impl QPDFJob {
         self.set_input_name_bytes(&input_name);
         options.logger = Some(self.logger.clone());
         options.description = input_name;
+        // qpdf's createQPDF reaches doProcess for every command, including
+        // --show-encryption, so the job's verbose policy and message prefix
+        // apply to this open exactly like the ordinary path
+        // (`QPDFJob.cc:1717-1791`).
+        options.verbose |= self.configuration.verbose;
+        options.message_prefix = self.message_prefix.as_bytes().to_vec();
         // The encryption-inspection creation path is still a qpdf input
         // QPDF, so `noWarn` must be applied before authentication/parsing just
         // like the ordinary `doProcessOnce` path.
@@ -3888,6 +3900,84 @@ mod tests {
                 PdfOpenOptions::default(),
             )
             .is_ok());
+    }
+
+    struct RecordingInfoSink {
+        bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl crate::pipeline::Pipeline for RecordingInfoSink {
+        // cov:ignore-start: the logger never queries an info sink's identifier
+        fn identifier(&self) -> &str {
+            "recording info sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            self.bytes.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        // cov:ignore-start: the logger does not finish an info sink during an open
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    /// qpdf's `createQPDF` reaches `doProcess` for `--show-encryption` too,
+    /// so the job's verbose policy and message prefix govern the password
+    /// retry diagnostic on the encryption-inspection open exactly as on the
+    /// ordinary open (`QPDFJob.cc:1717-1791`).
+    #[test]
+    fn open_for_encryption_inspection_applies_the_job_verbose_policy_and_prefix() {
+        let mut source = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let mut writer = crate::PdfWriter::new(&mut source);
+        writer.set_encryption_parameters(crate::EncryptParams::v4_aes128(
+            b"caf\xe9".to_vec(),
+            b"owner".to_vec(),
+        ));
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("encrypt fixture");
+        let encrypted = writer.get_buffer().expect("encrypted bytes");
+
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = crate::QPDFLogger::create();
+        logger.set_info(Some(crate::pipeline::PipelineHandle::new(
+            RecordingInfoSink {
+                bytes: std::sync::Arc::clone(&bytes),
+            },
+        )));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.configuration.verbose = true;
+        job.set_message_prefix("job");
+
+        let pdf = job
+            .open_for_encryption_inspection(
+                Cursor::new(encrypted),
+                "input.pdf",
+                PdfOpenOptions {
+                    password: "caf\u{e9}".as_bytes().to_vec(),
+                    ..PdfOpenOptions::default()
+                },
+            )
+            .expect("qpdf-compatible password recovery authenticates");
+        drop(pdf);
+
+        let output = bytes.lock().unwrap();
+        assert!(
+            output.starts_with(b"job: supplied password didn't work; trying other"),
+            "the inspection open must emit the job-prefixed retry line: {:?}",
+            String::from_utf8_lossy(&output) // cov:ignore: assertion failure message
+        );
     }
 
     /// `--password-is-hex-key` authentication intentionally leaves both

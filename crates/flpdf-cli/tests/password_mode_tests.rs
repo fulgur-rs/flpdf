@@ -35,6 +35,139 @@ fn encrypted_fixture_with_password(password: &[u8]) -> Vec<u8> {
     writer.get_buffer().unwrap()
 }
 
+fn encrypted_v4_fixture_with_password(password: &[u8]) -> Vec<u8> {
+    let input_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let input = fs::read(input_path).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(input)).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(
+        password.to_vec(),
+        b"owner".to_vec(),
+    ));
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    writer.get_buffer().unwrap()
+}
+
+#[test]
+fn verbose_password_recovery_reports_the_qpdf_retry_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("encrypted.pdf");
+    fs::write(&input, encrypted_v4_fixture_with_password(b"caf\xe9")).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--verbose", "--password=café"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    let message = format!(
+        "flpdf: supplied password didn't work; trying other passwords based on interpreting password with different string encodings{EOL}"
+    )
+    .into_bytes();
+
+    assert!(output.status.success());
+    assert_eq!(
+        combined
+            .windows(message.len())
+            .filter(|window| *window == message.as_slice())
+            .count(),
+        1,
+        "qpdf retry message must be emitted exactly once: {:?}",
+        String::from_utf8_lossy(&combined)
+    );
+}
+
+#[test]
+fn rewrite_verbose_password_recovery_reports_the_qpdf_retry_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("encrypted.pdf");
+    let output_path = temp.path().join("out.pdf");
+    fs::write(&input, encrypted_v4_fixture_with_password(b"caf\xe9")).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--verbose", "--password=café"])
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    let message = format!(
+        "flpdf: supplied password didn't work; trying other passwords based on interpreting password with different string encodings{EOL}"
+    )
+    .into_bytes();
+
+    assert!(output.status.success());
+    assert_eq!(
+        combined
+            .windows(message.len())
+            .filter(|window| *window == message.as_slice())
+            .count(),
+        1,
+        "the rewrite subcommand must carry --verbose to the retry boundary: {:?}",
+        String::from_utf8_lossy(&combined)
+    );
+}
+
+#[test]
+fn suppressed_password_recovery_does_not_report_a_retry_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("encrypted.pdf");
+    fs::write(&input, encrypted_v4_fixture_with_password(b"caf\xe9")).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-encryption",
+            "--verbose",
+            "--suppress-password-recovery",
+            "--password=café",
+        ])
+        .arg(&input)
+        .output()
+        .unwrap();
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&combined).contains("trying other"));
+}
+
+#[cfg(unix)]
+#[test]
+fn top_level_encrypt_unicode_mode_rejects_invalid_utf8_password() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = temp.path().join("encrypted.pdf");
+    let invalid_password = std::ffi::OsString::from_vec(b"bad\xff".to_vec());
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password-mode=unicode",
+            "--allow-weak-crypto",
+            "--encrypt",
+        ])
+        .arg(invalid_password)
+        .args(["owner", "128", "--"])
+        .arg(input)
+        .arg(output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    assert_eq!(
+        result.stderr,
+        b"flpdf: supplied password is not valid UTF-8\n"
+    );
+}
+
 #[test]
 fn auto_mode_authenticates_composed_nfc_password() {
     // The fixture was qpdf-encrypted with user password "café" (NFC composed).

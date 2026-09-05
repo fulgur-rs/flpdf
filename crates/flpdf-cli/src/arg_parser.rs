@@ -1,6 +1,8 @@
 use clap::Command;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::path::Path;
 
 use super::CliResult;
 
@@ -164,6 +166,7 @@ impl ArgParser {
     }
 
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
+        let args = expand_arg_files(args)?;
         let mut iter = args.into_iter();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());
@@ -291,6 +294,104 @@ impl ArgParser {
         } else {
             token
         }
+    }
+}
+
+/// Expand qpdf's one-level `@file` argument syntax before option parsing.
+///
+/// This is the responsibility of qpdf's `QPDFArgParser::handleArgFileArguments`
+/// and `readArgsFromFile` (`QPDFArgParser.cc:232-260,347-360`). Each physical
+/// line is one argument; the file is not shell-parsed and arguments read from a
+/// file are deliberately not scanned for another `@file` reference.
+fn expand_arg_files(args: Vec<OsString>) -> CliResult<Vec<OsString>> {
+    let mut iter = args.into_iter();
+    let Some(program) = iter.next() else {
+        return Err("qpdf argument vector is empty".into());
+    };
+
+    let mut expanded = Vec::new();
+    expanded.push(program);
+    for arg in iter {
+        let Some(path) = argument_file_path(&arg) else {
+            expanded.push(arg);
+            continue;
+        };
+        let Some(lines) = read_argument_file(&path)? else {
+            // qpdf treats an @path that cannot be opened as an ordinary argv
+            // token and lets normal option/positional parsing handle it.
+            expanded.push(arg);
+            continue;
+        };
+        expanded.extend(lines);
+    }
+    Ok(expanded)
+}
+
+fn argument_file_path(arg: &OsStr) -> Option<OsString> {
+    let bytes = os_bytes(arg);
+    if bytes.len() <= 1 || bytes[0] != b'@' {
+        return None;
+    }
+    Some(os_string_from_bytes(&bytes[1..]))
+}
+
+/// Read one qpdf argument file, returning `None` when its path cannot be
+/// opened. qpdf probes openability first and preserves such a token for the
+/// regular parser; an error after a successful open is propagated instead.
+fn read_argument_file(path: &OsStr) -> CliResult<Option<Vec<OsString>>> {
+    let bytes = if path == OsStr::new("-") {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes)?;
+        bytes
+    } else {
+        let mut file = match std::fs::File::open(Path::new(path)) {
+            Ok(file) => file,
+            Err(_) => return Ok(None),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        bytes
+    };
+
+    Ok(Some(
+        read_argument_file_lines(&bytes)
+            .into_iter()
+            .map(|line| os_string_from_bytes(&line))
+            .collect(),
+    ))
+}
+
+/// Match qpdf's `QUtil::read_lines_from_file(..., preserve_eol=false)`.
+fn read_argument_file_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    for &byte in bytes {
+        if byte == b'\n' {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            lines.push(std::mem::take(&mut line));
+        } else {
+            line.push(byte);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -527,6 +628,78 @@ mod tests {
 
         assert_eq!(parsed.residual_args, ["flpdf", "--qdf", "input.pdf"]);
         assert!(parsed.named_segments.is_empty());
+    }
+
+    #[test]
+    fn parser_expands_qpdf_argument_file_before_parsing() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("args");
+        std::fs::write(&path, b"--qdf\ninput.pdf\n").expect("write argument file");
+        let command = clap::Command::new("flpdf").arg(clap::Arg::new("qdf").long("qdf"));
+
+        let parsed = ArgParser::from_command(command)
+            .parse(vec!["flpdf".into(), format!("@{}", path.display())])
+            .expect("qpdf argument file should be expanded");
+
+        assert_eq!(parsed.residual_args, ["flpdf", "--qdf", "input.pdf"]);
+    }
+
+    #[test]
+    fn parser_preserves_qpdf_argument_file_line_boundaries_without_recursion() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("args");
+        std::fs::write(&path, b"--qdf\r\n\n@nested\r\nplain argument\r\n")
+            .expect("write argument file");
+        let command = clap::Command::new("flpdf").arg(clap::Arg::new("qdf").long("qdf"));
+
+        let parsed = ArgParser::from_command(command)
+            .parse(vec!["flpdf".into(), format!("@{}", path.display())])
+            .expect("qpdf argument file should be expanded");
+
+        assert_eq!(
+            parsed.residual_args,
+            ["flpdf", "--qdf", "", "@nested", "plain argument"]
+        );
+    }
+
+    #[test]
+    fn parser_keeps_an_unavailable_argument_file_as_an_original_token() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let missing = format!("@{}", directory.path().join("missing").display());
+        let command = clap::Command::new("flpdf");
+
+        let parsed = ArgParser::from_command(command)
+            .parse(vec!["flpdf".into(), missing.clone()])
+            .expect("unavailable argument file should remain a positional token");
+
+        assert_eq!(
+            parsed.residual_args,
+            vec![OsString::from("flpdf"), OsString::from(missing)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_preserves_non_utf8_argument_file_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("args");
+        std::fs::write(&path, b"input-\xff.pdf\n").expect("write argument file");
+        let command = clap::Command::new("flpdf");
+        let argfile = OsString::from_vec(format!("@{}", path.display()).into_bytes());
+
+        let parsed = ArgParser::from_command(command)
+            .parse_os(vec![OsString::from("flpdf"), argfile])
+            .expect("qpdf argument file should be expanded");
+
+        assert_eq!(
+            parsed.residual_args,
+            vec![
+                OsString::from("flpdf"),
+                OsString::from_vec(b"input-\xff.pdf".to_vec())
+            ]
+        );
     }
 
     #[test]
