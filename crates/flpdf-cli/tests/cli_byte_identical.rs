@@ -17,6 +17,7 @@
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 
 fn fixture(stem: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -53,6 +54,42 @@ fn run_cli(stem: &str, extra: &[&str]) -> Vec<u8> {
         .success();
 
     std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
+}
+
+fn qpdf_available() -> bool {
+    StdCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Run the pinned qpdf CLI for a linearized byte-parity assertion.
+fn run_qpdf(stem: &str, extra: &[&str]) -> Option<Vec<u8>> {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf is required for linearized byte-parity assertions on CI");
+        }
+        eprintln!("skipping qpdf byte-parity assertion: qpdf is not available");
+        return None;
+    }
+
+    let outdir = tempfile::tempdir().unwrap();
+    let out = outdir.path().join("out.pdf");
+    let input = fixture(stem);
+    let status = StdCommand::new("qpdf")
+        .arg("--deterministic-id")
+        .arg("--linearize")
+        .args(extra)
+        .arg(&input)
+        .arg(&out)
+        .status()
+        .expect("spawn qpdf linearized byte-parity oracle");
+    assert!(
+        status.success(),
+        "qpdf linearized byte-parity oracle failed"
+    );
+    Some(std::fs::read(&out).unwrap_or_else(|e| panic!("read qpdf output for {stem}: {e}")))
 }
 
 /// Run `flpdf rewrite --static-id <fixture> <out>` through the
@@ -119,6 +156,43 @@ fn assert_byte_identical(stem: &str, kind: &str, extra: &[&str]) {
         expected.len(),
         String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
         String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+    );
+}
+
+fn assert_linearize_newline_byte_identical(stem: &str, extra: &[&str]) {
+    let Some(expected) = run_qpdf(stem, extra) else {
+        return;
+    };
+    let actual = run_cli(stem, extra);
+    if actual == expected {
+        return;
+    }
+    let common = actual.len().min(expected.len());
+    let off = (0..common)
+        .find(|&i| actual[i] != expected[i])
+        .unwrap_or(common);
+    let lo = off.saturating_sub(24);
+    panic!(
+        "{stem} (linearize --newline-before-endstream): CLI output diverged from qpdf 11.9.0 \
+         (flpdf={} bytes, qpdf={} bytes, first diff at byte {off})\n\
+         flpdf: {:?}\nqpdf: {:?}",
+        actual.len(),
+        expected.len(),
+        String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
+        String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+    );
+}
+
+#[test]
+fn cli_one_page_linearize_newline_before_endstream_matches_qpdf() {
+    assert_linearize_newline_byte_identical("one-page", &["--newline-before-endstream"]);
+}
+
+#[test]
+fn cli_three_page_linearize_objstm_newline_before_endstream_matches_qpdf() {
+    assert_linearize_newline_byte_identical(
+        "three-page",
+        &["--object-streams=generate", "--newline-before-endstream"],
     );
 }
 
