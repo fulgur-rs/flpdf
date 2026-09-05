@@ -242,3 +242,53 @@ fn top_level_split_pages_linearizes_every_chunk_like_qpdf() {
         );
     }
 }
+
+/// `--qdf --linearize --split-pages`: qpdf clears QDF on every linearized
+/// chunk writer (`QPDFWriter.cc:2068-2080`), so `--stream-data=preserve`
+/// keeps the source stream filters. flpdf's internal memory rewrite that
+/// feeds the split must therefore not run in QDF mode either.
+#[test]
+fn top_level_qdf_linearize_split_pages_preserve_matches_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_dir = temp.path().join("qpdf");
+    let flpdf_dir = temp.path().join("flpdf");
+    std::fs::create_dir(&qpdf_dir).unwrap();
+    std::fs::create_dir(&flpdf_dir).unwrap();
+    let input = fixture("three-page.pdf");
+    let input = input.to_str().unwrap();
+    let qpdf_template = qpdf_dir.join("out.pdf");
+    let flpdf_template = flpdf_dir.join("out.pdf");
+    let args = [
+        "--static-id",
+        "--qdf",
+        "--linearize",
+        "--stream-data=preserve",
+        "--split-pages=1",
+    ];
+
+    let qpdf = run_qpdf(&[&args[..], &[input, qpdf_template.to_str().unwrap()]].concat());
+    assert_success(&qpdf, "qpdf --qdf --linearize --split-pages");
+    let flpdf = run_flpdf(&[&args[..], &[input, flpdf_template.to_str().unwrap()]].concat());
+    assert_success(&flpdf, "flpdf --qdf --linearize --split-pages");
+
+    for page in 1..=3 {
+        let qpdf_chunk = qpdf_dir.join(format!("out-{page}.pdf"));
+        let flpdf_chunk = flpdf_dir.join(format!("out-{page}.pdf"));
+        let qpdf_bytes = std::fs::read(&qpdf_chunk).unwrap();
+        assert!(
+            qpdf_bytes
+                .windows(b"/FlateDecode".len())
+                .any(|part| part == b"/FlateDecode"),
+            "qpdf chunk {page} keeps the preserved source filter"
+        );
+        assert_linearized(&flpdf_chunk, &format!("flpdf qdf linearized chunk {page}"));
+        assert_eq!(
+            std::fs::read(&flpdf_chunk).unwrap(),
+            qpdf_bytes,
+            "qdf+linearize split chunk {page} with --stream-data=preserve must match qpdf"
+        );
+    }
+}

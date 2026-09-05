@@ -411,9 +411,20 @@ fn write_qpdf_to_memory<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     output: &Path,
     options: &WriterOptions,
+    chunks_linearized: bool,
 ) -> CliResult<Vec<u8>> {
     let mut writer = PdfWriter::new(pdf);
-    configure_pdf_writer(&mut writer, options, false, None)?;
+    // qpdf's linearized writers clear QDF mode before deriving QDF's
+    // decode/uncompress defaults (`QPDFWriter.cc:2068-2080`). This memory
+    // rewrite is flpdf's internal preparation for split chunks, so when those
+    // chunks will be linearized it must not apply QDF either; otherwise a
+    // `--stream-data=preserve` chunk would lose the source filters the QDF
+    // pass decoded.
+    let intermediate = WriterOptions {
+        qdf: options.qdf && !chunks_linearized,
+        ..options.clone()
+    };
+    configure_pdf_writer(&mut writer, &intermediate, false, None)?;
     configure_cli_progress(&mut writer, output, options.progress)?;
     writer.set_output_memory()?;
     writer.write()?;
@@ -6297,7 +6308,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         options.progress = false;
     }
     if let Some(n) = split_pages.filter(|size| *size > 0) {
-        let bytes = write_qpdf_to_memory(pdf, output, &options)?;
+        let bytes = write_qpdf_to_memory(pdf, output, &options, linearize)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
@@ -6548,7 +6559,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(n) = split_pages.filter(|size| *size > 0) {
         let suppress_warnings = pdf.suppress_warnings();
-        let bytes = write_qpdf_to_memory(&mut pdf, output, &options)?;
+        let bytes = write_qpdf_to_memory(&mut pdf, output, &options, linearize)?;
         let (_, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
