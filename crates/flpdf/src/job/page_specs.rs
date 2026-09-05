@@ -1031,6 +1031,19 @@ mod tests {
         (job, bytes)
     }
 
+    #[test]
+    fn recording_info_sink_implements_the_pipeline_contract() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = RecordingInfoSink {
+            bytes: Arc::clone(&bytes),
+        };
+
+        assert_eq!(sink.identifier(), "page-spec info capture");
+        sink.write(b"probe\n").unwrap();
+        sink.finish().unwrap();
+        assert_eq!(&*bytes.lock().unwrap(), b"probe\n");
+    }
+
     fn three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open_mem_owned(
             include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
