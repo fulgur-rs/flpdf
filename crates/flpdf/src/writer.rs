@@ -1321,10 +1321,12 @@ pub(crate) struct WriterOptions {
     /// `/ID`. Like `qpdf --deterministic-id`, this yields a content-derived,
     /// run-stable `/ID` and preserves the permanent identifier.
     ///
-    /// The canonical rewrite honors this flag. It is mutually exclusive with
-    /// [`WriterOptions::static_id`] and is rejected for encrypted output (the
-    /// `/ID` feeds the encryption key, so a content-derived `/ID` would be
-    /// circular) — both matching qpdf.
+    /// The canonical rewrite honors this flag. When it is combined with
+    /// [`WriterOptions::static_id`], the static ID takes precedence for the
+    /// emitted `/ID`, matching qpdf's `QPDFWriter::generateID` check order.
+    /// Any output with `deterministic_id` enabled remains rejected for
+    /// encryption because qpdf still enables its deterministic digest pipeline
+    /// and the encryption setup generates an ID before that pipeline exists.
     ///
     /// The digest is flpdf's own scheme (a single MD5 over the body); it is
     /// **not** byte-identical to the value qpdf writes, which seeds a second MD5
@@ -1587,6 +1589,16 @@ pub(crate) struct WriterOptions {
 
     /// qpdf progress callback shared by the lifecycle bridge and the emitter.
     pub(crate) progress_reporter: Option<ProgressReporter>,
+}
+
+/// Return whether qpdf's content-derived ID branch is effective.
+///
+/// qpdf accepts both ID flags and checks `static_id` first in
+/// `QPDFWriter::generateID` (`QPDFWriter.cc:1836-1878`). Keep the two input
+/// settings independent while using this predicate wherever the writer must
+/// choose between a static ID and the deterministic digest.
+pub(crate) const fn uses_deterministic_id(options: &WriterOptions) -> bool {
+    options.deterministic_id && !options.static_id
 }
 
 /// Configure qpdf-shaped progress after the writer has completed the setup
@@ -3391,14 +3403,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
-    // cov:ignore-start: emit_canonical_pdf_inner validates this combination
-    // before dispatching to the private PCLm emitter.
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
-    // cov:ignore-end
+    let deterministic_id = uses_deterministic_id(options);
 
     let plan = pclm::Plan::build(pdf)?;
     let version = effective_pdf_version(pdf.version(), options, false, false);
@@ -3546,7 +3551,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
             })?; // cov:ignore: Plan::build guarantees the direct Catalog handle before PCLm emission; LLVM places this continuation counter on the closure exit.
             let id_handle = pdf.trailer_key_handle(b"ID");
             let source_id0 = source_permanent_id_value_handle(&id_handle);
-            let generated_id = (!options.deterministic_id)
+            let generated_id = (!deterministic_id)
                 .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
             let trailer = build_writer_trailer_handle(
                 pdf,
@@ -3555,10 +3560,10 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 Some(root),
                 options,
                 None,
-                options.deterministic_id,
+                deterministic_id,
                 generated_id.as_ref(),
             )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup.
-            if options.deterministic_id {
+            if deterministic_id {
                 let info_suffix = deterministic_id_info_suffix(pdf);
                 let mut id_writer = |out: &mut Vec<u8>| {
                     write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
@@ -3587,7 +3592,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
         Some(root) => {
             let id_handle = pdf.trailer_key_handle(b"ID");
             let source_id0 = source_permanent_id_value_handle(&id_handle);
-            let generated_id = (!options.deterministic_id)
+            let generated_id = (!deterministic_id)
                 .then(|| generate_id_handle(source_id0.as_deref(), options.static_id));
             let trailer = build_writer_trailer_handle(
                 pdf,
@@ -3596,10 +3601,10 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 None,
                 options,
                 None,
-                options.deterministic_id,
+                deterministic_id,
                 generated_id.as_ref(),
             )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
-            if options.deterministic_id {
+            if deterministic_id {
                 let info_suffix = deterministic_id_info_suffix(pdf);
                 let mut id_writer = |out: &mut Vec<u8>| {
                     write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
@@ -3636,11 +3641,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
+    let deterministic_id = uses_deterministic_id(options);
 
     // A forced sub-1.5 header suppresses object-stream generation: object
     // streams are a PDF 1.5 feature and qpdf will not emit them under a forced
@@ -3874,15 +3875,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // `/ID[0]` (preserved when well-formed) and the `/Info`-derived seed suffix.
     // qpdf reads these from `m->pdf.getTrailer()`, not the remapped output
     // trailer, so both are gathered here while `pdf` is free.
-    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
-        if options.deterministic_id {
-            let id_handle = pdf.trailer_key_handle(b"ID");
-            let id0 = source_permanent_id_value_handle(&id_handle);
-            let suffix = deterministic_id_info_suffix(pdf);
-            (id0, suffix)
-        } else {
-            (None, Vec::new())
-        };
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
+        let id_handle = pdf.trailer_key_handle(b"ID");
+        let id0 = source_permanent_id_value_handle(&id_handle);
+        let suffix = deterministic_id_info_suffix(pdf);
+        (id0, suffix)
+    } else {
+        (None, Vec::new())
+    };
 
     // ── Step 1: run the ObjStm planner ───────────────────────────────────────
     // For --encrypt: ObjStm containers encrypt as a single blob per PDF 1.7
@@ -4404,7 +4404,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // Generate qpdf's ordinary/static identifier once before either encryption
     // key derivation or trailer emission. The complete array is reused at every
     // trailer site so the emitted /ID[0] is the exact salt used by the context.
-    let generated_id = if options.deterministic_id {
+    let generated_id = if deterministic_id {
         if encrypting {
             // QPDFWriter::generateID is called by the encryption setup before
             // the deterministic MD5 pipeline can produce its data.
@@ -5318,7 +5318,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 root_handle.as_ref(),
                 options,
                 encrypt_ctx.as_ref(),
-                options.deterministic_id,
+                deterministic_id,
                 generated_id.as_ref(),
             )?; // cov:ignore: validated writer trailer construction; LLVM maps this continuation to the call setup
             let trailer_map = |object_ref: ObjectRef| {
@@ -5355,7 +5355,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // ("[<hex><hex>]") — do NOT route the trailer through the qdf
                 // dict serializer. Closing ">>" then startxref directly (no
                 // extra leading newline) to match the qpdf reference.
-                if options.deterministic_id {
+                if deterministic_id {
                     let mut id_writer = |out: &mut Vec<u8>| {
                         write_deterministic_id_inline(
                             out,
@@ -5391,7 +5391,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // (single space, not its own line) with keys sorted but /ID
                 // forced last — `trailer << /Info .. /Root .. /Size N /ID [..]
                 // >>` (verified against qpdf 11.9.0 static-id goldens).
-                if options.deterministic_id {
+                if deterministic_id {
                     let mut id_writer = |out: &mut Vec<u8>| {
                         write_deterministic_id_inline(
                             out,
@@ -5461,10 +5461,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 root_handle.as_ref(),
                 options,
                 encrypt_ctx.as_ref(),
-                options.deterministic_id,
+                deterministic_id,
                 generated_id.as_ref(),
             )?; // cov:ignore: validated xref trailer construction; LLVM maps this continuation to the call setup
-            let id = if options.deterministic_id {
+            let id = if deterministic_id {
                 plain::xref::IdPlan::Deterministic {
                     source_id0: det_id_source_id0.clone(),
                     info_suffix: det_id_info_suffix.clone(),

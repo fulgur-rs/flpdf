@@ -303,7 +303,8 @@ impl PlainWritePlan {
         }
 
         let source_id0 = live_source_id0(pdf)?;
-        let generated_id = if options.deterministic_id || options.copy_encryption.is_some() {
+        let deterministic_id = crate::writer::uses_deterministic_id(options);
+        let generated_id = if deterministic_id || options.copy_encryption.is_some() {
             None
         } else {
             Some(crate::writer::generate_id_handle(
@@ -338,10 +339,10 @@ impl PlainWritePlan {
             direct_root.as_ref(),
             options,
             None,
-            options.deterministic_id,
+            deterministic_id,
             generated_id.as_ref(),
         )?; // cov:ignore: LLVM attributes this validated trailer-call continuation to the call setup
-        let id = if options.deterministic_id {
+        let id = if deterministic_id {
             IdPlan::Deterministic {
                 source_id0,
                 info_suffix: crate::writer::deterministic_id_info_suffix(pdf),

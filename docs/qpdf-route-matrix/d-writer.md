@@ -327,7 +327,8 @@ dispatch は 2 段。まず `PdfWriter::write`（`crates/flpdf/src/writer.rs:719
 `crates/flpdf/src/writer/settings.rs:38`）を見て linearized を切り離し、非 linearized だけが
 `emit_canonical_pdf` → `emit_canonical_pdf_inner`（`crates/flpdf/src/writer.rs:3576-5439`）へ入る。
 `emit_canonical_pdf_inner` の順序は
-(1) `deterministic_id && static_id` の排他チェック →
+(1) `deterministic_id && !static_id` の effective-ID 判定（両方指定時は
+static ID を出力しつつ、deterministic の暗号化禁止は保持）→
 (2) **force<1.5 による ObjStm 抑制** →
 (3) `encrypt && copy_encryption` の排他チェック →
 (4) `/Extensions /ADBE` 注入・除去 →
