@@ -205,12 +205,8 @@ fn report_page_spec_diagnostics<R: Read + Seek>(
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<Vec<bool>> {
     let source_names: Vec<Vec<u8>> = sources.iter().map(Pdf::input_source_description).collect();
-    let mut source_order: Vec<(usize, Vec<u8>)> = source_names
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, name)| (index, name))
-        .collect();
+    let mut source_order: Vec<(usize, Vec<u8>)> =
+        source_names.iter().cloned().enumerate().collect();
     source_order.sort_by(|(left_index, left_name), (right_index, right_name)| {
         left_name
             .cmp(right_name)
