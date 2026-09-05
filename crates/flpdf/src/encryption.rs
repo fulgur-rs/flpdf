@@ -43,6 +43,16 @@ pub use keys::ObjectKeyAlg;
 pub use password::PasswordMode;
 pub use permissions::{Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig};
 
+/// Narrow a qpdf integer accessor to the signed 32-bit permission bitfield.
+///
+/// qpdf calls `static_cast<int>(getIntValue())` for `/P` in both
+/// `QPDF_encryption.cc:783` and `QPDFWriter.cc:692`. Rust's integer cast has
+/// the same low-bit narrowing semantics on the pinned Linux x86_64 target,
+/// including `4294967292` becoming `-4`.
+pub(crate) fn qpdf_permission_i32(value: i64) -> i32 {
+    value as i32
+}
+
 /// Encryption method to apply at write time.
 ///
 /// The Standard handler V/R/Length/CFM tuple is encoded as one enum

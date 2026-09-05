@@ -2669,7 +2669,7 @@ fn canonical_copy_encryption(
         )));
     }
 
-    let p = copy_integer(&src.encrypt_dict, "P")?;
+    let p = crate::encryption::qpdf_permission_i32(copy_integer(&src.encrypt_dict, "P")?);
     let o = copy_string(&src.encrypt_dict, "O")?;
     let u = copy_string(&src.encrypt_dict, "U")?;
     let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict);
@@ -2679,7 +2679,7 @@ fn canonical_copy_encryption(
         (b"V".to_vec(), ObjectHandle::integer(version)),
         (b"Length".to_vec(), ObjectHandle::integer(length_bits)),
         (b"R".to_vec(), ObjectHandle::integer(revision)),
-        (b"P".to_vec(), ObjectHandle::integer(p)),
+        (b"P".to_vec(), ObjectHandle::integer(i64::from(p))),
         (b"O".to_vec(), ObjectHandle::string(o)),
         (b"U".to_vec(), ObjectHandle::string(u)),
     ];
@@ -5863,6 +5863,36 @@ mod final_handle_writer_tests {
                 .expect("metadata flag")
                 .as_boolean(),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn copied_unsigned_permission_value_wraps_like_qpdf() {
+        let source = CopyEncryptionSource {
+            encrypt_dict: ObjectHandle::dictionary(vec![
+                (b"/V".to_vec(), ObjectHandle::integer(5)),
+                (b"/R".to_vec(), ObjectHandle::integer(6)),
+                (b"/Length".to_vec(), ObjectHandle::integer(256)),
+                (b"/P".to_vec(), ObjectHandle::integer(4_294_967_292)),
+                (b"/O".to_vec(), ObjectHandle::string(vec![1; 48])),
+                (b"/U".to_vec(), ObjectHandle::string(vec![2; 48])),
+                (b"/OE".to_vec(), ObjectHandle::string(vec![3; 32])),
+                (b"/UE".to_vec(), ObjectHandle::string(vec![4; 32])),
+                (b"/Perms".to_vec(), ObjectHandle::string(vec![5; 16])),
+            ]),
+            file_key: vec![0; 32],
+            id0: vec![0; 16],
+            object_key_alg: ObjectKeyAlg::Aes,
+        };
+        let (dictionary, _, _, _) =
+            canonical_copy_encryption(&source).expect("positive /P copy source");
+
+        assert_eq!(
+            dictionary
+                .try_get_key(b"/P")
+                .expect("copied /P")
+                .as_integer(),
+            Some(-4)
         );
     }
 
