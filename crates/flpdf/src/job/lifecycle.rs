@@ -1247,6 +1247,13 @@ pub struct QPDFJob {
     warnings_exit_zero: bool,
     progress_handler: Option<SharedProgressHandler>,
     configuration: JobConfiguration,
+    /// Whether this job created its primary document through
+    /// [`QPDFJob::create_empty_document`]. qpdf's `Config::emptyInput` keys the
+    /// page-spec source map with the empty string while `QPDF::emptyPDF`
+    /// leaves the job configuration alone (`libqpdf/QPDFJob_config.cc:27-38`,
+    /// `libqpdf/QPDF.cc:290-293`); track the factory outcome separately so a
+    /// reused job can still receive an input file afterwards.
+    empty_primary_created: bool,
 }
 
 /// Fluent configuration proxy for the qpdf `QPDFJob::Config` surface.
@@ -1315,6 +1322,7 @@ impl QPDFJob {
             warnings_exit_zero: false,
             progress_handler: None,
             configuration: JobConfiguration::default(),
+            empty_primary_created: false,
         }
     }
 
@@ -2441,10 +2449,11 @@ impl QPDFJob {
         // qpdf's `Config::emptyInput` uses the empty string as the page-spec
         // source-map key while `QPDF::emptyPDF` names the diagnostic source
         // "empty PDF" (`libqpdf/QPDFJob_config.cc:27-38`;
-        // `libqpdf/QPDF.cc:290-293`). Keep those two qpdf values distinct so
-        // page-source ordering can use the map key without changing output
-        // text.
-        self.configuration.empty_input = true;
+        // `libqpdf/QPDF.cc:290-293`). Remember the factory outcome for the
+        // page-source ordering key without touching the input configuration:
+        // `QPDF::emptyPDF` does not configure the job, so a reused job may
+        // still be given an input file afterwards.
+        self.empty_primary_created = true;
         // qpdf's `setQPDFOptions` (`QPDFJob.cc:651-665`) runs unconditionally
         // right after `QPDF` construction, before dispatching to empty,
         // JSON-input, or file-based creation (`QPDFJob.cc:1701-1710`), so
@@ -2479,7 +2488,7 @@ impl QPDFJob {
         source_index: usize,
         source_description: &[u8],
     ) -> Vec<u8> {
-        if source_index == 0 && self.configuration.empty_input {
+        if source_index == 0 && (self.configuration.empty_input || self.empty_primary_created) {
             Vec::new()
         } else {
             source_description.to_vec()
@@ -3953,6 +3962,37 @@ mod tests {
         job.config().verbose();
 
         assert!(job.verbose());
+    }
+
+    /// `QPDF::emptyPDF` is a document factory that leaves the job
+    /// configuration untouched (`libqpdf/QPDF.cc:290-293`); only
+    /// `Config::emptyInput` marks the job's input as empty. Creating an empty
+    /// document must therefore keep the job reusable for a real input while
+    /// still keying the empty primary with qpdf's empty source-map name.
+    #[test]
+    fn create_empty_document_keeps_the_input_configuration_reusable() {
+        let mut job = QPDFJob::new();
+        job.create_empty_document().expect("empty document");
+
+        assert_eq!(
+            job.page_spec_source_sort_key(0, b"empty PDF"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            job.page_spec_source_sort_key(1, b"other.pdf"),
+            b"other.pdf".to_vec()
+        );
+        assert!(
+            !job.configuration.empty_input,
+            "the factory must not configure --empty"
+        );
+        job.set_input_file("input.pdf")
+            .expect("a job that created an empty document can still take an input file");
+        assert_eq!(
+            job.page_spec_source_sort_key(0, b"input.pdf"),
+            Vec::<u8>::new(),
+            "the empty primary created earlier keeps qpdf's empty map key"
+        );
     }
 
     fn trailer_root_pdf(root: &str) -> Vec<u8> {
