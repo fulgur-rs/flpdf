@@ -3651,7 +3651,6 @@ fn parse_xref_entries(
                 return Err(Error::parse(cursor.pos, "xref stream data truncated"));
             }
 
-            let entry_offset = cursor.pos;
             let object_type = if w0 == 0 {
                 1
             } else {
@@ -3711,9 +3710,13 @@ fn parse_xref_entries(
                     registration
                         .entries
                         .insert(object_ref, XrefEntry::Free { next: 0 });
-                    let offset = stream_data_offset
-                        .unwrap_or_default()
-                        .saturating_add(entry_offset);
+                    // qpdf reports this through `damagedPDF("xref stream",
+                    // ...)`, which uses the input's last read offset
+                    // (`QPDF.cc:2625-2628`): `pipeStreamData` reads the whole
+                    // payload with one `read` from its start
+                    // (`QPDF.cc:2496-2498`), so the offset is the stream
+                    // payload start regardless of which entry is malformed.
+                    let offset = stream_data_offset.unwrap_or_default();
                     return Err(Error::parse(
                         offset,
                         format!("unknown xref stream entry type {object_type}"),
