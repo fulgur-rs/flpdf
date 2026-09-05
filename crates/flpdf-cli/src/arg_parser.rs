@@ -703,6 +703,44 @@ mod tests {
     }
 
     #[test]
+    fn parser_preserves_non_utf8_argument_file_bytes_on_every_platform() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("args");
+        std::fs::write(&path, b"input-\xff.pdf\n").expect("write argument file");
+        let command = clap::Command::new("flpdf");
+
+        let parsed = ArgParser::from_command(command)
+            .parse_os(vec![
+                OsString::from("flpdf"),
+                OsString::from(format!("@{}", path.display())),
+            ])
+            .expect("qpdf argument file should be expanded");
+
+        assert_eq!(parsed.raw_residual_args[1].as_bytes(), b"input-\xff.pdf");
+    }
+
+    #[test]
+    fn parser_preserves_non_utf8_password_bytes_inside_an_encrypt_segment() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("args");
+        std::fs::write(&path, b"--encrypt\nuser-\xff\nowner\n128\n--\n")
+            .expect("write argument file");
+        let command = clap::Command::new("flpdf");
+
+        let parsed = ArgParser::from_command(command)
+            .parse_os(vec![
+                OsString::from("flpdf"),
+                OsString::from(format!("@{}", path.display())),
+            ])
+            .expect("qpdf argument file should be expanded");
+
+        assert_eq!(
+            parsed.raw_named_segments[0].tokens[0].as_bytes(),
+            b"user-\xff"
+        );
+    }
+
+    #[test]
     fn parser_captures_raw_overlay_segment_without_feature_validation() {
         let command = clap::Command::new("flpdf");
         let parsed = ArgParser::from_command(command)
