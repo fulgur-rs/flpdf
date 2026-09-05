@@ -1141,13 +1141,14 @@ struct Cli {
 
     /// Remove an attachment by key (qpdf --remove-attachment compatible).
     ///
-    /// KEY is the name-tree key used when the attachment was added.
+    /// KEY is the name-tree key used when the attachment was added. The flag
+    /// may be repeated; keys are removed in argv order.
     #[arg(
         long = "remove-attachment",
         value_name = "KEY",
         help = "Remove the embedded file with the given key (qpdf --remove-attachment)"
     )]
-    remove_attachment: Option<OsString>,
+    remove_attachment: Vec<OsString>,
 
     /// List all embedded-file attachments (qpdf --list-attachments compatible).
     #[arg(
@@ -2640,7 +2641,7 @@ fn main() {
                     && !args.check
                     && !args.list_attachments
                     && args.show_attachment.is_none()
-                    && args.remove_attachment.is_none()
+                    && args.remove_attachment.is_empty()
                     && args.add_attachment.is_empty()
                     && args.copy_attachments_from.is_empty()
             }
@@ -2756,7 +2757,7 @@ fn main() {
         )
     } else if let Some(key) = args.show_attachment {
         run_show_attachment(args.input, args.repair, &args.password, &key, args.no_warn)
-    } else if let Some(ref key) = args.remove_attachment {
+    } else if !args.remove_attachment.is_empty() {
         let options = top_level_writer_options(
             &args,
             normalize_content,
@@ -2768,7 +2769,7 @@ fn main() {
             args.output,
             args.repair,
             &args.password,
-            key,
+            &args.remove_attachment,
             args.verbose,
             args.no_warn,
             args.remove_restrictions,
@@ -8266,7 +8267,7 @@ fn run_remove_attachment(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    key: &OsStr,
+    keys: &[OsString],
     verbose: bool,
     suppress_warnings: bool,
     remove_restrictions: bool,
@@ -8289,20 +8290,22 @@ fn run_remove_attachment(
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
-    let key = arg_parser::os_bytes(key);
-    let found = pdf.embedded_files().remove_embedded_file(&key)?;
-    if !found {
-        let mut message = b"attachment ".to_vec();
-        message.extend_from_slice(&key);
-        message.extend_from_slice(b" not found");
-        return Err(Error::SystemBytes(message).into());
-    }
+    for key in keys {
+        let key = arg_parser::os_bytes(key);
+        let found = pdf.embedded_files().remove_embedded_file(&key)?;
+        if !found {
+            let mut message = b"attachment ".to_vec();
+            message.extend_from_slice(&key);
+            message.extend_from_slice(b" not found");
+            return Err(Error::SystemBytes(message).into());
+        }
 
-    if verbose {
-        let mut message = format!("{}: removed attachment ", progname()).into_bytes();
-        message.extend_from_slice(&key);
-        message.push(b'\n');
-        logger_info(message)?;
+        if verbose {
+            let mut message = format!("{}: removed attachment ", progname()).into_bytes();
+            message.extend_from_slice(&key);
+            message.push(b'\n');
+            logger_info(message)?;
+        }
     }
 
     let normalization_warnings = if writer_options.content_normalization {
