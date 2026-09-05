@@ -659,10 +659,16 @@ fn lifecycle_4c_copy_from_repeated_donor_groups() {
     assert!(listing.contains("from-a"), "listing: {listing}");
     assert!(listing.contains("from-b"), "listing: {listing}");
 
-    for (key, payload) in [("from-a", b"donor A payload"), ("from-b", b"donor B payload")] {
+    for (key, payload) in [
+        ("from-a", b"donor A payload"),
+        ("from-b", b"donor B payload"),
+    ] {
         let extracted = CargoCommand::cargo_bin("flpdf")
             .unwrap()
-            .args([&format!("--show-attachment={key}"), output.to_str().unwrap()])
+            .args([
+                &format!("--show-attachment={key}"),
+                output.to_str().unwrap(),
+            ])
             .output()
             .unwrap();
         assert!(extracted.status.success());
