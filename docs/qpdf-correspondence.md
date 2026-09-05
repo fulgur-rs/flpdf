@@ -1393,7 +1393,7 @@ writer に適用される。一方、linearize と暗号化出力は qpdf の設
 | 組み合わせ | 排他の実装箇所 |
 |---|---|
 | QDF × ObjStm | `qdf_tests.rs:749,913,1013` — QDF preserves explicit `Preserve`/`Generate`; `Disable` keeps the classic no-ObjStm form, matching qpdf's mode-independent writer setup |
-| QDF × linearize | `flpdf-cli/src/main.rs:1466` `--qdf and --linearize cannot be used together` |
+| QDF × linearize | `libqpdf/QPDFWriter.cc:2068-2080` — linearized setup clears `qdf_mode` before deriving QDF defaults; flpdf accepts the combination and its canonical writer clears QDF in `crates/flpdf/src/writer.rs:772-773` (CLI parity: `crates/flpdf-cli/tests/cli_qdf.rs`) |
 | QDF × 暗号化出力 | `writer.rs:3135` `--encrypt / --copy-encryption-from cannot be combined with --qdf` |
 
 **残る有効な穴**: 暗号化された**入力**からの QDF 出力（復号 → QDF）、および

@@ -11,7 +11,8 @@
 //!    deterministic — see the `/ID`-line normalization in the alias test).
 //!  - `qdf-fix` repairs a hand-edited stream's `/Length` holder.
 //!  - `--qdf` forwards the explicit `--object-streams` mode without a
-//!    compatibility diagnostic; `--qdf` + `--linearize` is fatal (exit 1).
+//!    compatibility diagnostic; `--qdf` + `--linearize` is accepted and the
+//!    linearized writer drops QDF mode like qpdf.
 //!
 //! qpdf is used only as an external `--check` oracle and follows the same
 //! skip policy as `cli_object_streams_qpdf_parity.rs`: hard-fail on CI,
@@ -562,48 +563,118 @@ fn qdf_object_streams_disable_matches_qpdf() {
 }
 
 #[test]
-fn qdf_linearize_is_rejected_rewrite() {
+fn qdf_linearize_matches_qpdf_rewrite() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
-    let output = temp.path().join("out.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
 
-    Command::cargo_bin("flpdf")
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--static-id", "--qdf", "--linearize"])
+        .arg(input.path())
+        .arg(&qpdf_output)
+        .output()
+        .expect("failed to spawn qpdf");
+    assert!(qpdf.status.success(), "qpdf QDF linearization failed");
+
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
         .args([
             "rewrite",
+            "--static-id",
             "--qdf",
             "--linearize",
             input.path().to_str().unwrap(),
-            output.to_str().unwrap(),
+            flpdf_output.to_str().unwrap(),
         ])
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains(
-            "--qdf and --linearize cannot be used together",
-        ));
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf QDF linearization failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+
+    let check = qpdf_check(&flpdf_output);
+    assert!(
+        check.success(),
+        "flpdf QDF linearized output must pass qpdf --check"
+    );
+    let rendered = std::fs::read(&flpdf_output).unwrap();
+    assert!(!rendered.starts_with(b"%QDF-"));
+    assert!(!rendered
+        .windows(b"Original object ID".len())
+        .any(|window| { window == b"Original object ID" }));
+
+    #[cfg(feature = "qpdf-zlib-compat")]
+    assert_eq!(
+        rendered,
+        std::fs::read(&qpdf_output).unwrap(),
+        "rewrite --qdf --linearize must match qpdf after QDF is dropped"
+    );
 }
 
 #[test]
-fn qdf_linearize_is_rejected_top_level() {
+fn qdf_linearize_matches_qpdf_top_level() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
-    let output = temp.path().join("out.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
 
-    Command::cargo_bin("flpdf")
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--static-id", "--qdf", "--linearize"])
+        .arg(input.path())
+        .arg(&qpdf_output)
+        .output()
+        .expect("failed to spawn qpdf");
+    assert!(qpdf.status.success(), "qpdf QDF linearization failed");
+
+    let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
         .args([
+            "--static-id",
             "--qdf",
             "--linearize",
             input.path().to_str().unwrap(),
-            output.to_str().unwrap(),
+            flpdf_output.to_str().unwrap(),
         ])
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains(
-            "--qdf and --linearize cannot be used together",
-        ));
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf QDF linearization failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+
+    let check = qpdf_check(&flpdf_output);
+    assert!(
+        check.success(),
+        "flpdf QDF linearized output must pass qpdf --check"
+    );
+    let rendered = std::fs::read(&flpdf_output).unwrap();
+    assert!(!rendered.starts_with(b"%QDF-"));
+    assert!(!rendered
+        .windows(b"Original object ID".len())
+        .any(|window| { window == b"Original object ID" }));
+
+    #[cfg(feature = "qpdf-zlib-compat")]
+    assert_eq!(
+        rendered,
+        std::fs::read(&qpdf_output).unwrap(),
+        "top-level --qdf --linearize must match qpdf after QDF is dropped"
+    );
 }
 
 /// qpdf applies QDF at the final writer even when a page operation is present.
