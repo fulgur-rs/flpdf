@@ -180,6 +180,74 @@ fn apply_cli_decode_level(options: &mut WriterOptions, decode_level: Option<CliD
     }
 }
 
+/// Build the writer settings shared by top-level rewrite-shaped routes.
+///
+/// qpdf applies these settings after each top-level transformation, including
+/// `--copy-attachments-from` (`QPDFJob.cc:484-507,2847-2945`). Keeping the
+/// assembly here prevents an operation-specific writer from silently dropping
+/// a setting that the canonical rewrite path already honors.
+fn top_level_writer_options(
+    args: &Cli,
+    normalize_content: bool,
+    compression_level: Option<i32>,
+    version_options: &CliVersionOptions,
+) -> WriterOptions {
+    let mut options = WriterOptions {
+        static_id: args.static_id,
+        deterministic_id: args.deterministic_id,
+        static_aes_iv: args.static_aes_iv,
+        no_original_object_ids: args.no_original_object_ids,
+        preserve_unreferenced_objects: args.preserve_unreferenced,
+        progress: args.progress,
+        recompress_flate: args.recompress_flate,
+        compression_level,
+        object_streams: args.object_streams.into(),
+        stream_data: args.stream_data.map(Into::into),
+        content_normalization: normalize_content,
+        content_normalization_set: args.normalize_content.is_some(),
+        qdf: args.qdf,
+        newline_before_endstream: match args.newline_before_endstream {
+            CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
+            // qpdf treats `--newline-before-endstream=<value>` as the
+            // presence of its boolean option, so `=n` has the same output as
+            // `=y` in the 11.9.0 CLI.
+            CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::Yes,
+            CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
+        },
+        password_mode: args.password.password_mode.into(),
+        ..WriterOptions::default()
+    };
+    apply_cli_decode_level(&mut options, args.decode_level);
+    apply_cli_version_options(&mut options, version_options);
+
+    if let Some(ref cs) = args.compress_streams {
+        match cs.as_str() {
+            "y" => options.compress_streams = Some(CompressStreams::Yes),
+            "n" => options.compress_streams = Some(CompressStreams::No),
+            other => {
+                emit_logger_error(format!(
+                    "flpdf: --compress-streams must be y or n, got: {:?}\n",
+                    other
+                ));
+                std::process::exit(2);
+            }
+        }
+    }
+
+    apply_encryption_options(
+        &mut options,
+        args.raw_encrypt.as_deref(),
+        args.copy_encryption.as_deref(),
+        args.raw_encryption_file_password.as_deref(),
+        &args.password,
+        args.no_warn,
+    );
+    if args.decrypt {
+        options.preserve_encryption = false;
+    }
+    options
+}
+
 fn parse_compression_level(value: Option<&str>) -> CliResult<Option<i32>> {
     value.map(qpdf_selector_integer).transpose()
 }
@@ -863,6 +931,13 @@ struct Cli {
     /// `uncompress` is the same as `--compress-streams=n --decode-level=generalized`.
     #[arg(long = "stream-data", value_enum)]
     stream_data: Option<CliStreamDataMode>,
+    /// Insert a newline before each `endstream` keyword (qpdf
+    /// `--newline-before-endstream`). The `y` and `n` spellings both select
+    /// qpdf's enabled boolean setting; `never` retains the default framing.
+    #[arg(long = "newline-before-endstream", value_enum, num_args = 0..=1,
+          require_equals = true, default_missing_value = "y",
+          default_value_t = CliNewlineBeforeEndstream::Never)]
+    newline_before_endstream: CliNewlineBeforeEndstream,
     /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
     /// linearization writer's distinct pass-1 intermediate file.
     #[arg(long = "linearize-pass1")]
@@ -2530,17 +2605,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Attachment add/remove/copy operations rewrite through their own
-    // serializers before the shared rewrite branch. qpdf applies writer
-    // normalization to those outputs, but flpdf cannot yet do so without
-    // duplicating the consumer. Reject effective `y` until those serializers
-    // delegate to the shared rewrite path; list/show are read-only and remain
-    // accepted, matching qpdf.
-    if normalize_content
-        && (args.remove_attachment.is_some()
-            || !args.add_attachment.is_empty()
-            || !args.copy_attachments_from.is_empty())
-    {
+    // Attachment add/remove operations rewrite through their own serializers
+    // before the shared rewrite branch. qpdf applies writer normalization to
+    // those outputs, but flpdf cannot yet do so without duplicating the
+    // consumer. Reject effective `y` until those serializers delegate to the
+    // shared rewrite path; list/show and copy use their own supported writer
+    // boundaries, matching qpdf.
+    if normalize_content && (args.remove_attachment.is_some() || !args.add_attachment.is_empty()) {
         emit_logger_error(
             "flpdf: --normalize-content is not applied by attachment mutation operations; \
              rerun with --normalize-content=n or without the attachment operation\n",
@@ -2548,14 +2619,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Same rationale as the --normalize-content guard above: the attachment
+    // Same rationale as the --normalize-content guard above: the add/remove
     // serializers build their own minimal WriterOptions and never call
     // apply_cli_decode_level, so a non-`none` --decode-level would silently
-    // be dropped rather than applied.
+    // be dropped rather than applied. The copy route uses the full top-level
+    // WriterOptions bridge below.
     if matches!(args.decode_level, Some(level) if level != CliDecodeLevel::None)
-        && (args.remove_attachment.is_some()
-            || !args.add_attachment.is_empty()
-            || !args.copy_attachments_from.is_empty())
+        && (args.remove_attachment.is_some() || !args.add_attachment.is_empty())
     {
         emit_logger_error(
             "flpdf: --decode-level is not applied by attachment mutation operations; \
@@ -2745,21 +2815,24 @@ fn main() {
             .raw_copy_attachments_from
             .clone()
             .unwrap_or_else(|| vec![raw_os_args(&args.copy_attachments_from)]);
+        let options = top_level_writer_options(
+            &args,
+            normalize_content,
+            top_level_compression_level,
+            &top_level_version_options,
+        );
         run_copy_attachments_from(
             args.input,
             args.output,
             args.repair,
             &args.password,
             copy_groups,
-            args.deterministic_id,
-            args.static_id,
-            args.preserve_unreferenced,
-            args.progress,
-            args.recompress_flate,
-            top_level_compression_level,
             args.verbose,
             args.no_warn,
-            &top_level_version_options,
+            args.remove_restrictions,
+            args.linearize,
+            args.linearize_pass1.as_deref(),
+            options,
         )
     } else if args.linearize {
         // --linearize is incompatible with the page-extraction pipeline:
@@ -2774,53 +2847,11 @@ fn main() {
             );
             std::process::exit(1);
         }
-        let mut options = WriterOptions {
-            static_id: args.static_id,
-            deterministic_id: args.deterministic_id,
-            static_aes_iv: args.static_aes_iv,
-            no_original_object_ids: args.no_original_object_ids,
-            preserve_unreferenced_objects: args.preserve_unreferenced,
-            progress: args.progress,
-            recompress_flate: args.recompress_flate,
-            compression_level: top_level_compression_level,
-            object_streams: args.object_streams.into(),
-            stream_data: args.stream_data.map(Into::into),
-            content_normalization: normalize_content,
-            content_normalization_set: args.normalize_content.is_some(),
-            password_mode: args.password.password_mode.into(),
-            ..WriterOptions::default()
-        };
-        apply_cli_decode_level(&mut options, args.decode_level);
-        apply_cli_version_options(&mut options, &top_level_version_options);
-        // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
-        // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
-        if let Some(ref cs) = args.compress_streams {
-            match cs.as_str() {
-                "y" => options.compress_streams = Some(CompressStreams::Yes),
-                "n" => options.compress_streams = Some(CompressStreams::No),
-                other => {
-                    emit_logger_error(format!(
-                        "flpdf: --compress-streams must be y or n, got: {:?}\n",
-                        other
-                    ));
-                    std::process::exit(2);
-                }
-            }
-        }
-        // Top-level --encrypt / --copy-encryption on the --linearize
-        // alias: wire encryption onto WriterOptions (shared with the
-        // non-linearize branch below and the `rewrite` subcommand via
-        // apply_encryption_options). Without this call the linearize branch
-        // would silently drop --encrypt/--copy-encryption (WriterOptions
-        // built here is separate from the non-linearize branch's), emitting
-        // plaintext output even though the user asked for encryption.
-        apply_encryption_options(
-            &mut options,
-            args.raw_encrypt.as_deref(),
-            args.copy_encryption.as_deref(),
-            args.raw_encryption_file_password.as_deref(),
-            &args.password,
-            args.no_warn,
+        let options = top_level_writer_options(
+            &args,
+            normalize_content,
+            top_level_compression_level,
+            &top_level_version_options,
         );
         let result = run_rewrite(
             args.input,
@@ -2972,55 +3003,11 @@ fn main() {
             }
         }
     } else {
-        let mut options = WriterOptions {
-            static_id: args.static_id,
-            deterministic_id: args.deterministic_id,
-            static_aes_iv: args.static_aes_iv,
-            no_original_object_ids: args.no_original_object_ids,
-            preserve_unreferenced_objects: args.preserve_unreferenced,
-            progress: args.progress,
-            recompress_flate: args.recompress_flate,
-            compression_level: top_level_compression_level,
-            object_streams: args.object_streams.into(),
-            stream_data: args.stream_data.map(Into::into),
-            content_normalization: normalize_content,
-            content_normalization_set: args.normalize_content.is_some(),
-            qdf: args.qdf,
-            password_mode: args.password.password_mode.into(),
-            ..WriterOptions::default()
-        };
-        apply_cli_decode_level(&mut options, args.decode_level);
-        apply_cli_version_options(&mut options, &top_level_version_options);
-        // Top-level `--qdf` is an alias of `rewrite --qdf`; both configure the
-        // same canonical qpdf writer.
-        // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
-        // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
-        if let Some(ref cs) = args.compress_streams {
-            match cs.as_str() {
-                "y" => options.compress_streams = Some(CompressStreams::Yes),
-                "n" => options.compress_streams = Some(CompressStreams::No),
-                other => {
-                    emit_logger_error(format!(
-                        "flpdf: --compress-streams must be y or n, got: {:?}\n",
-                        other
-                    ));
-                    std::process::exit(2);
-                }
-            }
-        }
-        // Top-level --encrypt / --copy-encryption: wire encryption onto
-        // WriterOptions (shared with the `rewrite` surface via
-        // apply_encryption_options). Parse / donor-open errors exit 2. The
-        // page-op pipeline does not thread either option, so
-        // the `else if page_ops_active` arm above already rejects them; this is
-        // the non-page-op branch, so no further page-op guard is needed here.
-        apply_encryption_options(
-            &mut options,
-            args.raw_encrypt.as_deref(),
-            args.copy_encryption.as_deref(),
-            args.raw_encryption_file_password.as_deref(),
-            &args.password,
-            args.no_warn,
+        let options = top_level_writer_options(
+            &args,
+            normalize_content,
+            top_level_compression_level,
+            &top_level_version_options,
         );
         run_rewrite(
             args.input,
@@ -8395,15 +8382,12 @@ fn run_copy_attachments_from(
     repair: bool,
     password: &PasswordArgs,
     groups: Vec<Vec<Vec<u8>>>,
-    deterministic_id: bool,
-    static_id: bool,
-    preserve_unreferenced: bool,
-    progress: bool,
-    recompress_flate: bool,
-    compression_level: Option<i32>,
     verbose: bool,
     suppress_warnings: bool,
-    version_options: &CliVersionOptions,
+    remove_restrictions: bool,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    writer_options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
@@ -8421,6 +8405,13 @@ fn run_copy_attachments_from(
     let mut pdf = job
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    pdf.set_suppress_warnings(suppress_warnings);
+    let was_encrypted = pdf.is_encrypted();
+    let had_signatures = if remove_restrictions {
+        AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?
+    } else {
+        false
+    };
 
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
@@ -8465,27 +8456,40 @@ fn run_copy_attachments_from(
         .collect::<Vec<_>>();
     job.copy_attachments_many(&mut pdf, &mut sources)?;
 
-    let mut writer_options = WriterOptions {
-        deterministic_id,
-        static_id,
-        preserve_unreferenced_objects: preserve_unreferenced,
-        progress,
-        recompress_flate,
-        compression_level,
-        ..WriterOptions::default()
+    // Content normalization is a writer option in qpdf, but the CLI's shared
+    // prepass also owns its diagnostic collection. Run it after attachments
+    // have been copied so the target page graph is the one normalized by the
+    // final writer.
+    let normalization_warnings = if writer_options.content_normalization {
+        normalize_page_contents(&mut pdf)?
+    } else {
+        Vec::new()
     };
-    apply_cli_version_options(&mut writer_options, version_options);
     write_with_pdf_writer(
         &mut pdf,
         &output,
         &mut standard_output,
         &writer_options,
-        false,
-        None,
+        linearize,
+        linearize_pass1,
     )?;
     if verbose && output.as_os_str() != "-" {
         job.logger()
             .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+    }
+    if remove_restrictions && was_encrypted {
+        emit_logger_error(
+            "flpdf: removed restrictions (digital-signature restrictions stripped)\n",
+        );
+    }
+    if had_signatures {
+        logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
+    }
+    for &warning in &normalization_warnings {
+        emit_content_normalization_warnings(&input, warning)?;
+    }
+    if !normalization_warnings.is_empty() {
+        job.record_warnings();
     }
     job.record_document_warnings(&pdf);
     finish_job_exit_status(job.complete(true)?)
