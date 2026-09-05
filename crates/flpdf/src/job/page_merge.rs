@@ -1247,9 +1247,11 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
 
 #[cfg(test)]
 mod tests {
+    use super::super::resource_pruning::RemoveUnreferencedResources;
     use super::{
         collect_retained_widget_refs, discover_primary_acroform, field_kid_refs, merge_documents,
-        merge_documents_with_resource_decisions_and_preserve_primary, resolve_field_partial_name,
+        merge_documents_with_resource_decisions_and_preserve_primary,
+        merge_documents_with_resource_mode_and_preserve_primary, resolve_field_partial_name,
         rewrite_field_kids, trim_field_kids, unique_field_name, widget_page_ref, MergeInput,
         DEFAULT_MAX_ACROFORM_DEPTH,
     };
@@ -1376,6 +1378,33 @@ mod tests {
             Err(Error::Internal(message))
                 if message == "page merge resource decisions do not match source count"
         ));
+    }
+
+    #[test]
+    fn resource_mode_wrapper_evaluates_yes_and_auto_decisions() {
+        for mode in [
+            RemoveUnreferencedResources::Yes,
+            RemoveUnreferencedResources::Auto,
+        ] {
+            let mut source = Pdf::open_mem_owned(build_pdf(
+                &[
+                    (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                    (2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+                    (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                ],
+                1,
+            ))
+            .expect("one-page source");
+            let mut inputs = [MergeInput {
+                source: &mut source,
+                pages: vec![0],
+            }];
+
+            let mut merged =
+                merge_documents_with_resource_mode_and_preserve_primary(&mut inputs, mode, false)
+                    .expect("resource mode merge");
+            assert_eq!(crate::pages::page_refs(&mut merged).unwrap().len(), 1);
+        }
     }
 
     #[test]

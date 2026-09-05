@@ -3922,6 +3922,14 @@ mod tests {
     use crate::{Error, PdfOpenOptions};
     use std::io::Cursor;
 
+    #[test]
+    fn config_verbose_enables_the_job_verbose_setting() {
+        let mut job = QPDFJob::new();
+        job.config().verbose();
+
+        assert!(job.verbose());
+    }
+
     fn trailer_root_pdf(root: &str) -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let xref_start = bytes.len();
