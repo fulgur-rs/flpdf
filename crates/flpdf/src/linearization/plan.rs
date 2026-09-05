@@ -1377,22 +1377,25 @@ impl LinearizationPlan {
                 part2_objects.push(*obj_ref);
             }
         }
-        // qpdf packs first-half shared objects in ascending source object number
-        // order (observed against qpdf 11.9.0: ObjStm member ordering matches
-        // source number order, not the BFS discovery order which follows dict key
-        // alphabetical order). Mirror the same sort used in `fold_pages_tree_into_first_half`.
-        part3_objects.sort_unstable_by_key(|r| r.number);
+        // qpdf packs first-half shared objects in the source/discovery order
+        // assigned by the input document. A page-selection merge records that
+        // order separately because its fresh target references no longer carry
+        // the primary source's object numbers; ordinary parsed documents fall
+        // back to their live references. This is also the order used by qpdf's
+        // `std::set<QPDFObjGen>` part-6 packing after the primary/foreign
+        // provenance has been accounted for.
+        part3_objects.sort_unstable_by_key(|r| pdf.linearization_object_order_key(*r));
         // qpdf numbers the first-page section (qpdf part6) as: the first-page
         // object first, then the remaining first-page-private objects in
-        // ascending source object number order — NOT compute_closure's
-        // /Resources-DFS discovery order, which only coincides when resource
-        // streams are numbered below the page's content stream. Pin the page
-        // dict first (qpdf pushes the first-page object explicitly) and sort the
-        // rest by source number. Oracle: qpdf 11.9.0 on a 1-page image fixture
-        // orders Page, Contents, Image when Contents < Image by source number
-        // (and Page, Image, Contents when Image < Contents), in both generate
-        // and disable mode.
-        part2_objects.sort_unstable_by_key(|r| (Some(*r) != first_page_ref, r.number));
+        // source/discovery order. Pin the page dict first (qpdf pushes the
+        // first-page object explicitly), then apply that order key rather than
+        // the fresh merge target's allocation number.
+        part2_objects.sort_unstable_by_key(|r| {
+            (
+                Some(*r) != first_page_ref,
+                pdf.linearization_object_order_key(*r),
+            )
+        });
 
         // ----------------------------------------------------------------
         // Step 6: build Part 4 by removing Part 2 and Part 3 objects.
