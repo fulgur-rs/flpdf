@@ -8206,6 +8206,11 @@ fn run_add_attachment(
         })
         .collect::<CliResult<Vec<_>>>()?;
 
+    // Reserve standard output before opening the input, like qpdf's
+    // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
+    // info lines go to stderr when the PDF goes to stdout.
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
@@ -8216,8 +8221,6 @@ fn run_add_attachment(
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     pdf.set_suppress_warnings(suppress_warnings);
-
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
 
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
@@ -8274,13 +8277,14 @@ fn run_remove_attachment(
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
 
-    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
-
-    // qpdf switches the logger to "save to standard output" before any
-    // transformation runs (`QPDFJob.cc:625`), so a `--verbose` info line
-    // emitted below lands on stderr when the PDF itself goes to stdout.
+    // qpdf switches the logger to "save to standard output" before it opens
+    // the input (`QPDFJob.cc:625`), so every `--verbose` info line — the
+    // password-encoding recovery notice emitted while opening as well as the
+    // removal report below — lands on stderr when the PDF goes to stdout.
     let mut standard_output = prepare_pdf_standard_output(&output)?;
     let creates_output = standard_output.is_none();
+
+    let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
 
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
@@ -8398,6 +8402,11 @@ fn run_copy_attachments_from(
         .map(parse_copy_attachments_segment)
         .collect::<CliResult<Vec<_>>>()?;
 
+    // Reserve standard output before opening the target, like qpdf's
+    // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
+    // info lines go to stderr when the PDF goes to stdout.
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
@@ -8411,8 +8420,6 @@ fn run_copy_attachments_from(
     if remove_restrictions {
         let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
-
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
 
     // Open each source with its own password (independent of the target's).
     // Retain the command-wide open policy so qpdf's recovery/xref controls
