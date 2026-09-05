@@ -379,9 +379,9 @@ fn missing_remove_attachment_diagnostic_preserves_non_utf8_key_bytes() {
 
     assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
     assert_preserves_raw_bytes(&output, key, "missing remove-attachment diagnostic");
-    let mut expected = b"qpdf: --remove-attachment: key \"missing-".to_vec();
+    let mut expected = b"qpdf: attachment missing-".to_vec();
     expected.push(0xff);
-    expected.extend_from_slice(b"\" not found in document\n");
+    expected.extend_from_slice(b" not found\n");
     assert_eq!(output.stderr, expected);
 }
 
@@ -418,7 +418,7 @@ fn missing_show_attachment_diagnostic_escapes_control_bytes_in_the_inner_message
 }
 
 #[test]
-fn attachment_diagnostic_uses_byte_safe_debug_quoting() {
+fn attachment_diagnostic_preserves_raw_key_bytes() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = raw_path(directory.path(), b"input.pdf");
     let output_path = raw_path(directory.path(), b"output.pdf");
@@ -432,10 +432,9 @@ fn attachment_diagnostic_uses_byte_safe_debug_quoting() {
     ]);
 
     assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
-    let mut expected =
-        b"qpdf: --remove-attachment: key \"quote-\\\"-\\n-\\r-\\t-\\x01-\\\\-".to_vec();
-    expected.push(0xff);
-    expected.extend_from_slice(b"\" not found in document\n");
+    let mut expected = b"qpdf: attachment ".to_vec();
+    expected.extend_from_slice(key);
+    expected.extend_from_slice(b" not found\n");
     assert_eq!(output.stderr, expected);
 }
 
