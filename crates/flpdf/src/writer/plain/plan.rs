@@ -1274,6 +1274,7 @@ mod tests {
             )
             .unwrap();
         let mut options = write_options(ObjectStreamMode::Disable);
+        options.static_id = false;
         options.deterministic_id = true;
 
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
@@ -1605,6 +1606,7 @@ mod tests {
         let mut pdf =
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let mut options = write_options(ObjectStreamMode::Disable);
+        options.static_id = false;
         options.deterministic_id = true;
 
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
