@@ -994,7 +994,7 @@ mod tests {
 
     // A key shorter than the qpdf provider's 16-byte fallback input is
     // rejected because qpdf's provider reads beyond the raw key buffer there.
-    // That undefined behavior is recorded as a qpdf-deviation marker above.
+    // That undefined behavior is recorded by the deviation marker above.
     #[test]
     fn a_key_shorter_than_the_provider_fallback_is_rejected() {
         let mut sink = Buffer::new("ciphertext", None);
