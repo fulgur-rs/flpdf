@@ -28,6 +28,11 @@
 //! `first_object_offset`) is adjusted by qpdf's rule: the hint table locations
 //! disregard the hint stream itself, so any raw offset `>= H_offset` has
 //! `H_length` added before display (qpdf's `adjusted_offset`).
+//!
+//! The count-driven hint vectors intentionally follow qpdf's incremental
+//! push/read order. There is no count-vs-remaining-bits resource preflight;
+//! malformed input therefore has qpdf's proportional resource exposure when
+//! preceding columns have zero width (`QPDF_linearization.cc:19-60`).
 
 use super::check::{
     check_linearization_parameters, check_linearization_warnings, load_hint_stream_with_damage,
@@ -303,6 +308,9 @@ pub(crate) fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOff
         e.nshared_objects = bits.get_bits_i32(nbits_nshared_objects as usize)? as u32;
     }
     bits.skip_to_next_byte()?;
+    // qpdf enters both nested columns directly. In particular, a zero-width
+    // read intentionally consumes no bits, so do not add a count-vs-stream
+    // resource guard here (`QPDF_linearization.cc:353-366`).
     // (d) shared_identifiers — nested: per page, read that page's count
     for e in entries.iter_mut() {
         for _ in 0..e.nshared_objects {
@@ -1673,6 +1681,31 @@ mod tests {
     }
 
     #[test]
+    fn shared_object_zero_width_column_defers_to_bit_stream_overflow() {
+        // A 24-byte header (byte-aligned) claims entries but has no column bytes
+        // following. qpdf allocates the declared entries, then lets the first
+        // one-bit signature read report the actual bit-stream overflow.
+        let buf = bit_writer_bytes(|writer| {
+            writer.write_bits(0, 32)?; // first_shared_obj
+            writer.write_bits(0, 32)?; // first_shared_offset
+            writer.write_bits(0, 32)?; // nshared_first_page
+            writer.write_bits(32, 32)?; // nshared_total
+            writer.write_bits(0, 16)?; // nbits_nobjects
+            writer.write_bits(0, 32)?; // min_group_length
+            writer.write_bits(0, 16) // nbits_delta_group_length
+        });
+        assert_eq!(buf.len(), 24, "header is exactly 24 bytes, no column data");
+
+        let result = read_h_shared_object(&buf);
+        assert!(result.is_err(), "signature column must exhaust input");
+        let error = result.err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "malformed linearization data: overflow reading bit stream: wanted = 1; available = 0"
+        );
+    }
+
+    #[test]
     fn page_offset_oversized_nshared_objects_reports_bitstream_exhaustion() {
         // The first shared identifier read is the qpdf failure boundary. Use
         // a one-bit identifier column so the large count cannot be mistaken
@@ -1708,6 +1741,43 @@ mod tests {
             Err(ShowLinearizationError::Malformed { message })
                 if message == "overflow reading bit stream: wanted = 1; available = 0"
         ));
+    }
+
+    #[test]
+    fn page_offset_zero_width_shared_columns_keep_declared_entries() {
+        // A single-page table whose shared-reference column claims entries, but
+        // whose identifier/numerator widths are zero. qpdf keeps the declared
+        // number of zero-valued entries because getBits(0) does not consume.
+        let buf = bit_writer_bytes(|writer| {
+            // 13-field header (5×32 + 8×16 = 36 bytes, byte-aligned).
+            writer.write_bits(0, 32)?; // min_nobjects
+            writer.write_bits(0, 32)?; // first_page_offset
+            writer.write_bits(0, 16)?; // nbits_delta_nobjects = 0
+            writer.write_bits(0, 32)?; // min_page_length
+            writer.write_bits(0, 16)?; // nbits_delta_page_length = 0
+            writer.write_bits(0, 32)?; // min_content_offset
+            writer.write_bits(0, 16)?; // nbits_delta_content_offset = 0
+            writer.write_bits(0, 32)?; // min_content_length
+            writer.write_bits(0, 16)?; // nbits_delta_content_length = 0
+            writer.write_bits(32, 16)?; // nbits_nshared_objects = 32
+            writer.write_bits(0, 16)?; // nbits_shared_identifier = 0
+            writer.write_bits(0, 16)?; // nbits_shared_numerator = 0
+            writer.write_bits(1, 16)?; // shared_denominator
+                                       // cols (a)/(b): 0-bit, nothing written. col (c):
+                                       // nshared_objects for the single page.
+            writer.write_bits(32, 32)?;
+            writer.flush()
+        });
+        assert_eq!(
+            buf.len(),
+            40,
+            "36-byte header + 4-byte nshared_objects column"
+        );
+
+        let decoded = read_h_page_offset(&buf, 1).expect("zero-width columns are qpdf-valid");
+        assert_eq!(decoded.entries[0].nshared_objects, 32);
+        assert_eq!(decoded.entries[0].shared_identifiers, vec![0; 32]);
+        assert_eq!(decoded.entries[0].shared_numerators, vec![0; 32]);
     }
 
     // -----------------------------------------------------------------------
