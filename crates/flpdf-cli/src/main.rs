@@ -2591,7 +2591,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let normalize_content = normalize_content_enabled(args.normalize_content, args.qdf);
+    // QPDFWriter::doWriteSetup clears QDF before deriving QDF's implicit
+    // normalization defaults for linearized output (`QPDFWriter.cc:2068-2080`).
+    // Keep an explicit --normalize-content value, but do not synthesize the
+    // QDF default when --linearize will clear QDF in the writer.
+    let normalize_content =
+        normalize_content_enabled(args.normalize_content, args.qdf && !args.linearize);
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
     // for deterministic test/parity output. The native `rewrite --static-id`
@@ -2601,18 +2606,6 @@ fn main() {
     // succeeds and before any rewrite work, so the warning never precedes a
     // usage error yet is always visible.
     warn_if_static_id(&args);
-
-    // Top-level `--qdf --linearize` is rejected here, before the dispatch
-    // chain. The `else if args.linearize` branch (below) wins over the
-    // default rewrite branch, so deferring this check into the rewrite branch
-    // would let the linearize path run while silently dropping --qdf. QDF is
-    // inherently non-linearized; mirror the rewrite/--linearize rejection.
-    // (The `Commands::Rewrite` arm performs the
-    // equivalent check for the subcommand form.)
-    if args.qdf && args.linearize {
-        emit_logger_error("flpdf: --qdf and --linearize cannot be used together\n");
-        std::process::exit(1);
-    }
 
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
     // `preprocess_qpdf_args`, so a stripped group leaves no trace for the
@@ -3651,15 +3644,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     std::process::exit(1);
                 }
             };
-            // QDF is inherently non-linearized; reject the combination with a
-            // fatal diagnostic, mirroring the rewrite/--linearize rejection
-            // above. (The top-level `--qdf --linearize` form is
-            // rejected earlier in main(), before the linearize branch wins
-            // the dispatch chain.)
-            if cmd.qdf && cmd.linearize {
-                emit_logger_error("flpdf: --qdf and --linearize cannot be used together\n");
-                std::process::exit(1);
-            }
             let mut options = WriterOptions {
                 static_id: cmd.static_id,
                 deterministic_id: cmd.deterministic_id,
