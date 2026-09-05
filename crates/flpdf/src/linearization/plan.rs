@@ -663,7 +663,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                 // Sort by original object number: qpdf assigns first-page slots in
                 // ascending original-number order regardless of dict key alphabetical
                 // order (empirically verified; see discriminator-fixture analysis).
-                refs_raw.sort_by_key(|(r, _)| r.number);
+                refs_raw.sort_by_key(|(r, _)| pdf.linearization_object_order_key(*r));
                 for (r, va) in refs_raw {
                     if !visited.contains(&r) {
                         queue.push_back((r, va));
@@ -686,7 +686,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
             // Same number-ordering rule as the page-dict loop above: qpdf enqueues
             // a non-page object's children in ascending original-object-number order,
             // not in dict-key (alphabetical) order.
-            refs.sort_by_key(|(r, _)| r.number);
+            refs.sort_by_key(|(r, _)| pdf.linearization_object_order_key(*r));
             for (r, va) in refs {
                 if !visited.contains(&r) {
                     queue.push_back((r, va));
@@ -703,8 +703,12 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
     // (b) Page(orig 10) with Content(orig 3) → Page stays first despite having a
     //     higher original number, so a fully-global sort would misplace it.
     // Sorting only order[1..] satisfies both invariants simultaneously.
+    // A multi-source page-selection target carries qpdf's source/discovery
+    // order separately from its fresh references (see
+    // `Pdf::linearization_object_order_key`); ordinary documents resolve to
+    // the same ascending original-number order as before.
     if order.len() > 1 {
-        order[1..].sort_by_key(|r| r.number);
+        order[1..].sort_by_key(|r| pdf.linearization_object_order_key(*r));
     }
     // Deferred resurrectable refs: now that the full BFS is complete and
     // seen_as_array is exhaustive, admit those that turn out to be reachable
