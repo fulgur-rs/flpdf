@@ -6,7 +6,7 @@
 //! ordinary page-inspection dispatch are layered on top of this state; write,
 //! page-transform, and remaining inspection consumers are later job slices.
 
-use super::attachments::{AttachmentAddOptions, AttachmentCopyOptions};
+use super::attachments::{AttachmentAddOptions, AttachmentCopyOptions, AttachmentCopySource};
 use super::image_optimization::{optimize_images, ImageOptimizationOptions};
 use super::json::{JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 use super::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
@@ -2940,18 +2940,27 @@ impl QPDFJob {
 
         let mut attachment_sources = Vec::with_capacity(configuration.attachments_to_copy.len());
         for copy in &configuration.attachments_to_copy {
-            let mut source = self.open_job_source(&copy.path, &copy.password)?;
-            self.copy_attachments(
-                pdf,
-                &mut source,
-                &AttachmentCopyOptions {
+            let source = self.open_job_source(&copy.path, &copy.password)?;
+            attachment_sources.push((
+                source,
+                AttachmentCopyOptions {
                     path: copy.path.clone(),
                     prefix: copy.prefix.clone(),
                     verbose: configuration.verbose,
                 },
-            )?; // cov:ignore: llvm-cov attributes this successful attachment copy continuation to its opening call lines
-            attachment_sources.push(source);
+            ));
         }
+        // qpdf copies from every configured donor in one pass and reports the
+        // conflicting keys once after the last donor (`QPDFJob.cc:2089-2135`).
+        let mut copy_sources = attachment_sources
+            .iter_mut()
+            .map(|(source, options)| AttachmentCopySource {
+                source,
+                options: options.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.copy_attachments_many(pdf, &mut copy_sources)?;
+        drop(copy_sources);
 
         if configuration.check
             || configuration.show_npages

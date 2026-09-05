@@ -254,6 +254,12 @@ impl QPDFJob {
         R1: Read + Seek + 'static,
         R2: Read + Seek + 'static,
     {
+        // qpdf's sole caller only invokes `copyAttachments` when
+        // `attachments_to_copy` is non-empty (`QPDFJob.cc:2245-2247`); an
+        // empty batch is a no-op there, so no page-mode change happens.
+        if sources.is_empty() {
+            return Ok(());
+        }
         target.set_logger(self.logger());
         self.set_attachment_page_mode(target)?;
 
@@ -1515,6 +1521,25 @@ mod tests {
         assert!(
             info.contains("  attachment.txt -> src-attachment.txt\n"),
             "info was: {info:?}"
+        );
+    }
+
+    #[test]
+    fn copy_attachments_many_with_no_sources_leaves_the_target_untouched() {
+        let mut target =
+            Pdf::open(Cursor::new(minimal_fixture_bytes())).expect("open target fixture");
+        let mut job = QPDFJob::new();
+        let mut sources: [AttachmentCopySource<'_, Cursor<Vec<u8>>>; 0] = [];
+
+        job.copy_attachments_many(&mut target, &mut sources)
+            .expect("an empty donor batch is a no-op");
+
+        let root = target.root_handle().expect("target root");
+        assert!(
+            root.try_get_key(b"/PageMode")
+                .expect("PageMode lookup")
+                .is_null(),
+            "qpdf never reaches copyAttachments for an empty configuration"
         );
     }
 

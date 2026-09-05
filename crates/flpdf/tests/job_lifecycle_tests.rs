@@ -1871,6 +1871,82 @@ fn json_job_parser_accepts_all_covered_qpdf_handler_shapes() {
 }
 
 #[test]
+fn json_job_copies_attachments_from_every_donor_before_reporting_conflicts() {
+    // qpdf's copyAttachments visits every configured donor and reports the
+    // conflicting keys once after the last one (QPDFJob.cc:2089-2135), so a
+    // conflict in the first donor must not stop the second from being
+    // processed and listed.
+    let tempdir = tempfile::tempdir().unwrap();
+    let minimal = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+    )
+    .unwrap();
+    let write_with_attachment = |name: &str| -> std::path::PathBuf {
+        let payload = tempdir.path().join(format!("{name}.bin"));
+        std::fs::write(&payload, name.as_bytes()).unwrap();
+        let mut job = QPDFJob::new();
+        let mut pdf = job
+            .open(
+                Cursor::new(minimal.clone()),
+                "fixture.pdf",
+                PdfOpenOptions::default(),
+            )
+            .unwrap();
+        job.add_attachments(
+            &mut pdf,
+            &[flpdf::job::AttachmentAddOptions {
+                path: payload,
+                key: b"shared".to_vec(),
+                filename: b"shared".to_vec(),
+                mimetype: None,
+                description: None,
+                creation_date: None,
+                modification_date: None,
+                replace: false,
+                verbose: false,
+            }],
+        )
+        .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+        let path = tempdir.path().join(format!("{name}.pdf"));
+        std::fs::write(&path, writer.get_buffer().unwrap()).unwrap();
+        path
+    };
+    let target = write_with_attachment("target");
+    let donor_a = write_with_attachment("donor-a");
+    let donor_b = write_with_attachment("donor-b");
+    let output = tempdir.path().join("output.pdf");
+
+    let (logger, errors) = logger_with_error_sink();
+    logger.set_info(Some(logger.discard()));
+    logger.set_warn(Some(logger.discard()));
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(&format!(
+        r#"{{"inputFile":"{}","outputFile":"{}","copyAttachmentsFrom":[{{"file":"{}"}},{{"file":"{}"}}]}}"#,
+        target.display(),
+        output.display(),
+        donor_a.display(),
+        donor_b.display()
+    ))
+    .unwrap();
+
+    assert_eq!(job.run().unwrap(), flpdf::job::JobExitCode::Error);
+    let message = String::from_utf8_lossy(&errors.lock().unwrap().bytes).into_owned();
+    assert!(
+        message.contains("donor-a.pdf, key: shared")
+            && message.contains("donor-b.pdf, key: shared"),
+        "both donors must be processed before the aggregate error: {message}"
+    );
+    assert!(
+        !output.exists(),
+        "a conflicting copy must not write the output"
+    );
+}
+
+#[test]
 fn json_job_run_covers_update_page_labels_and_linearized_writer_stages() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/json-input/complete.json");
