@@ -8641,8 +8641,8 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_qpdf_args_refuses_to_drop_an_earlier_copy_attachments_group() {
-        let error = match preprocess_qpdf_args(strs(&[
+    fn preprocess_qpdf_args_preserves_every_copy_attachments_group() {
+        let preprocessed = preprocess_qpdf_args(strs(&[
             "flpdf",
             "--copy-attachments-from",
             "don0.pdf",
@@ -8652,13 +8652,15 @@ mod tests {
             "--",
             "in.pdf",
             "out.pdf",
-        ])) {
-            Ok(_) => panic!("a second donor group must not silently replace the first"),
-            Err(error) => error,
-        };
-        assert!(error
-            .to_string()
-            .contains("multiple donor groups are not supported yet"));
+        ]))
+        .expect("qpdf accepts repeated donor groups");
+        assert_eq!(
+            preprocessed.raw_overrides.raw_copy_attachments_from,
+            Some(vec![
+                vec![b"don0.pdf".to_vec()],
+                vec![b"don1.pdf".to_vec()],
+            ])
+        );
     }
 
     #[test]

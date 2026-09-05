@@ -593,6 +593,83 @@ fn lifecycle_4b_copy_with_prefix() {
     assert_eq!(extracted, b"prefix test content");
 }
 
+#[test]
+fn lifecycle_4c_copy_from_repeated_donor_groups() {
+    let temp = tempfile::tempdir().unwrap();
+    let donor_a_base = minimal_pdf_temp();
+    let donor_b_base = minimal_pdf_temp();
+    let target = minimal_pdf_temp();
+
+    let attachment_a = temp.path().join("donor-a.txt");
+    let attachment_b = temp.path().join("donor-b.txt");
+    std::fs::write(&attachment_a, b"donor A payload").unwrap();
+    std::fs::write(&attachment_b, b"donor B payload").unwrap();
+
+    let donor_a = temp.path().join("donor-a.pdf");
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            donor_a_base.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment_a.to_str().unwrap(),
+            "--key=from-a",
+            "--",
+            donor_a.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let donor_b = temp.path().join("donor-b.pdf");
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            donor_b_base.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment_b.to_str().unwrap(),
+            "--key=from-b",
+            "--",
+            donor_b.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = temp.path().join("repeated-copy.pdf");
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            target.path().to_str().unwrap(),
+            "--copy-attachments-from",
+            donor_a.to_str().unwrap(),
+            "--",
+            "--copy-attachments-from",
+            donor_b.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let listing = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    assert!(listing.contains("from-a"), "listing: {listing}");
+    assert!(listing.contains("from-b"), "listing: {listing}");
+
+    for (key, payload) in [("from-a", b"donor A payload"), ("from-b", b"donor B payload")] {
+        let extracted = CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args([&format!("--show-attachment={key}"), output.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(extracted.status.success());
+        assert_eq!(extracted.stdout, payload);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Matrix cell 5: metadata survives rewrite
 // Add with full metadata, then rewrite through `flpdf in.pdf out.pdf`

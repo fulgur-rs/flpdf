@@ -1481,6 +1481,50 @@ mod tests {
     }
 
     #[test]
+    fn copy_attachments_many_processes_all_sources_before_aggregating_duplicates() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut first = pdf_with_attachments(
+            dir.path(),
+            "first",
+            &[(b"first".as_slice(), b"first payload".as_slice())],
+        );
+        let mut second = pdf_with_attachments(
+            dir.path(),
+            "second",
+            &[
+                (b"first".as_slice(), b"duplicate payload".as_slice()),
+                (b"second".as_slice(), b"second payload".as_slice()),
+            ],
+        );
+        let mut target = Pdf::open(Cursor::new(minimal_fixture_bytes()))
+            .expect("open target fixture");
+        let mut job = QPDFJob::new();
+        job.set_input_name("target.pdf");
+        let first_options = copy_options(std::path::PathBuf::from("first.pdf"), b"", false);
+        let second_options = copy_options(std::path::PathBuf::from("second.pdf"), b"", false);
+        let mut sources = [
+            (&mut first, first_options),
+            (&mut second, second_options),
+        ];
+
+        let error = job
+            .copy_attachments_many(&mut target, &mut sources)
+            .expect_err("duplicate keys from later sources must be reported");
+        assert_eq!(
+            error.to_string(),
+            "target.pdf already has attachments with keys that conflict with attachments from other files: file: second.pdf, key: first. Use --prefix with --copy-attachments-from or manually copy individual attachments."
+        );
+        assert_eq!(
+            extract_attachment(&mut target, b"first").expect("first attachment"),
+            b"first payload"
+        );
+        assert_eq!(
+            extract_attachment(&mut target, b"second").expect("second attachment"),
+            b"second payload"
+        );
+    }
+
+    #[test]
     fn copy_attachments_aggregates_duplicate_keys_and_still_copies_the_rest() {
         let dir = tempfile::tempdir().expect("temporary directory");
         let mut source = pdf_with_attachments(
