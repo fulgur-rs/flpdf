@@ -1658,8 +1658,9 @@ mod live_input_tests {
     }
 }
 
-/// Exact line ending removed from the recovered stream payload immediately
-/// before a line-anchored `endstream`.
+/// Exact line ending observed at the end of a recovered stream span immediately
+/// before a line-anchored `endstream`. Inspection consumers may use this
+/// metadata for their separate display-framing policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveredStreamEol {
     Lf,

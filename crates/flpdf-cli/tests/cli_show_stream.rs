@@ -358,17 +358,9 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
 
 /// Regression test: `show-stream --raw-stream-data` must agree byte-for-byte
 /// with `--show-object --raw-stream-data` on an encrypted stream whose
-/// length required recovery. Both routes read the same source bytes through
-/// the same canonical `ObjectHandle`; only `show-stream` additionally trims
-/// a recovered end-of-line marker via
-/// [`crate::job::inspection`]'s `canonical_recovered_stream_eol` gate.
-///
-/// This previously double-trimmed: `canonical_recovered_stream_eol` fell
-/// back to the legacy `transformed_stream_refs` set, which pure canonical
-/// `ObjectHandle` reads (this command's own route) never populate, so the
-/// stream's own decrypted-content trailing newline was mistaken for
-/// recovery-scan ciphertext framing and stripped, losing one real content
-/// byte (12344 instead of 12345).
+/// length required recovery. qpdf's pipe-time decrypt route reads the full
+/// recovered span, so the output includes 12368 decrypted bytes rather than
+/// subtracting the recovery-scan EOL before decryption.
 #[test]
 fn show_stream_raw_matches_show_object_for_encrypted_recovered_length_stream() {
     let mut show_stream = Command::cargo_bin("flpdf").unwrap();
@@ -399,7 +391,7 @@ fn show_stream_raw_matches_show_object_for_encrypted_recovered_length_stream() {
         .stdout
         .clone();
 
-    assert_eq!(show_stream_out.len(), 12345);
+    assert_eq!(show_stream_out.len(), 12368);
     assert_eq!(show_stream_out, show_object_out);
 }
 

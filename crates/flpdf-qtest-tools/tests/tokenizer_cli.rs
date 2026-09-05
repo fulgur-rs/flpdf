@@ -367,8 +367,20 @@ fn tokenizer_reuses_canonical_page_stream_resolution_without_replaying_warnings(
                 "expected the recovered page content to end with Q: {stdout}"
             );
             assert!(
-                !stdout.contains("12345: word:"),
-                "recovered AES framing must not be tokenized as page content: {stdout}"
+                stdout.contains("12345: word:"),
+                "qpdf pipes the complete recovered encrypted span: {stdout}"
+            );
+            assert!(
+                stdout.contains("12359: brace_close: }"),
+                "qpdf's trailing content-parser token must be visible: {stdout}"
+            );
+            assert!(
+                stdout.contains("12360: word:"),
+                "qpdf's trailing word token must be visible: {stdout}"
+            );
+            assert!(
+                stdout.contains("12368: eof"),
+                "tokenizer must consume the complete recovered span: {stdout}"
             );
         }
     }
