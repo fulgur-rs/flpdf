@@ -206,14 +206,7 @@ fn top_level_writer_options(
         content_normalization: normalize_content,
         content_normalization_set: args.normalize_content.is_some(),
         qdf: args.qdf,
-        newline_before_endstream: match args.newline_before_endstream {
-            CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
-            // qpdf treats `--newline-before-endstream=<value>` as the
-            // presence of its boolean option, so `=n` has the same output as
-            // `=y` in the 11.9.0 CLI.
-            CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::Yes,
-            CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
-        },
+        newline_before_endstream: args.newline_before_endstream.into(),
         password_mode: args.password.password_mode.into(),
         ..WriterOptions::default()
     };
@@ -2118,6 +2111,19 @@ enum CliNewlineBeforeEndstream {
     Never,
 }
 
+impl From<CliNewlineBeforeEndstream> for NewlineBeforeEndstream {
+    fn from(v: CliNewlineBeforeEndstream) -> Self {
+        match v {
+            CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
+            // qpdf treats `--newline-before-endstream=<value>` as the presence
+            // of its boolean option, so `=n` has the same output as `=y` in
+            // the 11.9.0 CLI.
+            CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::Yes,
+            CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
+        }
+    }
+}
+
 /// `--remove-unreferenced-resources=auto|yes|no` (qpdf-compatible).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum CliRemoveUnreferencedResources {
@@ -2921,6 +2927,9 @@ fn main() {
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
+            // qpdf applies `--newline-before-endstream` to every output
+            // writer (`QPDFWriter.cc:1560`), including page-operation output.
+            newline_before_endstream: args.newline_before_endstream.into(),
             password_mode: args.password.password_mode.into(),
             ..WriterOptions::default()
         };
@@ -3686,14 +3695,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     CliYesNo::Yes => CompressStreams::Yes,
                     CliYesNo::No => CompressStreams::No,
                 }),
-                newline_before_endstream: match cmd.newline_before_endstream {
-                    CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
-                    // qpdf treats `--newline-before-endstream=<value>` as the
-                    // presence of its boolean option, so `=n` has the same
-                    // output as `=y` in the 11.9.0 CLI.
-                    CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::Yes,
-                    CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
-                },
+                newline_before_endstream: cmd.newline_before_endstream.into(),
                 // --stream-data overrides --compress-streams when set.
                 stream_data: cmd.stream_data.map(Into::into),
                 // Recompressing an existing lone /FlateDecode stream is a writer
@@ -7944,8 +7946,13 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     // full collection here, not only warnings added after this route opened
     // the document.
     let has_repair_warnings = !pdf.repair_diagnostics().entries().is_empty();
-    for &warning in normalization_warnings {
-        emit_content_normalization_warnings(input, warning)?;
+    // qpdf reports these through `QPDF::warn`, which records the warning but
+    // skips the text under `--no-warn` (`QPDF_Stream.cc:625`, `QPDF.cc:491`);
+    // the exit status still reflects it.
+    if !no_warn {
+        for &warning in normalization_warnings {
+            emit_content_normalization_warnings(input, warning)?;
+        }
     }
     if normalization_warnings.is_empty() && !has_repair_warnings {
         return Ok(());
@@ -8485,8 +8492,12 @@ fn run_copy_attachments_from(
     if had_signatures {
         logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
     }
-    for &warning in &normalization_warnings {
-        emit_content_normalization_warnings(&input, warning)?;
+    // Same `--no-warn` boundary as `finish_rewrite_warnings`: the warning is
+    // recorded (exit status 3) but its text is suppressed like `QPDF::warn`.
+    if !suppress_warnings {
+        for &warning in &normalization_warnings {
+            emit_content_normalization_warnings(&input, warning)?;
+        }
     }
     if !normalization_warnings.is_empty() {
         job.record_warnings();

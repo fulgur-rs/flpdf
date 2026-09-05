@@ -3033,3 +3033,55 @@ fn pages_decode_level_with_encrypted_primary_produces_cleartext_output() {
     assert_qpdf_cleartext_chunk(&f);
     assert_eq!(npages_of(&q), npages_of(&f));
 }
+
+/// `--newline-before-endstream` is a writer option that qpdf applies to every
+/// output (`QPDFWriter.cc:1560`), including `--pages` output. With
+/// `--stream-data=uncompress` no DEFLATE bytes are involved, so the page-op
+/// output must be byte-identical to qpdf's.
+#[test]
+fn pages_newline_before_endstream_matches_qpdf_bytes() {
+    if !qpdf_available() {
+        return;
+    }
+    let src = fixture_abs(ONE_PAGE);
+    let src = src.to_str().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (ok, _) = run_qpdf(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--newline-before-endstream",
+        src,
+        "--pages",
+        src,
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        ok,
+        "qpdf --pages with --newline-before-endstream must succeed"
+    );
+    flpdf_ok(&[
+        "--static-id",
+        "--stream-data=uncompress",
+        "--newline-before-endstream",
+        src,
+        "--pages",
+        src,
+        "--",
+        f.to_str().unwrap(),
+    ]);
+
+    let qpdf_bytes = std::fs::read(&q).unwrap();
+    let flpdf_bytes = std::fs::read(&f).unwrap();
+    assert!(
+        qpdf_bytes.windows(11).any(|w| w == b"\n\nendstream"),
+        "qpdf output must carry the extra newline before endstream"
+    );
+    assert_eq!(
+        flpdf_bytes, qpdf_bytes,
+        "--pages output with --newline-before-endstream must match qpdf byte-for-byte"
+    );
+}
