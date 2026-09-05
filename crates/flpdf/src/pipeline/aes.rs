@@ -1,4 +1,4 @@
-//! qpdf correspondence: Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time.
+//! qpdf correspondence: Pl_AES_PDF.cc AES-128/192/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time.
 //!
 //! qpdf reaches AES through `QPDFCryptoImpl::rijndael_init`/`rijndael_process`
 //! (`libqpdf/qpdf/Pl_AES_PDF.hh:47`), a provider abstraction this crate replaces
@@ -12,7 +12,7 @@ use super::{Pipeline, PipelineError, PipelineResult};
 use aes::cipher::{
     BlockCipherDecrypt, BlockCipherEncrypt, BlockModeDecrypt, BlockModeEncrypt, KeyInit, KeyIvInit,
 };
-use aes::{Aes128, Aes256};
+use aes::{Aes128, Aes192, Aes256};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// qpdf `QPDFCryptoImpl::rijndael_buf_size` (`Pl_AES_PDF.hh:44`).
@@ -40,8 +40,10 @@ pub(crate) fn static_initialization_vector() -> [u8; BUF_SIZE] {
 }
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
+type Aes192CbcDec = cbc::Decryptor<Aes192>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+type Aes192CbcEnc = cbc::Encryptor<Aes192>;
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
 /// The initialized cipher, standing in for the state qpdf's crypto provider
@@ -50,13 +52,17 @@ type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 /// (`Pl_AES_PDF.cc:152-181`).
 enum Cipher {
     Cbc128Decrypt(Box<Aes128CbcDec>),
+    Cbc192Decrypt(Box<Aes192CbcDec>),
     Cbc256Decrypt(Box<Aes256CbcDec>),
     Cbc128Encrypt(Box<Aes128CbcEnc>),
+    Cbc192Encrypt(Box<Aes192CbcEnc>),
     Cbc256Encrypt(Box<Aes256CbcEnc>),
     /// `disableCBC` leaves each block independent, with no chaining state.
     Ecb128Decrypt(Box<Aes128>),
+    Ecb192Decrypt(Box<Aes192>),
     Ecb256Decrypt(Box<Aes256>),
     Ecb128Encrypt(Box<Aes128>),
+    Ecb192Encrypt(Box<Aes192>),
     Ecb256Encrypt(Box<Aes256>),
 }
 
@@ -65,12 +71,16 @@ impl Cipher {
     fn process(&mut self, inbuf: &[u8; BUF_SIZE], outbuf: &mut [u8; BUF_SIZE]) {
         match self {
             Self::Cbc128Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Cbc192Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Cbc256Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Cbc128Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Cbc192Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Cbc256Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb128Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Ecb192Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb256Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb128Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Ecb192Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb256Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
         }
     }
@@ -113,7 +123,7 @@ impl<'a> PlAesPdf<'a> {
         key: &[u8],
     ) -> PipelineResult<Self> {
         let key = match key.len() {
-            16 | 32 => key.to_vec(),
+            16 | 24 | 32 => key.to_vec(),
             len if len > 16 && len != 24 => {
                 // qpdf's GnuTLS and OpenSSL providers select AES-128 for every
                 // key length other than 16/24/32 and configure a 16-byte
@@ -123,17 +133,10 @@ impl<'a> PlAesPdf<'a> {
                 // projection uses its first 16 bytes.
                 key[..16].to_vec()
             }
-            24 => {
-                // qpdf selects AES-192 here; this pipeline provides AES-128 and
-                // AES-256 only.
-                return Err(PipelineError::logic(
-                    "Pl_AES_PDF: key must be 16 or 32 bytes (qpdf selects AES-192 for a 24-byte key, which is not provided here), got 24",
-                ));
-            }
             // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
             len => {
                 return Err(PipelineError::logic(format!(
-                    "Pl_AES_PDF: key must be 16 or 32 bytes, got {len}"
+                    "Pl_AES_PDF: key must be at least 16 bytes, got {len}"
                 )))
             }
         };
@@ -162,10 +165,10 @@ impl<'a> PlAesPdf<'a> {
     ///
     /// # Errors
     ///
-    /// [`PipelineError`] when `key` is neither 16 nor 32 bytes and is not an
-    /// overlength raw V=5 key. The latter is accepted because qpdf's crypto
-    /// providers project unsupported key lengths to their AES-128 fallback;
-    /// the normal PDF-facing contract remains AES-128/AES-256
+    /// [`PipelineError`] when `key` is shorter than 16 bytes. qpdf's crypto
+    /// providers select AES-192 for a 24-byte key and AES-128 for other
+    /// unsupported lengths using at least 16 bytes of key material. The
+    /// normal PDF-facing contract remains AES-128/AES-256
     /// (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
     pub(crate) fn new_decrypt(
         identifier: impl Into<String>,
@@ -195,7 +198,7 @@ impl<'a> PlAesPdf<'a> {
     /// # Errors
     ///
     /// Same key-length contract as [`Self::new_decrypt`], including qpdf's
-    /// overlength raw-key provider fallback.
+    /// AES-192 and unsupported-length provider dispatch.
     pub(crate) fn decrypt_to_vec(
         identifier: impl Into<String>,
         data: &[u8],
@@ -275,7 +278,7 @@ impl<'a> PlAesPdf<'a> {
     /// # Errors
     ///
     /// Same key-length contract as [`Self::new_decrypt`], including qpdf's
-    /// overlength raw-key provider fallback.
+    /// AES-192 and unsupported-length provider dispatch.
     pub(crate) fn new_encrypt(
         identifier: impl Into<String>,
         next: &'a mut dyn Pipeline,
@@ -424,10 +427,14 @@ impl<'a> PlAesPdf<'a> {
     fn build_cipher(&self) -> Cipher {
         let iv = &self.cbc_block;
         let key16 = || -> &[u8; 16] { self.key.as_slice().try_into().expect("checked in new") };
+        let key24 = || -> &[u8; 24] { self.key.as_slice().try_into().expect("checked in new") };
         let key32 = || -> &[u8; 32] { self.key.as_slice().try_into().expect("checked in new") };
         match (self.cbc_mode, self.encrypt, self.key.len()) {
             (true, false, 16) => {
                 Cipher::Cbc128Decrypt(Box::new(Aes128CbcDec::new(key16().into(), iv.into())))
+            }
+            (true, false, 24) => {
+                Cipher::Cbc192Decrypt(Box::new(Aes192CbcDec::new(key24().into(), iv.into())))
             }
             (true, false, _) => {
                 Cipher::Cbc256Decrypt(Box::new(Aes256CbcDec::new(key32().into(), iv.into())))
@@ -435,12 +442,17 @@ impl<'a> PlAesPdf<'a> {
             (true, true, 16) => {
                 Cipher::Cbc128Encrypt(Box::new(Aes128CbcEnc::new(key16().into(), iv.into())))
             }
+            (true, true, 24) => {
+                Cipher::Cbc192Encrypt(Box::new(Aes192CbcEnc::new(key24().into(), iv.into())))
+            }
             (true, true, _) => {
                 Cipher::Cbc256Encrypt(Box::new(Aes256CbcEnc::new(key32().into(), iv.into())))
             }
             (false, false, 16) => Cipher::Ecb128Decrypt(Box::new(Aes128::new(key16().into()))),
+            (false, false, 24) => Cipher::Ecb192Decrypt(Box::new(Aes192::new(key24().into()))),
             (false, false, _) => Cipher::Ecb256Decrypt(Box::new(Aes256::new(key32().into()))),
             (false, true, 16) => Cipher::Ecb128Encrypt(Box::new(Aes128::new(key16().into()))),
+            (false, true, 24) => Cipher::Ecb192Encrypt(Box::new(Aes192::new(key24().into()))),
             (false, true, _) => Cipher::Ecb256Encrypt(Box::new(Aes256::new(key32().into()))),
         }
     }
@@ -731,6 +743,35 @@ mod tests {
         assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT);
     }
 
+    // qpdf's crypto providers select AES-192 for a 24-byte raw key
+    // (`QPDFCrypto_gnutls.cc:197-205`). This is the NIST SP 800-38A F.2.3
+    // first-block vector, with the IV supplied separately as qpdf's stage
+    // contract requires.
+    #[test]
+    fn aes_192_matches_the_nist_cbc_vector() {
+        let key = from_hex(
+            "8e73b0f7da0e6452c810f32b809079e5\
+             62f8ead2522c6b7b",
+        );
+        let plaintext = from_hex("6bc1bee22e409f96e93d7e117393172a");
+        let iv = from_hex("000102030405060708090a0b0c0d0e0f");
+
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES-192 stream encryption", &mut sink, &key)
+            .expect("AES-192 key is a supported provider length");
+        stage
+            .set_iv(&iv)
+            .expect("a 16-byte vector is the block size");
+        stage.disable_padding();
+        stage.write(&plaintext).expect("write");
+        stage.finish().expect("finish");
+
+        assert_eq!(
+            sink.take_buffer().expect("buffer"),
+            from_hex("4f021db243bc633d7178183a9fa071e8")
+        );
+    }
+
     // Without a static, zero or specified vector the stage draws a fresh one
     // per instance (`QUtil::initializeWithRandomBytes`,
     // `libqpdf/Pl_AES_PDF.cc:140-142`), so two encryptions of the same input
@@ -951,21 +992,21 @@ mod tests {
         assert!(short.as_deref().is_some_and(|m| m.contains("got 8")));
     }
 
-    // An unsupported key length below the qpdf provider fallback remains
-    // rejected: qpdf's own header scopes this pipeline to AES-128 and AES-256
-    // (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
+    // A key shorter than the qpdf provider's 16-byte fallback input is
+    // rejected because qpdf's provider reads beyond the raw key buffer there.
+    // That undefined behavior is recorded as a qpdf-deviation marker above.
     #[test]
-    fn a_key_that_is_neither_128_nor_256_bits_is_rejected() {
+    fn a_key_shorter_than_the_provider_fallback_is_rejected() {
         let mut sink = Buffer::new("ciphertext", None);
 
-        let message = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 24])
+        let message = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 8])
             .err()
             .map(|error| error.to_string());
 
         assert_eq!(
-            message.as_deref().map(|m| m.contains("16 or 32 bytes")),
+            message.as_deref().map(|m| m.contains("at least 16 bytes")),
             Some(true),
-            "24 bytes is not a supported AES key length: {message:?}"
+            "8 bytes is below the provider fallback boundary: {message:?}"
         );
     }
 
@@ -1100,15 +1141,22 @@ mod tests {
         }
     }
 
-    /// The one-shot inherits `new_decrypt`'s key-length contract.
+    /// The one-shot inherits `new_decrypt`'s key-length contract, including
+    /// qpdf's AES-192 provider dispatch.
     #[test]
-    fn decrypt_to_vec_rejects_an_unsupported_key_length() {
-        let error = PlAesPdf::decrypt_to_vec("AES string decryption", &[0u8; 32], &[0u8; 24])
-            .expect_err("24 bytes is not a supported AES key length");
+    fn decrypt_to_vec_accepts_an_aes192_key() {
+        let key = [0xa5u8; 24];
+        let mut encrypted = vec![0; 16];
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES-192 string encryption", &mut sink, &key)
+            .expect("AES-192 key is a supported provider length");
+        stage.use_zero_iv();
+        stage.write(PLAINTEXT).expect("write");
+        stage.finish().expect("finish");
+        encrypted.extend_from_slice(&sink.take_buffer().expect("buffer"));
 
-        assert!(
-            error.to_string().contains("16 or 32 bytes"),
-            "unexpected message: {error}"
-        );
+        let plaintext = PlAesPdf::decrypt_to_vec("AES-192 string decryption", &encrypted, &key)
+            .expect("AES-192 decryption should succeed");
+        assert_eq!(plaintext, PLAINTEXT);
     }
 }

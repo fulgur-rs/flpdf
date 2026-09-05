@@ -1473,6 +1473,8 @@ pub(crate) enum StringCipher<'a> {
     Rc4 { key: &'a [u8] },
     /// AES-128-CBC with an already-derived object key. PDF string bytes include the IV.
     Aes128 { key: &'a [u8; 16] },
+    /// AES-192-CBC with a raw provider key. PDF string bytes include the IV.
+    Aes192 { key: &'a [u8; 24] },
     /// AES-256-CBC for V=5. PDF string bytes include the IV.
     Aes256 { key: &'a [u8; 32] },
 }
@@ -1493,6 +1495,10 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
         // plaintext. Keeping this on the stage rather than a one-shot cipher is
         // what preserves qpdf's tolerance for a short or unpadded tail.
         StringCipher::Aes128 { key } => {
+            *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
+            Ok(())
+        }
+        StringCipher::Aes192 { key } => {
             *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
             Ok(())
         }

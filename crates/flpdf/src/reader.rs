@@ -2207,13 +2207,14 @@ mod encryption_state_commit_tests {
 
     #[test]
     fn aes_object_key_follows_the_qpdf_provider_length_dispatch() {
-        // 24 bytes selects AES-192 in qpdf's providers, which this port does
-        // not provide; every other length that is not 16 or 32 takes the
-        // AES-128 prefix (`QPDFCrypto_gnutls.cc:197-213`).
-        let error = crate::encryption::state::aes128_object_key(&[0; 24])
-            .expect_err("24-byte keys select AES-192 in qpdf");
-        assert!(error.to_string().contains("AES-192"));
-
+        // 24 bytes selects AES-192 in qpdf's providers; every other length
+        // that is not 16 or 32 takes the AES-128 prefix
+        // (`QPDFCrypto_gnutls.cc:197-213`).
+        assert_eq!(
+            crate::encryption::state::aes192_object_key(&[0xa5; 24])
+                .expect("24-byte keys use qpdf's AES-192 provider dispatch"),
+            [0xa5; 24]
+        );
         let error = crate::encryption::state::aes128_object_key(&[0; 8])
             .expect_err("qpdf reads past a shorter key buffer; this port rejects it");
         assert!(error.to_string().contains("not 16 bytes"));
