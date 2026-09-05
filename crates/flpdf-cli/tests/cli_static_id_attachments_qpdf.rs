@@ -204,3 +204,186 @@ fn copy_attachments_applies_stream_data_to_every_stream_like_qpdf() {
         "copy-attachments-from with --stream-data=uncompress must match qpdf byte-for-byte"
     );
 }
+
+#[test]
+fn add_attachment_applies_stream_data_and_newline_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let attachment = temp.path().join("payload.txt");
+    std::fs::write(&attachment, b"attachment option parity payload")
+        .expect("write attachment");
+    let qpdf_output = temp.path().join("qpdf-add-options.pdf");
+    let flpdf_output = temp.path().join("flpdf-add-options.pdf");
+    let creation_date = "--creationdate=D:20240101120000Z";
+    let modification_date = "--moddate=D:20240102130000Z";
+
+    run_qpdf(
+        &[
+            Path::new("--stream-data=uncompress"),
+            Path::new("--newline-before-endstream=y"),
+            Path::new("--add-attachment"),
+            &attachment,
+            Path::new("--key=option-key"),
+            Path::new(creation_date),
+            Path::new(modification_date),
+            Path::new("--"),
+            &input,
+        ],
+        &qpdf_output,
+    );
+    run_flpdf(
+        &[
+            input.to_str().expect("input path"),
+            "--static-id",
+            "--stream-data=uncompress",
+            "--newline-before-endstream=y",
+            "--add-attachment",
+            attachment.to_str().expect("attachment path"),
+            "--key=option-key",
+            creation_date,
+            modification_date,
+            "--",
+        ],
+        &flpdf_output,
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf output"),
+        std::fs::read(&qpdf_output).expect("read qpdf output"),
+        "--add-attachment must apply stream-data and newline-before-endstream like qpdf"
+    );
+}
+
+#[test]
+fn remove_attachment_applies_stream_data_and_newline_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let qpdf_output = temp.path().join("qpdf-remove-options.pdf");
+    let flpdf_output = temp.path().join("flpdf-remove-options.pdf");
+
+    run_qpdf(
+        &[
+            Path::new("--stream-data=uncompress"),
+            Path::new("--newline-before-endstream=y"),
+            Path::new("--remove-attachment=attachment.txt"),
+            &input,
+        ],
+        &qpdf_output,
+    );
+    run_flpdf(
+        &[
+            input.to_str().expect("input path"),
+            "--static-id",
+            "--stream-data=uncompress",
+            "--newline-before-endstream=y",
+            "--remove-attachment=attachment.txt",
+        ],
+        &flpdf_output,
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf output"),
+        std::fs::read(&qpdf_output).expect("read qpdf output"),
+        "--remove-attachment must apply stream-data and newline-before-endstream like qpdf"
+    );
+}
+
+#[test]
+fn add_attachment_applies_qdf_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let attachment = temp.path().join("payload.txt");
+    std::fs::write(&attachment, b"qdf attachment parity payload").expect("write attachment");
+    let qpdf_output = temp.path().join("qpdf-add-qdf.pdf");
+    let flpdf_output = temp.path().join("flpdf-add-qdf.pdf");
+    let creation_date = "--creationdate=D:20240101120000Z";
+    let modification_date = "--moddate=D:20240102130000Z";
+
+    run_qpdf(
+        &[
+            Path::new("--qdf"),
+            Path::new("--add-attachment"),
+            &attachment,
+            Path::new("--key=qdf-key"),
+            Path::new(creation_date),
+            Path::new(modification_date),
+            Path::new("--"),
+            &input,
+        ],
+        &qpdf_output,
+    );
+    run_flpdf(
+        &[
+            input.to_str().expect("input path"),
+            "--static-id",
+            "--qdf",
+            "--add-attachment",
+            attachment.to_str().expect("attachment path"),
+            "--key=qdf-key",
+            creation_date,
+            modification_date,
+            "--",
+        ],
+        &flpdf_output,
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf output"),
+        std::fs::read(&qpdf_output).expect("read qpdf output"),
+        "--add-attachment must apply qdf mode like qpdf"
+    );
+}
+
+#[test]
+fn remove_attachment_applies_qdf_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let qpdf_output = temp.path().join("qpdf-remove-qdf.pdf");
+    let flpdf_output = temp.path().join("flpdf-remove-qdf.pdf");
+
+    run_qpdf(
+        &[
+            Path::new("--qdf"),
+            Path::new("--remove-attachment=attachment.txt"),
+            &input,
+        ],
+        &qpdf_output,
+    );
+    run_flpdf(
+        &[
+            input.to_str().expect("input path"),
+            "--static-id",
+            "--qdf",
+            "--remove-attachment=attachment.txt",
+        ],
+        &flpdf_output,
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("read flpdf output"),
+        std::fs::read(&qpdf_output).expect("read qpdf output"),
+        "--remove-attachment must apply qdf mode like qpdf"
+    );
+}
