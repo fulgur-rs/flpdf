@@ -2220,8 +2220,27 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
             }
             "add-attachment" => attachment_segments.push(tokens),
             "encrypt" => raw_encrypt = Some(tokens),
-            "pages" => raw_pages = Some(tokens),
-            "copy-attachments-from" => raw_copy_attachments_from = Some(tokens),
+            "pages" => {
+                // qpdf rejects a second --pages group as a usage error
+                // (`QPDFJob_config.cc:945-951`).
+                if raw_pages.is_some() {
+                    return Err(Box::new(UsageError::new(
+                        "--pages may only be specified one time".to_owned(),
+                    )));
+                }
+                raw_pages = Some(tokens)
+            }
+            "copy-attachments-from" => {
+                // qpdf accumulates every --copy-attachments-from group and
+                // copies from all of them (`QPDFJob.hh:683`,
+                // `QPDFJob_config.cc:825-833`, `QPDFJob.cc:2089-2100`); this
+                // consumer still handles one donor, so refuse a second group
+                // instead of silently dropping the first one.
+                if raw_copy_attachments_from.is_some() {
+                    return Err("--copy-attachments-from: multiple donor groups are not supported yet; qpdf copies from every group".into());
+                }
+                raw_copy_attachments_from = Some(tokens)
+            }
             _ => {}
         }
     }
@@ -8606,6 +8625,40 @@ mod tests {
             donor.raw_overrides.encryption_file_password.as_deref(),
             Some(b"donor-\xff".as_slice())
         );
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_rejects_a_second_pages_group_like_qpdf() {
+        let error = match preprocess_qpdf_args(strs(&[
+            "flpdf", "--pages", "a.pdf", "1", "--", "--pages", "a.pdf", "2", "--", "in.pdf",
+            "out.pdf",
+        ])) {
+            Ok(_) => panic!("qpdf rejects a second --pages group"),
+            Err(error) => error,
+        };
+        let usage = find_usage_error(error.as_ref()).expect("a qpdf usage error");
+        assert_eq!(usage.to_string(), "--pages may only be specified one time");
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_refuses_to_drop_an_earlier_copy_attachments_group() {
+        let error = match preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--copy-attachments-from",
+            "don0.pdf",
+            "--",
+            "--copy-attachments-from",
+            "don1.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ])) {
+            Ok(_) => panic!("a second donor group must not silently replace the first"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("multiple donor groups are not supported yet"));
     }
 
     #[test]
