@@ -7,8 +7,8 @@
 //!   constant;
 //! - `--linearize` is supported: the deterministic /ID is derived from the
 //!   linearized body and is self-stable across runs;
-//! - the qpdf-incompatible combinations are rejected (+ `--static-id`,
-//!   + `--encrypt`);
+//! - `--static-id` takes precedence when combined with `--deterministic-id`,
+//!   while any deterministic-id use remains incompatible with encryption;
 //! - unlike `--static-id`, the flag is production-safe and emits no
 //!   testing-only warning.
 //!
@@ -128,19 +128,116 @@ fn deterministic_id_preserves_permanent_id_and_is_content_dependent() {
 }
 
 #[test]
-fn deterministic_id_conflicts_with_static_id() {
+fn static_id_takes_precedence_over_deterministic_id_on_both_cli_surfaces() {
     let tmp = tempdir().expect("tempdir");
     let input = fixture_path("one-page.pdf");
-    let output = tmp.path().join("out.pdf");
+    let rewrite_both = tmp.path().join("rewrite-both.pdf");
+    let rewrite_static = tmp.path().join("rewrite-static.pdf");
+    let top_level_both = tmp.path().join("top-level-both.pdf");
+    let top_level_static = tmp.path().join("top-level-static.pdf");
 
     CargoCommand::cargo_bin("flpdf")
         .expect("flpdf binary")
         .args(["rewrite", "--deterministic-id", "--static-id"])
         .arg(&input)
-        .arg(&output)
+        .arg(&rewrite_both)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+        .success();
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["rewrite", "--static-id"])
+        .arg(&input)
+        .arg(&rewrite_static)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&rewrite_both).expect("read rewrite both"),
+        std::fs::read(&rewrite_static).expect("read rewrite static"),
+        "rewrite --static-id must take precedence over --deterministic-id"
+    );
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--deterministic-id", "--static-id"])
+        .arg(&input)
+        .arg(&top_level_both)
+        .assert()
+        .success();
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg("--static-id")
+        .arg(&input)
+        .arg(&top_level_static)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&top_level_both).expect("read top-level both"),
+        std::fs::read(&top_level_static).expect("read top-level static"),
+        "top-level --static-id must take precedence over --deterministic-id"
+    );
+
+    let rewrite_linearized_both = tmp.path().join("rewrite-linearized-both.pdf");
+    let rewrite_linearized_static = tmp.path().join("rewrite-linearized-static.pdf");
+    for (output, flags) in [
+        (
+            &rewrite_linearized_both,
+            [
+                "rewrite",
+                "--linearize",
+                "--deterministic-id",
+                "--static-id",
+            ]
+            .as_slice(),
+        ),
+        (
+            &rewrite_linearized_static,
+            ["rewrite", "--linearize", "--static-id"].as_slice(),
+        ),
+    ] {
+        CargoCommand::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(flags)
+            .arg(&input)
+            .arg(output)
+            .assert()
+            .success();
+    }
+    assert_eq!(
+        std::fs::read(&rewrite_linearized_both).expect("read linearized both"),
+        std::fs::read(&rewrite_linearized_static).expect("read linearized static"),
+        "linearized --static-id must take precedence over --deterministic-id"
+    );
+
+    let top_level_objstm_both = tmp.path().join("top-level-objstm-both.pdf");
+    let top_level_objstm_static = tmp.path().join("top-level-objstm-static.pdf");
+    for (output, flags) in [
+        (
+            &top_level_objstm_both,
+            [
+                "--object-streams=generate",
+                "--deterministic-id",
+                "--static-id",
+            ]
+            .as_slice(),
+        ),
+        (
+            &top_level_objstm_static,
+            ["--object-streams=generate", "--static-id"].as_slice(),
+        ),
+    ] {
+        CargoCommand::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .args(flags)
+            .arg(&input)
+            .arg(output)
+            .assert()
+            .success();
+    }
+    assert_eq!(
+        std::fs::read(&top_level_objstm_both).expect("read object-stream both"),
+        std::fs::read(&top_level_objstm_static).expect("read object-stream static"),
+        "object-stream output must use static ID precedence"
+    );
 }
 
 #[test]
@@ -159,6 +256,33 @@ fn deterministic_id_incompatible_with_encryption() {
         .arg(&output)
         .assert()
         .failure()
+        .stderr(predicate::str::contains(
+            "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID",
+        ));
+}
+
+#[test]
+fn static_and_deterministic_id_remain_incompatible_with_encryption() {
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("one-page.pdf");
+    let output = tmp.path().join("out.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--static-id",
+            "--deterministic-id",
+            "--encrypt",
+            "u",
+            "o",
+            "256",
+            "--",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2)
         .stderr(predicate::str::contains(
             "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID",
         ));

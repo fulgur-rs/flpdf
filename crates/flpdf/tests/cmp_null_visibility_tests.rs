@@ -843,13 +843,13 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
 }
 
 #[test]
-fn preserve_fast_path_rejects_conflicting_id_modes() {
+fn preserve_fast_path_uses_static_id_when_both_id_modes_are_set() {
     let fixture = single_member_objstm_fixture(b"<< /Kind /Ordinary >>", "");
-    let error = preserve_fixture(&fixture, |options| options.deterministic_id = true).unwrap_err();
-    assert!(
-        matches!(error, flpdf::Error::Unsupported(ref message)
-            if message.contains("mutually exclusive")),
-        "got {error:?}"
+    let both = preserve_fixture(&fixture, |options| options.deterministic_id = true).unwrap();
+    let static_only = preserve_fixture(&fixture, |_| {}).unwrap();
+    assert_eq!(
+        both, static_only,
+        "the Preserve fast path must use static ID precedence"
     );
 }
 
