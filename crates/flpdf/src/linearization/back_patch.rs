@@ -720,4 +720,43 @@ mod tests {
     fn placeholder_width_constant_is_ten() {
         assert_eq!(PLACEHOLDER_WIDTH, 10);
     }
+
+    /// `write_linearized` mirrors qpdf's two logic errors for a deterministic
+    /// ID combined with encryption: without a static ID `generateID` fails
+    /// first (`QPDFWriter.cc:1868-1874`); with a static ID the encryption
+    /// setup generates the static `/ID` and `pushMD5Pipeline` fails afterwards
+    /// (`QPDFWriter.cc:1011-1014`).
+    #[test]
+    fn write_linearized_reports_qpdf_logic_error_for_deterministic_id_with_encryption() {
+        for (static_id, expected) in [
+            (
+                false,
+                "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID",
+            ),
+            (
+                true,
+                "Deterministic ID computation enabled after ID generation has already occurred.",
+            ),
+        ] {
+            let mut pdf = open_tiny_pdf();
+            let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+            let renumber = RenumberMap::from_plan(&plan);
+            let mut pdf2 = open_tiny_pdf();
+            let options = WriterOptions {
+                static_id,
+                deterministic_id: true,
+                encrypt: Some(crate::encryption::EncryptParams::v5_r6(
+                    b"u".to_vec(),
+                    b"o".to_vec(),
+                )),
+                ..WriterOptions::default()
+            };
+            let error = write_linearized(&plan, &renumber, &mut pdf2, &options)
+                .expect_err("deterministic ID with encryption must fail");
+            assert!(
+                matches!(error, crate::Error::Internal(ref message) if message.starts_with(expected)),
+                "static_id={static_id}: got {error:?}"
+            );
+        }
+    }
 }

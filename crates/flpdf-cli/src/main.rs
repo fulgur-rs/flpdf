@@ -838,9 +838,10 @@ struct Cli {
     /// output body instead of a random value (top-level alias of `flpdf rewrite
     /// --deterministic-id`; qpdf `--deterministic-id` equivalent). The permanent
     /// identifier /ID[0] is preserved from the input. Implies a full rewrite.
-    /// Mutually exclusive with `--static-id`, and incompatible with encrypted
-    /// output (the /ID feeds the encryption key).
-    #[arg(long = "deterministic-id", conflicts_with = "static_id")]
+    /// If both this flag and `--static-id` are supplied, qpdf gives
+    /// `--static-id` precedence for the emitted ID. The deterministic setting
+    /// still makes the combination incompatible with encrypted output.
+    #[arg(long = "deterministic-id")]
     deterministic_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value
     /// (top-level alias of `flpdf rewrite --static-aes-iv`).
@@ -1600,11 +1601,13 @@ struct RewriteCommand {
     ///
     /// The changing identifier /ID[1] is an MD5 over the rewritten output body;
     /// the permanent identifier /ID[0] is preserved from the input (matching
-    /// `--static-id` and ISO 32000-1 §14.4). Uses the canonical writer. Mutually
-    /// exclusive with `--static-id`, and incompatible with encrypted output (the
-    /// /ID feeds the encryption key). Unlike `--static-id` it is a production-safe
-    /// flag and emits no testing-only warning.
-    #[arg(long = "deterministic-id", conflicts_with = "static_id")]
+    /// `--static-id` and ISO 32000-1 §14.4). Uses the canonical writer. When
+    /// combined with `--static-id`, qpdf gives `--static-id` precedence for
+    /// the emitted ID. Any use of this flag remains incompatible with
+    /// encrypted output (the /ID feeds the encryption key). Unlike
+    /// `--static-id` it is a production-safe flag and emits no testing-only
+    /// warning.
+    #[arg(long = "deterministic-id")]
     deterministic_id: bool,
     /// Force every AES CBC IV to all-zero bytes instead of a random value.
     /// **Testing only; produces insecure deterministic IVs, NOT for

@@ -1179,7 +1179,7 @@ pub(crate) fn first_page_xref_object_count(
 /// producing inconsistent identifiers within a single file).
 ///
 /// Policy mirrors `crate::writer`:
-///   - `--deterministic-id`: a fixed-width all-zero placeholder
+///   - `--deterministic-id` without `--static-id`: a fixed-width all-zero placeholder
 ///     `[<0×32><0×32>]` installed here so pass 1 (which only measures object
 ///     byte lengths) emits a fixed-width `/ID`. The real two-level
 ///     identifier cannot be known until the bytes exist, so it is computed from
@@ -1193,6 +1193,7 @@ pub(crate) fn first_page_xref_object_count(
 ///     hint stream, xref offsets) is unchanged.
 ///   - `--static-id`: `[source_id0_or_π, π_const]`, with an empty source
 ///     `/ID[0]` falling back to the same pi value
+///     (when both flags are set, this static form takes precedence)
 ///   - default: a fresh changing identifier; a non-empty source `/ID[0]` is
 ///     preserved, otherwise the same fresh value is used for both elements
 ///     (ISO 32000-1 §14.4).
@@ -1202,7 +1203,7 @@ fn finalize_linearized_id(
     det_id_source_id0: Option<&[u8]>,
     copy_encryption: Option<&crate::encryption::CopyEncryptionSource>,
 ) -> ObjectHandle {
-    if options.deterministic_id {
+    if crate::writer::uses_deterministic_id(options) {
         // Size the all-zero permanent-identifier placeholder to the source
         // `/ID[0]` length so the serialized `/ID` array reaches its FINAL width
         // here, before the two layout passes. qpdf preserves `/ID[0]` verbatim
@@ -3056,20 +3057,21 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 /// Returns [`LinearizedDocument`] containing both the bytes and the
 /// [`LinearizedOffsets`] needed for back-patching.
 ///
-/// With [`WriterOptions::deterministic_id`] the `/ID` is derived from an MD5
-/// over the assembled layout (the same digest feeds every trailer / xref-stream
-/// dict), so the identifier is reproducible across runs for identical input.
+/// With [`WriterOptions::deterministic_id`] and without
+/// [`WriterOptions::static_id`], the `/ID` is derived from an MD5 over the
+/// assembled layout (the same digest feeds every trailer / xref-stream dict),
+/// so the identifier is reproducible across runs for identical input. When
+/// both flags are set, qpdf's static-ID precedence is used instead.
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Internal`] when [`WriterOptions::deterministic_id`]
-/// is combined with encrypted output ([`WriterOptions::encrypt`] or
-/// [`WriterOptions::copy_encryption`]): a content-derived `/ID` cannot be
-/// produced once the bytes are encrypted, because the identifier would need to
-/// be known before the file encryption key that protects every string and
-/// stream can be derived (the key derives from `/ID[0]`, PDF 1.7 §7.6.3.3
-/// Algorithm 2). This guard mirrors only that specific restriction — qpdf itself accepts
-/// a *non*-deterministic-id `/ID` alongside encryption (observed on qpdf
+/// Returns [`crate::Error::Internal`] when
+/// [`WriterOptions::deterministic_id`] is combined with encrypted output
+/// ([`WriterOptions::encrypt`] or [`WriterOptions::copy_encryption`]): qpdf
+/// still enables its deterministic digest pipeline, but the encryption setup
+/// generates an ID before that pipeline exists. This guard mirrors only that
+/// specific restriction — qpdf itself accepts a *non*-deterministic-id `/ID`
+/// alongside encryption (observed on qpdf
 /// 11.9.0: `qpdf --linearize --encrypt "" "" 128 --use-aes=y -- in.pdf
 /// out.pdf` succeeds, while adding `--deterministic-id` to that same command
 /// fails with qpdf's own `QPDFWriter::generateID has no data for
@@ -3258,16 +3260,7 @@ fn write_linearized_impl<R: Read + Seek>(
     options: &WriterOptions,
     pass1_path: Option<&Path>,
 ) -> Result<(LinearizedDocument, WriterResult)> {
-    // `--deterministic-id` and `--static-id` are mutually exclusive: a
-    // content-derived `/ID` and qpdf's fixed test constant cannot both be the
-    // identifier. The flat (`crate::writer::emit_canonical_pdf`) path
-    // rejects the combination; mirror it here so the public linearization API
-    // does not silently let the deterministic branch win over `static_id`.
-    if options.deterministic_id && options.static_id {
-        return Err(crate::Error::Unsupported(
-            "deterministic_id and static_id are mutually exclusive".to_string(),
-        ));
-    }
+    let deterministic_id = crate::writer::uses_deterministic_id(options);
 
     // Finalize the file identifier exactly once here — before the plan/
     // renumber-map rebuild below, before `Optimization::prepare_for_linearized_write`,
@@ -3295,13 +3288,12 @@ fn write_linearized_impl<R: Read + Seek>(
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
     let source_trailer_handle = pdf.trailer().shallow_copy()?;
     let source_id0 = crate::writer::source_permanent_id_handle(&source_trailer_handle);
-    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
-        if options.deterministic_id {
-            let suffix = crate::writer::deterministic_id_info_suffix(pdf);
-            (source_id0.clone(), suffix)
-        } else {
-            (None, Vec::new())
-        };
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) = if deterministic_id {
+        let suffix = crate::writer::deterministic_id_info_suffix(pdf);
+        (source_id0.clone(), suffix)
+    } else {
+        (None, Vec::new())
+    };
     let pass1_id = linearization_pass1_id(source_id0.as_deref());
     let finalized_id = finalize_linearized_id(
         options,
@@ -3317,16 +3309,16 @@ fn write_linearized_impl<R: Read + Seek>(
     // placeholder, static-id, default) constructs one — so this is an
     // internal-invariant check, not a reachable error for well-formed input.
     //
-    // NOTE: when `options.deterministic_id` is set, this array's element 0 is
+    // NOTE: when effective deterministic ID mode is set, this array's element 0 is
     // an ALL-ZERO PLACEHOLDER (`finalize_linearized_id`'s first branch above),
     // not real key material — the actual content-derived identifier is only
     // computed after the bytes exist, and is then either direct-written
     // (classic path) or back-patched in place (ObjStm/xref-stream path) — see
     // `finalize_linearized_id`'s doc. `id0` is extracted unconditionally
     // here, so it CAN transiently hold that placeholder. It is only safe to
-    // feed into `build_encryption_context` below because the
-    // `deterministic_id && encrypting` guard immediately below this block
-    // returns `Err` first whenever both are set — see the `debug_assert!` at
+    // feed into `build_encryption_context` below because the effective
+    // deterministic-ID-and-encrypting guard immediately below this block
+    // returns `Err` first — see the `debug_assert!` at
     // this function's `options.encrypt` consumption site, which restates that
     // invariant at the point it actually matters.
     let id0: Vec<u8> = finalized_id
@@ -3349,10 +3341,10 @@ fn write_linearized_impl<R: Read + Seek>(
     // QPDFWriter::copyEncryptionParameters call generateID() before the
     // linearized pass can produce deterministic ID data. Translate that
     // qpdf logic_error rather than treating the combination as an unsupported
-    // feature.
+    // feature (with a static ID, qpdf's pushMD5Pipeline fails instead).
     if options.deterministic_id && (options.encrypt.is_some() || options.copy_encryption.is_some())
     {
-        return Err(crate::writer::generate_id_without_data());
+        return Err(crate::writer::deterministic_id_encryption_error(options));
     }
 
     // `plan`/`renumber` are built from a separate `Pdf` handle opened on the
@@ -3660,11 +3652,11 @@ fn write_linearized_impl<R: Read + Seek>(
     // later steps that consume this value.
     let encrypt_ctx: Option<crate::writer::EncryptionContext> =
         if let Some(params) = options.encrypt.as_ref() {
-            // `id0` (extracted above, before the `deterministic_id &&
-            // encrypting` guard runs) must never be the all-zero placeholder
+            // `id0` (extracted above, before the deterministic-ID-and-encryption
+            // guard runs) must never be the all-zero placeholder
             // here: reaching this branch means `options.encrypt.is_some()`,
             // and the guard above already returns `Err` before this point
-            // whenever `deterministic_id` also holds. Restated here,
+            // whenever deterministic ID mode also holds. Restated here,
             // self-enforcing, in case a future edit reorders the guard
             // relative to this block.
             debug_assert!(
@@ -4005,7 +3997,7 @@ fn write_linearized_impl<R: Read + Seek>(
         encrypted_string_emitter.as_mut(),
     )?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
 
-    let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if options.deterministic_id {
+    let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if deterministic_id {
         let pass1_bytes = &pass1_output.bytes;
         // Whole-buffer digest: a linearized file repeats `/ID` at several
         // sites, so there is no single `[` cutoff; pass the last index as the
