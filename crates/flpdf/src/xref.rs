@@ -1496,7 +1496,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             error,
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
-            Some(&loaded.bootstrap_cache),
+            Some(&loaded.bootstrap_cache), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
             options,
             diagnostics,
             None,
