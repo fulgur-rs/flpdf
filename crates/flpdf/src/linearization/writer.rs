@@ -301,9 +301,10 @@ fn append_objstm_container_object<R: Read + Seek>(
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
     removed_refs: &BTreeSet<ObjectRef>,
-    filtered: bool,
+    options: &WriterOptions,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<usize> {
+    let filtered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
     let map = |object_ref| {
         renumber.new_for_original(object_ref).ok_or_else(|| {
             crate::Error::Unsupported(format!(
@@ -360,6 +361,8 @@ fn append_objstm_container_object<R: Read + Seek>(
     // qpdf writes ObjStm keys in the fixed order Type/Length/Filter/N/First.
     // The values themselves are emitted by the canonical handle serializer;
     // only the surrounding order and object-stream framing remain raw layout.
+    // Its newline-before-endstream setting applies to this container exactly
+    // as it does to ordinary body streams (QPDFWriter.cc:1752-1755).
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
     bytes.extend_from_slice(b"<< /Type ");
@@ -379,14 +382,18 @@ fn append_objstm_container_object<R: Read + Seek>(
         crate::writer::write_stream_payload_with_pipeline(
             bytes,
             &data,
-            NewlineBeforeEndstream::Never,
+            options.newline_before_endstream,
             object_ref,
             ctx,
             true,
             None,
         )?;
     } else {
-        crate::writer::serialize::write_stream_payload(bytes, &data, NewlineBeforeEndstream::Never);
+        crate::writer::serialize::write_stream_payload(
+            bytes,
+            &data,
+            options.newline_before_endstream,
+        );
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -678,14 +685,18 @@ fn append_body_object(
         crate::writer::write_stream_payload_with_pipeline(
             bytes,
             &data,
-            NewlineBeforeEndstream::Never,
+            options.newline_before_endstream,
             new_ref,
             ctx,
             true,
             None,
         )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
     } else {
-        crate::writer::serialize::write_stream_payload(bytes, &data, NewlineBeforeEndstream::Never);
+        crate::writer::serialize::write_stream_payload(
+            bytes,
+            &data,
+            options.newline_before_endstream,
+        );
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -1775,7 +1786,9 @@ fn next_test_hint_stream_aes_iv(default: [u8; 16]) -> [u8; 16] {
 /// match that order; the surrounding framing (`N G obj\n` … `\nstream\n` …
 /// `\nendstream\nendobj\n`) is byte-identical to [`append_object`]. The newline
 /// before `endstream` is written only when the payload does not already end in
-/// one (qpdf, QPDFWriter.cc:2327).
+/// one (qpdf, QPDFWriter.cc:2327). This deliberately does not use the global
+/// `newline_before_endstream` option: qpdf's hint-stream helper has this
+/// separate conditional framing rule.
 ///
 /// The hint stream IS encrypted when `encrypt_ctx` is `Some` — unlike the
 /// `/Encrypt` dict and the xref table/stream, it carries no exemption in
@@ -2319,7 +2332,7 @@ fn do_write_pass<R: Read + Seek>(
             renumber,
             pdf,
             &plan.removed_refs,
-            structural_streams_filtered,
+            options,
             encrypt_ctx,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
@@ -2448,7 +2461,7 @@ fn do_write_pass<R: Read + Seek>(
                     renumber,
                     pdf,
                     &plan.removed_refs,
-                    structural_streams_filtered,
+                    options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
@@ -2545,7 +2558,7 @@ fn do_write_pass<R: Read + Seek>(
                     renumber,
                     pdf,
                     &plan.removed_refs,
-                    structural_streams_filtered,
+                    options,
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
