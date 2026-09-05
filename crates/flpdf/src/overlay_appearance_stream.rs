@@ -26,12 +26,21 @@ use std::rc::Rc;
 
 use crate::acroform_document_helper::DrMap;
 use crate::object_handle::{ObjectHandle, ResourceConflicts};
-use crate::resource_replacer::replace_resource_names;
+use crate::resource_replacer::replace_resource_names_with_context;
 use crate::writer::DecodeLevel;
 use crate::{Pdf, Result};
 
+#[cfg(test)]
 fn rewrite_appearance_content(decoded: &[u8], dr_map: &DrMap) -> Vec<u8> {
-    match replace_resource_names(decoded, dr_map.renames()) {
+    rewrite_appearance_content_with_context(decoded, dr_map, None)
+}
+
+fn rewrite_appearance_content_with_context(
+    decoded: &[u8],
+    dr_map: &DrMap,
+    context: Option<Rc<dyn crate::object_handle::DocumentResolver>>,
+) -> Vec<u8> {
+    match replace_resource_names_with_context(decoded, dr_map.renames(), context) {
         Ok(Some(bytes)) => bytes,
         Ok(None) | Err(_) => decoded.to_vec(),
     }
@@ -167,7 +176,8 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     // qpdf's token-filter installation is best effort. Resource mutations are
     // intentionally not rolled back when the stream cannot be decoded.
     if let Ok(Some(decoded)) = filterable_stream_data(stream, DecodeLevel::Generalized) {
-        let rewritten = rewrite_appearance_content(&decoded, &local_dr_map);
+        let rewritten =
+            rewrite_appearance_content_with_context(&decoded, &local_dr_map, stream.context());
         if let Ok(encoded) =
             crate::filters::encode_stream_data_from_handle(&stream_dict, &rewritten)
         {

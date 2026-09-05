@@ -10,7 +10,7 @@
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
 | `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/ContentNormalizer.cc |
-| `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
+| `crates/flpdf/src/content_stream.rs` | correspondence | \`QPDFObjectHandle::ParserCallbacks\` and \`QPDFParser::warn\` content boundary |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads. The input-side \`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` boundary lives in the private JSON document module (the output and input paths remain separate qpdf responsibilities) |

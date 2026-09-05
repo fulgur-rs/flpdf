@@ -25,6 +25,12 @@ use std::io::{Read, Seek};
 /// (`Font`, `XObject`, …) → set of referenced names.
 type UsedNames = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 
+/// Snapshot qpdf's `QPDF::numWarnings` around a document-owned content parse
+/// (`QPDFPageObjectHelper.cc:547-557`).
+fn diagnostic_count<R: Read + Seek>(pdf: &Pdf<R>) -> usize {
+    pdf.repair_diagnostics().entries().len()
+}
+
 /// qpdf `QPDFPageObjectHelper::removeUnreferencedResources` for one page.
 ///
 /// qpdf first copies an inherited or indirect `/Resources` dictionary onto the
@@ -45,18 +51,19 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
     // copied through getAttribute(copy_if_shared=true). The Form pre-pass
     // above remains separate because qpdf runs it before the page action and
     // uses its unresolved-name accumulator to protect page resources.
-    let (finder, resources) = {
+    let diagnostics_before = diagnostic_count(pdf);
+    let (finder, parse_ok) = {
         let mut helper = PageObjectHelper::new(page_ref, pdf);
         let mut finder = ResourceFinder::default();
-        if helper.parse_contents(&mut finder).is_err()
-            || finder.had_diagnostics()
-            || finder.has_pending_operands()
-        {
-            return Ok(());
-        }
-        let resources = helper.get_resources(true)?;
-        (finder, resources)
+        let parse_ok = helper.parse_contents(&mut finder).is_ok() && !finder.has_pending_operands();
+        (finder, parse_ok)
     };
+
+    if !parse_ok || diagnostic_count(pdf) > diagnostics_before {
+        return Ok(());
+    }
+
+    let resources = PageObjectHelper::new(page_ref, pdf).get_resources(true)?;
 
     if resources.is_null() {
         return Ok(());
@@ -138,18 +145,19 @@ fn prune_canonical_resource_target<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     target: ObjectHandle,
 ) -> Result<()> {
-    let (finder, resources) = {
-        let mut helper = PageObjectHelper::from_object_handle(target, pdf);
+    let diagnostics_before = diagnostic_count(pdf);
+    let (finder, parse_ok) = {
+        let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
         let mut finder = ResourceFinder::default();
-        if helper.parse_contents(&mut finder).is_err()
-            || finder.had_diagnostics()
-            || finder.has_pending_operands()
-        {
-            return Ok(());
-        }
-        let resources = helper.get_resources(true)?;
-        (finder, resources)
+        let parse_ok = helper.parse_contents(&mut finder).is_ok() && !finder.has_pending_operands();
+        (finder, parse_ok)
     };
+
+    if !parse_ok || diagnostic_count(pdf) > diagnostics_before {
+        return Ok(());
+    }
+
+    let resources = PageObjectHelper::from_object_handle(target, pdf).get_resources(true)?;
 
     if resources.is_null() {
         return Ok(());
@@ -396,7 +404,6 @@ fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
     let mut used = BTreeMap::new();
     let mut finder = ResourceFinder::default();
     let complete = parse_content_stream_handles(stream_bytes, None, "", &mut finder).is_ok()
-        && !finder.had_diagnostics()
         && !finder.has_pending_operands();
     if complete {
         record_direct_names(&mut used, finder.names_by_resource_type(), true);
@@ -507,16 +514,48 @@ fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
 
 #[cfg(test)]
 mod final_handle_tests {
-    use super::remove_unreferenced_resources_in_form_xobjects;
+    use super::{
+        remove_unreferenced_resources_in_form_xobjects, remove_unreferenced_resources_on_form,
+    };
     use crate::{ObjectHandle, Pdf};
+    use std::io::Cursor;
     use std::rc::Rc;
+
+    fn fixture() -> Pdf<Cursor<Vec<u8>>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
+        Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists")).expect("fixture opens")
+    }
+
+    fn form_with_resources(pdf: &Pdf<Cursor<Vec<u8>>>, contents: &[u8]) -> ObjectHandle {
+        let form = pdf
+            .new_stream_with_data(Rc::new(contents.to_vec()))
+            .expect("form stream");
+        let form_dict = form.as_stream_dict().expect("form dictionary");
+        form_dict
+            .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+            .expect("form type");
+        form_dict
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+            .expect("form subtype");
+        form_dict
+            .replace_key(
+                b"/Resources",
+                ObjectHandle::dictionary(vec![(
+                    b"/Font".to_vec(),
+                    ObjectHandle::dictionary(vec![
+                        (b"/F1".to_vec(), ObjectHandle::dictionary(Vec::new())),
+                        (b"/Unused".to_vec(), ObjectHandle::dictionary(Vec::new())),
+                    ]),
+                )]),
+            )
+            .expect("form resources");
+        form
+    }
 
     #[test]
     fn form_resource_prepass_resolves_form_and_resource_handles() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/compat/direct-root-one-page.pdf");
-        let mut pdf = Pdf::open_mem_owned(std::fs::read(path).expect("fixture exists"))
-            .expect("fixture opens");
+        let mut pdf = fixture();
         let page_ref = crate::pages::page_refs(&mut pdf).expect("page refs")[0];
         let page_handle = pdf.get_object_handle(page_ref);
         pdf.resolve(&page_handle).expect("page resolves");
@@ -556,6 +595,54 @@ mod final_handle_tests {
                 .expect("form resource prepass");
         assert!(unresolved.is_empty());
         assert!(!failures);
+    }
+
+    #[test]
+    fn canonical_form_pruning_uses_the_clean_parse_boundary() {
+        let mut pdf = fixture();
+        let form = form_with_resources(&pdf, b"/F1 12 Tf");
+
+        remove_unreferenced_resources_on_form(&mut pdf, form.clone())
+            .expect("clean Form content should be pruned");
+
+        let resources = form
+            .as_stream_dict()
+            .expect("form dictionary")
+            .try_get_key(b"/Resources")
+            .expect("resources");
+        let fonts = resources.try_get_key(b"/Font").expect("fonts");
+        assert!(!fonts.try_get_key(b"/F1").expect("used font").is_null());
+        assert!(fonts
+            .try_get_key(b"/Unused")
+            .expect("unused font")
+            .is_null());
+    }
+
+    #[test]
+    fn canonical_form_pruning_skips_a_scope_with_parser_warnings() {
+        let mut pdf = fixture();
+        let form = form_with_resources(&pdf, b"<0g>");
+
+        remove_unreferenced_resources_on_form(&mut pdf, form.clone())
+            .expect("recoverable Form warnings should skip pruning");
+
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("invalid character (g) in hexstring")));
+        let resources = form
+            .as_stream_dict()
+            .expect("form dictionary")
+            .try_get_key(b"/Resources")
+            .expect("resources");
+        let fonts = resources.try_get_key(b"/Font").expect("fonts");
+        assert!(!fonts
+            .try_get_key(b"/Unused")
+            .expect("unused font")
+            .is_null());
     }
 
     #[test]

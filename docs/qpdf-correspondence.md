@@ -330,17 +330,20 @@ Rust unit test と qtest の `error-condition 45`
 `QPDFObjectHandle::parsePageContents` keeps the `all_description` produced by
 `arrayOrStreamToStreamArray` when it enters `parseContentStream_data`
 (`libqpdf/QPDFObjectHandle.cc:1438-1485,1740-1850`). The canonical flpdf
-content-parser callback carries that source description together with qpdf's
-`content` or `stream data` object description and the parser offset. In
-particular, an EOF inside an inline image uses the end position returned after
-the tokenizer consumes the truncated image, matching qpdf's `input->tell()`.
-For document-owned handles, the same recovery diagnostics are also delivered
-through the owning `DocumentResolver` warning sink before the optional callback,
-which preserves qpdf's `QPDFObjectHandle::warn` collection/logger boundary;
-detached parses have no owning warning sink and remain callback-only. The qtest
-`parsing 10` regression pins this complete diagnostic context; the
-other test-37 parsing rows retain their existing object spans and `handleEOF`
-output.
+content-parser retains that source description for qpdf exception formatting;
+object callbacks carry the parsed object span. In particular, an EOF inside an
+inline image uses the end position returned after the tokenizer consumes the
+truncated image, matching qpdf's `input->tell()`.
+For document-owned handles, the same recovery diagnostics are delivered only
+through the owning `DocumentResolver` warning sink, which preserves qpdf's
+`QPDFObjectHandle::warn` collection/logger boundary. Detached parses have no
+owning warning sink, so the first recoverable diagnostic returns the formatted
+`QPDFExc::what()` as an `Error::System`; no recovered callback object or
+`handleEOF` follows that throw, matching `QPDFParser::warn`'s null-context arm
+(`libqpdf/QPDFParser.cc:487-498`). The qtest `parsing 10` regression pins the
+complete document-owned diagnostic context; the other test-37 parsing rows
+retain their existing object spans and `handleEOF` output while draining the
+document diagnostics after each parse.
 
 pre-`Pdf` の xref bootstrap も qpdf の `QPDF::Members::file` / `InputSource`
 の遅延 read 境界（`QPDF.hh:67-97,1453-1457`、`QPDF.cc:245-275`）を保つ。

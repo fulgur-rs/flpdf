@@ -18,7 +18,6 @@ pub(crate) struct ResourceFinder {
     last_name: Option<(Vec<u8>, usize)>,
     names: BTreeSet<Vec<u8>>,
     names_by_resource_type: ResourceNamesByType,
-    had_diagnostics: bool,
     pending_operands: bool,
 }
 
@@ -32,10 +31,6 @@ impl ResourceFinder {
 
     pub(crate) fn names_by_resource_type(&self) -> &ResourceNamesByType {
         &self.names_by_resource_type
-    }
-
-    pub(crate) fn had_diagnostics(&self) -> bool {
-        self.had_diagnostics
     }
 
     pub(crate) fn has_pending_operands(&self) -> bool {
@@ -128,17 +123,6 @@ impl ObjectHandleParserCallbacks for ResourceFinder {
         self.handle_object_handle(&object, offset, length)
     }
 
-    fn handle_diagnostic(
-        &mut self,
-        _source_description: &str,
-        _object_description: &str,
-        _offset: usize,
-        _message: &str,
-    ) -> Result<()> {
-        self.had_diagnostics = true;
-        Ok(())
-    }
-
     fn handle_eof(&mut self) -> Result<()> {
         Ok(())
     }
@@ -175,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_callbacks_cover_inline_image_and_diagnostic_events() {
+    fn canonical_callbacks_cover_inline_image_events() {
         let mut finder = ResourceFinder::default();
         let inline = ObjectHandle::inline_image(b"payload".to_vec());
 
@@ -185,10 +169,6 @@ mod tests {
                 .unwrap(),
             ParseControl::Continue
         );
-        ObjectHandleParserCallbacks::handle_diagnostic(&mut finder, "", "content", 2, "recovered")
-            .expect("diagnostics are warning-only");
-
-        assert!(finder.had_diagnostics());
         assert!(!finder.has_pending_operands());
     }
 
@@ -404,9 +384,8 @@ mod tests {
     }
 
     #[test]
-    fn parser_diagnostics_mark_results_incomplete() {
-        let finder = find(b"<0g> /F1 12 Tf").unwrap();
-        assert!(finder.had_diagnostics());
+    fn parser_recovery_warning_makes_detached_scan_fail() {
+        assert!(find(b"<0g> /F1 12 Tf").is_err());
     }
 
     #[test]
