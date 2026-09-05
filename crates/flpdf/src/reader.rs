@@ -401,20 +401,19 @@ impl<R: Read + Seek> Pdf<R> {
     /// `--password-is-hex-key` (`QPDFJob.cc:1245-1252`). Before authentication,
     /// the inspection state provides qpdf's revision-aware dictionary length.
     pub fn encryption_length_bits(&self) -> Option<i64> {
-        if let Some(encryption) = self.encryption.borrow().as_ref() {
-            if let Some(bits) = encryption
+        let authenticated_bits = self.encryption.borrow().as_ref().and_then(|encryption| {
+            encryption
                 .file_key
                 .len()
                 .checked_mul(8)
                 .and_then(|bits| i64::try_from(bits).ok())
-            {
-                return Some(bits);
-            }
-        }
-        self.encryption_inspection
-            .borrow()
-            .as_ref()
-            .map(|inspection| inspection.length_bits)
+        });
+        authenticated_bits.or_else(|| {
+            self.encryption_inspection
+                .borrow()
+                .as_ref()
+                .map(|inspection| inspection.length_bits)
+        })
     }
 
     /// Return qpdf `getTrimmedUserPassword()` bytes, if the document is encrypted.
@@ -2211,6 +2210,12 @@ mod encryption_state_commit_tests {
         let error = crate::encryption::state::aes128_object_key(&[0; 24])
             .expect_err("24-byte keys are not an AES-128/256 PDF key");
         assert!(error.to_string().contains("not 16 bytes"));
+
+        assert_eq!(
+            crate::encryption::state::aes128_object_key(&[0xa5; 40])
+                .expect("overlength keys use the qpdf AES-128 provider fallback"),
+            [0xa5; 16]
+        );
     }
 
     #[test]

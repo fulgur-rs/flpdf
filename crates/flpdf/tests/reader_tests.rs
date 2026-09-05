@@ -1516,8 +1516,9 @@ fn overlength_raw_hex_key_preserves_qpdf_reported_key_bits() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
-            password: b"abababababababababababababababababababababababababababababababababababababababab"
-                .to_vec(),
+            password:
+                b"abababababababababababababababababababababababababababababababababababababababab"
+                    .to_vec(),
             password_is_hex_key: true,
             ..PdfOpenOptions::default()
         },
