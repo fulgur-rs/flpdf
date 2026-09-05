@@ -1837,8 +1837,25 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
 
         let result = load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118);
-        assert!(result.is_ok(), "the fixture hint stream should resolve and decode");
+        assert!(
+            result.is_ok(),
+            "the fixture hint stream should resolve and decode"
+        );
         let (_hint_dict, decoded) = result.ok().unwrap();
         assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn load_hint_stream_propagates_offset_resolver_failure() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let mut pdf = Pdf::empty().expect("empty PDF should be constructible");
+
+        assert!(matches!(
+            load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118),
+            Err(super::HintStreamLoadError::Core(_))
+        ));
     }
 }
