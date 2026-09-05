@@ -1924,13 +1924,17 @@ fn json_job_copies_attachments_from_every_donor_before_reporting_conflicts() {
     logger.set_warn(Some(logger.discard()));
     let mut job = QPDFJob::new();
     job.set_logger(logger);
-    job.initialize_from_json_partial(&format!(
-        r#"{{"inputFile":"{}","outputFile":"{}","copyAttachmentsFrom":[{{"file":"{}"}},{{"file":"{}"}}]}}"#,
-        target.display(),
-        output.display(),
-        donor_a.display(),
-        donor_b.display()
-    ))
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": target.display().to_string(),
+            "outputFile": output.display().to_string(),
+            "copyAttachmentsFrom": [
+                {"file": donor_a.display().to_string()},
+                {"file": donor_b.display().to_string()},
+            ],
+        })
+        .to_string(),
+    )
     .unwrap();
 
     assert_eq!(job.run().unwrap(), flpdf::job::JobExitCode::Error);
