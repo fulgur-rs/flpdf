@@ -334,7 +334,11 @@ content-parser callback carries that source description together with qpdf's
 `content` or `stream data` object description and the parser offset. In
 particular, an EOF inside an inline image uses the end position returned after
 the tokenizer consumes the truncated image, matching qpdf's `input->tell()`.
-The qtest `parsing 10` regression pins this complete diagnostic context; the
+For document-owned handles, the same recovery diagnostics are also delivered
+through the owning `DocumentResolver` warning sink before the optional callback,
+which preserves qpdf's `QPDFObjectHandle::warn` collection/logger boundary;
+detached parses have no owning warning sink and remain callback-only. The qtest
+`parsing 10` regression pins this complete diagnostic context; the
 other test-37 parsing rows retain their existing object spans and `handleEOF`
 output.
 
