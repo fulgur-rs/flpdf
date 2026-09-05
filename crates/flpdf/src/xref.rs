@@ -1371,12 +1371,14 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                     initial_diagnostics.push(diagnostic.clone());
                 }
             }
+            let preexisting_entries = (startxref != 0).then_some(&registration.entries);
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
                 version,
                 startxref,
                 trigger,
                 None,
+                preexisting_entries,
                 options,
                 initial_diagnostics,
                 observed_first_xref_item_offset,
@@ -1401,6 +1403,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             startxref,
             trigger,
             Some(&loaded.loaded.trailer),
+            Some(&registration.entries),
             options,
             diagnostics,
             Some(loaded.first_xref_item_offset),
@@ -1431,6 +1434,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 startxref,
                 trigger,
                 Some(&loaded.loaded.trailer),
+                Some(&registration.entries),
                 options,
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
@@ -1484,6 +1488,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             startxref,
             error,
             Some(&loaded.loaded.trailer),
+            None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
             options,
             diagnostics,
             None,
@@ -2219,6 +2224,7 @@ fn recover_xref_from_linear_scan(
     startxref: u64,
     trigger_error: Error,
     fallback_trailer: Option<&ObjectHandle>,
+    preexisting_entries: Option<&BTreeMap<ObjectRef, XrefEntry>>,
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
     observed_first_xref_item_offset: Option<u64>,
@@ -2234,6 +2240,18 @@ fn recover_xref_from_linear_scan(
     let recovered = recover_xref_entries(bytes, fallback_trailer.is_none())
         .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
     let mut entries = recovered.entries;
+    // qpdf removes only type-1 rows before its reconstruction scan
+    // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
+    // type-0 row in the table, and compressed rows survive as well. Carry those
+    // non-uncompressed rows into the candidate re-entry while allowing the
+    // line scan's reconstructed type-1 rows to take precedence.
+    if let Some(preexisting_entries) = preexisting_entries {
+        for (&object_ref, &entry) in preexisting_entries {
+            if !matches!(entry, XrefEntry::Uncompressed { .. }) {
+                entries.entry(object_ref).or_insert(entry);
+            }
+        }
+    }
     for diagnostic in recovered.trailer_diagnostics {
         repair_diagnostics.push(diagnostic);
     }
@@ -2302,6 +2320,12 @@ fn recover_xref_from_linear_scan(
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
+    // `XrefRegistration` uses a free entry only as the private placeholder
+    // left by qpdf's failed unknown-type insertion. The effective reader xref
+    // table never exposes free rows (`ObjectCache::entry_from_xref` owns only
+    // live/uncompressed and compressed inputs), so remove the placeholder at
+    // the recovery boundary after candidate re-entry has consumed it.
+    entries.retain(|_, entry| !matches!(entry, XrefEntry::Free { .. }));
 
     Ok(LoadedXrefState {
         loaded: LoadedXref {
@@ -2552,7 +2576,13 @@ fn recover_trailer_from_xref_stream_candidate(
     // just this call and its `/Prev` chain -- qpdf's `insertXrefEntry`/
     // `insertFreeXrefEntry` priority is local to `read_xref`'s own walk of
     // that one revision chain, not shared with the line scan's entries.
-    let mut reentry_registration = XrefRegistration::default();
+    // qpdf re-enters `read_xref` against the xref table produced by the
+    // reconstruction scan. Seed registration with that table so an entry
+    // already present there is skipped before its type is validated.
+    let mut reentry_registration = XrefRegistration {
+        entries: entries.clone(),
+        ..XrefRegistration::default()
+    };
     let mut reentry = match parse_xref_from_start(
         bytes,
         max_offset as usize,
@@ -2960,6 +2990,11 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
         Error::Parse { offset, message } if is_classic_trailer_validation_message(message) => {
             (format!("(trailer, offset {offset}): {message}"), None)
         }
+        Error::Parse { offset, message }
+            if message.starts_with("unknown xref stream entry type ") =>
+        {
+            (format!("(xref stream, offset {offset}): {message}"), None)
+        }
         Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
         // qpdf's outer `parse` catches non-QPDF exceptions raised by
         // `read_xref` and turns them into a damaged-PDF exception with the
@@ -3231,6 +3266,9 @@ fn parse_xref_stream(
         // Xref streams are not encrypted, but filter decoding still requires
         // the logical payload rather than qpdf's raw recovery EOL.
         let _recovered_handle_eol = handle_completed.remove_included_recovery_eol_for_decryption();
+        let stream_data_offset = handle_completed
+            .stream_data_offset
+            .map(|offset| xref_pos.saturating_add(offset));
         let handle_object = handle_completed.object;
         let object_ref = handle_completed.object_ref;
         // Push through `context.diagnostics` -- not directly into
@@ -3363,7 +3401,14 @@ fn parse_xref_stream(
                 ));
             }
             let mut cursor = ByteCursor::new(&stream_data, 0);
-            let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
+            let entries = parse_xref_entries(
+                &mut cursor,
+                size,
+                &ranges,
+                widths,
+                stream_data_offset,
+                registration,
+            )?;
             let trailer_references = collect_trailer_references(&trailer);
 
             Ok((trailer, entries, trailer_references, has_first_xref_item))
@@ -3582,6 +3627,8 @@ fn parse_xref_entries(
     size: u32,
     ranges: &[(u32, u32)],
     widths: XrefWidths,
+    stream_data_offset: Option<usize>,
+    registration: &mut XrefRegistration,
 ) -> Result<Vec<ParsedXrefEntry>> {
     let (w0, w1, w2) = widths;
     let entry_width = w0 + w1 + w2;
@@ -3616,21 +3663,35 @@ fn parse_xref_entries(
             let field2 = if w2 == 0 { 0 } else { cursor.read_be_u64(w2)? };
 
             let object_number = (start + index) as u32;
+            let object_ref = match object_type {
+                0 | 2 => ObjectRef::new(object_number, 0),
+                _ => ObjectRef::new(
+                    object_number,
+                    u16::try_from(field2)
+                        .map_err(|_| Error::parse(0, "generation does not fit u16"))?,
+                ),
+            };
+            // qpdf's insertXrefEntry checks deleted object numbers and the
+            // exact object-generation slot before it switches on the entry
+            // type (`QPDF.cc:1158-1169`). This matters on a failed first
+            // pass: try_emplace leaves a default type-0 slot behind, so the
+            // reconstruction re-entry skips the same malformed entry.
+            if registration.deleted_objects.contains(&object_number)
+                || registration.entries.contains_key(&object_ref)
+            {
+                continue;
+            }
             match object_type {
                 0 => {
                     let _next = field1;
                     let _generation = field2;
-                    entries.push(ParsedXrefEntry::Free {
-                        object_ref: ObjectRef::new(object_number, 0),
-                    });
+                    registration.insert_free_xref_entry(object_ref);
+                    entries.push(ParsedXrefEntry::Free { object_ref });
                 }
                 1 => {
-                    let generation = u16::try_from(field2)
-                        .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
-                    entries.push(ParsedXrefEntry::Live {
-                        object_ref: ObjectRef::new(object_number, generation),
-                        entry: XrefEntry::Uncompressed { offset: field1 },
-                    });
+                    let entry = XrefEntry::Uncompressed { offset: field1 };
+                    registration.insert_xref_entry(object_ref, entry);
+                    entries.push(ParsedXrefEntry::Live { object_ref, entry });
                 }
                 2 => {
                     let stream = u32::try_from(field1).map_err(|_| {
@@ -3638,15 +3699,28 @@ fn parse_xref_entries(
                     })?;
                     let index = u32::try_from(field2)
                         .map_err(|_| Error::parse(0, "xref stream index does not fit u32"))?;
-                    entries.push(ParsedXrefEntry::Live {
-                        object_ref: ObjectRef::new(object_number, 0),
-                        entry: XrefEntry::Compressed { stream, index },
-                    });
+                    let entry = XrefEntry::Compressed { stream, index };
+                    registration.insert_xref_entry(object_ref, entry);
+                    entries.push(ParsedXrefEntry::Live { object_ref, entry });
                 }
                 _ => {
-                    return Err(Error::Unsupported(format!(
-                        "unsupported xref entry type {object_type}"
-                    )))
+                    // qpdf's `try_emplace` has already inserted its default
+                    // type-0 entry before the unknown-type exception. Keep
+                    // the same partial registration for reconstruction.
+                    registration
+                        .entries
+                        .insert(object_ref, XrefEntry::Free { next: 0 });
+                    // qpdf reports this through `damagedPDF("xref stream",
+                    // ...)`, which uses the input's last read offset
+                    // (`QPDF.cc:2625-2628`): `pipeStreamData` reads the whole
+                    // payload with one `read` from its start
+                    // (`QPDF.cc:2496-2498`), so the offset is the stream
+                    // payload start regardless of which entry is malformed.
+                    let offset = stream_data_offset.unwrap_or_default();
+                    return Err(Error::parse(
+                        offset,
+                        format!("unknown xref stream entry type {object_type}"),
+                    ));
                 }
             }
         }
@@ -4755,17 +4829,24 @@ mod final_handle_tests {
     #[test]
     fn nonzero_xref_stream_decode_warning_is_kept_before_recovery() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n";
-        let error = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
-            .expect_err("the malformed xref stream must enter recovery");
-        let (_, diagnostics) = error
-            .open_failure()
-            .expect("permissive xref failure carries repair diagnostics");
-        assert!(
-            diagnostics.entries().iter().any(|diagnostic| {
-                diagnostic.message
-                    == "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4"
-            }),
-            "the warning from the non-zero initial xref read must survive recovery: {diagnostics:?}"
+        let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+            .expect("the reconstruction re-entry must skip the already-registered entry");
+        let messages: Vec<_> = loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4",
+                "file is damaged",
+                "(xref stream, offset 71): unknown xref stream entry type 97",
+                "Attempting to reconstruct cross-reference table",
+                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4",
+                "reported number of objects (1) is not one plus the highest object number (1)",
+            ]
         );
     }
 

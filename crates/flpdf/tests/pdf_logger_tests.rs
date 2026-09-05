@@ -90,6 +90,15 @@ fn terminal_repair_failure_bytes() -> (Vec<u8>, usize) {
     (pdf, xref_start)
 }
 
+fn unknown_xref_entry_type_bytes() -> Vec<u8> {
+    b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 1 /Length 4 >>\nstream\nabcd\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
+}
+
+/// Two entries: a valid type-1 row followed by an unknown type `a` (97).
+fn unknown_second_xref_entry_type_bytes() -> Vec<u8> {
+    b"%PDF-1.4\n1 0 obj\n<< /Type /XRef /W [1 0 1] /Size 2 /Length 4 >>\nstream\n\x01\x00a\x00\nendstream\nendobj\nstartxref\n9\n%%EOF\n".to_vec()
+}
+
 fn two_lazy_warning_objects() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -393,6 +402,71 @@ fn terminal_open_failure_returns_warning_delivery_failure() {
         ),
         Err(Error::System(ref message)) if message == "warning sink failed"
     ));
+}
+
+#[test]
+fn unknown_xref_entry_type_matches_qpdf_after_reconstruction() {
+    let (logger, output) = recording_logger();
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(unknown_xref_entry_type_bytes()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf-compatible reconstruction should return the candidate trailer");
+
+    let error = pdf
+        .root_handle()
+        .expect_err("the recovered candidate has no /Root dictionary");
+    assert!(matches!(
+        error,
+        Error::System(ref message) if message == "unable to find /Root dictionary"
+    ));
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        b"WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4\n\
+         WARNING: input.pdf: file is damaged\n\
+         WARNING: input.pdf (xref stream, offset 71): unknown xref stream entry type 97\n\
+         WARNING: input.pdf: Attempting to reconstruct cross-reference table\n\
+         WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4\n\
+         WARNING: input.pdf: reported number of objects (1) is not one plus the highest object number (1)\n"
+    );
+}
+
+#[test]
+fn unknown_second_xref_entry_type_reports_the_payload_offset_like_qpdf() {
+    // qpdf's `damagedPDF("xref stream", ...)` reports the input's last read
+    // offset, which is the stream payload start after `pipeStreamData`'s
+    // single read (QPDF.cc:2496-2498, 2625-2628), so the second malformed
+    // entry is still reported at offset 71, not 73.
+    let (logger, output) = recording_logger();
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(unknown_second_xref_entry_type_bytes()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: b"input.pdf".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf-compatible reconstruction should return the candidate trailer");
+
+    let error = pdf
+        .root_handle()
+        .expect_err("the recovered candidate has no /Root dictionary");
+    assert!(matches!(
+        error,
+        Error::System(ref message) if message == "unable to find /Root dictionary"
+    ));
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        b"WARNING: input.pdf: file is damaged\n\
+         WARNING: input.pdf (xref stream, offset 71): unknown xref stream entry type 97\n\
+         WARNING: input.pdf: Attempting to reconstruct cross-reference table\n"
+    );
 }
 
 #[test]
