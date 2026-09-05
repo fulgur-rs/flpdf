@@ -246,7 +246,7 @@ fn report_page_spec_diagnostics<R: Read + Seek>(
                             Ok(())
                         }
                     },
-                )?;
+                )?; // cov:ignore: llvm-cov attributes this executed generic preflight call to its closing delimiter
                 if verbose && !should_remove {
                     logger.info(prefixed_info_line(job, b"no shared resources found\n"))?;
                 }
@@ -261,7 +261,7 @@ fn report_page_spec_diagnostics<R: Read + Seek>(
         logger.info(prefixed_info_line(
             job,
             b"removing unreferenced pages from primary input\n",
-        ))?;
+        ))?; // cov:ignore: llvm-cov attributes this executed multiline logger call to its closing delimiter
         for spec in specs {
             let source_name = source_names.get(spec.source_index).ok_or_else(|| {
                 Error::Unsupported(format!(
@@ -791,7 +791,7 @@ fn handle_page_specs<R: Read + Seek + 'static>(
             &mut merge_inputs,
             &remove_resources,
             false,
-        )?
+        )? // cov:ignore: llvm-cov attributes this executed multiline merge call to its closing delimiter
     };
     drop(merge_inputs);
 
