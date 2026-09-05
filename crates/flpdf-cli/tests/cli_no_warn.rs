@@ -467,3 +467,128 @@ fn split_pages_no_warn_matches_qpdf_for_a_warning_bearing_source() {
     assert!(qpdf_dir.join("out1.pdf").exists());
     assert!(flpdf_dir.join("out1.pdf").exists());
 }
+
+/// One page whose content stream starts with a bad token (`\r<0g`), so
+/// `--normalize-content=y` records qpdf's "content normalization encountered
+/// bad tokens" warning family.
+fn bad_content_pdf() -> Vec<u8> {
+    let content: &[u8] = b"\r<0g";
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>".to_vec(),
+        [
+            format!("<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+            content.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        out.extend_from_slice(object);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn top_level_rewrite_no_warn_suppresses_normalization_warnings_like_qpdf() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = temp.path().join("bad-content.pdf");
+    std::fs::write(&input, bad_content_pdf()).expect("write bad-content PDF");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let input_str = input.to_str().expect("input path is UTF-8");
+    let qpdf_output_str = qpdf_output.to_str().expect("qpdf output path is UTF-8");
+
+    let qpdf = run_qpdf(&[
+        "--no-warn",
+        "--normalize-content=y",
+        input_str,
+        qpdf_output_str,
+    ]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args(["--no-warn", "--normalize-content=y", input_str])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf invocation");
+
+    // qpdf records the normalization warning through `QPDF::warn`, which keeps
+    // the warning exit status but prints nothing under `--no-warn`.
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert!(qpdf.stderr.is_empty());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(flpdf_output.exists());
+}
+
+#[test]
+fn attachment_copy_no_warn_suppresses_normalization_warnings_like_qpdf() {
+    if !qpdf_or_skip() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = temp.path().join("bad-content.pdf");
+    std::fs::write(&input, bad_content_pdf()).expect("write bad-content PDF");
+    let donor = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let input_str = input.to_str().expect("input path is UTF-8");
+    let donor_str = donor.to_str().expect("donor path is UTF-8");
+    let qpdf_output_str = qpdf_output.to_str().expect("qpdf output path is UTF-8");
+
+    let qpdf = run_qpdf(&[
+        "--no-warn",
+        "--normalize-content=y",
+        "--copy-attachments-from",
+        donor_str,
+        "--",
+        input_str,
+        qpdf_output_str,
+    ]);
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--no-warn",
+            "--normalize-content=y",
+            "--copy-attachments-from",
+            donor_str,
+            "--",
+            input_str,
+        ])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(3));
+    assert!(qpdf.stderr.is_empty());
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(flpdf_output.exists());
+}

@@ -148,3 +148,59 @@ fn attachment_mutation_routes_honor_static_id_like_qpdf() {
     );
     assert_static_id_pair(&qpdf_remove, &flpdf_remove);
 }
+
+#[test]
+fn copy_attachments_applies_stream_data_to_every_stream_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat");
+    let input = fixtures.join("one-page.pdf");
+    let donor = fixtures.join("attachment-two-page.pdf");
+    let qpdf_output = temp.path().join("qpdf-copy-uncompress.pdf");
+    let flpdf_output = temp.path().join("flpdf-copy-uncompress.pdf");
+
+    let qpdf = ShellCommand::new(QPDF)
+        .args([
+            "--static-id",
+            "--stream-data=uncompress",
+            "--newline-before-endstream=y",
+            "--copy-attachments-from",
+        ])
+        .arg(&donor)
+        .arg("--")
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf copy should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf copy failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--static-id",
+            "--stream-data=uncompress",
+            "--newline-before-endstream=y",
+            "--copy-attachments-from",
+        ])
+        .arg(&donor)
+        .arg("--")
+        .arg(&input)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).expect("read qpdf output");
+    let flpdf_bytes = std::fs::read(&flpdf_output).expect("read flpdf output");
+    assert_eq!(
+        flpdf_bytes, qpdf_bytes,
+        "copy-attachments-from with --stream-data=uncompress must match qpdf byte-for-byte"
+    );
+}

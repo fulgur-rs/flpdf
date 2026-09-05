@@ -1579,7 +1579,7 @@ fn top_level_normalize_content_y_applies_after_page_selection() {
 }
 
 #[test]
-fn top_level_normalize_content_y_rejects_unwired_mutating_attachment_paths() {
+fn top_level_normalize_content_y_rejects_unwired_add_remove_attachment_paths() {
     let cases: &[&[&str]] = &[
         &[
             "--normalize-content=y",
@@ -1593,14 +1593,6 @@ fn top_level_normalize_content_y_rejects_unwired_mutating_attachment_paths() {
             "attachment.bin",
             "--",
             "in.pdf",
-            "out.pdf",
-        ],
-        &[
-            "--normalize-content=y",
-            "in.pdf",
-            "--copy-attachments-from",
-            "donor.pdf",
-            "--",
             "out.pdf",
         ],
     ];
@@ -1619,7 +1611,7 @@ fn top_level_normalize_content_y_rejects_unwired_mutating_attachment_paths() {
 }
 
 #[test]
-fn top_level_decode_level_rejects_unwired_mutating_attachment_paths() {
+fn top_level_decode_level_rejects_unwired_add_remove_attachment_paths() {
     let cases: &[&[&str]] = &[
         &[
             "--decode-level=all",
@@ -1633,14 +1625,6 @@ fn top_level_decode_level_rejects_unwired_mutating_attachment_paths() {
             "attachment.bin",
             "--",
             "in.pdf",
-            "out.pdf",
-        ],
-        &[
-            "--decode-level=specialized",
-            "in.pdf",
-            "--copy-attachments-from",
-            "donor.pdf",
-            "--",
             "out.pdf",
         ],
     ];
