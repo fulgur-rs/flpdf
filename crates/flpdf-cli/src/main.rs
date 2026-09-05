@@ -1166,6 +1166,8 @@ struct Cli {
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
     )]
     encrypt: Option<Vec<OsString>>,
+    #[arg(skip)]
+    raw_encrypt: Option<Vec<Vec<u8>>>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
@@ -1204,6 +1206,11 @@ struct Cli {
         help = "User password to open the donor PDF for --copy-encryption"
     )]
     encryption_file_password: Option<OsString>,
+    #[arg(skip)]
+    raw_encryption_file_password: Option<Vec<u8>>,
+
+    #[arg(skip)]
+    raw_copy_attachments_from: Option<Vec<Vec<u8>>>,
 
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -1255,6 +1262,8 @@ struct PageOpArgs {
                 range = all pages."
     )]
     pages: Vec<OsString>,
+    #[arg(skip)]
+    raw_pages: Option<Vec<Vec<u8>>>,
 
     /// Rotate pages by a multiple of 90 degrees (qpdf `--rotate`).
     ///
@@ -1573,6 +1582,8 @@ struct RewriteCommand {
         ]
     )]
     encrypt: Option<Vec<OsString>>,
+    #[arg(skip)]
+    raw_encrypt: Option<Vec<Vec<u8>>>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
     /// output encryption (qpdf --copy-encryption equivalent).
     ///
@@ -1604,6 +1615,11 @@ struct RewriteCommand {
         help = "User password to open the donor PDF for --copy-encryption"
     )]
     encryption_file_password: Option<OsString>,
+    #[arg(skip)]
+    raw_encryption_file_password: Option<Vec<u8>>,
+
+    #[arg(skip)]
+    raw_copy_attachments_from: Option<Vec<Vec<u8>>>,
     /// Set a minimum PDF version for the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.
@@ -2064,6 +2080,8 @@ struct PasswordArgs {
     recovery: RecoveryArgs,
     #[arg(skip)]
     verbose: bool,
+    #[arg(skip)]
+    raw_password: Option<Vec<u8>>,
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
     password: Option<OsString>,
@@ -2102,6 +2120,21 @@ alternate password encodings (UTF-8 / PDFDocEncoding) when authentication \
 fails; this flag disables that recovery."
     )]
     suppress_password_recovery: bool,
+}
+
+impl PasswordArgs {
+    fn password_bytes(&self) -> Option<Vec<u8>> {
+        self.raw_password.clone().or_else(|| {
+            self.password
+                .as_ref()
+                .map(|password| arg_parser::os_bytes(password))
+        })
+    }
+
+    fn set_password_bytes(&mut self, password: Option<Vec<u8>>) {
+        self.raw_password = password.clone();
+        self.password = password.map(|password| arg_parser::os_string_from_bytes(&password));
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -2169,18 +2202,45 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
     let parsed = arg_parser::ArgParser::from_command(cli_command()).parse_os(args)?;
     let mut overlay_specs = Vec::new();
     let mut attachment_segments = Vec::new();
+    let mut raw_encrypt = None;
+    let mut raw_pages = None;
+    let mut raw_copy_attachments_from = None;
 
-    for segment in parsed.named_segments {
-        match segment.option.as_str() {
-            "overlay" => overlay_specs.push(parse_overlay_segment(
-                OverlayKind::Overlay,
-                &segment.tokens,
-            )?),
-            "underlay" => overlay_specs.push(parse_overlay_segment(
-                OverlayKind::Underlay,
-                &segment.tokens,
-            )?),
-            "add-attachment" => attachment_segments.push(segment.tokens),
+    for segment in parsed.raw_named_segments {
+        let option = segment.option;
+        let tokens = segment
+            .tokens
+            .into_iter()
+            .map(|token| token.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        match option.as_str() {
+            "overlay" => overlay_specs.push(parse_overlay_segment(OverlayKind::Overlay, &tokens)?),
+            "underlay" => {
+                overlay_specs.push(parse_overlay_segment(OverlayKind::Underlay, &tokens)?)
+            }
+            "add-attachment" => attachment_segments.push(tokens),
+            "encrypt" => raw_encrypt = Some(tokens),
+            "pages" => {
+                // qpdf rejects a second --pages group as a usage error
+                // (`QPDFJob_config.cc:945-951`).
+                if raw_pages.is_some() {
+                    return Err(Box::new(UsageError::new(
+                        "--pages may only be specified one time".to_owned(),
+                    )));
+                }
+                raw_pages = Some(tokens)
+            }
+            "copy-attachments-from" => {
+                // qpdf accumulates every --copy-attachments-from group and
+                // copies from all of them (`QPDFJob.hh:683`,
+                // `QPDFJob_config.cc:825-833`, `QPDFJob.cc:2089-2100`); this
+                // consumer still handles one donor, so refuse a second group
+                // instead of silently dropping the first one.
+                if raw_copy_attachments_from.is_some() {
+                    return Err("--copy-attachments-from: multiple donor groups are not supported yet; qpdf copies from every group".into());
+                }
+                raw_copy_attachments_from = Some(tokens)
+            }
             _ => {}
         }
     }
@@ -2189,7 +2249,123 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
         residual_args: parsed.residual_args,
         overlay_specs,
         attachment_segments,
+        raw_overrides: RawCliOverrides {
+            password: raw_option_value(&parsed.raw_residual_args, "password"),
+            encryption_file_password: raw_option_value(
+                &parsed.raw_residual_args,
+                "encryption-file-password",
+            ),
+            raw_encrypt,
+            raw_pages,
+            raw_copy_attachments_from,
+        },
     })
+}
+
+fn raw_option_value(args: &[arg_parser::RawArg], name: &str) -> Option<Vec<u8>> {
+    let mut attached_prefix = b"--".to_vec();
+    attached_prefix.extend_from_slice(name.as_bytes());
+    let mut separate_option = b"--".to_vec();
+    separate_option.extend_from_slice(name.as_bytes());
+    let mut found = None;
+    let mut index = 1;
+    while index < args.len() {
+        let bytes = args[index].as_bytes();
+        if bytes == b"--" {
+            break;
+        }
+        if is_named_segment_option(bytes) {
+            index += 1;
+            while index < args.len() && args[index].as_bytes() != b"--" {
+                index += 1;
+            }
+            index += usize::from(index < args.len());
+            continue;
+        }
+        if let Some(value) = bytes
+            .strip_prefix(attached_prefix.as_slice())
+            .and_then(|value| {
+                value
+                    .first()
+                    .is_some_and(|byte| *byte == b'=')
+                    .then(|| value[1..].to_vec())
+            })
+        {
+            found = Some(value);
+        } else if bytes == separate_option.as_slice() {
+            if let Some(value) = args.get(index + 1) {
+                found = Some(value.as_bytes().to_vec());
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+fn is_named_segment_option(bytes: &[u8]) -> bool {
+    matches!(
+        bytes,
+        b"--encrypt"
+            | b"--pages"
+            | b"--add-attachment"
+            | b"--copy-attachments-from"
+            | b"--overlay"
+            | b"--underlay"
+    )
+}
+
+fn raw_os_args(args: &[OsString]) -> Vec<Vec<u8>> {
+    args.iter().map(|arg| arg_parser::os_bytes(arg)).collect()
+}
+
+fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
+    let RawCliOverrides {
+        password,
+        encryption_file_password,
+        raw_encrypt,
+        raw_pages,
+        raw_copy_attachments_from,
+    } = overrides;
+    args.password.raw_password = password.clone();
+    args.raw_encryption_file_password = encryption_file_password.clone().or_else(|| {
+        args.encryption_file_password
+            .as_ref()
+            .map(|value| arg_parser::os_bytes(value))
+    });
+    args.raw_encrypt =
+        raw_encrypt.or_else(|| args.encrypt.as_ref().map(|tokens| raw_os_args(tokens)));
+    args.page_ops.raw_pages = raw_pages
+        .or_else(|| (!args.page_ops.pages.is_empty()).then(|| raw_os_args(&args.page_ops.pages)));
+    args.raw_copy_attachments_from = raw_copy_attachments_from.or_else(|| {
+        (!args.copy_attachments_from.is_empty()).then(|| raw_os_args(&args.copy_attachments_from))
+    });
+
+    if let Some(command) = args.command.as_mut() {
+        match command {
+            Commands::Check(command) => command.password.raw_password = password.clone(),
+            Commands::DumpObject(command) => command.password.raw_password = password.clone(),
+            Commands::Pages(command) => command.password.raw_password = password.clone(),
+            Commands::Qdf(command) => command.password.raw_password = password.clone(),
+            Commands::ShowStream(command) => command.password.raw_password = password.clone(),
+            Commands::ShowEncryption(command)
+            | Commands::RequiresPassword(command)
+            | Commands::ShowEncryptionKey(command) => {
+                command.password.raw_password = password.clone()
+            }
+            Commands::Rewrite(command) => {
+                command.password.raw_password = password.clone();
+                command.raw_encryption_file_password = args.raw_encryption_file_password.clone();
+                command.raw_encrypt = args.raw_encrypt.clone();
+                command.page_ops.raw_pages = args.page_ops.raw_pages.clone();
+                command.raw_copy_attachments_from = args.raw_copy_attachments_from.clone();
+            }
+            Commands::CheckLinearization(_)
+            | Commands::IsEncrypted(_)
+            | Commands::QdfFix(_)
+            | Commands::ZlibFlate(_) => {}
+        }
+    }
 }
 
 // The flattened clap model is deep enough that constructing it can exhaust
@@ -2283,6 +2459,7 @@ fn main() {
         residual_args,
         overlay_specs,
         attachment_segments,
+        raw_overrides,
     } = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -2291,6 +2468,7 @@ fn main() {
         }
     };
     let mut args = cli_parse_from(residual_args);
+    apply_raw_overrides(&mut args, raw_overrides);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
     // the reader owns the authentication retry boundary in flpdf. Carry the
     // job policy through the existing PasswordArgs copy used by every open
@@ -2566,12 +2744,16 @@ fn main() {
             &top_level_version_options,
         )
     } else if !args.copy_attachments_from.is_empty() {
+        let copy_tokens = args
+            .raw_copy_attachments_from
+            .clone()
+            .unwrap_or_else(|| raw_os_args(&args.copy_attachments_from));
         run_copy_attachments_from(
             args.input,
             args.output,
             args.repair,
             &args.password,
-            args.copy_attachments_from,
+            copy_tokens,
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
@@ -2637,9 +2819,9 @@ fn main() {
         // plaintext output even though the user asked for encryption.
         apply_encryption_options(
             &mut options,
-            args.encrypt.as_deref(),
+            args.raw_encrypt.as_deref(),
             args.copy_encryption.as_deref(),
-            args.encryption_file_password.as_deref(),
+            args.raw_encryption_file_password.as_deref(),
             &args.password,
             args.no_warn,
         );
@@ -2837,9 +3019,9 @@ fn main() {
         // the non-page-op branch, so no further page-op guard is needed here.
         apply_encryption_options(
             &mut options,
-            args.encrypt.as_deref(),
+            args.raw_encrypt.as_deref(),
             args.copy_encryption.as_deref(),
-            args.encryption_file_password.as_deref(),
+            args.raw_encryption_file_password.as_deref(),
             &args.password,
             args.no_warn,
         );
@@ -2974,8 +3156,8 @@ fn run_job_json_file(
             }) as Box<dyn std::error::Error>
         })?;
     }
-    if let Some(password) = password.password.as_deref() {
-        job.set_password(arg_parser::os_bytes(password));
+    if let Some(password) = password.password_bytes() {
+        job.set_password(password);
     }
     // The library JSON entry point uses qpdfjob's C-helper prefix while the
     // CLI's QPDFJob caller uses the ordinary qpdf prefix. Set the CLI
@@ -3222,7 +3404,8 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
         return Ok(());
     }
 
-    let raw_specs = parse_pages_segment(&page_ops.pages)?;
+    let page_tokens = raw_page_tokens(page_ops);
+    let raw_specs = parse_pages_segment(&page_tokens)?;
     let inputs = resolve_page_specs(&raw_specs, primary_input)?;
     if inputs.iter().any(|input| input.path != primary_input) {
         return Err("--pages: JSON output currently accepts only the primary input source".into());
@@ -3542,9 +3725,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             // apply_encryption_options).
             apply_encryption_options(
                 &mut options,
-                cmd.encrypt.as_deref(),
+                cmd.raw_encrypt.as_deref(),
                 cmd.copy_encryption.as_deref(),
-                cmd.encryption_file_password.as_deref(),
+                cmd.raw_encryption_file_password.as_deref(),
                 &cmd.password,
                 false,
             );
@@ -3780,11 +3963,11 @@ fn run_check_linearization(
 /// 2, matching the surrounding option parsers. The two options are mutually
 /// exclusive at the CLI layer (clap `conflicts_with`), so at most one branch
 /// fires.
-fn apply_encryption_options(
+fn apply_encryption_options<T: RawCliArg>(
     options: &mut WriterOptions,
-    encrypt: Option<&[OsString]>,
+    encrypt: Option<&[T]>,
     copy_encryption: Option<&std::path::Path>,
-    encryption_file_password: Option<&OsStr>,
+    encryption_file_password: Option<&[u8]>,
     password_args: &PasswordArgs,
     suppress_warnings: bool,
 ) {
@@ -3835,7 +4018,7 @@ fn apply_encryption_options(
 /// rejected with a "not yet supported" message.
 fn build_copy_encryption_source(
     path: &std::path::Path,
-    password: Option<&OsStr>,
+    password: Option<&[u8]>,
     password_args: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<CopyEncryptionSource> {
@@ -3844,7 +4027,7 @@ fn build_copy_encryption_source(
     let reader = BufReader::new(file);
 
     let mut donor_password = password_args.clone();
-    donor_password.password = Some(password.map(OsStr::to_os_string).unwrap_or_default());
+    donor_password.set_password_bytes(password.map(ToOwned::to_owned));
     donor_password.password_file = None;
     let opts = pdf_open_options(true, &donor_password)
         .map_err(|error| format!("--copy-encryption: failed to configure {:?}: {error}", path))?;
@@ -3951,17 +4134,46 @@ struct ParsedEncryptSegment {
 
 trait RawCliArg {
     fn raw_bytes(&self) -> Vec<u8>;
+    fn os_string(&self) -> OsString;
 }
 
 impl RawCliArg for String {
     fn raw_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
+
+    fn os_string(&self) -> OsString {
+        OsString::from(self)
+    }
 }
 
 impl RawCliArg for OsString {
     fn raw_bytes(&self) -> Vec<u8> {
         arg_parser::os_bytes(self)
+    }
+
+    fn os_string(&self) -> OsString {
+        self.clone()
+    }
+}
+
+impl RawCliArg for Vec<u8> {
+    fn raw_bytes(&self) -> Vec<u8> {
+        self.clone()
+    }
+
+    fn os_string(&self) -> OsString {
+        arg_parser::os_string_from_bytes(self)
+    }
+}
+
+impl RawCliArg for arg_parser::RawArg {
+    fn raw_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+
+    fn os_string(&self) -> OsString {
+        self.as_os_str().to_os_string()
     }
 }
 
@@ -4733,6 +4945,8 @@ struct PageSegmentSpec {
     file_token: OsString,
     /// Per-input password (`--password=` immediately following the file).
     password: Option<OsString>,
+    /// Raw per-input password bytes, retained when the OS projection is lossy.
+    raw_password: Option<Vec<u8>>,
     /// Page-range string (empty = all pages).
     range: String,
 }
@@ -4749,39 +4963,43 @@ struct PageSegmentSpec {
 /// ```
 ///
 /// Bounded, non-recursive single pass over `tokens`; no panics.
-fn parse_pages_segment<T: AsRef<OsStr>>(tokens: &[T]) -> CliResult<Vec<PageSegmentSpec>> {
+fn parse_pages_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<Vec<PageSegmentSpec>> {
     let mut specs: Vec<PageSegmentSpec> = Vec::new();
 
     for tok in tokens {
-        let tok = tok.as_ref();
-        if let Some(path) = arg_parser::os_strip_prefix(tok, "--file=") {
+        let token_bytes = tok.raw_bytes();
+        if let Some(path) = token_bytes.strip_prefix(b"--file=") {
             specs.push(PageSegmentSpec {
-                file_token: path,
+                file_token: arg_parser::os_string_from_bytes(path),
                 password: None,
+                raw_password: None,
                 range: String::new(),
             });
             continue;
         }
-        if let Some(pw) = arg_parser::os_strip_prefix(tok, "--password=") {
+        if let Some(pw) = token_bytes.strip_prefix(b"--password=") {
             let cur = specs
                 .last_mut()
                 .ok_or("--pages: --password= must follow a file in the --pages segment")?;
-            cur.password = Some(pw);
+            cur.password = Some(arg_parser::os_string_from_bytes(pw));
+            cur.raw_password = Some(pw.to_vec());
             continue;
         }
-        if let Some(r) = arg_parser::os_strip_prefix(tok, "--range=") {
+        if let Some(r) = token_bytes.strip_prefix(b"--range=") {
             let cur = specs
                 .last_mut()
                 .ok_or("--pages: --range= must follow a file in the --pages segment")?;
             if !cur.range.is_empty() {
                 return Err("--pages: duplicate page-range for one input file".into());
             }
-            cur.range = arg_parser::os_to_string(&r, "--pages --range")?;
+            cur.range =
+                String::from_utf8(r.to_vec()).map_err(|_| "--pages --range must be valid UTF-8")?;
             continue;
         }
-        if arg_parser::os_starts_with(tok, "--") {
+        if token_bytes.starts_with(b"--") {
             return Err(format!(
-                "--pages: unsupported token {tok:?} in the page-selection segment"
+                "--pages: unsupported token {:?} in the page-selection segment",
+                tok.os_string()
             )
             .into());
         }
@@ -4789,8 +5007,8 @@ fn parse_pages_segment<T: AsRef<OsStr>>(tokens: &[T]) -> CliResult<Vec<PageSegme
         // current file. qpdf's heuristic: the token is a page-range iff a
         // file is already open and that file has no range yet AND the token
         // parses as a page-range. Otherwise it starts a new file.
-        let range = tok
-            .to_str()
+        let range = std::str::from_utf8(&token_bytes)
+            .ok()
             .filter(|range| PageRange::parse(range).is_ok())
             .map(str::to_owned);
         match (specs.last_mut(), range) {
@@ -4798,8 +5016,9 @@ fn parse_pages_segment<T: AsRef<OsStr>>(tokens: &[T]) -> CliResult<Vec<PageSegme
                 cur.range = range;
             }
             _ => specs.push(PageSegmentSpec {
-                file_token: tok.to_os_string(),
+                file_token: tok.os_string(),
                 password: None,
+                raw_password: None,
                 range: String::new(),
             }),
         }
@@ -4809,6 +5028,13 @@ fn parse_pages_segment<T: AsRef<OsStr>>(tokens: &[T]) -> CliResult<Vec<PageSegme
         return Err("--pages: no input files given in the page-selection segment".into());
     }
     Ok(specs)
+}
+
+fn raw_page_tokens(page_ops: &PageOpArgs) -> Vec<Vec<u8>> {
+    page_ops
+        .raw_pages
+        .clone()
+        .unwrap_or_else(|| raw_os_args(&page_ops.pages))
 }
 
 /// Resolve `--pages` specs into [`InputSpec`]s, mapping the `.` shorthand to
@@ -4833,7 +5059,11 @@ fn resolve_page_specs(
         })?;
         out.push(InputSpec::new(
             path,
-            s.password.as_deref().map(arg_parser::os_bytes),
+            s.raw_password.clone().or_else(|| {
+                s.password
+                    .as_ref()
+                    .map(|password| arg_parser::os_bytes(password))
+            }),
             range,
         ));
     }
@@ -4873,6 +5103,8 @@ struct OverlaySpec {
     file: OsString,
     /// Password for the source PDF, if supplied via `--password=`.
     password: Option<OsString>,
+    /// Raw password bytes, retained when the OS projection is lossy.
+    raw_password: Option<Vec<u8>>,
     /// Raw `--from=` page-range string (source pages to cycle through).
     from: Option<String>,
     /// Raw `--to=` page-range string (destination pages to receive content).
@@ -4884,7 +5116,17 @@ struct OverlaySpec {
 struct PreprocessedArgs {
     residual_args: Vec<OsString>,
     overlay_specs: Vec<OverlaySpec>,
-    attachment_segments: Vec<Vec<OsString>>,
+    attachment_segments: Vec<Vec<Vec<u8>>>,
+    raw_overrides: RawCliOverrides,
+}
+
+#[derive(Debug, Default)]
+struct RawCliOverrides {
+    password: Option<Vec<u8>>,
+    encryption_file_password: Option<Vec<u8>>,
+    raw_encrypt: Option<Vec<Vec<u8>>>,
+    raw_pages: Option<Vec<Vec<u8>>>,
+    raw_copy_attachments_from: Option<Vec<Vec<u8>>>,
 }
 
 /// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
@@ -4902,10 +5144,7 @@ struct PreprocessedArgs {
 ///
 /// Returns an error if the token slice is empty, a file is missing or duplicated,
 /// a range is syntactically invalid, a flag is duplicated, or an unknown `--` flag appears.
-fn parse_overlay_segment<T: AsRef<OsStr>>(
-    kind: OverlayKind,
-    tokens: &[T],
-) -> CliResult<OverlaySpec> {
+fn parse_overlay_segment<T: RawCliArg>(kind: OverlayKind, tokens: &[T]) -> CliResult<OverlaySpec> {
     let flag = match kind {
         OverlayKind::Overlay => "--overlay",
         OverlayKind::Underlay => "--underlay",
@@ -4917,64 +5156,71 @@ fn parse_overlay_segment<T: AsRef<OsStr>>(
 
     let mut file: Option<OsString> = None;
     let mut password: Option<OsString> = None;
+    let mut raw_password: Option<Vec<u8>> = None;
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
     let mut repeat: Option<String> = None;
 
     for tok in tokens {
-        let tok = tok.as_ref();
-        if let Some(path) = arg_parser::os_strip_prefix(tok, "--file=") {
+        let token_bytes = tok.raw_bytes();
+        if let Some(path) = token_bytes.strip_prefix(b"--file=") {
             if file.is_some() {
                 return Err(format!("{flag}: duplicate file in segment").into());
             }
-            file = Some(path);
+            file = Some(arg_parser::os_string_from_bytes(path));
             continue;
         }
-        if let Some(pw) = arg_parser::os_strip_prefix(tok, "--password=") {
+        if let Some(pw) = token_bytes.strip_prefix(b"--password=") {
             if password.is_some() {
                 return Err(format!("{flag}: duplicate --password= in segment").into());
             }
-            password = Some(pw);
+            password = Some(arg_parser::os_string_from_bytes(pw));
+            raw_password = Some(pw.to_vec());
             continue;
         }
-        if let Some(r) = arg_parser::os_strip_prefix(tok, "--to=") {
+        if let Some(r) = token_bytes.strip_prefix(b"--to=") {
             if to.is_some() {
                 return Err(format!("{flag}: duplicate --to= in segment").into());
             }
-            let r = arg_parser::os_to_string(&r, "overlay --to")?;
+            let r =
+                String::from_utf8(r.to_vec()).map_err(|_| "overlay --to must be valid UTF-8")?;
             PageRange::parse(&r)
                 .map_err(|e| format!("{flag}: invalid --to= page range {r:?}: {e}"))?;
             to = Some(r);
             continue;
         }
-        if let Some(r) = arg_parser::os_strip_prefix(tok, "--from=") {
+        if let Some(r) = token_bytes.strip_prefix(b"--from=") {
             if from.is_some() {
                 return Err(format!("{flag}: duplicate --from= in segment").into());
             }
-            let r = arg_parser::os_to_string(&r, "overlay --from")?;
+            let r =
+                String::from_utf8(r.to_vec()).map_err(|_| "overlay --from must be valid UTF-8")?;
             PageRange::parse(&r)
                 .map_err(|e| format!("{flag}: invalid --from= page range {r:?}: {e}"))?;
             from = Some(r);
             continue;
         }
-        if let Some(r) = arg_parser::os_strip_prefix(tok, "--repeat=") {
+        if let Some(r) = token_bytes.strip_prefix(b"--repeat=") {
             if repeat.is_some() {
                 return Err(format!("{flag}: duplicate --repeat= in segment").into());
             }
-            let r = arg_parser::os_to_string(&r, "overlay --repeat")?;
+            let r = String::from_utf8(r.to_vec())
+                .map_err(|_| "overlay --repeat must be valid UTF-8")?;
             PageRange::parse(&r)
                 .map_err(|e| format!("{flag}: invalid --repeat= page range {r:?}: {e}"))?;
             repeat = Some(r);
             continue;
         }
-        if arg_parser::os_starts_with(tok, "--") {
-            return Err(format!("{flag}: unsupported token {tok:?} in segment").into());
+        if token_bytes.starts_with(b"--") {
+            return Err(
+                format!("{flag}: unsupported token {:?} in segment", tok.os_string()).into(),
+            );
         }
         // Bare (non-flag) token: must be the file path (exactly one allowed).
         if file.is_some() {
             return Err(format!("{flag}: duplicate file in segment").into());
         }
-        file = Some(tok.to_os_string());
+        file = Some(tok.os_string());
     }
 
     let file = file.ok_or_else(|| format!("{flag}: no source file given in the segment"))?;
@@ -4983,6 +5229,7 @@ fn parse_overlay_segment<T: AsRef<OsStr>>(
         kind,
         file,
         password,
+        raw_password,
         from,
         to,
         repeat,
@@ -5130,7 +5377,11 @@ fn build_overlay_specs_with_suppression(
         // command-wide open policy (including recovery and xref handling),
         // replacing only the source-local password.
         let mut source_password = password.clone();
-        source_password.password = spec.password.clone();
+        source_password.set_password_bytes(spec.raw_password.clone().or_else(|| {
+            spec.password
+                .as_ref()
+                .map(|password| arg_parser::os_bytes(password))
+        }));
         source_password.password_file = None;
         let options = pdf_open_options(repair, &source_password)?;
         let mut source_job = QPDFJob::new();
@@ -5287,7 +5538,8 @@ fn run_page_extraction(
         );
     }
 
-    let specs = parse_pages_segment(&page_ops.pages)?;
+    let page_tokens = raw_page_tokens(page_ops);
+    let specs = parse_pages_segment(&page_tokens)?;
     let mut inputs = resolve_page_specs(&specs, primary_input)?;
     let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
 
@@ -5298,10 +5550,10 @@ fn run_page_extraction(
     // not fall back to the primary password for a distinct source
     // (QPDFJob.cc:2400-2412).
     if !has_external_source {
-        if let Some(top_pw) = &password.password {
+        if let Some(top_pw) = password.password_bytes() {
             for spec in &mut inputs {
                 if spec.password.is_none() {
-                    spec.password = Some(arg_parser::os_bytes(top_pw));
+                    spec.password = Some(top_pw.clone());
                 }
             }
         }
@@ -5459,7 +5711,8 @@ fn run_empty_page_extraction(
 ) -> CliResult<()> {
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     let creates_output = standard_output.is_none();
-    let raw_specs = parse_pages_segment(&page_ops.pages)?;
+    let page_tokens = raw_page_tokens(page_ops);
+    let raw_specs = parse_pages_segment(&page_tokens)?;
     if raw_specs
         .iter()
         .any(|spec| spec.file_token == OsStr::new("."))
@@ -5513,9 +5766,7 @@ fn run_empty_page_extraction(
             ))?;
         }
         let mut source_password = password.clone();
-        source_password.password = source_passwords[source_index]
-            .as_deref()
-            .map(os_string_from_bytes);
+        source_password.set_password_bytes(source_passwords[source_index].clone());
         source_password.password_file = None;
         sources.push(open_page_source(
             path,
@@ -5692,9 +5943,7 @@ fn run_page_extraction_from_multiple_sources(
         // not a fallback for a secondary with no segment password; retain the
         // global interpretation/policy flags, but replace both credential
         // fields with the per-source value, including an explicit empty value.
-        source_password.password = source_passwords[source_index]
-            .as_deref()
-            .map(os_string_from_bytes);
+        source_password.set_password_bytes(source_passwords[source_index].clone());
         source_password.password_file = None;
         if verbose {
             logger_info(format!(
@@ -7443,8 +7692,8 @@ fn open_pdf_file_impl(
 }
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
-    let password_bytes = if let Some(password) = &password.password {
-        arg_parser::os_bytes(password)
+    let password_bytes = if let Some(password) = password.password_bytes() {
+        password
     } else if let Some(path) = &password.password_file {
         read_password_file(path)?
     } else {
@@ -7582,20 +7831,6 @@ fn path_description(input: &Path) -> Vec<u8> {
 #[cfg(not(unix))]
 fn path_description(input: &Path) -> Vec<u8> {
     input.to_string_lossy().into_owned().into_bytes()
-}
-
-fn os_string_from_bytes(bytes: &[u8]) -> OsString {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-
-        OsString::from_vec(bytes.to_vec())
-    }
-
-    #[cfg(not(unix))]
-    {
-        OsString::from(String::from_utf8_lossy(bytes).into_owned())
-    }
 }
 
 /// Program name used in qpdf-parity diagnostic prefixes.
@@ -7832,11 +8067,12 @@ struct AddAttachmentArgs {
 ///
 /// Expected token order: FILE [--key=K] [--filename=F] [--mimetype=M]
 /// [--description=D] [--creationdate=D] [--moddate=D] [--replace]
-fn parse_add_attachment_segment<T: Into<OsString>>(tokens: Vec<T>) -> CliResult<AddAttachmentArgs> {
-    let mut iter = tokens.into_iter().map(Into::into);
+fn parse_add_attachment_segment<T: RawCliArg>(tokens: Vec<T>) -> CliResult<AddAttachmentArgs> {
+    let mut iter = tokens.into_iter();
     let file: PathBuf = iter
         .next()
         .ok_or("--add-attachment: missing FILE argument")?
+        .os_string()
         .into();
 
     let mut key: Option<Vec<u8>> = None;
@@ -7848,33 +8084,33 @@ fn parse_add_attachment_segment<T: Into<OsString>>(tokens: Vec<T>) -> CliResult<
     let mut replace = false;
 
     for token in iter {
-        if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--key=") {
-            key = Some(arg_parser::os_bytes(&v));
-        } else if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--filename=") {
-            filename = Some(arg_parser::os_bytes(&v));
-        } else if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--mimetype=") {
-            let bytes = arg_parser::os_bytes(&v);
+        let token_bytes = token.raw_bytes();
+        if let Some(v) = token_bytes.strip_prefix(b"--key=") {
+            key = Some(v.to_vec());
+        } else if let Some(v) = token_bytes.strip_prefix(b"--filename=") {
+            filename = Some(v.to_vec());
+        } else if let Some(v) = token_bytes.strip_prefix(b"--mimetype=") {
+            let bytes = v.to_vec();
             if !bytes.contains(&b'/') {
                 return Err("mime type should be specified as type/subtype".into());
             }
             mimetype = Some(bytes);
-        } else if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--description=") {
-            description = Some(arg_parser::os_bytes(&v));
-        } else if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--creationdate=") {
-            creation_date = Some(parse_pdf_date_arg(&arg_parser::os_to_string(
-                &v,
-                "--add-attachment --creationdate",
-            )?)?);
-        } else if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--moddate=") {
-            mod_date = Some(parse_pdf_date_arg(&arg_parser::os_to_string(
-                &v,
-                "--add-attachment --moddate",
-            )?)?);
-        } else if token == OsStr::new("--replace") {
+        } else if let Some(v) = token_bytes.strip_prefix(b"--description=") {
+            description = Some(v.to_vec());
+        } else if let Some(v) = token_bytes.strip_prefix(b"--creationdate=") {
+            let value = std::str::from_utf8(v)
+                .map_err(|_| "--add-attachment --creationdate must be valid UTF-8")?;
+            creation_date = Some(parse_pdf_date_arg(value)?);
+        } else if let Some(v) = token_bytes.strip_prefix(b"--moddate=") {
+            let value = std::str::from_utf8(v)
+                .map_err(|_| "--add-attachment --moddate must be valid UTF-8")?;
+            mod_date = Some(parse_pdf_date_arg(value)?);
+        } else if token_bytes == b"--replace" {
             replace = true;
         } else {
             return Err(format!(
-                "--add-attachment: unknown sub-flag or unexpected token {token:?}"
+                "--add-attachment: unknown sub-flag or unexpected token {:?}",
+                token.os_string()
             )
             .into());
         }
@@ -7906,26 +8142,27 @@ struct CopyAttachmentsArgs {
 /// [`CopyAttachmentsArgs`].
 ///
 /// Expected token order: FILE [--password=P] [--prefix=X]
-fn parse_copy_attachments_segment<T: Into<OsString>>(
-    tokens: Vec<T>,
-) -> CliResult<CopyAttachmentsArgs> {
-    let mut iter = tokens.into_iter().map(Into::into);
+fn parse_copy_attachments_segment<T: RawCliArg>(tokens: Vec<T>) -> CliResult<CopyAttachmentsArgs> {
+    let mut iter = tokens.into_iter();
     let file: PathBuf = iter
         .next()
         .ok_or("--copy-attachments-from: missing FILE argument")?
+        .os_string()
         .into();
 
     let mut password: Vec<u8> = Vec::new();
     let mut prefix: Option<Vec<u8>> = None;
 
     for token in iter {
-        if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--password=") {
-            password = arg_parser::os_bytes(&v);
-        } else if let Some(v) = arg_parser::os_strip_prefix(token.as_os_str(), "--prefix=") {
-            prefix = Some(arg_parser::os_bytes(&v));
+        let token_bytes = token.raw_bytes();
+        if let Some(v) = token_bytes.strip_prefix(b"--password=") {
+            password = v.to_vec();
+        } else if let Some(v) = token_bytes.strip_prefix(b"--prefix=") {
+            prefix = Some(v.to_vec());
         } else {
             return Err(format!(
-                "--copy-attachments-from: unknown sub-flag or unexpected token {token:?}"
+                "--copy-attachments-from: unknown sub-flag or unexpected token {:?}",
+                token.os_string()
             )
             .into());
         }
@@ -7975,7 +8212,7 @@ fn run_add_attachment(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    segments: Vec<Vec<OsString>>,
+    segments: Vec<Vec<Vec<u8>>>,
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
@@ -8158,7 +8395,7 @@ fn run_copy_attachments_from(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    tokens: Vec<OsString>,
+    tokens: Vec<Vec<u8>>,
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
@@ -8200,6 +8437,7 @@ fn run_copy_attachments_from(
     // target.
     let mut source_password = password.clone();
     source_password.password = None;
+    source_password.raw_password = None;
     source_password.password_file = None;
     let mut src_options =
         pdf_open_options_with_password_bytes(repair, &source_password, args.password.clone());
@@ -8303,6 +8541,7 @@ mod tests {
             residual_args: residual,
             overlay_specs,
             attachment_segments,
+            ..
         } = preprocess_qpdf_args(strs(&["flpdf", "--overlay", "source.pdf", "--to=1", "--"]))
             .expect("qpdf preprocessing should succeed");
 
@@ -8311,6 +8550,158 @@ mod tests {
         assert_eq!(overlay_specs[0].file, "source.pdf");
         assert_eq!(overlay_specs[0].to.as_deref(), Some("1"));
         assert!(attachment_segments.is_empty());
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_keeps_raw_top_level_password_for_clap_override() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("args");
+        std::fs::write(&path, b"--password=top-\xff\ninput.pdf\n").expect("write argument file");
+        let preprocessed = preprocess_qpdf_args(vec![
+            OsString::from("flpdf"),
+            OsString::from(format!("@{}", path.display())),
+        ])
+        .expect("qpdf preprocessing should preserve raw password bytes");
+        let expected = b"top-\xff".to_vec();
+        assert_eq!(
+            preprocessed.raw_overrides.password.as_deref(),
+            Some(expected.as_slice())
+        );
+
+        let mut args = cli_parse_from(preprocessed.residual_args);
+        apply_raw_overrides(&mut args, preprocessed.raw_overrides);
+        assert_eq!(args.password.password_bytes(), Some(expected));
+    }
+
+    #[test]
+    fn raw_password_override_reaches_pdf_open_options_without_projection() {
+        let mut password = PasswordArgs {
+            password: Some(OsString::from("replacement")),
+            ..PasswordArgs::default()
+        };
+        password.raw_password = Some(b"raw-\xff".to_vec());
+
+        let options = pdf_open_options(false, &password).expect("password options should build");
+        assert_eq!(options.password, b"raw-\xff");
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_keeps_raw_encrypt_and_donor_passwords() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let encrypt_path = directory.path().join("encrypt-args");
+        std::fs::write(
+            &encrypt_path,
+            b"--encrypt\nuser-\xff\nowner\n128\n--\ninput.pdf\noutput.pdf\n",
+        )
+        .expect("write encryption argument file");
+        let preprocessed = preprocess_qpdf_args(vec![
+            OsString::from("flpdf"),
+            OsString::from(format!("@{}", encrypt_path.display())),
+        ])
+        .expect("qpdf encryption segment should be expanded");
+        assert_eq!(
+            preprocessed.raw_overrides.raw_encrypt.as_ref().unwrap()[0],
+            b"user-\xff"
+        );
+        let parsed_encrypt = parse_encrypt_segment(
+            preprocessed.raw_overrides.raw_encrypt.as_ref().unwrap(),
+            true,
+        )
+        .expect("raw encrypt passwords should reach the byte parser");
+        assert_eq!(parsed_encrypt.params.user_password, b"user-\xff");
+
+        let donor_path = directory.path().join("donor-args");
+        std::fs::write(
+            &donor_path,
+            b"--encryption-file-password=donor-\xff\ninput.pdf\noutput.pdf\n",
+        )
+        .expect("write donor argument file");
+        let donor = preprocess_qpdf_args(vec![
+            OsString::from("flpdf"),
+            OsString::from(format!("@{}", donor_path.display())),
+        ])
+        .expect("qpdf donor password should be expanded");
+        assert_eq!(
+            donor.raw_overrides.encryption_file_password.as_deref(),
+            Some(b"donor-\xff".as_slice())
+        );
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_rejects_a_second_pages_group_like_qpdf() {
+        let error = match preprocess_qpdf_args(strs(&[
+            "flpdf", "--pages", "a.pdf", "1", "--", "--pages", "a.pdf", "2", "--", "in.pdf",
+            "out.pdf",
+        ])) {
+            Ok(_) => panic!("qpdf rejects a second --pages group"),
+            Err(error) => error,
+        };
+        let usage = find_usage_error(error.as_ref()).expect("a qpdf usage error");
+        assert_eq!(usage.to_string(), "--pages may only be specified one time");
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_refuses_to_drop_an_earlier_copy_attachments_group() {
+        let error = match preprocess_qpdf_args(strs(&[
+            "flpdf",
+            "--copy-attachments-from",
+            "don0.pdf",
+            "--",
+            "--copy-attachments-from",
+            "don1.pdf",
+            "--",
+            "in.pdf",
+            "out.pdf",
+        ])) {
+            Ok(_) => panic!("a second donor group must not silently replace the first"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("multiple donor groups are not supported yet"));
+    }
+
+    #[test]
+    fn preprocess_qpdf_args_does_not_promote_segment_password_to_top_level() {
+        let directory = tempfile::tempdir().expect("create argument-file directory");
+        let path = directory.path().join("pages-args");
+        std::fs::write(
+            &path,
+            b"--pages\nsource.pdf\n--password=page-\xff\n--\ninput.pdf\noutput.pdf\n",
+        )
+        .expect("write page argument file");
+
+        let preprocessed = preprocess_qpdf_args(vec![
+            OsString::from("flpdf"),
+            OsString::from(format!("@{}", path.display())),
+        ])
+        .expect("qpdf page segment should be expanded");
+        assert!(preprocessed.raw_overrides.password.is_none());
+        assert_eq!(
+            preprocessed.raw_overrides.raw_pages.as_ref().unwrap()[1],
+            b"--password=page-\xff"
+        );
+    }
+
+    #[test]
+    fn raw_passwords_reach_pages_overlay_and_copy_segment_parsers() {
+        let page_tokens = vec![b"source.pdf".to_vec(), b"--password=page-\xff".to_vec()];
+        let pages = parse_pages_segment(&page_tokens).expect("page segment should parse");
+        assert_eq!(pages[0].raw_password, Some(b"page-\xff".to_vec()));
+
+        let overlay = parse_overlay_segment(
+            OverlayKind::Overlay,
+            &[b"source.pdf".to_vec(), b"--password=overlay-\xff".to_vec()],
+        )
+        .expect("overlay segment should parse");
+        assert_eq!(overlay.raw_password, Some(b"overlay-\xff".to_vec()));
+
+        let copy = parse_copy_attachments_segment(vec![
+            b"source.pdf".to_vec(),
+            b"--password=copy-\xff".to_vec(),
+        ])
+        .expect("copy-attachments segment should parse");
+        assert_eq!(copy.password, b"copy-\xff".to_vec());
     }
 
     #[test]
@@ -8510,6 +8901,7 @@ mod tests {
                 kind: OverlayKind::Overlay,
                 file: "over.pdf".into(),
                 password: None,
+                raw_password: None,
                 from: None,
                 to: None,
                 repeat: None,
@@ -9572,6 +9964,7 @@ mod tests {
             kind: OverlayKind::Underlay,
             file: compat_fixture("one-page.pdf").into(),
             password: None,
+            raw_password: None,
             from: Some("1".into()),
             to: Some("1-2".into()),
             repeat: Some("1".into()),
@@ -9591,6 +9984,7 @@ mod tests {
             kind: OverlayKind::Overlay,
             file: compat_fixture("one-page.pdf").into(),
             password: None,
+            raw_password: None,
             from: None,
             to: None,
             repeat: None,
@@ -9609,6 +10003,7 @@ mod tests {
             kind: OverlayKind::Overlay,
             file: "/nonexistent/overlay/source.pdf".into(),
             password: None,
+            raw_password: None,
             from: None,
             to: None,
             repeat: None,
@@ -9645,6 +10040,7 @@ mod tests {
                 kind: OverlayKind::Overlay,
                 file: file.clone().into(),
                 password: None,
+                raw_password: None,
                 from: from.map(str::to_string),
                 to: None,
                 repeat: None,
@@ -9673,6 +10069,7 @@ mod tests {
                 kind: OverlayKind::Overlay,
                 file: file.clone().into(),
                 password: None,
+                raw_password: None,
                 from: None,
                 to: to.map(str::to_string),
                 repeat: None,
@@ -9701,6 +10098,7 @@ mod tests {
                 kind: OverlayKind::Overlay,
                 file: file.clone().into(),
                 password: None,
+                raw_password: None,
                 from: None,
                 to: None,
                 repeat: repeat.map(str::to_string),
@@ -9736,6 +10134,7 @@ mod tests {
             kind: OverlayKind::Overlay,
             file: encrypted_fixture("v2-rc4-128-r3.pdf").into(),
             password: Some("user-v2".into()),
+            raw_password: None,
             from: None,
             to: None,
             repeat: None,
