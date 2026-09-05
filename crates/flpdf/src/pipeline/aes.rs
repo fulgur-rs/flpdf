@@ -888,8 +888,35 @@ mod tests {
         sink.take_buffer().expect("buffer")
     }
 
-    // An unsupported key length is rejected: qpdf's own header scopes this
-    // pipeline to AES-128 and AES-256 (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
+    // A 24-byte key remains unsupported by the PDF-facing stage. Raw V=5 keys
+    // longer than 32 bytes are a separate qpdf provider edge case: qpdf's
+    // GnuTLS/OpenSSL providers select AES-128 and consume the first 16 bytes
+    // for an unsupported provider key length (`QPDFCrypto_gnutls.cc:197-213`,
+    // `QPDFCrypto_openssl.cc:225-241`).
+    #[test]
+    fn an_overlength_provider_key_uses_its_aes128_prefix() {
+        let mut overlength = KEY128.to_vec();
+        overlength.extend_from_slice(&[0xa5; 24]);
+
+        let encrypt = |key: &[u8]| {
+            let mut sink = Buffer::new("ciphertext", None);
+            let mut stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, key)
+                .expect("qpdf provider accepts an overlength raw key");
+            stage
+                .set_iv(&IV)
+                .expect("a 16-byte vector is the block size");
+            stage.disable_padding();
+            stage.write(PLAINTEXT_32).expect("write");
+            stage.finish().expect("finish");
+            sink.take_buffer().expect("buffer")
+        };
+
+        assert_eq!(encrypt(&overlength), encrypt(&KEY128));
+    }
+
+    // An unsupported key length below the qpdf provider fallback remains
+    // rejected: qpdf's own header scopes this pipeline to AES-128 and AES-256
+    // (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
     #[test]
     fn a_key_that_is_neither_128_nor_256_bits_is_rejected() {
         let mut sink = Buffer::new("ciphertext", None);
