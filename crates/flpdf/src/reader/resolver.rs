@@ -3022,26 +3022,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.resolve_at_offset_with_optional_description(offset, expected, None)
     }
 
-    /// Read an object at a physical offset using qpdf's caller-provided
-    /// description. `QPDF::readHintStream` supplies `linearization hint
-    /// stream` to `readObjectAtOffset`, so stream framing and recovery warnings
-    /// must retain that description instead of falling back to `object N G`
-    /// (`libqpdf/QPDF_linearization.cc:241-245` and
-    /// `libqpdf/QPDF.cc:1297-1339`).
-    pub(crate) fn resolve_at_offset_with_description(
-        &self,
-        offset: u64,
-        expected: ObjectRef,
-        description: impl AsRef<[u8]>,
-    ) -> Result<(ObjectHandle, Option<u64>)> {
-        self.resolve_at_offset_with_optional_description(
-            offset,
-            expected,
-            Some(description.as_ref().to_vec()),
-        )
-    }
-
-    fn resolve_at_offset_with_optional_description(
+    /// Read an object at a physical offset, optionally retaining qpdf's
+    /// caller-provided description in stream diagnostics. The existing
+    /// no-description offset route and the linearization hint-stream route
+    /// share this canonical primitive.
+    pub(crate) fn resolve_at_offset_with_optional_description(
         &self,
         offset: u64,
         expected: ObjectRef,
@@ -11253,10 +11238,10 @@ mod tests {
         );
 
         let (handle, _) = resolver
-            .resolve_at_offset_with_description(
+            .resolve_at_offset_with_optional_description(
                 0,
                 ObjectRef::new(2, 0),
-                b"linearization hint stream",
+                Some(b"linearization hint stream".to_vec()),
             )
             .expect("qpdf's described offset read resolves");
         assert!(handle.as_stream_dict().is_some());
