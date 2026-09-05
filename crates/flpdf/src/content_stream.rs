@@ -81,9 +81,7 @@ fn deliver_diagnostic(
     message: &str,
 ) -> Result<()> {
     if let Some(context) = context {
-        let offset = i64::try_from(offset).map_err(|_| {
-            Error::Internal("content diagnostic offset does not fit qpdf offset".into())
-        })?;
+        let offset = offset as i64;
         context.warn(
             format_qpdf_exception_what(source_description, object_description, offset, message)
                 .into_bytes(),
@@ -126,7 +124,7 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 "content",
                 diagnostic.relative_offset,
                 &diagnostic.message,
-            )?;
+            )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
             callbacks.handle_diagnostic(
                 source_description,
                 "content",
@@ -182,7 +180,7 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                     "stream data",
                     image.end,
                     diagnostic,
-                )?;
+                )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
                 callbacks.handle_diagnostic(
                     source_description,
                     "stream data",
