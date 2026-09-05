@@ -5748,14 +5748,20 @@ fn run_empty_page_extraction(
     }
 
     if verbose {
-        let mut message = String::from(
-            "flpdf: empty PDF: checking for shared resources\nflpdf: no shared resources found\n",
-        );
-        for path in &source_paths {
-            let fname = pages_progress_filename(path);
-            message.push_str(&format!(
-                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-            ));
+        let mut message = String::new();
+        // qpdf's shouldRemoveUnreferencedResources returns before any
+        // report for explicit yes/no (`QPDFJob.cc:2253-2258`); only the
+        // Auto heuristic announces the preflight.
+        if remove_unref == CliRemoveUnreferencedResources::Auto {
+            message.push_str(
+                "flpdf: empty PDF: checking for shared resources\nflpdf: no shared resources found\n",
+            );
+            for path in &source_paths {
+                let fname = pages_progress_filename(path);
+                message.push_str(&format!(
+                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+                ));
+            }
         }
         message.push_str("flpdf: removing unreferenced pages from primary input\n");
         for path in &source_paths {
@@ -5936,11 +5942,14 @@ fn run_page_extraction_from_multiple_sources(
 
     if verbose {
         let mut message = String::new();
-        for path in &source_paths {
-            let fname = pages_progress_filename(path);
-            message.push_str(&format!(
-                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-            ));
+        // Explicit yes/no skip qpdf's preflight report (`QPDFJob.cc:2253-2258`).
+        if remove_unref == CliRemoveUnreferencedResources::Auto {
+            for path in &source_paths {
+                let fname = pages_progress_filename(path);
+                message.push_str(&format!(
+                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+                ));
+            }
         }
         message.push_str("flpdf: removing unreferenced pages from primary input\n");
         for path in &source_paths {
@@ -6078,11 +6087,14 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 "n"
             }
         );
-        for path in distinct {
-            let fname = pages_progress_filename(path);
-            message.push_str(&format!(
-                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-            ));
+        // Explicit yes/no skip qpdf's preflight report (`QPDFJob.cc:2253-2258`).
+        if remove_unref == CliRemoveUnreferencedResources::Auto {
+            for path in distinct {
+                let fname = pages_progress_filename(path);
+                message.push_str(&format!(
+                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+                ));
+            }
         }
         logger_info(message)?;
     }

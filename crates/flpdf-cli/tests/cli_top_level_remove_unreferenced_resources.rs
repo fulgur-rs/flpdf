@@ -194,3 +194,40 @@ fn top_level_remove_unreferenced_resources_matches_qpdf_for_pages() {
         );
     }
 }
+
+/// qpdf's `shouldRemoveUnreferencedResources` returns before any verbose
+/// report for explicit `yes`/`no` (`QPDFJob.cc:2253-2258`), so the
+/// `checking for shared resources` / `no shared resources found` lines must
+/// only appear in `auto` mode on the `--pages` route.
+#[test]
+fn top_level_pages_verbose_preflight_lines_only_appear_in_auto_mode() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let input = fixture("three-page.pdf");
+
+    for (mode, expected) in [("auto", true), ("yes", false), ("no", false)] {
+        let output = temp.path().join(format!("{mode}.pdf"));
+        let mut args = common_flags(mode);
+        args.extend([
+            OsString::from("--verbose"),
+            input.as_os_str().to_owned(),
+            OsString::from("--pages"),
+            OsString::from("."),
+            OsString::from("1-2"),
+            OsString::from("--"),
+            output.as_os_str().to_owned(),
+        ]);
+        let flpdf = run_flpdf(&args);
+        assert_success(&flpdf, "flpdf verbose pages resource mode");
+        let stdout = String::from_utf8_lossy(&flpdf.stdout);
+        assert_eq!(
+            stdout.contains("checking for shared resources"),
+            expected,
+            "mode {mode}: preflight report presence must follow qpdf: {stdout:?}"
+        );
+        assert_eq!(
+            stdout.contains("no shared resources found"),
+            expected,
+            "mode {mode}: no-shared report presence must follow qpdf: {stdout:?}"
+        );
+    }
+}
