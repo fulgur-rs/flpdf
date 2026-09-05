@@ -188,11 +188,21 @@ impl EncryptionState {
 pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
     match key.len() {
         16 => key.try_into().map_err(|_| unreachable!("length checked")),
-        len if len > 32 => {
+        // qpdf's providers map every key length other than 16/24/32 to
+        // AES-128 and hand the provider the first 16 bytes
+        // (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`).
+        // A 32-byte key is dispatched to AES-256 by the caller, and 24 bytes
+        // selects AES-192 in qpdf, which this port does not provide.
+        len if len > 16 && len != 24 && len != 32 => {
             let mut object_key = [0u8; 16];
             object_key.copy_from_slice(&key[..16]);
             Ok(object_key)
         }
+        24 => Err(EncryptedError::Malformed {
+            reason: "AES-192 (24-byte) raw keys are not supported".into(),
+        }
+        .into()),
+        // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
         _ => Err(EncryptedError::Malformed {
             reason: "AES-128 object key is not 16 bytes".into(),
         }

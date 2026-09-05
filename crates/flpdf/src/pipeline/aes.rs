@@ -114,18 +114,26 @@ impl<'a> PlAesPdf<'a> {
     ) -> PipelineResult<Self> {
         let key = match key.len() {
             16 | 32 => key.to_vec(),
-            len if len > 32 => {
-                // qpdf's GnuTLS and OpenSSL providers select AES-128 for an
-                // unsupported key length and configure a 16-byte provider key
-                // (`QPDFCrypto_gnutls.cc:197-213`,
+            len if len > 16 && len != 24 => {
+                // qpdf's GnuTLS and OpenSSL providers select AES-128 for every
+                // key length other than 16/24/32 and configure a 16-byte
+                // provider key (`QPDFCrypto_gnutls.cc:197-213`,
                 // `QPDFCrypto_openssl.cc:225-241`). The raw V=5 file key is
                 // retained by EncryptionState; only this provider-facing
                 // projection uses its first 16 bytes.
                 key[..16].to_vec()
             }
+            24 => {
+                // qpdf selects AES-192 here; this pipeline provides AES-128 and
+                // AES-256 only.
+                return Err(PipelineError::logic(
+                    "Pl_AES_PDF: key must be 16 or 32 bytes (qpdf selects AES-192 for a 24-byte key, which is not provided here), got 24",
+                ));
+            }
+            // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
             len => {
                 return Err(PipelineError::logic(format!(
-                    "Pl_AES_PDF: key must be 16 or 32 bytes, or longer than 32 bytes for qpdf's provider fallback, got {len}"
+                    "Pl_AES_PDF: key must be 16 or 32 bytes, got {len}"
                 )))
             }
         };
@@ -927,6 +935,20 @@ mod tests {
         };
 
         assert_eq!(encrypt(&overlength), encrypt(&KEY128));
+
+        // Any other length that is not 16/24/32 takes the same provider
+        // default: a 20-byte raw key encrypts exactly like its 16-byte prefix.
+        let mut twenty = KEY128.to_vec();
+        twenty.extend_from_slice(&[0x5a; 4]);
+        assert_eq!(encrypt(&twenty), encrypt(&KEY128));
+
+        // Below 16 bytes qpdf's providers read past the key buffer, which has
+        // no reproducible result; this port rejects such keys.
+        let mut sink = Buffer::new("ciphertext", None);
+        let short = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 8])
+            .err()
+            .map(|error| error.to_string());
+        assert!(short.as_deref().is_some_and(|m| m.contains("got 8")));
     }
 
     // An unsupported key length below the qpdf provider fallback remains

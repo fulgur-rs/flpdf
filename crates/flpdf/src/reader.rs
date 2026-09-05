@@ -2206,11 +2206,23 @@ mod encryption_state_commit_tests {
     }
 
     #[test]
-    fn aes_object_key_rejects_a_length_below_the_qpdf_fallback_boundary() {
+    fn aes_object_key_follows_the_qpdf_provider_length_dispatch() {
+        // 24 bytes selects AES-192 in qpdf's providers, which this port does
+        // not provide; every other length that is not 16 or 32 takes the
+        // AES-128 prefix (`QPDFCrypto_gnutls.cc:197-213`).
         let error = crate::encryption::state::aes128_object_key(&[0; 24])
-            .expect_err("24-byte keys are not an AES-128/256 PDF key");
+            .expect_err("24-byte keys select AES-192 in qpdf");
+        assert!(error.to_string().contains("AES-192"));
+
+        let error = crate::encryption::state::aes128_object_key(&[0; 8])
+            .expect_err("qpdf reads past a shorter key buffer; this port rejects it");
         assert!(error.to_string().contains("not 16 bytes"));
 
+        assert_eq!(
+            crate::encryption::state::aes128_object_key(&[0xa5; 20])
+                .expect("a 20-byte key uses the qpdf AES-128 provider fallback"),
+            [0xa5; 16]
+        );
         assert_eq!(
             crate::encryption::state::aes128_object_key(&[0xa5; 40])
                 .expect("overlength keys use the qpdf AES-128 provider fallback"),
