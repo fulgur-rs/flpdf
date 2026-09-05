@@ -824,12 +824,13 @@ fn encrypt_metadata_flag_from_handle(encrypt: &ObjectHandle) -> Result<bool> {
 }
 
 fn required_permissions_from_handle(encrypt: &ObjectHandle) -> Result<i32> {
-    i32::try_from(required_integer_from_handle(encrypt, "P")?).map_err(|_| {
-        crate::error::EncryptedError::Malformed {
-            reason: "/P entry is out of i32 range".into(),
-        }
-        .into()
-    })
+    // qpdf QPDF_encryption.cc:783 uses static_cast<int>(getIntValue())
+    // rather than getIntValueAsInt(). Preserve that signed permission
+    // bitfield narrowing so an unsigned /P such as 4294967292 becomes -4,
+    // matching qpdf on the pinned Linux x86_64 oracle.
+    Ok(crate::encryption::qpdf_permission_i32(
+        required_integer_from_handle(encrypt, "P")?,
+    ))
 }
 
 fn r6_perms_warning_from_handle(
@@ -966,6 +967,23 @@ mod tests {
         let state = parse_inspection_state(&encrypt).expect("parse encryption dictionary");
 
         assert_eq!(state.length_bits, 128);
+    }
+
+    #[test]
+    fn positive_unsigned_permission_value_wraps_like_qpdf() {
+        let encrypt = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"Standard".to_vec()),
+            ),
+            (b"/V".to_vec(), ObjectHandle::integer(2)),
+            (b"/R".to_vec(), ObjectHandle::integer(3)),
+            (b"/P".to_vec(), ObjectHandle::integer(4_294_967_292)),
+        ]);
+
+        let state = parse_inspection_state(&encrypt).expect("parse positive /P");
+
+        assert_eq!(state.permissions.raw(), -4);
     }
 
     #[test]
