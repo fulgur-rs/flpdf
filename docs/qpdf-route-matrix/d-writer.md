@@ -243,6 +243,10 @@ pinned qpdf 11.9.0 の `libqpdf/QPDFWriter.cc`（3044 行）/ `include/qpdf/QPDF
    `writeHintStream(hint_id)`（`libqpdf/QPDFWriter.cc:2287-2332` → `QPDF::Writer::generateHintStream`
    `libqpdf/QPDF_linearization.cc:1758-1796`）を `Pl_Buffer` に書いて `hint_length` を得る。
    **収束ループは無い**。pass 2 は pass 1 の padding に収まらなければ `std::logic_error` で失敗する設計。
+   `newline_before_endstream` は linearization で clear されず、`writeObject` の通常stream
+   （`libqpdf/QPDFWriter.cc:1551-1566`）と `writeObjectStream` の ObjStm container
+   （同 `:1752-1755`）へそのまま適用される。一方 `writeHintStream` はこの設定を参照せず、
+   暗号化後の末尾が LF でない場合だけ LF を追加する（同 `:2319-2329`）。
 8. linearized では `enqueueObject` の direct 子再帰も、`enqueueObject` からの
    `assignCompressedObjectNumbers` 呼び出しも無効（D-1）。
 
