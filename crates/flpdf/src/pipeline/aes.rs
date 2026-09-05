@@ -897,6 +897,29 @@ mod tests {
     }
 
     #[test]
+    fn ecb_aes_192_round_trips() {
+        let key = [0xa5u8; 24];
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage =
+            PlAesPdf::new_encrypt("AES-192 ECB", &mut sink, &key).expect("supported key length");
+        stage.disable_cbc();
+        stage.disable_padding();
+        stage.write(PLAINTEXT_32).expect("write");
+        stage.finish().expect("finish");
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(out[..16], out[16..], "identical blocks encrypt identically");
+
+        let mut back = Buffer::new("plaintext", None);
+        let mut reverse =
+            PlAesPdf::new_decrypt("AES-192 ECB", &mut back, &key).expect("supported key length");
+        reverse.disable_cbc();
+        reverse.disable_padding();
+        reverse.write(&out).expect("write");
+        reverse.finish().expect("finish");
+        assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT_32);
+    }
+
+    #[test]
     fn the_identifier_is_the_one_the_stage_was_built_with() {
         let mut sink = Buffer::new("ciphertext", None);
         let stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
