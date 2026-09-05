@@ -1271,6 +1271,15 @@ message prefix/logger へ渡し、`get_all_pages` と resource mutation より�
 `cli_split_pages_verbose_qpdf.rs` が qpdf 11.9.0 の stdout/stderr と chunk report の
 順序を比較する。
 
+`.u3iq` では、qpdf の main option table (`qpdf/auto_job_init.hh:124`) に登録される
+`--remove-unreferenced-resources=auto|yes|no` を flpdf-cli の top-level `Cli` にも
+公開する。選択値は `--pages` の `QPDFJob::handlePageSpecs` 相当と
+`--split-pages` の `doSplitPages` 相当へそのまま渡し、plain rewrite では qpdf と同じく
+`/Resources` entry の剪定を行わない（`QPDFJob_config.cc:751-761`、
+`QPDFJob.cc:2442-2455,2961-2967`）。pages/split の no/yes 各 mode は
+`cli_top_level_remove_unreferenced_resources.rs` が qpdf 11.9.0 の stdout と
+生成 bytes を比較する。
+
 ### C. qpdf に機能そのものが無いもの
 
 | flpdf | 行 | 備考 |

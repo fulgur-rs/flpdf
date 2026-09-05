@@ -972,6 +972,21 @@ struct Cli {
     )]
     preserve_unreferenced: bool,
 
+    /// Remove unreferenced page-resource entries using qpdf's job policy.
+    ///
+    /// `auto` (the default) runs qpdf's shared-resource heuristic, `yes`
+    /// always runs the page-level pruning pass, and `no` leaves `/Resources`
+    /// entries untouched. The policy is consumed by page-copy and split jobs;
+    /// plain rewrites accept the option but do not prune resource entries,
+    /// matching qpdf 11.9.0.
+    #[arg(
+        long = "remove-unreferenced-resources",
+        value_enum,
+        default_value_t = CliRemoveUnreferencedResources::Auto,
+        help = "Remove unreferenced page resources (qpdf default: auto)"
+    )]
+    remove_unreferenced_resources: CliRemoveUnreferencedResources,
+
     /// Normalize PDF page content streams (qpdf --normalize-content=y|n).
     ///
     /// The absence of this option is distinct from an explicit `n`: qpdf
@@ -2846,7 +2861,7 @@ fn main() {
             args.decrypt,
             normalize_content,
             args.coalesce_contents,
-            CliRemoveUnreferencedResources::No, // remove_unreferenced (no-op for linearize path)
+            args.remove_unreferenced_resources,
             args.generate_appearances,
             args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
@@ -2931,6 +2946,7 @@ fn main() {
                     args.update_from_json.as_deref(),
                     &args.page_ops,
                     &overlay_specs,
+                    args.remove_unreferenced_resources,
                     options,
                     args.linearize,
                     args.linearize_pass1.as_deref(),
@@ -2952,7 +2968,7 @@ fn main() {
                         args.update_from_json.as_deref(),
                         &args.page_ops,
                         &overlay_specs,
-                        CliRemoveUnreferencedResources::Auto,
+                        args.remove_unreferenced_resources,
                         options.clone(),
                         args.linearize,
                         args.linearize_pass1.as_deref(),
@@ -2977,6 +2993,7 @@ fn main() {
                         args.json_input,
                         args.update_from_json.as_deref(),
                         &args.page_ops,
+                        args.remove_unreferenced_resources,
                         options.clone(),
                         args.linearize,
                         args.linearize_pass1.as_deref(),
@@ -3011,7 +3028,7 @@ fn main() {
             args.decrypt,
             normalize_content,
             args.coalesce_contents,
-            CliRemoveUnreferencedResources::No, // remove_unreferenced (top-level alias is no-op)
+            args.remove_unreferenced_resources,
             args.generate_appearances,
             args.optimize_images.then_some(top_level_image_options),
             args.flatten_annotations,
@@ -3784,6 +3801,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         None,
                         &cmd.page_ops,
                         overlay_specs,
+                        remove_unref,
                         options,
                         cmd.linearize,
                         None,
@@ -3818,6 +3836,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         false,
                         None,
                         &cmd.page_ops,
+                        remove_unref,
                         options,
                         cmd.linearize,
                         None,
@@ -5652,6 +5671,7 @@ fn run_empty_page_extraction(
     update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
+    remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -5728,14 +5748,20 @@ fn run_empty_page_extraction(
     }
 
     if verbose {
-        let mut message = String::from(
-            "flpdf: empty PDF: checking for shared resources\nflpdf: no shared resources found\n",
-        );
-        for path in &source_paths {
-            let fname = pages_progress_filename(path);
-            message.push_str(&format!(
-                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-            ));
+        let mut message = String::new();
+        // qpdf's shouldRemoveUnreferencedResources returns before any
+        // report for explicit yes/no (`QPDFJob.cc:2253-2258`); only the
+        // Auto heuristic announces the preflight.
+        if remove_unref == CliRemoveUnreferencedResources::Auto {
+            message.push_str(
+                "flpdf: empty PDF: checking for shared resources\nflpdf: no shared resources found\n",
+            );
+            for path in &source_paths {
+                let fname = pages_progress_filename(path);
+                message.push_str(&format!(
+                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+                ));
+            }
         }
         message.push_str("flpdf: removing unreferenced pages from primary input\n");
         for path in &source_paths {
@@ -5762,7 +5788,7 @@ fn run_empty_page_extraction(
         &mut sources,
         &specs,
         collate.as_deref(),
-        RemoveUnreferencedResources::Auto,
+        remove_unref.into(),
         options.preserve_unreferenced_objects,
     )?;
     let source_warnings = source_warnings || job.has_warnings();
@@ -5793,7 +5819,7 @@ fn run_empty_page_extraction(
         password,
         page_ops,
         overlay_specs,
-        CliRemoveUnreferencedResources::No,
+        remove_unref,
         options,
         linearize,
         linearize_pass1,
@@ -5916,11 +5942,14 @@ fn run_page_extraction_from_multiple_sources(
 
     if verbose {
         let mut message = String::new();
-        for path in &source_paths {
-            let fname = pages_progress_filename(path);
-            message.push_str(&format!(
-                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-            ));
+        // Explicit yes/no skip qpdf's preflight report (`QPDFJob.cc:2253-2258`).
+        if remove_unref == CliRemoveUnreferencedResources::Auto {
+            for path in &source_paths {
+                let fname = pages_progress_filename(path);
+                message.push_str(&format!(
+                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+                ));
+            }
         }
         message.push_str("flpdf: removing unreferenced pages from primary input\n");
         for path in &source_paths {
@@ -6058,11 +6087,14 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 "n"
             }
         );
-        for path in distinct {
-            let fname = pages_progress_filename(path);
-            message.push_str(&format!(
-                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
-            ));
+        // Explicit yes/no skip qpdf's preflight report (`QPDFJob.cc:2253-2258`).
+        if remove_unref == CliRemoveUnreferencedResources::Auto {
+            for path in distinct {
+                let fname = pages_progress_filename(path);
+                message.push_str(&format!(
+                    "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+                ));
+            }
         }
         logger_info(message)?;
     }
@@ -6468,6 +6500,7 @@ fn run_rewrite_with_page_ops(
     json_input: bool,
     update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
+    remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -6490,6 +6523,7 @@ fn run_rewrite_with_page_ops(
             input,
             output,
             page_ops,
+            remove_unref,
             options,
             linearize,
             linearize_pass1,
@@ -6501,6 +6535,7 @@ fn run_rewrite_with_page_ops(
             input,
             output,
             page_ops,
+            remove_unref,
             options,
             linearize,
             linearize_pass1,
@@ -6516,6 +6551,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     input: &Path,
     output: &std::path::Path,
     page_ops: &PageOpArgs,
+    remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
@@ -6573,7 +6609,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             suppress_warnings,
-            RemoveUnreferencedResources::Auto,
+            remove_unref.into(),
             writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
         // The intermediate rewrite may already have repaired the condition
