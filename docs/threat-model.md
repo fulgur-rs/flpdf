@@ -163,7 +163,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
 | Weak-crypto write gate: selecting new RC4 or deprecated R=5 (AES-256) encryption parameters via `--encrypt` requires the explicit `--allow-weak-crypto` opt-in (a preserve-only rewrite of an already weakly encrypted input is not gated) | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the new selection; encrypted inputs remain readable, matching qpdf's write-only weak-crypto policy |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `encryption/` |
-| Signed-PDF qpdf-compatible handling (full rewrite proceeds, leaving signatures present-but-invalid like qpdf; signatures are stripped only via the explicit `--remove-restrictions` opt-in, never silently). A preserve-by-default *refusal* is a deferred post-v1.0 improvement (`flpdf-hn1g.14`). | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
+| Signed-PDF qpdf-compatible handling (full rewrite proceeds, leaving signatures present-but-invalid like qpdf; signatures are stripped only via the explicit `--remove-restrictions` opt-in; like qpdf, that opt-in emits no extra diagnostic). A preserve-by-default *refusal* is a deferred post-v1.0 improvement (`flpdf-hn1g.14`). | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Canonical cross-document graph copying stops at `/Pages` nodes and nested `/Page` boundaries, preserves indirect cycles through the source identity map, and does not scan all live objects | `object_copy.rs` (`ForeignObjectCopier`), [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
 
 ## 6. Verification
