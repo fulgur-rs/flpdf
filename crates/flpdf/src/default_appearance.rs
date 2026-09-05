@@ -13,7 +13,7 @@
 //! Inheritance resolution (falling back to the `/AcroForm` root `/DA` when a
 //! field-level `/DA` is absent) is the caller's responsibility.
 
-use crate::content_stream::{parse_content_operations, ParseControl};
+use crate::content_stream::{parse_content_operations_with_recoverable_warnings, ParseControl};
 use crate::ObjectHandle;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -93,11 +93,12 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
     let mut auto_size: bool = true;
     let mut color: TextColor = TextColor::Gray(0.0);
 
-    // The operation adapter recovers at parser/tokenizer-owned token
-    // boundaries, so a malformed token does not drop later operators. Ignore
-    // the final error for this best-effort public API, preserving its
-    // "skip malformed / last wins" contract.
-    let _ = parse_content_operations(da, |operands, operator| {
+    // qpdf's default-appearance finder uses a warning-and-continue tokenizer
+    // context (`QPDFFormFieldObjectHelper.cc:804-810`), so malformed tokens do
+    // not drop later operators. Ignore the final structural error for this
+    // best-effort public API, preserving its "skip malformed / last wins"
+    // contract.
+    let _ = parse_content_operations_with_recoverable_warnings(da, |operands, operator| {
         match operator {
             b"Tf" => {
                 // Operands: /FontName size. PDF operators consume their operands

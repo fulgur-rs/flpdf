@@ -5,13 +5,17 @@
 
 use std::collections::BTreeMap;
 
-use crate::content_stream::parse_content_stream_handles;
+use crate::content_stream::{
+    parse_content_stream_handles, parse_content_stream_handles_with_recoverable_warnings,
+};
+use crate::object_handle::DocumentResolver;
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
+use std::rc::Rc;
 
 pub(crate) type ResourceRenames = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
 
@@ -88,16 +92,29 @@ impl TokenFilter for ResourceReplacer {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn replace_resource_names(
     input: &[u8],
     renames: &ResourceRenames,
+) -> crate::Result<Option<Vec<u8>>> {
+    replace_resource_names_with_context(input, renames, None)
+}
+
+pub(crate) fn replace_resource_names_with_context(
+    input: &[u8],
+    renames: &ResourceRenames,
+    context: Option<Rc<dyn DocumentResolver>>,
 ) -> crate::Result<Option<Vec<u8>>> {
     if renames.is_empty() {
         return Ok(Some(input.to_vec()));
     }
 
     let mut finder = ResourceFinder::default();
-    if parse_content_stream_handles(input, None, "", &mut finder).is_err() {
+    let scan = match context {
+        Some(context) => parse_content_stream_handles(input, Some(context), "", &mut finder),
+        None => parse_content_stream_handles_with_recoverable_warnings(input, "", &mut finder),
+    };
+    if scan.is_err() {
         return Ok(None);
     }
 

@@ -534,47 +534,19 @@ pub(crate) fn run_test_36<R: Read + Seek>(
 // test_37 (`test_driver.cc:1340-1348`, `ParserCallbacks` at `:98-134`)
 // ---------------------------------------------------------------------------
 
-struct ContentParserCallbacks<'a> {
+struct ContentParserCallbacks<'a, R: Read + Seek + 'static> {
     stdout: &'a mut dyn Write,
     stderr: &'a mut dyn Write,
+    pdf: &'a Pdf<R>,
+    filename: &'a [u8],
+    diagnostics_written: &'a mut usize,
 }
 
-impl<'a> flpdf::ObjectHandleParserCallbacks for ContentParserCallbacks<'a> {
+impl<'a, R: Read + Seek + 'static> flpdf::ObjectHandleParserCallbacks
+    for ContentParserCallbacks<'a, R>
+{
     fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
         writeln!(self.stdout, "content size: {size}")?;
-        Ok(())
-    }
-
-    // The canonical parser supplies qpdf's source and object descriptions
-    // directly, so the driver does not reconstruct diagnostic context from
-    // message text.
-    fn handle_diagnostic(
-        &mut self,
-        source_description: &str,
-        object_description: &str,
-        offset: usize,
-        message: &str,
-    ) -> flpdf::Result<()> {
-        // QPDFExc::createWhat (libqpdf/QPDFExc.cc:18-51) formats the
-        // source/object/offset fields exactly as qpdf's warning callback:
-        // "WARNING: " followed by exc.what().
-        let mut what = source_description.to_owned();
-        if !what.is_empty() {
-            what.push_str(" (");
-        }
-        what.push_str(object_description);
-        if offset > 0 {
-            what.push_str(&format!(", offset {offset}"));
-        }
-        if !source_description.is_empty() {
-            what.push(')');
-        }
-        what.push_str(": ");
-        what.push_str(message);
-        self.stdout.flush()?;
-        self.stderr.write_all(b"WARNING: ")?;
-        self.stderr.write_all(what.as_bytes())?;
-        self.stderr.write_all(b"\n")?;
         Ok(())
     }
 
@@ -609,6 +581,13 @@ impl<'a> flpdf::ObjectHandleParserCallbacks for ContentParserCallbacks<'a> {
     }
 
     fn handle_eof(&mut self) -> flpdf::Result<()> {
+        emit_new_diagnostics(
+            self.pdf,
+            self.diagnostics_written,
+            self.filename,
+            self.stdout,
+            self.stderr,
+        )?;
         writeln!(self.stdout, "-EOF-")?;
         Ok(())
     }
@@ -616,17 +595,27 @@ impl<'a> flpdf::ObjectHandleParserCallbacks for ContentParserCallbacks<'a> {
 
 pub(crate) fn run_test_37<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
     for page_ref in page_refs {
         let page = pdf.get_object_handle(page_ref);
-        let mut callbacks = ContentParserCallbacks { stdout, stderr };
-        page.parse_page_contents(&mut callbacks)?;
+        let result = {
+            let mut callbacks = ContentParserCallbacks {
+                stdout,
+                stderr,
+                pdf: &*pdf,
+                filename,
+                diagnostics_written,
+            };
+            page.parse_page_contents(&mut callbacks)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        result?;
     }
     Ok(())
 }

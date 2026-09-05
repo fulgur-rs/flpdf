@@ -2092,6 +2092,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().repair_diagnostics.clone()
     }
 
+    /// qpdf's `QPDF::numWarnings` (`libqpdf/QPDF.cc:360-363`): the size of
+    /// the warning collection without copying it.
+    pub(crate) fn num_warnings(&self) -> usize {
+        self.core.borrow().repair_diagnostics.entries().len()
+    }
+
     pub(crate) fn logger(&self) -> crate::QPDFLogger {
         self.core.borrow().logger.clone()
     }

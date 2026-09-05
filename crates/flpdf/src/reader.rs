@@ -313,6 +313,13 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.repair_diagnostics()
     }
 
+    /// The number of warnings recorded so far, without copying the
+    /// collection: qpdf's `QPDF::numWarnings` (`libqpdf/QPDF.cc:360-363`),
+    /// which consumers snapshot around a parse to detect new warnings.
+    pub(crate) fn num_warnings(&self) -> usize {
+        self.resolver.num_warnings()
+    }
+
     /// Record a non-fatal processing warning on this handle.
     ///
     /// Used by recoverable code paths (e.g. form-field inheritance walks that hit

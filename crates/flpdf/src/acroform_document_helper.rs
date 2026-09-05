@@ -11,7 +11,7 @@ use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity, ResourceConflicts};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pdf_string::utf8_value;
-use crate::resource_replacer::{replace_resource_names, ResourceRenames};
+use crate::resource_replacer::{replace_resource_names_with_context, ResourceRenames};
 use crate::{Error, Matrix, ObjectRef, Pdf, Rectangle, Result, DEFAULT_MAX_ACROFORM_DEPTH};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -1243,7 +1243,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // bytes via `newString`, not re-encoded through `newUnicodeString`
         // (`:609`).
         let default_appearance = decode_field_name(&default_appearance).into_bytes();
-        let Some(rewritten) = replace_resource_names(&default_appearance, &resources.renames)?
+        let Some(rewritten) = replace_resource_names_with_context(
+            &default_appearance,
+            &resources.renames,
+            // cov:ignore-start: LLVM maps the tested warning-sink error continuation to this multiline call
+            field.context(),
+        )?
+        // cov:ignore-end
         else {
             let warning = "Unable to parse /DA while remapping foreign AcroForm resources";
             field.warn_if_possible(warning)?;
@@ -2413,10 +2419,31 @@ fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 #[allow(clippy::mutable_key_type)]
 mod final_handle_tests {
-    use super::{AcroFormDocumentHelper, InheritedFieldOverrides};
-    use crate::{ObjectHandle, ObjectRef, Pdf};
+    use super::{AcroFormDocumentHelper, ForeignResourcePlan, InheritedFieldOverrides};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
+    use crate::{ObjectHandle, ObjectRef, Pdf, QPDFLogger};
     use std::collections::{BTreeSet, HashMap};
     use std::io::Cursor;
+
+    struct FailingWarningSink;
+
+    impl Pipeline for FailingWarningSink {
+        // cov:ignore-start: mandatory test-sink metadata has no behavioral role
+        fn identifier(&self) -> &str {
+            "acroform test warning sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(PipelineError::runtime("acroform warning sink failed"))
+        }
+
+        // cov:ignore-start: the failure sink never reaches finish after write fails
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
 
     fn fixture(name: &str) -> Pdf<Cursor<Vec<u8>>> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2531,5 +2558,39 @@ mod final_handle_tests {
                 .expect("final name lookup"),
             [ObjectRef::new(4, 0)].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn foreign_default_appearance_warning_sink_failure_propagates() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let field = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/DA".to_vec(),
+                ObjectHandle::string(b"/F1 12 Tf <0g>".to_vec()),
+            )]))
+            .expect("field handle");
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(crate::PipelineHandle::new(FailingWarningSink)));
+        pdf.set_logger(logger);
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        let mut renames = crate::resource_replacer::ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"F1".to_vec(), b"F2".to_vec());
+        let error = helper
+            .adjust_foreign_field_resources(
+                &field,
+                &ForeignResourcePlan {
+                    destination_resources: ObjectHandle::dictionary(Vec::new()),
+                    renames,
+                },
+            )
+            .expect_err("the parser warning sink failure must cross the DA remap boundary");
+        assert!(matches!(
+            error,
+            crate::Error::System(message) if message == "acroform warning sink failed"
+        ));
     }
 }

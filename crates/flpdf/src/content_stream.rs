@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFParser.cc content callbacks.
+//! qpdf correspondence: `QPDFObjectHandle::ParserCallbacks` and `QPDFParser::warn` content boundary.
 //! Content-stream object callbacks (ISO 32000-1 §7.8.2).
 //!
 //! A PDF content stream is a sequence of operands followed by an operator,
@@ -11,9 +11,10 @@
 //! for consumers that do not need inline-image payload events.
 //!
 //! When parsing a document-owned handle, recoverable tokenizer/parser
-//! diagnostics are delivered through the owning `DocumentResolver` before
-//! the optional callback notification. This mirrors qpdf's
-//! `QPDFObjectHandle::warn` path; detached parses remain callback-only.
+//! diagnostics are delivered through the owning `DocumentResolver`. This
+//! mirrors qpdf's `QPDFObjectHandle::warn` path. Detached parses have no qpdf
+//! warning sink, so the first recoverable diagnostic is returned as the
+//! corresponding `QPDFExc` error.
 
 use crate::parser::ContentHandleParser;
 use crate::tokenizer::{TokenType, Tokenizer, TokenizerStateError};
@@ -21,7 +22,7 @@ use crate::{
     object_handle::{format_qpdf_exception_what, DocumentResolver, ObjectHandle},
     Error, Result,
 };
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 /// Whether content-stream parsing should continue after an object callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +33,8 @@ pub enum ParseControl {
     Stop,
 }
 
-/// qpdf's `QPDFObjectHandle::ParserCallbacks` boundary.
+/// qpdf's `QPDFObjectHandle::ParserCallbacks` boundary
+/// (`include/qpdf/QPDFObjectHandle.hh:204-226`).
 ///
 /// Parsed values are canonical [`ObjectHandle`]s, so callback code
 /// can inspect identity and parsed offsets without introducing an
@@ -51,22 +53,6 @@ pub trait ObjectHandleParserCallbacks {
         length: usize,
     ) -> Result<ParseControl>;
 
-    /// Receive a non-fatal parser recovery diagnostic.
-    ///
-    /// source_description and object_description correspond to qpdf's
-    /// QPDFExc filename and object fields. Keeping them at this boundary
-    /// lets consumers reproduce qpdf's diagnostic context without
-    /// reconstructing it from the message text.
-    fn handle_diagnostic(
-        &mut self,
-        _source_description: &str,
-        _object_description: &str,
-        _offset: usize,
-        _message: &str,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     /// Receive normal content EOF. A [`ParseControl::Stop`] return from
     /// `handle_object` skips this callback, matching qpdf's
     /// `terminateParsing` path.
@@ -80,14 +66,35 @@ fn deliver_diagnostic(
     offset: usize,
     message: &str,
 ) -> Result<()> {
+    let message = format_qpdf_exception_what(
+        source_description,
+        object_description,
+        offset as i64,
+        message,
+    );
     if let Some(context) = context {
-        let offset = offset as i64;
-        context.warn(
-            format_qpdf_exception_what(source_description, object_description, offset, message)
-                .into_bytes(),
-        )?;
+        context.warn(message.into_bytes())?;
+        Ok(())
+    } else {
+        Err(Error::System(message))
     }
-    Ok(())
+}
+
+/// Parse an in-memory fragment with qpdf's warning-and-continue context.
+///
+/// qpdf's tolerant content consumers always parse through a document-owned
+/// `QPDF`, even when the bytes are an in-memory fragment. This internal route
+/// supplies only that warning boundary; the public detached route above still
+/// throws when no context exists.
+pub(crate) fn parse_content_stream_handles_with_recoverable_warnings<
+    C: ObjectHandleParserCallbacks,
+>(
+    input: &[u8],
+    source_description: &str,
+    callbacks: &mut C,
+) -> Result<()> {
+    let context: Rc<dyn DocumentResolver> = Rc::new(RecoverableWarningResolver::default());
+    parse_content_stream_handles(input, Some(context), source_description, callbacks)
 }
 
 /// Parse decoded content bytes into ObjectHandle callbacks.
@@ -125,12 +132,6 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 diagnostic.relative_offset,
                 &diagnostic.message,
             )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
-            callbacks.handle_diagnostic(
-                source_description,
-                "content",
-                diagnostic.relative_offset,
-                &diagnostic.message,
-            )?;
         }
         let is_id = object.as_operator().as_deref() == Some(b"ID");
 
@@ -143,7 +144,8 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
             // exception; the subsequent inline-image token read reports the
             // warning-only EOF case (QPDFObjectHandle.cc:1820-1848).
             if tokenizer.consume_one_byte().is_err() {
-                callbacks.handle_diagnostic(
+                deliver_diagnostic(
+                    context.as_ref(),
                     source_description,
                     "stream data",
                     input.len(),
@@ -181,12 +183,6 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                     image.end,
                     diagnostic,
                 )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
-                callbacks.handle_diagnostic(
-                    source_description,
-                    "stream data",
-                    image.end,
-                    diagnostic,
-                )?;
                 break;
             }
             let image_offset = image.start;
@@ -205,6 +201,28 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
     callbacks.handle_eof()
 }
 
+#[derive(Default)]
+struct RecoverableWarningResolver {
+    warnings: RefCell<Vec<Vec<u8>>>,
+}
+
+impl DocumentResolver for RecoverableWarningResolver {
+    fn resolve_indirect(
+        &self,
+        _object_ref: crate::ObjectRef,
+        _handle: &ObjectHandle,
+    ) -> Result<()> {
+        Err(Error::Internal(
+            "indirect resolution requested from an in-memory content warning sink".to_owned(),
+        ))
+    }
+
+    fn warn(&self, message: Vec<u8>) -> Result<()> {
+        self.warnings.borrow_mut().push(message);
+        Ok(())
+    }
+}
+
 /// Accumulates content objects until an operator event is received.
 ///
 /// This adapter deliberately sees only parser events. Lexical boundaries and
@@ -212,6 +230,20 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
 pub(crate) struct OperationCallbacks<F> {
     operands: Vec<ObjectHandle>,
     on_operation: F,
+}
+
+pub(crate) fn parse_content_operations_with_recoverable_warnings<F>(
+    input: &[u8],
+    on_operation: F,
+) -> Result<()>
+where
+    F: FnMut(&[ObjectHandle], &[u8]) -> Result<ParseControl>,
+{
+    let mut callbacks = OperationCallbacks {
+        operands: Vec::new(),
+        on_operation,
+    };
+    parse_content_stream_handles_with_recoverable_warnings(input, "", &mut callbacks)
 }
 
 impl<F> ObjectHandleParserCallbacks for OperationCallbacks<F>
@@ -250,8 +282,10 @@ where
 ///
 /// # Errors
 ///
-/// Recoverable object-token errors are skipped at parser-owned boundaries.
-/// Inline-image/tokenizer state errors and callback errors are propagated.
+/// Recoverable object-token errors use qpdf's document warning sink when the
+/// content belongs to a document, and become `Error::System` values carrying
+/// qpdf's formatted `QPDFExc::what()` for detached parsing. Inline-image/
+/// tokenizer state errors and callback errors are propagated.
 pub fn parse_content_operations<F>(input: &[u8], on_operation: F) -> Result<()>
 where
     F: FnMut(&[ObjectHandle], &[u8]) -> Result<ParseControl>,
@@ -261,4 +295,25 @@ where
         on_operation,
     };
     parse_content_stream_handles(input, None, "", &mut callbacks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recoverable_warning_resolver_rejects_indirect_resolution() {
+        let resolver = RecoverableWarningResolver::default();
+        let object_ref = crate::ObjectRef::new(9, 0);
+        let handle = ObjectHandle::new_indirect_unresolved(object_ref, -1);
+
+        let error = resolver
+            .resolve_indirect(object_ref, &handle)
+            .expect_err("an in-memory warning sink cannot resolve indirect objects");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "indirect resolution requested from an in-memory content warning sink"
+        ));
+    }
 }
