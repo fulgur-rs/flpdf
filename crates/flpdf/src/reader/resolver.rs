@@ -1391,6 +1391,30 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    /// Warn `expected endobj` with qpdf's current object description.
+    ///
+    /// `damagedPDF("expected endobj")` renders `m->last_object_description`,
+    /// which `readObjectAtOffset` and `readObject` build from the caller's
+    /// description and the object identity (`libqpdf/QPDF.cc:1298-1310`,
+    /// `:1331-1354`, `:2641-2644`), so a described read such as the
+    /// `linearization hint stream` keeps its prefix on this warning too.
+    fn push_expected_endobj_warning(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        read_description: Option<&[u8]>,
+    ) -> Result<()> {
+        if read_description.is_some() {
+            return self.push_stream_warning_with_description(
+                object_ref,
+                offset,
+                "expected endobj",
+                read_description,
+            );
+        }
+        self.push_warning(Self::expected_endobj_warning(object_ref, offset))
+    }
+
     /// The canonical handle for `object_ref` **if one has already been
     /// minted**, without minting one.
     ///
@@ -3281,10 +3305,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             })
         } else {
             if !trailing.is_word_value(b"endobj") {
-                self.push_warning(Self::expected_endobj_warning(
+                self.push_expected_endobj_warning(
                     found,
                     u64::try_from(trailing.start).unwrap_or(u64::MAX),
-                ))
+                    read_description.as_deref(),
+                )
                 .map_err(ReadObjectAtOffsetError::Body)?;
             }
             let (end_before_space, end_after_space) = if capture_end_offsets {
@@ -3420,7 +3445,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // `readStream` returns and warns if it is not `endobj`.
         let (trailing, trailing_offset) = self.read_token_from_input()?;
         if !trailing.is_word_value(b"endobj") {
-            self.push_warning(Self::expected_endobj_warning(object_ref, trailing_offset))?;
+            self.push_expected_endobj_warning(object_ref, trailing_offset, read_description)?;
         }
 
         let dict = self.direct_object_handle(dict);
@@ -3663,8 +3688,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 offset,
                 message.as_bytes(),
             );
-            core.repair_diagnostics
-                .push(Diagnostic::object_warning_bytes(&what));
+            // `QPDFExc` keeps the file position beside the rendered text
+            // (`QPDFExc.cc:19-50`); retain it for `repair_diagnostics()`.
+            let mut diagnostic = Diagnostic::object_warning_bytes(&what);
+            diagnostic.offset = Some(offset);
+            core.repair_diagnostics.push(diagnostic);
             (core.logger.clone(), core.suppress_warnings, what)
         };
         if suppress_warnings {
@@ -11303,6 +11331,92 @@ mod tests {
              WARNING: input.pdf (linearization hint stream: object 2 0, offset {}): attempting to recover stream length\n\
              WARNING: input.pdf (linearization hint stream: object 2 0, offset {}): recovered stream length: {}\n",
             bytes.len(), stream_offset, stream_offset, recovered_length
+        );
+        assert_eq!(
+            output.lock().expect("warning output").as_slice(),
+            expected.as_bytes()
+        );
+    }
+
+    type RecordedWarnings = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+    fn described_read_warning_output(
+        bytes: &[u8],
+    ) -> (RecordedWarnings, Rc<ResolverHandle<Cursor<Vec<u8>>>>) {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes.to_vec()),
+            0,
+            BTreeMap::from([(ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 0 })]),
+            true,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, b"input.pdf".to_vec()),
+            0,
+        );
+        (output, resolver)
+    }
+
+    /// qpdf: `qpdf --check` on a linearized file whose hint stream lacks
+    /// `endobj` warns `(linearization hint stream: object 7 0, offset 722):
+    /// expected endobj`; the description set by `readObjectAtOffset` is
+    /// still `m->last_object_description` when `readObject` checks the
+    /// trailing token (`libqpdf/QPDF.cc:1298-1310`, `:2641-2644`).
+    #[test]
+    fn described_offset_read_preserves_context_for_stream_expected_endobj() {
+        let bytes = b"2 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobX\n%%EOF\n";
+        let trailing_offset = bytes
+            .windows(b"endobX".len())
+            .position(|window| window == b"endobX")
+            .expect("trailing token");
+        let (output, resolver) = described_read_warning_output(bytes);
+
+        let (handle, _) = resolver
+            .resolve_at_offset_with_optional_description(
+                0,
+                ObjectRef::new(2, 0),
+                Some(b"linearization hint stream".to_vec()),
+            )
+            .expect("qpdf's described offset read resolves");
+        assert!(handle.as_stream_dict().is_some());
+
+        let expected = format!(
+            "WARNING: input.pdf (linearization hint stream: object 2 0, offset {trailing_offset}): expected endobj\n"
+        );
+        assert_eq!(
+            output.lock().expect("warning output").as_slice(),
+            expected.as_bytes()
+        );
+        let diagnostics = resolver.repair_diagnostics();
+        let diagnostic = diagnostics.entries().last().expect("recorded warning");
+        assert!(diagnostic.is_object_warning());
+        assert_eq!(diagnostic.offset, Some(trailing_offset as u64));
+    }
+
+    #[test]
+    fn described_offset_read_preserves_context_for_dictionary_expected_endobj() {
+        let bytes = b"2 0 obj\n<< /Type /Test >>\nendobX\n%%EOF\n";
+        let trailing_offset = bytes
+            .windows(b"endobX".len())
+            .position(|window| window == b"endobX")
+            .expect("trailing token");
+        let (output, resolver) = described_read_warning_output(bytes);
+
+        let (handle, _) = resolver
+            .resolve_at_offset_with_optional_description(
+                0,
+                ObjectRef::new(2, 0),
+                Some(b"linearization hint stream".to_vec()),
+            )
+            .expect("qpdf's described offset read resolves");
+        assert!(handle.as_dictionary().is_some());
+
+        let expected = format!(
+            "WARNING: input.pdf (linearization hint stream: object 2 0, offset {trailing_offset}): expected endobj\n"
         );
         assert_eq!(
             output.lock().expect("warning output").as_slice(),
