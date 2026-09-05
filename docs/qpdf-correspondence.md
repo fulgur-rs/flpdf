@@ -1030,6 +1030,18 @@ logger consumer に移行済みである。
 - `error`: check error と top-level の通常 fatal error
 - `usage`: `UsageError` を `usage_exit` へ直接渡し、qpdf の空行・help block付き exit-2 を再現
 
+添付の mutation route も同じ writer 境界に接続する。qpdf は
+`handleTransformations` 内で `addAttachments` / `removeEmbeddedFile` を完了してから
+`writeOutfile` を呼び、`setWriterOptions` の全設定を一度だけ適用する
+（`QPDFJob.cc:2137-2248,2847-2945,3029-3058`）。flpdf の
+`run_add_attachment` / `run_remove_attachment` は mutation 後に
+`normalize_page_contents` を実行し、`top_level_writer_options` から
+`writer_configuration` を経由して `write_with_pdf_writer` へ渡すため、
+`--stream-data`、`--decode-level`、`--newline-before-endstream`、ObjStm、QDF、
+encryption、decrypt、linearization、version、ID、progress を attachment output にも
+適用する。`QPDFWriter.cc:1538-1564,1735-1755` の stream/object-stream framing と
+QDF/linearization の writer 内優先順位もこの共通経路で保持する。
+
 `flpdf-25kg.5.5` では、top-level `--show-linearization` も `QPDFJob::open` が
 設定した同じ `Pdf` を `QPDFJob::show_linearization` に渡す。これは qpdf の
 `setQPDFOptions` による logger/suppression 設定（`QPDFJob.cc:650-665`）、同じ

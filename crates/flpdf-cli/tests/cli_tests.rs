@@ -1609,70 +1609,6 @@ fn top_level_normalize_content_y_applies_after_page_selection() {
 }
 
 #[test]
-fn top_level_normalize_content_y_rejects_unwired_add_remove_attachment_paths() {
-    let cases: &[&[&str]] = &[
-        &[
-            "--normalize-content=y",
-            "--remove-attachment=key",
-            "in.pdf",
-            "out.pdf",
-        ],
-        &[
-            "--normalize-content=y",
-            "--add-attachment",
-            "attachment.bin",
-            "--",
-            "in.pdf",
-            "out.pdf",
-        ],
-    ];
-
-    for args in cases {
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .args(*args)
-            .assert()
-            .failure()
-            .code(1)
-            .stderr(predicate::str::contains(
-                "--normalize-content is not applied by attachment mutation operations",
-            ));
-    }
-}
-
-#[test]
-fn top_level_decode_level_rejects_unwired_add_remove_attachment_paths() {
-    let cases: &[&[&str]] = &[
-        &[
-            "--decode-level=all",
-            "--remove-attachment=key",
-            "in.pdf",
-            "out.pdf",
-        ],
-        &[
-            "--decode-level=generalized",
-            "--add-attachment",
-            "attachment.bin",
-            "--",
-            "in.pdf",
-            "out.pdf",
-        ],
-    ];
-
-    for args in cases {
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .args(*args)
-            .assert()
-            .failure()
-            .code(1)
-            .stderr(predicate::str::contains(
-                "--decode-level is not applied by attachment mutation operations",
-            ));
-    }
-}
-
-#[test]
 fn top_level_decode_level_none_is_accepted_with_mutating_attachment_paths() {
     // decode-level=none matches the attachment serializers' existing
     // behavior (no filter decoding at all), so it must not be rejected the
@@ -1695,6 +1631,69 @@ fn top_level_decode_level_none_is_accepted_with_mutating_attachment_paths() {
         ])
         .assert()
         .success();
+}
+
+#[test]
+fn top_level_add_attachment_normalization_preserves_warning_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let attachment = temp.path().join("attachment.bin");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    std::fs::write(&attachment, b"payload").unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--normalize-content=y", "--compress-streams=n"])
+        .arg("--add-attachment")
+        .arg(&attachment)
+        .arg("--")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(
+        output.exists(),
+        "warning exit must retain attachment output"
+    );
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.contains("content normalization encountered bad tokens"));
+    assert!(
+        stderr.contains("operation succeeded with warnings; resulting file may have some problems")
+    );
+}
+
+#[test]
+fn top_level_add_attachment_no_warn_suppresses_normalization_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("bad-content.pdf");
+    let attachment = temp.path().join("attachment.bin");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    std::fs::write(&attachment, b"payload").unwrap();
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--no-warn", "--normalize-content=y", "--compress-streams=n"])
+        .arg("--add-attachment")
+        .arg(&attachment)
+        .arg("--")
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(3));
+    assert!(
+        output.exists(),
+        "warning exit must retain attachment output"
+    );
+    assert!(
+        result.stderr.is_empty(),
+        "--no-warn must suppress warning text"
+    );
 }
 
 #[test]
