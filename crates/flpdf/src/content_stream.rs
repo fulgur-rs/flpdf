@@ -9,11 +9,16 @@
 //!
 //! [`parse_content_operations`] provides the common operand/operator adapter
 //! for consumers that do not need inline-image payload events.
+//!
+//! When parsing a document-owned handle, recoverable tokenizer/parser
+//! diagnostics are delivered through the owning `DocumentResolver` before
+//! the optional callback notification. This mirrors qpdf's
+//! `QPDFObjectHandle::warn` path; detached parses remain callback-only.
 
 use crate::parser::ContentHandleParser;
 use crate::tokenizer::{TokenType, Tokenizer, TokenizerStateError};
 use crate::{
-    object_handle::{DocumentResolver, ObjectHandle},
+    object_handle::{format_qpdf_exception_what, DocumentResolver, ObjectHandle},
     Error, Result,
 };
 use std::rc::Rc;
@@ -68,6 +73,25 @@ pub trait ObjectHandleParserCallbacks {
     fn handle_eof(&mut self) -> Result<()>;
 }
 
+fn deliver_diagnostic(
+    context: Option<&Rc<dyn DocumentResolver>>,
+    source_description: &str,
+    object_description: &str,
+    offset: usize,
+    message: &str,
+) -> Result<()> {
+    if let Some(context) = context {
+        let offset = i64::try_from(offset).map_err(|_| {
+            Error::Internal("content diagnostic offset does not fit qpdf offset".into())
+        })?;
+        context.warn(
+            format_qpdf_exception_what(source_description, object_description, offset, message)
+                .into_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Parse decoded content bytes into ObjectHandle callbacks.
 pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
     input: &[u8],
@@ -96,6 +120,13 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
             (object, length, diagnostics)
         };
         for diagnostic in diagnostics {
+            deliver_diagnostic(
+                context.as_ref(),
+                source_description,
+                "content",
+                diagnostic.relative_offset,
+                &diagnostic.message,
+            )?;
             callbacks.handle_diagnostic(
                 source_description,
                 "content",
@@ -145,6 +176,13 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 // an incomplete inline image is not a parser exception on this
                 // owning ObjectHandle route (QPDFObjectHandle.cc:1826-1848).
                 let diagnostic = "EOF found while reading inline image";
+                deliver_diagnostic(
+                    context.as_ref(),
+                    source_description,
+                    "stream data",
+                    image.end,
+                    diagnostic,
+                )?;
                 callbacks.handle_diagnostic(
                     source_description,
                     "stream data",
