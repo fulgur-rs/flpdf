@@ -188,9 +188,11 @@ impl EncryptionState {
 pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
     match key.len() {
         16 => key.try_into().map_err(|_| unreachable!("length checked")),
-        len if len > 32 => key[..16]
-            .try_into()
-            .map_err(|_| unreachable!("prefix length checked")),
+        len if len > 32 => {
+            let mut object_key = [0u8; 16];
+            object_key.copy_from_slice(&key[..16]);
+            Ok(object_key)
+        }
         _ => Err(EncryptedError::Malformed {
             reason: "AES-128 object key is not 16 bytes".into(),
         }
