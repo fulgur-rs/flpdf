@@ -874,12 +874,11 @@ struct Cli {
     /// `flpdf rewrite --decrypt`; qpdf `--decrypt` equivalent). On
     /// encrypted input requires `--password` to authenticate; on plaintext
     /// input it is a no-op pass-through. Silent in both cases (matching
-    /// qpdf), unlike `--remove-restrictions` which prints a one-line
-    /// diagnostic when an encrypted input was de-restricted.
+    /// qpdf). Both flags are silent when the operation succeeds.
     ///
     /// Relationship with `--remove-restrictions`: this flag removes source
     /// encryption, while `--remove-restrictions` preserves it and only removes
-    /// digital-signature restrictions. The latter prints a diagnostic.
+    /// digital-signature restrictions. Neither flag invents a success diagnostic.
     // Same conflict semantics as --remove-restrictions: this is a
     // rewrite-path modifier and must be rejected against the inspection
     // subcommands so `flpdf --check --decrypt in out` is a usage error
@@ -1619,9 +1618,8 @@ struct RewriteCommand {
     /// with `--decrypt` to strip encryption too.
     ///
     /// A normal rewrite preserves authenticated source encryption. This flag
-    /// removes qpdf's digital-signature restrictions and prints a one-line
-    /// diagnostic when an encrypted input was de-restricted. It does NOT
-    /// bypass authentication.
+    /// removes qpdf's digital-signature restrictions without inventing a
+    /// success diagnostic. It does NOT bypass authentication.
     ///
     /// See `--decrypt` for the silent qpdf-compatible encryption-removal flag.
     #[arg(long = "remove-restrictions")]
@@ -1633,7 +1631,7 @@ struct RewriteCommand {
     ///
     /// Relationship with `--remove-restrictions`: this flag removes source
     /// encryption, while `--remove-restrictions` preserves it and only removes
-    /// digital-signature restrictions. The latter prints a diagnostic.
+    /// digital-signature restrictions. Neither flag invents a success diagnostic.
     #[arg(long = "decrypt")]
     decrypt: bool,
     /// Encrypt the output (qpdf `--encrypt` compatible). See the top-level
@@ -4689,11 +4687,9 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // --remove-restrictions must strip signatures before the linearization
         // plan is computed: removing signature objects changes the reachable
         // first-page graph. qpdf applies this transformation before planning.
-        let had_signatures = if remove_restrictions {
-            AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?
-        } else {
-            false
-        };
+        if remove_restrictions {
+            let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+        }
         let mut options = options;
         if decrypt {
             options.preserve_encryption = false;
@@ -4728,28 +4724,20 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         if verbose && announce_file {
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
-        if had_signatures {
-            logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
-        }
         // On an encrypted input, `--decrypt` has already disabled
         // source-encryption preservation above.
         finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file, no_warn)?;
     } else {
-        // Capture encryption state before the write for the qpdf-compatible
-        // restriction diagnostic.
-        let was_encrypted = pdf.is_encrypted();
         // qpdf runs disableDigitalSignatures unconditionally under
         // --remove-restrictions: remove catalog /Perms, zero /AcroForm
         // /SigFlags, strip /FT /V /SV /Lock from /Sig form fields, and erase them
         // from the top-level /Fields array (a field still reachable from a page
         // /Annots survives as a plain annotation; orphaned signature dicts are
-        // dropped by the canonical rewrite GC). The returned flag reports
-        // whether anything changed, driving the warning.
-        let had_signatures = if remove_restrictions {
-            AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?
-        } else {
-            false
-        };
+        // dropped by the canonical rewrite GC). The qpdf mutation itself is
+        // silent; normal document warnings continue through completion.
+        if remove_restrictions {
+            let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+        }
         let mut options = options;
         if decrypt {
             options.preserve_encryption = false;
@@ -4886,14 +4874,6 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
 
         if verbose && announce_file {
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
-        }
-        if remove_restrictions && was_encrypted {
-            emit_logger_error(
-                "flpdf: removed restrictions (digital-signature restrictions stripped)\n",
-            );
-        }
-        if had_signatures {
-            logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
         }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
@@ -8416,12 +8396,9 @@ fn run_copy_attachments_from(
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     pdf.set_suppress_warnings(suppress_warnings);
-    let was_encrypted = pdf.is_encrypted();
-    let had_signatures = if remove_restrictions {
-        AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?
-    } else {
-        false
-    };
+    if remove_restrictions {
+        let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
+    }
 
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
@@ -8486,14 +8463,6 @@ fn run_copy_attachments_from(
     if verbose && output.as_os_str() != "-" {
         job.logger()
             .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
-    }
-    if remove_restrictions && was_encrypted {
-        emit_logger_error(
-            "flpdf: removed restrictions (digital-signature restrictions stripped)\n",
-        );
-    }
-    if had_signatures {
-        logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
     }
     // Same `--no-warn` boundary as `finish_rewrite_warnings`: the warning is
     // recorded (exit status 3) but its text is suppressed like `QPDF::warn`.
