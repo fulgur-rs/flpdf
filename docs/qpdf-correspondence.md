@@ -1228,6 +1228,8 @@ qpdf は `Config::verbose` (`QPDFJob_config.cc:637-645`) を job に保持し、
 `doIfVerbose` (`QPDFJob.cc:340-345,2360-2472`) から同じ info logger へ流す。
 flpdf は `Pdf` の caller-provided input description bytes と `QPDFJob` の message prefix/logger
 を使い、`resource_pruning.rs` の finding callback を一度だけ実行した結果を page merge へ渡す。
+`Config::emptyInput` の primary だけは内部 source-map key が空文字列で表示名が `empty PDF`
+となる qpdf の分離 (`QPDFJob_config.cc:27-38`, `QPDF.cc:290-293`) も保持する。
 これにより absolute/non-UTF-8 argv path、finding/no-finding の分岐、source preflight 順、
 `--pages` 後の split preflight を CLI 固有の synthetic template なしで qpdf と揃える
 （`QPDFJob.cc:2251-2339,2440-2565,2940-3025`; differential coverage:
