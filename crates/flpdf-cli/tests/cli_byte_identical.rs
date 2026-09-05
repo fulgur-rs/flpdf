@@ -56,11 +56,22 @@ fn run_cli(stem: &str, extra: &[&str]) -> Vec<u8> {
     std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
 }
 
+/// The pinned qpdf release these byte-parity assertions are derived from. A
+/// different qpdf on `PATH` is treated as unavailable (and as an error on CI)
+/// so its output is never mistaken for the 11.9.0 oracle.
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
 fn qpdf_available() -> bool {
     StdCommand::new("qpdf")
         .arg("--version")
         .output()
-        .map(|output| output.status.success())
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
         .unwrap_or(false)
 }
 
@@ -68,9 +79,11 @@ fn qpdf_available() -> bool {
 fn run_qpdf(stem: &str, extra: &[&str]) -> Option<Vec<u8>> {
     if !qpdf_available() {
         if std::env::var_os("CI").is_some() {
-            panic!("qpdf is required for linearized byte-parity assertions on CI");
+            panic!(
+                "{EXPECTED_QPDF_VERSION} is required for linearized byte-parity assertions on CI"
+            );
         }
-        eprintln!("skipping qpdf byte-parity assertion: qpdf is not available");
+        eprintln!("skipping qpdf byte-parity assertion: {EXPECTED_QPDF_VERSION} is not available");
         return None;
     }
 
