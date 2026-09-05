@@ -59,16 +59,70 @@ const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
     "with-images",
 ];
 
+/// One argv token with qpdf's raw byte representation and an OS-facing
+/// projection. Windows `OsString` cannot represent arbitrary bytes, so the
+/// projection is only for clap/path APIs; byte-oriented qpdf values must use
+/// [`Self::as_bytes`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawArg {
+    bytes: Vec<u8>,
+    os: OsString,
+}
+
+impl RawArg {
+    fn from_os(os: OsString) -> Self {
+        let bytes = os_bytes(&os);
+        Self { bytes, os }
+    }
+
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        let os = os_string_from_bytes(&bytes);
+        Self { bytes, os }
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn as_os_str(&self) -> &OsStr {
+        &self.os
+    }
+
+    pub(crate) fn into_os_string(self) -> OsString {
+        self.os
+    }
+}
+
+impl AsRef<OsStr> for RawArg {
+    fn as_ref(&self) -> &OsStr {
+        self.as_os_str()
+    }
+}
+
+impl From<RawArg> for OsString {
+    fn from(value: RawArg) -> Self {
+        value.into_os_string()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParsedArgs {
     pub(crate) residual_args: Vec<OsString>,
+    pub(crate) raw_residual_args: Vec<RawArg>,
     pub(crate) named_segments: Vec<NamedSegment>,
+    pub(crate) raw_named_segments: Vec<RawNamedSegment>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NamedSegment {
     pub(crate) option: String,
     pub(crate) tokens: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawNamedSegment {
+    pub(crate) option: String,
+    pub(crate) tokens: Vec<RawArg>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +220,7 @@ impl ArgParser {
     }
 
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
-        let args = expand_arg_files(args)?;
+        let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
         let mut iter = args.into_iter();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());
@@ -176,14 +230,14 @@ impl ArgParser {
         let mut first_add_attachment = true;
 
         while let Some(arg) = iter.next() {
-            if arg == OsStr::new("--") {
+            if arg.as_bytes() == b"--" {
                 residual_args.push(arg);
                 residual_args.extend(iter);
                 break;
             }
 
             let canonical = self.canonical_top_level_option(arg);
-            let Some(option) = option_name(&canonical) else {
+            let Some(option) = option_name(canonical.as_os_str()) else {
                 residual_args.push(canonical);
                 continue;
             };
@@ -192,10 +246,10 @@ impl ArgParser {
                 continue;
             };
 
-            let mut tokens: Vec<OsString> = Vec::new();
+            let mut tokens: Vec<RawArg> = Vec::new();
             let mut terminated = false;
             for token in iter.by_ref() {
-                if token == OsStr::new("--") {
+                if token.as_bytes() == b"--" {
                     terminated = true;
                     break;
                 }
@@ -210,28 +264,52 @@ impl ArgParser {
                 return Err(message.into());
             }
 
-            let segment = NamedSegment { option, tokens };
+            let segment = RawNamedSegment { option, tokens };
             let option = segment.option.as_str();
             let retain = kind.retain_in_residual(first_add_attachment);
             if kind == SegmentKind::AddAttachment {
                 first_add_attachment = false;
             }
             if retain {
-                residual_args.push(OsString::from(format!("--{option}")));
+                residual_args.push(RawArg::from_bytes(format!("--{option}").into_bytes()));
                 residual_args.extend(segment.tokens.iter().cloned());
-                residual_args.push(OsString::from("--"));
+                residual_args.push(RawArg::from_bytes(b"--".to_vec()));
             }
-            named_segments.push(segment);
+            named_segments.push(RawNamedSegment {
+                option: segment.option,
+                tokens: segment.tokens,
+            });
         }
 
+        let raw_residual_args = residual_args;
+        let residual_args = raw_residual_args
+            .iter()
+            .cloned()
+            .map(RawArg::into_os_string)
+            .collect();
+        let raw_named_segments = named_segments;
+        let named_segments = raw_named_segments
+            .iter()
+            .map(|segment| NamedSegment {
+                option: segment.option.clone(),
+                tokens: segment
+                    .tokens
+                    .iter()
+                    .cloned()
+                    .map(RawArg::into_os_string)
+                    .collect(),
+            })
+            .collect();
         Ok(ParsedArgs {
             residual_args,
+            raw_residual_args,
             named_segments,
+            raw_named_segments,
         })
     }
 
-    fn canonical_top_level_option(&self, arg: OsString) -> OsString {
-        let Some(arg_str) = arg.to_str() else {
+    fn canonical_top_level_option(&self, arg: RawArg) -> RawArg {
+        let Some(arg_str) = std::str::from_utf8(arg.as_bytes()).ok() else {
             return canonical_top_level_non_utf8_option(
                 &self.known_long_options,
                 &self.bare_long_options,
@@ -241,7 +319,7 @@ impl ArgParser {
         if let Some(rest) = arg_str.strip_prefix("--") {
             let name = rest.split('=').next().unwrap_or(rest);
             if self.bare_long_options.contains(name) && should_discard_bare_value(name, arg_str) {
-                return OsString::from(format!("--{name}"));
+                return RawArg::from_bytes(format!("--{name}").into_bytes());
             }
             return arg;
         }
@@ -258,24 +336,27 @@ impl ArgParser {
 
         let name = rest.split('=').next().unwrap_or(rest);
         let canonical = if self.known_long_options.contains(name) {
-            OsString::from(format!("--{rest}"))
+            RawArg::from_bytes(format!("--{rest}").into_bytes())
         } else {
             arg
         };
-        let Some(name) = option_name(&canonical) else {
+        let Some(name) = option_name(canonical.as_os_str()) else {
             return canonical;
         };
         if self.bare_long_options.contains(&name)
-            && should_discard_bare_value(&name, canonical.to_str().unwrap_or_default())
+            && should_discard_bare_value(
+                &name,
+                std::str::from_utf8(canonical.as_bytes()).unwrap_or_default(),
+            )
         {
-            OsString::from(format!("--{name}"))
+            RawArg::from_bytes(format!("--{name}").into_bytes())
         } else {
             canonical
         }
     }
 
-    fn canonical_segment_option(&self, kind: SegmentKind, token: OsString) -> OsString {
-        let Some(token_str) = token.to_str() else {
+    fn canonical_segment_option(&self, kind: SegmentKind, token: RawArg) -> RawArg {
+        let Some(token_str) = std::str::from_utf8(token.as_bytes()).ok() else {
             return canonical_segment_non_utf8_option(kind, token);
         };
         let Some(rest) = token_str.strip_prefix('-') else {
@@ -290,7 +371,7 @@ impl ArgParser {
 
         let name = rest.split('=').next().unwrap_or(rest);
         if kind.accepts(name) {
-            OsString::from(format!("--{rest}"))
+            RawArg::from_bytes(format!("--{rest}").into_bytes())
         } else {
             token
         }
@@ -303,7 +384,7 @@ impl ArgParser {
 /// and `readArgsFromFile` (`QPDFArgParser.cc:232-260,347-360`). Each physical
 /// line is one argument; the file is not shell-parsed and arguments read from a
 /// file are deliberately not scanned for another `@file` reference.
-fn expand_arg_files(args: Vec<OsString>) -> CliResult<Vec<OsString>> {
+fn expand_arg_files(args: Vec<RawArg>) -> CliResult<Vec<RawArg>> {
     let mut iter = args.into_iter();
     let Some(program) = iter.next() else {
         return Err("qpdf argument vector is empty".into());
@@ -327,8 +408,8 @@ fn expand_arg_files(args: Vec<OsString>) -> CliResult<Vec<OsString>> {
     Ok(expanded)
 }
 
-fn argument_file_path(arg: &OsStr) -> Option<OsString> {
-    let bytes = os_bytes(arg);
+fn argument_file_path(arg: &RawArg) -> Option<OsString> {
+    let bytes = arg.as_bytes();
     if bytes.len() <= 1 || bytes[0] != b'@' {
         return None;
     }
@@ -338,7 +419,7 @@ fn argument_file_path(arg: &OsStr) -> Option<OsString> {
 /// Read one qpdf argument file, returning `None` when its path cannot be
 /// opened. qpdf probes openability first and preserves such a token for the
 /// regular parser; an error after a successful open is propagated instead.
-fn read_argument_file(path: &OsStr) -> CliResult<Option<Vec<OsString>>> {
+fn read_argument_file(path: &OsStr) -> CliResult<Option<Vec<RawArg>>> {
     let bytes = if path == OsStr::new("-") {
         let mut bytes = Vec::new();
         std::io::stdin().read_to_end(&mut bytes)?;
@@ -356,7 +437,7 @@ fn read_argument_file(path: &OsStr) -> CliResult<Option<Vec<OsString>>> {
     Ok(Some(
         read_argument_file_lines(&bytes)
             .into_iter()
-            .map(|line| os_string_from_bytes(&line))
+            .map(RawArg::from_bytes)
             .collect(),
     ))
 }
@@ -381,7 +462,9 @@ fn read_argument_file_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
-fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+/// Build only the OS-facing projection for a raw token. The original bytes
+/// remain in [`RawArg`] and are never recovered from this projection.
+pub(crate) fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -450,156 +533,87 @@ pub(crate) fn os_bytes(value: &OsStr) -> Vec<u8> {
     }
 }
 
-/// Test an argument prefix without requiring the entire argument to be UTF-8.
-pub(crate) fn os_starts_with(value: &OsStr, prefix: &str) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        value.as_bytes().starts_with(prefix.as_bytes())
-    }
-
-    #[cfg(not(unix))]
-    {
-        value
-            .to_str()
-            .is_some_and(|value| value.starts_with(prefix))
-    }
-}
-
-/// Strip an ASCII option prefix while retaining a non-UTF-8 Unix suffix.
-pub(crate) fn os_strip_prefix(value: &OsStr, prefix: &str) -> Option<OsString> {
-    if let Some(value) = value.to_str() {
-        return value.strip_prefix(prefix).map(OsString::from);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        let bytes = os_bytes(value);
-        bytes
-            .strip_prefix(prefix.as_bytes())
-            .map(|suffix| OsString::from_vec(suffix.to_vec()))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = prefix;
-        None
-    }
-}
-
-/// Convert an option value to text at the boundary where its grammar needs
-/// UTF-8, returning a CLI error instead of panicking on Unix.
-pub(crate) fn os_to_string(value: &OsStr, context: &str) -> CliResult<String> {
-    value
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("{context} must be valid UTF-8").into())
-}
-
 fn canonical_top_level_non_utf8_option(
     known_long_options: &HashSet<String>,
     bare_long_options: &HashSet<String>,
-    arg: OsString,
-) -> OsString {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        let bytes = arg.as_bytes();
-        let (is_double_dash, rest) = if let Some(rest) = bytes.strip_prefix(b"--") {
-            if rest.starts_with(b"-") {
-                return arg;
-            }
-            (true, rest)
-        } else if let Some(rest) = bytes.strip_prefix(b"-") {
-            (false, rest)
-        } else {
-            return arg;
-        };
-        if rest.is_empty() || rest[0].is_ascii_digit() {
+    arg: RawArg,
+) -> RawArg {
+    let bytes = arg.as_bytes();
+    let (is_double_dash, rest) = if let Some(rest) = bytes.strip_prefix(b"--") {
+        if rest.starts_with(b"-") {
             return arg;
         }
-        let name_end = rest
-            .iter()
-            .position(|byte| *byte == b'=')
-            .unwrap_or(rest.len());
-        let Ok(name) = std::str::from_utf8(&rest[..name_end]) else {
-            return arg;
-        };
-        let name = name.to_owned();
-        // A single-dash abbreviation only reaches the qpdf-shaped `--name`
-        // grammar when the ASCII path (`canonical_top_level_option`) would
-        // also promote it: either the argument was already `--name` form, or
-        // `known_long_options` recognizes the abbreviated name. Gating the
-        // bare-value discard below on that same condition keeps this raw-byte
-        // path's decisions identical to the ASCII path for every name;
-        // otherwise a name present in `QPDF_BARE_LONG_OPTIONS` but absent
-        // from `known_long_options` would have its attached value silently
-        // discarded here while the ASCII path leaves the same argument
-        // untouched.
-        let promoted = is_double_dash || known_long_options.contains(&name);
-        let canonical = if is_double_dash {
-            arg
-        } else if known_long_options.contains(&name) {
-            let mut bytes = Vec::with_capacity(rest.len() + 2);
-            bytes.extend_from_slice(b"--");
-            bytes.extend_from_slice(rest);
-            OsString::from_vec(bytes)
-        } else {
-            arg
-        };
-        if promoted && bare_long_options.contains(&name) {
-            let bytes = canonical.as_bytes();
-            if let Some(equal_pos) = bytes.iter().position(|byte| *byte == b'=') {
-                let value = &bytes[equal_pos + 1..];
-                if name != "newline-before-endstream" || !matches!(value, b"y" | b"n" | b"never") {
-                    return OsString::from(format!("--{name}"));
-                }
-            }
-        }
-        canonical
+        (true, rest)
+    } else if let Some(rest) = bytes.strip_prefix(b"-") {
+        (false, rest)
+    } else {
+        return arg;
+    };
+    if rest.is_empty() || rest[0].is_ascii_digit() {
+        return arg;
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (known_long_options, bare_long_options);
+    let name_end = rest
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(rest.len());
+    let Ok(name) = std::str::from_utf8(&rest[..name_end]) else {
+        return arg;
+    };
+    let name = name.to_owned();
+    // A single-dash abbreviation only reaches the qpdf-shaped `--name`
+    // grammar when the ASCII path (`canonical_top_level_option`) would
+    // also promote it: either the argument was already `--name` form, or
+    // `known_long_options` recognizes the abbreviated name. Gating the
+    // bare-value discard below on that same condition keeps this raw-byte
+    // path's decisions identical to the ASCII path for every name;
+    // otherwise a name present in `QPDF_BARE_LONG_OPTIONS` but absent
+    // from `known_long_options` would have its attached value silently
+    // discarded here while the ASCII path leaves the same argument
+    // untouched.
+    let promoted = is_double_dash || known_long_options.contains(&name);
+    let canonical = if is_double_dash {
         arg
+    } else if known_long_options.contains(&name) {
+        let mut bytes = Vec::with_capacity(rest.len() + 2);
+        bytes.extend_from_slice(b"--");
+        bytes.extend_from_slice(rest);
+        RawArg::from_bytes(bytes)
+    } else {
+        arg
+    };
+    if promoted && bare_long_options.contains(&name) {
+        let bytes = canonical.as_bytes();
+        if let Some(equal_pos) = bytes.iter().position(|byte| *byte == b'=') {
+            let value = &bytes[equal_pos + 1..];
+            if name != "newline-before-endstream" || !matches!(value, b"y" | b"n" | b"never") {
+                return RawArg::from_bytes(format!("--{name}").into_bytes());
+            }
+        }
     }
+    canonical
 }
 
-fn canonical_segment_non_utf8_option(kind: SegmentKind, token: OsString) -> OsString {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        let bytes = token.as_bytes();
-        let Some(rest) = bytes.strip_prefix(b"-") else {
-            return token;
-        };
-        if rest.is_empty() || rest.starts_with(b"-") || rest[0].is_ascii_digit() {
-            return token;
-        }
-        let name_end = rest
-            .iter()
-            .position(|byte| *byte == b'=')
-            .unwrap_or(rest.len());
-        let Ok(name) = std::str::from_utf8(&rest[..name_end]) else {
-            return token;
-        };
-        if kind.accepts(name) {
-            let mut bytes = Vec::with_capacity(rest.len() + 2);
-            bytes.extend_from_slice(b"--");
-            bytes.extend_from_slice(rest);
-            OsString::from_vec(bytes)
-        } else {
-            token
-        }
+fn canonical_segment_non_utf8_option(kind: SegmentKind, token: RawArg) -> RawArg {
+    let bytes = token.as_bytes();
+    let Some(rest) = bytes.strip_prefix(b"-") else {
+        return token;
+    };
+    if rest.is_empty() || rest.starts_with(b"-") || rest[0].is_ascii_digit() {
+        return token;
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = kind;
+    let name_end = rest
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(rest.len());
+    let Ok(name) = std::str::from_utf8(&rest[..name_end]) else {
+        return token;
+    };
+    if kind.accepts(name) {
+        let mut bytes = Vec::with_capacity(rest.len() + 2);
+        bytes.extend_from_slice(b"--");
+        bytes.extend_from_slice(rest);
+        RawArg::from_bytes(bytes)
+    } else {
         token
     }
 }

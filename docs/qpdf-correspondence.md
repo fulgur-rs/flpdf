@@ -873,6 +873,11 @@ flpdf は `QPDFJob::open_with_description` / `open_document_with_description` �
 check banner と open error を raw bytes で出力する。Windows は qpdf の
 `wmain` → `QUtil::call_main_from_wmain`（`QUtil.cc:1895-1935`）と同じく Unicode
 argv を UTF-8 化するため、invalid-byte の実ファイル回帰は Unix/Linux に限定する。
+ただしこれは `wmain` から渡される process argv の制約であり、`@argfile` の内容には
+適用されない。`QPDFArgParser::readArgsFromFile` は `QUtil::read_lines_from_file`
+（`QPDFArgParser.cc:347-360`; `QUtil.cc:1260-1288`）から得た raw bytes をそのまま
+後続の `std::string` argv として使うため、Windows でも argfile 内の byte-oriented
+password 値は process argv とは別に保持される。
 
 入力ソース名は qpdf の `FileInputSource::filename` / `InputSource::getName`
 （`libqpdf/FileInputSource.cc:14-18,87-90`; `include/qpdf/InputSource.hh:69-74`）から
