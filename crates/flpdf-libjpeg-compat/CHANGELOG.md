@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/fulgur-rs/flpdf/compare/flpdf-libjpeg-compat-v0.5.0...flpdf-libjpeg-compat-v0.5.1) - 2026-09-05
+
+### Other
+
+- record default DCT marker limitation
+
 ## [0.5.0](https://github.com/fulgur-rs/flpdf/compare/flpdf-libjpeg-compat-v0.4.0...flpdf-libjpeg-compat-v0.5.0) - 2026-08-30
 
 ### Added
