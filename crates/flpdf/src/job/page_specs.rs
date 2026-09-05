@@ -428,6 +428,30 @@ fn replace_merged_fields(
     Ok(())
 }
 
+/// Remove the grouped foreign fields before the final per-occurrence replay
+/// when the primary AcroForm had no `/Fields` array of its own. The grouped
+/// page merge is an intermediate copy optimization; qpdf's empty-primary path
+/// adds each foreign field only at `fixCopiedAnnotations`, so retaining that
+/// intermediate field would make the replay rename the field against itself
+/// (`QPDFJob.cc:2514-2584`). Existing `/DR`, `/DA`, and other AcroForm keys are
+/// intentionally left in place for the replay's lazy initialization boundary.
+fn clear_grouped_foreign_fields_for_replay(merged: &mut Pdf<Cursor<Vec<u8>>>) -> Result<()> {
+    let Some(root_ref) = merged.root_ref() else {
+        return Ok(());
+    };
+    let root = merged.get_object_handle(root_ref);
+    let acroform = merged.resolve_handle(&root.try_get_key(b"/AcroForm")?)?;
+    if acroform.try_as_dictionary()?.is_none() {
+        return Ok(());
+    }
+    let fields = merged.resolve_handle(&acroform.try_get_key(b"/Fields")?)?;
+    if fields.try_as_array()?.is_none() {
+        return Ok(());
+    }
+    acroform.replace_key(b"/Fields", ObjectHandle::array(Vec::new()))?;
+    merged.mark_object_handle_dirty(&acroform)
+}
+
 /// Repair grouped-copy annotation `/P` values after the final page order is
 /// restored. qpdf installs this back-pointer at each final page-copy event,
 /// while the structural merge initially copies pages in source-group order.
@@ -537,6 +561,9 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
     };
     let primary_fields = collect_primary_fields(merged, &primary_first_pages)?;
     replace_merged_fields(merged, primary_fields, had_fields_array)?;
+    if !had_fields_array {
+        clear_grouped_foreign_fields_for_replay(merged)?;
+    }
 
     for (source_index, mappings) in first_output_for_source_page.iter().enumerate() {
         if mappings.is_empty() {

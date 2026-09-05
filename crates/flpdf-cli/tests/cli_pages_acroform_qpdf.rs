@@ -633,6 +633,27 @@ fn acroform_secondary_bad_da_pdf() -> Vec<u8> {
     ])
 }
 
+/// One-page AcroForm source used to compare qpdf's lazy foreign-field setup
+/// when the primary input is `--empty`.
+fn acroform_need_appearances_source_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) \
+          /DA (/Helv 12 Tf 0 g) /DR 6 0 R /Rect [0 0 100 20] \
+          /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /NeedAppearances true \
+          /DR 6 0 R /DA (/Helv 0 Tf 0 g) >>\nendobj\n"
+            .to_vec(),
+        b"6 0 obj\n<< /Font << /Helv 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+    ])
+}
+
 /// Single-page primary with a distinct `/DR/Font/F1`, so the malformed foreign
 /// source above necessarily receives a resource rename during the page copy.
 fn acroform_primary_with_dr_pdf() -> Vec<u8> {
@@ -952,6 +973,52 @@ fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
         da_parser_warning_message(&qpdf.stderr),
         "foreign /DA parser warning message must match qpdf",
     );
+}
+
+/// qpdf's empty primary lazily creates the destination AcroForm at the first
+/// foreign field-copy event. It keeps the source field name and propagates the
+/// source `/NeedAppearances` marker/default resources before the final write.
+#[test]
+fn empty_primary_pages_preserves_foreign_acroform_defaults_and_field_name() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let source = temp.path().join("acroform-source.pdf");
+    std::fs::write(&source, acroform_need_appearances_source_pdf()).expect("write AcroForm source");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .args(["--empty", "--pages"])
+        .arg(&source)
+        .arg("1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--empty", "--pages"])
+        .arg(&source)
+        .arg("1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).expect("qpdf output");
+    let flpdf_bytes = std::fs::read(&flpdf_output).expect("flpdf output");
+    assert_eq!(
+        flpdf_bytes, qpdf_bytes,
+        "empty-primary AcroForm page copy must be byte-identical to qpdf"
+    );
+    let qdf = qdf(&qpdf_output);
+    assert!(qdf.contains("/NeedAppearances true"));
+    assert!(qdf.contains("/T (f1)"));
 }
 
 /// Same scenario as
