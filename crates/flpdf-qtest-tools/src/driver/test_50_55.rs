@@ -4,6 +4,7 @@ use std::io::{Read, Seek, Write};
 use flpdf::form_field_object_helper::FormFieldObjectHelper;
 use flpdf::json_inspect::pdf_object_to_json;
 use flpdf::page_document_helper::PageDocumentHelper;
+use flpdf::page_object_helper::PageObjectHelper;
 use flpdf::writer::{ObjectStreamMode, PdfWriter};
 use flpdf::{Error, ObjectHandle, Pdf};
 
@@ -426,32 +427,49 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let mut helper = PageDocumentHelper::new(pdf);
-    let _pages = helper.get_all_pages()?;
+    let pages = helper.get_all_pages()?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
-    // qpdf builds the empty `/QTest` array before its per-page loop
-    // (`QPDFObjectHandle qtest = QPDFObjectHandle::newArray();`); kept here
-    // for the same order of operations even though nothing below can
-    // populate or use it.
-    let _qtest = ObjectHandle::array(Vec::new());
+    // qpdf constructs the array before the loop and appends both
+    // `getFormXObjectForPage()` and `getFormXObjectForPage(false)` for each
+    // page (`qpdf/test_driver.cc:2056-2064`). The canonical page helper owns
+    // the page-to-Form-XObject conversion, including inherited attributes,
+    // lazy content, and the conditional transformation matrix
+    // (`libqpdf/QPDFPageObjectHelper.cc:706-733`).
+    let qtest = ObjectHandle::array(Vec::new());
+    for page_ref in pages {
+        let transformed = {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            page.get_form_xobject_for_page(true)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let transformed = transformed?;
+        qtest.append_array_item(transformed)?;
 
-    // GAP(QPDFPageObjectHelper::getFormXObjectForPage): for each page, qpdf
-    // appends `ph.getFormXObjectForPage()` (default
-    // `handle_from_transformation = true`) and
-    // `ph.getFormXObjectForPage(false)` to `/QTest`, replaces the
-    // trailer's `/QTest` with the finished array, then writes `a.pdf` in
-    // QDF/static-ID mode (`libqpdf/QPDFPageObjectHelper.cc`). flpdf's
-    // page-to-Form-XObject conversion exists (`page_form_xobject.rs`,
-    // `get_form_xobject_for_page`) but that module is declared
-    // `pub(crate) mod page_form_xobject` (`lib.rs:136`), so it is
-    // unreachable from this crate. Since the array this test's entire
-    // output depends on can never be built, nothing below this point --
-    // including the QDF/static-ID `a.pdf` write, which would otherwise
-    // fabricate a trailer without the array qpdf actually produces -- is
-    // emitted. The `get_all_pages()` call above is real, not gapped: it is
-    // qpdf's own repair pass over `/Pages` (`QPDFPageDocumentHelper::
-    // getAllPages`), so any repair diagnostics it surfaces still reach
-    // stderr through `emit_new_diagnostics` even though -- unlike a full
-    // qpdf run -- no `a.pdf` capturing the repaired tree is ever written.
+        let untransformed = {
+            let mut page = PageObjectHelper::new(page_ref, pdf);
+            page.get_form_xobject_for_page(false)
+        };
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+        let untransformed = untransformed?;
+        qtest.append_array_item(untransformed)?;
+    }
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    // Keep the finished array on the live trailer, matching qpdf's
+    // `getTrailer().replaceKey("/QTest", qtest)` before construction of the
+    // writer (`qpdf/test_driver.cc:2065`).
+    let trailer = pdf.trailer();
+    trailer.replace_key(b"/QTest", qtest)?;
+    pdf.mark_object_handle_dirty(&trailer)?;
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    let write_result = writer.write();
+    drop(writer);
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    write_result?;
     Ok(())
 }
 
