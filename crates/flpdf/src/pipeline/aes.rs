@@ -154,8 +154,10 @@ impl<'a> PlAesPdf<'a> {
     ///
     /// # Errors
     ///
-    /// [`PipelineError`] when `key` is not 16 or 32 bytes: qpdf's own header
-    /// scopes this pipeline to "AES-128 and AES-256"
+    /// [`PipelineError`] when `key` is neither 16 nor 32 bytes and is not an
+    /// overlength raw V=5 key. The latter is accepted because qpdf's crypto
+    /// providers project unsupported key lengths to their AES-128 fallback;
+    /// the normal PDF-facing contract remains AES-128/AES-256
     /// (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
     pub(crate) fn new_decrypt(
         identifier: impl Into<String>,
@@ -184,7 +186,8 @@ impl<'a> PlAesPdf<'a> {
     ///
     /// # Errors
     ///
-    /// Same key-length contract as [`Self::new_decrypt`].
+    /// Same key-length contract as [`Self::new_decrypt`], including qpdf's
+    /// overlength raw-key provider fallback.
     pub(crate) fn decrypt_to_vec(
         identifier: impl Into<String>,
         data: &[u8],
@@ -263,7 +266,8 @@ impl<'a> PlAesPdf<'a> {
     ///
     /// # Errors
     ///
-    /// Same key-length contract as [`Self::new_decrypt`].
+    /// Same key-length contract as [`Self::new_decrypt`], including qpdf's
+    /// overlength raw-key provider fallback.
     pub(crate) fn new_encrypt(
         identifier: impl Into<String>,
         next: &'a mut dyn Pipeline,
