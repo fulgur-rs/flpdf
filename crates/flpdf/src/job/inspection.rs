@@ -265,12 +265,18 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
         let mut output = dictionary.unparse_resolved();
         output.extend_from_slice(b"\nstream\n");
         let data = data.as_ref();
+        // qpdf-deviation-start: `dump-object` has no qpdf counterpart
+        // (QPDFJob::doShowObj prints "Object is stream.  Dictionary:" and never
+        // reserializes stream framing, QPDFJob.cc:806-832). This flpdf-only
+        // reserializer drops the recovered-length EOL so its own
+        // "\nendstream" framing does not double the source line ending.
         let recovered_eol = pdf.canonical_recovered_stream_eol(object_ref, object)?;
         let data = if let Some(eol) = recovered_eol.filter(|eol| data.ends_with(eol)) {
             &data[..data.len() - eol.len()]
         } else {
             data
         };
+        // qpdf-deviation-end
         output.extend_from_slice(data);
         output.extend_from_slice(b"\nendstream");
         Ok(output)
