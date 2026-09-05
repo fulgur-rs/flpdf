@@ -9155,11 +9155,10 @@ fn rewrite_help_describes_screen_mode_as_including_printable_annotations() {
         .stdout(predicate::str::contains("not when printed").not());
 }
 
-/// Combining `--linearize` with the flatten/generate passes is rejected loudly
-/// rather than silently dropping the requested transformation (the passes only
-/// run on the non-linearize rewrite branch).
+/// Combining `--linearize` with `--flatten-rotation` keeps the transformation
+/// enabled on the linearized rewrite branch.
 #[test]
-fn rewrite_linearize_with_flatten_is_rejected() {
+fn rewrite_linearize_with_flatten_succeeds() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("rotated.pdf");
     let output = temp.path().join("out.pdf");
@@ -9171,6 +9170,10 @@ fn rewrite_linearize_with_flatten_is_rejected() {
         .arg(&input)
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("--linearize cannot be combined"));
+        .success();
+
+    assert!(
+        output.exists(),
+        "linearized flattened output must be created"
+    );
 }
