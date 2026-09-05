@@ -21,6 +21,10 @@ const JSON_COMPLETE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/compat/json-input/complete.json"
 );
+const ATTACHMENT_TWO_PAGE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/attachment-two-page.pdf"
+);
 
 fn raw(value: &[u8]) -> OsString {
     OsString::from_vec(value.to_vec())
@@ -379,9 +383,9 @@ fn missing_remove_attachment_diagnostic_preserves_non_utf8_key_bytes() {
 
     assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
     assert_preserves_raw_bytes(&output, key, "missing remove-attachment diagnostic");
-    let mut expected = b"qpdf: --remove-attachment: key \"missing-".to_vec();
+    let mut expected = b"qpdf: attachment missing-".to_vec();
     expected.push(0xff);
-    expected.extend_from_slice(b"\" not found in document\n");
+    expected.extend_from_slice(b" not found\n");
     assert_eq!(output.stderr, expected);
 }
 
@@ -418,7 +422,7 @@ fn missing_show_attachment_diagnostic_escapes_control_bytes_in_the_inner_message
 }
 
 #[test]
-fn attachment_diagnostic_uses_byte_safe_debug_quoting() {
+fn attachment_diagnostic_preserves_raw_key_bytes() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = raw_path(directory.path(), b"input.pdf");
     let output_path = raw_path(directory.path(), b"output.pdf");
@@ -432,10 +436,9 @@ fn attachment_diagnostic_uses_byte_safe_debug_quoting() {
     ]);
 
     assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
-    let mut expected =
-        b"qpdf: --remove-attachment: key \"quote-\\\"-\\n-\\r-\\t-\\x01-\\\\-".to_vec();
-    expected.push(0xff);
-    expected.extend_from_slice(b"\" not found in document\n");
+    let mut expected = b"qpdf: attachment ".to_vec();
+    expected.extend_from_slice(key);
+    expected.extend_from_slice(b" not found\n");
     assert_eq!(output.stderr, expected);
 }
 
@@ -605,4 +608,54 @@ fn split_pages_preserves_non_utf8_output_template_bytes() {
     ]);
     assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
     assert!(raw_path(directory.path(), b"percent-\xff-1.pdf").exists());
+}
+
+#[test]
+fn remove_attachment_verbose_wrote_file_preserves_non_utf8_output_path() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let output_path = raw_path(directory.path(), b"out-\xff.pdf");
+    fs::copy(ATTACHMENT_TWO_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from("--verbose"),
+        OsString::from("--remove-attachment=attachment.txt"),
+        input.into_os_string(),
+        output_path.clone().into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(
+        &output,
+        output_path.as_os_str().as_bytes(),
+        "remove-attachment wrote-file line",
+    );
+    // qpdf writes the output name's raw bytes (`QPDFJob.cc:3059-3062`).
+    let mut expected = b"qpdf: removed attachment attachment.txt\nqpdf: wrote file ".to_vec();
+    expected.extend_from_slice(output_path.as_os_str().as_bytes());
+    expected.push(b'\n');
+    assert_eq!(output.stdout, expected);
+    assert!(output_path.exists());
+}
+
+#[test]
+fn rewrite_verbose_wrote_file_preserves_non_utf8_output_path() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = raw_path(directory.path(), b"input.pdf");
+    let output_path = raw_path(directory.path(), b"rewrite-\xff.pdf");
+    fs::copy(ONE_PAGE, &input).expect("copy input");
+
+    let output = run([
+        OsString::from("--verbose"),
+        input.into_os_string(),
+        output_path.clone().into_os_string(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    assert_preserves_raw_bytes(
+        &output,
+        output_path.as_os_str().as_bytes(),
+        "rewrite wrote-file line",
+    );
+    assert!(output_path.exists());
 }

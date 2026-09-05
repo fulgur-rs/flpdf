@@ -2769,6 +2769,7 @@ fn main() {
             args.repair,
             &args.password,
             key,
+            args.verbose,
             args.no_warn,
             args.remove_restrictions,
             args.linearize,
@@ -4700,7 +4701,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             linearize_pass1,
         )?;
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
         // On an encrypted input, `--decrypt` has already disabled
         // source-encryption preservation above.
@@ -4851,7 +4852,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         )?;
 
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
@@ -6319,7 +6320,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(pdf, output, &mut standard_output, &options, false, None)?;
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
     }
     finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
@@ -6555,7 +6556,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             None,
         )?;
         if verbose && announce_file {
-            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
+            logger_info(wrote_file_message("flpdf", output))?;
         }
     }
     finish_operation_warnings(&pdf, creates_output)
@@ -7780,6 +7781,16 @@ fn path_description(input: &Path) -> Vec<u8> {
     input.to_string_lossy().into_owned().into_bytes()
 }
 
+/// Build qpdf's `<prefix>: wrote file <output>` line with the output name's
+/// raw bytes (`QPDFJob.cc:3059-3062`); `Path::display()` would replace
+/// non-UTF-8 bytes with U+FFFD.
+fn wrote_file_message(prefix: &str, output: &Path) -> Vec<u8> {
+    let mut message = format!("{prefix}: wrote file ").into_bytes();
+    message.extend_from_slice(&path_description(output));
+    message.push(b'\n');
+    message
+}
+
 /// Program name used in qpdf-parity diagnostic prefixes.
 ///
 /// `FLPDF_PROGNAME` overrides the default so the qpdf qtest harness shim can
@@ -8195,6 +8206,11 @@ fn run_add_attachment(
         })
         .collect::<CliResult<Vec<_>>>()?;
 
+    // Reserve standard output before opening the input, like qpdf's
+    // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
+    // info lines go to stderr when the PDF goes to stdout.
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
@@ -8205,8 +8221,6 @@ fn run_add_attachment(
         .open_with_description(BufReader::new(file), path_description(&input), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     pdf.set_suppress_warnings(suppress_warnings);
-
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
 
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
@@ -8231,7 +8245,7 @@ fn run_add_attachment(
     )?;
     if verbose && output.as_os_str() != "-" {
         job.logger()
-            .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+            .info(wrote_file_message(&progname(), &output))?;
     }
     if !suppress_warnings {
         for &warning in &normalization_warnings {
@@ -8253,6 +8267,7 @@ fn run_remove_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &OsStr,
+    verbose: bool,
     suppress_warnings: bool,
     remove_restrictions: bool,
     linearize: bool,
@@ -8262,6 +8277,13 @@ fn run_remove_attachment(
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
 
+    // qpdf switches the logger to "save to standard output" before it opens
+    // the input (`QPDFJob.cc:625`), so every `--verbose` info line — the
+    // password-encoding recovery notice emitted while opening as well as the
+    // removal report below — lands on stderr when the PDF goes to stdout.
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let creates_output = standard_output.is_none();
+
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
 
     if remove_restrictions {
@@ -8270,10 +8292,17 @@ fn run_remove_attachment(
     let key = arg_parser::os_bytes(key);
     let found = pdf.embedded_files().remove_embedded_file(&key)?;
     if !found {
-        let mut message = b"--remove-attachment: key ".to_vec();
-        append_debug_quoted_bytes(&mut message, &key);
-        message.extend_from_slice(b" not found in document");
+        let mut message = b"attachment ".to_vec();
+        message.extend_from_slice(&key);
+        message.extend_from_slice(b" not found");
         return Err(Error::SystemBytes(message).into());
+    }
+
+    if verbose {
+        let mut message = format!("{}: removed attachment ", progname()).into_bytes();
+        message.extend_from_slice(&key);
+        message.push(b'\n');
+        logger_info(message)?;
     }
 
     let normalization_warnings = if writer_options.content_normalization {
@@ -8281,8 +8310,6 @@ fn run_remove_attachment(
     } else {
         Vec::new()
     };
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
-    let creates_output = standard_output.is_none();
     write_with_pdf_writer(
         &mut pdf,
         &output,
@@ -8291,6 +8318,9 @@ fn run_remove_attachment(
         linearize,
         linearize_pass1,
     )?;
+    if verbose && output.as_os_str() != "-" {
+        logger_info(wrote_file_message(&progname(), &output))?;
+    }
     finish_rewrite_warnings(
         &input,
         &pdf,
@@ -8372,6 +8402,11 @@ fn run_copy_attachments_from(
         .map(parse_copy_attachments_segment)
         .collect::<CliResult<Vec<_>>>()?;
 
+    // Reserve standard output before opening the target, like qpdf's
+    // `saveToStandardOutput` (`QPDFJob.cc:625`), so open-time `--verbose`
+    // info lines go to stderr when the PDF goes to stdout.
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
@@ -8385,8 +8420,6 @@ fn run_copy_attachments_from(
     if remove_restrictions {
         let _ = AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
-
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
 
     // Open each source with its own password (independent of the target's).
     // Retain the command-wide open policy so qpdf's recovery/xref controls
@@ -8448,7 +8481,7 @@ fn run_copy_attachments_from(
     )?;
     if verbose && output.as_os_str() != "-" {
         job.logger()
-            .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+            .info(wrote_file_message(&progname(), &output))?;
     }
     // Same `--no-warn` boundary as `finish_rewrite_warnings`: the warning is
     // recorded (exit status 3) but its text is suppressed like `QPDF::warn`.

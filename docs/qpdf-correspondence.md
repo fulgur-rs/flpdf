@@ -1042,6 +1042,12 @@ encryption、decrypt、linearization、version、ID、progress を attachment ou
 適用する。`QPDFWriter.cc:1538-1564,1735-1755` の stream/object-stream framing と
 QDF/linearization の writer 内優先順位もこの共通経路で保持する。
 
+`flpdf-w0ne` では `--remove-attachment` の診断も qpdf の job logger 境界へ揃える。
+qpdf は成功した removal を `doIfVerbose` で報告し、`writeOutfile` の成功後に
+`wrote file` を報告する一方、missing key は `attachment <key> not found` を throw する
+（`QPDFJob.cc:2230-2241,3030-3062`）。flpdf は remove route に `verbose` を渡し、key の
+raw bytes を保持した info/error message と同じ completion order を使う。
+
 `flpdf-25kg.5.5` では、top-level `--show-linearization` も `QPDFJob::open` が
 設定した同じ `Pdf` を `QPDFJob::show_linearization` に渡す。これは qpdf の
 `setQPDFOptions` による logger/suppression 設定（`QPDFJob.cc:650-665`）、同じ
