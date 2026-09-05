@@ -164,3 +164,45 @@ fn remove_attachment_missing_key_diagnostic_matches_qpdf() {
     assert_eq!(flpdf.stderr, qpdf.stderr);
     assert!(!output.exists(), "missing removal must not write output");
 }
+
+#[test]
+fn remove_attachment_verbose_to_stdout_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    // qpdf switches the logger to standard-output-save mode before any
+    // transformation runs (`QPDFJob.cc:625`), so the `removed attachment`
+    // info line goes to stderr, the PDF alone goes to stdout, and no
+    // `wrote file` line is printed.
+    let input = fixture("attachment-two-page.pdf");
+    let args = [
+        "--verbose",
+        "--static-id",
+        "--stream-data=uncompress",
+        "--remove-attachment=attachment.txt",
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .arg("-")
+        .output()
+        .expect("qpdf invocation");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(args)
+        .arg(&input)
+        .arg("-")
+        .output()
+        .expect("flpdf invocation");
+
+    assert_eq!(qpdf.status.code(), Some(0));
+    assert!(qpdf.stdout.starts_with(b"%PDF-"));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+}

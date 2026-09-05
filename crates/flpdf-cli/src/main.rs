@@ -8266,6 +8266,12 @@ fn run_remove_attachment(
 
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
 
+    // qpdf switches the logger to "save to standard output" before any
+    // transformation runs (`QPDFJob.cc:625`), so a `--verbose` info line
+    // emitted below lands on stderr when the PDF itself goes to stdout.
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let creates_output = standard_output.is_none();
+
     if remove_restrictions {
         AcroFormDocumentHelper::new(&mut pdf)?.disable_digital_signatures()?;
     }
@@ -8290,8 +8296,6 @@ fn run_remove_attachment(
     } else {
         Vec::new()
     };
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
-    let creates_output = standard_output.is_none();
     write_with_pdf_writer(
         &mut pdf,
         &output,
