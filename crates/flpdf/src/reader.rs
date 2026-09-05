@@ -396,10 +396,21 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Return the initialized encryption key length in bits.
     ///
-    /// The inspection state provides qpdf's revision-aware length selection
-    /// before authentication and remains available after authentication. This
-    /// is the same key length qpdf uses for its JSON encryption section.
+    /// After authentication, qpdf reports the actual `getEncryptionKey()`
+    /// length, including an overlength value supplied through
+    /// `--password-is-hex-key` (`QPDFJob.cc:1245-1252`). Before authentication,
+    /// the inspection state provides qpdf's revision-aware dictionary length.
     pub fn encryption_length_bits(&self) -> Option<i64> {
+        if let Some(encryption) = self.encryption.borrow().as_ref() {
+            if let Some(bits) = encryption
+                .file_key
+                .len()
+                .checked_mul(8)
+                .and_then(|bits| i64::try_from(bits).ok())
+            {
+                return Some(bits);
+            }
+        }
         self.encryption_inspection
             .borrow()
             .as_ref()

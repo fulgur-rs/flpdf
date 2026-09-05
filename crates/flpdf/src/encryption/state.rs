@@ -186,12 +186,16 @@ impl EncryptionState {
 }
 
 pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
-    key.try_into().map_err(|_| {
-        EncryptedError::Malformed {
+    match key.len() {
+        16 => key.try_into().map_err(|_| unreachable!("length checked")),
+        len if len > 32 => key[..16]
+            .try_into()
+            .map_err(|_| unreachable!("prefix length checked")),
+        _ => Err(EncryptedError::Malformed {
             reason: "AES-128 object key is not 16 bytes".into(),
         }
-        .into()
-    })
+        .into()),
+    }
 }
 
 /// qpdf `QPDF::encryption_method_e` (`QPDF.hh:436`).
@@ -677,17 +681,12 @@ fn map_uo_length_to_bad_password(err: crate::Error) -> crate::Error {
 }
 
 fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
-    let key = decode_hex(raw);
-    if key.len() > 32 {
-        return Err(crate::error::EncryptedError::Malformed {
-            reason: format!(
-                "--password-is-hex-key: decoded key is {} bytes; the Standard security handler key is at most 32 bytes",
-                key.len()
-            ),
-        }
-        .into());
-    }
-    Ok(key)
+    // qpdf stores QUtil::hex_decode's result without imposing the normal
+    // Standard-handler key-size limit when --password-is-hex-key is active
+    // (QPDF_encryption.cc:933-934). V>=5 object-key derivation returns this
+    // raw value unchanged; the crypto provider chooses its own AES fallback
+    // when the length is not one of its supported AES sizes.
+    Ok(decode_hex(raw))
 }
 
 fn required_integer_from_handle(dict: &ObjectHandle, key: &'static str) -> Result<i64> {

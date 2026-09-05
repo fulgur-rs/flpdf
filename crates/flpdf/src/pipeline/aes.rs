@@ -112,16 +112,27 @@ impl<'a> PlAesPdf<'a> {
         encrypt: bool,
         key: &[u8],
     ) -> PipelineResult<Self> {
-        if key.len() != 16 && key.len() != 32 {
-            return Err(PipelineError::logic(format!(
-                "Pl_AES_PDF: key must be 16 or 32 bytes, got {}",
-                key.len()
-            )));
-        }
+        let key = match key.len() {
+            16 | 32 => key.to_vec(),
+            len if len > 32 => {
+                // qpdf's GnuTLS and OpenSSL providers select AES-128 for an
+                // unsupported key length and configure a 16-byte provider key
+                // (`QPDFCrypto_gnutls.cc:197-213`,
+                // `QPDFCrypto_openssl.cc:225-241`). The raw V=5 file key is
+                // retained by EncryptionState; only this provider-facing
+                // projection uses its first 16 bytes.
+                key[..16].to_vec()
+            }
+            len => {
+                return Err(PipelineError::logic(format!(
+                    "Pl_AES_PDF: key must be 16 or 32 bytes, or longer than 32 bytes for qpdf's provider fallback, got {len}"
+                )))
+            }
+        };
         Ok(Self {
             identifier: identifier.into(),
             next,
-            key: key.to_vec(),
+            key,
             cipher: None,
             encrypt,
             cbc_mode: true,
