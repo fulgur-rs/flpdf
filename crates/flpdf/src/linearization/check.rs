@@ -1796,9 +1796,10 @@ pub fn check_linearization_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{length_next_n, LinearizationCheckError};
+    use super::{length_next_n, load_hint_stream_with_damage, LinearizationCheckError};
     use crate::Pdf;
     use std::collections::BTreeMap;
+    use std::io::Cursor;
 
     #[test]
     fn length_next_n_rejects_object_number_wrap() {
@@ -1825,5 +1826,19 @@ mod tests {
             2,
             "the two missing entries precede the wrap"
         );
+    }
+
+    #[test]
+    fn load_hint_stream_uses_qpdf_description_route_for_valid_fixture() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+
+        let result = load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118);
+        assert!(result.is_ok(), "the fixture hint stream should resolve and decode");
+        let (_hint_dict, decoded) = result.ok().unwrap();
+        assert!(!decoded.is_empty());
     }
 }

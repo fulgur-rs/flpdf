@@ -1634,6 +1634,18 @@ mod tests {
     }
 
     #[test]
+    fn linearization_runtime_error_message_preserves_qpdf_text() {
+        assert_eq!(
+            linearization_parameter_error_message(
+                b"linearized.pdf",
+                "overflow reading bit stream: wanted = 12556; available = 968",
+                660,
+            ),
+            b"overflow reading bit stream: wanted = 12556; available = 968"
+        );
+    }
+
+    #[test]
     fn document_check_uses_qpdf_page_count_warning() {
         let output = check_linearized_candidate_warning(b"/N", ObjectHandle::integer(2));
 

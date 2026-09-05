@@ -1665,14 +1665,11 @@ mod tests {
         });
         assert_eq!(buf.len(), 24, "header is exactly 24 bytes, no column data");
 
-        let error = match read_h_shared_object(&buf) {
-            Ok(_) => panic!("the first column is truncated"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            "malformed linearization data: overflow reading bit stream: wanted = 12556; available = 0"
-        );
+        assert!(matches!(
+            read_h_shared_object(&buf),
+            Err(ShowLinearizationError::Malformed { message })
+                if message == "overflow reading bit stream: wanted = 12556; available = 0"
+        ));
     }
 
     #[test]
@@ -1706,14 +1703,11 @@ mod tests {
             "36-byte header + 4-byte nshared_objects column"
         );
 
-        let error = match read_h_page_offset(&buf, 1) {
-            Ok(_) => panic!("the shared identifier column is truncated"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            "malformed linearization data: overflow reading bit stream: wanted = 1; available = 0"
-        );
+        assert!(matches!(
+            read_h_page_offset(&buf, 1),
+            Err(ShowLinearizationError::Malformed { message })
+                if message == "overflow reading bit stream: wanted = 1; available = 0"
+        ));
     }
 
     // -----------------------------------------------------------------------
