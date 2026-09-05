@@ -2769,6 +2769,7 @@ fn main() {
             args.repair,
             &args.password,
             key,
+            args.verbose,
             args.no_warn,
             args.remove_restrictions,
             args.linearize,
@@ -8253,6 +8254,7 @@ fn run_remove_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &OsStr,
+    verbose: bool,
     suppress_warnings: bool,
     remove_restrictions: bool,
     linearize: bool,
@@ -8270,10 +8272,17 @@ fn run_remove_attachment(
     let key = arg_parser::os_bytes(key);
     let found = pdf.embedded_files().remove_embedded_file(&key)?;
     if !found {
-        let mut message = b"--remove-attachment: key ".to_vec();
-        append_debug_quoted_bytes(&mut message, &key);
-        message.extend_from_slice(b" not found in document");
+        let mut message = b"attachment ".to_vec();
+        message.extend_from_slice(&key);
+        message.extend_from_slice(b" not found");
         return Err(Error::SystemBytes(message).into());
+    }
+
+    if verbose {
+        let mut message = format!("{}: removed attachment ", progname()).into_bytes();
+        message.extend_from_slice(&key);
+        message.push(b'\n');
+        logger_info(message)?;
     }
 
     let normalization_warnings = if writer_options.content_normalization {
@@ -8291,6 +8300,9 @@ fn run_remove_attachment(
         linearize,
         linearize_pass1,
     )?;
+    if verbose && output.as_os_str() != "-" {
+        logger_info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+    }
     finish_rewrite_warnings(
         &input,
         &pdf,

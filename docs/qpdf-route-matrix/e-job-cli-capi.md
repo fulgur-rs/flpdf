@@ -249,6 +249,11 @@ public/private 境界の 2 つ目の witness になる。
 `writeQPDF` → `writeOutfile` → `setWriterOptions` の順序
 （`libqpdf/QPDFJob.cc:484-507,2137-2248,2847-2945,3029-3058`）に対応する。
 
+`flpdf-w0ne` では remove route の diagnostics も同じ E-9/E-4 境界へ揃える。
+`run_remove_attachment` は mutation 成功時の `removed attachment <key>` を verbose info sink
+へ送り、writer 完了後に `wrote file <output>` を送り、missing key は qpdf の
+`attachment <key> not found` を raw bytes のまま返す（`libqpdf/QPDFJob.cc:2230-2241,3030-3062`）。
+
 ### 分類別件数
 
 | 分類 | 件数 | 行 |
