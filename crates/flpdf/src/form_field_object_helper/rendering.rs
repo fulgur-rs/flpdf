@@ -20,7 +20,8 @@ use std::rc::Rc;
 
 use crate::annotation_object_helper::AnnotationObjectHelper;
 use crate::content_stream::{
-    parse_content_stream_handles, ObjectHandleParserCallbacks, ParseControl,
+    parse_content_stream_handles_with_recoverable_warnings, ObjectHandleParserCallbacks,
+    ParseControl,
 };
 use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
@@ -667,10 +668,13 @@ fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) 
         last_number: None,
         tf_size_span: None,
     };
-    // Best-effort, matching parse_default_appearance's own "skip malformed,
-    // last wins" recovery: a parse error partway through still leaves
-    // whatever valid Tf occurrence was already found in place.
-    let _ = parse_content_stream_handles(default_appearance, None, "", &mut finder);
+    // qpdf's `TfFinder` is a token filter fed by `Pl_QPDFTokenizer`
+    // (`QPDFFormFieldObjectHelper.cc:804-810`): a bad token passes through as
+    // raw text and never stops the scan, so a later `Tf` is still found. Use
+    // the warning-and-continue context; a structural error partway through
+    // still leaves whatever valid Tf occurrence was already found in place.
+    let _ =
+        parse_content_stream_handles_with_recoverable_warnings(default_appearance, "", &mut finder);
 
     let Some((offset, length, raw_value)) = finder.tf_size_span else {
         return default_appearance.to_vec();
@@ -1107,6 +1111,17 @@ mod tests {
         );
         assert_eq!(substitute_da_tf_operand(b"0 Tf 0 g", 11.0), b"11 Tf 0 g");
         assert_eq!(substitute_da_tf_operand(b"0 g", 11.0), b"0 g");
+    }
+
+    /// qpdf's `TfFinder` sees the bad hexstring as a raw token and still
+    /// records the later `Tf` (`QPDFFormFieldObjectHelper.cc:689-711`), so a
+    /// malformed token before the operator must not leave `0 Tf` in place.
+    #[test]
+    fn substitute_da_tf_recovers_after_a_malformed_token() {
+        assert_eq!(
+            substitute_da_tf_operand(b"<0g> /Helv 0 Tf 0 g", 11.0),
+            b"<0g> /Helv 11 Tf 0 g"
+        );
     }
 
     #[test]

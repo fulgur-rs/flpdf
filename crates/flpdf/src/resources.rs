@@ -28,7 +28,7 @@ type UsedNames = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
 /// Snapshot qpdf's `QPDF::numWarnings` around a document-owned content parse
 /// (`QPDFPageObjectHelper.cc:547-557`).
 fn diagnostic_count<R: Read + Seek>(pdf: &Pdf<R>) -> usize {
-    pdf.repair_diagnostics().entries().len()
+    pdf.num_warnings()
 }
 
 /// qpdf `QPDFPageObjectHelper::removeUnreferencedResources` for one page.

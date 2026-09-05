@@ -786,7 +786,7 @@ fn is_logger_error(error: &crate::Error) -> bool {
 }
 
 fn diagnostic_count<R: Read + Seek>(pdf: &Pdf<R>) -> usize {
-    pdf.repair_diagnostics().entries().len()
+    pdf.num_warnings()
 }
 
 fn logger_failure_since<R: Read + Seek>(pdf: &Pdf<R>, seen: usize) -> bool {
