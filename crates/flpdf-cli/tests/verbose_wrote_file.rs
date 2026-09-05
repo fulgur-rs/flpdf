@@ -166,6 +166,112 @@ fn remove_attachment_missing_key_diagnostic_matches_qpdf() {
 }
 
 #[test]
+fn remove_attachment_repeated_keys_match_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let input = fixture("attachment-two-page.pdf");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let input_with_two = tmp.path().join("with-two.pdf");
+    let add = ShellCommand::new("qpdf")
+        .args(["--static-id", "--add-attachment"])
+        .arg(&input)
+        .arg("--key=second")
+        .arg("--")
+        .arg(&input)
+        .arg(&input_with_two)
+        .output()
+        .expect("qpdf attachment setup");
+    assert!(
+        add.status.success(),
+        "qpdf attachment setup failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let output = tmp.path().join("out.pdf");
+    let args = [
+        "--static-id",
+        "--verbose",
+        "--remove-attachment=attachment.txt",
+        "--remove-attachment=second",
+    ];
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input_with_two)
+        .arg(&output)
+        .output()
+        .expect("qpdf repeated remove invocation");
+    assert_eq!(qpdf.status.code(), Some(0));
+    let qpdf_bytes = std::fs::read(&output).expect("qpdf repeated remove output");
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(args)
+        .arg(&input_with_two)
+        .arg(&output)
+        .output()
+        .expect("flpdf repeated remove invocation");
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert_eq!(
+        std::fs::read(&output).expect("flpdf repeated remove output"),
+        qpdf_bytes,
+        "repeated attachment removal must produce qpdf-identical bytes"
+    );
+}
+
+#[test]
+fn remove_attachment_duplicate_key_failure_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[skip] qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let input = fixture("attachment-two-page.pdf");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = tmp.path().join("out.pdf");
+    let args = [
+        "--static-id",
+        "--verbose",
+        "--remove-attachment=attachment.txt",
+        "--remove-attachment=attachment.txt",
+    ];
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .expect("qpdf duplicate remove invocation");
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert!(
+        !output.exists(),
+        "qpdf duplicate removal must not write output"
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(args)
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .expect("flpdf duplicate remove invocation");
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(!output.exists(), "duplicate removal must not write output");
+}
+
+#[test]
 fn remove_attachment_verbose_to_stdout_matches_qpdf() {
     if !qpdf_available() {
         eprintln!("[skip] qpdf 11.9.0 is not available");
