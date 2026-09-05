@@ -694,26 +694,12 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
     let diagnostics_seen = diagnostic_count(pdf);
     match check_linearization_parameters(pdf) {
         Ok(LinearizationParameterCheck::Clean) => {
-            warnings |= emit_linearization_check_warnings_with_suppression(
-                pdf,
-                &source_bytes,
-                logger,
-                input_name,
-                false,
-                suppress_warnings,
-            )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            warnings |= emit_linearization_check_warnings(pdf, &source_bytes, input_name, false)?;
         }
         Ok(LinearizationParameterCheck::Warning(message)) => {
             warnings = true;
             push_qpdf_warning_bytes(pdf, input_name, message.as_bytes())?;
-            warnings |= emit_linearization_check_warnings_with_suppression(
-                pdf,
-                &source_bytes,
-                logger,
-                input_name,
-                true,
-                suppress_warnings,
-            )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            warnings |= emit_linearization_check_warnings(pdf, &source_bytes, input_name, true)?;
         }
         Ok(LinearizationParameterCheck::Error(message)) => {
             warnings = true;
@@ -739,22 +725,24 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
     Ok(warnings)
 }
 
-fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
+/// qpdf collects every `checkLinearizationInternal` finding and then reports
+/// each one through `QPDF::warn` in order (`QPDF_linearization.cc:70-81`,
+/// `:412-421`). The parameter preflight above already goes through the
+/// document's warning channel, so the deep checker's findings must use the
+/// same channel: when the document defers delivery, replaying a recorded
+/// `/O` warning after a live `/T` warning would reverse qpdf's order.
+fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     source_bytes: &[u8],
-    logger: &QPDFLogger,
     input_name: &[u8],
     skip_first_page_warning: bool,
-    suppress_warnings: bool,
 ) -> Result<bool> {
     let diagnostics_seen = diagnostic_count(pdf);
     match check_linearization_warnings(pdf, source_bytes, skip_first_page_warning) {
         Ok(messages) => {
             let has_warnings = !messages.is_empty();
             for message in messages {
-                if !suppress_warnings {
-                    emit_warning(logger, input_name, message)?;
-                } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+                push_qpdf_warning_bytes(pdf, input_name, message.as_bytes())?;
             }
             Ok(has_warnings)
         }
@@ -2151,16 +2139,8 @@ mod tests {
         )));
         pdf.set_logger(document_logger);
 
-        let report_output = Arc::new(Mutex::new(Vec::new()));
-        let report_logger = logger_with_capture(Arc::clone(&report_output));
-        let result = emit_linearization_check_warnings_with_suppression(
-            &mut pdf,
-            &source_bytes,
-            &report_logger,
-            b"linearized.pdf",
-            false,
-            false,
-        );
+        let result =
+            emit_linearization_check_warnings(&mut pdf, &source_bytes, b"linearized.pdf", false);
 
         assert!(
             matches!(
@@ -2194,14 +2174,8 @@ mod tests {
         let logger = logger_with_capture(Arc::clone(&output));
         pdf.set_logger(logger.clone());
 
-        let result = emit_linearization_check_warnings_with_suppression(
-            &mut pdf,
-            source_bytes,
-            &logger,
-            b"linearized.pdf",
-            false,
-            false,
-        );
+        let result =
+            emit_linearization_check_warnings(&mut pdf, source_bytes, b"linearized.pdf", false);
 
         assert!(matches!(result, Ok(true)));
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();

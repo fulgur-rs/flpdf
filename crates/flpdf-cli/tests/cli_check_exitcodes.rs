@@ -514,6 +514,42 @@ fn check_linearized_o_mismatch_uses_qpdf_warning() {
     );
 }
 
+/// qpdf reports every `checkLinearizationInternal` finding through
+/// `QPDF::warn` in collection order (`/O` before `/T`); the deferred
+/// `--check` replay must not reorder the parameter preflight behind the deep
+/// checker's findings.
+#[test]
+fn check_linearized_o_and_t_mismatch_keep_qpdf_warning_order() {
+    let mut bytes = linearized_with_parameter_replacement(b"/O 6 /E", b"/O 7 /E");
+    let marker = b"/T 1523";
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("/T parameter should exist");
+    bytes[start..start + marker.len()].copy_from_slice(b"/T 1525");
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&bytes).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let output = cmd
+        .env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "WARNING: {path}: first page object (/O) mismatch{EOL}\
+             WARNING: {path}: space before first xref item (/T) mismatch \
+             (computed = 1524; file = 1525{EOL}\
+             flpdf: operation succeeded with warnings{EOL}"
+        )
+    );
+}
+
 #[test]
 fn check_linearized_n_mismatch_uses_qpdf_warning() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
