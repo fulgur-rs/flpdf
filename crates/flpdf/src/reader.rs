@@ -329,6 +329,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.push_warning(message)
     }
 
+    /// Record and route a complete qpdf warning value without rebuilding its
+    /// source/object context at a higher layer.
+    pub(crate) fn push_qpdf_warning_bytes(&self, message: impl AsRef<[u8]>) -> Result<()> {
+        self.resolver.push_qpdf_warning_bytes(message)
+    }
+
     /// Exact source framing recorded by the canonical ObjectHandle resolver
     /// after a repaired stream-length scan. Job-level stream inspection and
     /// writer consumers use this qpdf-shaped metadata without a second raw
@@ -1804,13 +1810,18 @@ impl<R: Read + Seek> Pdf<R> {
     /// a following `damagedPDF` warning. The resolver distinguishes an already
     /// cached object from a newly parsed one, matching qpdf's
     /// `readObjectAtOffset`/`InputSource::getLastOffset` behavior.
-    pub(crate) fn resolve_at_offset_with_damage_offset(
+    /// Read one object at an offset with qpdf's caller-provided description.
+    /// The description is part of the source warning context, as with
+    /// `QPDF::readObjectAtOffset` used by `QPDF::readHintStream`
+    /// (`libqpdf/QPDF_linearization.cc:241-245`).
+    pub(crate) fn resolve_at_offset_with_description(
         &self,
         offset: u64,
         expected: ObjectRef,
+        description: impl AsRef<[u8]>,
     ) -> Result<(ObjectHandle, Option<u64>)> {
         self.resolver
-            .resolve_at_offset_with_damage_offset(offset, expected)
+            .resolve_at_offset_with_description(offset, expected, description)
     }
 
     /// Return qpdf's first-1024-byte linearization candidate as an exact

@@ -214,7 +214,7 @@ pub(crate) struct HPageOffset {
 }
 
 /// Decoded per-page entry of the Page Offset Hint Table.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct HPageOffsetEntry {
     pub(crate) delta_nobjects: u64,
     pub(crate) delta_page_length: u64,
@@ -239,7 +239,7 @@ pub(crate) struct HSharedObject {
 }
 
 /// Decoded per-entry data of the Shared Object Hint Table.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct HSharedObjectEntry {
     pub(crate) delta_group_length: u64,
     pub(crate) signature_present: bool,
@@ -279,20 +279,17 @@ pub(crate) fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOff
     let shared_denominator = bits.get_bits_i32(16)? as u32;
 
     let n = npages as usize;
-    let mut entries: Vec<HPageOffsetEntry> = (0..n)
-        .map(|_| HPageOffsetEntry {
-            delta_nobjects: 0,
-            delta_page_length: 0,
-            nshared_objects: 0,
-            shared_identifiers: Vec::new(),
-            shared_numerators: Vec::new(),
-            delta_content_offset: 0,
-            delta_content_length: 0,
-        })
-        .collect();
+    let mut entries: Vec<HPageOffsetEntry> = Vec::new();
 
     // (a) delta_nobjects
-    for e in entries.iter_mut() {
+    for _ in 0..n {
+        // qpdf's load_vector_int appends the entry before reading its first
+        // value. Preserve that allocation/read ordering at malformed-input
+        // boundaries as well as the successful result.
+        entries.push(HPageOffsetEntry::default());
+        let e = entries
+            .last_mut()
+            .expect("the entry was appended immediately above");
         e.delta_nobjects = bits.get_bits_i32(nbits_delta_nobjects as usize)? as u32 as u64;
     }
     bits.skip_to_next_byte()?;
@@ -306,18 +303,6 @@ pub(crate) fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOff
         e.nshared_objects = bits.get_bits_i32(nbits_nshared_objects as usize)? as u32;
     }
     bits.skip_to_next_byte()?;
-    // Bound the per-page shared-object refs before the nested (d)/(e) loops.
-    // With zero-width identifier/numerator fields each push reads 0 bits and
-    // never advances the reader, so an untrusted `nshared_objects` could
-    // otherwise drive unbounded time/allocation from a tiny stream. Cap the
-    // total against the bits remaining, keeping work O(stream length).
-    let remaining_bits = bits.bits_available();
-    let total_shared: u64 = entries.iter().map(|e| e.nshared_objects as u64).sum();
-    if total_shared > remaining_bits as u64 {
-        return Err(malformed!(
-            "page offset hint table claims {total_shared} shared-object refs but only {remaining_bits} bits remain"
-        ));
-    }
     // (d) shared_identifiers — nested: per page, read that page's count
     for e in entries.iter_mut() {
         for _ in 0..e.nshared_objects {
@@ -381,28 +366,17 @@ pub(crate) fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
     let min_group_length = bits.get_bits_i32(32)? as u32 as u64;
     let nbits_delta_group_length = bits.get_bits_i32(16)? as u32;
 
-    // Each entry consumes at least one bit (the signature_present column below),
-    // so a well-formed table cannot claim more entries than there are bits left
-    // in the stream. Guard before allocating so a malformed `nshared_total`
-    // (up to u32::MAX) cannot drive a multi-gigabyte pre-allocation (OOM DoS).
-    let remaining_bits = bits.bits_available();
-    if nshared_total as usize > remaining_bits {
-        return Err(malformed!(
-            "shared-object hint table claims {nshared_total} entries but only {remaining_bits} bits remain"
-        ));
-    }
-
     let n = nshared_total as usize;
-    let mut entries: Vec<HSharedObjectEntry> = (0..n)
-        .map(|_| HSharedObjectEntry {
-            delta_group_length: 0,
-            signature_present: false,
-            nobjects_minus_one: 0,
-        })
-        .collect();
+    let mut entries: Vec<HSharedObjectEntry> = Vec::new();
 
     // (a) delta_group_length
-    for e in entries.iter_mut() {
+    for _ in 0..n {
+        // Match qpdf's load_vector_int allocation timing: append one default
+        // entry, then attempt its first bit read.
+        entries.push(HSharedObjectEntry::default());
+        let e = entries
+            .last_mut()
+            .expect("the entry was appended immediately above");
         e.delta_group_length = bits.get_bits_i32(nbits_delta_group_length as usize)? as u32 as u64;
     }
     bits.skip_to_next_byte()?;
@@ -1676,11 +1650,10 @@ mod tests {
     }
 
     #[test]
-    fn shared_object_oversized_nshared_total_is_malformed() {
-        // A 24-byte header (byte-aligned) claiming a huge nshared_total but with
-        // no column bytes following. Each entry needs at least one bit (the
-        // signature_present column), so the decoder must reject it as malformed
-        // rather than pre-allocating ~u32::MAX entries (OOM DoS guard).
+    fn shared_object_oversized_nshared_total_reports_bitstream_exhaustion() {
+        // qpdf allocates one entry, then reads the first requested column. A
+        // huge count with a bit width that cannot fit in the remaining stream
+        // therefore fails in BitStream before the count can drive allocation.
         let buf = bit_writer_bytes(|writer| {
             writer.write_bits(0, 32)?; // first_shared_obj
             writer.write_bits(0, 32)?; // first_shared_offset
@@ -1688,26 +1661,25 @@ mod tests {
             writer.write_bits(1_000_000, 32)?; // nshared_total
             writer.write_bits(0, 16)?; // nbits_nobjects
             writer.write_bits(0, 32)?; // min_group_length
-            writer.write_bits(0, 16) // nbits_delta_group_length
+            writer.write_bits(12_556, 16) // nbits_delta_group_length
         });
         assert_eq!(buf.len(), 24, "header is exactly 24 bytes, no column data");
 
-        let is_malformed = matches!(
-            read_h_shared_object(&buf),
-            Err(ShowLinearizationError::Malformed { .. })
-        );
-        assert!(
-            is_malformed,
-            "expected Malformed for oversized nshared_total"
+        let error = match read_h_shared_object(&buf) {
+            Ok(_) => panic!("the first column is truncated"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "malformed linearization data: overflow reading bit stream: wanted = 12556; available = 0"
         );
     }
 
     #[test]
-    fn page_offset_oversized_nshared_objects_is_malformed() {
-        // A single-page table whose `nshared_objects` column claims ~1e6 shared
-        // refs, but the stream ends right after that column. With zero-width
-        // identifier/numerator fields the nested loops would push ~1e6 entries
-        // from a tiny buffer; the per-page bound must reject it instead.
+    fn page_offset_oversized_nshared_objects_reports_bitstream_exhaustion() {
+        // The first shared identifier read is the qpdf failure boundary. Use
+        // a one-bit identifier column so the large count cannot be mistaken
+        // for a reason to reject the table before BitStream runs.
         let buf = bit_writer_bytes(|writer| {
             // 13-field header (5×32 + 8×16 = 36 bytes, byte-aligned).
             writer.write_bits(0, 32)?; // min_nobjects
@@ -1720,7 +1692,7 @@ mod tests {
             writer.write_bits(0, 32)?; // min_content_length
             writer.write_bits(0, 16)?; // nbits_delta_content_length = 0
             writer.write_bits(32, 16)?; // nbits_nshared_objects = 32
-            writer.write_bits(0, 16)?; // nbits_shared_identifier = 0
+            writer.write_bits(1, 16)?; // nbits_shared_identifier = 1
             writer.write_bits(0, 16)?; // nbits_shared_numerator = 0
             writer.write_bits(1, 16)?; // shared_denominator
                                        // cols (a)/(b): 0-bit, nothing written. col (c):
@@ -1734,13 +1706,13 @@ mod tests {
             "36-byte header + 4-byte nshared_objects column"
         );
 
-        let is_malformed = matches!(
-            read_h_page_offset(&buf, 1),
-            Err(ShowLinearizationError::Malformed { .. })
-        );
-        assert!(
-            is_malformed,
-            "expected Malformed for oversized per-page nshared_objects"
+        let error = match read_h_page_offset(&buf, 1) {
+            Ok(_) => panic!("the shared identifier column is truncated"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "malformed linearization data: overflow reading bit stream: wanted = 1; available = 0"
         );
     }
 
@@ -2292,21 +2264,17 @@ mod tests {
             .position(|window| window == b"stream\n")
             .map(|relative| obj6 + relative + b"stream\n".len())
             .expect("overflow stream keyword");
-        // Corrupt a byte a few bytes into the deflate payload (past the zlib
-        // header), matching `decode_failure_is_malformed`'s technique.
-        bytes[stream_start + 4] ^= 0xFF;
+        // Corrupt the zlib header so both the qpdf-zlib and pure-Rust
+        // backends reject the stream before any backend-specific decoded
+        // bytes can be mistaken for a huge zero-width hint table.
+        bytes[stream_start + 1] ^= 0xFF;
 
         let result = show_linearization_bytes_with_warnings(&bytes, "split-corrupt.pdf")
             .expect("a corrupted overflow hint stream is a qpdf warning, not a hard error");
         assert!(result.dump.is_empty());
-        // The exact warning text depends on which DEFLATE backend rejects
-        // the corrupted bytes first (miniz_oxide vs the qpdf-zlib-compat
-        // feature's zlib): the pure-Rust decoder can produce a
-        // still-truncated-but-parseable payload that fails at the
-        // bit-stream layer instead, while zlib fails the inflate itself.
-        // Both are genuine decode failures under the same qpdf throw site
-        // (CLAUDE.md's sole byte-identical exception is DEFLATE output);
-        // assert the shape (one warning, no dump), not the wording.
+        // Both DEFLATE backends now reject the malformed zlib header at the
+        // same qpdf readHintStream throw boundary. Keep the assertion at the
+        // consumer boundary: one warning and no dump.
         assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
     }
 
@@ -2521,7 +2489,11 @@ mod tests {
 
         let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("fixture should open");
         let (_, first_offset) = pdf
-            .resolve_at_offset_with_damage_offset(601, ObjectRef::new(5, 0))
+            .resolve_at_offset_with_description(
+                601,
+                ObjectRef::new(5, 0),
+                b"linearization hint stream",
+            )
             .expect("first offset read should succeed");
         assert_eq!(first_offset, Some(660));
         let error = load_hint_stream_with_damage(&mut pdf, &bytes, 601, 118)
