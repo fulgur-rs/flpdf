@@ -2571,16 +2571,17 @@ qpdf --decrypt --static-id --warning-exit-0 \
     "$FIX/encrypted-r4-three-page.pdf" "$REF/encrypted-r4-three-page/plain.pdf"
 echo "encrypted-r4-three-page/plain.pdf"
 
-# --- encrypted recovered-stream EOL: source encryption framing must not be
-# appended to the decrypted plaintext payload. Both paths use unfiltered stream
-# data so a stray LF is directly observable in the byte oracle.
+# --- encrypted recovered-stream length: qpdf pipes the complete recovered
+# ciphertext span before decryption, including the trailing bytes that become
+# content-parser tokens. Use the malformed source, not the direct-length
+# control fixture, so the oracle covers the recovery path itself.
 qpdf --decrypt --linearize --object-streams=disable --stream-data=preserve \
     --deterministic-id --warning-exit-0 \
-    "$FIX/encrypted-recovered-eol-valid.pdf" \
+    "$FIX/encrypted-recovered-eol.pdf" \
     "$REF/encrypted-recovered-eol/linearize-disable.pdf"
 qpdf --decrypt --linearize --object-streams=generate --stream-data=preserve \
     --deterministic-id --warning-exit-0 \
-    "$FIX/encrypted-recovered-eol-valid.pdf" \
+    "$FIX/encrypted-recovered-eol.pdf" \
     "$REF/encrypted-recovered-eol/linearize-objstm.pdf"
 qpdf --check-linearization \
     "$REF/encrypted-recovered-eol/linearize-disable.pdf"

@@ -53,8 +53,8 @@
 #   finish_file_object_handle   B9 + B10
 #   append_xref_and_trailer     D12 + D13
 #   prune_acroform_after_subset E-26（free 関数と QPDFJob メソッドが同名）
-#   recover_stream_length       B11（mixed、2 実装）+ C42（unknown、「実装は 1 本」）
-#                               — 領域間の矛盾。README.md §8 の X-1 参照
+#   recover_stream_length       B11（mixed、2 実装）+ C42（mixed、pipe-side subtraction は解決済み）
+#                               — 領域間の粒度差。README.md §8 の X-1 参照
 #   RecoveryPolicy              B11 + B26
 #   objstm_membership_linearized_with_eligibility  D6 + D23
 #
@@ -152,7 +152,7 @@ crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 ca
 crates/flpdf/src/reader/resolver.rs::read_object_at_offset_with_description  # B8 canonical
 crates/flpdf/src/reader/file_object.rs::parse_file_object_handle_syntax  # B9 canonical
 crates/flpdf/src/reader/resolver.rs::validate_stream_line_end            # B10 canonical
-crates/flpdf/src/reader/resolver.rs::recover_stream_length               # B11 canonical / C42 unknown
+crates/flpdf/src/reader/resolver.rs::recover_stream_length               # B11 canonical / C42 mixed
 crates/flpdf/src/reader/resolver.rs::resolve_object_stream_with_failure_kind # B12 canonical
 crates/flpdf/src/xref.rs::parse_trailer_candidate                        # B13 canonical
 crates/flpdf/src/xref.rs::merge_previous_xref_sections_with_observer     # B14 canonical

@@ -567,7 +567,7 @@ fn linearize_preserve_source_objstm_removes_only_stale_generation() {
 }
 
 #[test]
-fn linearize_encrypted_recovered_eol_is_not_appended_to_plaintext() {
+fn linearize_encrypted_recovered_length_matches_qpdf() {
     for (mode, golden) in [
         (
             ObjectStreamMode::Disable,

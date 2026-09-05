@@ -161,3 +161,37 @@ fn check_unterminated_inline_image_warning_matches_qpdf() {
 fn check_content_warning_no_warn_matches_qpdf() {
     assert_check_matches_qpdf(b"\r<0g", &["--no-warn"], None);
 }
+
+#[test]
+fn check_recovered_encrypted_stream_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+
+    let args = [
+        "--check",
+        "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+    ];
+    let qpdf = run_qpdf(&args);
+    let flpdf = run_flpdf(&args);
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "--check exit code must match qpdf; qpdf={qpdf:?}, flpdf={flpdf:?}"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stdout),
+        normalize_text_newlines(&qpdf.stdout),
+        "--check stdout must match qpdf"
+    );
+    assert_eq!(
+        normalize_text_newlines(&flpdf.stderr),
+        normalize_text_newlines(&qpdf.stderr),
+        "--check stderr must match qpdf"
+    );
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("treating unexpected brace token as null"),
+        "fixture must exercise the recovered trailing content warning"
+    );
+}

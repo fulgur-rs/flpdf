@@ -345,24 +345,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.set_immediate_copy_from(value);
     }
 
-    /// Run a writer-owned operation with qpdf's PCLm stream-length boundary
-    /// selected on this document's resolver.
-    ///
-    /// qpdf's PCLm writer passes the complete length recovered by an
-    /// `endstream` scan into its encrypted stream pipeline
-    /// (`libqpdf/QPDFWriter.cc:2068-2098,2928-3005`; `libqpdf/QPDF.cc:1482-1524`).
-    /// Other stream consumers retain flpdf's existing recovery-framing policy,
-    /// so this mode is scoped to the PCLm writer and restored before return.
-    pub(crate) fn with_pclm_stream_data<T>(
-        &mut self,
-        operation: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        let previous = self.resolver.set_pclm_mode(true);
-        let result = operation(self);
-        self.resolver.set_pclm_mode(previous);
-        result
-    }
-
     /// Whether this document has been asked to enumerate its complete page tree.
     ///
     /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's

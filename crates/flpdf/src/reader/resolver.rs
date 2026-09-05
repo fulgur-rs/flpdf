@@ -722,9 +722,9 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     ///
     /// The recovered length follows qpdf's `recoverStreamLength` coordinate
     /// and therefore includes the line ending immediately before
-    /// `endstream`. That byte is source framing for an encrypted stream, not
-    /// ciphertext; retain the distinction until pipe time so identity streams
-    /// keep their source bytes while RC4/AES stages receive only ciphertext.
+    /// `endstream`. Retain the observed suffix for inspection consumers that
+    /// have their own display-framing policy; the qpdf pipe path always reads
+    /// the complete recovered length before any AES/RC4 stage.
     recovered_stream_eols: RefCell<BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>>,
     /// A `Weak` to this same allocation, so minting a canonical handle can
     /// attach the resolver the handle will later call back into.
@@ -741,15 +741,6 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// qpdf's source-side `setImmediateCopyFrom` flag. It is read by the
     /// destination stream-copy boundary before a lazy source is registered.
     immediate_copy_from: Cell<bool>,
-    /// Whether the qpdf writer is currently emitting its PCLm stream queue.
-    ///
-    /// PCLm's `QPDFWriter::willFilterStream` calls `pipeStreamData` with the
-    /// full recovered stream length, including bytes found by the
-    /// `endstream` scan. The ordinary compatibility stream path retains its
-    /// existing encrypted-recovery framing policy, so the writer toggles this
-    /// source-side mode only around the PCLm writer (`QPDFWriter.cc:2068-2098,
-    /// 2928-3005`).
-    pclm_mode: Cell<bool>,
     /// The owning document's [`crate::Pdf`] identity, stamped onto every
     /// handle this minted — `ObjectHandle`'s `pdf_unique_id`, whose own doc
     /// traces it to qpdf's `QPDF::getUniqueId`
@@ -791,7 +782,6 @@ struct ForeignStreamData<R: Read + Seek + 'static> {
     parsed_offset: i64,
     stream_length: usize,
     local_dict: ObjectHandle,
-    recovered_stream_eol_length: usize,
     description: Vec<u8>,
 }
 
@@ -820,15 +810,9 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
         let destination = self.destination_resolver.upgrade().ok_or_else(|| {
             Error::Internal("foreign stream destination resolver is no longer live".to_owned())
         })?;
-        let recovered_stream_eol_length = if destination.pclm_mode() {
-            0
-        } else {
-            self.foreign_data.recovered_stream_eol_length
-        };
         pipe_stream_data_from_input(
             &self.foreign_data.input,
             &self.foreign_data.encryption_parameters,
-            recovered_stream_eol_length,
             destination.as_ref(),
             Some(self.foreign_data.description.as_slice()),
             self.foreign_data.object_ref,
@@ -965,7 +949,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
-            pclm_mode: Cell::new(false),
             pdf_unique_id,
         })
     }
@@ -1005,7 +988,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
-            pclm_mode: Cell::new(false),
             pdf_unique_id,
         })
     }
@@ -1052,18 +1034,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.immediate_copy_from.set(value);
     }
 
-    /// Temporarily select qpdf's PCLm stream-length boundary and return the
-    /// previous mode so the writer can restore it on both success and error.
-    pub(crate) fn set_pclm_mode(&self, value: bool) -> bool {
-        self.pclm_mode.replace(value)
-    }
-
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from.get()
-    }
-
-    fn pclm_mode(&self) -> bool {
-        self.pclm_mode.get()
     }
 
     /// qpdf's `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2216-2272`). Existing
@@ -1174,7 +1146,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 parsed_offset: source.get_parsed_offset(),
                 stream_length,
                 local_dict: destination_dict.clone(),
-                recovered_stream_eol_length: self.recovered_stream_eol_len(object_ref),
                 description,
             }),
             destination_resolver,
@@ -2643,6 +2614,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// That is deliberate here even though parsing deliberately does *not*
     /// pre-allocate a declared `/Length`: by pipe time the offset and length
     /// have already been validated by the framing scan.
+    /// A recovery scan's line ending is part of that length; qpdf does not
+    /// subtract it before the decryption stage or for foreign stream data.
     ///
     /// qpdf prepends a decryption stage before it touches the input source
     /// (`:2490-2492`, `QPDF::decryptStream`). The legacy `/V < 4` form has no
@@ -2667,15 +2640,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<bool> {
         let input = self.stream_input();
         let encryption_parameters = self.encryption_parameters();
-        let recovered_stream_eol_length = if self.pclm_mode() {
-            0
-        } else {
-            self.recovered_stream_eol_len(object_ref)
-        };
         pipe_stream_data_from_input(
             &input,
             &encryption_parameters,
-            recovered_stream_eol_length,
             self,
             None,
             object_ref,
@@ -3641,17 +3608,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .copied()
     }
 
-    fn recovered_stream_eol_len(&self, object_ref: ObjectRef) -> usize {
-        self.recovered_stream_eols
-            .borrow()
-            .get(&object_ref)
-            .map_or(0, |eol| eol.as_bytes().len())
-    }
-
-    /// Whether the canonical `decryptStream` route treats a recovered source
-    /// line ending as ciphertext framing for this stream. This intentionally
-    /// performs only qpdf's method classification; the stateful unknown-filter
-    /// warning/rewrite remains in `pipe_stream_data_from_input`.
+    /// Whether the canonical `decryptStream` route transforms the complete
+    /// recovered source span for this stream. Inspection uses this
+    /// classification to avoid applying its separate display-framing trim;
+    /// the pipe itself still passes the full length to the decrypt stage.
     pub(crate) fn recovered_stream_eol_is_transformed(
         &self,
         stream_dict: &ObjectHandle,
@@ -3886,11 +3846,13 @@ const INPUT_CHUNK: usize = 4096;
 /// qpdf's non-foreign overload, where `file` and `qpdf_for_warning` are the
 /// same `QPDF` (`libqpdf/QPDF.cc:2541-2552`) and `warning_sink`'s own
 /// description is already correct.
+/// The `length` argument remains the complete source span supplied by qpdf's
+/// `QPDF_Stream`, including bytes found by recovered stream framing; the
+/// recovery-EOL metadata is not a pipe-time decryption adjustment.
 #[allow(clippy::too_many_arguments)]
 fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
     encryption_parameters: &Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
-    recovered_stream_eol_length: usize,
     warning_sink: &dyn DocumentResolver,
     description_override: Option<&[u8]>,
     object_ref: ObjectRef,
@@ -3999,7 +3961,6 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             will_retry,
         ),
         StreamDecryption::Rc4(key) => {
-            let length = length.saturating_sub(recovered_stream_eol_length);
             let mut decrypt = PlRc4::new("RC4 stream decryption", pipeline, &key)?;
             pipe_stream_data_to_pipeline_for_input(
                 input,
@@ -4014,7 +3975,6 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             )
         }
         StreamDecryption::Aes(key) => {
-            let length = length.saturating_sub(recovered_stream_eol_length);
             let mut decrypt = PlAesPdf::new_decrypt("AES stream decryption", pipeline, &key)?;
             pipe_stream_data_to_pipeline_for_input(
                 input,
@@ -4489,10 +4449,6 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from()
-    }
-
-    fn pclm_mode(&self) -> bool {
-        self.pclm_mode()
     }
 
     fn warn(&self, message: Vec<u8>) -> Result<()> {
@@ -6629,7 +6585,6 @@ mod tests {
         let error = pipe_stream_data_from_input(
             &input,
             &encryption_parameters,
-            0,
             &warning_sink,
             None,
             ObjectRef::new(4, 0),
@@ -6658,7 +6613,6 @@ mod tests {
         assert!(pipe_stream_data_from_input(
             &input,
             &encryption_parameters,
-            0,
             resolver.as_ref(),
             None,
             ObjectRef::new(4, 0),
@@ -6700,7 +6654,6 @@ mod tests {
         assert!(pipe_stream_data_from_input(
             &input,
             &encryption_parameters,
-            0,
             &warning_sink,
             None,
             ObjectRef::new(4, 0),
