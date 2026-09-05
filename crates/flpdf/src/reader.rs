@@ -2186,6 +2186,34 @@ mod encryption_state_commit_tests {
     use std::io::Cursor;
 
     #[test]
+    fn overlength_raw_hex_key_reports_the_authenticated_key_length() {
+        let fixture = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/encrypted/v5-aes-256-r6.pdf"),
+        )
+        .expect("R6 fixture");
+        let pdf = Pdf::open_with_options(
+            Cursor::new(fixture),
+            PdfOpenOptions {
+                password: b"abababababababababababababababababababababababababababababababababababababababab"
+                    .to_vec(),
+                password_is_hex_key: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("qpdf accepts an overlength raw key for this inspection fixture");
+
+        assert_eq!(pdf.encryption_length_bits(), Some(320));
+    }
+
+    #[test]
+    fn aes_object_key_rejects_a_length_below_the_qpdf_fallback_boundary() {
+        let error = crate::encryption::state::aes128_object_key(&[0; 24])
+            .expect_err("24-byte keys are not an AES-128/256 PDF key");
+        assert!(error.to_string().contains("not 16 bytes"));
+    }
+
+    #[test]
     fn authenticated_state_is_not_committed_before_perms_warning_delivery() {
         let fixture = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
