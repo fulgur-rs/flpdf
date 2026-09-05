@@ -139,11 +139,10 @@ fn qpdf_objects_json(path: &Path, password: &str, allow_weak_crypto: bool) -> Ve
 // ---------------------------------------------------------------------------
 // `rewrite --remove-restrictions`
 //
-// `--remove-restrictions` explicitly disables the normal rewrite's source
-// encryption preservation. These tests verify that the flag
-// de-restricts an encrypted+restricted fixture (one-line diagnostic, no
-// /Encrypt, `show-encryption` reports "File is not encrypted"), it does NOT
-// bypass authentication, and it is a no-op exit-0 rewrite on unencrypted
+// `--remove-restrictions` removes qpdf's digital-signature restrictions while
+// preserving source encryption. These tests verify that an encrypted input
+// remains encrypted and emits no custom diagnostic, that the flag does NOT
+// bypass authentication, and that it is a no-op exit-0 rewrite on unencrypted
 // input.
 // ---------------------------------------------------------------------------
 
@@ -152,7 +151,7 @@ const REMOVE_RESTRICTIONS_DIAGNOSTIC: &str =
     "flpdf: removed restrictions (digital-signature restrictions stripped)";
 
 #[test]
-fn remove_restrictions_preserves_encryption_and_emits_diagnostic() {
+fn remove_restrictions_preserves_encryption_without_diagnostic() {
     // v4-aes-128-r4 needs no --allow-weak-crypto, keeping the case clean.
     let input = encrypted_fixture("v4-aes-128-r4.pdf");
     let tmp = tempfile::tempdir().unwrap();
@@ -170,6 +169,11 @@ fn remove_restrictions_preserves_encryption_and_emits_diagnostic() {
         "qpdf remove-restrictions failed: {}",
         String::from_utf8_lossy(&qpdf.stderr)
     );
+    assert!(
+        qpdf.stderr.is_empty(),
+        "qpdf --remove-restrictions must not emit a custom diagnostic: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
     let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
     assert!(
         qpdf_bytes
@@ -185,7 +189,7 @@ fn remove_restrictions_preserves_encryption_and_emits_diagnostic() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC));
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC).not());
 
     let bytes = std::fs::read(&output).unwrap();
     assert!(
@@ -333,10 +337,9 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
 // ---------------------------------------------------------------------------
 // `--decrypt`
 //
-// `--decrypt` is qpdf's silent encryption-removal flag. Unlike
-// `--remove-restrictions`, it explicitly disables source-encryption
-// preservation and drops /Encrypt. These tests pin its silence + no-op
-// semantics.
+// `--decrypt` is qpdf's silent encryption-removal flag. It explicitly disables
+// source-encryption preservation and drops /Encrypt. These tests pin its
+// silence + no-op semantics alongside the silent --remove-restrictions flag.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -460,11 +463,10 @@ fn decrypt_does_not_bypass_authentication() {
 
 /// `--decrypt` and `--remove-restrictions` together must not conflict —
 /// they are documented as semantically overlapping on the current rewrite
-/// path. Passing both should succeed and the `--remove-restrictions`
-/// diagnostic must still fire (since it gates only on its own flag, not on
-/// the absence of `--decrypt`).
+/// path. Passing both should succeed without either route inventing a custom
+/// diagnostic.
 #[test]
-fn decrypt_combined_with_remove_restrictions_keeps_diagnostic() {
+fn decrypt_combined_with_remove_restrictions_is_silent() {
     let input = encrypted_fixture("v4-aes-128-r4.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("decrypt-and-rm-restrictions.pdf");
@@ -481,9 +483,7 @@ fn decrypt_combined_with_remove_restrictions_keeps_diagnostic() {
         .arg(&output)
         .assert()
         .success()
-        // The remove-restrictions diagnostic is gated on its own flag, so it
-        // must still fire when both flags are passed.
-        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC));
+        .stderr(predicates::str::contains(REMOVE_RESTRICTIONS_DIAGNOSTIC).not());
 
     let bytes = std::fs::read(&output).unwrap();
     assert!(

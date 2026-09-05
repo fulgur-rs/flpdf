@@ -537,7 +537,7 @@ fn rewrite_fixture_creates_output() {
 }
 
 #[test]
-fn rewrite_remove_restrictions_strips_signatures_and_warns() {
+fn rewrite_remove_restrictions_strips_signatures_without_warning() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("signed.pdf");
     let output = temp.path().join("unsigned.pdf");
@@ -550,7 +550,7 @@ fn rewrite_remove_restrictions_strips_signatures_and_warns() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signatures are now invalidated"));
+        .stderr(predicate::str::contains("signatures are now invalidated").not());
 
     let file = File::open(&output).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
@@ -583,7 +583,37 @@ fn rewrite_remove_restrictions_strips_signatures_and_warns() {
 }
 
 #[test]
-fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
+fn copy_attachments_remove_restrictions_is_silent_for_signatures() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("signed.pdf");
+    let output = temp.path().join("copied.pdf");
+    let donor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/attachment-two-page.pdf");
+    std::fs::write(&input, signed_acroform_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--remove-restrictions", "--copy-attachments-from"])
+        .arg(&donor)
+        .arg("--")
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("removed restrictions").not())
+        .stderr(predicate::str::contains("removed signatures").not());
+
+    assert!(output.exists());
+    let file = File::open(&output).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    assert!(
+        pdf.signatures().unwrap().is_empty(),
+        "copy route must strip signatures under --remove-restrictions"
+    );
+}
+
+#[test]
+fn rewrite_linearize_remove_restrictions_strips_signatures_without_warning() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("signed.pdf");
     let output = temp.path().join("unsigned-linearized.pdf");
@@ -596,7 +626,7 @@ fn rewrite_linearize_remove_restrictions_strips_signatures_and_warns() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signatures are now invalidated"));
+        .stderr(predicate::str::contains("signatures are now invalidated").not());
 
     let file = File::open(&output).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
@@ -631,7 +661,7 @@ fn rewrite_linearize_remove_restrictions_strips_docmdp_perms() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signatures are now invalidated"));
+        .stderr(predicate::str::contains("signatures are now invalidated").not());
 
     let output_bytes = std::fs::read(&output).unwrap();
     for tok in [&b"/Perms"[..], &b"/DocMDP"[..], &b"/ByteRange"[..]] {
@@ -660,7 +690,7 @@ fn rewrite_linearize_remove_restrictions_keeps_widget_annotation() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signatures are now invalidated"));
+        .stderr(predicate::str::contains("signatures are now invalidated").not());
 
     let output_bytes = std::fs::read(&output).unwrap();
     // Widget annotation survives (reachable from page /Annots) ...
@@ -680,7 +710,7 @@ fn rewrite_linearize_remove_restrictions_keeps_widget_annotation() {
 }
 
 #[test]
-fn rewrite_remove_restrictions_strips_docmdp_perms_and_warns() {
+fn rewrite_remove_restrictions_strips_docmdp_perms_without_warning() {
     // A certification (DocMDP) signature can live only in the catalog /Perms
     // dictionary, with no /AcroForm. qpdf --remove-restrictions drops /Perms
     // unconditionally (QPDF::removeSecurityRestrictions), which orphans the
@@ -697,7 +727,7 @@ fn rewrite_remove_restrictions_strips_docmdp_perms_and_warns() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signatures are now invalidated"));
+        .stderr(predicate::str::contains("signatures are now invalidated").not());
 
     let file = File::open(&output).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
@@ -739,7 +769,7 @@ fn rewrite_remove_restrictions_keeps_widget_annotation() {
         .arg(&output)
         .assert()
         .success()
-        .stderr(predicate::str::contains("signatures are now invalidated"));
+        .stderr(predicate::str::contains("signatures are now invalidated").not());
 
     let file = File::open(&output).unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
