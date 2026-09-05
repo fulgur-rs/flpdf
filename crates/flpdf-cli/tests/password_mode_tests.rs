@@ -81,6 +81,39 @@ fn verbose_password_recovery_reports_the_qpdf_retry_message() {
 }
 
 #[test]
+fn rewrite_verbose_password_recovery_reports_the_qpdf_retry_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("encrypted.pdf");
+    let output_path = temp.path().join("out.pdf");
+    fs::write(&input, encrypted_v4_fixture_with_password(b"caf\xe9")).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--verbose", "--password=café"])
+        .arg(&input)
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    let mut combined = output.stdout;
+    combined.extend_from_slice(&output.stderr);
+    let message = format!(
+        "flpdf: supplied password didn't work; trying other passwords based on interpreting password with different string encodings{EOL}"
+    )
+    .into_bytes();
+
+    assert!(output.status.success());
+    assert_eq!(
+        combined
+            .windows(message.len())
+            .filter(|window| *window == message.as_slice())
+            .count(),
+        1,
+        "the rewrite subcommand must carry --verbose to the retry boundary: {:?}",
+        String::from_utf8_lossy(&combined)
+    );
+}
+
+#[test]
 fn suppressed_password_recovery_does_not_report_a_retry_message() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("encrypted.pdf");

@@ -66,6 +66,14 @@ pub(crate) fn password_bytes_for_write(
         PasswordMode::Bytes => Ok((raw.to_vec(), false)),
         PasswordMode::HexBytes => Ok((decode_hex(raw), false)),
         PasswordMode::Unicode => {
+            // qpdf's `maybeFixWritePassword` shares one early return for
+            // `pm_unicode` and `pm_auto`: a password without 8-bit characters
+            // is used verbatim before any UTF-8 or PDFDoc check
+            // (`QPDFJob.cc:2671-2674`).
+            let (has_8bit_chars, _, _) = analyze_encoding(raw);
+            if !has_8bit_chars {
+                return Ok((raw.to_vec(), false));
+            }
             if std::str::from_utf8(raw).is_err() {
                 return Err(crate::Error::System(
                     "supplied password is not valid UTF-8".to_owned(),
@@ -562,6 +570,19 @@ mod tests {
                 .0,
             "café".as_bytes()
         );
+    }
+
+    #[test]
+    fn write_password_unicode_keeps_ascii_control_characters_unchanged() {
+        // qpdf returns before the UTF-8 and PDFDoc checks when the password
+        // has no 8-bit characters (`QPDFJob.cc:2671-2674`), so an ASCII
+        // control byte PDFDoc cannot encode is still accepted verbatim.
+        let (bytes, warned) =
+            password_bytes_for_write(b"ab\x18cd", PasswordMode::Unicode, 4).unwrap();
+        assert_eq!(bytes, b"ab\x18cd");
+        assert!(!warned);
+        let (bytes, _) = password_bytes_for_write(b"ab\x7fcd", PasswordMode::Unicode, 4).unwrap();
+        assert_eq!(bytes, b"ab\x7fcd");
     }
 
     #[test]

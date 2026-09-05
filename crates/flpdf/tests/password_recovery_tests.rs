@@ -119,7 +119,7 @@ fn reader_recovery_accepts_rc4_without_write_opt_in() {
 }
 
 #[test]
-fn reader_recovery_uses_qpdf_prefix_when_message_prefix_is_empty() {
+fn reader_recovery_emits_an_empty_message_prefix_verbatim() {
     let encrypted = v4_encrypted_with_raw_password(b"caf\xe9");
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let logger = QPDFLogger::create();
@@ -139,12 +139,13 @@ fn reader_recovery_uses_qpdf_prefix_when_message_prefix_is_empty() {
     )
     .expect("qpdf-compatible password recovery should authenticate");
 
+    // qpdf's doIfVerbose hands the job's message prefix to the callback as
+    // is (`QPDFJob.cc:339-345`), so an empty prefix yields a line that
+    // starts with ": supplied password ..." rather than a substituted name.
     let output = bytes.lock().unwrap();
     assert!(
-        output
-            .windows(b"qpdf: supplied password didn't work; trying other".len())
-            .any(|window| window == b"qpdf: supplied password didn't work; trying other"),
-        "empty job prefix should use qpdf's default prefix: {:?}",
+        output.starts_with(b": supplied password didn't work; trying other"),
+        "an empty job prefix must be emitted verbatim: {:?}",
         String::from_utf8_lossy(&output)
     );
 }

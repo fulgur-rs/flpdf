@@ -3477,7 +3477,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::ShowEncryptionKey(cmd) => {
             run_show_encryption_key(&cmd.input, cmd.repair, &cmd.password)
         }
-        Commands::Rewrite(cmd) => {
+        Commands::Rewrite(mut cmd) => {
+            // qpdf keeps --verbose on QPDFJob, so the subcommand's copy of the
+            // password arguments must carry the job policy to the reader's
+            // retry boundary exactly like the top-level path does.
+            cmd.password.verbose = cmd.verbose;
             validate_collate_values(&cmd.page_ops.collate);
             validate_keep_files_open_threshold(&cmd.page_ops)?;
             let version_options = match parse_cli_version_options(

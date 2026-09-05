@@ -686,11 +686,7 @@ impl<R: Read + Seek> Pdf<R> {
                     final_bad_password = Some(error);
                     if options.verbose && !warned {
                         warned = true;
-                        let mut message = if options.message_prefix.is_empty() {
-                            b"qpdf".to_vec()
-                        } else {
-                            options.message_prefix.clone()
-                        };
+                        let mut message = options.message_prefix.clone();
                         message.extend_from_slice(
                             b": supplied password didn't work; trying other passwords based on interpreting password with different string encodings\n",
                         );
