@@ -3907,18 +3907,22 @@ mod tests {
     }
 
     impl crate::pipeline::Pipeline for RecordingInfoSink {
+        // cov:ignore-start: the logger never queries an info sink's identifier
         fn identifier(&self) -> &str {
             "recording info sink"
         }
+        // cov:ignore-end
 
         fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
             self.bytes.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
 
+        // cov:ignore-start: the logger does not finish an info sink during an open
         fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
             Ok(())
         }
+        // cov:ignore-end
     }
 
     /// qpdf's `createQPDF` reaches `doProcess` for `--show-encryption` too,
@@ -3972,7 +3976,7 @@ mod tests {
         assert!(
             output.starts_with(b"job: supplied password didn't work; trying other"),
             "the inspection open must emit the job-prefixed retry line: {:?}",
-            String::from_utf8_lossy(&output)
+            String::from_utf8_lossy(&output) // cov:ignore: assertion failure message
         );
     }
 
