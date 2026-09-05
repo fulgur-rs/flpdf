@@ -5996,11 +5996,11 @@ fn run_page_extraction_from_multiple_sources(
         page_ops,
         overlay_specs,
         // QPDFJob has already applied the page-copy resource policy to each
-        // source page. The post-copy completion boundary must not run the
-        // document-wide resource pass a second time; qpdf's --pages job does
-        // this pruning before its first page copy and relies on the writer for
-        // final reachability cleanup.
-        CliRemoveUnreferencedResources::No,
+        // The page-copy job has already applied its source-side resource
+        // policy. Retain the original mode for the later doSplitPages
+        // preflight; the post-copy completion boundary itself remains a
+        // no-op for resource pruning.
+        remove_unref,
         options,
         linearize,
         linearize_pass1,
@@ -6120,7 +6120,7 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 password,
                 page_ops,
                 overlay_specs,
-                CliRemoveUnreferencedResources::No,
+                remove_unref,
                 options,
                 linearize,
                 linearize_pass1,
@@ -6162,9 +6162,10 @@ fn run_page_extraction_from_single_source<R: Read + Seek + 'static>(
                 page_ops,
                 overlay_specs,
                 // QPDFJob has already applied the page-copy resource policy
-                // to each source page. The post-copy completion boundary must
-                // not run the document-wide resource pass a second time.
-                CliRemoveUnreferencedResources::No,
+                // to each source page. Retain the original mode only for the
+                // later doSplitPages preflight; post-copy completion remains
+                // a no-op for resource pruning.
+                remove_unref,
                 options,
                 linearize,
                 linearize_pass1,
@@ -6318,6 +6319,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             no_warn,
+            remove_unref.into(),
             writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
         // The intermediate rewrite may already have repaired the condition
@@ -6421,6 +6423,7 @@ fn split_rewritten_pdf(
     progress: bool,
     verbose: bool,
     suppress_warnings: bool,
+    remove_unreferenced_resources: RemoveUnreferencedResources,
     writer_configuration: WriterConfiguration,
 ) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
@@ -6444,6 +6447,7 @@ fn split_rewritten_pdf(
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
         .with_verbose(verbose)
+        .with_remove_unreferenced_resources(remove_unreferenced_resources)
         .with_writer_configuration(writer_configuration);
     let written = job.split_pages(&mut pdf, options)?;
     Ok((written, job))
@@ -6569,6 +6573,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             split_progress,
             verbose,
             suppress_warnings,
+            RemoveUnreferencedResources::Auto,
             writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
         // The intermediate rewrite may already have repaired the condition

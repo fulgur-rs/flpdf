@@ -31,6 +31,23 @@ pub enum RemoveUnreferencedResources {
     No,
 }
 
+/// A shared-resource finding emitted by qpdf's Auto heuristic before it
+/// returns `true`. The job layer owns formatting these findings through its
+/// verbose info logger; the heuristic itself remains usable by non-verbose
+/// callers without an output side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedResourceFinding {
+    /// A non-leaf page-tree node has its own `/Resources` entry.
+    NonLeaf { node: ObjectRef },
+    /// Two page/Form leaves share an indirect `/Resources` object.
+    Resources {
+        node: ObjectRef,
+        resources: ObjectRef,
+    },
+    /// Two page/Form leaves share an indirect `/XObject` dictionary.
+    XObject { node: ObjectRef, xobject: ObjectRef },
+}
+
 /// Decide whether qpdf's `--pages` Auto mode should run page-level resource
 /// pruning for this source document.
 ///
@@ -50,6 +67,19 @@ pub enum RemoveUnreferencedResources {
 /// Returns an error when resolving the catalog, page tree, resources, or a
 /// nested Form XObject fails while evaluating the heuristic.
 pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    should_remove_unreferenced_resources_with_report(pdf, |_| Ok(()))
+}
+
+/// Evaluate the qpdf Auto heuristic and report the first shared-resource
+/// finding to the caller. This is the internal callback-bearing form used by
+/// `QPDFJob::doSplitPages`'s verbose boundary.
+pub(crate) fn should_remove_unreferenced_resources_with_report<
+    R: Read + Seek,
+    F: FnMut(SharedResourceFinding) -> Result<()>,
+>(
+    pdf: &mut Pdf<R>,
+    mut report: F,
+) -> Result<bool> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(false);
     };
@@ -79,6 +109,9 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
             // qpdf returns true for any non-leaf page node that owns a
             // /Resources key, even if only one descendant page is selected.
             if dict.try_has_key(b"/Resources")? {
+                report(SharedResourceFinding::NonLeaf {
+                    node: node.object_ref().unwrap_or(ObjectRef::new(0, 0)),
+                })?;
                 return Ok(true);
             }
             queue.extend(kids);
@@ -88,6 +121,10 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
         let resources = dict.try_get_key(b"/Resources")?;
         if let Some(resources_ref) = resources.object_ref() {
             if !indirect_resources_seen.insert(resources_ref) {
+                report(SharedResourceFinding::Resources {
+                    node: node.object_ref().unwrap_or(ObjectRef::new(0, 0)),
+                    resources: resources_ref,
+                })?;
                 return Ok(true);
             }
         }
@@ -102,6 +139,10 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
             .unwrap_or_else(crate::ObjectHandle::null);
         if let Some(xobject_ref) = xobject.object_ref() {
             if !indirect_resources_seen.insert(xobject_ref) {
+                report(SharedResourceFinding::XObject {
+                    node: node.object_ref().unwrap_or(ObjectRef::new(0, 0)),
+                    xobject: xobject_ref,
+                })?;
                 return Ok(true);
             }
         }
