@@ -1,8 +1,9 @@
 //! qpdf 11.9.0 differential tests for verbose `--pages` diagnostics.
 
 use assert_cmd::Command;
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output};
@@ -59,7 +60,7 @@ fn run_flpdf(args: &[String]) -> Output {
         .expect("flpdf should spawn")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_qpdf_os(args: &[OsString]) -> Output {
     ProcessCommand::new("qpdf")
         .args(args)
@@ -67,7 +68,7 @@ fn run_qpdf_os(args: &[OsString]) -> Output {
         .expect("qpdf should spawn")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn run_flpdf_os(args: &[OsString]) -> Output {
     ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
         .env("FLPDF_PROGNAME", "qpdf")
@@ -138,7 +139,8 @@ fn verbose_pages_multi_source_diagnostics_match_qpdf() {
         "verbose multi-source --pages stderr must match qpdf"
     );
 
-    let stdout = String::from_utf8_lossy(&qpdf.stdout);
+    let normalized_qpdf_stdout = normalize_text_newlines(&qpdf.stdout);
+    let stdout = String::from_utf8_lossy(&normalized_qpdf_stdout);
     let secondary_path = secondary.to_str().unwrap();
     assert!(
         stdout.contains(&format!(
@@ -234,7 +236,7 @@ fn verbose_pages_split_reports_merge_and_split_preflights_like_qpdf() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn verbose_pages_preserves_non_utf8_source_and_output_path_bytes() {
     if !qpdf_available() {
