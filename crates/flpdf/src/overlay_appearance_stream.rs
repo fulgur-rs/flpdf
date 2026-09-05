@@ -185,6 +185,14 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
         }
     }
 
+    // The resource mutations above are already part of the document, exactly
+    // as qpdf's in-place handle edits are before its parse step. Record them
+    // before the fallible token-filter step so an escaping warning-sink
+    // failure leaves the writer with the same retained state qpdf keeps.
+    pdf.mark_object_handle_dirty(&private_resources)?;
+    pdf.mark_object_handle_dirty(&stream_dict)?;
+    pdf.mark_object_handle_dirty(stream)?;
+
     // qpdf's token-filter installation is best effort. Resource mutations are
     // intentionally not rolled back when the stream cannot be decoded.
     if let Ok(Some(decoded)) = filterable_stream_data(stream, DecodeLevel::Generalized) {
@@ -212,8 +220,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
         }
     }
 
-    pdf.mark_object_handle_dirty(&private_resources)?;
-    pdf.mark_object_handle_dirty(&stream_dict)?;
+    // The replaced stream data is the only mutation after the early marking.
     pdf.mark_object_handle_dirty(stream)?;
     Ok(())
 }
@@ -832,6 +839,10 @@ mod tests {
             error,
             crate::Error::System(message) if message == "appearance warning sink failed"
         ));
+        assert!(
+            pdf.is_dirty(ap_ref),
+            "the retained resource mutations must already be recorded for the writer"
+        );
     }
 
     #[test]
