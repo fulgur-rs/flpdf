@@ -80,8 +80,7 @@ impl QPDFJob {
 
             if raw_stream_data {
                 let raw = object.get_raw_stream_data()?;
-                let bytes = cli_stream_bytes(pdf, object_ref, &object, raw.as_ref(), true)?;
-                return write_to_standard_output(&logger, bytes);
+                return write_to_standard_output(&logger, raw.as_ref());
             }
 
             // Preserve the existing CLI marker for the specialized codecs that
@@ -91,17 +90,14 @@ impl QPDFJob {
                 if !crate::filters::is_decoded_filter(&filter_name) {
                     if let Some(label) = crate::filters::passthrough_codec_label(&filter_name) {
                         let raw = object.get_raw_stream_data()?;
-                        let len =
-                            cli_stream_bytes(pdf, object_ref, &object, raw.as_ref(), true)?.len();
+                        let len = raw.len();
                         return logger.info(format!("<binary, {len} bytes, codec {label}>\n"));
                     }
                 }
             }
 
-            let unfiltered = stream_is_unfiltered(&stream_dictionary)?;
             let decoded = object.get_stream_data(DecodeLevel::All)?;
-            let bytes = cli_stream_bytes(pdf, object_ref, &object, decoded.as_ref(), unfiltered)?;
-            write_to_standard_output(&logger, bytes)
+            write_to_standard_output(&logger, decoded.as_ref())
         })
     }
 
@@ -269,12 +265,18 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
         let mut output = dictionary.unparse_resolved();
         output.extend_from_slice(b"\nstream\n");
         let data = data.as_ref();
+        // qpdf-deviation-start: `dump-object` has no qpdf counterpart
+        // (QPDFJob::doShowObj prints "Object is stream.  Dictionary:" and never
+        // reserializes stream framing, QPDFJob.cc:806-832). This flpdf-only
+        // reserializer drops the recovered-length EOL so its own
+        // "\nendstream" framing does not double the source line ending.
         let recovered_eol = pdf.canonical_recovered_stream_eol(object_ref, object)?;
         let data = if let Some(eol) = recovered_eol.filter(|eol| data.ends_with(eol)) {
             &data[..data.len() - eol.len()]
         } else {
             data
         };
+        // qpdf-deviation-end
         output.extend_from_slice(data);
         output.extend_from_slice(b"\nendstream");
         Ok(output)
@@ -301,35 +303,6 @@ fn first_stream_filter_name(stream_dictionary: &ObjectHandle) -> Result<Option<V
         .expect("one-element filter array has one item");
     item.type_code()?;
     Ok(item.as_name())
-}
-
-fn stream_is_unfiltered(stream_dictionary: &ObjectHandle) -> Result<bool> {
-    let filter = stream_dictionary.get_key(b"/Filter");
-    filter.type_code()?;
-    if filter.is_null() {
-        return Ok(true);
-    }
-    // An empty `/Filter []` array applies zero filters, same as a missing
-    // `/Filter` (QPDF_Stream.cc:396-406: the per-item loop over an empty
-    // array leaves `filter_names` empty, so decoding is a no-op).
-    Ok(filter.as_array().is_some_and(|items| items.is_empty()))
-}
-
-fn cli_stream_bytes<'a, R: Read + Seek>(
-    pdf: &Pdf<R>,
-    object_ref: ObjectRef,
-    stream: &ObjectHandle,
-    data: &'a [u8],
-    trim_recovered_eol: bool,
-) -> Result<&'a [u8]> {
-    let Some(eol) = pdf.canonical_recovered_stream_eol(object_ref, stream)? else {
-        return Ok(data);
-    };
-    Ok(if trim_recovered_eol && data.ends_with(eol) {
-        &data[..data.len() - eol.len()]
-    } else {
-        data
-    })
 }
 
 fn write_to_standard_output(logger: &crate::QPDFLogger, data: &[u8]) -> Result<()> {
@@ -520,19 +493,6 @@ mod tests {
         let output =
             unparse_object_with_stream_data(&pdf, &stream(), ObjectRef::new(7, 0)).unwrap();
         assert!(output.ends_with(b"encoded\nendstream"));
-    }
-
-    #[test]
-    fn cli_stream_bytes_keeps_data_when_recovered_eol_is_not_to_be_trimmed() {
-        let mut pdf = recovered_pdf();
-        let object_ref = ObjectRef::new(1, 0);
-        let handle = pdf.get_object_handle(object_ref);
-        handle.get_raw_stream_data().unwrap();
-        let data = b"decoded\n";
-        assert_eq!(
-            cli_stream_bytes(&pdf, object_ref, &handle, data, false).unwrap(),
-            data
-        );
     }
 
     #[test]

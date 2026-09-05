@@ -343,9 +343,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Exact source framing recorded by the canonical ObjectHandle resolver
-    /// after a repaired stream-length scan. Job-level stream inspection and
-    /// writer consumers use this qpdf-shaped metadata without a second raw
-    /// value cache.
+    /// after a repaired stream-length scan. The `dump-object` reserialization
+    /// consumer uses this qpdf-shaped metadata without a second raw value
+    /// cache; stream-data output itself keeps the complete recovered span.
     ///
     /// A recovered EOL is not removable framing when the stream's own bytes
     /// were replaced, it has a data provider, qpdf's `decryptStream` route

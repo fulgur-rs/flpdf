@@ -301,12 +301,11 @@ fn build_pdf_with_stale_length_and_empty_filter_array(stream_data: &[u8]) -> Vec
 /// Regression test: an explicit `/Filter []` (empty array) applies zero
 /// filters, same as a missing `/Filter` (`QPDF_Stream.cc:391-406`: the
 /// per-item loop over an empty array leaves `filter_names` empty). The
-/// recovered source-framing EOL from a stale `/Length` must still be
-/// trimmed from decoded output in this case, exactly as it is for a
-/// stream with no `/Filter` key at all
+/// recovered source-framing EOL from a stale `/Length` must be retained in
+/// decoded output, exactly as qpdf's `--show-object --raw-stream-data` does.
 /// (`show_stream_surfaces_lazy_recovery_warnings`).
 #[test]
-fn show_stream_trims_recovered_eol_for_empty_filter_array() {
+fn show_stream_keeps_recovered_eol_for_empty_filter_array() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         temp.path(),
@@ -319,7 +318,7 @@ fn show_stream_trims_recovered_eol_for_empty_filter_array() {
         .arg(temp.path())
         .assert()
         .code(3)
-        .stdout(predicate::eq(b"payload".as_slice()));
+        .stdout(predicate::eq(b"payload\n".as_slice()));
 }
 
 #[test]
@@ -332,11 +331,43 @@ fn show_stream_surfaces_lazy_recovery_warnings() {
         .arg(temp.path())
         .assert()
         .code(3)
-        .stdout(predicate::eq(b"payload".as_slice()))
+        .stdout(predicate::eq(b"payload\n".as_slice()))
         .stderr(predicate::str::contains("expected endstream"))
         .stderr(predicate::str::contains(
             "flpdf: operation succeeded with warnings",
         ));
+}
+
+/// Regression test: the show-stream raw route must keep the complete
+/// recovered span, just like qpdf's `--show-object --raw-stream-data` route.
+#[test]
+fn show_stream_raw_matches_show_object_for_unencrypted_recovered_length_stream() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), build_pdf_with_stale_length_stream(b"payload")).unwrap();
+
+    let mut show_stream = Command::cargo_bin("flpdf").unwrap();
+    let show_stream_out = show_stream
+        .args(["show-stream", "--raw-stream-data", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("recovered stream length"))
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut show_object = Command::cargo_bin("flpdf").unwrap();
+    let show_object_out = show_object
+        .args(["--show-object=3", "--raw-stream-data"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(show_stream_out, b"payload\n".as_slice());
+    assert_eq!(show_stream_out, show_object_out);
 }
 
 #[test]

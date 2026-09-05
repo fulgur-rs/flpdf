@@ -1659,8 +1659,8 @@ mod live_input_tests {
 }
 
 /// Exact line ending observed at the end of a recovered stream span immediately
-/// before a line-anchored `endstream`. Inspection consumers may use this
-/// metadata for their separate display-framing policy.
+/// before a line-anchored `endstream`. The `dump-object` reserializer may use
+/// this metadata to distinguish source payload from its own framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveredStreamEol {
     Lf,
