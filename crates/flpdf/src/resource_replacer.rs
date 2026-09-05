@@ -1,7 +1,10 @@
 //! qpdf correspondence: `QPDFAcroFormDocumentHelper.cc` `ResourceReplacer`.
 //! Resource-name discovery uses the live `ObjectHandle` content callback route
 //! (`QPDFObjectHandle.cc:1776-1847`, `ResourceFinder.cc:3-56`) before the
-//! exact-byte token filter rewrites source names.
+//! exact-byte token filter rewrites source names. A document-owned scan keeps
+//! errors for the qpdf caller's catch-and-re-warn boundary; only the detached
+//! in-memory route converts a structural failure to the byte-preserving
+//! `Ok(None)` fallback.
 
 use std::collections::BTreeMap;
 
@@ -109,12 +112,22 @@ pub(crate) fn replace_resource_names_with_context(
         return Ok(Some(input.to_vec()));
     }
 
+    let has_document_context = context.is_some();
     let mut finder = ResourceFinder::default();
     let scan = match context {
         Some(context) => parse_content_stream_handles(input, Some(context), "", &mut finder),
         None => parse_content_stream_handles_with_recoverable_warnings(input, "", &mut finder),
     };
-    if scan.is_err() {
+    if let Err(error) = scan {
+        if has_document_context {
+            // qpdf's document-owned parse catches this at the caller's
+            // warning boundary. In particular, a warning sink failure must
+            // not be converted into the ordinary malformed-content fallback.
+            return Err(error);
+        }
+        // The detached/recoverable in-memory route has no qpdf object to
+        // re-warn through, so structural failures retain the existing
+        // byte-preserving fallback.
         return Ok(None);
     }
 
