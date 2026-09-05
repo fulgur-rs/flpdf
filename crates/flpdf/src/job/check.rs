@@ -633,9 +633,13 @@ fn linearization_parameter_error_message(input_name: &[u8], message: &str, offse
             return result;
         }
     }
-    let mut result = b"linearization check failed: ".to_vec();
-    result.extend_from_slice(message.as_bytes());
-    result
+    // qpdf's checkLinearization catch prepends only
+    // "error encountered while checking linearization data: " to runtime
+    // failures that do not carry a damagedPDF object category
+    // (QPDF_linearization.cc:70-81). LinearizationCheckError's Display adds
+    // "linearization check failed:" for its standalone Rust API, but that is
+    // not part of qpdf's job-level diagnostic.
+    message.as_bytes().to_vec()
 }
 
 fn linearization_parameter_offset<R: Read + Seek + 'static>(
@@ -690,28 +694,12 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
     let diagnostics_seen = diagnostic_count(pdf);
     match check_linearization_parameters(pdf) {
         Ok(LinearizationParameterCheck::Clean) => {
-            warnings |= emit_linearization_check_warnings_with_suppression(
-                pdf,
-                &source_bytes,
-                logger,
-                input_name,
-                false,
-                suppress_warnings,
-            )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            warnings |= emit_linearization_check_warnings(pdf, &source_bytes, input_name, false)?;
         }
         Ok(LinearizationParameterCheck::Warning(message)) => {
             warnings = true;
-            if !suppress_warnings {
-                emit_warning(logger, input_name, message)?;
-            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
-            warnings |= emit_linearization_check_warnings_with_suppression(
-                pdf,
-                &source_bytes,
-                logger,
-                input_name,
-                true,
-                suppress_warnings,
-            )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            push_qpdf_warning_bytes(pdf, input_name, message.as_bytes())?;
+            warnings |= emit_linearization_check_warnings(pdf, &source_bytes, input_name, true)?;
         }
         Ok(LinearizationParameterCheck::Error(message)) => {
             warnings = true;
@@ -722,9 +710,7 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
                 message,
                 linearization_parameter_offset(pdf, message)?,
             ));
-            if !suppress_warnings {
-                emit_warning_bytes(logger, input_name, &warning_message)?;
-            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            push_qpdf_warning_bytes(pdf, input_name, &warning_message)?;
         }
         Err(error) if logger_failure_since(pdf, diagnostics_seen) && is_logger_error(&error) => {
             return Err(error);
@@ -732,31 +718,31 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
         Err(error) => {
             warnings = true;
             let message = format!("error encountered while checking linearization data: {error}");
-            if !suppress_warnings {
-                emit_warning(logger, input_name, message)?;
-            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            push_qpdf_warning_bytes(pdf, input_name, message.as_bytes())?;
         }
     }
 
     Ok(warnings)
 }
 
-fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
+/// qpdf collects every `checkLinearizationInternal` finding and then reports
+/// each one through `QPDF::warn` in order (`QPDF_linearization.cc:70-81`,
+/// `:412-421`). The parameter preflight above already goes through the
+/// document's warning channel, so the deep checker's findings must use the
+/// same channel: when the document defers delivery, replaying a recorded
+/// `/O` warning after a live `/T` warning would reverse qpdf's order.
+fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     source_bytes: &[u8],
-    logger: &QPDFLogger,
     input_name: &[u8],
     skip_first_page_warning: bool,
-    suppress_warnings: bool,
 ) -> Result<bool> {
     let diagnostics_seen = diagnostic_count(pdf);
     match check_linearization_warnings(pdf, source_bytes, skip_first_page_warning) {
         Ok(messages) => {
             let has_warnings = !messages.is_empty();
             for message in messages {
-                if !suppress_warnings {
-                    emit_warning(logger, input_name, message)?;
-                } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+                push_qpdf_warning_bytes(pdf, input_name, message.as_bytes())?;
             }
             Ok(has_warnings)
         }
@@ -769,9 +755,7 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
                 &message,
                 linearization_parameter_offset(pdf, &message)?,
             ));
-            if !suppress_warnings {
-                emit_warning_bytes(logger, input_name, &warning_message)?;
-            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            push_qpdf_warning_bytes(pdf, input_name, &warning_message)?;
             Ok(true)
         }
         Err(error) => {
@@ -781,9 +765,7 @@ fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
             }
             let message =
                 format!("error encountered while checking linearization data: {error_message}");
-            if !suppress_warnings {
-                emit_warning(logger, input_name, message)?;
-            }
+            push_qpdf_warning_bytes(pdf, input_name, message.as_bytes())?;
             Ok(true)
         }
     }
@@ -951,6 +933,17 @@ fn emit_warning_bytes(logger: &QPDFLogger, input_name: &[u8], message: &[u8]) ->
     line.extend_from_slice(message);
     line.push(b'\n');
     logger.warn(line)
+}
+
+fn push_qpdf_warning_bytes<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    input_name: &[u8],
+    message: &[u8],
+) -> Result<()> {
+    let mut warning = input_name.to_vec();
+    warning.extend_from_slice(b": ");
+    warning.extend_from_slice(message);
+    pdf.push_qpdf_warning_bytes(warning)
 }
 
 fn emit_warning(logger: &QPDFLogger, input_name: &[u8], message: impl AsRef<str>) -> Result<()> {
@@ -1629,6 +1622,18 @@ mod tests {
     }
 
     #[test]
+    fn linearization_runtime_error_message_preserves_qpdf_text() {
+        assert_eq!(
+            linearization_parameter_error_message(
+                b"linearized.pdf",
+                "overflow reading bit stream: wanted = 12556; available = 968",
+                660,
+            ),
+            b"overflow reading bit stream: wanted = 12556; available = 968"
+        );
+    }
+
+    #[test]
     fn document_check_uses_qpdf_page_count_warning() {
         let output = check_linearized_candidate_warning(b"/N", ObjectHandle::integer(2));
 
@@ -1692,7 +1697,7 @@ mod tests {
         assert!(
             output.contains(
                 "WARNING: linearized.pdf: error encountered while checking linearization data: \
-                 linearization check failed: /H has the wrong number of items (expected 2 or 4, got 1)\n"
+                 linearized.pdf (linearization dictionary, offset 23): H has the wrong number of items\n"
             ),
             "{output}"
         );
@@ -2134,16 +2139,8 @@ mod tests {
         )));
         pdf.set_logger(document_logger);
 
-        let report_output = Arc::new(Mutex::new(Vec::new()));
-        let report_logger = logger_with_capture(Arc::clone(&report_output));
-        let result = emit_linearization_check_warnings_with_suppression(
-            &mut pdf,
-            &source_bytes,
-            &report_logger,
-            b"linearized.pdf",
-            false,
-            false,
-        );
+        let result =
+            emit_linearization_check_warnings(&mut pdf, &source_bytes, b"linearized.pdf", false);
 
         assert!(
             matches!(
@@ -2175,15 +2172,10 @@ mod tests {
         ));
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
+        pdf.set_logger(logger.clone());
 
-        let result = emit_linearization_check_warnings_with_suppression(
-            &mut pdf,
-            source_bytes,
-            &logger,
-            b"linearized.pdf",
-            false,
-            false,
-        );
+        let result =
+            emit_linearization_check_warnings(&mut pdf, source_bytes, b"linearized.pdf", false);
 
         assert!(matches!(result, Ok(true)));
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();

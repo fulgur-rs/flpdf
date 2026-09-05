@@ -85,10 +85,6 @@ impl<'a> BitStream<'a> {
         Ok(self.get_bits(bits)? as i32)
     }
 
-    pub(crate) fn bits_available(&self) -> usize {
-        self.bits_available
-    }
-
     pub(crate) fn skip_to_next_byte(&mut self) -> Result<(), BitStreamError> {
         if self.bit_offset != 7 {
             let bits_to_skip = self.bit_offset + 1;

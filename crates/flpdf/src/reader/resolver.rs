@@ -2052,6 +2052,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
         route_object_warning(&logger, suppress_warnings, &message)
     }
 
+    /// Record and route a complete qpdf warning value whose
+    /// `QPDFExc::what()` has already been assembled by the owning consumer.
+    /// This is the byte-preserving equivalent of `QPDF::warn(QPDFExc const&)`:
+    /// deferred job replay must not prepend a second filename or discard a
+    /// non-UTF-8 source description (`libqpdf/QPDF.cc:488-504` and
+    /// `QPDFExc.cc:19-50`).
+    pub(crate) fn push_qpdf_warning_bytes(&self, message: impl AsRef<[u8]>) -> Result<()> {
+        let message = message.as_ref().to_vec();
+        let (logger, suppress_warnings) = {
+            let mut core = self.core.borrow_mut();
+            core.repair_diagnostics
+                .push(Diagnostic::object_warning_bytes(&message));
+            (core.logger.clone(), core.suppress_warnings)
+        };
+        route_object_warning(&logger, suppress_warnings, &message)
+    }
+
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
         let (logger, suppress_warnings, own_description) = {
             let core = self.core.borrow();
@@ -3038,12 +3055,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the direct whitespace scan advances the last offset to
     /// `end_after_space`. Keep both cases as operation metadata rather than
     /// storing a hint-specific field on every `ObjectHandle`.
-    pub(crate) fn resolve_at_offset_with_damage_offset(
+    /// Read an object at a physical offset using qpdf's caller-provided
+    /// description. `QPDF::readHintStream` supplies `linearization hint
+    /// stream` to `readObjectAtOffset`, so stream framing and recovery warnings
+    /// must retain that description instead of falling back to `object N G`
+    /// (`libqpdf/QPDF_linearization.cc:241-245` and
+    /// `libqpdf/QPDF.cc:1297-1339`).
+    pub(crate) fn resolve_at_offset_with_description(
         &self,
         offset: u64,
         expected: ObjectRef,
+        description: impl AsRef<[u8]>,
     ) -> Result<(ObjectHandle, Option<u64>)> {
-        self.resolve_at_offset_with_optional_description(offset, expected, None)
+        self.resolve_at_offset_with_optional_description(
+            offset,
+            expected,
+            Some(description.as_ref().to_vec()),
+        )
     }
 
     /// Read an object at a physical offset, optionally retaining qpdf's

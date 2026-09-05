@@ -149,7 +149,7 @@ fn check_linearization_rejects_out_of_bounds_shared_hint_offset_directly() {
         .expect_err("the standalone checker must validate /S without show prechecking");
     let message = error.to_string();
     assert!(
-        message.contains("hint stream /S offset (99) is out of bounds"),
+        message.contains("linearization hint table: /S (shared object) offset is out of bounds"),
         "unexpected /S boundary error: {message}"
     );
 }
@@ -165,7 +165,7 @@ fn check_linearization_rejects_out_of_bounds_outline_hint_offset_directly() {
         .expect_err("the standalone checker must validate /O without show prechecking");
     let message = error.to_string();
     assert!(
-        message.contains("hint stream /O offset (999) is out of bounds"),
+        message.contains("linearization hint table: /O (outline) offset is out of bounds"),
         "unexpected /O boundary error: {message}"
     );
 }

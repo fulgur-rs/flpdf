@@ -1247,10 +1247,7 @@ fn check_linearization_inner<R: Read + Seek>(
         fail!("/H is missing or has unexpected format (expected [offset length])");
     };
     if !matches!(h_items.len(), 2 | 4) {
-        fail!(
-            "/H has the wrong number of items (expected 2 or 4, got {})",
-            h_items.len()
-        );
+        fail!("linearization dictionary: H has the wrong number of items");
     }
     for (index, item) in h_items.iter().enumerate() {
         let _ = as_u64(item, &format!("H[{index}]"))?;
@@ -1306,10 +1303,7 @@ fn check_linearization_inner<R: Read + Seek>(
 
     let (shared_offset, outline_offset) = read_hint_offsets(&hint_dict).map_err(map_show_error)?;
     if shared_offset >= hint_bytes.len() {
-        fail!(
-            "hint stream /S offset ({shared_offset}) is out of bounds (hint size {})",
-            hint_bytes.len()
-        );
+        fail!("linearization hint table: /S (shared object) offset is out of bounds");
     }
     // cov:ignore-start: an opened PDF page tree cannot contain more than u32::MAX pages on supported targets
     let n_pages = u32::try_from(n_val).map_err(|_| LinearizationCheckError::InvalidParam {
@@ -1322,10 +1316,7 @@ fn check_linearization_inner<R: Read + Seek>(
     let outline_hints = match outline_offset {
         Some(offset) => {
             if offset >= hint_bytes.len() {
-                fail!(
-                    "hint stream /O offset ({offset}) is out of bounds (hint size {})",
-                    hint_bytes.len()
-                );
+                fail!("linearization hint table: /O (outline) offset is out of bounds");
             }
             Some(read_h_generic(&hint_bytes[offset..]).map_err(map_show_error)?)
         }
@@ -1534,8 +1525,11 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
     // hint stream with a non-zero generation (e.g. after incremental update)
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
-    let (hint_obj, hint_object_damage_offset) =
-        pdf.resolve_at_offset_with_damage_offset(offset as u64, hint_ref)?;
+    let (hint_obj, hint_object_damage_offset) = pdf.resolve_at_offset_with_description(
+        offset as u64,
+        hint_ref,
+        b"linearization hint stream",
+    )?;
     // qpdf's readHintStream supplies no explicit offset for this damage. The
     // resolver returns the operation-specific last offset; retain the source
     // seam as a defensive fallback for recovered empty objects without a
@@ -1802,9 +1796,10 @@ pub fn check_linearization_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{length_next_n, LinearizationCheckError};
+    use super::{length_next_n, load_hint_stream_with_damage, LinearizationCheckError};
     use crate::Pdf;
     use std::collections::BTreeMap;
+    use std::io::Cursor;
 
     #[test]
     fn length_next_n_rejects_object_number_wrap() {
@@ -1831,5 +1826,36 @@ mod tests {
             2,
             "the two missing entries precede the wrap"
         );
+    }
+
+    #[test]
+    fn load_hint_stream_uses_qpdf_description_route_for_valid_fixture() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec())).expect("fixture should open");
+
+        let result = load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118);
+        assert!(
+            result.is_ok(),
+            "the fixture hint stream should resolve and decode"
+        );
+        let (_hint_dict, decoded) = result.ok().unwrap();
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn load_hint_stream_propagates_offset_resolver_failure() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let mut pdf = Pdf::empty().expect("empty PDF should be constructible");
+
+        assert!(matches!(
+            load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118),
+            Err(super::HintStreamLoadError::Core(_))
+        ));
     }
 }
