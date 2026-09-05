@@ -8555,6 +8555,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_password_override_reaches_pdf_open_options_without_projection() {
+        let mut password = PasswordArgs {
+            password: Some(OsString::from("replacement")),
+            ..PasswordArgs::default()
+        };
+        password.raw_password = Some(b"raw-\xff".to_vec());
+
+        let options = pdf_open_options(false, &password).expect("password options should build");
+        assert_eq!(options.password, b"raw-\xff");
+    }
+
+    #[test]
     fn preprocess_qpdf_args_keeps_raw_encrypt_and_donor_passwords() {
         let directory = tempfile::tempdir().expect("create argument-file directory");
         let encrypt_path = directory.path().join("encrypt-args");
