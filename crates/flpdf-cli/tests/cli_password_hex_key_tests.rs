@@ -15,7 +15,11 @@
 //! together.
 
 use assert_cmd::Command;
+use flpdf::{EncryptParams, Pdf, PdfWriter};
 use predicates::prelude::PredicateBooleanExt;
+use std::fs;
+use std::io::Cursor;
+use std::path::Path;
 
 #[path = "support/eol.rs"]
 mod eol;
@@ -185,6 +189,50 @@ fn hex_key_32_byte_key_works() {
             "--password-is-hex-key",
             V5_R6,
         ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn hex_key_24_byte_key_reaches_the_aes192_stream_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf"),
+    )
+    .unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_encryption_parameters(EncryptParams::v5_r6(
+        b"user-pfpr".to_vec(),
+        b"owner-pfpr".to_vec(),
+    ));
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let encrypted = temp.path().join("encrypted.pdf");
+    fs::write(&encrypted, writer.get_buffer().unwrap()).unwrap();
+
+    let key = flpdf()
+        .args(["show-encryption-key", "--password=user-pfpr"])
+        .arg(&encrypted)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let key = String::from_utf8(key).unwrap().trim().to_owned();
+    assert_eq!(key.len(), 64, "the generated R=6 file has a 32-byte key");
+    let aes192_key = key[..48].to_owned();
+
+    flpdf()
+        .args([
+            "--decrypt",
+            "--static-id",
+            "--stream-data=preserve",
+            "--password-is-hex-key",
+        ])
+        .arg(format!("--password={aes192_key}"))
+        .arg(&encrypted)
+        .arg(temp.path().join("decrypted.pdf"))
         .assert()
         .success();
 }

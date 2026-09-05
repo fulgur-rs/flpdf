@@ -170,6 +170,9 @@ impl EncryptionState {
         if let Ok(key) = <&[u8; 32]>::try_from(key.as_slice()) {
             return apply(StringCipher::Aes256 { key });
         }
+        if let Ok(key) = aes192_object_key(&key) {
+            return apply(StringCipher::Aes192 { key: &key });
+        }
         let key = aes128_object_key(&key)?;
         apply(StringCipher::Aes128 { key: &key })
     }
@@ -192,22 +195,27 @@ pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
         // AES-128 and hand the provider the first 16 bytes
         // (`QPDFCrypto_gnutls.cc:197-213`, `QPDFCrypto_openssl.cc:225-241`).
         // A 32-byte key is dispatched to AES-256 by the caller, and 24 bytes
-        // selects AES-192 in qpdf, which this port does not provide.
+        // selects AES-192 before reaching this AES-128 helper.
         len if len > 16 && len != 24 && len != 32 => {
             let mut object_key = [0u8; 16];
             object_key.copy_from_slice(&key[..16]);
             Ok(object_key)
         }
-        24 => Err(EncryptedError::Malformed {
-            reason: "AES-192 (24-byte) raw keys are not supported".into(),
-        }
-        .into()),
         // qpdf-deviation: qpdf's providers read 16 key bytes past the end of a shorter raw key (undefined contents); reject instead of fabricating them
         _ => Err(EncryptedError::Malformed {
             reason: "AES-128 object key is not 16 bytes".into(),
         }
         .into()),
     }
+}
+
+pub(crate) fn aes192_object_key(key: &[u8]) -> Result<[u8; 24]> {
+    key.try_into().map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "AES-192 object key is not 24 bytes".into(),
+        }
+        .into()
+    })
 }
 
 /// qpdf `QPDF::encryption_method_e` (`QPDF.hh:436`).
