@@ -63,13 +63,16 @@ fn verbose_password_recovery_reports_the_qpdf_retry_message() {
         .unwrap();
     let mut combined = output.stdout;
     combined.extend_from_slice(&output.stderr);
-    let message = b"flpdf: supplied password didn't work; trying other passwords based on interpreting password with different string encodings\n";
+    let message = format!(
+        "flpdf: supplied password didn't work; trying other passwords based on interpreting password with different string encodings{EOL}"
+    )
+    .into_bytes();
 
     assert!(output.status.success());
     assert_eq!(
         combined
             .windows(message.len())
-            .filter(|window| *window == message)
+            .filter(|window| *window == message.as_slice())
             .count(),
         1,
         "qpdf retry message must be emitted exactly once: {:?}",
