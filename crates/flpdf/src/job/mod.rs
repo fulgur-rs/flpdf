@@ -44,6 +44,7 @@ pub use attachment_list::{format_attachment_list_with_sink, AttachmentInfo};
 pub use attachments::{
     add_attachment_from_path, ascii_filename_fallback, extract_attachment,
     extract_attachment_to_path, write_attachment, AttachmentAddOptions, AttachmentCopyOptions,
+    AttachmentCopySource,
 };
 #[cfg(test)]
 pub(crate) use check::check_bytes_for_test;

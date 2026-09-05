@@ -6,10 +6,10 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
-    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions, CheckError,
-    FlattenAnnotationsMode, ImageOptimizationOptions, JobExitCode, JsonJobError, JsonJobOptions,
-    JsonJobOutput, JsonStreamData, PageSpecInput, PageSpecJobOutput, QPDFJob,
-    RemoveUnreferencedResources, SplitPageOptions,
+    should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions,
+    AttachmentCopySource, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
+    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
+    PageSpecJobOutput, QPDFJob, RemoveUnreferencedResources, SplitPageOptions,
 };
 use flpdf::pipeline::{FlateAction, Pipeline, PipelineHandle, PlFlate, PlStdioFile};
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -1210,7 +1210,7 @@ struct Cli {
     raw_encryption_file_password: Option<Vec<u8>>,
 
     #[arg(skip)]
-    raw_copy_attachments_from: Option<Vec<Vec<u8>>>,
+    raw_copy_attachments_from: Option<Vec<Vec<Vec<u8>>>>,
 
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -1619,7 +1619,7 @@ struct RewriteCommand {
     raw_encryption_file_password: Option<Vec<u8>>,
 
     #[arg(skip)]
-    raw_copy_attachments_from: Option<Vec<Vec<u8>>>,
+    raw_copy_attachments_from: Option<Vec<Vec<Vec<u8>>>>,
     /// Set a minimum PDF version for the output header.
     ///
     /// The effective version is `max(source_version, min_version)`.
@@ -2204,7 +2204,7 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
     let mut attachment_segments = Vec::new();
     let mut raw_encrypt = None;
     let mut raw_pages = None;
-    let mut raw_copy_attachments_from = None;
+    let mut raw_copy_attachments_from = Vec::new();
 
     for segment in parsed.raw_named_segments {
         let option = segment.option;
@@ -2233,13 +2233,8 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
             "copy-attachments-from" => {
                 // qpdf accumulates every --copy-attachments-from group and
                 // copies from all of them (`QPDFJob.hh:683`,
-                // `QPDFJob_config.cc:825-833`, `QPDFJob.cc:2089-2100`); this
-                // consumer still handles one donor, so refuse a second group
-                // instead of silently dropping the first one.
-                if raw_copy_attachments_from.is_some() {
-                    return Err("--copy-attachments-from: multiple donor groups are not supported yet; qpdf copies from every group".into());
-                }
-                raw_copy_attachments_from = Some(tokens)
+                // `QPDFJob_config.cc:825-833`, `QPDFJob.cc:2089-2100`).
+                raw_copy_attachments_from.push(tokens)
             }
             _ => {}
         }
@@ -2257,7 +2252,8 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
             ),
             raw_encrypt,
             raw_pages,
-            raw_copy_attachments_from,
+            raw_copy_attachments_from: (!raw_copy_attachments_from.is_empty())
+                .then_some(raw_copy_attachments_from),
         },
     })
 }
@@ -2338,7 +2334,8 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
     args.page_ops.raw_pages = raw_pages
         .or_else(|| (!args.page_ops.pages.is_empty()).then(|| raw_os_args(&args.page_ops.pages)));
     args.raw_copy_attachments_from = raw_copy_attachments_from.or_else(|| {
-        (!args.copy_attachments_from.is_empty()).then(|| raw_os_args(&args.copy_attachments_from))
+        (!args.copy_attachments_from.is_empty())
+            .then(|| vec![raw_os_args(&args.copy_attachments_from)])
     });
 
     if let Some(command) = args.command.as_mut() {
@@ -2744,16 +2741,16 @@ fn main() {
             &top_level_version_options,
         )
     } else if !args.copy_attachments_from.is_empty() {
-        let copy_tokens = args
+        let copy_groups = args
             .raw_copy_attachments_from
             .clone()
-            .unwrap_or_else(|| raw_os_args(&args.copy_attachments_from));
+            .unwrap_or_else(|| vec![raw_os_args(&args.copy_attachments_from)]);
         run_copy_attachments_from(
             args.input,
             args.output,
             args.repair,
             &args.password,
-            copy_tokens,
+            copy_groups,
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
@@ -5126,7 +5123,7 @@ struct RawCliOverrides {
     encryption_file_password: Option<Vec<u8>>,
     raw_encrypt: Option<Vec<Vec<u8>>>,
     raw_pages: Option<Vec<Vec<u8>>>,
-    raw_copy_attachments_from: Option<Vec<Vec<u8>>>,
+    raw_copy_attachments_from: Option<Vec<Vec<Vec<u8>>>>,
 }
 
 /// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
@@ -8388,14 +8385,16 @@ fn run_show_attachment(
     finish_job_exit_status(status)
 }
 
-/// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- input output`
+/// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- ...`
+///
+/// qpdf accepts this group repeatedly and copies from every donor in order.
 #[allow(clippy::too_many_arguments)]
 fn run_copy_attachments_from(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    tokens: Vec<Vec<u8>>,
+    groups: Vec<Vec<Vec<u8>>>,
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
@@ -8408,7 +8407,10 @@ fn run_copy_attachments_from(
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
-    let args = parse_copy_attachments_segment(tokens)?;
+    let donor_args = groups
+        .into_iter()
+        .map(parse_copy_attachments_segment)
+        .collect::<CliResult<Vec<_>>>()?;
 
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
@@ -8422,43 +8424,46 @@ fn run_copy_attachments_from(
 
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
-    // Open the source with its own password (independent of the target's).
+    // Open each source with its own password (independent of the target's).
     // Retain the command-wide open policy so qpdf's recovery/xref controls
-    // apply to this secondary input exactly as they do to the target. This
-    // uses a standalone open rather than `job.open_with_description`, since
-    // qpdf's own `doCopyAttachments` (`QPDFJob.cc:2100`) opens the donor as
-    // its own local `QPDF` independent of `this->pdf`
-    // (`processFile(other, ...)`), not through the job's single main-input
-    // slot: routing the donor through the job here would overwrite its
-    // `input_name` with the donor's path, misattributing a later
-    // `copy_attachments` "already has attachments with keys that conflict"
-    // error (which reports `self.input_name()`, matching qpdf's
-    // `pdf.getFilename()` at `QPDFJob.cc:2127`) to the donor instead of the
-    // target.
-    let mut source_password = password.clone();
-    source_password.password = None;
-    source_password.raw_password = None;
-    source_password.password_file = None;
-    let mut src_options =
-        pdf_open_options_with_password_bytes(repair, &source_password, args.password.clone());
-    configure_document_logger(&mut src_options, &args.file);
-    src_options.suppress_warnings |= suppress_warnings;
-    let src_file =
-        File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
-    let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
-        .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
-    src.root_handle()
-        .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
-
-    job.copy_attachments(
-        &mut pdf,
-        &mut src,
-        &AttachmentCopyOptions {
-            path: args.file,
-            prefix: args.prefix.unwrap_or_default(),
-            verbose,
-        },
-    )?;
+    // apply to every secondary input exactly as they do to the target. Each
+    // source uses a standalone Pdf rather than job.open_with_description,
+    // since qpdf's doCopyAttachments (`QPDFJob.cc:2100`) opens each donor as
+    // its own local QPDF. Keeping all donors alive lets the canonical job
+    // batch method aggregate duplicate keys across the complete list.
+    let mut donor_sources = Vec::with_capacity(donor_args.len());
+    for args in donor_args {
+        let mut source_password = password.clone();
+        source_password.password = None;
+        source_password.raw_password = None;
+        source_password.password_file = None;
+        let mut src_options =
+            pdf_open_options_with_password_bytes(repair, &source_password, args.password);
+        configure_document_logger(&mut src_options, &args.file);
+        src_options.suppress_warnings |= suppress_warnings;
+        let src_file =
+            File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
+        let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
+            .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
+        src.root_handle()
+            .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
+        donor_sources.push((
+            src,
+            AttachmentCopyOptions {
+                path: args.file,
+                prefix: args.prefix.unwrap_or_default(),
+                verbose,
+            },
+        ));
+    }
+    let mut sources = donor_sources
+        .iter_mut()
+        .map(|(source, options)| AttachmentCopySource {
+            source,
+            options: options.clone(),
+        })
+        .collect::<Vec<_>>();
+    job.copy_attachments_many(&mut pdf, &mut sources)?;
 
     let mut writer_options = WriterOptions {
         deterministic_id,
@@ -8656,10 +8661,7 @@ mod tests {
         .expect("qpdf accepts repeated donor groups");
         assert_eq!(
             preprocessed.raw_overrides.raw_copy_attachments_from,
-            Some(vec![
-                vec![b"don0.pdf".to_vec()],
-                vec![b"don1.pdf".to_vec()],
-            ])
+            Some(vec![vec![b"don0.pdf".to_vec()], vec![b"don1.pdf".to_vec()],])
         );
     }
 
