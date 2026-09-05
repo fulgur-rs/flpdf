@@ -613,6 +613,55 @@ fn acroform_secondary_collision_pdf() -> Vec<u8> {
     ])
 }
 
+/// Single-page foreign source with a colliding `/DR/Font/F1` and a malformed
+/// `/DA` token. The parser warning message is shared by qpdf's temporary
+/// `/DA` stream and flpdf's document-owned content parser.
+fn acroform_secondary_bad_da_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx \
+          /T (ForeignBadToken) /DA (/F1 18 Tf <0g 0 g) /DR 6 0 R \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// Single-page primary with a distinct `/DR/Font/F1`, so the malformed foreign
+/// source above necessarily receives a resource rename during the page copy.
+fn acroform_primary_with_dr_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx \
+          /T (Primary) /DA (/F1 12 Tf) /DR 6 0 R \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>\nendobj\n".to_vec(),
+    ])
+}
+
+fn da_parser_warning_message(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .find_map(|line| {
+            line.contains("invalid character (g) in hexstring")
+                .then(|| line.rsplit_once(": ").unwrap().1.to_owned())
+        })
+        .expect("the command must report the malformed /DA token")
+}
+
 /// Unrelated single-page source with no AcroForm at all.
 fn plain_page_pdf() -> Vec<u8> {
     assemble_pdf(&[
@@ -844,6 +893,64 @@ fn unselected_primary_field_names_reserve_later_collision_suffixes() {
     assert_eq!(
         flpdf_fields, qpdf_fields,
         "flpdf must reserve every primary original field name before renaming foreign fields"
+    );
+}
+
+/// qpdf parses foreign `/DA` through a temporary stream, while flpdf uses its
+/// document-owned content parser. Their source-description prefixes differ
+/// until `flpdf-1ks3`, but the parser warning message and warning-only exit
+/// status must already agree here.
+#[test]
+fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("bad-da-source.pdf");
+    std::fs::write(&primary, acroform_primary_with_dr_pdf()).expect("write primary");
+    std::fs::write(&secondary, acroform_secondary_bad_da_pdf()).expect("write bad /DA source");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {:?}", qpdf);
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "foreign /DA parser warning must keep qpdf's warning exit status; flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        da_parser_warning_message(&flpdf.stderr),
+        da_parser_warning_message(&qpdf.stderr),
+        "foreign /DA parser warning message must match qpdf",
     );
 }
 

@@ -18,8 +18,9 @@
 //! internally consistent.
 //!
 //! [`crate::resource_replacer`] owns the shared content-stream token scan;
-//! this module only applies its best-effort result to decoded appearance
-//! stream bytes.
+//! this module applies its result to decoded appearance stream bytes and
+//! retains qpdf's catch-and-re-warn boundary when the document-owned scan
+//! fails.
 
 use std::io::{Read, Seek};
 use std::rc::Rc;
@@ -32,17 +33,28 @@ use crate::{Pdf, Result};
 
 #[cfg(test)]
 fn rewrite_appearance_content(decoded: &[u8], dr_map: &DrMap) -> Vec<u8> {
-    rewrite_appearance_content_with_context(decoded, dr_map, None)
+    match replace_resource_names_with_context(decoded, dr_map.renames(), None) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(_) => decoded.to_vec(),
+    }
 }
 
 fn rewrite_appearance_content_with_context(
     decoded: &[u8],
     dr_map: &DrMap,
-    context: Option<Rc<dyn crate::object_handle::DocumentResolver>>,
-) -> Vec<u8> {
-    match replace_resource_names_with_context(decoded, dr_map.renames(), context) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) | Err(_) => decoded.to_vec(),
+    stream: &ObjectHandle,
+) -> Result<Vec<u8>> {
+    match replace_resource_names_with_context(decoded, dr_map.renames(), stream.context()) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Ok(decoded.to_vec()),
+        Err(error) => {
+            // qpdf catches parseAsContents exceptions and sends this second
+            // warning through the appearance stream itself
+            // (QPDFAcroFormDocumentHelper.cc:680-695). A warning-sink failure
+            // from this call must escape the appearance adjustment.
+            stream.warn_if_possible(&format!("Unable to parse appearance stream: {error}"))?;
+            Ok(decoded.to_vec())
+        }
     }
 }
 
@@ -176,8 +188,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     // qpdf's token-filter installation is best effort. Resource mutations are
     // intentionally not rolled back when the stream cannot be decoded.
     if let Ok(Some(decoded)) = filterable_stream_data(stream, DecodeLevel::Generalized) {
-        let rewritten =
-            rewrite_appearance_content_with_context(&decoded, &local_dr_map, stream.context());
+        let rewritten = rewrite_appearance_content_with_context(&decoded, &local_dr_map, stream)?;
         if let Ok(encoded) =
             crate::filters::encode_stream_data_from_handle(&stream_dict, &rewritten)
         {
@@ -231,10 +242,12 @@ fn extend_dr_map_from_conflicts(dr_map: &mut DrMap, conflicts: &ResourceConflict
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
     use crate::PdfOpenOptions;
-    use crate::{ObjectHandle, ObjectRef};
+    use crate::{ObjectHandle, ObjectRef, QPDFLogger};
     use std::io::Cursor;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     /// Build a `DrMap` with a single category's rename table. `DrMap`'s
     /// `by_name` is private to the AcroForm owner, so tests drive it through
@@ -426,6 +439,50 @@ mod tests {
             .expect("appearance fixture must have stream data")
             .as_ref()
             .clone()
+    }
+
+    struct FailingWarningSink;
+
+    impl Pipeline for FailingWarningSink {
+        // cov:ignore-start: mandatory test-sink metadata has no behavioral role
+        fn identifier(&self) -> &str {
+            "appearance test warning sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(PipelineError::runtime("appearance warning sink failed"))
+        }
+
+        // cov:ignore-start: the failure sink never reaches finish after write fails
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    struct RecordingWarningSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Pipeline for RecordingWarningSink {
+        // cov:ignore-start: mandatory test-sink metadata has no behavioral role
+        fn identifier(&self) -> &str {
+            "appearance recording warning sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.0
+                .lock()
+                .expect("appearance warning trace lock")
+                .extend_from_slice(data);
+            Ok(())
+        }
+
+        // cov:ignore-start: finish has no behavior beyond the Pipeline contract
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
     }
 
     fn key(handle: &ObjectHandle, name: &[u8]) -> ObjectHandle {
@@ -743,6 +800,93 @@ mod tests {
             .try_get_key(b"/F1")
             .unwrap()
             .is_null());
+    }
+
+    #[test]
+    fn canonical_adjust_appearance_stream_propagates_warning_sink_failure() {
+        let mut pdf = open_minimal();
+        let resources = HandleFixture::dictionary({
+            let mut d = HandleDictionary::new();
+            d.insert(
+                "Font",
+                HandleFixture::dictionary({
+                    let mut fonts = HandleDictionary::new();
+                    fonts.insert("F1", HandleFixture::integer(1));
+                    fonts
+                }),
+            );
+            d
+        });
+        let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf [");
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(crate::PipelineHandle::new(FailingWarningSink)));
+        pdf.set_logger(logger);
+
+        let error = adjust_appearance_stream_via_handle(
+            &mut pdf,
+            ap_ref,
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+        )
+        .expect_err("appearance warning sink failure must propagate");
+        assert!(matches!(
+            error,
+            crate::Error::System(message) if message == "appearance warning sink failed"
+        ));
+    }
+
+    #[test]
+    fn canonical_adjust_appearance_stream_rewarns_and_preserves_content() {
+        let mut pdf = open_minimal();
+        let resources = HandleFixture::dictionary({
+            let mut d = HandleDictionary::new();
+            d.insert(
+                "Font",
+                HandleFixture::dictionary({
+                    let mut fonts = HandleDictionary::new();
+                    fonts.insert("F1", HandleFixture::integer(1));
+                    fonts
+                }),
+            );
+            d
+        });
+        let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf [");
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(crate::PipelineHandle::new(RecordingWarningSink(
+            Arc::clone(&warnings),
+        ))));
+        pdf.set_logger(logger);
+
+        adjust_appearance_stream_via_handle(
+            &mut pdf,
+            ap_ref,
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+        )
+        .expect("a successful re-warning keeps the appearance adjustment non-fatal");
+
+        assert_eq!(
+            stream_bytes(&stream_handle(&mut pdf, ap_ref)),
+            b"/F1 18 Tf ["
+        );
+        let warning_bytes = warnings.lock().expect("appearance warning trace lock");
+        let warnings = String::from_utf8_lossy(&warning_bytes);
+        assert!(
+            warnings.contains("Unable to parse appearance stream:"),
+            "qpdf's appearance catch warning must be delivered: {warnings}"
+        );
+    }
+
+    #[test]
+    fn detached_appearance_rewrite_keeps_structural_failure_fallback() {
+        let stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+        let rewritten = rewrite_appearance_content_with_context(
+            b"/F1 18 Tf [",
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+            &stream,
+        )
+        .expect("detached structural failure keeps the original bytes");
+        assert_eq!(rewritten, b"/F1 18 Tf [");
     }
 
     #[test]
