@@ -3884,11 +3884,13 @@ mod tests {
         assert!(qdf_text.contains("/Filter /FlateDecode"));
         assert!(!qdf_text.contains("ASCIIHexDecode"));
 
+        // cov:ignore-start: test-only callback body forwards strings without an independent branch
         let mut qdf_string = Vec::new();
         let mut callback = |out: &mut Vec<u8>, value: &[u8]| {
-            out.extend_from_slice(value); // cov:ignore: test-only string callback forwards bytes directly
-            Ok(()) // cov:ignore: test-only string callback has no independent branch
+            out.extend_from_slice(value);
+            Ok(())
         };
+        // cov:ignore-end
         stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
             &mut qdf_string,
             0,
