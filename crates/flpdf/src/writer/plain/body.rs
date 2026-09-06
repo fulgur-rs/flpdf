@@ -10,7 +10,9 @@ use crate::writer::plain::plan::{
 use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
 use crate::writer::write_object::WriteObject;
 use crate::writer::WriterOptions;
-use crate::writer::{serialize, CompressStreams, ObjectWriterEmission, QPDF_BINARY_MARKER};
+use crate::writer::{
+    serialize, CompressStreams, ObjectWriterEmission, StreamDictionaryOptions, QPDF_BINARY_MARKER,
+};
 use crate::{ObjectHandle, ObjectRef, Pdf};
 
 /// Emit every body placement already chosen by `plan`.
@@ -313,14 +315,18 @@ fn emit_source_from_handle(
         } else {
             None // cov:ignore: every planned indirect source stream receives a cache entry; structural streams bypass this emitter
         };
-        let (dict, data, refiltered) = if let Some(cached) = cached {
-            (cached.dict.clone(), cached.data.clone(), cached.refiltered)
+        let (dict, data, dictionary_options) = if let Some(cached) = cached {
+            (
+                cached.dict.clone(),
+                cached.data.clone(),
+                cached.dictionary_options,
+            )
         } else {
             canonical_stream_output(handle, options)?
         };
-        dict.write_stream_body_with_ref_map_and_removed(
+        dict.write_stream_body_with_ref_map_and_removed_with_options(
             bytes,
-            refiltered,
+            dictionary_options,
             &map,
             &plan.removed_refs,
         )?; // cov:ignore: LLVM attributes the validated success continuation to the call lines above
@@ -334,10 +340,10 @@ fn emit_source_from_handle(
 pub(crate) fn canonical_stream_output(
     handle: &ObjectHandle,
     options: &WriterOptions,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
-    let (dict, data, refiltered, _) =
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
+    let (dict, data, dictionary_options) =
         canonical_stream_output_with_status(handle, options, true, false)?;
-    Ok((dict, data, refiltered))
+    Ok((dict, data, dictionary_options))
 }
 
 pub(crate) fn canonical_stream_output_with_status(
@@ -345,7 +351,7 @@ pub(crate) fn canonical_stream_output_with_status(
     options: &WriterOptions,
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
     canonical_stream_output_with_rewrite_policy(
         handle,
         options,
@@ -364,17 +370,17 @@ pub(crate) fn canonical_stream_output_for_rewrite(
     handle: &ObjectHandle,
     options: &WriterOptions,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
-    let (dict, data, refiltered, _) =
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
+    let (dict, data, dictionary_options) =
         canonical_stream_output_for_rewrite_with_status(handle, options, normalize_content)?;
-    Ok((dict, data, refiltered))
+    Ok((dict, data, dictionary_options))
 }
 
 pub(crate) fn canonical_stream_output_for_rewrite_with_status(
     handle: &ObjectHandle,
     options: &WriterOptions,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
     canonical_stream_output_with_status(handle, options, true, normalize_content)
 }
 
@@ -778,17 +784,17 @@ pub(crate) fn canonical_stream_output_for_linearization(
     handle: &ObjectHandle,
     options: &WriterOptions,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
-    let (dict, data, refiltered, _) =
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
+    let (dict, data, dictionary_options) =
         canonical_stream_output_for_linearization_with_status(handle, options, normalize_content)?;
-    Ok((dict, data, refiltered))
+    Ok((dict, data, dictionary_options))
 }
 
 pub(crate) fn canonical_stream_output_for_linearization_with_status(
     handle: &ObjectHandle,
     options: &WriterOptions,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
     canonical_stream_output_with_status(handle, options, true, normalize_content)
 }
 
@@ -905,7 +911,7 @@ fn canonical_stream_output_with_rewrite_policy(
     options: &WriterOptions,
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+) -> crate::Result<(ObjectHandle, Vec<u8>, StreamDictionaryOptions)> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
@@ -999,35 +1005,16 @@ fn canonical_stream_output_with_rewrite_policy(
             )
         };
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
-    entries.remove(b"/Length".as_slice());
-    if !filtering_attempted {
-        remove_crypt_filter_for_unfiltered_stream(&mut entries)?;
-    }
-    if filtering_attempted {
-        entries.retain(|key, _| {
-            !matches!(
-                key.as_slice(),
-                b"/Filter" | b"/DecodeParms" | b"/F" | b"/FFilter" | b"/FDecodeParms"
-            )
-        });
-        // qpdf's normalization branch wins over the ordinary compression
-        // branch (`QPDFWriter.cc:1279-1284`): normalized page content is
-        // emitted decoded, even when compress_streams is enabled.
-        if matches!(policy, Some(CompressStreams::Yes)) && !normalized_content {
-            entries.insert(
-                b"/Filter".to_vec(),
-                ObjectHandle::name(b"FlateDecode".to_vec()),
-            );
-        }
-    }
     entries.insert(
         b"/Length".to_vec(),
         ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
     );
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
-    let refiltered =
-        filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content;
-    Ok((dict, data, refiltered, filtering_attempted))
+    let dictionary_options = StreamDictionaryOptions::new(
+        filtering_attempted,
+        filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content,
+    );
+    Ok((dict, data, dictionary_options))
 }
 
 /// Read a stream through qpdf's writer-owned unfiltered pipe.
@@ -1115,8 +1102,11 @@ fn canonical_stream_filter_plan(
         && source_has_lone_flate
         && !handle.is_data_modified()
         && !options.recompress_flate
-        && !normalized_content
-        && !stream_dict.try_has_key(b"/F")?;
+        && !normalized_content;
+    // qpdf's writer policy inspects only the stream's `/Filter` value; the
+    // external-file `/F`, `/FFilter`, and `/FDecodeParms` entries remain
+    // ordinary dictionary keys and do not veto this optimization
+    // (`QPDFWriter.cc:1260-1269`).
     if !handle.is_data_modified() && (policy.is_none() || preserve_lone_flate) {
         return Ok(None);
     }
@@ -1133,56 +1123,6 @@ fn canonical_stream_filter_plan(
         encode_flags |= crate::object_handle::STREAM_ENCODE_NORMALIZE;
     }
     Ok(Some((encode_flags, decode_level, normalized_content)))
-}
-
-/// Mirror `QPDFWriter::unparseObject`'s unfiltered-stream cleanup
-/// (`libqpdf/QPDFWriter.cc:1446-1478`): source encryption is applied by the
-/// resolver pipe, so the writer never carries an explicit `/Crypt` stage into
-/// a rewritten stream dictionary. A direct `/Crypt` removes both filter keys;
-/// an array removes the first `/Crypt` item and its paired `/DecodeParms` slot,
-/// preserving the remaining filter representation byte-for-byte.
-fn remove_crypt_filter_for_unfiltered_stream(
-    entries: &mut std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
-) -> crate::Result<()> {
-    let Some(filter) = entries.get(b"/Filter".as_slice()).cloned() else {
-        return Ok(());
-    };
-
-    if filter.try_is_name_and_equals(b"Crypt")? {
-        entries.remove(b"/Filter".as_slice());
-        entries.remove(b"/DecodeParms".as_slice());
-        return Ok(());
-    }
-
-    let Some(filters) = filter.try_as_array()? else {
-        return Ok(());
-    };
-    let mut crypt_index = None;
-    for (index, item) in filters.iter().enumerate() {
-        if item.try_is_name_and_equals(b"Crypt")? {
-            crypt_index = Some(index);
-            break;
-        }
-    }
-    let Some(crypt_index) = crypt_index else {
-        return Ok(());
-    };
-
-    let mut remaining_filters = filters;
-    remaining_filters.remove(crypt_index);
-    entries.insert(b"/Filter".to_vec(), ObjectHandle::array(remaining_filters));
-
-    let Some(decode_parms) = entries.get(b"/DecodeParms".as_slice()).cloned() else {
-        return Ok(());
-    };
-    let Some(mut decode_items) = decode_parms.try_as_array()? else {
-        return Ok(());
-    };
-    if decode_items.len() > crypt_index {
-        decode_items.remove(crypt_index);
-        entries.insert(b"/DecodeParms".to_vec(), ObjectHandle::array(decode_items));
-    }
-    Ok(())
 }
 
 fn canonical_is_lone_flate(dict: &ObjectHandle) -> crate::Result<bool> {

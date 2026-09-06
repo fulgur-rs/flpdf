@@ -44,8 +44,7 @@ pub(crate) enum PlannedIndirectObject {
 pub(crate) struct CachedStreamOutput {
     pub(crate) dict: crate::ObjectHandle,
     pub(crate) data: Vec<u8>,
-    pub(crate) refiltered: bool,
-    pub(crate) parameters_removed: bool,
+    pub(crate) dictionary_options: crate::writer::StreamDictionaryOptions,
     pub(crate) fingerprint: StreamCacheFingerprint,
 }
 
@@ -155,7 +154,7 @@ impl PlainWritePlan {
             };
             if let Some(cached) = cached_stream_outputs.borrow().get(&source) {
                 if cached.fingerprint == stream_cache_fingerprint(handle)? {
-                    return Ok(cached.parameters_removed);
+                    return Ok(cached.dictionary_options.remove_filter_parameters);
                 }
             }
 
@@ -163,7 +162,7 @@ impl PlainWritePlan {
             // later unparseObject emission (`QPDFWriter.cc:1239-1314,1539-1560`).
             // Cache every indirect source stream, not only data-modified ones,
             // so deferred providers are invoked once across planning and emit.
-            let (dict, data, refiltered, parameters_removed) =
+            let (dict, data, dictionary_options) =
                 body::canonical_stream_output_with_status(handle, options, true, false)?;
             let fingerprint = stream_cache_fingerprint(handle)?;
             cached_stream_outputs.borrow_mut().insert(
@@ -171,12 +170,11 @@ impl PlainWritePlan {
                 CachedStreamOutput {
                     dict,
                     data,
-                    refiltered,
-                    parameters_removed,
+                    dictionary_options,
                     fingerprint,
                 },
             );
-            Ok(parameters_removed)
+            Ok(dictionary_options.remove_filter_parameters)
         };
 
         let placement = match options.object_streams {

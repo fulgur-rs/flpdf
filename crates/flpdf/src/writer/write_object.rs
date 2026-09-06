@@ -251,12 +251,13 @@ mod tests {
                 self.cur_stream_length = data.len();
                 if self.qdf.is_some() {
                     let length_ref = (!self.direct_stream_lengths).then_some(ObjectRef::new(2, 0));
-                    object.write_stream_body_qdf_with_ref_map_and_removed_and_length(
+                    object.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
                         &mut self.bytes,
                         0,
                         &|object| Ok(object),
                         &BTreeSet::new(),
                         length_ref,
+                        crate::writer::StreamDictionaryOptions::preserve(),
                     )?;
                 } else {
                     object.write_stream_body(&mut self.bytes, false)?;

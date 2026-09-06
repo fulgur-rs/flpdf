@@ -528,81 +528,6 @@ fn append_object(
     Ok(offset)
 }
 
-/// Prepend a qpdf Crypt filter to a live stream dictionary without
-/// materializing a legacy dictionary.
-fn prepend_crypt_filter_to_handle_entries(
-    entries: &mut BTreeMap<Vec<u8>, ObjectHandle>,
-    cf_name: &[u8],
-) -> Result<()> {
-    let crypt_decode_parms = ObjectHandle::dictionary(vec![
-        (
-            b"/Type".to_vec(),
-            ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
-        ),
-        (b"/Name".to_vec(), ObjectHandle::name(cf_name.to_vec())),
-    ]);
-    let existing_filter = entries.remove(b"/Filter".as_slice());
-    let existing_decode_parms = entries.remove(b"/DecodeParms".as_slice());
-
-    match existing_filter {
-        None => {
-            entries.insert(b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec()));
-            entries.insert(b"/DecodeParms".to_vec(), crypt_decode_parms);
-        }
-        Some(filter) => {
-            if let Some(name) = filter.try_as_name()? {
-                entries.insert(
-                    b"/Filter".to_vec(),
-                    ObjectHandle::array(vec![
-                        ObjectHandle::name(b"Crypt".to_vec()),
-                        ObjectHandle::name(name),
-                    ]),
-                );
-                entries.insert(
-                    b"/DecodeParms".to_vec(),
-                    ObjectHandle::array(vec![
-                        crypt_decode_parms,
-                        existing_decode_parms.unwrap_or_else(ObjectHandle::null),
-                    ]),
-                );
-            } else if let Some(mut filters) = filter.try_as_array()? {
-                let chain_len = filters.len();
-                let mut new_filters = Vec::with_capacity(chain_len + 1);
-                new_filters.push(ObjectHandle::name(b"Crypt".to_vec()));
-                new_filters.append(&mut filters);
-
-                let mut new_decode_parms = Vec::with_capacity(chain_len + 1);
-                new_decode_parms.push(crypt_decode_parms);
-                match existing_decode_parms {
-                    None => new_decode_parms.extend((0..chain_len).map(|_| ObjectHandle::null())),
-                    Some(params) => {
-                        if let Some(params) = params.try_as_array()? {
-                            new_decode_parms.extend(
-                                params
-                                    .into_iter()
-                                    .chain(std::iter::repeat_with(ObjectHandle::null))
-                                    .take(chain_len),
-                            );
-                        } else {
-                            new_decode_parms.push(params);
-                            new_decode_parms.extend((1..chain_len).map(|_| ObjectHandle::null()));
-                        }
-                    }
-                }
-                entries.insert(b"/Filter".to_vec(), ObjectHandle::array(new_filters));
-                entries.insert(
-                    b"/DecodeParms".to_vec(),
-                    ObjectHandle::array(new_decode_parms),
-                );
-            } else {
-                entries.insert(b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec()));
-                entries.insert(b"/DecodeParms".to_vec(), crypt_decode_parms);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Append one live-handle body object in output-number space.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object(
@@ -636,7 +561,7 @@ fn append_body_object(
         );
     }
 
-    let (dict, data, mut refiltered) =
+    let (dict, data, dictionary_options) =
         crate::writer::plain::body::canonical_stream_output_for_linearization(
             object,
             options,
@@ -646,13 +571,10 @@ fn append_body_object(
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
     let cleartext_metadata = payload_ctx
         .is_some_and(|ctx| !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref));
-    if cleartext_metadata {
-        prepend_crypt_filter_to_handle_entries(&mut entries, b"Identity")?;
-        // The final dictionary now carries an explicit `/Crypt` stage, so it
-        // is no longer the lone `/FlateDecode` shape that selects qpdf's
-        // refiltered key ordering.
-        refiltered = false;
-    }
+    // qpdf clears the active data key for cleartext metadata and leaves the
+    // stream dictionary's ordinary filter policy to `unparseObject`; it does
+    // not inject a synthetic `/Crypt /Identity` stage here
+    // (`QPDFWriter.cc:1539-1546`).
 
     let mut payload_length = data.len();
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
@@ -672,13 +594,22 @@ fn append_body_object(
             new_ref,
             None,
             &dict,
-            crate::writer::encrypted_strings::StreamDictOptions::new(false, refiltered, true),
+            crate::writer::encrypted_strings::StreamDictOptions::new(
+                false,
+                dictionary_options,
+                true,
+            ),
             &map,
             removed_refs,
             None,
         )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
     } else {
-        dict.write_stream_body_with_ref_map_and_removed(bytes, refiltered, &map, removed_refs)?;
+        dict.write_stream_body_with_ref_map_and_removed_with_options(
+            bytes,
+            dictionary_options,
+            &map,
+            removed_refs,
+        )?;
     }
 
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {

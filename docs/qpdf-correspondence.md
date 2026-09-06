@@ -1791,6 +1791,23 @@ canonical type-warning boundary として利用し、qtest driver は警告を�
 捕捉だけを行う。Pinned qpdf 11.9.0 の `test_driver 81 -` は exit 0、stdout
 `test 81 done`、stderr空を返す。
 
+### `QPDFWriter::willFilterStream` と refiltered stream dictionary
+
+`.48.64`でwriterのstream dictionary処理をqpdfの責務境界へ戻した。
+`canonical_stream_output_with_rewrite_policy`はpipeの2回試行、provider/token-filterの
+buffer、`filtering_attempted`を所有するが、辞書キーを先に削除しない。
+`writer/object.rs::prepare_stream_dict_entries`が`QPDFWriter.cc:1440-1486`のshallow-copy
+ownerとして`/Length`、空`/DecodeParms`、`/Crypt`、成功filter時の`/Filter`/`/DecodeParms`
+を出力用copyで処理する。compressionの有無は独立した`add_flate_filter`で表し、metadata
+decodeやuncompressではsource filterを消してもFlateを追加しない。外部streamの
+`/F`・`/FFilter`・`/FDecodeParms`は全分岐で保持する。
+
+`tests/oracle/qpdf_refiltered_stream_dictionary_probe.cc`はqpdf 11.9.0でrefilter、decode、
+filter-on-write veto、metadata、retry provider、token filterを実測し、Rustの
+`refiltered_stream_dictionary_tests.rs`が辞書値・retry flag・provider回数・token EOFを
+同じrunの契約として固定する。plain cache、specialized、linearizedの各consumerには
+同じ`StreamDictionaryOptions`を渡し、linearizedの専用pre-probe自体は変更していない。
+
 ### `QPDF::getRoot` の test_driver consumer
 
 `libqpdf/QPDF.cc:2355-2368` の `QPDF::getRoot` は trailer の `/Root` を

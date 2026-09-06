@@ -4,7 +4,9 @@ use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncr
 use crate::object_handle::ObjectHandle;
 use crate::pdf_syntax::{write_hex_string, write_name_escaped, write_string_value};
 use crate::writer::encryption_state::WriterEncryptionState;
-use crate::writer::{EncryptionContext, ObjectWriterEmission, WriteCipher, WriterOptions};
+use crate::writer::{
+    EncryptionContext, ObjectWriterEmission, StreamDictionaryOptions, WriteCipher, WriterOptions,
+};
 use crate::ObjectRef;
 
 type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
@@ -12,15 +14,19 @@ type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
 #[derive(Clone, Copy)]
 pub(crate) struct StreamDictOptions {
     qdf: bool,
-    refiltered: bool,
+    dictionary: StreamDictionaryOptions,
     encrypt_strings: bool,
 }
 
 impl StreamDictOptions {
-    pub(crate) const fn new(qdf: bool, refiltered: bool, encrypt_strings: bool) -> Self {
+    pub(crate) const fn new(
+        qdf: bool,
+        dictionary: StreamDictionaryOptions,
+        encrypt_strings: bool,
+    ) -> Self {
         Self {
             qdf,
-            refiltered,
+            dictionary,
             encrypt_strings,
         }
     }
@@ -175,17 +181,19 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         if !options.encrypt_strings {
             if options.qdf {
-                return dict.write_stream_body_qdf_with_ref_map_and_removed_and_length(
-                    out,
-                    0,
-                    map,
-                    removed_refs,
-                    length_ref,
-                );
+                return dict
+                    .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                        out,
+                        0,
+                        map,
+                        removed_refs,
+                        length_ref,
+                        options.dictionary,
+                    );
             }
-            return dict.write_stream_body_with_ref_map_and_removed(
+            return dict.write_stream_body_with_ref_map_and_removed_with_options(
                 out,
-                options.refiltered,
+                options.dictionary,
                 map,
                 removed_refs,
             );
@@ -207,18 +215,19 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if options.qdf {
-                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
                         out,
                         0,
                         map,
                         removed_refs,
                         length_ref,
+                        options.dictionary,
                         &mut write_string,
                     )
                 } else {
-                    dict.write_stream_body_with_ref_map_and_removed_with_string_writer(
+                    dict.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
                         out,
-                        options.refiltered,
+                        options.dictionary,
                         map,
                         removed_refs,
                         &mut write_string,

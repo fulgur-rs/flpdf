@@ -20,6 +20,38 @@ pub(crate) enum TrailerKind {
     LinearizedSecond { size: i64 },
 }
 
+/// Stream-dictionary changes selected by qpdf's `willFilterStream` result.
+///
+/// `remove_filter_parameters` corresponds to `f_filtered` in
+/// `QPDFWriter::unparseObject`: it removes only `/Filter` and `/DecodeParms`
+/// from the shallow dictionary copy. `add_flate_filter` is the independent
+/// `compress && f_filtered` tail. Keeping these bits separate matters for
+/// uncompressing and metadata streams, where qpdf removes the source filter
+/// parameters without appending a new Flate filter
+/// (`libqpdf/QPDFWriter.cc:1274-1284,1440-1455,1508-1522`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamDictionaryOptions {
+    pub(crate) remove_filter_parameters: bool,
+    pub(crate) add_flate_filter: bool,
+}
+
+impl StreamDictionaryOptions {
+    pub(crate) const fn new(remove_filter_parameters: bool, add_flate_filter: bool) -> Self {
+        Self {
+            remove_filter_parameters,
+            add_flate_filter,
+        }
+    }
+
+    pub(crate) const fn preserve() -> Self {
+        Self::new(false, false)
+    }
+
+    pub(crate) const fn from_refiltered(refiltered: bool) -> Self {
+        Self::new(refiltered, refiltered)
+    }
+}
+
 /// The single writer-owned emission surface for live `ObjectHandle` values.
 ///
 /// This is deliberately crate-private: it is the writer-owned replacement for
@@ -100,6 +132,7 @@ pub(crate) trait ObjectWriterEmission {
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
     #[cfg(test)]
     fn write_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
         out: &mut Vec<u8>,
@@ -108,6 +141,16 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
     ) -> Result<()>;
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
+    ) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -115,6 +158,21 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
+        F,
+    >(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -128,6 +186,7 @@ pub(crate) trait ObjectWriterEmission {
     ) -> Result<()>
     where
         F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
@@ -135,9 +194,17 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    fn write_stream_body_with_ref_map_and_removed_with_options(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()>;
     /// Stream-dictionary emission with a direct output `/Length` override.
     /// The source handle remains unchanged; this mirrors qpdf's stream writer,
     /// which computes the emitted length from the bytes supplied to its pipe.
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length(
         &self,
         out: &mut Vec<u8>,
@@ -146,10 +213,29 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         length: usize,
     ) -> Result<()>;
+    fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length: usize,
+    ) -> Result<()>;
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>;
+    fn write_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
@@ -510,7 +596,11 @@ impl ObjectWriterEmission for ObjectHandle {
                 }
                 _ => Vec::new(),
             };
-            unparse_stream_dict_entries(&entries, refiltered, out)
+            unparse_stream_dict_entries(
+                &entries,
+                StreamDictionaryOptions::from_refiltered(refiltered),
+                out,
+            )
         })
     }
 
@@ -631,12 +721,7 @@ impl ObjectWriterEmission for ObjectHandle {
         })
     }
 
-    /// QDF stream-dictionary emission with the same reference remapping and
-    /// null visibility rules, but with an optional synthetic `/Length`
-    /// reference. QDF full-rewrite streams do not retain the source length;
-    /// qpdf writes a fresh holder immediately after the stream body. Keeping
-    /// that override at the serializer boundary avoids manufacturing a fake
-    /// source handle for an output-only object number.
+    #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length(
         &self,
         out: &mut Vec<u8>,
@@ -644,6 +729,31 @@ impl ObjectWriterEmission for ObjectHandle {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
+    ) -> Result<()> {
+        self.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+            out,
+            indent,
+            map,
+            removed_refs,
+            length_ref,
+            StreamDictionaryOptions::preserve(),
+        )
+    }
+
+    /// QDF stream-dictionary emission with the same reference remapping and
+    /// null visibility rules, but with an optional synthetic `/Length`
+    /// reference. QDF full-rewrite streams do not retain the source length;
+    /// qpdf writes a fresh holder immediately after the stream body. Keeping
+    /// that override at the serializer boundary avoids manufacturing a fake
+    /// source handle for an output-only object number.
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
     ) -> Result<()> {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
@@ -674,13 +784,12 @@ impl ObjectWriterEmission for ObjectHandle {
                 map,
                 removed_refs,
                 length_ref,
+                options,
             )
         })
     }
 
-    /// QDF stream-dictionary emission that combines output-reference
-    /// remapping, removed-reference null visibility, and encrypted string
-    /// serialization.
+    #[cfg(test)]
     fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -688,6 +797,35 @@ impl ObjectWriterEmission for ObjectHandle {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         length_ref: Option<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        self.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+            out,
+            indent,
+            map,
+            removed_refs,
+            length_ref,
+            StreamDictionaryOptions::preserve(),
+            write_string,
+        )
+    }
+
+    /// QDF stream-dictionary emission that combines output-reference
+    /// remapping, removed-reference null visibility, and encrypted string
+    /// serialization.
+    fn write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options<
+        F,
+    >(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        options: StreamDictionaryOptions,
         write_string: &mut F,
     ) -> Result<()>
     where
@@ -722,6 +860,7 @@ impl ObjectWriterEmission for ObjectHandle {
                 map,
                 removed_refs,
                 length_ref,
+                options,
                 write_string,
             )
         })
@@ -766,12 +905,28 @@ impl ObjectWriterEmission for ObjectHandle {
         })
     }
 
-    /// Stream-dictionary writer emission with output reference remapping and
-    /// qpdf null visibility for references removed during this write.
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        self.write_stream_body_with_ref_map_and_removed_with_options(
+            out,
+            StreamDictionaryOptions::from_refiltered(refiltered),
+            map,
+            removed_refs,
+        )
+    }
+
+    /// Stream-dictionary writer emission with output reference remapping and
+    /// qpdf null visibility for references removed during this write.
+    fn write_stream_body_with_ref_map_and_removed_with_options(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
@@ -797,14 +952,32 @@ impl ObjectWriterEmission for ObjectHandle {
                 }
                 _ => Vec::new(),
             };
-            unparse_stream_dict_entries_with_ref_map(&entries, refiltered, out, map, removed_refs)
+            unparse_stream_dict_entries_with_ref_map(&entries, options, out, map, removed_refs)
         })
     }
 
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_and_length(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length: usize,
+    ) -> Result<()> {
+        self.write_stream_body_with_ref_map_and_removed_and_length_with_options(
+            out,
+            StreamDictionaryOptions::from_refiltered(refiltered),
+            map,
+            removed_refs,
+            length,
+        )
+    }
+
+    fn write_stream_body_with_ref_map_and_removed_and_length_with_options(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         length: usize,
@@ -833,7 +1006,7 @@ impl ObjectWriterEmission for ObjectHandle {
             };
             unparse_stream_dict_entries_with_ref_map_and_length(
                 &entries,
-                refiltered,
+                options,
                 out,
                 map,
                 removed_refs,
@@ -842,12 +1015,33 @@ impl ObjectWriterEmission for ObjectHandle {
         })
     }
 
-    /// Compact stream-dictionary emission with output-reference remapping,
-    /// removed-reference null visibility, and encrypted string serialization.
+    #[cfg(test)]
     fn write_stream_body_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
         refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        self.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
+            out,
+            StreamDictionaryOptions::from_refiltered(refiltered),
+            map,
+            removed_refs,
+            write_string,
+        )
+    }
+
+    /// Compact stream-dictionary emission with output-reference remapping,
+    /// removed-reference null visibility, and encrypted string serialization.
+    fn write_stream_body_with_ref_map_and_removed_with_options_and_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
         write_string: &mut F,
@@ -879,7 +1073,7 @@ impl ObjectWriterEmission for ObjectHandle {
             };
             unparse_stream_dict_entries_with_ref_map_and_string_writer(
                 &entries,
-                refiltered,
+                options,
                 out,
                 map,
                 removed_refs,
@@ -1121,6 +1315,99 @@ impl ObjectWriterEmission for ObjectHandle {
         write_id_style_value_handle_with_ref_map(self, out, map, removed_refs)
     }
 }
+/// Apply qpdf's stream-dictionary preparation to a shallow copy.
+///
+/// `/Length` is always supplied by the writer. qpdf then removes an empty
+/// `/DecodeParms` array, removes only `/Filter` and `/DecodeParms` when the
+/// stream was successfully filtered, or strips `/Crypt` from the existing
+/// filter list when the raw source is retained. External-file keys (`/F`,
+/// `/FFilter`, and `/FDecodeParms`) are untouched in every branch
+/// (`libqpdf/QPDFWriter.cc:1440-1485`).
+fn prepare_stream_dict_entries(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    options: StreamDictionaryOptions,
+) -> Result<Vec<(Vec<u8>, ObjectHandle)>> {
+    let mut prepared: Vec<_> = entries.to_vec();
+
+    // qpdf probes an empty `/DecodeParms` array before deciding whether the
+    // filtered branch will remove the key (`QPDFWriter.cc:1444-1455`). This
+    // lookup is intentionally part of the same lazy-resolution boundary.
+    if let Some((index, value)) = prepared
+        .iter()
+        .enumerate()
+        .find(|(_, (key, _))| key.as_slice() == b"/DecodeParms")
+    {
+        if value
+            .1
+            .try_as_array()?
+            .is_some_and(|items| items.is_empty())
+        {
+            prepared.remove(index);
+        }
+    }
+
+    if options.remove_filter_parameters {
+        prepared
+            .retain(|(key, _)| key.as_slice() != b"/Filter" && key.as_slice() != b"/DecodeParms");
+    } else {
+        remove_crypt_filter_from_entries(&mut prepared)?;
+    }
+    Ok(prepared)
+}
+
+/// Remove the first `/Crypt` filter and its paired decode parameters from a
+/// copied dictionary. This mutates only the copy, matching qpdf's shallow
+/// `unparseObject` preparation.
+fn remove_crypt_filter_from_entries(entries: &mut Vec<(Vec<u8>, ObjectHandle)>) -> Result<()> {
+    let Some(filter_index) = entries
+        .iter()
+        .position(|(key, _)| key.as_slice() == b"/Filter")
+    else {
+        return Ok(());
+    };
+    let filter = entries[filter_index].1.clone();
+    if filter.try_is_name_and_equals(b"Crypt")? {
+        entries.remove(filter_index);
+        entries.retain(|(key, _)| key.as_slice() != b"/DecodeParms");
+        return Ok(());
+    }
+    let Some(filters) = filter.try_as_array()? else {
+        return Ok(());
+    };
+    let mut crypt_index = None;
+    for (index, item) in filters.iter().enumerate() {
+        if item.try_is_name_and_equals(b"Crypt")? {
+            crypt_index = Some(index);
+            break;
+        }
+    }
+    let Some(crypt_index) = crypt_index else {
+        return Ok(());
+    };
+    // qpdf's shallow dictionary copy still shares this array QObject with
+    // the source dictionary; `eraseItem` therefore mutates the live alias in
+    // place. Keep that identity by calling the canonical array mutator
+    // instead of replacing the value with a newly allocated array.
+    filter.erase_array_item(crypt_index)?;
+
+    let Some(decode_index) = entries
+        .iter()
+        .position(|(key, _)| key.as_slice() == b"/DecodeParms")
+    else {
+        // `getKey` returns qpdf's contextual null when the key is absent, and
+        // qpdf still calls `eraseItem` on that handle. Preserve the call's
+        // warning/error boundary instead of silently skipping it.
+        let _ = ObjectHandle::null().erase_array_item(crypt_index);
+        return Ok(());
+    };
+    let decode = entries[decode_index].1.clone();
+    // qpdf calls `decode_parms.eraseItem(idx)` unconditionally after removing
+    // the Crypt filter. The canonical mutator preserves its warning and
+    // out-of-bounds behavior for malformed/non-array parameter values.
+    decode.erase_array_item(crypt_index)?;
+    Ok(())
+}
+
 // Writes a stream dictionary's own body -- `write_stream_body`'s sole
 // callee -- matching `Dictionary::write_pdf_stream`'s established shape
 // (`object.rs`) with `visible_dict_entries`'s null-suppression layered on
@@ -1155,25 +1442,13 @@ impl ObjectWriterEmission for ObjectHandle {
 // removes these entries before checking which dictionary values are visible.
 fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
-    refiltered: bool,
+    options: StreamDictionaryOptions,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let excluded_entries;
-    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
-        excluded_entries = entries
-            .iter()
-            .filter(|entry| {
-                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        &excluded_entries
-    } else {
-        entries
-    };
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
@@ -1182,7 +1457,7 @@ fn unparse_stream_dict_entries(
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child(value, out)?;
         }
@@ -1191,7 +1466,7 @@ fn unparse_stream_dict_entries(
         out.extend_from_slice(b" /Length ");
         write_child(length, out)?;
     }
-    if refiltered {
+    if options.add_flate_filter {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(b" >>");
@@ -1222,9 +1497,10 @@ fn unparse_stream_dict_entries_qdf(
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let entries = prepare_stream_dict_entries(entries, StreamDictionaryOptions::preserve())?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
@@ -1233,7 +1509,7 @@ fn unparse_stream_dict_entries_qdf(
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
@@ -1257,10 +1533,12 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
+    options: StreamDictionaryOptions,
 ) -> Result<()> {
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
@@ -1272,7 +1550,7 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
         }
@@ -1289,11 +1567,16 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
         write_child_qdf_with_ref_map(length, indent + 2, out, map, removed_refs)?;
         out.push(b'\n');
     }
+    if options.add_flate_filter {
+        push_spaces(out, indent + 2);
+        out.extend_from_slice(b"/Filter /FlateDecode\n");
+    }
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
@@ -1301,14 +1584,16 @@ fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
+    options: StreamDictionaryOptions,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
@@ -1320,7 +1605,7 @@ where
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             out.push(b'\n');
             continue;
@@ -1352,6 +1637,10 @@ where
         out.extend_from_slice(b"null");
     }
     out.push(b'\n');
+    if options.add_flate_filter {
+        push_spaces(out, indent + 2);
+        out.extend_from_slice(b"/Filter /FlateDecode\n");
+    }
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
     Ok(())
@@ -1367,22 +1656,13 @@ fn unparse_stream_dict_entries_with_string_writer<F>(
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
-    let excluded_entries;
-    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
-        excluded_entries = entries
-            .iter()
-            .filter(|entry| {
-                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        &excluded_entries
-    } else {
-        entries
-    };
+    let entries = prepare_stream_dict_entries(
+        entries,
+        StreamDictionaryOptions::from_refiltered(refiltered),
+    )?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
@@ -1391,7 +1671,7 @@ where
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
             continue;
         }
@@ -1450,14 +1730,14 @@ where
 
 fn unparse_stream_dict_entries_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
-    refiltered: bool,
+    options: StreamDictionaryOptions,
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     unparse_stream_dict_entries_with_ref_map_and_length(
         entries,
-        refiltered,
+        options,
         out,
         map,
         removed_refs,
@@ -1467,28 +1747,16 @@ fn unparse_stream_dict_entries_with_ref_map(
 
 fn unparse_stream_dict_entries_with_ref_map_and_length(
     entries: &[(Vec<u8>, ObjectHandle)],
-    refiltered: bool,
+    options: StreamDictionaryOptions,
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_override: Option<usize>,
 ) -> Result<()> {
-    let excluded_entries;
-    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
-        excluded_entries = entries
-            .iter()
-            .filter(|entry| {
-                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        &excluded_entries
-    } else {
-        entries
-    };
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
@@ -1500,7 +1768,7 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
@@ -1512,7 +1780,7 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
         out.extend_from_slice(b" /Length ");
         write_child_with_ref_map(length, out, map, removed_refs)?;
     }
-    if refiltered {
+    if options.add_flate_filter {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(b" >>");
@@ -1521,7 +1789,7 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
 
 fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
     entries: &[(Vec<u8>, ObjectHandle)],
-    refiltered: bool,
+    options: StreamDictionaryOptions,
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
@@ -1530,22 +1798,10 @@ fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
-    let excluded_entries;
-    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
-        excluded_entries = entries
-            .iter()
-            .filter(|entry| {
-                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        &excluded_entries
-    } else {
-        entries
-    };
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
-    for (key, value) in visible_dict_entries(entries)? {
+    for (key, value) in visible_dict_entries(&entries)? {
         if is_removed_reference(value, removed_refs) {
             continue;
         }
@@ -1557,7 +1813,7 @@ where
         write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
         if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             continue;
         }
@@ -1567,7 +1823,7 @@ where
         out.extend_from_slice(b" /Length ");
         write_child_with_ref_map_and_string_writer(length, out, map, removed_refs, write_string)?;
     }
-    if refiltered {
+    if options.add_flate_filter {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(b" >>");
