@@ -1453,7 +1453,9 @@ fn write_first_page_xref_stream(
     // with spaces; qpdf starts the first-page xref stream on a fresh line, so emit
     // the line-break separator here (the classic path's analogue is in
     // `write_part1_xref_and_trailer`). This lands the object at qpdf's offset.
-    bytes.push(b'\n');
+    if bytes.last() != Some(&b'\n') {
+        bytes.push(b'\n');
+    }
     let obj_offset = bytes.len();
     // Space placeholder of exactly the region length, then the trailing newline
     // (outside the region, mirroring qpdf). The placeholder content is

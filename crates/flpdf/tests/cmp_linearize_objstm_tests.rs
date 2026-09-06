@@ -1760,6 +1760,33 @@ mod common;
 #[allow(unused_imports)]
 use common::{write_linearized_with_settings, WriterTestSettings};
 
+#[test]
+fn linearized_objstm_extra_header_has_one_boundary_newline() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("one-page.pdf");
+    let file = std::fs::File::open(&path).expect("open one-page fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture as PDF");
+    let settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        extra_header_text: "%% Comment\n% No newline".to_owned(),
+        ..WriterTestSettings::default()
+    };
+
+    let output = write_linearized_with_settings(&mut pdf, &settings)
+        .expect("write linearized ObjStm output with extra header");
+    let marker = b"%% Comment\n% No newline\n";
+    let marker_start = find(&output, marker).expect("extra header should be present");
+    assert!(marker_start > 0, "extra header must not start at byte zero");
+    assert_eq!(output[marker_start - 1], b'\n');
+    assert_ne!(
+        output.get(marker_start + marker.len()),
+        Some(&b'\n'),
+        "qpdf starts the first-page xref-stream object immediately after the header"
+    );
+}
+
 /// Linearize `fixture` with generate + a forced version (qpdf-matching options).
 fn flpdf_linearized_objstm_force(fixture: &str, force: &str) -> Vec<u8> {
     flpdf_linearized_objstm_mode_force(fixture, ObjectStreamMode::Generate, force)
