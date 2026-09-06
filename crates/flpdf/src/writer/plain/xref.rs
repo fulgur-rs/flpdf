@@ -481,6 +481,7 @@ fn written_xref_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn trailer() -> TrailerPlan {
         TrailerPlan {
@@ -493,6 +494,41 @@ mod tests {
             structural_filtered: false,
             qdf: false,
         }
+    }
+
+    #[test]
+    fn classic_trailer_uses_live_shared_owner_for_null_and_unknown_keys() {
+        let trailer_handle = ObjectHandle::dictionary(vec![
+            (b"/Info".to_vec(), ObjectHandle::integer(1)),
+            (b"/Custom".to_vec(), ObjectHandle::name(b"Value".to_vec())),
+            (b"/NullEntry".to_vec(), ObjectHandle::null()),
+            (b"/Size".to_vec(), ObjectHandle::integer(99)),
+            (
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"id0".to_vec()),
+                    ObjectHandle::string(b"id1".to_vec()),
+                ]),
+            ),
+        ]);
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+        let mut bytes = Vec::new();
+        let map = |object_ref: ObjectRef| -> crate::Result<ObjectRef> { Ok(object_ref) };
+
+        append_xref_and_trailer_with_handle(
+            &mut bytes,
+            &layout,
+            &trailer(),
+            &trailer_handle,
+            &map,
+            &BTreeSet::new(),
+        )
+        .expect("live trailer owner emits classic output");
+
+        let text = String::from_utf8(bytes).expect("classic output is UTF-8");
+        assert!(text.contains("trailer << /Info 1 /Custom /Value /Size 2 /ID [<696430><696431>] >>"));
+        assert!(!text.contains("/NullEntry"));
     }
 
     #[test]
