@@ -2582,26 +2582,7 @@ fn main() {
         }
         return;
     }
-    if raw_args.len() == 2 {
-        match raw_args[1].to_str() {
-            Some("--version") | Some("-version") => {
-                print_qpdf_version();
-                return;
-            }
-            Some("--copyright") | Some("-copyright") => {
-                print_qpdf_copyright();
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    let PreprocessedArgs {
-        residual_args,
-        overlay_specs,
-        attachment_segments,
-        raw_overrides,
-    } = match preprocess_qpdf_args(raw_args) {
+    let preprocessed = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             // qpdf's arg parser raises its errors through
@@ -2616,6 +2597,25 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if preprocessed.residual_args.len() == 2 {
+        match preprocessed.residual_args[1].to_str() {
+            Some("--version") | Some("-version") => {
+                print_qpdf_version();
+                return;
+            }
+            Some("--copyright") | Some("-copyright") => {
+                print_qpdf_copyright();
+                return;
+            }
+            _ => {}
+        }
+    }
+    let PreprocessedArgs {
+        residual_args,
+        overlay_specs,
+        attachment_segments,
+        raw_overrides,
+    } = preprocessed;
     let mut args = cli_parse_from(residual_args);
     apply_raw_overrides(&mut args, raw_overrides);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but

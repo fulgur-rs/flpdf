@@ -53,3 +53,33 @@ fn qpdf_copyright_prints_the_pinned_license_text_without_opening_input() {
         .stdout(qpdf_copyright_output())
         .stderr("");
 }
+
+#[test]
+fn qpdf_version_from_argfile_is_handled_after_expansion() {
+    let directory = tempfile::tempdir().expect("argument-file directory");
+    let path = directory.path().join("version.args");
+    std::fs::write(&path, b"--version\n").expect("write version argument file");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg(format!("@{}", path.display()))
+        .assert()
+        .success()
+        .stdout(qpdf_version_output())
+        .stderr("");
+}
+
+#[test]
+fn qpdf_copyright_from_argfile_is_handled_after_expansion() {
+    let directory = tempfile::tempdir().expect("argument-file directory");
+    let path = directory.path().join("copyright.args");
+    std::fs::write(&path, b"--copyright\n").expect("write copyright argument file");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .arg(format!("@{}", path.display()))
+        .assert()
+        .success()
+        .stdout(qpdf_copyright_output())
+        .stderr("");
+}
