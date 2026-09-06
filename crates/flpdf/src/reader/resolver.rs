@@ -1693,12 +1693,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow_mut().attempt_recovery = value;
     }
 
-    /// Rebind the resolver's qpdf document identity when an already
-    /// constructed document installs a new input source.
-    pub(crate) fn set_pdf_unique_id(&self, value: u64) {
-        self.pdf_unique_id.set(value);
-    }
-
     fn stream_recovery_enabled(&self) -> bool {
         self.core.borrow().attempt_recovery
     }

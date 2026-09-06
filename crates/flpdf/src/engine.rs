@@ -203,9 +203,24 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn open_with_repair_mode(
+        reader: R,
+        options: PdfOpenOptions,
+        allow_bad_password: bool,
+    ) -> Result<Self> {
+        Self::open_with_repair_mode_as(reader, options, allow_bad_password, None)
+    }
+
+    /// The open path with an optional pre-assigned document identity.
+    ///
+    /// `QPDF::processMemoryFile` installs a source on an already constructed
+    /// `QPDF`, so every handle minted while parsing must carry that object's
+    /// identity rather than a fresh one; `None` allocates a new identity for
+    /// the ordinary factory functions.
+    fn open_with_repair_mode_as(
         mut reader: R,
         options: PdfOpenOptions,
         allow_bad_password: bool,
+        unique_id: Option<u64>,
     ) -> Result<Self> {
         let warning_options = ResolverWarningOptions::new(
             options
@@ -265,7 +280,7 @@ impl<R: Read + Seek> Pdf<R> {
         // Hoisted out of the struct literal because the resolver needs the
         // same id: it stamps `pdf_unique_id` onto every canonical handle it
         // mints, which `ObjectHandle::belongs_to_pdf` answers on.
-        let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
+        let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
         let initial_diagnostics = loaded.repair_diagnostics.clone();
         let resolver = ResolverHandle::new_shared(
             reader,
@@ -502,10 +517,15 @@ impl Pdf<Cursor<Vec<u8>>> {
             description: description.as_ref().to_vec(),
             ..PdfOpenOptions::default()
         };
-        let mut replacement = Self::open_mem_owned_with_options(bytes, options)?;
-        replacement.resolver.set_pdf_unique_id(self.unique_id);
-        replacement.unique_id = self.unique_id;
-        *self = replacement;
+        // Parse with this document's identity so the handles minted during
+        // the open (trailer, root, cached objects) and any handle created
+        // afterwards agree on their owner.
+        *self = Self::open_with_repair_mode_as(
+            Cursor::new(bytes),
+            options,
+            false,
+            Some(self.unique_id),
+        )?;
         Ok(())
     }
 
@@ -734,6 +754,14 @@ mod tests {
 
         assert!(pdf.parsed);
         assert_eq!(pdf.unique_id, unique_id);
-        assert!(pdf.root_handle().is_ok());
+        // Handles minted while parsing and handles created afterwards must
+        // share one owner: qpdf's processMemoryFile keeps working on the
+        // same QPDF object.
+        let root = pdf.root_handle().expect("root resolves");
+        let stream = pdf
+            .new_stream_with_data(std::rc::Rc::new(b"x".to_vec()))
+            .expect("new stream on the processed document");
+        root.replace_key(b"/X", stream)
+            .expect("a handle minted during the open accepts a later handle of the same document");
     }
 }
