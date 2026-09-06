@@ -1160,7 +1160,7 @@ struct Cli {
     /// the OUTPUT positional.
     #[arg(
         long = "add-attachment",
-        num_args = 1..,
+        num_args = 0..,
         value_terminator = "--",
         allow_hyphen_values = true,
         value_name = "FILE [sub-flags]",
@@ -2665,7 +2665,7 @@ fn main() {
                     && !args.list_attachments
                     && args.show_attachment.is_none()
                     && args.remove_attachment.is_empty()
-                    && args.add_attachment.is_empty()
+                    && attachment_segments.is_empty()
                     && args.copy_attachments_from.is_empty()
             }
         };
@@ -2833,7 +2833,7 @@ fn main() {
             args.linearize_pass1.as_deref(),
             options,
         )
-    } else if !args.add_attachment.is_empty() {
+    } else if !attachment_segments.is_empty() {
         let options = top_level_writer_options(
             &args,
             normalize_content,
@@ -8325,38 +8325,31 @@ fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> 
 // ── Attachment helpers ──────────────────────────────────────────
 
 /// Parse and retain the PDF timestamp syntax accepted by qpdf's
-/// `QUtil::pdf_time_to_qpdf_time`: `D:YYYYMMDDHHmmSS`, optionally followed by
-/// `Z` or a signed `HH'MM'` offset. The raw value is retained so qpdf's exact
-/// timezone spelling is written to `/Params`.
-fn parse_pdf_date_arg(s: &str) -> CliResult<Vec<u8>> {
-    let s = s
-        .strip_prefix("D:")
-        .ok_or_else(|| format!("invalid PDF date {s:?}: must start with D:"))?;
-    // Validate the required 14-character body is ASCII digits BEFORE slicing
-    // by byte offsets: a multibyte value (e.g. fullwidth digits
-    // `D:２０２４…`) would otherwise panic on a non-char-boundary slice.
-    if s.len() < 14 || !s.as_bytes()[..14].iter().all(u8::is_ascii_digit) {
-        return Err(format!(
-            "invalid PDF date D:{s:?}: need at least 14 ASCII digits (YYYYMMDDHHmmSS)"
-        )
-        .into());
-    }
-    let suffix = &s[14..];
-    let valid_suffix = match suffix.as_bytes() {
-        b"" | b"Z" => true,
-        [sign, hour_tens, hour_ones, b'\'', minute_tens, minute_ones, b'\''] => {
-            matches!(sign, b'+' | b'-')
-                && hour_tens.is_ascii_digit()
-                && hour_ones.is_ascii_digit()
-                && minute_tens.is_ascii_digit()
-                && minute_ones.is_ascii_digit()
+/// `QUtil::pdf_time_to_qpdf_time` (`libqpdf/QUtil.cc:960-983`). qpdf checks
+/// only this exact regex and does not validate calendar ranges. Keep the raw
+/// value so the spelling written to `/Params` remains unchanged.
+fn parse_pdf_date_arg(value: &str) -> CliResult<Vec<u8>> {
+    let bytes = value.as_bytes();
+    let valid_body =
+        bytes.len() >= 16 && bytes[..2] == *b"D:" && bytes[2..16].iter().all(u8::is_ascii_digit);
+    let valid_suffix = match bytes.len() {
+        16 => true,
+        17 => bytes[16] == b'Z',
+        23 => {
+            matches!(bytes[16], b'+' | b'-')
+                && bytes[17].is_ascii_digit()
+                && bytes[18].is_ascii_digit()
+                && bytes[19] == b'\''
+                && bytes[20].is_ascii_digit()
+                && bytes[21].is_ascii_digit()
+                && bytes[22] == b'\''
         }
         _ => false,
     };
-    if !valid_suffix {
-        return Err(format!("invalid PDF date D:{s:?}: timezone must be Z or [+|-]HH'MM'").into());
+    if !valid_body || !valid_suffix {
+        return Err(format!("{value} is not a valid PDF timestamp").into());
     }
-    Ok(format!("D:{s}").into_bytes())
+    Ok(bytes.to_vec())
 }
 
 /// Parsed sub-flags for the `--add-attachment FILE [sub-flags] --` segment.
@@ -8388,7 +8381,7 @@ fn parse_add_attachment_segment<T: RawCliArg>(tokens: Vec<T>) -> CliResult<AddAt
     let mut iter = tokens.into_iter();
     let file: PathBuf = iter
         .next()
-        .ok_or("--add-attachment: missing FILE argument")?
+        .ok_or("add attachment: no file specified")?
         .os_string()
         .into();
 
@@ -8498,28 +8491,6 @@ fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
     path.file_name()
         .ok_or_else(|| format!("cannot determine filename from path {:?}", path).into())
         .map(arg_parser::os_bytes)
-}
-
-/// Append the existing attachment diagnostic's quoted key without converting
-/// arbitrary argv bytes through UTF-8. Printable non-UTF-8 bytes stay raw;
-/// quotes, backslashes, and ASCII control bytes retain the old debug-style
-/// quoting convention in an unambiguous form.
-fn append_debug_quoted_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
-    output.push(b'"');
-    for &byte in bytes {
-        match byte {
-            b'"' => output.extend_from_slice(b"\\\""),
-            b'\\' => output.extend_from_slice(b"\\\\"),
-            b'\n' => output.extend_from_slice(b"\\n"),
-            b'\r' => output.extend_from_slice(b"\\r"),
-            b'\t' => output.extend_from_slice(b"\\t"),
-            byte if byte.is_ascii_control() => {
-                output.extend_from_slice(format!("\\x{byte:02x}").as_bytes())
-            }
-            byte => output.push(byte),
-        }
-    }
-    output.push(b'"');
 }
 
 /// `--add-attachment FILE [sub-flags] -- output.pdf`
@@ -8724,16 +8695,7 @@ fn run_show_attachment(
         let mut job = new_cli_job(suppress_warnings);
         let mut pdf = create_empty_primary_document(&mut job, None)?;
         let key = arg_parser::os_bytes(key);
-        let status = job.show_attachment(&mut pdf, &key).map_err(|error| {
-            let detail = error
-                .raw_message()
-                .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
-            let mut message = b"--show-attachment: key ".to_vec();
-            append_debug_quoted_bytes(&mut message, &key);
-            message.extend_from_slice(b" not found or unreadable: ");
-            message.extend_from_slice(&detail);
-            Error::SystemBytes(message)
-        })?;
+        let status = job.show_attachment(&mut pdf, &key)?;
         return finish_job_exit_status(status);
     }
     let input = input.ok_or_else(missing_input_usage_error)?;
@@ -8741,16 +8703,7 @@ fn run_show_attachment(
     let mut job = new_cli_job(suppress_warnings);
     job.set_input_name_bytes(path_description(&input));
     let key = arg_parser::os_bytes(key);
-    let status = job.show_attachment(&mut pdf, &key).map_err(|error| {
-        let detail = error
-            .raw_message()
-            .map_or_else(|| error.to_string().into_bytes(), ToOwned::to_owned);
-        let mut message = b"--show-attachment: key ".to_vec();
-        append_debug_quoted_bytes(&mut message, &key);
-        message.extend_from_slice(b" not found or unreadable: ");
-        message.extend_from_slice(&detail);
-        Error::SystemBytes(message)
-    })?;
+    let status = job.show_attachment(&mut pdf, &key)?;
     finish_job_exit_status(status)
 }
 
