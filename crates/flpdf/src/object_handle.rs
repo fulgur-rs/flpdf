@@ -2178,9 +2178,6 @@ impl ObjectHandle {
         for child in &new_children {
             Self::attach_child_to_parent(child, &parent);
         }
-        if let Some(pdf_unique_id) = self.0.borrow().active_pdf_unique_id() {
-            source.associate_pdf_identity(pdf_unique_id, &mut BTreeSet::new());
-        }
     }
 
     /// Turn an indirect canonical slot into the floating null object qpdf
@@ -2383,7 +2380,7 @@ impl ObjectHandle {
     pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let slot = self.0.borrow();
         if slot.object_ref().is_some() {
-            slot.identity.borrow_mut().active_pdf_unique_id == Some(pdf_unique_id)
+            slot.active_pdf_unique_id() == Some(pdf_unique_id)
         } else {
             slot.pdf_unique_ids.is_empty() || slot.pdf_unique_ids.contains(&pdf_unique_id)
         }
@@ -2545,7 +2542,7 @@ impl ObjectHandle {
             if !matches!(&*state, ObjectValue::Unresolved) {
                 return Ok(());
             }
-            (object_ref, slot.resolver().clone())
+            (object_ref, slot.resolver())
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
@@ -6821,7 +6818,7 @@ impl ObjectHandle {
                     "pipeStreamData called for original direct stream".to_owned(),
                 ));
             };
-            (object_ref, slot.resolver().clone())
+            (object_ref, slot.resolver())
         };
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
             return Err(Error::Internal(format!(
