@@ -85,6 +85,22 @@ fn run_flpdf(args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[cfg(unix)]
+fn run_merged_check(program: impl AsRef<std::ffi::OsStr>, args: &[&str], input: &Path) -> Output {
+    ProcessCommand::new("/bin/sh")
+        .args([
+            "-c",
+            r#"program="$1"; shift; exec "$program" "$@" 2>&1"#,
+            "qpdf-check",
+        ])
+        .arg(program)
+        .args(args)
+        .arg(input)
+        .env("FLPDF_PROGNAME", "qpdf")
+        .output()
+        .unwrap()
+}
+
 fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut remaining = bytes;
@@ -531,6 +547,64 @@ fn qpdf_differential_matches_routed_output_matrix() {
             *text_output,
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn qpdf_differential_preserves_open_warning_order_before_check_banner() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping merged check-order differential");
+        return;
+    }
+
+    let input = Path::new(WARNING_PDF);
+    let qpdf = run_merged_check("qpdf", &["--check"], input);
+    let flpdf = run_merged_check(
+        assert_cmd::cargo::cargo_bin!("flpdf"),
+        &["--repair", "--check"],
+        input,
+    );
+
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf status");
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "status");
+    assert_eq!(flpdf.stdout, qpdf.stdout, "merged stdout/stderr output");
+    assert!(
+        qpdf.stderr.is_empty(),
+        "qpdf shell stderr: {:?}",
+        qpdf.stderr
+    );
+    assert!(
+        flpdf.stderr.is_empty(),
+        "flpdf shell stderr: {:?}",
+        flpdf.stderr
+    );
+
+    let qpdf_no_warn = run_merged_check("qpdf", &["--no-warn", "--check"], input);
+    let flpdf_no_warn = run_merged_check(
+        assert_cmd::cargo::cargo_bin!("flpdf"),
+        &["--no-warn", "--repair", "--check"],
+        input,
+    );
+    assert_eq!(qpdf_no_warn.status.code(), Some(3), "qpdf --no-warn status");
+    assert_eq!(
+        flpdf_no_warn.status.code(),
+        qpdf_no_warn.status.code(),
+        "--no-warn status"
+    );
+    assert_eq!(
+        flpdf_no_warn.stdout, qpdf_no_warn.stdout,
+        "--no-warn merged stdout/stderr output"
+    );
+    assert!(
+        qpdf_no_warn.stderr.is_empty(),
+        "qpdf --no-warn shell stderr: {:?}",
+        qpdf_no_warn.stderr
+    );
+    assert!(
+        flpdf_no_warn.stderr.is_empty(),
+        "flpdf --no-warn shell stderr: {:?}",
+        flpdf_no_warn.stderr
+    );
 }
 
 #[test]

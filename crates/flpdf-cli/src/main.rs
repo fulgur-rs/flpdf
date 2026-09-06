@@ -3912,14 +3912,15 @@ fn run_check(
     job.set_suppress_warnings(no_warn);
     job.set_show_encryption_key(show_encryption_key);
     let mut options = pdf_open_options(repair, password)?;
-    // The job emits the collected diagnostics once, after the qpdf check
-    // banner, and owns the shared warning completion boundary.
-    options.suppress_warnings = true;
+    // qpdf delivers xref-recovery warnings while opening, before the check
+    // banner. Only --no-warn suppresses that live delivery; the check job's
+    // replay path remains available for callers that deliberately opened a
+    // document with warning delivery suppressed.
+    options.suppress_warnings = no_warn;
     let mut pdf =
         match job.open_with_description(BufReader::new(file), path_description(&input), options) {
             Ok(pdf) => pdf,
             Err(error) => {
-                job.report_open_failure(&error)?;
                 return Err(error_with_file(&input, actionable_password_error(error)));
             }
         };
