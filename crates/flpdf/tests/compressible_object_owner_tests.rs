@@ -74,6 +74,46 @@ fn generate_preserve_does_not_seed_a_removed_generation() {
     );
 }
 
+#[test]
+fn repeated_generate_preserve_does_not_resurrect_a_removed_generation() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+    ))
+    .unwrap();
+    let old = pdf
+        .get_all_objects()
+        .unwrap()
+        .into_iter()
+        .find(|object| object.as_stream_dict().is_some())
+        .unwrap();
+    let old_ref = old.object_ref().unwrap();
+    pdf.replace_object(
+        ObjectRef::new(old_ref.number, old_ref.generation + 1),
+        ObjectHandle::integer(42),
+    )
+    .unwrap();
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/ZPending", ObjectHandle::array(vec![]))
+        .unwrap();
+
+    for _ in 0..2 {
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(ObjectStreamMode::Generate);
+        writer.set_preserve_unreferenced_objects(true);
+        writer.set_static_id(true);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+        let output = writer.get_buffer().unwrap();
+        assert!(
+            !output
+                .windows(b"\nnull\nendobj\n".len())
+                .any(|window| window == b"\nnull\nendobj\n"),
+            "a removed generation must stay absent across repeated writes"
+        );
+    }
+}
+
 #[cfg(feature = "qpdf-zlib-compat")]
 #[test]
 fn generated_stale_generation_arrays_match_qpdf_in_both_visit_orders() {

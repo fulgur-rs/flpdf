@@ -17,6 +17,8 @@ pub enum CacheEntry {
     Resolved(ObjectHandle),
     Missing,
     Reserved,
+    /// A qpdf-style removal retained by the compatibility cache so repeated
+    /// enumeration cannot resurrect the erased object reference.
     Deleted,
 }
 
@@ -185,9 +187,20 @@ impl ObjectCache {
             .insert(object_ref, CacheEntry::Unresolved { offset });
     }
 
+    /// Retain a qpdf `removeObject` tombstone in the compatibility cache.
+    /// Resolver removal erases its canonical cache slot; this companion state
+    /// keeps the legacy enumeration from exposing that reference again.
     pub fn set_deleted(&mut self, object_ref: ObjectRef) {
         self.entries.insert(object_ref, CacheEntry::Deleted);
         self.deleted_refs.insert(object_ref);
+    }
+
+    /// Forget a persistent removal when qpdf-style `replaceObject` installs a
+    /// new value under the same object generation.
+    pub(crate) fn clear_deleted(&mut self, object_ref: ObjectRef) {
+        if self.deleted_refs.remove(&object_ref) {
+            self.entries.remove(&object_ref);
+        }
     }
 
     pub(crate) fn deleted_refs(&self) -> Vec<ObjectRef> {

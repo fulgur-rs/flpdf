@@ -1278,6 +1278,12 @@ impl<R: Read + Seek> Pdf<R> {
                 if self.resolver.has_newer_cached_generation(og) {
                     removed.insert(og);
                     self.resolver.remove_object(og)?;
+                    // Keep the compatibility enumeration in the same
+                    // post-remove state on later writer passes. qpdf's
+                    // removeObject erases its only cache entry; flpdf keeps a
+                    // separate legacy cache, so record the persistent tombstone
+                    // there as well.
+                    self.cache.set_deleted(og);
                     continue;
                 }
                 visited[index / 64] |= bit;
@@ -1476,17 +1482,19 @@ impl<R: Read + Seek> Pdf<R> {
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
         // Like `set_object`, this is canonical cache replacement only. Keep it
-        // separate from `deleted_objects`: normal `read_xref` clears after
-        // `/Size` (`QPDF.cc:686-708`), but `reconstruct_xref` clears its
-        // line-scan filter at `:575` before a candidate re-read (`:516-607`).
-        // Never clear or add either registration here. Exact xref/cache removal
-        // remains `removeObject` (`QPDF.cc:1996-2005`).
+        // separate from parser-owned xref recovery state: normal `read_xref`
+        // clears after `/Size` (`QPDF.cc:686-708`), while `reconstruct_xref`
+        // clears its line-scan filter at `:575` before a candidate re-read
+        // (`:516-607`). Exact resolver removal remains `removeObject`
+        // (`QPDF.cc:1996-2005`); only a compatibility tombstone is cleared
+        // below when this replacement re-registers the same object reference.
         //
         // Refresh the compatibility-cache metadata before replacing the
         // canonical value. This keeps recovery-derived xref metadata aligned
         // without changing any other object-cache cell.
         self.synchronize_cache_with_resolver_xref();
         let target = self.resolver.replace_object(object_ref, replacement)?;
+        self.cache.clear_deleted(object_ref);
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.mark_object_handle_mutated(object_ref);
@@ -2331,6 +2339,37 @@ mod compressible_owner_tests {
             .registered_handle(ObjectRef::new(3, 0))
             .is_none());
         assert!(pdf.dangling_references_fixed());
+    }
+
+    #[test]
+    fn compressible_removal_tombstone_is_cleared_by_replacement() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .unwrap();
+        let old = pdf
+            .get_all_objects()
+            .unwrap()
+            .into_iter()
+            .find(|object| object.as_stream_dict().is_some())
+            .unwrap();
+        let old_ref = old.object_ref().unwrap();
+        pdf.replace_object(
+            ObjectRef::new(old_ref.number, old_ref.generation + 1),
+            ObjectHandle::integer(42),
+        )
+        .unwrap();
+
+        let (_, removed) = pdf
+            .get_compressible_objgens_with_removed()
+            .expect("compressible walk succeeds");
+        assert!(removed.contains(&old_ref));
+        assert!(pdf.deleted_object_refs().contains(&old_ref));
+
+        pdf.replace_object(old_ref, ObjectHandle::integer(99))
+            .expect("qpdf-style replacement re-registers the removed generation");
+        assert!(!pdf.deleted_object_refs().contains(&old_ref));
+        assert!(pdf.live_object_refs().contains(&old_ref));
     }
 
     #[test]
