@@ -618,11 +618,20 @@ fn qpdf_differential_matches_remaining_file_error_boundaries() {
     std::fs::write(&recovery_input, b"not a PDF\n").expect("write malformed input");
     let recovery_input = recovery_input.to_str().expect("UTF-8 temporary path");
 
+    let missing_parent_json_path = directory.path().join("missing-parent").join("output.json");
+    let missing_parent_json = missing_parent_json_path
+        .to_str()
+        .expect("UTF-8 temporary path");
+
     let cases = [
         ("directory input", vec![input_directory, output]),
         (
             "missing output parent",
             vec![MINIMAL, missing_parent_output],
+        ),
+        (
+            "missing JSON output parent",
+            vec!["--json=2", MINIMAL, "--json-output", missing_parent_json],
         ),
         ("recovery failure", vec![recovery_input, output]),
     ];

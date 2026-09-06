@@ -6929,11 +6929,14 @@ fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn st
 }
 
 fn open_verified_json_output(input: &File, output: &Path) -> CliResult<File> {
+    // qpdf opens the JSON output with `QUtil::safe_fopen(outfilename, "w")`
+    // (`libqpdf/QPDFJob.cc:3104`), so a failure reads `open <path>: <strerror>`.
     let mut output_file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(output)?;
+        .open(output)
+        .map_err(|error| open_error_with_file(output, error.into()))?;
     let input_handle = same_file::Handle::from_file(input.try_clone()?)?;
     let output_handle = same_file::Handle::from_file(output_file.try_clone()?)?;
     if input_handle == output_handle {
