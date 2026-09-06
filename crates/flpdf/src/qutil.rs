@@ -109,6 +109,49 @@ pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
         .map_err(|error| crate::Error::System(format!("open {filename}: {error}")))
 }
 
+/// Format a signed integer using qpdf's supported bases and width rules.
+///
+/// This is qpdf's `QUtil::int_to_string_base` (`include/qpdf/QUtil.hh:46-48`,
+/// `libqpdf/QUtil.cc:294-300,337-350`). Positive lengths prepend zeroes;
+/// negative lengths append spaces. Unsupported bases are the qpdf
+/// `std::logic_error` boundary and therefore become `Error::Internal`.
+pub fn int_to_string_base(number: i64, base: i32, length: i32) -> crate::Result<String> {
+    let mut converted = match base {
+        8 | 16 => {
+            let magnitude = number.unsigned_abs();
+            let digits = if base == 8 {
+                format!("{magnitude:o}")
+            } else {
+                format!("{magnitude:x}")
+            };
+            if number < 0 {
+                format!("-{digits}")
+            } else {
+                digits
+            }
+        }
+        10 => number.to_string(),
+        _ => {
+            return Err(crate::Error::Internal(
+                "int_to_string_base called with unsupported base".to_owned(),
+            ))
+        }
+    };
+
+    let width = usize::try_from(i64::from(length).unsigned_abs()).map_err(|_| {
+        crate::Error::Internal("int_to_string_base length does not fit usize".to_owned())
+    })?;
+    if length > 0 && converted.len() < width {
+        let mut padded = String::with_capacity(width);
+        padded.extend(std::iter::repeat_n('0', width - converted.len()));
+        padded.push_str(&converted);
+        converted = padded;
+    } else if length < 0 && converted.len() < width {
+        converted.extend(std::iter::repeat_n(' ', width - converted.len()));
+    }
+    Ok(converted)
+}
+
 #[derive(Clone, Copy)]
 enum SingleByteEncoding {
     Ascii,
@@ -320,10 +363,27 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        qpdf_string_to_int_checked, safe_fopen, same_file, utf8_to_ascii, utf8_to_mac_roman,
-        utf8_to_win_ansi, QpdfIntParse,
+        int_to_string_base, qpdf_string_to_int_checked, safe_fopen, same_file, utf8_to_ascii,
+        utf8_to_mac_roman, utf8_to_win_ansi, QpdfIntParse,
     };
     use std::io::{Read, Write};
+
+    #[test]
+    fn int_to_string_base_matches_qpdf_bases_and_widths() {
+        assert_eq!(int_to_string_base(42, 8, 0).unwrap(), "52");
+        assert_eq!(int_to_string_base(42, 10, 4).unwrap(), "0042");
+        assert_eq!(int_to_string_base(-42, 16, 0).unwrap(), "-2a");
+        assert_eq!(int_to_string_base(42, 10, -4).unwrap(), "42  ");
+    }
+
+    #[test]
+    fn int_to_string_base_rejects_an_unsupported_base_as_a_logic_error() {
+        let error = int_to_string_base(0, 12, 0).expect_err("base 12 is not supported by qpdf");
+
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message == "int_to_string_base called with unsupported base")
+        );
+    }
 
     #[test]
     fn safe_fopen_missing_path_is_a_qpdf_system_error() {
