@@ -86,7 +86,6 @@ crates/flpdf/src/object_handle.rs::ObjectHandle::is_null                 # A6
 crates/flpdf/src/reader.rs::Pdf::resolve                                 # A7（曖昧 leaf）
 crates/flpdf/src/reader.rs::Pdf::resolve_handle                          # A7
 crates/flpdf/src/reader.rs::Pdf::resolve_handle_ref                      # A7
-crates/flpdf/src/reader.rs::Pdf::resolve_qpdf_json_handle                # A7
 crates/flpdf/src/object_handle.rs::ObjectHandle::get_key                 # A8 panic 版
 crates/flpdf/src/object_handle.rs::ObjectHandle::has_key                 # A8
 crates/flpdf/src/reader.rs::Pdf::get_all_objects                         # A9
@@ -172,9 +171,7 @@ crates/flpdf/src/xref.rs::push_repair_diagnostics                        # B33 c
 
 # --- (a) deletable route ---
 crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream    # C4
-crates/flpdf/src/filters.rs::stream_filter_capabilities                  # C8 filterable 第 2 実装
 crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle       # C9 filterable 第 3 実装
-crates/flpdf/src/json_inspect.rs::stream_payload_with_decode_status      # C25 第 2 実装
 crates/flpdf/src/filters.rs::decode_stream_data                          # C26
 crates/flpdf/src/filters.rs::decode_stream_data_from_handle              # C27
 crates/flpdf/src/filters.rs::decode_stream_data_recovering               # C28
