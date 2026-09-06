@@ -654,6 +654,45 @@ mod tests {
     }
 
     #[test]
+    fn classic_trailer_keeps_writer_owned_root_when_the_source_slot_is_null() {
+        // Regression: when the source Catalog is not object 1 and source object 1
+        // is null/free/removed, the planner renumbers the Catalog onto output
+        // object 1 and build_writer_trailer_handle installs that output-space
+        // handle as /Root. The trailer owner must not drop /Root via source
+        // null/removed filtering (qpdf's writeTrailer, QPDFWriter.cc:1160-1236,
+        // always emits /Root); only non-/Root source entries are filtered.
+        let trailer_handle = ObjectHandle::dictionary(vec![
+            (b"/Root".to_vec(), ObjectHandle::null()),
+            (b"/NullEntry".to_vec(), ObjectHandle::null()),
+            (b"/Size".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+        let mut bytes = Vec::new();
+        let map = HashMap::new();
+
+        append_xref_and_trailer_with_handle(
+            &mut bytes,
+            &layout,
+            &trailer(),
+            &trailer_handle,
+            &map,
+            &BTreeSet::new(),
+        )
+        .expect("live trailer owner emits classic output");
+
+        let text = String::from_utf8(bytes).expect("classic output is UTF-8");
+        assert!(
+            text.contains("/Root"),
+            "writer-owned /Root must survive source null filtering: {text:?}"
+        );
+        assert!(
+            !text.contains("/NullEntry"),
+            "non-/Root source null entries are still filtered: {text:?}"
+        );
+    }
+
+    #[test]
     fn classic_shared_owner_rejects_an_offset_that_cannot_fit_qpdf_xref() {
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(1, (0, 10_000_000_000));

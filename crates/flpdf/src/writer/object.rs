@@ -3145,10 +3145,17 @@ fn unparse_trailer_entries_with_ref_map(
             }
             _ => {}
         }
-        if suppress_null_values && value.try_is_null()? {
+        // qpdf's writeTrailer always emits the writer-owned /Root
+        // (QPDFWriter.cc:1160-1236 applies no null/removed filtering). Its value
+        // is the output-space Catalog installed by build_writer_trailer_handle,
+        // so source null/removed filtering must never drop it — e.g. when the
+        // source Catalog is not object 1 and source object 1 is null/free/removed
+        // and the Catalog renumbers onto output object 1.
+        let writer_owned_root = key.as_slice() == b"/Root";
+        if !writer_owned_root && suppress_null_values && value.try_is_null()? {
             continue;
         }
-        if is_removed_reference(value, removed_refs) {
+        if !writer_owned_root && is_removed_reference(value, removed_refs) {
             continue;
         }
 
@@ -3278,10 +3285,17 @@ fn unparse_trailer_entries_with_ref_map_and_kind(
             continue;
         }
 
-        if suppress_null_values && value.try_is_null()? {
+        // qpdf's writeTrailer always emits the writer-owned /Root
+        // (QPDFWriter.cc:1160-1236 applies no null/removed filtering). Its value
+        // is the output-space Catalog installed by build_writer_trailer_handle,
+        // so source null/removed filtering must never drop it — e.g. when the
+        // source Catalog is not object 1 and source object 1 is null/free/removed
+        // and the Catalog renumbers onto output object 1.
+        let writer_owned_root = key.as_slice() == b"/Root";
+        if !writer_owned_root && suppress_null_values && value.try_is_null()? {
             continue;
         }
-        if is_removed_reference(value, removed_refs) {
+        if !writer_owned_root && is_removed_reference(value, removed_refs) {
             continue;
         }
         if qdf {
@@ -3350,10 +3364,17 @@ fn unparse_dictionary_entries_with_ref_map_and_id_writer(
 ) -> Result<()> {
     out.extend_from_slice(b"<<");
     for (key, value) in entries {
-        if suppress_null_values && value.try_is_null()? {
+        // qpdf's writeTrailer always emits the writer-owned /Root
+        // (QPDFWriter.cc:1160-1236 applies no null/removed filtering). Its value
+        // is the output-space Catalog installed by build_writer_trailer_handle,
+        // so source null/removed filtering must never drop it — e.g. when the
+        // source Catalog is not object 1 and source object 1 is null/free/removed
+        // and the Catalog renumbers onto output object 1.
+        let writer_owned_root = key.as_slice() == b"/Root";
+        if !writer_owned_root && suppress_null_values && value.try_is_null()? {
             continue;
         }
-        if is_removed_reference(value, removed_refs) {
+        if !writer_owned_root && is_removed_reference(value, removed_refs) {
             continue;
         }
         out.push(b' ');
