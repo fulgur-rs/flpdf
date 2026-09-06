@@ -1,12 +1,14 @@
 //! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
 //!
-//! This module owns the qpdf `QUtil::string_to_int`, `QUtil::utf8_to_ascii`,
-//! `QUtil::utf8_to_win_ansi`, and `QUtil::utf8_to_mac_roman` behavior used by
-//! form appearance generation (`libqpdf/QUtil.cc:1528-1667` and
+//! This module owns the qpdf `QUtil::string_to_int`, `QUtil::safe_fopen`,
+//! `QUtil::utf8_to_ascii`, `QUtil::utf8_to_win_ansi`, and
+//! `QUtil::utf8_to_mac_roman` behavior used by form appearance generation
+//! (`libqpdf/QUtil.cc:490-518,1528-1667` and
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
 //! unrepresentable input to `?`, matching qpdf's default replacement argument.
 //! It does not own PDF resource lookup, font selection, or password policy.
 
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 /// Return whether two existing paths identify the same filesystem object.
@@ -35,6 +37,76 @@ pub fn same_file(first: &Path, second: &Path) -> bool {
     {
         same_file::is_same_file(first, second).unwrap_or(false)
     }
+}
+
+/// Open a file with qpdf's `QUtil::safe_fopen` error boundary.
+///
+/// The mode grammar mirrors the portable `fopen` modes qpdf passes here:
+/// `r`, `w`, and `a`, optionally followed by `b` and/or `+`. The returned
+/// filesystem failure is promoted to `Error::System`, matching qpdf's
+/// `QPDFSystemError` rather than leaking a bare `std::io::Error` through a
+/// utility consumer.
+pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
+    let mut mode_bytes = mode.bytes();
+    let Some(kind) = mode_bytes.next() else {
+        return Err(crate::Error::System(format!(
+            "open {filename}: invalid fopen mode"
+        )));
+    };
+
+    let mut plus = false;
+    let mut exclusive = false;
+    for modifier in mode_bytes {
+        match modifier {
+            b'b' => {}
+            b'+' => plus = true,
+            b'x' => exclusive = true,
+            _ => {
+                return Err(crate::Error::System(format!(
+                    "open {filename}: invalid fopen mode"
+                )))
+            }
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    match kind {
+        b'r' => {
+            options.read(true);
+            if plus {
+                options.write(true);
+            }
+        }
+        b'w' => {
+            options.write(true);
+            if plus {
+                options.read(true);
+            }
+            if exclusive {
+                options.create_new(true);
+            } else {
+                options.create(true).truncate(true);
+            }
+        }
+        b'a' => {
+            options.append(true).create(true);
+            if plus {
+                options.read(true);
+            }
+            if exclusive {
+                options.create_new(true);
+            }
+        }
+        _ => {
+            return Err(crate::Error::System(format!(
+                "open {filename}: invalid fopen mode"
+            )))
+        }
+    }
+
+    options
+        .open(filename)
+        .map_err(|error| crate::Error::System(format!("open {filename}: {error}")))
 }
 
 #[derive(Clone, Copy)]
@@ -248,9 +320,42 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        qpdf_string_to_int_checked, same_file, utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi,
-        QpdfIntParse,
+        qpdf_string_to_int_checked, safe_fopen, same_file, utf8_to_ascii, utf8_to_mac_roman,
+        utf8_to_win_ansi, QpdfIntParse,
     };
+    use std::io::{Read, Write};
+
+    #[test]
+    fn safe_fopen_missing_path_is_a_qpdf_system_error() {
+        let error = safe_fopen("/definitely/not/a/flpdf/file", "rb")
+            .expect_err("opening a missing path must fail");
+
+        assert!(
+            matches!(error, crate::Error::System(message) if message.starts_with("open /definitely/not/a/flpdf/file: "))
+        );
+    }
+
+    #[test]
+    fn safe_fopen_supports_qpdf_read_write_modes() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("safe-fopen.pdf");
+        let path = path.to_str().expect("temporary path is UTF-8");
+
+        let mut writer = safe_fopen(path, "wb").expect("open file for writing");
+        writer.write_all(b"first").expect("write first chunk");
+        drop(writer);
+
+        let mut appender = safe_fopen(path, "ab").expect("open file for appending");
+        appender
+            .write_all(b" second")
+            .expect("write appended chunk");
+        drop(appender);
+
+        let mut reader = safe_fopen(path, "rb").expect("open file for reading");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read file");
+        assert_eq!(bytes, b"first second");
+    }
 
     #[test]
     fn qpdf_string_to_int_checked_handles_empty_and_negative_values() {
