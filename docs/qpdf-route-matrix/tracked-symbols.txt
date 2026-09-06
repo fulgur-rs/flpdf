@@ -189,7 +189,9 @@ crates/flpdf/src/encryption/state.rs::compute_data_key                   # C17 c
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe     # C22
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe_for_linearization  # C22
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_will_be_refiltered_with_policy  # C22
-crates/flpdf/src/object_handle.rs::write_stream_json                     # C44 canonical
+crates/flpdf/src/object_handle.rs::write_stream_json                     # C24 canonical baseline; C44 public API is absent
+crates/flpdf/src/object_handle.rs::prepare_stream_filter_plan            # C7 mixed: stream warning route
+crates/flpdf/src/writer/plain/body.rs::canonical_stream_output_with_rewrite_policy # C21 mixed: retry and output-dictionary responsibilities
 
 # ===========================================================================
 # D. writer
