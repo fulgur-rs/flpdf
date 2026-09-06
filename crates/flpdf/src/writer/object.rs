@@ -1266,13 +1266,16 @@ fn remove_crypt_filter_from_entries(
     Ok(())
 }
 
+type StreamDictionaryEntries = Vec<(Vec<u8>, ObjectHandle)>;
+type StreamDictionarySnapshot = (StreamDictionaryEntries, Option<ObjectHandle>);
+
 /// Snapshot a stream dictionary's entries together with the live dictionary
 /// handle qpdf uses for missing-key warning context. A stream's nested
 /// dictionary is the context for `getKey("/DecodeParms")`; the stream handle
 /// itself is not a dictionary and would report the wrong type warning.
 fn stream_dictionary_entries_for_emission(
     handle: &ObjectHandle,
-) -> Result<(Vec<(Vec<u8>, ObjectHandle)>, Option<ObjectHandle>)> {
+) -> Result<StreamDictionarySnapshot> {
     handle.try_dereference()?;
     if let Some(entries) = handle.with_value(|value| match value {
         Some(ObjectValue::Dictionary(entries)) => Some(
@@ -1430,6 +1433,7 @@ fn unparse_stream_dict_entries_qdf(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unparse_stream_dict_entries_qdf_with_ref_map(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
