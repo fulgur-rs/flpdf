@@ -2533,6 +2533,9 @@ mod compressible_owner_tests {
         assert!(!without_length.contains(&sig.object_ref().unwrap()));
         assert!(!without_length.contains(&encryption.object_ref().unwrap()));
         assert!(!without_length.contains(&stream.object_ref().unwrap()));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(stream.get_raw_stream_data().unwrap().as_slice(), b"xyz");
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
