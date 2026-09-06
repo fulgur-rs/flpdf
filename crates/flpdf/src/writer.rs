@@ -500,7 +500,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             .create(true)
             .truncate(true)
             .open(path)
-            .map_err(|error| Error::file_io("open output", path.to_path_buf(), error))?;
+            .map_err(|error| Error::file_io("open", path.to_path_buf(), error))?;
         self.output = Some(WriterOutput::Writer(Box::new(QpdfFileWriter::new(file))));
         Ok(())
     }
