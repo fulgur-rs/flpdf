@@ -1249,7 +1249,7 @@ fn remove_crypt_filter_from_entries(entries: &mut Vec<(Vec<u8>, ObjectHandle)>) 
         );
         let decode = output_dictionary.try_get_key(b"/DecodeParms")?;
         decode.erase_array_item(crypt_index)?;
-        return Ok(());
+        return Ok(()); // cov:ignore: qpdf's contextless missing-key erase always raises; this success continuation is defensive only
     };
     let decode = entries[decode_index].1.clone();
     // qpdf calls `decode_parms.eraseItem(idx)` unconditionally after removing
