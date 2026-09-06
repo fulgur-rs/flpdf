@@ -1,33 +1,6 @@
 //! qpdf correspondence: QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state.
 
-use crate::encryption::primitives::md5;
-
-/// qpdf's `QPDF::compute_data_key` for writer object emission.
-///
-/// The output length is based on the complete MD5 input. In particular, qpdf
-/// counts the four-byte AES salt, so short AES file keys can produce a longer
-/// data key than RC4 keys of the same file-key length.
-fn compute_data_key(
-    encryption_key: &[u8],
-    object_number: u32,
-    use_aes: bool,
-    encryption_v: i32,
-    _encryption_r: i32,
-) -> Vec<u8> {
-    let mut input = encryption_key.to_vec();
-    if encryption_v >= 5 {
-        return input;
-    }
-
-    input.extend_from_slice(&object_number.to_le_bytes()[..3]);
-    input.extend_from_slice(&[0, 0]);
-    if use_aes {
-        input.extend_from_slice(b"sAlT");
-    }
-
-    let digest = md5(&input);
-    digest[..input.len().min(16)].to_vec()
-}
+use crate::encryption::primitives::compute_data_key;
 
 /// Writer-owned encryption parameters and the key for the object being emitted.
 ///
@@ -41,7 +14,7 @@ pub(crate) struct WriterEncryptionState {
     encryption_key: Vec<u8>,
     encrypt_use_aes: bool,
     encryption_v: i32,
-    encryption_r: i32,
+    _encryption_r: i32,
     cur_data_key: Option<Vec<u8>>,
 }
 
@@ -51,13 +24,13 @@ impl WriterEncryptionState {
         encryption_key: Vec<u8>,
         encrypt_use_aes: bool,
         encryption_v: i32,
-        encryption_r: i32,
+        _encryption_r: i32,
     ) -> Self {
         Self {
             encryption_key,
             encrypt_use_aes,
             encryption_v,
-            encryption_r,
+            _encryption_r,
             cur_data_key: None,
         }
     }
@@ -101,9 +74,9 @@ impl WriterEncryptionState {
         self.cur_data_key = Some(compute_data_key(
             &self.encryption_key,
             emitted_object_number,
+            0,
             self.encrypt_use_aes,
-            self.encryption_v,
-            self.encryption_r,
+            i64::from(self.encryption_v),
         ));
     }
 }

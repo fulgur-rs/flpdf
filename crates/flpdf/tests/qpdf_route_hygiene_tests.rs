@@ -26,9 +26,18 @@ fn dead_qpdf_routes_are_removed_and_canonical_owners_remain() {
         !standard.contains("keys::per_object_key"),
         "standard encryption docs still point at the removed route"
     );
+    let primitives = read_source("encryption/primitives.rs");
     assert!(
-        read_source("encryption/state.rs").contains("fn compute_data_key("),
-        "the canonical encryption-state key owner is missing"
+        primitives.contains("fn compute_data_key("),
+        "the canonical shared data-key primitive is missing"
+    );
+    assert!(
+        !read_source("encryption/state.rs").contains("fn compute_data_key("),
+        "reader state still owns a duplicate data-key implementation"
+    );
+    assert!(
+        !read_source("writer/encryption_state.rs").contains("fn compute_data_key("),
+        "writer state still owns a duplicate data-key implementation"
     );
 
     let filters = read_source("filters.rs");

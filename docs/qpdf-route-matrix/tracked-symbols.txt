@@ -45,7 +45,7 @@
 #   Plan     (D24) — `writer/pclm.rs::Plan` 以外の `Plan` も拾う。
 #
 # leaf を共有する行（1 つの数字が複数の行セルに対応する）
-#   compute_data_key            C17（reader 側 canonical）+ C18（writer 側の複製）
+#   compute_data_key            C17（reader/writer 共通 primitive）
 #   write                       D1 + D26
 #   write_qpdf                  E-3 + E-4
 #   write_qpdf_to_memory        D30（writer.rs, test-only）+ E-4（flpdf-cli の同名別関数）
@@ -185,7 +185,7 @@ crates/flpdf/src/filters.rs::is_decoded_filter                           # C43
 crates/flpdf/src/filters.rs::passthrough_codec_label                     # C43
 
 # --- (b) baseline denominator ---
-crates/flpdf/src/encryption/state.rs::compute_data_key                   # C17 canonical + C18 複製
+crates/flpdf/src/encryption/primitives.rs::compute_data_key               # C17 reader/writer 共通 primitive
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe     # C22
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_filter_probe_for_linearization  # C22
 crates/flpdf/src/writer/plain/body.rs::canonical_stream_will_be_refiltered_with_policy  # C22

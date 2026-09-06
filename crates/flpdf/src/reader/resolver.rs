@@ -8212,7 +8212,7 @@ mod tests {
     // The failure has to come from key derivation rather than from the
     // ciphertext: `Pl_AES_PDF` never rejects a payload for its length or its
     // padding (see the lenient-acceptance test below), so a short file key —
-    // which leaves `compute_data_key` returning something that is neither an
+    // which leaves the shared `compute_data_key` returning something that is neither an
     // AES-128 nor an AES-256 key — is what a string cipher failure looks like.
     #[test]
     fn canonical_resolver_propagates_string_decryption_errors() {

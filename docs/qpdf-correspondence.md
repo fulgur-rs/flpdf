@@ -664,6 +664,14 @@ V5 の `/O` `/U` `/OE` `/UE` `/Perms` は qpdf CLI の CSPRNG（同じ qpdf invo
 `V5Randomness` seam（`.6.5`）で flpdf の deterministic repeat を検証し、qpdf とは
 復号後の QDF で比較する。production default は引き続き OS CSPRNG である。
 
+`QPDF::compute_data_key`（`QPDF_encryption.cc:325-357`）の共有 Rust primitive は
+qpdf の未使用 `encryption_R` 引数を省略している。これは reader state に存在しない
+値を sentinel で補うことを避ける、出力不変の内部 signature 代替である。Algorithm 3.1
+が実際に読む V、object ID、generation、AES salt の順序と bytes は変更せず、reader の
+`(obj,gen)` cache と writer の generation 0 呼び出し契約も保持する。writer state の
+`_encryption_r` は qpdf `QPDFWriter::Members` の state 対応として保持するが、鍵計算へは
+渡さない。
+
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDF_encryption.cc` | 1410 | `encryption.rs` (facade) + `encryption/state.rs` + `encryption/crypt_filters.rs` + `encryption/keys.rs` + `encryption/standard.rs`(1879) + `encryption/permissions.rs`(206) + `encryption/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当。`--password-is-hex-key` は `QPDF_encryption.cc:933-934` の通り decoded key に通常の 32-byte 上限を適用せず、`QPDFJob.cc:1245-1252` の JSON bits も実 key 長を報告する。AES provider は 16/24/32 以外の鍵長を AES-128（先頭 16 バイト、`QPDFCrypto_gnutls.cc:197-213` / `QPDFCrypto_openssl.cc:225-244` の default arm）へ投影し、24 バイトは AES-192 を選ぶ。16 バイト未満は qpdf が鍵バッファを over-read する未定義挙動のため flpdf は拒否する（`qpdf-deviation` マーカー）) | 🔀 |
