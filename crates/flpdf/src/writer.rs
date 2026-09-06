@@ -5906,7 +5906,7 @@ mod final_handle_writer_tests {
                 false,
                 false,
                 None,
-                &|object_ref| Ok(object_ref),
+                &|object_ref| Ok(object_ref), // cov:ignore: reserved handles exit before the callback can run
                 &BTreeSet::new(),
                 true,
             )
@@ -5922,7 +5922,7 @@ mod final_handle_writer_tests {
                 false,
                 false,
                 None,
-                &|object_ref| Ok(object_ref),
+                &|object_ref| Ok(object_ref), // cov:ignore: scalar handles have no child reference to map
                 &BTreeSet::new(),
                 true,
             )
@@ -5940,6 +5940,7 @@ mod final_handle_writer_tests {
             (b"/Size".to_vec(), ObjectHandle::integer(1)),
         ]);
         let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
+            // cov:ignore: this direct-root case has no indirect child
             Ok(ObjectRef::new(object_ref.number + 100, 0))
         };
         let mut output = Vec::new();
@@ -5957,6 +5958,35 @@ mod final_handle_writer_tests {
             .expect("direct QDF Catalog is emitted");
         let text = String::from_utf8(output).expect("trailer is UTF-8");
         assert!(text.contains("/Pages 3"));
+    }
+
+    #[test]
+    fn shared_trailer_contract_filters_a_removed_reference() {
+        let pdf = Pdf::empty().expect("empty PDF for removed-reference test");
+        let custom = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("indirect custom trailer value");
+        let custom_ref = custom.object_ref().expect("custom object reference");
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/CustomRef".to_vec(), custom),
+            (b"/Size".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut output = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 2 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref),
+                &[custom_ref].into_iter().collect(),
+                true,
+            )
+            .expect("removed trailer reference is filtered");
+        assert!(!String::from_utf8(output)
+            .expect("trailer is UTF-8")
+            .contains("/CustomRef"));
     }
 
     #[test]
