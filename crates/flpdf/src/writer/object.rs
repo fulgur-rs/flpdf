@@ -51,6 +51,14 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    fn write_root_object_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<()>;
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -333,6 +341,24 @@ impl ObjectWriterEmission for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
         unparse_object_walk_with_ref_map(self, out, map, removed_refs)
+    }
+
+    /// Emit the root through qpdf's output-only `unparseObject` mutation.
+    ///
+    /// qpdf makes an unsafe shallow copy of the root dictionary before
+    /// reconciling `/Extensions /ADBE` (`QPDFWriter.cc:1347-1435`). Keep that
+    /// copy local to serialization so the live Catalog is never changed merely
+    /// because a writer is producing output.
+    fn write_root_object_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<()> {
+        let root = root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)?;
+        unparse_object_walk_with_ref_map(&root, out, map, removed_refs)
     }
 
     /// Encrypted writer counterpart of
@@ -1546,6 +1572,75 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
     handle
         .object_ref()
         .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+}
+
+/// Make qpdf's output-only shallow root copy and reconcile `/ADBE` on it.
+fn root_output_copy_with_adbe(
+    source: &ObjectHandle,
+    final_pdf_version: &str,
+    final_extension_level: i64,
+) -> Result<ObjectHandle> {
+    let entries = source
+        .try_as_dictionary()?
+        .ok_or_else(|| Error::Unsupported("root object is not a dictionary".into()))?;
+    let root = ObjectHandle::dictionary(entries.into_iter().collect());
+    let raw_extensions = root.try_get_key(b"/Extensions")?;
+    let extension_entries = raw_extensions.try_as_dictionary()?;
+
+    if final_extension_level <= 0 && extension_entries.is_none() {
+        return Ok(root);
+    }
+
+    let extensions = extension_entries
+        .map(|entries| ObjectHandle::dictionary(entries.into_iter().collect()))
+        .unwrap_or_else(|| ObjectHandle::dictionary(Vec::new()));
+    let keys = extensions.try_get_keys()?;
+    let have_adbe = keys.iter().any(|key| key.as_slice() == b"/ADBE");
+    let have_other = keys.iter().any(|key| key.as_slice() != b"/ADBE");
+
+    if final_extension_level > 0 {
+        let adbe = extensions.try_get_key(b"/ADBE")?;
+        let preserves_existing = adbe.try_as_dictionary()?.is_some()
+            && adbe
+                .try_get_key(b"/BaseVersion")?
+                .try_is_name_and_equals(final_pdf_version.as_bytes())?
+            && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()?
+                == Some(final_extension_level);
+        if !preserves_existing {
+            extensions.replace_key(
+                b"/ADBE",
+                ObjectHandle::dictionary(vec![
+                    (
+                        b"/BaseVersion".to_vec(),
+                        ObjectHandle::name(final_pdf_version.as_bytes().to_vec()),
+                    ),
+                    (
+                        b"/ExtensionLevel".to_vec(),
+                        ObjectHandle::integer(final_extension_level),
+                    ),
+                ]),
+            )?; // cov:ignore: replacement mutates a local qpdf-shaped dictionary copy; the validated success path is not failure-injectable
+        }
+        root.replace_key(b"/Extensions", extensions)?;
+    } else if have_adbe {
+        if have_other {
+            let adbe = extensions.try_get_key(b"/ADBE")?;
+            let preserves_existing = adbe.try_as_dictionary()?.is_some()
+                && adbe
+                    .try_get_key(b"/BaseVersion")?
+                    .try_is_name_and_equals(final_pdf_version.as_bytes())?
+                && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()?
+                    == Some(final_extension_level);
+            if !preserves_existing {
+                extensions.remove_key(b"/ADBE");
+                root.replace_key(b"/Extensions", extensions)?;
+            }
+        } else {
+            root.remove_key(b"/Extensions");
+        }
+    } // cov:ignore: LLVM maps this covered ADBE branch join to the unreachable continuation line
+
+    Ok(root)
 }
 
 // The sole recursion hub for the plain unparse family (`ObjectHandle::

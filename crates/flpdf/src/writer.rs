@@ -1668,11 +1668,11 @@ pub(crate) const fn uses_deterministic_id(options: &WriterOptions) -> bool {
 ///
 /// The qpdf writer calls `QPDF::fixDanglingReferences` and then makes a
 /// dictionary-valued Catalog `/Extensions` direct, followed by an indirect
-/// `/ADBE` child when present (`libqpdf/QPDFWriter.cc:2034-2055`). The ADBE
-/// add/remove decision is deliberately not here: qpdf makes that decision in
-/// the root dictionary's output-time `unparseObject` path, which remains the
-/// responsibility of [`inject_adbe_extension`] and
-/// [`strip_adbe_extension`].
+/// `/ADBE` child when present (`libqpdf/QPDFWriter.cc:2034-2055`). The plain
+/// writer's ADBE add/remove decision now happens in the root dictionary's
+/// output-time `unparseObject` copy (`ObjectWriterEmission`); specialized and
+/// linearized consumers retain their legacy output mutation until their own
+/// migration slices.
 ///
 /// This function is called once by [`PdfWriter::write`] before the standard or
 /// linearized route is selected. The directization is permanent on the live
@@ -3517,6 +3517,13 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
 ) -> Result<WriterResult> {
+    // The plain route now reconciles ADBE on the root's output-only shallow
+    // copy. It therefore needs no Catalog snapshot/restore; specialized routes
+    // still retain that boundary until their own root consumers migrate.
+    if plain::eligible(pdf.is_encrypted(), options, options.object_streams) {
+        return emit_canonical_pdf_inner(pdf, out, options, special_streams);
+    }
+
     // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
     // turn a logger/read failure into an absent snapshot. QPDFWriter constructs
     // its Members with `pdf.getRoot()` before writing and propagates that
@@ -3839,9 +3846,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    // Propagate the Adobe extension level into the destination
-    // Catalog BEFORE any downstream dispatch, so every full-rewrite route sees
-    // the injected Catalog.
+    let plain_route = plain::eligible(pdf.is_encrypted(), options, requested_object_streams);
+    // Compute the Adobe extension level before downstream dispatch. The plain
+    // route applies it to the root's output-only shallow copy; legacy
+    // specialized routes still apply the existing live-graph mutation below.
     // When WriterOptions::min_extension_level requests an ext >= 1 (or the
     // source Catalog already carries one that survives the pairwise rule)
     // inject
@@ -3849,7 +3857,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // so it becomes part of the Catalog the selected writer sees. A source
     // indirect /Extensions ref, if any, is inlined here and
     // drops out of the reachable graph — mirroring qpdf's writer behaviour.
-    {
+    if !plain_route {
         let source_ver = pdf.version().to_string();
         let source_ext = pdf.adobe_extension_level()?.unwrap_or(0);
         // Predict whether the header floor will bump to PDF 1.5 due to
@@ -3888,7 +3896,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         return write_pclm(pdf, out, options);
     }
 
-    if plain::eligible(pdf.is_encrypted(), options, requested_object_streams) {
+    if plain_route {
         return plain::write_plain(pdf, out, options);
     }
 
@@ -6402,6 +6410,63 @@ mod final_handle_writer_tests {
 
         let result = emit_canonical_pdf(&mut pdf, Vec::new(), &options);
         assert!(matches!(result, Err(Error::Missing("/Root"))));
+    }
+
+    #[test]
+    fn root_object_emission_injects_adbe_without_mutating_live_catalog() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .expect("no-extension fixture");
+        let root = pdf.root_handle().expect("Catalog handle");
+        assert!(root
+            .try_get_key(b"/Extensions")
+            .expect("source Extensions")
+            .is_null());
+
+        let mut output = Vec::new();
+        let map = |object_ref| Ok(object_ref);
+        let removed = BTreeSet::new();
+        root.write_root_object_with_ref_map_and_removed(&mut output, &map, &removed, "1.7", 8)
+            .expect("root output succeeds");
+
+        assert!(output
+            .windows(b"/ADBE".len())
+            .any(|window| window == b"/ADBE"));
+        assert!(output
+            .windows(b"/BaseVersion /1.7".len())
+            .any(|window| window == b"/BaseVersion /1.7"));
+        assert!(output
+            .windows(b"/ExtensionLevel 8".len())
+            .any(|window| window == b"/ExtensionLevel 8"));
+        assert!(
+            root.try_get_key(b"/Extensions")
+                .expect("live Extensions")
+                .is_null(),
+            "output-only ADBE reconciliation must not mutate the live Catalog"
+        );
+    }
+
+    #[test]
+    fn plain_adbe_output_failure_keeps_the_live_catalog_unmodified() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .expect("no-extension fixture");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer
+            .set_output_writer(AlwaysFailingOutput)
+            .expect("install failing output");
+
+        assert!(writer.write().is_err(), "the output sink must fail");
+        let root = pdf.root_handle().expect("Catalog remains available");
+        assert!(
+            root.try_get_key(b"/Extensions")
+                .expect("live Extensions")
+                .is_null(),
+            "a failed plain write must not leave output-only ADBE on the live Catalog"
+        );
     }
 
     #[test]

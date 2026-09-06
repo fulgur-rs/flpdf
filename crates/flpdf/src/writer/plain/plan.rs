@@ -87,7 +87,9 @@ pub(crate) fn stream_cache_fingerprint(
 #[derive(Clone, Debug)]
 pub(crate) struct PlainWritePlan {
     pub(crate) version: String,
+    pub(crate) final_extension_level: i64,
     pub(crate) objects: Vec<PlannedIndirectObject>,
+    pub(crate) root_source: Option<ObjectRef>,
     /// Remapped Catalog identity when the source `/Root` is indirect.
     pub(crate) root: Option<ObjectRef>,
     /// Canonical Catalog handle when the source `/Root` is direct.
@@ -284,13 +286,17 @@ impl PlainWritePlan {
         } else {
             XrefForm::Table
         };
-        let mut version = crate::writer::effective_pdf_version(
-            pdf.version(),
-            options,
-            false,
-            has_object_stream || form == XrefForm::Stream,
-        )
-        .to_string();
+        let source_version = pdf.version().to_string();
+        let source_extension_level = pdf.adobe_extension_level()?.unwrap_or(0);
+        let (effective_version, final_extension_level) =
+            crate::writer::effective_pdf_version_and_ext(
+                &source_version,
+                source_extension_level,
+                options,
+                false,
+                has_object_stream || form == XrefForm::Stream,
+            );
+        let mut version = effective_version.to_string();
         // If a source version cannot be numerically compared, the canonical
         // writer keeps its raw value. PDF 1.5 introduced xref streams, so
         // repair the header to that floor exactly as the full-rewrite path
@@ -372,10 +378,12 @@ impl PlainWritePlan {
                     }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
             };
             let mut bytes = Vec::new();
-            root_handle.write_object_with_ref_map_and_removed(
+            root_handle.write_root_object_with_ref_map_and_removed(
                 &mut bytes,
                 &map,
                 &placement.removed_refs,
+                &version,
+                final_extension_level,
             )?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
             Some(bytes)
         } else {
@@ -402,7 +410,9 @@ impl PlainWritePlan {
 
         let plan = Self {
             version,
+            final_extension_level,
             objects: placement.objects,
+            root_source: source_root_ref,
             root,
             direct_root,
             old_to_new: placement.old_to_new,
@@ -998,7 +1008,9 @@ mod tests {
         let root_output = ObjectRef::new(1, 0);
         PlainWritePlan {
             version: "1.5".to_string(),
+            final_extension_level: 0,
             objects,
+            root_source: Some(root_source),
             root: Some(root_output),
             direct_root: None,
             old_to_new: HashMap::from([(root_source, root_output)]),
