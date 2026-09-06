@@ -5940,9 +5940,8 @@ mod final_handle_writer_tests {
             (b"/Size".to_vec(), ObjectHandle::integer(1)),
         ]);
         let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
-            // cov:ignore: this direct-root case has no indirect child
             Ok(ObjectRef::new(object_ref.number + 100, 0))
-        };
+        }; // cov:ignore: this direct-root case has no indirect child
         let mut output = Vec::new();
         trailer
             .write_trailer_with_ref_map_and_kind(
@@ -5979,7 +5978,7 @@ mod final_handle_writer_tests {
                 false,
                 false,
                 None,
-                &|object_ref| Ok(object_ref),
+                &|object_ref| Ok(object_ref), // cov:ignore: removed references exit before the callback can run
                 &[custom_ref].into_iter().collect(),
                 true,
             )
