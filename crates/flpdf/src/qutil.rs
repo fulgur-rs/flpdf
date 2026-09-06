@@ -105,9 +105,17 @@ pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
         }
     }
 
-    options
-        .open(filename)
-        .map_err(|error| crate::Error::System(format!("open {filename}: {error}")))
+    options.open(filename).map_err(|error| {
+        // `QPDFSystemError::createWhat` renders `strerror(errno)`
+        // (`libqpdf/QPDFSystemError.cc:13-29`); drop Rust's numeric
+        // `(os error N)` suffix so the text matches qpdf's.
+        let rendered = error.to_string();
+        let message = error
+            .raw_os_error()
+            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+            .unwrap_or(&rendered);
+        crate::Error::System(format!("open {filename}: {message}"))
+    })
 }
 
 /// Format a signed integer using qpdf's supported bases and width rules.
@@ -118,19 +126,12 @@ pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
 /// `std::logic_error` boundary and therefore become `Error::Internal`.
 pub fn int_to_string_base(number: i64, base: i32, length: i32) -> crate::Result<String> {
     let mut converted = match base {
-        8 | 16 => {
-            let magnitude = number.unsigned_abs();
-            let digits = if base == 8 {
-                format!("{magnitude:o}")
-            } else {
-                format!("{magnitude:x}")
-            };
-            if number < 0 {
-                format!("-{digits}")
-            } else {
-                digits
-            }
-        }
+        // qpdf formats these through `std::ostringstream << std::setbase(base)
+        // << num` (`libqpdf/QUtil.cc:305-310`); C++ streams print a negative
+        // integer in octal or hexadecimal as its unsigned two's-complement
+        // representation, not as a sign plus magnitude.
+        8 => format!("{:o}", number as u64),
+        16 => format!("{:x}", number as u64),
         10 => number.to_string(),
         _ => {
             return Err(crate::Error::Internal(
@@ -432,7 +433,14 @@ mod tests {
     fn int_to_string_base_matches_qpdf_bases_and_widths() {
         assert_eq!(int_to_string_base(42, 8, 0).unwrap(), "52");
         assert_eq!(int_to_string_base(42, 10, 4).unwrap(), "0042");
-        assert_eq!(int_to_string_base(-42, 16, 0).unwrap(), "-2a");
+        // `std::ostringstream << std::hex << -42LL` prints the unsigned
+        // two's-complement representation.
+        assert_eq!(int_to_string_base(-42, 16, 0).unwrap(), "ffffffffffffffd6");
+        assert_eq!(
+            int_to_string_base(-8, 8, 0).unwrap(),
+            "1777777777777777777770"
+        );
+        assert_eq!(int_to_string_base(-42, 10, 0).unwrap(), "-42");
         assert_eq!(int_to_string_base(42, 10, -4).unwrap(), "42  ");
     }
 
@@ -451,7 +459,12 @@ mod tests {
             .expect_err("opening a missing path must fail");
 
         assert!(
-            matches!(error, crate::Error::System(message) if message.starts_with("open /definitely/not/a/flpdf/file: "))
+            matches!(&error, crate::Error::System(message) if message.starts_with("open /definitely/not/a/flpdf/file: "))
+        );
+        #[cfg(unix)]
+        assert!(
+            matches!(&error, crate::Error::System(message) if message == "open /definitely/not/a/flpdf/file: No such file or directory"),
+            "qpdf renders strerror without Rust's os-error suffix: {error:?}"
         );
     }
 
