@@ -5939,9 +5939,11 @@ mod final_handle_writer_tests {
             ),
             (b"/Size".to_vec(), ObjectHandle::integer(1)),
         ]);
+        // cov:ignore-start: this direct-root case has no indirect child to map
         let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
             Ok(ObjectRef::new(object_ref.number + 100, 0))
-        }; // cov:ignore: this direct-root case has no indirect child
+        };
+        // cov:ignore-end
         let mut output = Vec::new();
         trailer
             .write_trailer_with_ref_map_and_kind(
