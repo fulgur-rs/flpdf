@@ -184,3 +184,56 @@ fn overlay_repairs_boxless_source_before_form_conversion_like_qpdf() {
     );
     assert!(letter_bbox_count(&qpdf_qdf) >= 2);
 }
+
+#[test]
+fn overlay_qdf_original_object_ids_match_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP] qpdf {EXPECTED_QPDF_VERSION} not on PATH");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let destination = fixture("two-page.pdf");
+    let source = fixture("fxo-red.pdf");
+    let qpdf_output = temp.path().join("qpdf-qdf.pdf");
+    let flpdf_output = temp.path().join("flpdf-qdf.pdf");
+
+    let qpdf = Shell::new(qpdf_command())
+        .args([
+            destination.to_str().unwrap(),
+            "--overlay",
+            source.to_str().unwrap(),
+            "--",
+            "--static-id",
+            "--qdf",
+            qpdf_output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("qpdf overlay should spawn");
+    assert!(qpdf.status.success(), "qpdf stderr: {:?}", qpdf);
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "rewrite",
+            "--static-id",
+            "--qdf",
+            destination.to_str().unwrap(),
+            "--overlay",
+            source.to_str().unwrap(),
+            "--",
+            flpdf_output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("flpdf overlay should spawn");
+    assert!(
+        flpdf.status.success(),
+        "flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf qdf output"),
+        std::fs::read(&qpdf_output).expect("qpdf qdf output"),
+        "qdf Original object ID comments and allocation order must match qpdf"
+    );
+}
