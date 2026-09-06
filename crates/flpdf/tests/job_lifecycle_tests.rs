@@ -564,7 +564,7 @@ fn json_job_run_applies_rotate_to_a_collate_zero_empty_page_selection() {
         "staticId": "",
         "pages": [{"file": fixture}, {"file": fixture}],
         "collate": "0",
-        "rotate": "90"
+        "rotate": "+90"
     })
     .to_string();
 

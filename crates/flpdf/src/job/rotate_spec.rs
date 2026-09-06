@@ -61,6 +61,13 @@ fn parse_rotation_parts(
         }
     }
     let negative = angle_bytes.first() == Some(&b'-');
+    let range = match range_bytes {
+        Some(bytes) if !bytes.is_empty() => bytes.to_vec(),
+        _ => b"1-z".to_vec(),
+    };
+    if parse_numrange(&range, 0).is_err() {
+        return Err(invalid_rotation_parameter(parameter));
+    }
     let angle_value = match angle {
         b"0" => 0,
         b"90" => 90,
@@ -69,13 +76,6 @@ fn parse_rotation_parts(
         _ => return Err(invalid_rotation_parameter(parameter)),
     };
     let angle = if negative { -angle_value } else { angle_value };
-    let range = match range_bytes {
-        Some(bytes) if !bytes.is_empty() => bytes.to_vec(),
-        _ => b"1-z".to_vec(),
-    };
-    if parse_numrange(&range, 0).is_err() {
-        return Err(invalid_rotation_parameter(parameter));
-    }
     Ok(RotationParameter {
         range,
         spec: RotationSpec { angle, relative },
@@ -133,6 +133,12 @@ mod tests {
     fn parse_rotation_parameter_rejects_invalid_angle_or_range() {
         assert!(parse_rotation_parameter(b"45").is_err());
         assert!(parse_rotation_parameter(b"90:1-").is_err());
+        assert!(parse_rotation_parameter(b"x90").is_err());
+    }
+
+    #[test]
+    fn parse_rotation_parameter_accepts_angle_270_after_range_validation() {
+        assert_eq!(parse_rotation_parameter(b"270:1").unwrap().spec.angle, 270);
     }
 
     #[test]

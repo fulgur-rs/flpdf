@@ -442,11 +442,10 @@ pub fn parse_numrange(range: &[u8], max: i32) -> crate::Result<Vec<i32>> {
             .position(|&byte| byte == b',')
             .map_or(range_end, |offset| cursor + offset);
         let group = &range[cursor..group_end];
-        let is_exclude = group.first() == Some(&b'x');
-        if !valid_numrange_group(group) {
+        let Some(group_match) = capture_numrange_group(group) else {
             return Err(numrange_error(range, cursor, b"invalid range syntax"));
-        }
-        if first && is_exclude {
+        };
+        if first && group_match.is_exclude {
             return Err(numrange_error(
                 range,
                 cursor,
@@ -455,19 +454,15 @@ pub fn parse_numrange(range: &[u8], max: i32) -> crate::Result<Vec<i32>> {
         }
         first = false;
 
-        let mut position = usize::from(is_exclude);
-        let first_num = parse_numrange_endpoint(range, cursor, group, &mut position, max)?;
-        let mut last_num = 0;
-        let is_span = position < group.len() && group[position] == b'-';
-        if is_span {
-            position += 1;
-            last_num = parse_numrange_endpoint(range, cursor, group, &mut position, max)?;
-        }
-        if position != group.len() {
-            return Err(numrange_error(range, cursor, b"invalid range syntax"));
-        }
+        let first_num = parse_numrange_integer(range, cursor, group_match.first, max)?;
+        let last_num = group_match
+            .last
+            .map(|last| parse_numrange_integer(range, cursor, last, max))
+            .transpose()?;
+        let is_span = last_num.is_some();
+        let last_num = last_num.unwrap_or_default();
 
-        if is_exclude {
+        if group_match.is_exclude {
             let work = populate_numrange_group(first_num, is_span, last_num);
             let mut exclusions = std::collections::BTreeSet::new();
             exclusions.extend(work.iter().copied());
@@ -493,84 +488,76 @@ pub fn parse_numrange(range: &[u8], max: i32) -> crate::Result<Vec<i32>> {
     Ok(result.into_iter().skip(start_idx).step_by(skip).collect())
 }
 
-fn parse_numrange_endpoint(
-    input: &[u8],
-    group_start: usize,
-    group: &[u8],
-    position: &mut usize,
-    max: i32,
-) -> crate::Result<i32> {
-    let endpoint_start = *position;
-    let Some(&first) = group.get(*position) else {
-        return Err(numrange_error(input, group_start, b"invalid range syntax"));
+struct NumrangeGroup<'a> {
+    is_exclude: bool,
+    first: &'a [u8],
+    last: Option<&'a [u8]>,
+}
+
+fn capture_numrange_group(group: &[u8]) -> Option<NumrangeGroup<'_>> {
+    let is_exclude = group.first() == Some(&b'x');
+    let mut position = usize::from(is_exclude);
+    let first_start = position;
+    position = capture_numrange_endpoint(group, position)?;
+    let first = &group[first_start..position];
+    let last = if group.get(position) == Some(&b'-') {
+        position += 1;
+        let last_start = position;
+        position = capture_numrange_endpoint(group, position)?;
+        Some(&group[last_start..position])
+    } else {
+        None
     };
-    if first == b'z' {
-        *position += 1;
-        return check_numrange_value(input, group_start, max, max);
+    (position == group.len()).then_some(NumrangeGroup {
+        is_exclude,
+        first,
+        last,
+    })
+}
+
+fn capture_numrange_endpoint(group: &[u8], mut position: usize) -> Option<usize> {
+    if group.get(position) == Some(&b'z') {
+        return Some(position + 1);
     }
-    let from_end = first == b'r';
-    if from_end {
-        *position += 1;
+    if group.get(position) == Some(&b'r') {
+        position += 1;
     }
-    let digits_start = *position;
+    let start = position;
     while group
-        .get(*position)
+        .get(position)
         .is_some_and(|byte| byte.is_ascii_digit())
     {
-        *position += 1;
+        position += 1;
     }
-    if digits_start == *position || (!from_end && endpoint_start != digits_start) {
-        return Err(numrange_error(input, group_start, b"invalid range syntax"));
+    (position != start).then_some(position)
+}
+
+fn parse_numrange_integer(
+    input: &[u8],
+    offset: usize,
+    endpoint: &[u8],
+    max: i32,
+) -> crate::Result<i32> {
+    if endpoint == b"z" {
+        return check_numrange_value(input, offset, max, max);
     }
-    let number = parse_numrange_integer(input, group_start, &group[digits_start..*position])?;
+    let from_end = endpoint.first() == Some(&b'r');
+    let digits = if from_end { &endpoint[1..] } else { endpoint };
+    let text = std::str::from_utf8(digits)
+        .map_err(|_| numrange_error(input, offset, b"invalid range syntax"))?;
+    let number = match qpdf_string_to_int_checked(text) {
+        QpdfIntParse::Value(value) => value,
+        QpdfIntParse::Overflow(message) => {
+            return Err(numrange_error(input, offset, message.as_bytes()));
+        }
+        QpdfIntParse::NoDigits => 0,
+    };
     let value = if from_end {
         max.wrapping_add(1).wrapping_sub(number)
     } else {
         number
     };
-    check_numrange_value(input, group_start, value, max)
-}
-
-fn valid_numrange_group(group: &[u8]) -> bool {
-    let mut position = usize::from(group.first() == Some(&b'x'));
-    if !valid_numrange_endpoint(group, &mut position) {
-        return false;
-    }
-    if position < group.len() && group[position] == b'-' {
-        position += 1;
-        if !valid_numrange_endpoint(group, &mut position) {
-            return false;
-        }
-    }
-    position == group.len()
-}
-
-fn valid_numrange_endpoint(group: &[u8], position: &mut usize) -> bool {
-    if group.get(*position) == Some(&b'z') {
-        *position += 1;
-        return true;
-    }
-    if group.get(*position) == Some(&b'r') {
-        *position += 1;
-    }
-    let start = *position;
-    while group
-        .get(*position)
-        .is_some_and(|byte| byte.is_ascii_digit())
-    {
-        *position += 1;
-    }
-    *position != start
-}
-
-fn parse_numrange_integer(input: &[u8], offset: usize, digits: &[u8]) -> crate::Result<i32> {
-    let text = std::str::from_utf8(digits)
-        .map_err(|_| numrange_error(input, offset, b"invalid range syntax"))?;
-    match qpdf_string_to_int_checked(text) {
-        QpdfIntParse::Value(value) => Ok(value),
-        QpdfIntParse::Overflow(message) => Err(numrange_error(input, offset, message.as_bytes())),
-        QpdfIntParse::NoDigits => Err(numrange_error(input, offset, b"invalid range syntax")),
-    }
+    check_numrange_value(input, offset, value, max)
 }
 
 fn check_numrange_value(input: &[u8], offset: usize, value: i32, max: i32) -> crate::Result<i32> {
@@ -850,6 +837,16 @@ mod tests {
                 "{input:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn parse_numrange_reports_invalid_suffix_and_first_exclusion() {
+        let suffix = parse_numrange(b"1:unexpected", 5).unwrap_err();
+        assert!(suffix.to_string().ends_with(": expected :even or :odd"));
+        let exclusion = parse_numrange(b"x3", 5).unwrap_err();
+        assert!(exclusion
+            .to_string()
+            .ends_with(": first range group may not be an exclusion"));
     }
 
     #[test]

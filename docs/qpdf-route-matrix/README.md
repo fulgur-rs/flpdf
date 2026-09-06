@@ -491,9 +491,9 @@ crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 3 (1 files) 
     crates/flpdf/src/job/lifecycle.rs 3
 crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: prod 2 (2 files) / test 16
     crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/lifecycle.rs 1
-crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 3 (2 files) / test 9
+crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 3 (2 files) / test 11
     crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
-crates/flpdf/src/qutil.rs::parse_numrange: prod 4 (3 files) / test 22
+crates/flpdf/src/qutil.rs::parse_numrange: prod 4 (3 files) / test 24
     crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/rotate_spec.rs 1
 crates/flpdf/src/job/page_range.rs::PageRange: prod 35 (6 files) / test 70
     crates/flpdf-cli/src/main.rs 13, crates/flpdf/src/job/overlay.rs 9, crates/flpdf/src/job/lifecycle.rs 6, crates/flpdf/src/job/page_combine.rs 4, crates/flpdf/src/job/page_specs.rs 2, crates/flpdf/src/job/page_plan.rs 1
