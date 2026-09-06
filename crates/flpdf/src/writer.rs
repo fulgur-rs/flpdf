@@ -2770,7 +2770,9 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
             .and_then(ObjectHandle::as_array)
             .and_then(|values| values.first().and_then(ObjectHandle::as_string))
             .ok_or_else(|| {
+                // cov:ignore-start: build_writer_setup always creates this two-string ID
                 Error::Unsupported("writer setup: generated encryption ID is malformed".into())
+                // cov:ignore-end
             })?;
         let metadata_ref = if params.encrypt_metadata {
             None
@@ -2782,7 +2784,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
             params,
             metadata_ref,
             &id0,
-        )?)
+        )?) // cov:ignore: shared Standard builder is exercised; LLVM maps this continuation to setup
     } else if let Some(source) = options.copy_encryption.as_ref() {
         let metadata_ref = if copy_encryption_encrypts_metadata_from_dict(&source.encrypt_dict) {
             None
@@ -4645,11 +4647,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         } else {
             compact_body_max
         };
+        // cov:ignore-start: supported object numbers cannot exhaust u32
         let encrypt_ref = base_for_encrypt.checked_add(1).ok_or_else(|| {
             crate::Error::Unsupported(
                 "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
             )
         })?;
+        // cov:ignore-end
         Some(parameters.into_context(ObjectRef::new(encrypt_ref, 0)))
     } else {
         None
