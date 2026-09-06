@@ -1,4 +1,4 @@
-//! qpdf 11.9.0 parity for linearization's reachable-object prepass.
+//! qpdf 11.9.0 parity for writer setup and linearization's reachable-object prepass.
 
 mod common;
 
@@ -25,10 +25,10 @@ fn qpdf_available() -> bool {
         .unwrap_or(false)
 }
 
-/// A valid one-page document with an orphaned stream whose indirect `/Length`
-/// holder is a genuinely malformed object on disk. qpdf's optimization walk
-/// does not use that orphan as a reachable stream edge, while qpdf's general
-/// writer setup may still diagnose it while resolving the xref universe.
+/// A valid one-page document with an orphaned stream and a valid indirect
+/// `/Length` holder. qpdf's writer setup resolves the object header and length,
+/// but its optimization walk does not pipe the orphan's payload. The reader
+/// below fails only if a writer route reads those unreachable payload bytes.
 fn pdf_with_unreachable_stream() -> (Vec<u8>, u64, u64) {
     let bytes = build_pdf(
         &[
@@ -38,28 +38,30 @@ fn pdf_with_unreachable_stream() -> (Vec<u8>, u64, u64) {
                 3,
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>".to_owned(),
             ),
-            (4, "<< /Length 5 0 R >>\nstream\n\nendstream".to_owned()),
-            (5, "<< /Broken [ >>".to_owned()),
+            (
+                4,
+                "<< /Length 5 0 R >>\nstream\norphan\nendstream".to_owned(),
+            ),
+            (5, "7".to_owned()),
         ],
         1,
     );
-    let object_start = bytes
-        .windows(b"5 0 obj\n".len())
-        .position(|window| window == b"5 0 obj\n")
-        .expect("orphan stream length holder header");
-    let object_end = object_start
-        + bytes[object_start..]
-            .windows(b"\nendobj\n".len())
-            .position(|window| window == b"\nendobj\n")
-            .expect("orphan stream object terminator")
-        + b"\nendobj\n".len();
-    (bytes, object_start as u64, object_end as u64)
+    let stream_keyword = bytes
+        .windows(b"stream\n".len())
+        .position(|window| window == b"stream\n")
+        .expect("orphan stream keyword");
+    let stream_start = stream_keyword + b"stream\n".len();
+    let stream_end = stream_start
+        + bytes[stream_start..]
+            .windows(b"endstream".len())
+            .position(|window| window == b"endstream")
+            .expect("orphan stream terminator");
+    (bytes, stream_start as u64, stream_end as u64)
 }
 
-/// Inject an I/O failure only while the reader is asked for the orphaned
-/// stream's indirect `/Length` holder. The xref/trailer remain readable, so
-/// the document can be opened lazily and the failure proves whether
-/// linearization touched the unreachable stream.
+/// Inject an I/O failure only while a writer is asked to read the orphaned
+/// stream's payload. Resolving its header and indirect `/Length` is allowed,
+/// matching qpdf's `fixDanglingReferences` setup boundary.
 struct FailingObjectReader {
     inner: Cursor<Vec<u8>>,
     fail_start: u64,
@@ -150,11 +152,6 @@ fn linearization_does_not_resolve_an_unreachable_unreadable_stream() {
         qpdf.status.code(),
         Some(0),
         "qpdf warning-exit-0 linearization must complete: {}",
-        String::from_utf8_lossy(&qpdf.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&qpdf.stderr).contains("object 5"),
-        "qpdf must diagnose the genuinely malformed orphan object: {}",
         String::from_utf8_lossy(&qpdf.stderr)
     );
     assert!(qpdf_output.exists(), "qpdf must create linearized output");

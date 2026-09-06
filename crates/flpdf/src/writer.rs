@@ -5771,8 +5771,10 @@ mod final_handle_writer_tests {
         ))
         .expect("indirect Extensions fixture opens");
         let mut writer = PdfWriter::new(&mut pdf);
+        let mut output = AlwaysFailingOutput;
+        assert!(output.flush().is_ok());
         writer
-            .set_output_writer(AlwaysFailingOutput)
+            .set_output_writer(output)
             .expect("install failing output");
 
         assert!(writer.write().is_err(), "the output sink must fail");
