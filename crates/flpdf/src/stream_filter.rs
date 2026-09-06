@@ -45,7 +45,7 @@
 //! (`libqpdf/QPDF_Stream.cc:33-50`) has an `else` arm that refuses on any
 //! other key, which is why a `Crypt` stage keeps all of them.
 
-use crate::object_handle::{legacy_dictionary_key, ObjectHandle};
+use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85_decoder::Ascii85Decoder;
 use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
@@ -123,16 +123,14 @@ pub(crate) enum DecodeParams {
 /// branch without re-inspecting the value.
 ///
 /// `isInteger` also `dereference()`s first, and honoring that is each shape
-/// reader's job rather than this type's: `param_value_from_object` classifies
-/// whatever `Object` it is handed, so an indirect integer inside a
-/// `/DecodeParms` dictionary reduces to `Other` there. The handle-shaped
-/// reader closes that gap (plan decision D1 of `flpdf-25kg.3.4`) **for the
-/// filters that read parameter entries at all** — qpdf dereferences a value
-/// only through `SF_FlateLzwDecode`'s `getKeys()`/`getKey()` walk, so for
-/// every other filter `decode_params_from_entries` reads the value without
-/// resolving. See [`filter_reads_decode_params`], and
-/// [`param_value_without_resolving`] for what such a value classifies as and
-/// why that classification is unobservable. This enum is the same either way.
+/// reader's job rather than this type's: the consuming
+/// [`param_value_from_handle`] path classifies values after qpdf-shaped
+/// dereference, while [`param_value_without_resolving`] classifies the shared
+/// snapshot without resolving children. qpdf dereferences a value only
+/// through `SF_FlateLzwDecode`'s `getKeys()`/`getKey()` walk, so for every
+/// other filter `decode_params_from_entries` reads the value without
+/// resolving. See [`filter_reads_decode_params`] for the boundary and
+/// [`param_value_without_resolving`] for the non-resolving classification.
 ///
 /// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for the two
 /// name comparisons a `Crypt` stage's consumers make — `/Name` selects the
@@ -583,15 +581,14 @@ fn decode_params_from_consuming_handle(
     let crypt_stage = is_crypt_filter(filter_name);
     let mut retained = Vec::new();
     for key in params.try_get_keys()? {
-        let logical_key = legacy_dictionary_key(&key);
-        if !retains_decode_param_key(logical_key, crypt_stage) {
+        if !retains_decode_param_key(&key, crypt_stage) {
             continue;
         }
         let value = params.try_get_key(&key)?;
-        let keeps_name = keeps_crypt_name_payload(logical_key, crypt_stage);
-        let consumes_integer = consumes_integer_decode_param_key(logical_key, filter_name);
+        let keeps_name = keeps_crypt_name_payload(&key, crypt_stage);
+        let consumes_integer = consumes_integer_decode_param_key(&key, filter_name);
         retained.push((
-            logical_key.to_vec(),
+            key,
             param_value_from_handle(&value, keeps_name, consumes_integer)?,
         ));
     }
@@ -618,11 +615,8 @@ fn decode_params_from_entries(
     let crypt_stage = is_crypt_filter(filter_name);
     let retained = entries
         .iter()
-        .filter(|(key, _)| retains_decode_param_key(legacy_dictionary_key(key), crypt_stage))
-        .map(|(key, value)| {
-            let logical_key = legacy_dictionary_key(key);
-            (logical_key.to_vec(), param_value_without_resolving(value))
-        })
+        .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
+        .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
         .collect();
     Ok(DecodeParams::Present(retained))
 }
@@ -640,8 +634,8 @@ fn consumes_integer_decode_param_key(key: &[u8], filter_name: &[u8]) -> bool {
         return false;
     }
     match key {
-        b"Predictor" | b"Columns" | b"Colors" | b"BitsPerComponent" => true,
-        b"EarlyChange" => normalize_filter_name(filter_name) == b"LZWDecode",
+        b"/Predictor" | b"/Columns" | b"/Colors" | b"/BitsPerComponent" => true,
+        b"/EarlyChange" => normalize_filter_name(filter_name) == b"LZWDecode",
         _ => false,
     }
 }
@@ -679,9 +673,9 @@ fn param_value_from_handle(
 /// [`param_value_from_handle`] for a non-consuming filter that never reads an
 /// entry. It only classifies shared-snapshot children and never resolves them.
 ///
-/// Deliberately the shape of `param_value_from_object`: the same
-/// classification off the same non-resolving accessor, so a *direct* value
-/// reduces to the identical [`ParamValue`] all three readers agree on.
+/// This deliberately uses the same non-resolving accessor as the snapshot
+/// reader, so a *direct* value reduces to the identical [`ParamValue`] all
+/// shape readers agree on.
 ///
 /// **No name test at all**, where the other two readers have one. This is
 /// reached only when [`filter_reads_decode_params`] is false, and
@@ -1001,10 +995,9 @@ impl FlateLzwStreamFilter {
 /// These five are exactly the ones
 /// `<FlateLzwStreamFilter as StreamFilter>::set_decode_params` matches below —
 /// the one `setDecodeParms` override in qpdf 11.9.0 that reads entries at all
-/// (`libqpdf/SF_FlateLzwDecode.cc:32-66`). qpdf spells its keys with the
-/// leading `/`; flpdf's `Dictionary` keys never carry one, so these do not
-/// either — matching `set_decode_params`' own `b"Predictor"` arms rather than
-/// qpdf's literals.
+/// (`libqpdf/SF_FlateLzwDecode.cc:32-66`). These constants retain qpdf's
+/// leading slash. A raw slashless key remains slashless in the snapshot and
+/// therefore does not accidentally match a qpdf filter key.
 ///
 /// **These five are retained whatever the filter is named, and that is not
 /// laziness.** The encode path validates each registered filter's
@@ -1072,11 +1065,11 @@ impl FlateLzwStreamFilter {
 /// shared snapshot and resolves no children. The former closes the
 /// `flpdf-h8mv` null-key divergence without widening either retained set.
 const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
-    b"BitsPerComponent",
-    b"Colors",
-    b"Columns",
-    b"EarlyChange",
-    b"Predictor",
+    b"/BitsPerComponent",
+    b"/Colors",
+    b"/Columns",
+    b"/EarlyChange",
+    b"/Predictor",
 ];
 
 /// The two `/DecodeParms` keys whose *name payload* a `Crypt` stage's
@@ -1125,7 +1118,7 @@ const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
 /// reproducing filterability, not an oversight to bound away. Restricting it
 /// to `Crypt` narrows the exposure to chains that name `Crypt`; it does not
 /// remove it.
-const CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS: [&[u8]; 2] = [b"Name", b"Type"];
+const CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS: [&[u8]; 2] = [b"/Name", b"/Type"];
 
 /// Does a stage's [`DecodeParams`] keep this key at all?
 ///
@@ -1232,7 +1225,7 @@ impl StreamFilter for FlateLzwStreamFilter {
         for (key, value) in decode_params.entries() {
             let key = key.as_slice();
             match key {
-                b"Predictor" => match *value {
+                b"/Predictor" => match *value {
                     ParamValue::Int(predictor) => {
                         self.predictor = predictor;
                         if !((predictor == 1) || (predictor == 2) || (10..=15).contains(&predictor))
@@ -1242,18 +1235,18 @@ impl StreamFilter for FlateLzwStreamFilter {
                     }
                     ParamValue::Name(_) | ParamValue::Other => filterable = false,
                 },
-                b"Columns" | b"Colors" | b"BitsPerComponent" => match *value {
+                b"/Columns" | b"/Colors" | b"/BitsPerComponent" => match *value {
                     // qpdf stores these without range validation and defers
                     // rejection to pipeline construction.
                     ParamValue::Int(parameter) => match key {
-                        b"Columns" => self.columns = parameter,
-                        b"Colors" => self.colors = parameter,
+                        b"/Columns" => self.columns = parameter,
+                        b"/Colors" => self.colors = parameter,
                         _ => self.bits_per_component = parameter,
                     },
                     ParamValue::Name(_) | ParamValue::Other => filterable = false,
                 },
                 // qpdf consults /EarlyChange only for LZW streams.
-                b"EarlyChange" if self.lzw => match *value {
+                b"/EarlyChange" if self.lzw => match *value {
                     ParamValue::Int(early_change) => {
                         self.early_code_change = early_change == 1;
                         if !((early_change == 0) || (early_change == 1)) {
@@ -1654,7 +1647,7 @@ struct CryptStreamFilter;
 /// `QPDF_Dictionary::getKeys` (`QPDF_Dictionary.cc:118-127`) and
 /// `QPDF_Dictionary::hasKey` (`:98-101`), which both skip a null value. Both
 /// readers that can feed a `Crypt` stage do drop them —
-/// `decode_params_from_object` gates on `filter_reads_decode_params`, and
+/// `decode_params_from_handle` gates on `filter_reads_decode_params`, and
 /// `decode_params_from_consuming_handle` takes its keys from `try_get_keys` —
 /// and the same [`filter_reads_decode_params`] arm selects them for `Crypt`.
 /// `decode_params_from_entries` keeps null values and is the reader a `Crypt`
@@ -1665,7 +1658,7 @@ fn crypt_params_type_entry(decode_params: &DecodeParams) -> Option<&ParamValue> 
     decode_params
         .entries()
         .iter()
-        .find(|(key, _)| key.as_slice() == b"Type")
+        .find(|(key, _)| key.as_slice() == b"/Type")
         .map(|(_, value)| value)
 }
 
@@ -1729,7 +1722,7 @@ impl StreamFilter for CryptStreamFilter {
         let type_entry = crypt_params_type_entry(decode_params);
         let mut filterable = true;
         for (key, _) in decode_params.entries() {
-            if ((key.as_slice() == b"Type") || (key.as_slice() == b"Name"))
+            if ((key.as_slice() == b"/Type") || (key.as_slice() == b"/Name"))
                 && ((!crypt_params_have_type(type_entry))
                     || crypt_params_are_dictionary_of_type(type_entry))
             {
@@ -1952,14 +1945,117 @@ mod tests {
     use super::{DecodeParams, FlateLzwStreamFilter, ParamValue, StreamFilter};
     use crate::pipeline::test_support::RecordingSink;
     use crate::pipeline::PipelineRef;
+    use crate::ObjectHandle;
 
     fn wide_tiff_decode_params() -> DecodeParams {
         DecodeParams::Present(vec![
-            (b"Predictor".to_vec(), ParamValue::Int(2)),
-            (b"Columns".to_vec(), ParamValue::Int(536_870_911)),
-            (b"Colors".to_vec(), ParamValue::Int(1)),
-            (b"BitsPerComponent".to_vec(), ParamValue::Int(8)),
+            (b"/Predictor".to_vec(), ParamValue::Int(2)),
+            (b"/Columns".to_vec(), ParamValue::Int(536_870_911)),
+            (b"/Colors".to_vec(), ParamValue::Int(1)),
+            (b"/BitsPerComponent".to_vec(), ParamValue::Int(8)),
         ])
+    }
+
+    #[test]
+    fn flate_filter_consumes_qpdf_canonical_slash_prefixed_keys() {
+        let mut filter = FlateLzwStreamFilter::new(false);
+        let params = DecodeParams::Present(vec![(b"/Predictor".to_vec(), ParamValue::Int(2))]);
+
+        assert!(filter.set_decode_params(&params));
+        assert_eq!(filter.predictor, 2);
+    }
+
+    #[test]
+    fn flate_reader_preserves_canonical_key_matching_and_ignores_raw_unknown_keys() {
+        fn decode_params(key: &[u8]) -> DecodeParams {
+            let params = ObjectHandle::dictionary(vec![]);
+            params
+                .replace_key(key, ObjectHandle::integer(2))
+                .expect("decode parameter dictionary is mutable");
+            super::decode_params_from_handle(&params, b"FlateDecode")
+                .expect("decode parameters are readable")
+        }
+
+        let canonical = decode_params(b"/Predictor");
+        let raw = decode_params(b"Predictor");
+        let special_unknown = decode_params(b"/Predictor B");
+
+        let mut canonical_filter = FlateLzwStreamFilter::new(false);
+        assert!(canonical_filter.set_decode_params(&canonical));
+        assert_eq!(canonical_filter.predictor, 2);
+
+        let mut raw_filter = FlateLzwStreamFilter::new(false);
+        assert!(raw_filter.set_decode_params(&raw));
+        assert_eq!(raw_filter.predictor, 1);
+
+        let mut special_filter = FlateLzwStreamFilter::new(false);
+        assert!(special_filter.set_decode_params(&special_unknown));
+        assert_eq!(special_filter.predictor, 1);
+    }
+
+    #[test]
+    fn crypt_reader_preserves_qpdf_name_and_type_validation() {
+        fn decode_params(entries: Vec<(Vec<u8>, ObjectHandle)>) -> DecodeParams {
+            let params = ObjectHandle::dictionary(entries);
+            super::decode_params_from_handle(&params, b"Crypt")
+                .expect("crypt decode parameters are readable")
+        }
+
+        let mut identity_filter = super::CryptStreamFilter;
+        let identity = decode_params(vec![(
+            b"/Name".to_vec(),
+            ObjectHandle::name(b"Identity".to_vec()),
+        )]);
+        assert!(identity_filter.set_decode_params(&identity));
+
+        let mut valid_type_filter = super::CryptStreamFilter;
+        let valid_type = decode_params(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+        )]);
+        assert!(valid_type_filter.set_decode_params(&valid_type));
+
+        let mut unknown_key_filter = super::CryptStreamFilter;
+        let unknown_key = decode_params(vec![(b"/Foo".to_vec(), ObjectHandle::integer(1))]);
+        assert!(!unknown_key_filter.set_decode_params(&unknown_key));
+
+        let mut invalid_type_filter = super::CryptStreamFilter;
+        let invalid_type = decode_params(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Foo".to_vec()),
+        )]);
+        assert!(!invalid_type_filter.set_decode_params(&invalid_type));
+    }
+
+    #[test]
+    fn lzw_reader_consumes_only_canonical_early_change_keys() {
+        fn decode_params(filter_name: &[u8], key: &[u8], value: i64) -> DecodeParams {
+            let params = ObjectHandle::dictionary(vec![]);
+            params
+                .replace_key(key, ObjectHandle::integer(value))
+                .expect("decode parameter dictionary is mutable");
+            super::decode_params_from_handle(&params, filter_name)
+                .expect("decode parameters are readable")
+        }
+
+        for (value, expected_filterable, expected_early_change) in
+            [(0, true, false), (1, true, true), (2, false, false)]
+        {
+            let params = decode_params(b"LZWDecode", b"/EarlyChange", value);
+            let mut filter = FlateLzwStreamFilter::new(true);
+            assert_eq!(filter.set_decode_params(&params), expected_filterable);
+            assert_eq!(filter.early_code_change, expected_early_change);
+        }
+
+        let raw = decode_params(b"LZWDecode", b"EarlyChange", 0);
+        let mut raw_filter = FlateLzwStreamFilter::new(true);
+        assert!(raw_filter.set_decode_params(&raw));
+        assert!(raw_filter.early_code_change);
+
+        let flate = decode_params(b"FlateDecode", b"/EarlyChange", 0);
+        let mut flate_filter = FlateLzwStreamFilter::new(false);
+        assert!(flate_filter.set_decode_params(&flate));
+        assert!(flate_filter.early_code_change);
     }
 
     fn wide_tiff_filter() -> FlateLzwStreamFilter {
@@ -1997,10 +2093,10 @@ mod tests {
     #[test]
     fn encode_predictor_uses_the_tiff_stream_filter_pipeline() {
         let params = DecodeParams::Present(vec![
-            (b"Predictor".to_vec(), ParamValue::Int(2)),
-            (b"Columns".to_vec(), ParamValue::Int(2)),
-            (b"Colors".to_vec(), ParamValue::Int(1)),
-            (b"BitsPerComponent".to_vec(), ParamValue::Int(8)),
+            (b"/Predictor".to_vec(), ParamValue::Int(2)),
+            (b"/Columns".to_vec(), ParamValue::Int(2)),
+            (b"/Colors".to_vec(), ParamValue::Int(1)),
+            (b"/BitsPerComponent".to_vec(), ParamValue::Int(8)),
         ]);
 
         assert_eq!(

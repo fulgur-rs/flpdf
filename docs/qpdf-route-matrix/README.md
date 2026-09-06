@@ -251,8 +251,8 @@ crates/flpdf/src/xref.rs::BootstrapCache: prod 2 (1 files) / test 2
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/reader/resolver.rs::read_window: prod 5 (1 files) / test 0
     crates/flpdf/src/reader.rs 5
-crates/flpdf/src/object_handle.rs::legacy_dictionary_key: prod 6 (3 files) / test 0
-    crates/flpdf/src/stream_filter.rs 3, crates/flpdf/src/parser.rs 2, crates/flpdf/src/writer/object.rs 1
+crates/flpdf/src/object_handle.rs::legacy_dictionary_key: prod 3 (2 files) / test 0
+    crates/flpdf/src/parser.rs 2, crates/flpdf/src/writer/object.rs 1
 crates/flpdf/src/pdf.rs::compressed_member_parents: prod 3 (2 files) / test 7
     crates/flpdf/src/engine.rs 2, crates/flpdf/src/reader.rs 1
 crates/flpdf/src/reader/resolver.rs::ResolverCore: prod 5 (1 files) / test 0
@@ -522,7 +522,7 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 63 (28 files) / test 1283
 | A7 | `resolve` | 256 | 257 | 行は「`\.resolve\(` 全件 − 非 `Pdf` receiver 23 件」の差集合。tracker の素の leaf 一致は `PageRange::resolve` 等も拾う | **行の方法**（leaf が曖昧）。数え直すときは行に書かれた差集合手順を再実行する |
 | A10 | `object_refs` | 6 | 14 | tracker は `let object_refs = pdf.object_refs();` のような **ローカル束縛と for パターン**（`crates/flpdf/src/linearization/plan.rs:1071` 付近に 3 件）も数える。行は `Pdf::object_refs()` の呼び出しだけを数えた | tracker（型位置・束縛も「移行が要る実参照」なので規約どおり） |
 | A15 | `synchronize_cache_with_resolver_xref` | 6 / test 2 | 6 / test 2 | `.46` で A14 の production deletion facade とその ObjStm 昇格 helper を撤去し、現在は reader.rs の remaining legacy-cache synchronization callers と test-only remove routeだけが残る | tracker |
-| A23 | `legacy_dictionary_key` | 8 | 6 | 行が挙げた 8 箇所のうち `crates/flpdf/src/stream_filter.rs:48` と `crates/flpdf/src/writer/object.rs:10` は `use` 行。tracker は `use` 行を除外する | tracker |
+| A23 | `legacy_dictionary_key` | 5 | 3 | `.48.36`でstream_filter.rsのimport 1行 + consumer 3行を削除。残るparser.rs 2行とwriter/object.rs 1行、およびimport 2行は別bounded slicesで移行する | tracker |
 | A24 | `compressed_member_parents` | 6 | 6 | A14 専用の ObjStm 昇格 helper は `.46` で撤去した。残る provenance state は A2/A15 の legacy cache 列を畳むまで保持する | tracker |
 | B25 | `reconstructed_xref` | 6 | 12 | 行は `reconstructed_xref(`（開き括弧つき）で数えたのでフィールド読み書きが落ちる。tracker は leaf 一致なので両方数える | tracker（行側の注記「`\breconstructed_xref\b` だと 48 hit」は除外規則を適用する前の生 `rg` 件数） |
 | B26 | `attempt_recovery` | 1 | 10 | 同上（`attempt_recovery(` で数えた行 vs フィールド参照も含む tracker） | tracker |
