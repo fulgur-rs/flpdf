@@ -5,7 +5,7 @@ mod arg_parser;
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
 use flpdf::job::{
-    apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
+    copy_duplicate_page_annotations, flatten_rotation_on_pages,
     should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions,
     AttachmentCopySource, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
     JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
@@ -24,7 +24,9 @@ use flpdf::{
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
-    CombinedPage, InputSpec, PageRange, RotateSpec,
+    parse_rotation_parameter,
+    qutil::{parse_numrange, qpdf_size_to_int},
+    CombinedPage, InputSpec, PageRange,
 };
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -1388,7 +1390,8 @@ struct PageOpArgs {
     /// Rotate pages by a multiple of 90 degrees (qpdf `--rotate`).
     ///
     /// Form: `[+|-]angle[:page-range]` where angle ∈ {0,90,180,270}.
-    /// Repeatable; specs are applied in argument order. In `--pages` mode the
+    /// Repeatable; duplicate raw ranges use qpdf's last-write-wins map and
+    /// distinct ranges are applied in lexical order. In `--pages` mode the
     /// page-range refers to OUTPUT page numbers (qpdf 11.9.0-observed:
     /// `qpdf in --pages . 2-3 -- --rotate=+90:1 out` rotates the first
     /// extracted page).
@@ -1399,7 +1402,7 @@ struct PageOpArgs {
         require_equals = true,
         help = "Rotate pages by 0/90/180/270 degrees (qpdf --rotate); repeatable"
     )]
-    rotate: Vec<String>,
+    rotate: Vec<OsString>,
 
     /// Write one output file per N-page group instead of a single file
     /// (qpdf `--split-pages[=n]`, default n=1).
@@ -2369,7 +2372,7 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
                 // (`QPDFJob_config.cc:945-951`).
                 if raw_pages.is_some() {
                     return Err(Box::new(UsageError::new(
-                        "--pages may only be specified one time".to_owned(),
+                        "--pages may only be specified one time",
                     )));
                 }
                 raw_pages = Some(tokens)
@@ -3236,11 +3239,17 @@ fn find_raw_error_message<'a>(error: &'a (dyn std::error::Error + 'static)) -> O
 
 fn usage_exit(error: &UsageError) -> ! {
     let who = progname();
-    emit_logger_error(format!(
-        "\n{who}: {error}\n\nFor help:\n  {who} --help=usage       usage information\n  \
+    let mut message = format!("\n{who}: ").into_bytes();
+    message.extend_from_slice(error.what_bytes());
+    message.extend_from_slice(
+        format!(
+            "\n\nFor help:\n  {who} --help=usage       usage information\n  \
 {who} --help=topic       help on a topic\n  {who} --help=--option    help on an option\n  \
 {who} --help             general help and a topic list\n\n"
-    ));
+        )
+        .as_bytes(),
+    );
+    emit_logger_error(message);
     std::process::exit(2);
 }
 
@@ -6566,42 +6575,43 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     finish_operation_warnings_with_prior(pdf, creates_output, prior_warnings)
 }
 
-/// Apply each `--rotate` spec (in order) to `target_pages`, resolving each
-/// spec's page-range against the number of target pages.
+/// Apply qpdf's rotation map to `target_pages`, resolving each raw range
+/// against the number of target pages.
 fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
-    rotate_args: &[String],
+    rotate_args: &[OsString],
     target_pages: &[ObjectRef],
 ) -> CliResult<()> {
     if rotate_args.is_empty() {
         return Ok(());
     }
-    let total = u32::try_from(target_pages.len())
-        .map_err(|_| "too many pages to apply --rotate".to_string())?;
-    for raw in rotate_args {
-        let spec =
-            RotateSpec::parse(raw).map_err(|e| format!("--rotate: invalid spec {raw:?}: {e}"))?;
+    let page_count = qpdf_size_to_int(target_pages.len())?;
+    let rotations = parse_rotate_specs(rotate_args)?;
+    for (range, spec) in rotations {
         // qpdf's handleRotations resolves each range against the real page
         // count and then filters `0 <= pageno < npages` before touching
         // `pages`, so an empty document rotates nothing without erroring
-        // (confirmed live: `--collate=0 --rotate=90` exits 0). A resolved
-        // range's own out-of-bounds check requires page_count >= 1, so this
-        // document-empty case is handled up front instead of via resolve().
-        let pages: Vec<ObjectRef> = if total == 0 {
-            Vec::new()
-        } else {
-            let indices = spec
-                .range
-                .resolve(total)
-                .map_err(|e| format!("--rotate: page range out of bounds in {raw:?}: {e}"))?;
-            indices
-                .iter()
-                .filter_map(|&i| target_pages.get((i - 1) as usize).copied())
-                .collect()
-        };
-        apply_rotate_to_pages(pdf, &pages, &spec.op)?;
+        // (confirmed live: `--collate=0 --rotate=90` exits 0).
+        for page in parse_numrange(&range, page_count)? {
+            let index = page.wrapping_sub(1);
+            if index >= 0 && index < page_count {
+                let mut page = PageObjectHelper::new(target_pages[index as usize], pdf);
+                page.rotate_page(spec.angle, spec.relative)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn parse_rotate_specs(
+    rotate_args: &[OsString],
+) -> CliResult<std::collections::BTreeMap<Vec<u8>, flpdf::RotationSpec>> {
+    let mut rotations = std::collections::BTreeMap::new();
+    for raw in rotate_args {
+        let parameter = parse_rotation_parameter(&arg_parser::os_bytes(raw))?;
+        rotations.insert(parameter.range, parameter.spec);
+    }
+    Ok(rotations)
 }
 
 /// Parse `--split-pages[=n]` (default 1; qpdf-compatible).
@@ -8910,6 +8920,34 @@ mod tests {
         assert_eq!(
             CliFlattenMode::Print.flags(),
             FlattenAnnotationsMode::Print.qpdf_flags()
+        );
+    }
+
+    #[test]
+    fn rotate_specs_use_qpdf_map_overwrite_and_lexical_order() {
+        let specs = parse_rotate_specs(&os_strs(&["90:1-3", "+90:2", "90:1-3"]))
+            .expect("rotation parameters should parse");
+        let keys: Vec<&[u8]> = specs.keys().map(Vec::as_slice).collect();
+        assert_eq!(keys, [b"1-3".as_slice(), b"2".as_slice()]);
+        assert_eq!(specs[b"1-3".as_slice()].angle, 90);
+        assert!(!specs[b"1-3".as_slice()].relative);
+        assert_eq!(specs[b"2".as_slice()].angle, 90);
+        assert!(specs[b"2".as_slice()].relative);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotate_specs_retain_raw_parameter_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"90:1-\xff".to_vec());
+        let error = parse_rotate_specs(&[raw]).unwrap_err();
+        let error = error
+            .downcast_ref::<flpdf::Error>()
+            .expect("rotation parser should preserve qpdf error bytes");
+        assert!(matches!(error, flpdf::Error::Usage(_)));
+        assert_eq!(
+            error.raw_message(),
+            Some(b"invalid parameter to rotate: 90:1-\xff".as_slice())
         );
     }
 

@@ -388,6 +388,212 @@ pub(crate) fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
     }
 }
 
+/// Narrow qpdf's `size_t` page count through `QIntC::to_int` semantics.
+///
+/// qpdf uses this conversion in `QPDFJob::handleRotations`
+/// (`libqpdf/QPDFJob.cc:2638`) before calling `QUtil::parse_numrange`; the
+/// checked failure is a runtime error, not a saturating or placeholder value.
+pub fn qpdf_size_to_int(value: usize) -> crate::Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        crate::Error::System(format!(
+            "integer out of range converting {value} from a {}-byte unsigned type to a {}-byte signed type",
+            std::mem::size_of::<usize>(),
+            std::mem::size_of::<i32>()
+        ))
+    })
+}
+
+/// Parse qpdf's numeric page-range language.
+///
+/// This is the byte-oriented counterpart of `QUtil::parse_numrange`
+/// (`libqpdf/QUtil.cc:1304-1438`, `include/qpdf/QUtil.hh:464`). qpdf receives a
+/// NUL-terminated `char const*`, so the input is truncated at the first NUL;
+/// retaining bytes here also keeps qpdf's runtime diagnostic payload intact at
+/// the job/CLI boundary. `max == 0` performs syntax-only validation, while a
+/// positive max performs qpdf's 1-based range checks. Non-positive maxima are
+/// intentionally not rejected because qpdf gates those checks on `max > 0`.
+pub fn parse_numrange(range: &[u8], max: i32) -> crate::Result<Vec<i32>> {
+    let range = &range[..range
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(range.len())];
+    let mut range_end = range.len();
+    let mut skip = 1usize;
+    let mut start_idx = 0usize;
+    if let Some(colon) = range.iter().position(|&byte| byte == b':') {
+        if &range[colon..] == b":odd" {
+            skip = 2;
+        } else if &range[colon..] == b":even" {
+            skip = 2;
+            start_idx = 1;
+        } else {
+            return Err(numrange_error(range, colon, b"expected :even or :odd"));
+        }
+        range_end = colon;
+    }
+
+    let mut result = Vec::new();
+    let mut last_group = Vec::new();
+    let mut cursor = 0usize;
+    let mut first = true;
+    while cursor != range_end {
+        let group_end = range[cursor..range_end]
+            .iter()
+            .position(|&byte| byte == b',')
+            .map_or(range_end, |offset| cursor + offset);
+        let group = &range[cursor..group_end];
+        let Some(group_match) = capture_numrange_group(group) else {
+            return Err(numrange_error(range, cursor, b"invalid range syntax"));
+        };
+        if first && group_match.is_exclude {
+            return Err(numrange_error(
+                range,
+                cursor,
+                b"first range group may not be an exclusion",
+            ));
+        }
+        first = false;
+
+        let first_num = parse_numrange_integer(range, cursor, group_match.first, max)?;
+        let last_num = group_match
+            .last
+            .map(|last| parse_numrange_integer(range, cursor, last, max))
+            .transpose()?;
+        let is_span = last_num.is_some();
+        let last_num = last_num.unwrap_or_default();
+
+        if group_match.is_exclude {
+            let work = populate_numrange_group(first_num, is_span, last_num);
+            let mut exclusions = std::collections::BTreeSet::new();
+            exclusions.extend(work.iter().copied());
+            let previous = std::mem::take(&mut last_group);
+            last_group.extend(previous.into_iter().filter(|n| !exclusions.contains(n)));
+        } else {
+            result.append(&mut last_group);
+            last_group = populate_numrange_group(first_num, is_span, last_num);
+        }
+
+        cursor = group_end;
+        if cursor < range_end && range[cursor] == b',' {
+            cursor += 1;
+            if cursor == range_end {
+                return Err(numrange_error(range, cursor, b"trailing comma"));
+            }
+        }
+    }
+    result.append(&mut last_group);
+    if skip == 1 {
+        return Ok(result);
+    }
+    Ok(result.into_iter().skip(start_idx).step_by(skip).collect())
+}
+
+struct NumrangeGroup<'a> {
+    is_exclude: bool,
+    first: &'a [u8],
+    last: Option<&'a [u8]>,
+}
+
+fn capture_numrange_group(group: &[u8]) -> Option<NumrangeGroup<'_>> {
+    let is_exclude = group.first() == Some(&b'x');
+    let mut position = usize::from(is_exclude);
+    let first_start = position;
+    position = capture_numrange_endpoint(group, position)?;
+    let first = &group[first_start..position];
+    let last = if group.get(position) == Some(&b'-') {
+        position += 1;
+        let last_start = position;
+        position = capture_numrange_endpoint(group, position)?;
+        Some(&group[last_start..position])
+    } else {
+        None
+    };
+    (position == group.len()).then_some(NumrangeGroup {
+        is_exclude,
+        first,
+        last,
+    })
+}
+
+fn capture_numrange_endpoint(group: &[u8], mut position: usize) -> Option<usize> {
+    if group.get(position) == Some(&b'z') {
+        return Some(position + 1);
+    }
+    if group.get(position) == Some(&b'r') {
+        position += 1;
+    }
+    let start = position;
+    while group
+        .get(position)
+        .is_some_and(|byte| byte.is_ascii_digit())
+    {
+        position += 1;
+    }
+    (position != start).then_some(position)
+}
+
+fn parse_numrange_integer(
+    input: &[u8],
+    offset: usize,
+    endpoint: &[u8],
+    max: i32,
+) -> crate::Result<i32> {
+    if endpoint == b"z" {
+        return check_numrange_value(input, offset, max, max);
+    }
+    let from_end = endpoint.first() == Some(&b'r');
+    let digits = if from_end { &endpoint[1..] } else { endpoint };
+    let text = std::str::from_utf8(digits)
+        .map_err(|_| numrange_error(input, offset, b"invalid range syntax"))?;
+    let number = match qpdf_string_to_int_checked(text) {
+        QpdfIntParse::Value(value) if value != 0 => value,
+        QpdfIntParse::Overflow(message) => {
+            return Err(numrange_error(input, offset, message.as_bytes()));
+        }
+        QpdfIntParse::Value(_) | QpdfIntParse::NoDigits => 0,
+    };
+    let value = if from_end {
+        max.wrapping_add(1).wrapping_sub(number)
+    } else {
+        number
+    };
+    check_numrange_value(input, offset, value, max)
+}
+
+fn check_numrange_value(input: &[u8], offset: usize, value: i32, max: i32) -> crate::Result<i32> {
+    if max > 0 && (value < 1 || value > max) {
+        return Err(numrange_error(
+            input,
+            offset,
+            format!("number {value} out of range").as_bytes(),
+        ));
+    }
+    Ok(value)
+}
+
+fn populate_numrange_group(first: i32, is_span: bool, last: i32) -> Vec<i32> {
+    let mut group = vec![first];
+    if is_span {
+        if first > last {
+            group.extend((last..first).rev());
+        } else if first < last {
+            group.extend((first + 1)..=last);
+        }
+    }
+    group
+}
+
+fn numrange_error(input: &[u8], offset: usize, detail: &[u8]) -> crate::Error {
+    let offset = offset.min(input.len());
+    let mut message = b"error at * in numeric range ".to_vec();
+    message.extend_from_slice(&input[..offset]);
+    message.push(b'*');
+    message.extend_from_slice(&input[offset..]);
+    message.extend_from_slice(b": ");
+    message.extend_from_slice(detail);
+    crate::Error::SystemBytes(message)
+}
+
 const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
     0x00c4, 0x00c5, 0x00c7, 0x00c9, 0x00d1, 0x00d6, 0x00dc, 0x00e1, 0x00e0, 0x00e2, 0x00e4, 0x00e3,
     0x00e5, 0x00e7, 0x00e9, 0x00e8, 0x00ea, 0x00eb, 0x00ed, 0x00ec, 0x00ee, 0x00ef, 0x00f1, 0x00f3,
@@ -405,8 +611,9 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        int_to_string_base, qpdf_string_to_int_checked, safe_fopen, same_file, to_utf8,
-        utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi, QpdfIntParse,
+        int_to_string_base, parse_numrange, qpdf_size_to_int, qpdf_string_to_int_checked,
+        safe_fopen, same_file, to_utf8, utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi,
+        QpdfIntParse,
     };
     use std::io::{Read, Write};
 
@@ -555,6 +762,107 @@ mod tests {
             QpdfIntParse::Overflow(
                 "integer out of range converting 4294967296 from a 8-byte signed type to a 4-byte signed type".into()
             )
+        );
+    }
+
+    #[test]
+    fn parse_numrange_matches_qpdf_groups_exclusions_and_position_filters() {
+        assert_eq!(parse_numrange(b"1-5,x3", 5).unwrap(), vec![1, 2, 4, 5]);
+        assert_eq!(parse_numrange(b"5-1", 5).unwrap(), vec![5, 4, 3, 2, 1]);
+        assert_eq!(parse_numrange(b"1-5:odd", 5).unwrap(), vec![1, 3, 5]);
+        assert_eq!(parse_numrange(b"1-5:even", 5).unwrap(), vec![2, 4]);
+        assert_eq!(parse_numrange(b":odd", 5).unwrap(), Vec::<i32>::new());
+        assert_eq!(parse_numrange(b":even", 5).unwrap(), Vec::<i32>::new());
+        assert_eq!(parse_numrange(b"1,1-3:odd", 5).unwrap(), vec![1, 2]);
+        assert_eq!(parse_numrange(b"1,1-3:even", 5).unwrap(), vec![1, 3]);
+        assert_eq!(parse_numrange(b"01-03", 5).unwrap(), vec![1, 2, 3]);
+        assert_eq!(parse_numrange(b"1-3,x2,4", 5).unwrap(), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn parse_numrange_max_zero_and_nonpositive_values_follow_qpdf() {
+        assert_eq!(parse_numrange(b"", 0).unwrap(), Vec::<i32>::new());
+        assert_eq!(parse_numrange(b"0,r0,z", 0).unwrap(), vec![0, 1, 0]);
+        assert_eq!(parse_numrange(b"z,r1", -1).unwrap(), vec![-1, -1]);
+    }
+
+    #[test]
+    fn parse_numrange_truncates_at_nul_and_preserves_raw_error_bytes() {
+        assert_eq!(parse_numrange(b"1-2\0not-a-range", 2).unwrap(), vec![1, 2]);
+        let error = parse_numrange(b"1-\xff", 2).unwrap_err();
+        assert_eq!(
+            error.raw_message(),
+            Some(b"error at * in numeric range *1-\xff: invalid range syntax".as_slice())
+        );
+    }
+
+    #[test]
+    fn parse_numrange_reports_qpdf_integer_overflow() {
+        let error = parse_numrange(b"999999999999999999999999", 0).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "error at * in numeric range *999999999999999999999999: overflow/underflow converting 999999999999999999999999 to 64-bit integer"
+        );
+    }
+
+    #[test]
+    fn parse_numrange_reports_qpdf_trailing_comma_position() {
+        let error = parse_numrange(b"1-5,:odd", 5).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "error at * in numeric range 1-5,*:odd: trailing comma"
+        );
+    }
+
+    #[test]
+    fn qpdf_size_to_int_matches_qintc_unsigned_narrowing() {
+        assert_eq!(qpdf_size_to_int(17).unwrap(), 17);
+        let error = qpdf_size_to_int(i32::MAX as usize + 1).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "integer out of range converting 2147483648 from a {}-byte unsigned type to a {}-byte signed type",
+                std::mem::size_of::<usize>(),
+                std::mem::size_of::<i32>()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_numrange_validates_group_syntax_before_exclusion_or_narrowing() {
+        for input in [b"x".as_slice(), b"xfoo", b"x1-", b"2147483648x", b"0x"] {
+            let error = parse_numrange(input, 5).unwrap_err();
+            assert!(
+                error.to_string().ends_with(": invalid range syntax"),
+                "{input:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_numrange_reports_invalid_suffix_and_first_exclusion() {
+        let suffix = parse_numrange(b"1:unexpected", 5).unwrap_err();
+        assert!(suffix.to_string().ends_with(": expected :even or :odd"));
+        let exclusion = parse_numrange(b"x3", 5).unwrap_err();
+        assert!(exclusion
+            .to_string()
+            .ends_with(": first range group may not be an exclusion"));
+    }
+
+    #[test]
+    fn parse_numrange_matches_qpdf_narrowing_and_wrapping_boundaries() {
+        let leading_zero = parse_numrange(b"02147483648", 0).unwrap_err();
+        assert!(leading_zero
+            .to_string()
+            .contains("integer out of range converting 2147483648 from"));
+        let leading_zero_short = parse_numrange(b"0004294967296", 0).unwrap_err();
+        assert!(leading_zero_short
+            .to_string()
+            .contains("integer out of range converting 4294967296 from"));
+        let wrapped = parse_numrange(b"r0", i32::MAX).unwrap_err();
+        assert_eq!(
+            wrapped.to_string(),
+            "error at * in numeric range *r0: number -2147483648 out of range"
         );
     }
 

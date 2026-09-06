@@ -14,8 +14,8 @@ use super::page_range::PageRange;
 use super::page_specs::{PageSpecInput, PageSpecJobOutput};
 use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
-use super::rotate::{apply_rotate_to_pages, flatten_rotation_on_pages};
-use super::rotate_spec::RotateSpec;
+use super::rotate::flatten_rotation_on_pages;
+use super::rotate_spec::{parse_rotation_parameter, RotationSpec};
 use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
 use crate::linearization::{show_linearization_pdf_with_warnings, ShowLinearizationError};
@@ -210,7 +210,7 @@ struct JobConfiguration {
     /// qpdf stores rotations in a map keyed by the original page-range
     /// string (`QPDFJob.cc:369-415`); assigning the same range replaces the
     /// earlier rotation and iteration is lexical by range.
-    rotations: BTreeMap<String, RotateSpec>,
+    rotations: BTreeMap<Vec<u8>, RotationSpec>,
     remove_restrictions: bool,
     coalesce_contents: bool,
     /// qpdf's image transformation toggles and thresholds. The actual image
@@ -656,18 +656,6 @@ fn job_json_yn(
     key: &[u8],
 ) -> Result<Option<bool>> {
     Ok(job_json_choice(members, key, &["y", "n"], true)?.map(|value| value == "y"))
-}
-
-fn job_json_rotate_range(value: &[u8]) -> String {
-    let value = String::from_utf8_lossy(value);
-    let Some((_, range)) = value.split_once(':') else {
-        return "1-z".to_owned();
-    };
-    if range.is_empty() {
-        "1-z".to_owned()
-    } else {
-        range.to_owned()
-    }
 }
 
 fn job_json_modify_permission(
@@ -2043,12 +2031,18 @@ impl QPDFJob {
             configuration.split_pages = Some(parse_job_split_pages(&value)?);
         }
         if let Some(value) = job_json_string(&members, b"rotate")? {
-            let value = String::from_utf8_lossy(&value);
-            let rotation = RotateSpec::parse(&value)
-                .map_err(|error| Error::Usage(UsageError::new(format!(".rotate: {error}"))))?;
+            // qpdf's JSON handler passes `parameter.c_str()` into Config, so
+            // JSON input truncates at its first NUL before the private
+            // parseRotationParameter receives the value. Direct Config and
+            // CLI callers retain the full std::string/argv bytes instead.
+            let value = &value[..value
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(value.len())];
+            let rotation = parse_rotation_parameter(value)?;
             configuration
                 .rotations
-                .insert(job_json_rotate_range(value.as_bytes()), rotation);
+                .insert(rotation.range, rotation.spec);
         }
         if job_json_bare(&members, b"removeRestrictions")? {
             configuration.remove_restrictions = true;
@@ -2180,7 +2174,7 @@ impl QPDFJob {
                 let item = String::from_utf8_lossy(&item);
                 let key = JsonKey::from_str(&item).ok_or_else(|| {
                     Error::Usage(UsageError::new(
-                        ".jsonKey: unexpected value; expected one of acroform, attachments, encrypt, objectinfo, objects, outlines, pagelabels, pages, qpdf".to_owned(),
+                ".jsonKey: unexpected value; expected one of acroform, attachments, encrypt, objectinfo, objects, outlines, pagelabels, pages, qpdf",
                     ))
                 })?;
                 configuration.json_keys.push(key);
@@ -2864,35 +2858,16 @@ impl QPDFJob {
             return Ok(());
         }
         let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
-        if page_refs.is_empty() {
-            // qpdf's handleRotations resolves each range against the real page
-            // count and then filters `0 <= pageno < npages` before touching
-            // `pages`, so an empty document rotates nothing without erroring
-            // (confirmed live: `--collate=0 --rotate=90` exits 0). A resolved
-            // range's own out-of-bounds check requires page_count >= 1, so
-            // this document-empty case is handled up front instead.
-            return Ok(());
-        }
-        let page_count = u32::try_from(page_refs.len())
-            .map_err(|_| Error::Unsupported("page count exceeds qpdf's range".to_owned()))?;
-        for rotation in configuration.rotations.values() {
-            let selected = rotation.range.resolve(page_count)?;
-            let selected_refs = selected
-                .into_iter()
-                .map(|page| {
-                    // cov:ignore-start: PageRange::resolve guarantees each
-                    // selected page is a 1-based member of page_refs, so these
-                    // defensive conversion/index failures are unreachable.
-                    let index = usize::try_from(page - 1).map_err(|_| {
-                        Error::Unsupported("rotation page index underflow".to_owned())
-                    })?;
-                    page_refs.get(index).copied().ok_or_else(|| {
-                        Error::Unsupported("rotation page index out of range".to_owned())
-                    })
-                    // cov:ignore-end
-                })
-                .collect::<Result<Vec<_>>>()?;
-            apply_rotate_to_pages(pdf, &selected_refs, &rotation.op)?;
+        let page_count = crate::qutil::qpdf_size_to_int(page_refs.len())?;
+        for (range, rotation) in &configuration.rotations {
+            let selected = crate::qutil::parse_numrange(range, page_count)?;
+            for page in selected {
+                let index = page.wrapping_sub(1);
+                if index >= 0 && index < page_count {
+                    let mut page = PageObjectHelper::new(page_refs[index as usize], pdf);
+                    page.rotate_page(rotation.angle, rotation.relative)?;
+                }
+            }
         }
         Ok(())
     }
@@ -4804,7 +4779,35 @@ mod tests {
         assert_eq!(job.configuration.json_stream_data, JsonStreamData::File);
         assert!(job.configuration.json_stream_data_set);
         assert_eq!(job.configuration.rotations.len(), 1);
-        assert_eq!(job.configuration.rotations["1"].op.degrees, 180);
+        assert_eq!(job.configuration.rotations[b"1".as_slice()].angle, 180);
+    }
+
+    #[test]
+    fn job_json_rotation_keeps_qpdf_raw_range_and_relative_state() {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(&serde_json::json!({"rotate": "+90:1-5,x3"}).to_string())
+            .unwrap();
+        let rotation = &job.configuration.rotations[b"1-5,x3".as_slice()];
+        assert_eq!(rotation.angle, 90);
+        assert!(rotation.relative);
+        assert_eq!(
+            crate::qutil::parse_numrange(b"1-5,x3", 5).unwrap(),
+            vec![1, 2, 4, 5]
+        );
+    }
+
+    #[test]
+    fn job_json_rotation_applies_qpdf_c_string_boundary_before_parsing() {
+        let mut job = QPDFJob::new();
+        job.initialize_from_json_partial(
+            &serde_json::json!({"rotate": "90:1\u{0000}junk"}).to_string(),
+        )
+        .unwrap();
+        assert!(job.configuration.rotations.contains_key(b"1".as_slice()));
+        assert!(!job
+            .configuration
+            .rotations
+            .contains_key(b"1\0junk".as_slice()));
     }
 
     #[test]
