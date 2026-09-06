@@ -576,6 +576,32 @@ fn json_job_run_applies_rotate_to_a_collate_zero_empty_page_selection() {
     assert_eq!(flpdf::pages::page_refs(&mut pdf).unwrap().len(), 0);
 }
 
+#[test]
+fn json_job_run_applies_relative_rotation_to_a_real_page() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/compat/one-page.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("relative-rotate.pdf");
+    let json = serde_json::json!({
+        "empty": "",
+        "outputFile": output,
+        "staticId": "",
+        "pages": [{"file": fixture}],
+        "rotate": "+90"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(output).unwrap())).unwrap();
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
+}
+
 /// qpdf keys its opened-source cache by filename alone
 /// (`page_spec_qpdfs.count(page_spec.filename) == 0`, `QPDFJob.cc:2389`),
 /// reusing the same already-open QPDF for a repeated literal path rather

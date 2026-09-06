@@ -14,7 +14,7 @@ use super::page_range::PageRange;
 use super::page_specs::{PageSpecInput, PageSpecJobOutput};
 use super::page_split::SplitPageOptions;
 use super::resource_pruning::RemoveUnreferencedResources;
-use super::rotate::{apply_rotate_to_pages, flatten_rotation_on_pages, RotateMode, RotateOp};
+use super::rotate::flatten_rotation_on_pages;
 use super::rotate_spec::{parse_rotation_parameter, RotationSpec};
 use crate::encryption::{EncryptMethod, EncryptParams, PasswordMode};
 use crate::json_inspect::{DecodeLevel as JsonDecodeLevel, JsonKey, JsonObjectSelector};
@@ -2861,27 +2861,13 @@ impl QPDFJob {
         let page_count = crate::qutil::qpdf_size_to_int(page_refs.len())?;
         for (range, rotation) in &configuration.rotations {
             let selected = crate::qutil::parse_numrange(range, page_count)?;
-            let selected_refs = selected
-                .into_iter()
-                .filter_map(|page| {
-                    let index = page.wrapping_sub(1);
-                    (index >= 0 && index < page_count)
-                        .then(|| page_refs.get(index as usize).copied())
-                        .flatten()
-                })
-                .collect::<Vec<_>>();
-            apply_rotate_to_pages(
-                pdf,
-                &selected_refs,
-                &RotateOp {
-                    mode: if rotation.relative {
-                        RotateMode::Add
-                    } else {
-                        RotateMode::Assign
-                    },
-                    degrees: rotation.angle,
-                },
-            )?;
+            for page in selected {
+                let index = page.wrapping_sub(1);
+                if index >= 0 && index < page_count {
+                    let mut page = PageObjectHelper::new(page_refs[index as usize], pdf);
+                    page.rotate_page(rotation.angle, rotation.relative)?;
+                }
+            }
         }
         Ok(())
     }

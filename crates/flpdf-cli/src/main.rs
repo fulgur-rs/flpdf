@@ -5,7 +5,7 @@ mod arg_parser;
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::fix_qdf;
 use flpdf::job::{
-    apply_rotate_to_pages, copy_duplicate_page_annotations, flatten_rotation_on_pages,
+    copy_duplicate_page_annotations, flatten_rotation_on_pages,
     should_remove_unreferenced_resources, AttachmentAddOptions, AttachmentCopyOptions,
     AttachmentCopySource, CheckError, FlattenAnnotationsMode, ImageOptimizationOptions,
     JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
@@ -26,7 +26,7 @@ use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     parse_rotation_parameter,
     qutil::{parse_numrange, qpdf_size_to_int},
-    CombinedPage, InputSpec, PageRange, RotateMode, RotateOp,
+    CombinedPage, InputSpec, PageRange,
 };
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -6591,30 +6591,14 @@ fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
         // qpdf's handleRotations resolves each range against the real page
         // count and then filters `0 <= pageno < npages` before touching
         // `pages`, so an empty document rotates nothing without erroring
-        // (confirmed live: `--collate=0 --rotate=90` exits 0). A resolved
-        // range's own out-of-bounds check requires page_count >= 1, so this
-        // document-empty case is handled up front instead of via resolve().
-        let pages: Vec<ObjectRef> = parse_numrange(&range, page_count)?
-            .into_iter()
-            .filter_map(|page| {
-                let index = page.wrapping_sub(1);
-                (index >= 0 && index < page_count)
-                    .then(|| target_pages.get(index as usize).copied())
-                    .flatten()
-            })
-            .collect();
-        apply_rotate_to_pages(
-            pdf,
-            &pages,
-            &RotateOp {
-                mode: if spec.relative {
-                    RotateMode::Add
-                } else {
-                    RotateMode::Assign
-                },
-                degrees: spec.angle,
-            },
-        )?;
+        // (confirmed live: `--collate=0 --rotate=90` exits 0).
+        for page in parse_numrange(&range, page_count)? {
+            let index = page.wrapping_sub(1);
+            if index >= 0 && index < page_count {
+                let mut page = PageObjectHelper::new(target_pages[index as usize], pdf);
+                page.rotate_page(spec.angle, spec.relative)?;
+            }
+        }
     }
     Ok(())
 }
