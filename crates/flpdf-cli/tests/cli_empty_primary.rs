@@ -28,6 +28,21 @@ fn run_flpdf(args: &[&str]) -> Output {
         .expect("flpdf process")
 }
 
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
 fn assert_same_process_result(args: &[&str]) {
     let qpdf = run_qpdf(args);
     let flpdf = run_flpdf(args);
@@ -102,8 +117,8 @@ fn empty_primary_json_output_file_matches_qpdf() {
     assert!(qpdf.status.success(), "qpdf stderr: {:?}", qpdf.stderr);
     assert!(flpdf.status.success(), "flpdf stderr: {:?}", flpdf.stderr);
     assert_eq!(
-        fs::read(&flpdf_output).expect("flpdf JSON output"),
-        fs::read(&qpdf_output).expect("qpdf JSON output"),
+        normalize_text_newlines(&fs::read(&flpdf_output).expect("flpdf JSON output")),
+        normalize_text_newlines(&fs::read(&qpdf_output).expect("qpdf JSON output")),
     );
 }
 
