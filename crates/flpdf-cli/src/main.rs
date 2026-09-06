@@ -2389,6 +2389,7 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
 
     Ok(PreprocessedArgs {
         residual_args: parsed.residual_args,
+        expanded_arg_count: parsed.expanded_arg_count,
         overlay_specs,
         attachment_segments,
         raw_overrides: RawCliOverrides {
@@ -2585,26 +2586,7 @@ fn main() {
         }
         return;
     }
-    if raw_args.len() == 2 {
-        match raw_args[1].to_str() {
-            Some("--version") | Some("-version") => {
-                print_qpdf_version();
-                return;
-            }
-            Some("--copyright") | Some("-copyright") => {
-                print_qpdf_copyright();
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    let PreprocessedArgs {
-        residual_args,
-        overlay_specs,
-        attachment_segments,
-        raw_overrides,
-    } = match preprocess_qpdf_args(raw_args) {
+    let preprocessed = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             // qpdf's arg parser raises its errors through
@@ -2619,6 +2601,32 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // qpdf treats --version/--copyright/--help as a valid sole option only
+    // when the whole expanded argv is exactly `<prog> <option>` (argc == 2),
+    // checked after @argfile expansion but before named-group parsing
+    // (`QPDFArgParser.cc:437,478-483`). Use the expanded count, not the
+    // post-strip residual, so e.g. `--overlay f -- --version` is not mistaken
+    // for a sole --version.
+    if preprocessed.expanded_arg_count == 2 && preprocessed.residual_args.len() == 2 {
+        match preprocessed.residual_args[1].to_str() {
+            Some("--version") | Some("-version") => {
+                print_qpdf_version();
+                return;
+            }
+            Some("--copyright") | Some("-copyright") => {
+                print_qpdf_copyright();
+                return;
+            }
+            _ => {}
+        }
+    }
+    let PreprocessedArgs {
+        residual_args,
+        overlay_specs,
+        attachment_segments,
+        raw_overrides,
+        expanded_arg_count: _,
+    } = preprocessed;
     let mut args = cli_parse_from(residual_args);
     apply_raw_overrides(&mut args, raw_overrides);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
@@ -5373,6 +5381,9 @@ struct PreprocessedArgs {
     overlay_specs: Vec<OverlaySpec>,
     attachment_segments: Vec<Vec<Vec<u8>>>,
     raw_overrides: RawCliOverrides,
+    /// argv token count after `@argfile` expansion, before named-segment
+    /// stripping (qpdf's `m->argc` at the sole-option check).
+    expanded_arg_count: usize,
 }
 
 #[derive(Debug, Default)]
