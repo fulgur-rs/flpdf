@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::content_stream::{
-    parse_content_stream_handles, parse_content_stream_handles_with_recoverable_warnings,
+    parse_content_stream_handles, parse_content_stream_handles_with_recoverable_warnings_and_status,
 };
 use crate::object_handle::DocumentResolver;
 use crate::pipeline::buffer::Buffer;
@@ -114,20 +114,25 @@ pub(crate) fn replace_resource_names_with_context(
 
     let has_document_context = context.is_some();
     let mut finder = ResourceFinder::default();
-    let scan = match context {
-        Some(context) => parse_content_stream_handles(input, Some(context), "", &mut finder),
-        None => parse_content_stream_handles_with_recoverable_warnings(input, "", &mut finder),
-    };
-    if let Err(error) = scan {
-        if has_document_context {
-            // qpdf's document-owned parse catches this at the caller's
-            // warning boundary. In particular, a warning sink failure must
-            // not be converted into the ordinary malformed-content fallback.
-            return Err(error);
+    let stopped_on_container_eof = match context {
+        Some(context) => {
+            parse_content_stream_handles(input, Some(context), "", &mut finder)?;
+            false
         }
+        None => match parse_content_stream_handles_with_recoverable_warnings_and_status(
+            input,
+            "",
+            &mut finder,
+        ) {
+            Ok(stopped_on_container_eof) => stopped_on_container_eof,
+            Err(_) => return Ok(None),
+        },
+    };
+    if !has_document_context && stopped_on_container_eof {
         // The detached/recoverable in-memory route has no qpdf object to
-        // re-warn through, so structural failures retain the existing
-        // byte-preserving fallback.
+        // retain the parser warning. Keep its historical byte-preserving
+        // fallback even though document-owned content parsing now treats this
+        // EOF as a warning followed by normal EOF completion.
         return Ok(None);
     }
 
@@ -376,10 +381,20 @@ mod tests {
     }
 
     #[test]
-    fn fatal_structure_error_discards_collected_prefix_replacement() {
+    fn detached_container_eof_discards_collected_prefix_replacement() {
         let renames = font_renames(b"F1", b"F2");
         assert!(replace_resource_names(b"/F1 12 Tf [", &renames)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn detached_hard_parser_error_discards_collected_prefix_replacement() {
+        let renames = font_renames(b"F1", b"F2");
+        assert!(
+            replace_resource_names(b"/F1 12 Tf 999999999999999999999999", &renames)
+                .unwrap()
+                .is_none()
+        );
     }
 }

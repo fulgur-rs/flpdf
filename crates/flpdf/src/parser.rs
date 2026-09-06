@@ -1881,14 +1881,14 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
             return Ok(None);
         }
         self.unread_token(token);
-        self.object().map(Some)
+        self.object()
     }
 
     pub(crate) fn take_diagnostics(&mut self) -> Vec<ParserDiagnostic> {
         std::mem::take(&mut self.diagnostics)
     }
 
-    fn object(&mut self) -> Result<ObjectHandle> {
+    fn object(&mut self) -> Result<Option<ObjectHandle>> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
@@ -1899,7 +1899,7 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
         result
     }
 
-    fn object_inner(&mut self) -> Result<ObjectHandle> {
+    fn object_inner(&mut self) -> Result<Option<ObjectHandle>> {
         let token = self.next_token()?;
         if self.depth > 1 {
             self.content_good_count += 1;
@@ -1913,22 +1913,22 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
                 self.reset_content_recovery_at_top_level();
                 self.array(token.start)
             }
-            TokenType::Name => Ok(self.direct_at(
+            TokenType::Name => Ok(Some(self.direct_at(
                 ObjectValue::Name(token.value[1..].to_vec()),
                 token.start as i64,
+            ))),
+            TokenType::String => Ok(Some(
+                self.direct_at(ObjectValue::String(token.value), token.start as i64),
             )),
-            TokenType::String => {
-                Ok(self.direct_at(ObjectValue::String(token.value), token.start as i64))
-            }
-            TokenType::Bool => Ok(self.direct_at(
+            TokenType::Bool => Ok(Some(self.direct_at(
                 ObjectValue::Boolean(token.value == b"true"),
                 token.start as i64,
-            )),
-            TokenType::Null => Ok(ObjectHandle::null()),
-            TokenType::Integer => Ok(self.direct_at(
+            ))),
+            TokenType::Null => Ok(Some(ObjectHandle::null())),
+            TokenType::Integer => Ok(Some(self.direct_at(
                 ObjectValue::Integer(parse_integer_token(&token)?),
                 token.start as i64,
-            )),
+            ))),
             TokenType::Real => {
                 let offset = token.start as i64;
                 let value = match classify_real(token)? {
@@ -1937,33 +1937,34 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
                         ObjectValue::RealLiteral { value, literal }
                     }
                 };
-                Ok(self.direct_at(value, offset))
+                Ok(Some(self.direct_at(value, offset)))
             }
-            TokenType::Word => {
-                Ok(self.direct_at(ObjectValue::Operator(token.value), token.start as i64))
-            }
-            TokenType::Bad => Ok(self.recover_content_null(
-                &token,
-                token
-                    .error_message
-                    .as_deref()
-                    .map(|message| String::from_utf8_lossy(message).into_owned())
-                    .unwrap_or_else(|| "bad token".to_owned()),
+            TokenType::Word => Ok(Some(
+                self.direct_at(ObjectValue::Operator(token.value), token.start as i64),
             )),
-            TokenType::BraceOpen | TokenType::BraceClose => Ok(self.recover_content_null(
+            TokenType::Bad => Ok(Some(
+                self.recover_content_null(
+                    &token,
+                    token
+                        .error_message
+                        .as_deref()
+                        .map(|message| String::from_utf8_lossy(message).into_owned())
+                        .unwrap_or_else(|| "bad token".to_owned()),
+                ),
+            )),
+            TokenType::BraceOpen | TokenType::BraceClose => Ok(Some(self.recover_content_null(
                 &token,
                 "treating unexpected brace token as null".to_owned(),
-            )),
-            TokenType::ArrayClose => Ok(self.recover_content_null(
+            ))),
+            TokenType::ArrayClose => Ok(Some(self.recover_content_null(
                 &token,
                 "treating unexpected array close token as null".to_owned(),
+            ))),
+            TokenType::DictClose => Ok(Some(
+                self.recover_content_null(&token, "unexpected dictionary close token".to_owned()),
             )),
-            TokenType::DictClose => {
-                Ok(self
-                    .recover_content_null(&token, "unexpected dictionary close token".to_owned()))
-            }
             // cov:ignore-start: content parsing probes EOF before object dispatch and excludes ignorable tokenizer states
-            TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
+            TokenType::Eof => Ok(self.content_eof(token.start)),
             TokenType::Space | TokenType::Comment | TokenType::InlineImage => {
                 Err(Error::parse(token.start, "expected PDF object"))
             } // cov:ignore-end
@@ -1974,22 +1975,22 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
         &mut self,
         object_offset: usize,
         frame_offset: usize,
-    ) -> Result<ObjectHandle> {
+    ) -> Result<Option<ObjectHandle>> {
         let mut values = std::collections::BTreeMap::new();
         let mut missing_key_values = Vec::new();
         loop {
             let token = self.next_token()?;
             if token.token_type == TokenType::DictClose {
                 self.content_good_count += 1;
-                return Ok(self.finish_content_dictionary(
+                return Ok(Some(self.finish_content_dictionary(
                     values,
                     missing_key_values,
                     object_offset,
                     frame_offset,
-                ));
+                )));
             }
             if token.token_type == TokenType::Eof {
-                return Err(Error::parse(token.start, "unexpected EOF in dictionary"));
+                return Ok(self.content_eof(token.start));
             }
             if token.token_type == TokenType::Name {
                 self.content_good_count += 1;
@@ -2004,23 +2005,28 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
                             .to_owned(),
                     });
                     values.insert(canonical_dictionary_key(&key), ObjectHandle::null());
-                    return Ok(self.finish_content_dictionary(
+                    return Ok(Some(self.finish_content_dictionary(
                         values,
                         missing_key_values,
                         object_offset,
                         frame_offset,
-                    ));
+                    )));
                 }
-                let value = self.object()?;
+                let Some(value) = self.object()? else {
+                    return Ok(None);
+                };
                 if self.content_give_up {
-                    return Ok(ObjectHandle::null());
+                    return Ok(Some(ObjectHandle::null()));
                 }
                 values.insert(canonical_dictionary_key(&key), value);
             } else {
                 self.unread_token(token);
-                missing_key_values.push(self.object()?);
+                let Some(value) = self.object()? else {
+                    return Ok(None);
+                };
+                missing_key_values.push(value);
                 if self.content_give_up {
-                    return Ok(ObjectHandle::null());
+                    return Ok(Some(ObjectHandle::null()));
                 }
             }
         }
@@ -2054,23 +2060,40 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
         self.direct_at(ObjectValue::Dictionary(values), object_offset as i64)
     }
 
-    fn array(&mut self, object_offset: usize) -> Result<ObjectHandle> {
+    fn array(&mut self, object_offset: usize) -> Result<Option<ObjectHandle>> {
         let mut values = Vec::new();
         loop {
             let token = self.peek_token()?;
             if token.token_type == TokenType::ArrayClose {
                 let _ = self.next_token()?;
                 self.content_good_count += 1;
-                return Ok(self.direct_at(ObjectValue::Array(values), object_offset as i64));
+                return Ok(Some(
+                    self.direct_at(ObjectValue::Array(values), object_offset as i64),
+                ));
             }
             if token.token_type == TokenType::Eof {
-                return Err(Error::parse(token.start, "unexpected EOF in array"));
+                return Ok(self.content_eof(token.start));
             }
-            values.push(self.object()?);
+            let Some(value) = self.object()? else {
+                return Ok(None);
+            };
+            values.push(value);
             if self.content_give_up {
-                return Ok(ObjectHandle::null());
+                return Ok(Some(ObjectHandle::null()));
             }
         }
+    }
+
+    fn content_eof(&mut self, offset: usize) -> Option<ObjectHandle> {
+        // QPDFParser emits this warning and returns an uninitialized object
+        // for `tt_eof` in content-stream mode (`QPDFParser.cc:190-196`);
+        // `QPDFObjectHandle::parseContentStream_internal` then stops the
+        // object scan and still delivers `handleEOF` (`QPDFObjectHandle.cc:1795-1815`).
+        self.diagnostics.push(ParserDiagnostic {
+            relative_offset: offset,
+            message: "parse error while reading object".to_owned(),
+        });
+        None
     }
 
     fn reset_content_recovery_at_top_level(&mut self) {

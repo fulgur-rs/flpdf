@@ -93,8 +93,27 @@ pub(crate) fn parse_content_stream_handles_with_recoverable_warnings<
     source_description: &str,
     callbacks: &mut C,
 ) -> Result<()> {
+    parse_content_stream_handles_with_recoverable_warnings_and_status(
+        input,
+        source_description,
+        callbacks,
+    )
+    .map(|_| ())
+}
+
+/// Parse through a synthetic warning sink and report whether a container EOF
+/// stopped the scan. Detached ResourceReplacer callers retain their historical
+/// structural-failure fallback, while document-owned callers use the qpdf
+/// warning-and-EOF path directly.
+pub(crate) fn parse_content_stream_handles_with_recoverable_warnings_and_status<
+    C: ObjectHandleParserCallbacks,
+>(
+    input: &[u8],
+    source_description: &str,
+    callbacks: &mut C,
+) -> Result<bool> {
     let context: Rc<dyn DocumentResolver> = Rc::new(RecoverableWarningResolver::default());
-    parse_content_stream_handles(input, Some(context), source_description, callbacks)
+    parse_content_stream_handles_internal(input, Some(context), source_description, callbacks)
 }
 
 /// Parse decoded content bytes into ObjectHandle callbacks.
@@ -104,10 +123,20 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
     source_description: &str,
     callbacks: &mut C,
 ) -> Result<()> {
+    parse_content_stream_handles_internal(input, context, source_description, callbacks).map(|_| ())
+}
+
+fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
+    input: &[u8],
+    context: Option<Rc<dyn DocumentResolver>>,
+    source_description: &str,
+    callbacks: &mut C,
+) -> Result<bool> {
     callbacks.content_size(input.len())?;
 
     let mut tokenizer = Tokenizer::new(input);
     tokenizer.allow_eof();
+    let mut stopped_on_container_eof = false;
 
     while tokenizer.position() < input.len() {
         let probe = tokenizer.read_token(true, 0)?;
@@ -116,15 +145,15 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
 
         let (object, length, diagnostics) = {
             let mut parser = ContentHandleParser::with_tokenizer(&mut tokenizer, context.clone());
-            let object = match parser.parse_content_object()? {
-                Some(object) => object,
-                None => break,
-            };
+            let object = parser.parse_content_object()?;
             let length = parser.position() - offset;
             let diagnostics = parser.take_diagnostics();
             (object, length, diagnostics)
         };
         for diagnostic in diagnostics {
+            if diagnostic.message == "parse error while reading object" {
+                stopped_on_container_eof = true;
+            }
             deliver_diagnostic(
                 context.as_ref(),
                 source_description,
@@ -133,10 +162,13 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 &diagnostic.message,
             )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
         }
+        let Some(object) = object else {
+            break;
+        };
         let is_id = object.as_operator().as_deref() == Some(b"ID");
 
         if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {
-            return Ok(());
+            return Ok(false);
         }
 
         if is_id {
@@ -193,12 +225,13 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 image_length,
             )? == ParseControl::Stop
             {
-                return Ok(());
+                return Ok(false);
             }
         }
     }
 
-    callbacks.handle_eof()
+    callbacks.handle_eof()?;
+    Ok(stopped_on_container_eof)
 }
 
 #[derive(Default)]
@@ -301,6 +334,49 @@ where
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingResolver {
+        warnings: RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl DocumentResolver for RecordingResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: crate::ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> Result<()> {
+            Err(Error::Internal("unexpected indirect resolution".to_owned()))
+        }
+
+        fn warn(&self, message: Vec<u8>) -> Result<()> {
+            self.warnings.borrow_mut().push(message);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCallbacks {
+        objects: usize,
+        eof: bool,
+    }
+
+    impl ObjectHandleParserCallbacks for RecordingCallbacks {
+        fn handle_object(
+            &mut self,
+            _object: ObjectHandle,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<ParseControl> {
+            self.objects += 1;
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            self.eof = true;
+            Ok(())
+        }
+    }
+
     #[test]
     fn recoverable_warning_resolver_rejects_indirect_resolution() {
         let resolver = RecoverableWarningResolver::default();
@@ -315,5 +391,83 @@ mod tests {
             Error::Internal(message)
                 if message == "indirect resolution requested from an in-memory content warning sink"
         ));
+    }
+
+    #[test]
+    fn recording_warning_resolver_rejects_indirect_resolution() {
+        let resolver = RecordingResolver::default();
+        let error = resolver
+            .resolve_indirect(crate::ObjectRef::new(7, 0), &ObjectHandle::null())
+            .expect_err("the test warning resolver must reject indirect resolution");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "unexpected indirect resolution"
+        ));
+    }
+
+    #[test]
+    fn container_eof_warns_and_finishes_content_parsing_like_qpdf() {
+        for input in [b"/F1 12 Tf [".as_slice(), b"/F1 12 Tf << /A 1".as_slice()] {
+            let resolver = Rc::new(RecordingResolver::default());
+            let context: Rc<dyn DocumentResolver> = resolver.clone();
+            let mut callbacks = RecordingCallbacks::default();
+
+            parse_content_stream_handles(
+                input,
+                Some(context),
+                "page object 14 0 stream 14 0",
+                &mut callbacks,
+            )
+            .expect("content EOF is a warning, not a hard parser error");
+
+            assert_eq!(callbacks.objects, 3, "qpdf keeps the complete prefix");
+            assert!(
+                callbacks.eof,
+                "qpdf invokes handleEOF after the truncated object"
+            );
+            let warnings = resolver.warnings.borrow();
+            assert_eq!(warnings.len(), 1, "qpdf emits one container EOF warning");
+            let warning = String::from_utf8_lossy(&warnings[0]);
+            let expected = format!(
+                "page object 14 0 stream 14 0 (content, offset {}): parse error while reading object",
+                input.len()
+            );
+            assert!(
+                warning.contains(&expected),
+                "warning must use qpdf's content description: {warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_container_eof_propagates_to_the_outer_content_parse() {
+        for input in [
+            b"<< /A [".as_slice(),
+            b"<< 1 [".as_slice(),
+            b"[[".as_slice(),
+        ] {
+            let resolver = Rc::new(RecordingResolver::default());
+            let context: Rc<dyn DocumentResolver> = resolver.clone();
+            let mut callbacks = RecordingCallbacks::default();
+
+            parse_content_stream_handles(input, Some(context), "nested", &mut callbacks)
+                .expect("nested content EOF is a warning, not a hard parser error");
+
+            assert_eq!(
+                callbacks.objects, 0,
+                "the incomplete outer object is discarded"
+            );
+            assert!(callbacks.eof, "qpdf completes the scan after the warning");
+            let warnings = resolver.warnings.borrow();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "qpdf emits one nested container EOF warning"
+            );
+            assert!(String::from_utf8_lossy(&warnings[0]).contains(&format!(
+                "nested (content, offset {}): parse error while reading object",
+                input.len()
+            )));
+        }
     }
 }

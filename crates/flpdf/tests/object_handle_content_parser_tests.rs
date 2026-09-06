@@ -358,8 +358,10 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
     for input in [b"<< /A 1".as_slice(), b"[1"] {
         let error = page_with_contents(stream(input))
             .parse_page_contents(&mut RecordingCallbacks::default())
-            .expect_err("unterminated content containers must fail");
-        assert!(error.to_string().contains("unexpected EOF"));
+            .expect_err("detached content parsing must surface the qpdf EOF diagnostic");
+        assert!(error
+            .to_string()
+            .contains("parse error while reading object"));
     }
 }
 
