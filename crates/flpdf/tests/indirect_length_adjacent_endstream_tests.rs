@@ -178,9 +178,9 @@ fn stale_holder_pointing_at_interior_endstreamendobj_matches_qpdf() {
         &mut pdf,
         b"AAAAendstream",
         &[
-            "(object 3 0, offset 165): expected endstream",
-            "(object 3 0, offset 161): attempting to recover stream length",
-            "(object 3 0, offset 161): recovered stream length: 13",
+            "(object 4 0, offset 165): expected endstream",
+            "(object 4 0, offset 161): attempting to recover stream length",
+            "(object 4 0, offset 161): recovered stream length: 13",
         ],
     );
 }
@@ -227,9 +227,9 @@ fn non_integer_holder_adjacent_endstream_recovers_like_qpdf() {
         &mut pdf,
         b"AAAABBBB",
         &[
-            "(object 3 0, offset 133): /Length key in stream dictionary is not an integer",
-            "(object 3 0, offset 161): attempting to recover stream length",
-            "(object 3 0, offset 161): recovered stream length: 8",
+            "(object 4 0, offset 133): /Length key in stream dictionary is not an integer",
+            "(object 4 0, offset 161): attempting to recover stream length",
+            "(object 4 0, offset 161): recovered stream length: 8",
         ],
     );
 }
@@ -388,9 +388,9 @@ fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
             .map(|entry| entry.message.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "(object 3 0, offset 65): /Length key in stream dictionary is not an integer",
-            "(object 3 0, offset 121): attempting to recover stream length",
-            "(object 3 0, offset 121): recovered stream length: 40",
+            "(object 5 0, offset 65): /Length key in stream dictionary is not an integer",
+            "(object 5 0, offset 121): attempting to recover stream length",
+            "(object 5 0, offset 121): recovered stream length: 40",
         ]
     );
 }
