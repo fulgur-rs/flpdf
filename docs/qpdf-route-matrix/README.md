@@ -33,7 +33,7 @@ container-above-max だった — `flpdf-hi08` / PR #1486）。本表は残る m
 
 | canonical | bridge | mixed | unknown | 合計 |
 |---|---|---|---|---|
-| 62 | 11 | 86 | 1 | 160 |
+| 66 | 11 | 82 | 1 | 160 |
 
 再現コマンド（`\|` でエスケープされたセル内パイプを先に潰してから7列目を読む）:
 
@@ -93,7 +93,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 |---|---|---|---|---|---|
 | [A. ObjectHandle / Resolver — object identity, lazy resolve, ownership, teardown](a-objecthandle-resolver.md) | 24 | 6 | 5 | 13 | 0 |
 | [B. parser / xref recovery / warning・error・diagnostics](b-parser-recovery-diagnostics.md) | 34 | 13 | 1 | 19 | 1 |
-| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 26 | 2 | 14 | 0 |
+| [C. stream data provider / decode / retry / filter / encryption / `/Length`](c-stream-pipeline-encryption.md) | 42 | 30 | 2 | 10 | 0 |
 | [D. writer — reachability, ObjStm planning / renumber / emission, xref / trailer, encryption, linearize](d-writer.md) | 31 | 12 | 0 | 19 | 0 |
 | [E. QPDFJob / CLI / C API 相当の consumer・adaptor](e-job-cli-capi.md) | 29 | 5 | 3 | 21 | 0 |
 
@@ -217,8 +217,6 @@ crates/flpdf/src/reader.rs::Pdf::resolve_handle: prod 160 (24 files) / test 7
     crates/flpdf/src/acroform_document_helper.rs 47, crates/flpdf-qtest-tools/src/driver/test_02_09.rs 16, crates/flpdf/src/job/page_merge.rs 15, crates/flpdf/src/signatures.rs 14, crates/flpdf/src/page_annotation_flatten.rs 12, crates/flpdf/src/page_object_helper.rs 10, crates/flpdf/src/job/resource_pruning.rs 6, crates/flpdf/src/page_label_document_helper.rs 6, crates/flpdf/src/filespec_helper/filespec.rs 5, crates/flpdf/src/embedded_files.rs 3, crates/flpdf/src/job/page_specs.rs 3, crates/flpdf/src/outline_document_helper.rs 3, crates/flpdf/src/outline_object_helper.rs 3, crates/flpdf/src/resources.rs 3, crates/flpdf-qtest-tools/src/driver/handle.rs 2, crates/flpdf-qtest-tools/src/driver/test_64_71.rs 2, crates/flpdf/src/document_json.rs 2, crates/flpdf/src/optimization/inherited_attrs.rs 2, crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 1, crates/flpdf/src/overlay_appearance_stream.rs 1, crates/flpdf/src/pages.rs 1, crates/flpdf/src/pages/repair.rs 1, crates/flpdf/src/writer/object_streams/eligibility.rs 1
 crates/flpdf/src/reader.rs::Pdf::resolve_handle_ref: prod 14 (4 files) / test 0
     crates/flpdf/src/thread_bead_p.rs 6, crates/flpdf/src/job/page_merge.rs 4, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 2, crates/flpdf/src/filespec_helper/filespec.rs 2
-crates/flpdf/src/reader.rs::Pdf::resolve_qpdf_json_handle: prod 1 (1 files) / test 0
-    crates/flpdf/src/json_inspect.rs 1
 crates/flpdf/src/object_handle.rs::ObjectHandle::get_key: prod 142 (28 files) / test 460
     crates/flpdf/src/form_field_object_helper.rs 19, crates/flpdf-qtest-tools/src/driver/test_10_17.rs 17, crates/flpdf-qtest-tools/src/driver/test_56_63.rs 16, crates/flpdf-qtest-tools/src/driver/test_50_55.rs 8, crates/flpdf/src/form_field_object_helper/rendering.rs 8, crates/flpdf-qtest-tools/src/driver/test_18_25.rs 7, crates/flpdf-qtest-tools/src/driver/handle.rs 5, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 5, crates/flpdf/src/annotation_object_helper.rs 5, crates/flpdf/src/linearization/writer.rs 5, crates/flpdf-qtest-tools/src/driver/test_02_09.rs 4, crates/flpdf-qtest-tools/src/driver/test_26_33.rs 4, crates/flpdf-qtest-tools/src/driver/test_42_49.rs 4, crates/flpdf-qtest-tools/src/driver/test_64_71.rs 4, crates/flpdf-qtest-tools/src/driver/test_88_98.rs 4, crates/flpdf-qtest-tools/src/large_file.rs 4, crates/flpdf/src/page_object_helper.rs 4, crates/flpdf-qtest-tools/src/compare.rs 3, crates/flpdf/src/optimization/inherited_attrs.rs 3, crates/flpdf-qtest-tools/src/clean.rs 2, crates/flpdf-qtest-tools/src/tokenizer_runner.rs 2, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 2, crates/flpdf/src/resources.rs 2, crates/flpdf-cli/src/main.rs 1, crates/flpdf-qtest-tools/src/driver/test_72_79.rs 1, crates/flpdf/src/embedded_files.rs 1, crates/flpdf/src/job/inspection.rs 1, crates/flpdf/src/object_handle.rs 1
 crates/flpdf/src/object_handle.rs::ObjectHandle::has_key: prod 8 (6 files) / test 100
@@ -354,14 +352,10 @@ crates/flpdf/src/xref.rs::push_repair_diagnostics: prod 2 (1 files) / test 0
     crates/flpdf/src/xref.rs 2
 crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream: prod 1 (1 files) / test 0
     crates/flpdf/src/reader/resolver.rs 1
-crates/flpdf/src/filters.rs::stream_filter_capabilities: prod 1 (1 files) / test 0
-    crates/flpdf/src/json_inspect.rs 1
 crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle: prod 3 (1 files) / test 0
     crates/flpdf/src/filters.rs 3
-crates/flpdf/src/json_inspect.rs::stream_payload_with_decode_status: prod 2 (1 files) / test 0
-    crates/flpdf/src/json_inspect.rs 2
-crates/flpdf/src/filters.rs::decode_stream_data: prod 4 (3 files) / test 1
-    crates/flpdf-qtest-tools/src/compare.rs 2, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 1, crates/flpdf/src/json_inspect.rs 1
+crates/flpdf/src/filters.rs::decode_stream_data: prod 3 (2 files) / test 1
+    crates/flpdf-qtest-tools/src/compare.rs 2, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 1
 crates/flpdf/src/filters.rs::decode_stream_data_from_handle: prod 4 (3 files) / test 0
     crates/flpdf/src/xref.rs 2, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 1, crates/flpdf/src/resources.rs 1
 crates/flpdf/src/filters.rs::decode_stream_data_recovering: prod 0 (0 files) / test 1

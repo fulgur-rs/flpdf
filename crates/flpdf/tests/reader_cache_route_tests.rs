@@ -22,36 +22,6 @@ fn canonical_replacement_does_not_round_trip_through_raw_materialization() {
 }
 
 #[test]
-fn json_inspection_keeps_top_level_resolution_handle_native() {
-    let source = include_str!("../src/json_inspect.rs").replace("\r\n", "\n");
-    let resolver = source
-        .split("pub(crate) fn qpdf_resolve_top_level_object")
-        .nth(1)
-        .and_then(|tail| tail.split("pub fn qpdf_raw_stream_payload").next())
-        .expect("qpdf JSON top-level resolver exists");
-
-    assert!(resolver.contains("ObjectHandle"));
-    assert!(resolver.contains("resolve_qpdf_json_handle"));
-    assert!(!resolver.contains("resolve_qpdf_json_object"));
-    assert!(!resolver.contains("lift_object_to_handle"));
-    assert!(!resolver.contains("materialize"));
-}
-
-#[test]
-fn json_stream_payload_uses_the_resolved_handle_directly() {
-    let source = include_str!("../src/json_inspect.rs").replace("\r\n", "\n");
-    let route = source
-        .split("pub fn qpdf_raw_stream_payload")
-        .nth(1)
-        .and_then(|tail| tail.split("/// Convert a PDF object handle").next())
-        .expect("qpdf raw stream payload route exists");
-
-    assert!(route.contains("stream_payload_with_decode_status"));
-    assert!(!route.contains("lift_object_to_handle"));
-    assert!(!route.contains("materialize"));
-}
-
-#[test]
 fn encryption_dictionary_reader_route_uses_handle_accessors() {
     let source = include_str!("../src/reader.rs").replace("\r\n", "\n");
     let route = source

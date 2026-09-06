@@ -11,40 +11,6 @@
 //! Production object and stream values route through [`ObjectHandle`] and
 //! [`crate::document_json`].
 
-pub(crate) fn qpdf_resolve_top_level_object<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-) -> Result<ObjectHandle, ConvertError> {
-    // JSON object keys already name the canonical indirect object. The final
-    // raw-object route no longer has a separate `ObjectValue::Reference`
-    // carrier to chase, so resolving once is both sufficient and preserves
-    // the document-owned cache identity.
-    Ok(pdf.resolve_qpdf_json_handle(start)?)
-}
-
-/// Return the qpdf JSON payload for a selected top-level stream object.
-///
-/// Unlike [`Pdf::resolve`](crate::Pdf::resolve), this intentionally uses the
-/// qpdf JSON object-cache view, which can retain a historical xref stream that
-/// a newer xref section has freed. The owned return value lets callers inspect
-/// or persist the exact payload named by a qpdf JSON file-mode `datafile`
-/// entry while keeping that resolver and its cache semantics encapsulated.
-pub fn qpdf_raw_stream_payload<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
-    decode_level: DecodeLevel,
-) -> Result<Option<Vec<u8>>, ConvertError> {
-    let stream = qpdf_resolve_top_level_object(pdf, object_ref)?;
-    if stream.as_stream_dict().is_none() {
-        return Ok(None);
-    }
-    Ok(Some(
-        stream_payload_with_decode_status(&stream, decode_level)?
-            .bytes
-            .into_owned(),
-    ))
-}
-
 /// Convert a PDF object handle into the qpdf v2 JSON value form.
 ///
 /// For streams, only the dictionary part is included; the stream data body is
@@ -182,105 +148,6 @@ impl DecodeLevel {
     }
 }
 
-// ── stream_payload_for_decode_level ──────────────────────────────────────────
-
-/// Return the stream payload bytes to emit for a given [`DecodeLevel`].
-///
-/// The supplied handle is a resolved stream whose payload is still
-/// filter-encoded.
-///
-/// - [`DecodeLevel::None`] → the raw filter-encoded bytes, verbatim.
-/// - Any other level → the filter-decoded content, computed via
-///   crate::filters::decode_stream_data when qpdf's filterability and
-///   decode-level gate permit a filter path implemented by flpdf.
-///
-/// qpdf leaves specialized and lossy streams raw until the requested decode
-/// level includes them. When the filter pipeline cannot decode a stream — e.g.
-/// an unsupported filter such as DCTDecode — this falls back to the raw bytes
-/// rather than erroring, matching qpdf, which emits the raw payload for filters
-/// it does not decode rather than failing the whole document. qpdf filter types
-/// not implemented by flpdf, such as DCTDecode, remain raw even at All.
-///
-/// The returned [`Cow`] retains the historical API shape. A handle owns its
-/// payload behind an `Rc`, so raw fallback paths clone that payload rather than
-/// returning a borrow whose owner would be dropped at this function boundary.
-///
-/// # Errors
-///
-/// Returns an error when the stream's raw bytes cannot be fetched at all
-/// (non-stream handle, or original-source I/O/parse failure) — this mirrors
-/// qpdf's `QPDF_Stream::writeStreamJSON`, which throws `std::logic_error`
-/// when even the undecoded raw-bytes retry attempt fails
-/// (`libqpdf/QPDF_Stream.cc:250-269`). A *filter decode* failure is not an
-/// error here: it falls back to the raw bytes, matching that same qpdf
-/// function's retry-with-`qpdf_dl_none` behavior for a filtered attempt.
-pub fn stream_payload_for_decode_level(
-    stream: &ObjectHandle,
-    decode_level: DecodeLevel,
-) -> crate::Result<Cow<'_, [u8]>> {
-    Ok(stream_payload_with_decode_status(stream, decode_level)?.bytes)
-}
-
-pub(crate) struct StreamPayload<'a> {
-    pub(crate) bytes: Cow<'a, [u8]>,
-}
-
-pub(crate) fn stream_payload_with_decode_status(
-    stream: &ObjectHandle,
-    decode_level: DecodeLevel,
-) -> crate::Result<StreamPayload<'_>> {
-    // qpdf `QPDF_Stream::getRawStreamData` (`libqpdf/QPDF_Stream.cc:362-376`):
-    // replaced data is returned directly, and original data is read lazily
-    // through the owning document at the parsed offset. Unlike
-    // `ObjectHandle::as_stream_data`, this also covers the lazy-original
-    // case rather than only the replaced-data case, so a freshly parsed
-    // stream that was never `replaceStreamData`-d still yields its real
-    // content instead of an empty payload.
-    let raw_data = stream.get_raw_stream_data()?;
-    if matches!(decode_level, DecodeLevel::None) {
-        return Ok(StreamPayload {
-            bytes: Cow::Owned(raw_data.as_ref().clone()),
-        });
-    }
-
-    // `get_raw_stream_data` above only succeeds for a handle whose resolved
-    // value is `ObjectValue::Stream`, and that success dereferences `stream`
-    // as a side effect — so `as_stream_dict` is guaranteed `Some` here, the
-    // same as qpdf's `QPDF_Stream` always carrying its own `stream_dict`
-    // member once a `QPDF_Stream` instance exists at all.
-    let stream_dict = stream
-        .as_stream_dict()
-        .expect("get_raw_stream_data succeeded, so stream must have a stream dict");
-    let Some(capabilities) = crate::filters::stream_filter_capabilities(&stream_dict) else {
-        return Ok(StreamPayload {
-            bytes: Cow::Owned(raw_data.as_ref().clone()),
-        });
-    };
-    let can_filter = if decode_level == DecodeLevel::Generalized {
-        !capabilities.specialized_compression && !capabilities.lossy_compression
-    } else if decode_level == DecodeLevel::Specialized {
-        !capabilities.lossy_compression
-    } else {
-        // DecodeLevel::None returned above, so this remaining level is All.
-        true
-    };
-
-    if !can_filter {
-        return Ok(StreamPayload {
-            bytes: Cow::Owned(raw_data.as_ref().clone()),
-        });
-    }
-
-    match crate::filters::decode_stream_data(&stream_dict, raw_data.as_ref()) {
-        Ok(decoded) => Ok(StreamPayload {
-            bytes: Cow::Owned(decoded),
-        }),
-        Err(_) => Ok(StreamPayload {
-            bytes: Cow::Owned(raw_data.as_ref().clone()),
-        }),
-    }
-}
-
 // ── JsonKey ────────────────────────────────────────────────
 
 /// A top-level qpdf JSON key that the caller may request via `--json-key`.
@@ -415,11 +282,8 @@ impl JsonObjectSelector {
 
 use crate::json::Json;
 use crate::object_handle::{ObjectHandle, ObjectJsonError};
-use crate::object_ref::ObjectRef;
 use crate::pipeline::PipelineError;
-use crate::Pdf;
-use std::borrow::Cow;
-use std::io::{Read, Seek, Write};
+use std::io::Write;
 
 pub(crate) use crate::pdf_string::decode_pdf_text_string;
 
@@ -575,9 +439,8 @@ pub(crate) fn json_dictionary<K: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_object_json_error, pdf_object_to_json, qpdf_raw_stream_payload,
-        stream_payload_for_decode_level, ConvertError, DecodeLevel, JsonObjectSelector,
-        JsonOutputError,
+        convert_object_json_error, pdf_object_to_json, ConvertError, DecodeLevel,
+        JsonObjectSelector, JsonOutputError,
     };
     use crate::object_handle::{ObjectHandle, ObjectJsonError};
     use crate::pipeline::PipelineError;
@@ -719,63 +582,58 @@ mod tests {
         ));
 
         let mut pdf = stream_pdf();
+        let stream = pdf.get_object_handle(crate::ObjectRef::new(4, 0));
         assert_eq!(
-            qpdf_raw_stream_payload(&mut pdf, crate::ObjectRef::new(4, 0), DecodeLevel::None)
+            stream
+                .get_raw_stream_data()
                 .expect("raw stream payload")
-                .expect("stream object"),
+                .as_slice(),
             b"hello"
         );
-        assert_eq!(
-            qpdf_raw_stream_payload(&mut pdf, crate::ObjectRef::new(1, 0), DecodeLevel::All)
-                .expect("non-stream payload lookup"),
-            None
-        );
+        let scalar = pdf.get_object_handle(crate::ObjectRef::new(1, 0));
+        scalar.try_dereference().expect("resolve non-stream object");
+        assert!(scalar.as_stream_dict().is_none());
     }
 
     #[test]
     fn stream_decode_levels_cover_raw_specialized_unsupported_and_corrupt_paths() {
         let plain = stream(b"plain".to_vec(), None);
         assert_eq!(
-            stream_payload_for_decode_level(&plain, DecodeLevel::None)
-                .expect("raw payload")
-                .as_ref(),
+            plain.get_raw_stream_data().expect("raw payload").as_slice(),
             b"plain"
         );
         assert_eq!(
-            stream_payload_for_decode_level(&plain, DecodeLevel::Generalized)
+            plain
+                .get_stream_data(crate::writer::DecodeLevel::Generalized)
                 .expect("plain decoded payload")
-                .as_ref(),
+                .as_slice(),
             b"plain"
         );
 
         let unknown = stream(b"raw".to_vec(), Some(b"UnknownDecode"));
-        assert_eq!(
-            stream_payload_for_decode_level(&unknown, DecodeLevel::All)
-                .expect("unknown filter raw fallback")
-                .as_ref(),
-            b"raw"
-        );
+        assert!(matches!(
+            unknown.get_stream_data(crate::writer::DecodeLevel::All),
+            Err(crate::Error::Unsupported(message))
+                if message == "getStreamData called on unfilterable stream"
+        ));
 
         let specialized = stream(b"raw".to_vec(), Some(b"RunLengthDecode"));
-        assert_eq!(
-            stream_payload_for_decode_level(&specialized, DecodeLevel::Generalized)
-                .expect("specialized filter remains raw")
-                .as_ref(),
-            b"raw"
-        );
-        assert!(
-            !stream_payload_for_decode_level(&specialized, DecodeLevel::Specialized)
-                .expect("specialized filter is selected at specialized level")
-                .is_empty()
-        );
+        assert!(matches!(
+            specialized.get_stream_data(crate::writer::DecodeLevel::Generalized),
+            Err(crate::Error::Unsupported(message))
+                if message == "getStreamData called on unfilterable stream"
+        ));
+        assert!(!specialized
+            .get_stream_data(crate::writer::DecodeLevel::Specialized)
+            .expect("specialized filter is selected at specialized level")
+            .is_empty());
 
         let corrupt = stream(b"not-flate".to_vec(), Some(b"FlateDecode"));
-        assert_eq!(
-            stream_payload_for_decode_level(&corrupt, DecodeLevel::All)
-                .expect("corrupt filter raw fallback")
-                .as_ref(),
-            b"not-flate"
-        );
+        assert!(matches!(
+            corrupt.get_stream_data(crate::writer::DecodeLevel::All),
+            Err(crate::Error::System(message))
+                if message == "stream inflate: inflate: data: incorrect header check"
+        ));
     }
 
     #[test]

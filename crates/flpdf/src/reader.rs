@@ -1865,26 +1865,6 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(Some(ObjectRef::new(number, 0)))
     }
 
-    /// Resolve `object_ref` for the qpdf JSON projection through the canonical
-    /// handle resolver. The returned handle is the persistent qpdf object-cache
-    /// cell, so callers can inspect its value or stream without creating a raw
-    /// `Object` snapshot.
-    ///
-    /// Unknown, freed, or compressed-but-broken entries resolve to a canonical
-    /// null handle rather than an error, matching the behavior the PDF spec
-    /// mandates for missing objects (§7.3.10).
-    ///
-    /// # Errors
-    ///
-    pub(crate) fn resolve_qpdf_json_handle(
-        &mut self,
-        object_ref: ObjectRef,
-    ) -> Result<ObjectHandle> {
-        let handle = self.get_object_handle(object_ref);
-        self.resolve(&handle)?;
-        Ok(handle)
-    }
-
     /// Offset of the first recorded object that starts strictly after `offset`,
     /// or `None` when `offset` belongs to the last object in the file.
     fn next_object_offset(&self, offset: u64) -> Option<u64> {
