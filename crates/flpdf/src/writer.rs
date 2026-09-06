@@ -359,13 +359,16 @@ impl WriterConfiguration {
     /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
     /// encryption passwords before a writer emits its encryption dictionary.
     ///
-    /// The returned count is the number of qpdf auto-mode fallback warnings
-    /// that the owning job should send through its error logger. Password
-    /// validation and conversion stay in the encryption password module so
-    /// direct CLI writers and `QPDFJob` share one implementation.
-    pub fn normalize_encryption_passwords(&mut self, password_mode: PasswordMode) -> Result<usize> {
+    /// The returned pair is `(verbose_info_count, warning_count)` for qpdf's
+    /// auto-mode password diagnostics. Password validation and conversion stay
+    /// in the encryption password module so direct CLI writers and `QPDFJob`
+    /// share one implementation.
+    pub fn normalize_encryption_passwords(
+        &mut self,
+        password_mode: PasswordMode,
+    ) -> Result<(usize, usize)> {
         let Some(params) = self.settings.encryption_parameters.as_mut() else {
-            return Ok(0);
+            return Ok((0, 0));
         };
         let revision = match params.method {
             EncryptMethod::V1Rc440 => 2,
@@ -374,20 +377,29 @@ impl WriterConfiguration {
             EncryptMethod::V5R5Aes256 => 5,
             EncryptMethod::V5R6Aes256 => 6,
         };
-        let (user_password, user_warning) = crate::encryption::password::password_bytes_for_write(
+        let (user_password, user_notice) = crate::encryption::password::password_bytes_for_write(
             &params.user_password,
             password_mode,
             revision,
         )?;
-        let (owner_password, owner_warning) =
-            crate::encryption::password::password_bytes_for_write(
-                &params.owner_password,
-                password_mode,
-                revision,
-            )?;
+        let (owner_password, owner_notice) = crate::encryption::password::password_bytes_for_write(
+            &params.owner_password,
+            password_mode,
+            revision,
+        )?;
         params.user_password = user_password;
         params.owner_password = owner_password;
-        Ok(usize::from(user_warning) + usize::from(owner_warning))
+        let info_count =
+            usize::from(user_notice == crate::encryption::password::PasswordWriteNotice::Info)
+                + usize::from(
+                    owner_notice == crate::encryption::password::PasswordWriteNotice::Info,
+                );
+        let warning_count =
+            usize::from(user_notice == crate::encryption::password::PasswordWriteNotice::Warning)
+                + usize::from(
+                    owner_notice == crate::encryption::password::PasswordWriteNotice::Warning,
+                );
+        Ok((info_count, warning_count))
     }
 
     /// Configure explicit encryption copied from an authenticated donor.
@@ -6287,7 +6299,7 @@ mod final_handle_writer_tests {
             empty
                 .normalize_encryption_passwords(PasswordMode::Bytes)
                 .unwrap(),
-            0
+            (0, 0)
         );
         for params in [
             EncryptParams::rc4(EncryptMethod::V1Rc440, b"u", b"o"),
@@ -6303,7 +6315,7 @@ mod final_handle_writer_tests {
                 configuration
                     .normalize_encryption_passwords(PasswordMode::Bytes)
                     .unwrap(),
-                0
+                (0, 0)
             );
         }
         let mut invalid = WriterConfiguration::default();
@@ -6312,7 +6324,7 @@ mod final_handle_writer_tests {
             invalid
                 .normalize_encryption_passwords(PasswordMode::HexBytes)
                 .unwrap(),
-            0
+            (0, 0)
         );
         let params = invalid
             .settings
@@ -6321,6 +6333,24 @@ mod final_handle_writer_tests {
             .expect("hex password parameters remain configured");
         assert_eq!(params.user_password, vec![0x75]);
         assert_eq!(params.owner_password, vec![0xe0]);
+    }
+
+    #[test]
+    fn job_writer_password_normalization_reports_owner_password_errors() {
+        let mut configuration = WriterConfiguration::default();
+        configuration.set_encryption_parameters(EncryptParams::v4_aes128(
+            "café".as_bytes().to_vec(),
+            b"bad\xff".to_vec(),
+        ));
+
+        let error = configuration
+            .normalize_encryption_passwords(PasswordMode::Unicode)
+            .expect_err("an invalid owner password must fail Unicode normalization");
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "supplied password is not valid UTF-8"
+        ));
     }
 
     #[test]

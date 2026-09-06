@@ -491,6 +491,42 @@ fn job_json_file_auto_password_warning_matches_qpdf() {
 }
 
 #[test]
+fn job_json_file_verbose_auto_password_conversion_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+        directory.path().join("input.pdf"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("job.json"),
+        r#"{"inputFile":"input.pdf","outputFile":"output.pdf","verbose":"","allowWeakCrypto":"","passwordMode":"auto","encrypt":{"userPassword":"café","ownerPassword":"owner","128bit":{}}}"#,
+    )
+    .unwrap();
+
+    let qpdf = ProcessCommand::new("/usr/bin/qpdf")
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=job.json")
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf job JSON failed: {qpdf:?}");
+    assert!(flpdf.status.success(), "flpdf job JSON failed: {flpdf:?}");
+    let qpdf_stdout = String::from_utf8_lossy(&qpdf.stdout).replace("qpdf:", "flpdf:");
+    assert_eq!(flpdf.stdout, qpdf_stdout.as_bytes());
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
 fn job_json_file_unicode_password_error_is_deferred_to_write() {
     let directory = tempfile::tempdir().unwrap();
     fs::copy(

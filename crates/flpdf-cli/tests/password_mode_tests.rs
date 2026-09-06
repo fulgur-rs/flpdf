@@ -210,6 +210,34 @@ fn auto_mode_authenticates_composed_nfc_password() {
 }
 
 #[test]
+fn verbose_auto_password_conversion_reports_qpdf_info() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = temp.path().join("encrypted.pdf");
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--verbose",
+            "--allow-weak-crypto",
+            "--encrypt",
+            "café",
+            "owner",
+            "128",
+            "--",
+        ])
+        .arg(input)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert!(result.status.success());
+    let expected = format!(
+        "flpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption{EOL}"
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains(&expected));
+}
+
+#[test]
 fn unicode_mode_reads_non_utf8_password_file_as_raw_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("encrypted.pdf");

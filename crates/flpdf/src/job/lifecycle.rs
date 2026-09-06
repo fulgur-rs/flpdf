@@ -2584,7 +2584,7 @@ impl QPDFJob {
                 }
             }
         }
-        let auto_password_warnings = match writer_configuration
+        let (auto_password_infos, auto_password_warnings) = match writer_configuration
             .normalize_encryption_passwords(self.configuration.password_mode)
         {
             Ok(count) => count,
@@ -2593,6 +2593,14 @@ impl QPDFJob {
                 return Ok(JobExitCode::Error);
             }
         };
+        if self.configuration.verbose {
+            for _ in 0..auto_password_infos {
+                self.logger.info(format!(
+                    "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
+                    self.message_prefix
+                ))?;
+            }
+        }
         for _ in 0..auto_password_warnings {
             self.logger.error(format!(
                 "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
@@ -4219,6 +4227,90 @@ mod tests {
         let mut writer = JobOutputWriter(PipelineHandle::new(crate::pipeline::Discard));
         std::io::Write::write_all(&mut writer, b"job output").unwrap();
         std::io::Write::flush(&mut writer).unwrap();
+    }
+
+    #[test]
+    fn write_qpdf_reports_verbose_auto_password_conversion() {
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let input = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        })));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(logger.discard()));
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_output_file(&output)
+            .expect("output path is accepted");
+        job.set_verbose(true);
+        job.configuration
+            .writer
+            .set_encryption_parameters(crate::EncryptParams::v4_aes128(
+                "café".as_bytes().to_vec(),
+                b"owner".to_vec(),
+            ));
+
+        let mut input = input;
+        assert_eq!(
+            job.write_qpdf(&mut input).expect("job write succeeds"),
+            JobExitCode::Success
+        );
+        assert!(output.is_file());
+        assert!(
+            bytes.lock().unwrap().windows(
+                b"qpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n".len()
+            ).any(|window| window == b"qpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n"),
+            "verbose writer output must include qpdf's auto-conversion info"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_propagates_verbose_auto_password_info_sink_error() {
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let mut input = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_output_file(&output)
+            .expect("output path is accepted");
+        job.set_verbose(true);
+        job.configuration
+            .writer
+            .set_encryption_parameters(crate::EncryptParams::v4_aes128(
+                "café".as_bytes().to_vec(),
+                b"owner".to_vec(),
+            ));
+
+        let error = job
+            .write_qpdf(&mut input)
+            .expect_err("info sink failure must propagate");
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "sink write failure 1"
+        ));
     }
 
     #[test]
