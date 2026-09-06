@@ -455,7 +455,8 @@ mod tests {
 
     #[test]
     fn qpdf_exc_what_matches_qpdf_c_string_boundaries_and_display_projection() {
-        let cases: &[(&str, &[u8], &[u8], i64, &[u8])] = &[
+        type QpdfWhatCase<'a> = (&'a str, &'a [u8], &'a [u8], i64, &'a [u8]);
+        let cases: &[QpdfWhatCase<'_>] = &[
             ("empty-empty-negative", b"", b"", -1, b"m"),
             ("empty-empty-zero", b"", b"", 0, b"m"),
             ("empty-empty-positive", b"", b"", 7, b"offset 7: m"),
