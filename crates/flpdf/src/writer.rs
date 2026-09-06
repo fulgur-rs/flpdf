@@ -744,6 +744,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 Flate::set_compression_level(level)?;
             }
         }
+        let setup = build_writer_setup(self.pdf, &options)?;
         // Page-tree repair below mutates `self.pdf`'s object graph in place
         // (promoting direct /Kids leaves, cloning duplicate leaves) and is not
         // safe to retry from a partially-mutated state on failure. Close off
@@ -778,7 +779,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
             let (mut document, result) =
-                write_linearized_for_pdf_writer(self.pdf, &options, pass1_path)?;
+                write_linearized_for_pdf_writer(self.pdf, &options, pass1_path, setup)?;
             document.back_patch()?;
             self.output
                 .as_mut()
@@ -796,6 +797,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 &mut sink,
                 &options,
                 special_streams.as_ref(),
+                setup,
             ) {
                 Ok(result) => {
                     sink.finish_output()?;
@@ -2428,15 +2430,10 @@ pub(crate) enum WriteCipher {
     FileKeyAes256,
 }
 
-/// Per-write encryption state used when [`WriterOptions::encrypt`] or
-/// [`WriterOptions::copy_encryption`] is set. Built once via
-/// [`build_encryption_context`] or [`build_copy_encryption_context`] — at the
-/// top of [`emit_canonical_pdf_with_special_streams`] for the full-rewrite path, or inside
-/// [`crate::linearization::writer::write_linearized_for_pdf_writer`] for linearized output
-/// (`--encrypt` only; donor-copy/automatic source preservation are not yet
-/// supported there) —
-/// and consumed by the per-object emission loop + the trailer-build step.
-pub(crate) struct EncryptionContext {
+/// Shared qpdf encryption parameter state before a route-specific `/Encrypt`
+/// object number is allocated.
+#[derive(Clone)]
+pub(crate) struct EncryptionParameters {
     /// Built `/Encrypt` dictionary handle (from the Standard handler builder).
     pub(crate) encrypt_dict: ObjectHandle,
     /// File encryption key derived from passwords + `/ID[0]` (Algorithm 2),
@@ -2449,10 +2446,6 @@ pub(crate) struct EncryptionContext {
     pub(crate) encryption_v: i32,
     /// Standard handler revision (`/R`) retained with the writer encryption state.
     pub(crate) encryption_r: i32,
-    /// Indirect reference of the freshly-allocated `/Encrypt` object. The
-    /// emission loop skips this ref so the `/Encrypt` dict itself stays
-    /// plaintext (PDF 1.7 §7.6.1).
-    pub(crate) encrypt_ref: ObjectRef,
     /// The 16-byte `/ID[0]` bytes that were fed into the file-key derivation.
     /// The output trailer's `/ID` array MUST start with these same bytes —
     /// readers re-derive the file key from `/ID[0]` to validate the password.
@@ -2471,6 +2464,37 @@ pub(crate) struct EncryptionContext {
     /// one exists AND `encrypt_metadata` is `false`. Used by the emission loop
     /// to exempt exactly that object from encryption. `None` whenever metadata
     /// is encrypted (the common case) or the document has no `/Metadata`.
+    pub(crate) metadata_ref: Option<ObjectRef>,
+}
+
+impl EncryptionParameters {
+    pub(crate) fn into_context(self, encrypt_ref: ObjectRef) -> EncryptionContext {
+        EncryptionContext {
+            encrypt_dict: self.encrypt_dict,
+            file_key: self.file_key,
+            cipher: self.cipher,
+            encryption_v: self.encryption_v,
+            encryption_r: self.encryption_r,
+            encrypt_ref,
+            id0: self.id0,
+            static_aes_iv: self.static_aes_iv,
+            encrypt_metadata: self.encrypt_metadata,
+            metadata_ref: self.metadata_ref,
+        }
+    }
+}
+
+/// Per-write encryption state after a route has assigned its `/Encrypt` slot.
+pub(crate) struct EncryptionContext {
+    pub(crate) encrypt_dict: ObjectHandle,
+    pub(crate) file_key: Vec<u8>,
+    pub(crate) cipher: WriteCipher,
+    pub(crate) encryption_v: i32,
+    pub(crate) encryption_r: i32,
+    pub(crate) encrypt_ref: ObjectRef,
+    pub(crate) id0: Vec<u8>,
+    pub(crate) static_aes_iv: bool,
+    pub(crate) encrypt_metadata: bool,
     pub(crate) metadata_ref: Option<ObjectRef>,
 }
 
@@ -2506,13 +2530,12 @@ pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(
 /// computed once, and encryption setup consumes that single value
 /// (`QPDFWriter::setEncryptionParameters` calls `generateID()` itself before
 /// deriving `/O`/`/U`, and `writeTrailer`'s later call is a no-op).
-pub(crate) fn build_encryption_context(
+pub(crate) fn build_encryption_parameters(
     options: &WriterOptions,
     params: &crate::encryption::EncryptParams,
-    existing_max: u32,
     metadata_ref: Option<ObjectRef>,
     id0: &[u8],
-) -> Result<EncryptionContext> {
+) -> Result<EncryptionParameters> {
     use crate::encryption::standard::{
         build_v1_v2_encrypt_dict, build_v4_encrypt_dict, ObjectKeyAlg, V1V2EncryptParams,
         V4CryptMethod, V4EncryptParams,
@@ -2618,22 +2641,12 @@ pub(crate) fn build_encryption_context(
         }
     };
 
-    // `existing_max` here is the highest already-allocated number (original
-    // objects plus any ObjStm container slots reserved by the caller).
-    // Adding 1 gives a safe slot that cannot collide with any emitted object.
-    let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
-        crate::Error::Unsupported(
-            "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
-        )
-    })?;
-
-    Ok(EncryptionContext {
+    Ok(EncryptionParameters {
         encrypt_dict,
         file_key,
         cipher,
         encryption_v,
         encryption_r,
-        encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0,
         static_aes_iv: options.static_aes_iv,
         encrypt_metadata: params.encrypt_metadata,
@@ -2694,33 +2707,102 @@ fn generate_v5r6_secrets(
 /// AESV3 while retaining the donor's recovered file key. Rebuild the same
 /// canonical dictionary here so a V4 RC4 donor has the same observable result
 /// as qpdf's copy path.
-pub(crate) fn build_copy_encryption_context(
+pub(crate) fn build_copy_encryption_parameters(
     src: &crate::encryption::CopyEncryptionSource,
     options: &WriterOptions,
-    existing_max: u32,
     metadata_ref: Option<ObjectRef>,
-) -> Result<EncryptionContext> {
+) -> Result<EncryptionParameters> {
     let (encrypt_dict, encryption_v, encryption_r, cipher) = canonical_copy_encryption(src)?;
-
-    let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
-        crate::Error::Unsupported(
-            "full-rewrite copy-encryption: /Encrypt object number overflows u32".to_string(),
-        )
-    })?;
 
     let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&encrypt_dict);
 
-    Ok(EncryptionContext {
+    Ok(EncryptionParameters {
         encrypt_dict,
         file_key: src.file_key.clone(),
         cipher,
         encryption_v,
         encryption_r,
-        encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
         encrypt_metadata,
         metadata_ref: if encrypt_metadata { None } else { metadata_ref },
+    })
+}
+
+/// The immutable result of qpdf's one-time writer setup. Route consumers may
+/// assign different `/Encrypt` object slots, but they must consume the same
+/// parameter state and generated identifier material.
+pub(crate) struct WriterSetupState {
+    pub(crate) generated_id: Option<ObjectHandle>,
+    pub(crate) encryption_parameters: Option<EncryptionParameters>,
+}
+
+/// Build the shared writer state before standard/linearized dispatch.
+pub(crate) fn build_writer_setup<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+) -> Result<WriterSetupState> {
+    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+    if uses_deterministic_id(options) && encrypting {
+        return Err(deterministic_id_encryption_error(options));
+    }
+
+    let generated_id = if uses_deterministic_id(options) {
+        None
+    } else if let Some(source) = options.copy_encryption.as_ref() {
+        let generated = generate_id_handle(None, options.static_id);
+        let id1 = generated
+            .as_array()
+            .and_then(|values| values.get(1).and_then(ObjectHandle::as_string))
+            .unwrap_or_else(|| source.id0.clone());
+        Some(ObjectHandle::array(vec![
+            ObjectHandle::string(source.id0.clone()),
+            ObjectHandle::string(id1),
+        ]))
+    } else {
+        let source_id0 = source_permanent_id_value_handle(&pdf.trailer_key_handle(b"ID"));
+        Some(generate_id_handle(source_id0.as_deref(), options.static_id))
+    };
+
+    let encryption_parameters = if let Some(params) = options.encrypt.as_ref() {
+        let id0 = generated_id
+            .as_ref()
+            .and_then(ObjectHandle::as_array)
+            .and_then(|values| values.first().and_then(ObjectHandle::as_string))
+            .ok_or_else(|| {
+                // cov:ignore-start: build_writer_setup always creates this two-string ID
+                Error::Unsupported("writer setup: generated encryption ID is malformed".into())
+                // cov:ignore-end
+            })?; // cov:ignore: generated ID invariant makes this continuation unreachable
+        let metadata_ref = if params.encrypt_metadata {
+            None
+        } else {
+            resolve_metadata_stream_ref(pdf)?
+        };
+        Some(build_encryption_parameters(
+            options,
+            params,
+            metadata_ref,
+            &id0,
+        )?) // cov:ignore: shared Standard builder is exercised; LLVM maps this continuation to setup
+    } else if let Some(source) = options.copy_encryption.as_ref() {
+        let metadata_ref = if copy_encryption_encrypts_metadata_from_dict(&source.encrypt_dict) {
+            None
+        } else {
+            resolve_metadata_stream_ref(pdf)?
+        };
+        Some(build_copy_encryption_parameters(
+            source,
+            options,
+            metadata_ref,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(WriterSetupState {
+        generated_id,
+        encryption_parameters,
     })
 }
 
@@ -3504,11 +3586,16 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
+    let setup = build_writer_setup(pdf, options)?;
     let special_streams = initialize_special_streams(pdf, options);
     match special_streams {
-        Ok(special_streams) => {
-            emit_canonical_pdf_with_special_streams(pdf, out, options, special_streams.as_ref())
-        }
+        Ok(special_streams) => emit_canonical_pdf_with_special_streams(
+            pdf,
+            out,
+            options,
+            special_streams.as_ref(),
+            setup,
+        ),
         Err(error) => Err(error),
     }
 }
@@ -3518,12 +3605,13 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
+    setup: WriterSetupState,
 ) -> Result<WriterResult> {
     // The plain route now reconciles ADBE on the root's output-only shallow
     // copy. It therefore needs no Catalog snapshot/restore; specialized routes
     // still retain that boundary until their own root consumers migrate.
     if plain::eligible(pdf.is_encrypted(), options, options.object_streams) {
-        return emit_canonical_pdf_inner(pdf, out, options, special_streams);
+        return emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
     }
 
     // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
@@ -3540,7 +3628,7 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams);
+    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
     if let Some(snapshot) = catalog_snapshot {
         restore_catalog_extensions(pdf, Some(snapshot))?;
     }
@@ -3806,7 +3894,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
+    setup: WriterSetupState,
 ) -> Result<WriterResult> {
+    let WriterSetupState {
+        generated_id,
+        encryption_parameters,
+    } = setup;
     let deterministic_id = uses_deterministic_id(options);
 
     // A forced sub-1.5 header suppresses object-stream generation: object
@@ -4384,20 +4477,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         .enumerate()
         .filter_map(|(batch_idx, source)| source.map(|source| (source, batch_idx)))
         .collect();
-    // Resolve /Metadata stream ref up front for --cleartext-metadata support.
-    let metadata_ref = if options
-        .encrypt
-        .as_ref()
-        .is_some_and(|p| !p.encrypt_metadata)
-        || options
-            .copy_encryption
-            .as_ref()
-            .is_some_and(|source| !copy_encryption_encrypts_metadata(source))
-    {
-        resolve_metadata_stream_ref(pdf)?
-    } else {
-        None
-    };
     // ── QDF emission pre-scan ─────────────────────────────────────────────────
     // qpdf --qdf emits each stream's /Length holder IMMEDIATELY after that
     // stream object (numbered in emission order), so file positions are strictly
@@ -4559,61 +4638,23 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         member_new_to_batch.insert(member_number, (container_num, index));
     }
 
-    // Generate qpdf's ordinary/static identifier once before either encryption
-    // key derivation or trailer emission. The complete array is reused at every
-    // trailer site so the emitted /ID[0] is the exact salt used by the context.
-    let generated_id = if deterministic_id {
-        if encrypting {
-            // QPDFWriter::generateID is called by the encryption setup before
-            // the deterministic MD5 pipeline can produce its data.
-            return Err(generate_id_without_data());
-        }
-        None
-    } else if options.copy_encryption.is_some() {
-        None
-    } else {
-        let id_handle = pdf.trailer_key_handle(b"ID");
-        let source_id0 = source_permanent_id_value_handle(&id_handle);
-        Some(generate_id_handle(source_id0.as_deref(), options.static_id))
-    };
-
-    // ── encryption context ────────────────────────────────────────────────
-    // Built ONCE up front so /ID[0] is decided before any object is encrypted.
-    // Compact /Encrypt follows existing objects and generated ObjStm containers.
-    // QDF /Encrypt follows the final interleaved /Length holder from the pre-scan.
-    let encrypt_ctx: Option<EncryptionContext> = if let Some(ref params) = options.encrypt {
+    // Encryption parameters were built once at the common writer setup
+    // boundary. The standard route assigns the qpdf slot after body planning,
+    // while linearization assigns its own slot from the same parameters.
+    let encrypt_ctx = if let Some(parameters) = encryption_parameters {
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
         } else {
             compact_body_max
         };
-        let id0 = generated_id
-            .as_ref()
-            .and_then(ObjectHandle::as_array)
-            .and_then(|values| values.first().and_then(ObjectHandle::as_string))
-            .ok_or_else(|| {
-                // cov:ignore-start: generate_id_handle always returns a valid two-string array here
-                crate::Error::Unsupported(
-                    "full-rewrite: ordinary/static ID generator returned an invalid /ID array"
-                        .to_string(),
-                )
-                // cov:ignore-end
-            })?; // cov:ignore: invalid ID guard is unreachable after generate_id_handle
-        let context =
-            build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
-        Some(context?)
-    } else if let Some(ref src) = options.copy_encryption {
-        let base_for_encrypt = if options.qdf {
-            qdf_max_emission
-        } else {
-            compact_body_max
-        };
-        Some(build_copy_encryption_context(
-            src,
-            options,
-            base_for_encrypt,
-            metadata_ref,
-        )?)
+        // cov:ignore-start: supported object numbers cannot exhaust u32
+        let encrypt_ref = base_for_encrypt.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported(
+                "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
+            )
+        })?;
+        // cov:ignore-end
+        Some(parameters.into_context(ObjectRef::new(encrypt_ref, 0)))
     } else {
         None
     };
@@ -6280,6 +6321,43 @@ mod final_handle_writer_tests {
             .expect("hex password parameters remain configured");
         assert_eq!(params.user_password, vec![0x75]);
         assert_eq!(params.owner_password, vec![0xe0]);
+    }
+
+    #[test]
+    fn writer_setup_shares_encryption_parameters_across_route_slots() {
+        let mut pdf = Pdf::empty().expect("empty PDF for writer setup");
+        let options = WriterOptions {
+            encrypt: Some(EncryptParams::v4_aes128(b"user", b"owner")),
+            ..WriterOptions::default()
+        };
+        let setup = build_writer_setup(&mut pdf, &options).expect("setup succeeds");
+        let parameters = setup
+            .encryption_parameters
+            .as_ref()
+            .expect("explicit encryption builds one shared parameter state");
+        let standard = parameters.clone().into_context(ObjectRef::new(7, 0));
+        let linearized = parameters.clone().into_context(ObjectRef::new(12, 0));
+
+        assert_eq!(standard.encrypt_ref, ObjectRef::new(7, 0));
+        assert_eq!(linearized.encrypt_ref, ObjectRef::new(12, 0));
+        assert_eq!(standard.id0, linearized.id0);
+        assert_eq!(standard.file_key, linearized.file_key);
+        assert_eq!(standard.encryption_v, linearized.encryption_v);
+        assert_eq!(standard.encryption_r, linearized.encryption_r);
+        assert_eq!(
+            standard
+                .encrypt_dict
+                .try_get_key(b"/V")
+                .unwrap()
+                .try_as_integer()
+                .unwrap(),
+            linearized
+                .encrypt_dict
+                .try_get_key(b"/V")
+                .unwrap()
+                .try_as_integer()
+                .unwrap()
+        );
     }
 
     #[test]

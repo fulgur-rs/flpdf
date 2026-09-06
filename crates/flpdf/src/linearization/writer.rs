@@ -3051,7 +3051,8 @@ pub(crate) fn write_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
 ) -> Result<LinearizedDocument> {
-    Ok(write_linearized_impl(plan, renumber, pdf, options, None)?.0)
+    let setup = crate::writer::build_writer_setup(pdf, options)?;
+    Ok(write_linearized_impl(plan, renumber, pdf, options, None, setup)?.0)
 }
 
 /// Write linearized output through the canonical [`crate::PdfWriter`] route.
@@ -3065,6 +3066,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
     pass1_path: Option<&Path>,
+    setup: crate::writer::WriterSetupState,
 ) -> Result<(LinearizedDocument, WriterResult)> {
     // Capture the already-prepared Catalog extension entry before the
     // output-only ADBE mutation. PdfWriter::write performs qpdf's permanent
@@ -3114,7 +3116,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     crate::writer::record_catalog_snapshot_dirty_baseline(pdf, &mut catalog_snapshot);
 
     let result = plan_result.and_then(|(plan, renumber)| {
-        write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
+        write_linearized_impl(&plan, &renumber, pdf, options, pass1_path, setup)
     });
 
     let restore = crate::writer::restore_catalog_extensions(pdf, catalog_snapshot);
@@ -3200,7 +3202,12 @@ fn write_linearized_impl<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
     pass1_path: Option<&Path>,
+    setup: crate::writer::WriterSetupState,
 ) -> Result<(LinearizedDocument, WriterResult)> {
+    let crate::writer::WriterSetupState {
+        generated_id,
+        encryption_parameters,
+    } = setup;
     let deterministic_id = crate::writer::uses_deterministic_id(options);
 
     // Finalize the file identifier exactly once here — before the plan/
@@ -3236,44 +3243,14 @@ fn write_linearized_impl<R: Read + Seek>(
         (None, Vec::new())
     };
     let pass1_id = linearization_pass1_id(source_id0.as_deref());
-    let finalized_id = finalize_linearized_id(
-        options,
-        source_id0.as_deref(),
-        det_id_source_id0.as_deref(),
-        options.copy_encryption.as_ref(),
-    );
-    // Extract `/ID[0]` now, before `finalized_id` moves into `source_trailer`,
-    // for `build_encryption_context` below (PDF 1.7 §7.6.3.3 Algorithm 2 uses
-    // `/ID[0]` as a salt, and the trailer's `/ID[0]` must carry the same bytes
-    // so a reader can re-derive the file key). `finalize_linearized_id` always
-    // returns a 2-element string array — every branch (deterministic
-    // placeholder, static-id, default) constructs one — so this is an
-    // internal-invariant check, not a reachable error for well-formed input.
-    //
-    // NOTE: when effective deterministic ID mode is set, this array's element 0 is
-    // an ALL-ZERO PLACEHOLDER (`finalize_linearized_id`'s first branch above),
-    // not real key material — the actual content-derived identifier is only
-    // computed after the bytes exist, and is then either direct-written
-    // (classic path) or back-patched in place (ObjStm/xref-stream path) — see
-    // `finalize_linearized_id`'s doc. `id0` is extracted unconditionally
-    // here, so it CAN transiently hold that placeholder. It is only safe to
-    // feed into `build_encryption_context` below because the effective
-    // deterministic-ID-and-encrypting guard immediately below this block
-    // returns `Err` first — see the `debug_assert!` at
-    // this function's `options.encrypt` consumption site, which restates that
-    // invariant at the point it actually matters.
-    let id0: Vec<u8> = finalized_id
-        .as_array()
-        .and_then(|values| values.first().and_then(ObjectHandle::as_string))
-        .ok_or_else(|| {
-            // cov:ignore-start: unreachable — every branch of finalize_linearized_id
-            // constructs a well-formed 2-element string array (see its own body)
-            crate::Error::Unsupported(
-                "linearization writer: finalize_linearized_id did not return a \
-                 well-formed /ID array"
-                    .to_string(),
-            )
-        })?; // cov:ignore-end
+    let finalized_id = generated_id.unwrap_or_else(|| {
+        finalize_linearized_id(
+            options,
+            source_id0.as_deref(),
+            det_id_source_id0.as_deref(),
+            options.copy_encryption.as_ref(),
+        )
+    });
     source_trailer_handle.replace_key(b"/ID", finalized_id)?;
     let pass1_source_trailer = source_trailer_handle.shallow_copy()?;
     pass1_source_trailer.replace_key(b"/ID", pass1_id)?;
@@ -3573,107 +3550,19 @@ fn write_linearized_impl<R: Read + Seek>(
     // sentinel at the hint slot then shifts only the first-half objects that
     // follow it; the container numbers below are adjusted by the same amount.
     //
-    // `existing_max` only feeds `build_encryption_context`'s internal
-    // `existing_max + 1` slot guess. That guess is immediately discarded
-    // below in favor of `reserve_encrypt_dict_slot`'s qpdf-aligned
-    // mid-sequence placement (`ctx.encrypt_ref` is overwritten), so
-    // `existing_max`'s exact value has no other effect on the returned
-    // context — any non-overflowing count is safe here.
-    //
-    // Explicit encryption and copied source encryption share the same qpdf
-    // output slot and emission machinery. The copy branch supplies the
-    // authenticated donor key instead of deriving a new key from passwords.
-    //
-    // `encrypt_ctx` is threaded into every `do_write_pass` call below, which
-    // emits `ctx.encrypt_dict` as a plaintext indirect object right after the
-    // catalog/open-document-plain objects (mirrors qpdf's `writeLinearized`
-    // calling `writeEncryptionDictionary()` right after `part4_end_marker`,
-    // unconditionally on `m->encrypted` — QPDFWriter.cc:2793-2796). Writing
-    // it into the trailer, and applying it to per-object strings/streams, are
-    // later steps that consume this value.
-    let encrypt_ctx: Option<crate::writer::EncryptionContext> =
-        if let Some(params) = options.encrypt.as_ref() {
-            // `id0` (extracted above, before the deterministic-ID-and-encryption
-            // guard runs) must never be the all-zero placeholder
-            // here: reaching this branch means `options.encrypt.is_some()`,
-            // and the guard above already returns `Err` before this point
-            // whenever deterministic ID mode also holds. Restated here,
-            // self-enforcing, in case a future edit reorders the guard
-            // relative to this block.
-            debug_assert!(
-                !options.deterministic_id,
-                "deterministic_id && encrypting must have already been rejected \
-                 by the guard above `write_linearized`'s /ID finalization — \
-                 reaching here with deterministic_id set would derive the file \
-                 encryption key from an all-zero /ID[0] placeholder"
-            );
-            let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
-                // cov:ignore-start: requires > 2^32 objects — impossible in practice
-                crate::Error::Unsupported(
-                    "linearization writer: object count overflows u32 for /Encrypt slot \
-                     reservation"
-                        .to_string(),
-                )
-            })?; // cov:ignore-end
-                 // Resolve /Metadata up front for --cleartext-metadata support, mirroring
-                 // the full-rewrite writer's own gating (`!params.encrypt_metadata`).
-            let metadata_ref = if params.encrypt_metadata {
-                None
-            } else {
-                crate::writer::resolve_metadata_stream_ref(pdf)?
-            };
-            let ctx_result = crate::writer::build_encryption_context(
-                options,
-                params,
-                existing_max,
-                metadata_ref,
-                &id0,
-            );
-            let mut ctx = ctx_result?;
-            ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
-            for container_number in &mut container_numbers {
-                if *container_number >= ctx.encrypt_ref.number {
-                    *container_number += 1;
-                }
+    // qpdf reserves the linearized `/Encrypt` slot after part layout is known,
+    // but the parameter state was already built by the common writer setup.
+    let encrypt_ctx = if let Some(parameters) = encryption_parameters {
+        let encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
+        for container_number in &mut container_numbers {
+            if *container_number >= encrypt_ref.number {
+                *container_number += 1;
             }
-            Some(ctx)
-        } else if let Some(source) = options.copy_encryption.as_ref() {
-            // cov:ignore-start: a supported in-memory PDF cannot contain 2^32 objects;
-            // the conversion failure is an internal capacity guard only.
-            let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
-                crate::Error::Unsupported(
-                    "linearization writer: object count overflows u32 for /Encrypt slot \
-                     reservation"
-                        .to_string(),
-                )
-            })?;
-            // cov:ignore-end
-            let encrypt_metadata = source
-                .encrypt_dict
-                .try_get_key(b"/EncryptMetadata")?
-                .as_boolean()
-                .unwrap_or(true);
-            let metadata_ref = if encrypt_metadata {
-                None
-            } else {
-                crate::writer::resolve_metadata_stream_ref(pdf)?
-            };
-            let mut ctx = crate::writer::build_copy_encryption_context(
-                source,
-                options,
-                existing_max,
-                metadata_ref,
-            )?;
-            ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
-            for container_number in &mut container_numbers {
-                if *container_number >= ctx.encrypt_ref.number {
-                    *container_number += 1;
-                }
-            }
-            Some(ctx)
-        } else {
-            None
-        };
+        }
+        Some(parameters.into_context(encrypt_ref))
+    } else {
+        None
+    };
     let mut encrypted_string_emitter = encrypt_ctx
         .as_ref()
         .map(EncryptedStringEmitter::from_context);
@@ -4576,7 +4465,8 @@ mod tests {
             }))),
             ..WriterOptions::default()
         };
-        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+        let setup = crate::writer::build_writer_setup(&mut pdf, &options).unwrap();
+        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None, setup)
             .expect_err("canonical progress reporter failure must abort writing");
         assert!(
             error.to_string().contains("test progress failure"),

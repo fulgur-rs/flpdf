@@ -573,6 +573,14 @@ Encrypt-map emission を handle tree で再現し、直接の `/O` `/U` `/OE` `/
 `/Perms` だけを hex 化する。`flpdf-egzr.3.2.5`（close 済み）writer cutover が
 この surface を production consumer として使用している。
 
+The D16/D1 setup slice adds `writer.rs::WriterSetupState`: the common write
+boundary captures generated ID material and builds `EncryptionParameters` once
+after qpdf-shaped option normalization. Standard and linearized output then
+assign route-specific `/Encrypt` object slots from that shared state through
+`EncryptionParameters::into_context`; they no longer rebuild the Standard
+dictionary, donor file key, metadata exemption, or data-key parameters at
+different route-local times.
+
 ### Non-linearized encrypted Generate ObjStm numbering (`flpdf-cecz`, 2026-08-31)
 
 qpdf 11.9.0 の standard writer は、`QPDFWriter.cc:1072-1118` の enqueue 中に
