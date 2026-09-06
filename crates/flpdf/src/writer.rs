@@ -754,14 +754,10 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         // (QPDFWriter.cc:2114-2115, 2189-2193). The QDF, explicit
         // content-normalization, and non-none decode-level routes use the
         // same page-tree repair boundary, matching qpdf's
-        // qdf_mode || normalize_content || stream_decode_level trigger. The
-        // repair can promote direct /Kids leaves or clone duplicate leaves.
-        // Prepare that graph before taking the progress snapshot so every
-        // emitted repaired object is represented in events_expected.
-        if options.qdf || options.content_normalization || options.decode_level != DecodeLevel::None
-        {
-            crate::PageDocumentHelper::new(self.pdf).get_all_pages()?;
-        }
+        // qdf_mode || normalize_content || stream_decode_level trigger. Keep
+        // the repaired page order and its three derived maps together so the
+        // specialized emitter consumes this setup without another page walk.
+        let special_streams = initialize_special_streams(self.pdf, &options)?;
         crate::writer::configure_progress_for_pdf(
             self.pdf,
             &options,
@@ -793,7 +789,12 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 .as_mut()
                 .expect("output was checked before writing");
             let mut sink = WriterOutputSink::new(output);
-            match emit_canonical_pdf(self.pdf, &mut sink, &options) {
+            match emit_canonical_pdf_with_special_streams(
+                self.pdf,
+                &mut sink,
+                &options,
+                special_streams.as_ref(),
+            ) {
                 Ok(result) => {
                     sink.finish_output()?;
                     result
@@ -1601,6 +1602,58 @@ pub(crate) struct WriterOptions {
     pub(crate) progress_reporter: Option<ProgressReporter>,
 }
 
+/// The page-derived state created by qpdf's `initializeSpecialStreams`.
+///
+/// qpdf builds these maps from one repaired page snapshot before it starts
+/// numbering or emitting objects. Keep the snapshot and all derived maps
+/// together so the specialized writer does not repair or enumerate the page
+/// tree again while it is preparing QDF markers and stream policy.
+#[derive(Debug, Default)]
+struct SpecialStreams {
+    pages: Vec<ObjectRef>,
+    page_seq: HashMap<ObjectRef, u32>,
+    contents_seq: HashMap<ObjectRef, u32>,
+    normalized_streams: BTreeSet<ObjectRef>,
+    content_container_refs: BTreeSet<ObjectRef>,
+}
+
+/// Build qpdf's page/content maps once for the writer setup trigger.
+fn initialize_special_streams<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+) -> Result<Option<SpecialStreams>> {
+    if !(options.qdf || options.content_normalization || options.decode_level != DecodeLevel::None)
+    {
+        return Ok(None);
+    }
+
+    let pages = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
+    let mut streams = SpecialStreams {
+        page_seq: HashMap::with_capacity(pages.len()),
+        contents_seq: HashMap::new(),
+        normalized_streams: BTreeSet::new(),
+        content_container_refs: BTreeSet::new(),
+        pages,
+    };
+
+    for (index, page_ref) in streams.pages.iter().copied().enumerate() {
+        let sequence = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| Error::Internal("page sequence overflows u32".into()))?;
+        streams.page_seq.insert(page_ref, sequence);
+        for content_ref in collect_content_stream_refs(pdf, page_ref)? {
+            streams.contents_seq.insert(content_ref, sequence);
+            streams.normalized_streams.insert(content_ref);
+        }
+        if options.qdf || options.content_normalization {
+            collect_content_container_refs(pdf, page_ref, &mut streams.content_container_refs)?;
+        }
+    }
+
+    Ok(Some(streams))
+}
+
 /// Return whether qpdf's content-derived ID branch is effective.
 ///
 /// qpdf accepts both ID flags and checks `static_id` first in
@@ -2376,7 +2429,7 @@ pub(crate) enum WriteCipher {
 /// Per-write encryption state used when [`WriterOptions::encrypt`] or
 /// [`WriterOptions::copy_encryption`] is set. Built once via
 /// [`build_encryption_context`] or [`build_copy_encryption_context`] — at the
-/// top of [`emit_canonical_pdf`] for the full-rewrite path, or inside
+/// top of [`emit_canonical_pdf_with_special_streams`] for the full-rewrite path, or inside
 /// [`crate::linearization::writer::write_linearized_for_pdf_writer`] for linearized output
 /// (`--encrypt` only; donor-copy/automatic source preservation are not yet
 /// supported there) —
@@ -3443,10 +3496,26 @@ fn write_qdf_objstm_dictionary(
     out.extend_from_slice(b">>");
 }
 
+#[cfg(test)]
 pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
     options: &WriterOptions,
+) -> Result<WriterResult> {
+    let special_streams = initialize_special_streams(pdf, options);
+    match special_streams {
+        Ok(special_streams) => {
+            emit_canonical_pdf_with_special_streams(pdf, out, options, special_streams.as_ref())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    out: W,
+    options: &WriterOptions,
+    special_streams: Option<&SpecialStreams>,
 ) -> Result<WriterResult> {
     // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
     // turn a logger/read failure into an absent snapshot. QPDFWriter constructs
@@ -3462,7 +3531,7 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let result = emit_canonical_pdf_inner(pdf, out, options);
+    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams);
     if let Some(snapshot) = catalog_snapshot {
         restore_catalog_extensions(pdf, Some(snapshot))?;
     }
@@ -3727,6 +3796,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriterOptions,
+    special_streams: Option<&SpecialStreams>,
 ) -> Result<WriterResult> {
     let deterministic_id = uses_deterministic_id(options);
 
@@ -3860,31 +3930,20 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // page tree via QPDF::getAllPages() (promoting a direct /Kids leaf to a
     // fresh indirect object, cloning a duplicate leaf) -- before any object
     // numbering (QPDFWriter.cc:2113-2115, ahead of preserveObjectStreams/
-    // generateObjectStreams). Run the same repair here, before the
-    // Catalog-first walk below, so any object it mints is already part of
-    // the graph the walk numbers. Running this after the walk (as an earlier
-    // version of this function did) left freshly-minted refs outside every
-    // numbering map, causing a hard failure for a page tree that needed
-    // repair in QDF/content-normalization/non-none-decode mode.
-    let qdf_page_refs = if options.qdf
-        || options.content_normalization
-        || options.decode_level != DecodeLevel::None
-    {
-        Some(crate::PageDocumentHelper::new(pdf).get_all_pages()?)
+    // generateObjectStreams). PdfWriter::write performs that setup before the
+    // progress snapshot and passes the resulting state into this coordinator.
+    // Direct callers of emit_canonical_pdf use the same setup wrapper, so this
+    // function never performs a second page repair or contents enumeration.
+    let empty_special_streams = SpecialStreams::default();
+    let special_streams = special_streams.unwrap_or(&empty_special_streams);
+    // qpdf always fills normalized_streams during setup, but writeStream only
+    // consults it when normalize_content is enabled (QPDFWriter.cc:1279).
+    // Keep that gate here so decode-only setup repairs the page graph without
+    // accidentally normalizing content streams.
+    let normalized_stream_refs = if options.content_normalization {
+        &special_streams.normalized_streams
     } else {
-        None
-    };
-    let normalized_stream_refs: BTreeSet<ObjectRef> = if options.content_normalization {
-        let mut refs = BTreeSet::new();
-        let page_refs = qdf_page_refs
-            .as_ref()
-            .expect("content normalization prepares page references");
-        for page_ref in page_refs {
-            refs.extend(collect_content_stream_refs(pdf, *page_ref)?);
-        }
-        refs
-    } else {
-        BTreeSet::new()
+        &empty_special_streams.normalized_streams
     };
     let cached_stream_outputs: RefCell<BTreeMap<ObjectRef, plain::plan::CachedStreamOutput>> =
         RefCell::new(BTreeMap::new());
@@ -4574,42 +4633,20 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // page dictionaries and indirect array holders that contain direct Stream
     // values; those values have no ObjectRef of their own and must be
     // normalized in the containing object during emission.
-    let (page_seq, contents_seq, content_container_refs): (
-        HashMap<ObjectRef, u32>,
-        HashMap<ObjectRef, u32>,
-        BTreeSet<ObjectRef>,
-    ) = if options.qdf || options.content_normalization {
-        let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
-        let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
-        let mut content_container_refs = BTreeSet::new();
-        // QPDFWriter::initializeSpecialStreams delegates page enumeration to
-        // QPDF::getAllPages(), whose live ObjectHandle lookup accepts a direct
-        // Catalog /Pages dictionary (QPDFWriter.cc:1916; QPDF_pages.cc:47-71).
-        // The repair-and-enumerate pass already ran once, before the
-        // Catalog-first numbering walk above, so any object it mints is
-        // numbered; reuse that snapshot instead of repairing (a no-op the
-        // second time) and enumerating again.
-        let page_refs = qdf_page_refs
-            .as_ref()
-            .expect("qdf_page_refs is Some whenever options.qdf || options.content_normalization");
-        for (idx, page_ref) in page_refs.iter().enumerate() {
-            let seq = (idx as u32).saturating_add(1);
-            if options.qdf {
-                page_seq.insert(*page_ref, seq);
-            }
-            // Enumerate page content streams through the canonical
-            // ObjectHandle graph. Keep the live stream handle's original
-            // indirect identity for the emission loop; qpdf does not chase
-            // crate-specific reference-holder chains here.
-            for content_ref in collect_content_stream_refs(pdf, *page_ref)? {
-                contents_seq.insert(content_ref, seq);
-            }
-            collect_content_container_refs(pdf, *page_ref, &mut content_container_refs)?;
-        }
-        (page_seq, contents_seq, content_container_refs)
-    } else {
-        (HashMap::new(), HashMap::new(), BTreeSet::new())
-    };
+    let (page_seq, contents_seq, content_container_refs) =
+        if options.qdf || options.content_normalization {
+            (
+                &special_streams.page_seq,
+                &special_streams.contents_seq,
+                &special_streams.content_container_refs,
+            )
+        } else {
+            (
+                &empty_special_streams.page_seq,
+                &empty_special_streams.contents_seq,
+                &empty_special_streams.content_container_refs,
+            )
+        };
 
     // In QDF mode, /Root's ref in the trailer is in emission-space; rebind
     // new_root from the qdf_emission_renumber map so trailer rewriting and the
@@ -6302,6 +6339,69 @@ mod final_handle_writer_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn special_stream_setup_populates_qpdf_page_content_and_normalization_maps() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/qdf-contents-ref-array.pdf").to_vec(),
+        ))
+        .expect("contents-array fixture");
+        let options = WriterOptions {
+            qdf: true,
+            content_normalization: true,
+            ..WriterOptions::default()
+        };
+
+        let streams = initialize_special_streams(&mut pdf, &options)
+            .expect("special-stream setup succeeds")
+            .expect("qdf setup must create a snapshot");
+
+        let page = ObjectRef::new(3, 0);
+        assert_eq!(streams.pages, vec![page]);
+        assert_eq!(streams.page_seq.get(&page), Some(&1));
+        assert_eq!(streams.contents_seq.get(&ObjectRef::new(6, 0)), Some(&1));
+        assert_eq!(streams.contents_seq.get(&ObjectRef::new(7, 0)), Some(&1));
+        assert!(streams.normalized_streams.contains(&ObjectRef::new(6, 0)));
+        assert!(streams.normalized_streams.contains(&ObjectRef::new(7, 0)));
+        assert!(streams
+            .content_container_refs
+            .contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn special_stream_setup_repairs_decode_only_without_enabling_container_markers() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/qdf-contents-ref-array.pdf").to_vec(),
+        ))
+        .expect("contents-array fixture");
+        let options = WriterOptions {
+            decode_level: DecodeLevel::Generalized,
+            ..WriterOptions::default()
+        };
+
+        let streams = initialize_special_streams(&mut pdf, &options)
+            .expect("decode-only setup succeeds")
+            .expect("decode-only setup must repair and snapshot pages");
+
+        assert_eq!(streams.pages, vec![ObjectRef::new(3, 0)]);
+        assert_eq!(streams.page_seq.get(&ObjectRef::new(3, 0)), Some(&1));
+        assert!(streams.normalized_streams.contains(&ObjectRef::new(6, 0)));
+        assert!(streams.normalized_streams.contains(&ObjectRef::new(7, 0)));
+        assert!(streams.content_container_refs.is_empty());
+    }
+
+    #[test]
+    fn direct_canonical_writer_propagates_special_stream_setup_failure() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        pdf.trailer().remove_key(b"/Root");
+        let options = WriterOptions {
+            qdf: true,
+            ..WriterOptions::default()
+        };
+
+        let result = emit_canonical_pdf(&mut pdf, Vec::new(), &options);
+        assert!(matches!(result, Err(Error::Missing("/Root"))));
     }
 
     #[test]

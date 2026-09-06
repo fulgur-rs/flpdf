@@ -978,7 +978,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | C-U3 | 未観測 | C22/C39 | token filter/providerを登録したlibrary harnessでplain/QDF cacheとlinearized optimizer probeを比較する。非対称だけでbugとはしない。 |
 | C-U4 | 完了 | C17/C18 | pinned qpdf headerをincludeしたC++ oracle probeと32固定vectorで、V/R・key長5/16/24/32・AES/RC4・非zero generationを確認し、単一primitiveへ統合した。 |
 | D-U1 | mixed確定・出力差を追加確認 | D6/D31 | source-index順のlinearized Preserveと共有membershipのobjgen順を比較する。既存strict Preserve byte testsを利用する。 |
-| D-U2 | sourceで解決 | D26 | normalized_streamsの参照はqpdfのnormalize_content条件内に限られる（`libqpdf/QPDFWriter.cc:1279`）。decode-onlyでそのsetが無いこと自体は差にならないが、page修復triggerとsetupの3map共有は移植対象。 |
+| D-U2 | sourceで解決 | D26 | `initialize_special_streams` が qpdf の setup snapshot と page/content/normalized state の owner になった。normalized_streams の適用は `normalize_content` 条件内に限定し（`libqpdf/QPDFWriter.cc:1279`）、decode-only の page修復 trigger は維持する。linearized/他 route の state consumer は後続。 |
 | D-U3 | oracle契約確定 | D12 | 欠番/type≠1をError::Internalにするprimitive testとproducerの欠番到達調査を分ける。fake free rowの選択問題ではない。 |
 | D-U4 | scaffoldingとして判定済み | D19/D30 | canonical writerに委譲するbyte-neutral test helper。D19のback-patch前観測点を保持し、削除専用issueは不要。 |
 | D-U5 | 完了 | D27 | single/multi-source双方のsweepがRust全域0 hit。新たなsweep cleanupは不要。 |
