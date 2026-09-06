@@ -214,28 +214,29 @@ impl<R: Read + Seek> Pdf<R> {
             options.suppress_warnings,
             options.description.clone(),
         );
-        let mut bootstrap_reader = BootstrapReadTracker::new(&mut reader);
-        let loaded_state = match load_xref_state_with_options(
-            &mut bootstrap_reader,
-            XrefLoadOptions {
-                allow_repair: options.repair,
-                ignore_xref_streams: options.ignore_xref_streams,
-            },
-        ) {
-            Ok(state) => state,
-            Err(error) => {
-                let error = qpdf_initial_read_error(
-                    &options.description,
-                    bootstrap_reader.read_attempted,
-                    error,
-                );
-                if let Some((_, diagnostics)) = error.open_failure() {
-                    warning_options.replay_warnings(diagnostics)?;
+        let loaded_state = {
+            let mut bootstrap_reader = BootstrapReadTracker::new(&mut reader);
+            match load_xref_state_with_options(
+                &mut bootstrap_reader,
+                XrefLoadOptions {
+                    allow_repair: options.repair,
+                    ignore_xref_streams: options.ignore_xref_streams,
+                },
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    let error = qpdf_initial_read_error(
+                        &options.description,
+                        bootstrap_reader.read_attempted,
+                        error,
+                    );
+                    if let Some((_, diagnostics)) = error.open_failure() {
+                        warning_options.replay_warnings(diagnostics)?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
         };
-        drop(bootstrap_reader);
         // Keep the temporary bootstrap resolver alive until every returned
         // handle has been rebound to this Pdf's canonical resolver. Its Drop
         // intentionally disconnects the temporary cache to break cycles, so
