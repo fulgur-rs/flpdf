@@ -24,6 +24,41 @@ use std::process::Command as ProcessCommand;
 mod eol;
 use eol::EOL;
 
+/// Expected qpdf version for the differential `--check` comparisons below.
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+/// Reports whether the pinned `qpdf` 11.9.0 executable is available for
+/// differential comparison. Mirrors the guard used by the other qpdf-dependent
+/// suites: on CI qpdf is mandatory (panic if absent or wrong version), while on
+/// developer machines without it the caller skips the comparison.
+fn qpdf_available() -> bool {
+    let output = match ProcessCommand::new("qpdf").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("qpdf 11.9.0 is required on CI: {error}");
+            }
+            eprintln!("skipping: qpdf 11.9.0 is unavailable: {error}");
+            return false;
+        }
+    };
+    let version = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && version.lines().next() == Some(EXPECTED_QPDF_VERSION) {
+        return true;
+    }
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "qpdf 11.9.0 is required on CI; found {:?}",
+            version.lines().next()
+        );
+    }
+    eprintln!(
+        "skipping: qpdf 11.9.0 is required; found {:?}",
+        version.lines().next()
+    );
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Fixture builders
 // ---------------------------------------------------------------------------
@@ -851,6 +886,9 @@ fn parameter_options_require_qpdf_equals_form() {
 
 #[test]
 fn check_stream_length_warnings_match_qpdf_object_context() {
+    if !qpdf_available() {
+        return;
+    }
     for (name, length, indirect_length_value, expected_object) in [
         (
             "indirect-bad-length",
