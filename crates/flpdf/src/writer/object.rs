@@ -571,37 +571,13 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    // `stream_dict` is itself an `ObjectHandle` that may not
-                    // yet be resolved (e.g. a mock-resolver-bearing indirect
-                    // handle whose value is a `Stream` wrapping another
-                    // indirect dictionary handle) -- force its own
-                    // resolution, mirroring the `self.try_dereference()?`
-                    // above, before reading its value.
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries(
-                &entries,
-                StreamDictionaryOptions::from_refiltered(refiltered),
-                out,
-            )
-        })
+        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries(
+            &entries,
+            StreamDictionaryOptions::from_refiltered(refiltered),
+            out,
+            dictionary_context.as_ref(),
+        )
     }
 
     /// Stream-dictionary counterpart of
@@ -622,27 +598,8 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_with_string_writer(&entries, refiltered, out, write_string)
-        })
+        let (entries, _dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_string_writer(&entries, refiltered, out, write_string)
     }
 
     /// QDF-mode counterpart of [`Self::write_stream_body`] -- same
@@ -694,31 +651,8 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    // Mirrors `write_stream_body`'s identical
-                    // `stream_dict.try_dereference()?` -- see that
-                    // primitive's own doc for why this is needed rather
-                    // than a plain `with_value` read.
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_qdf(&entries, indent, out)
-        })
+        let (entries, _dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_qdf(&entries, indent, out)
     }
 
     #[cfg(test)]
@@ -758,35 +692,17 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_qdf_with_ref_map(
-                &entries,
-                indent,
-                out,
-                map,
-                removed_refs,
-                length_ref,
-                options,
-            )
-        })
+        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_qdf_with_ref_map(
+            &entries,
+            indent,
+            out,
+            map,
+            removed_refs,
+            length_ref,
+            options,
+            dictionary_context.as_ref(),
+        )
     }
 
     #[cfg(test)]
@@ -834,36 +750,18 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer(
-                &entries,
-                indent,
-                out,
-                map,
-                removed_refs,
-                length_ref,
-                options,
-                write_string,
-            )
-        })
+        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer(
+            &entries,
+            indent,
+            out,
+            map,
+            removed_refs,
+            length_ref,
+            options,
+            dictionary_context.as_ref(),
+            write_string,
+        )
     }
 
     /// QDF-mode stream-dictionary counterpart of
@@ -933,27 +831,15 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_with_ref_map(&entries, options, out, map, removed_refs)
-        })
+        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_ref_map(
+            &entries,
+            options,
+            out,
+            map,
+            removed_refs,
+            dictionary_context.as_ref(),
+        )
     }
 
     #[cfg(test)]
@@ -985,34 +871,16 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_with_ref_map_and_length(
-                &entries,
-                options,
-                out,
-                map,
-                removed_refs,
-                Some(length),
-            )
-        })
+        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_ref_map_and_length(
+            &entries,
+            options,
+            out,
+            map,
+            removed_refs,
+            Some(length),
+            dictionary_context.as_ref(),
+        )
     }
 
     #[cfg(test)]
@@ -1052,34 +920,16 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        self.try_dereference()?;
-        self.with_value(|value| {
-            let entries = match value {
-                Some(ObjectValue::Dictionary(entries)) => entries
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-                Some(ObjectValue::Stream { stream_dict, .. }) => {
-                    stream_dict.try_dereference()?;
-                    stream_dict.with_value(|dict_value| match dict_value {
-                        Some(ObjectValue::Dictionary(entries)) => entries
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                        _ => Vec::new(),
-                    })
-                }
-                _ => Vec::new(),
-            };
-            unparse_stream_dict_entries_with_ref_map_and_string_writer(
-                &entries,
-                options,
-                out,
-                map,
-                removed_refs,
-                write_string,
-            )
-        })
+        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_ref_map_and_string_writer(
+            &entries,
+            options,
+            out,
+            map,
+            removed_refs,
+            dictionary_context.as_ref(),
+            write_string,
+        )
     }
 
     /// This trailer-shaped dictionary handle's writer-emission form,
@@ -1326,6 +1176,7 @@ impl ObjectWriterEmission for ObjectHandle {
 fn prepare_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
+    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<Vec<(Vec<u8>, ObjectHandle)>> {
     let mut prepared: Vec<_> = entries.to_vec();
 
@@ -1350,7 +1201,7 @@ fn prepare_stream_dict_entries(
         prepared
             .retain(|(key, _)| key.as_slice() != b"/Filter" && key.as_slice() != b"/DecodeParms");
     } else {
-        remove_crypt_filter_from_entries(&mut prepared)?;
+        remove_crypt_filter_from_entries(&mut prepared, dictionary_context)?;
     }
     Ok(prepared)
 }
@@ -1358,7 +1209,10 @@ fn prepare_stream_dict_entries(
 /// Remove the first `/Crypt` filter and its paired decode parameters from a
 /// copied dictionary. This mutates only the copy, matching qpdf's shallow
 /// `unparseObject` preparation.
-fn remove_crypt_filter_from_entries(entries: &mut Vec<(Vec<u8>, ObjectHandle)>) -> Result<()> {
+fn remove_crypt_filter_from_entries(
+    entries: &mut Vec<(Vec<u8>, ObjectHandle)>,
+    dictionary_context: Option<&ObjectHandle>,
+) -> Result<()> {
     let Some(filter_index) = entries
         .iter()
         .position(|(key, _)| key.as_slice() == b"/Filter")
@@ -1395,9 +1249,13 @@ fn remove_crypt_filter_from_entries(entries: &mut Vec<(Vec<u8>, ObjectHandle)>) 
         .position(|(key, _)| key.as_slice() == b"/DecodeParms")
     else {
         // `getKey` returns qpdf's contextual null when the key is absent, and
-        // qpdf still calls `eraseItem` on that handle. Preserve the call's
-        // warning/error boundary instead of silently skipping it.
-        let _ = ObjectHandle::null().erase_array_item(crypt_index);
+        // qpdf still calls `eraseItem` on that handle. Preserve that lookup's
+        // warning/error boundary instead of silently skipping the call.
+        let decode = dictionary_context
+            .map(|dictionary| dictionary.try_get_key(b"/DecodeParms"))
+            .transpose()?
+            .unwrap_or_else(ObjectHandle::null);
+        decode.erase_array_item(crypt_index)?;
         return Ok(());
     };
     let decode = entries[decode_index].1.clone();
@@ -1406,6 +1264,51 @@ fn remove_crypt_filter_from_entries(entries: &mut Vec<(Vec<u8>, ObjectHandle)>) 
     // out-of-bounds behavior for malformed/non-array parameter values.
     decode.erase_array_item(crypt_index)?;
     Ok(())
+}
+
+/// Snapshot a stream dictionary's entries together with the live dictionary
+/// handle qpdf uses for missing-key warning context. A stream's nested
+/// dictionary is the context for `getKey("/DecodeParms")`; the stream handle
+/// itself is not a dictionary and would report the wrong type warning.
+fn stream_dictionary_entries_for_emission(
+    handle: &ObjectHandle,
+) -> Result<(Vec<(Vec<u8>, ObjectHandle)>, Option<ObjectHandle>)> {
+    handle.try_dereference()?;
+    if let Some(entries) = handle.with_value(|value| match value {
+        Some(ObjectValue::Dictionary(entries)) => Some(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        _ => None,
+    }) {
+        return Ok((entries, Some(handle.clone())));
+    }
+
+    let Some(stream_dict) = handle.with_value(|value| match value {
+        Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
+        _ => None,
+    }) else {
+        return Ok((Vec::new(), None));
+    };
+    // Programmatically created stream dictionaries are direct children and
+    // may not carry the resolver that owns their indirect stream. qpdf's
+    // stream dictionary still inherits that document context, so retain the
+    // same warning boundary for a missing `/DecodeParms` lookup without
+    // changing any serialized dictionary bytes.
+    if stream_dict.context().is_none() && handle.context().is_some() {
+        stream_dict.set_child_description(handle, b" -> stream dictionary", b"");
+    }
+    stream_dict.try_dereference()?;
+    let entries = stream_dict.with_value(|value| match value {
+        Some(ObjectValue::Dictionary(entries)) => entries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        _ => Vec::new(),
+    });
+    Ok((entries, Some(stream_dict)))
 }
 
 // Writes a stream dictionary's own body -- `write_stream_body`'s sole
@@ -1444,8 +1347,9 @@ fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
     out: &mut Vec<u8>,
+    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, options)?;
+    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1497,7 +1401,7 @@ fn unparse_stream_dict_entries_qdf(
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, StreamDictionaryOptions::preserve())?;
+    let entries = prepare_stream_dict_entries(entries, StreamDictionaryOptions::preserve(), None)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1534,8 +1438,9 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
+    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, options)?;
+    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1585,12 +1490,13 @@ fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
+    dictionary_context: Option<&ObjectHandle>,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
-    let entries = prepare_stream_dict_entries(entries, options)?;
+    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1659,6 +1565,7 @@ where
     let entries = prepare_stream_dict_entries(
         entries,
         StreamDictionaryOptions::from_refiltered(refiltered),
+        None,
     )?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
@@ -1734,6 +1641,7 @@ fn unparse_stream_dict_entries_with_ref_map(
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
+    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
     unparse_stream_dict_entries_with_ref_map_and_length(
         entries,
@@ -1742,6 +1650,7 @@ fn unparse_stream_dict_entries_with_ref_map(
         map,
         removed_refs,
         None,
+        dictionary_context,
     )
 }
 
@@ -1752,8 +1661,9 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_override: Option<usize>,
+    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, options)?;
+    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1793,12 +1703,13 @@ fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
+    dictionary_context: Option<&ObjectHandle>,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
-    let entries = prepare_stream_dict_entries(entries, options)?;
+    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -3826,6 +3737,7 @@ fn write_id_style_value_handle_with_ref_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Pdf;
     use std::rc::Rc;
 
     #[test]
@@ -3939,19 +3851,15 @@ mod tests {
     #[test]
     fn stream_dictionary_owner_handles_missing_crypt_parameters_and_qdf_filter_append() -> Result<()>
     {
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![
-                (
-                    b"/Filter".to_vec(),
-                    ObjectHandle::array(vec![
-                        ObjectHandle::name(b"Crypt".to_vec()),
-                        ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
-                    ]),
-                ),
-                (b"/Length".to_vec(), ObjectHandle::integer(3)),
+        let pdf = Pdf::empty()?;
+        let stream = pdf.new_stream_with_data(Rc::new(b"abc".to_vec()))?;
+        stream.as_stream_dict().unwrap().replace_key(
+            b"/Filter",
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"Crypt".to_vec()),
+                ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
             ]),
-            Rc::new(b"abc".to_vec()),
-        );
+        )?;
         let map = |object_ref: ObjectRef| Ok(object_ref);
         let mut compact = Vec::new();
         stream.write_stream_body_with_ref_map_and_removed_with_options(
@@ -3959,7 +3867,7 @@ mod tests {
             StreamDictionaryOptions::preserve(),
             &map,
             &BTreeSet::new(),
-        )?;
+        )?; // cov:ignore: qdf/compact policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to the callback cleanup.
         assert!(String::from_utf8_lossy(&compact).contains("/Filter [ /ASCIIHexDecode ]"));
 
         let policy = StreamDictionaryOptions::new(true, true);
@@ -3971,15 +3879,15 @@ mod tests {
             &BTreeSet::new(),
             None,
             policy,
-        )?;
+        )?; // cov:ignore: qdf policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to the callback cleanup.
         let qdf_text = String::from_utf8(qdf).unwrap();
         assert!(qdf_text.contains("/Filter /FlateDecode"));
         assert!(!qdf_text.contains("ASCIIHexDecode"));
 
         let mut qdf_string = Vec::new();
         let mut callback = |out: &mut Vec<u8>, value: &[u8]| {
-            out.extend_from_slice(value);
-            Ok(())
+            out.extend_from_slice(value); // cov:ignore: test-only string callback forwards bytes directly
+            Ok(()) // cov:ignore: test-only string callback has no independent branch
         };
         stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
             &mut qdf_string,
@@ -3989,7 +3897,7 @@ mod tests {
             None,
             policy,
             &mut callback,
-        )?;
+        )?; // cov:ignore: qdf string policy owner call is covered by the surrounding assertions; llvm-cov attributes this terminator to callback cleanup.
         assert!(String::from_utf8(qdf_string)
             .unwrap()
             .contains("/Filter /FlateDecode"));

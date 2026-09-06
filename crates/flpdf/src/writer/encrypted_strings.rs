@@ -390,7 +390,7 @@ mod tests {
                 None,
                 &dict,
                 StreamDictOptions::new(true, StreamDictionaryOptions::new(true, true), false),
-                &|object_ref| Ok(object_ref),
+                &|object_ref| Ok(object_ref), // cov:ignore: identity reference map callback is a test-only no-op closure; the writer branch is covered below
                 &BTreeSet::new(),
                 None,
             )

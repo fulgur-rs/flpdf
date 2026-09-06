@@ -63,9 +63,8 @@ fn linearized_unencrypted_stream_uses_the_same_dictionary_owner() {
         .new_stream_with_data(Rc::new(b"q Q\n".to_vec()))
         .unwrap();
     add_external_keys(&stream);
-    pdf.root_handle()
-        .unwrap()
-        .replace_key(b"/Extra", stream)
+    pdf.get_object_handle(flpdf::ObjectRef::new(3, 0))
+        .replace_key(b"/Contents", stream)
         .unwrap();
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
@@ -341,6 +340,37 @@ fn unfiltered_stream_drops_only_an_empty_decode_parms_array_and_strips_crypt() {
     assert_eq!(
         dictionary.try_get_key(b"/F").unwrap().unparse(),
         b"(external.bin)"
+    );
+}
+
+#[test]
+fn missing_decode_parms_still_removes_a_crypt_filter() {
+    let bytes = rewrite_stream(
+        |stream| {
+            add_external_keys(stream);
+            stream
+                .as_stream_dict()
+                .unwrap()
+                .replace_key(
+                    b"/Filter",
+                    ObjectHandle::array(vec![
+                        ObjectHandle::name(b"Crypt".to_vec()),
+                        ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                    ]),
+                )
+                .unwrap();
+            stream.set_filter_on_write(false).unwrap();
+        },
+        |writer| writer.set_compress_streams(true),
+    );
+    let dictionary = emitted_stream_dict(bytes);
+    assert_eq!(
+        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
+        b"[ /ASCIIHexDecode ]"
+    );
+    assert_eq!(
+        dictionary.try_get_key(b"/DecodeParms").unwrap().unparse(),
+        b"null"
     );
 }
 

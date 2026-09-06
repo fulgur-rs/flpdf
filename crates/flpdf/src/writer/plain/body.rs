@@ -1010,6 +1010,13 @@ fn canonical_stream_output_with_rewrite_policy(
         ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
     );
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
+    // The output dictionary is a shallow writer copy. Preserve the source
+    // stream's warning context on that copy so qpdf's missing-key
+    // `/DecodeParms` erase boundary remains observable when `/Filter` carries
+    // `/Crypt` without a paired parameters entry.
+    if dict.context().is_none() && handle.context().is_some() {
+        dict.set_child_description(handle, b" -> stream dictionary", b"");
+    }
     let dictionary_options = StreamDictionaryOptions::new(
         filtering_attempted,
         filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content,
