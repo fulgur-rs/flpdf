@@ -6283,6 +6283,37 @@ mod final_handle_writer_tests {
     }
 
     #[test]
+    fn writer_setup_shares_encryption_parameters_across_route_slots() {
+        let mut pdf = Pdf::empty().expect("empty PDF for writer setup");
+        let options = WriterOptions {
+            encrypt: Some(EncryptParams::v4_aes128(b"user", b"owner")),
+            ..WriterOptions::default()
+        };
+        let setup = build_writer_setup(&mut pdf, &options).expect("setup succeeds");
+        let parameters = setup
+            .encryption_parameters
+            .as_ref()
+            .expect("explicit encryption builds one shared parameter state");
+        let standard = parameters
+            .clone()
+            .into_context(ObjectRef::new(7, 0));
+        let linearized = parameters
+            .clone()
+            .into_context(ObjectRef::new(12, 0));
+
+        assert_eq!(standard.encrypt_ref, ObjectRef::new(7, 0));
+        assert_eq!(linearized.encrypt_ref, ObjectRef::new(12, 0));
+        assert_eq!(standard.id0, linearized.id0);
+        assert_eq!(standard.file_key, linearized.file_key);
+        assert_eq!(standard.encryption_v, linearized.encryption_v);
+        assert_eq!(standard.encryption_r, linearized.encryption_r);
+        assert_eq!(
+            standard.encrypt_dict.try_get_key(b"/V").unwrap().try_as_integer().unwrap(),
+            linearized.encrypt_dict.try_get_key(b"/V").unwrap().try_as_integer().unwrap()
+        );
+    }
+
+    #[test]
     fn copied_v4_encryption_preserves_the_cleartext_metadata_flag() {
         let source = CopyEncryptionSource {
             encrypt_dict: ObjectHandle::dictionary(vec![
