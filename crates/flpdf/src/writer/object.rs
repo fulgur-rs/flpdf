@@ -51,6 +51,14 @@ pub(crate) trait ObjectWriterEmission {
         map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()>;
+    fn write_root_object_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<()>;
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -333,6 +341,25 @@ impl ObjectWriterEmission for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
         unparse_object_walk_with_ref_map(self, out, map, removed_refs)
+    }
+
+    /// Emit the root through qpdf's output-only `unparseObject` mutation.
+    ///
+    /// qpdf makes an unsafe shallow copy of the root dictionary before
+    /// reconciling `/Extensions /ADBE` (`QPDFWriter.cc:1347-1435`). Keep that
+    /// copy local to serialization. Existing direct Extensions remain shared:
+    /// replacing or removing ADBE there also changes the live graph. Creating
+    /// or removing the root's Extensions key changes only the output copy.
+    fn write_root_object_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<()> {
+        let root = root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)?;
+        unparse_object_walk_with_ref_map(&root, out, map, removed_refs)
     }
 
     /// Encrypted writer counterpart of
@@ -1546,6 +1573,69 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
     handle
         .object_ref()
         .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+}
+
+/// Copy the root container and reconcile `/ADBE` with qpdf's child aliasing.
+fn root_output_copy_with_adbe(
+    source: &ObjectHandle,
+    final_pdf_version: &str,
+    final_extension_level: i64,
+) -> Result<ObjectHandle> {
+    let root = source.unsafe_shallow_copy()?;
+    let mut extensions = if root.try_has_key(b"/Extensions")?
+        && root.try_get_key(b"/Extensions")?.try_is_dictionary()?
+    {
+        Some(root.try_get_key(b"/Extensions")?)
+    } else {
+        None
+    };
+    let (have_adbe, have_other) = if let Some(extensions) = &extensions {
+        let mut keys = extensions.try_get_keys()?;
+        let have_adbe = keys.remove(b"/ADBE".as_slice());
+        (have_adbe, !keys.is_empty())
+    } else {
+        (false, false)
+    };
+    let need_adbe = final_extension_level > 0;
+    if need_adbe {
+        if !(have_other || have_adbe) {
+            let created = ObjectHandle::dictionary(Vec::new());
+            root.replace_key(b"/Extensions", created.clone())?;
+            extensions = Some(created);
+        }
+    } else if !have_other && have_adbe {
+        root.remove_key(b"/Extensions");
+        extensions = None;
+    }
+
+    if let Some(extensions) = extensions {
+        let adbe = extensions.try_get_key(b"/ADBE")?;
+        let preserves_existing = adbe.try_is_dictionary()?
+            && adbe
+                .try_get_key(b"/BaseVersion")?
+                .try_is_name_and_equals(final_pdf_version.as_bytes())?
+            && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()?
+                == Some(final_extension_level);
+        if !preserves_existing {
+            if need_adbe {
+                let replacement = ObjectHandle::dictionary(vec![
+                    (
+                        b"/BaseVersion".to_vec(),
+                        ObjectHandle::name(final_pdf_version.as_bytes().to_vec()),
+                    ),
+                    (
+                        b"/ExtensionLevel".to_vec(),
+                        ObjectHandle::integer(final_extension_level),
+                    ),
+                ]);
+                extensions.replace_key(b"/ADBE", replacement)?;
+            } else {
+                extensions.remove_key(b"/ADBE");
+            }
+        }
+    }
+
+    Ok(root)
 }
 
 // The sole recursion hub for the plain unparse family (`ObjectHandle::

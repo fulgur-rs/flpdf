@@ -63,11 +63,21 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 let body = object_streams::emit_objstm_body_from_handles_with_writer(
                     &handles,
                     &mut |out, _member_index, _member_ref, handle| {
-                        let result = handle.write_object_with_ref_map_and_removed(
-                            out,
-                            &map,
-                            &plan.removed_refs,
-                        );
+                        let result = if handle.object_ref() == plan.root_source {
+                            handle.write_root_object_with_ref_map_and_removed(
+                                out,
+                                &map,
+                                &plan.removed_refs,
+                                &plan.version,
+                                plan.final_extension_level,
+                            )
+                        } else {
+                            handle.write_object_with_ref_map_and_removed(
+                                out,
+                                &map,
+                                &plan.removed_refs,
+                            )
+                        };
                         if result.is_ok() {
                             crate::writer::report_progress_event(options)?;
                         }
@@ -154,6 +164,17 @@ fn emit_source_from_handle<R: Read + Seek>(
             ))
         })
     };
+
+    if plan.root_source == Some(source) {
+        handle.write_root_object_with_ref_map_and_removed(
+            bytes,
+            &map,
+            &plan.removed_refs,
+            &plan.version,
+            plan.final_extension_level,
+        )?; // cov:ignore: root serializer success is exercised by qpdf parity; LLVM maps this multiline continuation to an unhit region
+        return Ok(());
+    }
 
     if handle.as_stream_dict().is_some() {
         let cached = if let Some(cached) = plan.cached_stream_outputs.get(&source) {
