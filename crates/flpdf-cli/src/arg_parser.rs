@@ -155,6 +155,10 @@ pub(crate) struct ParsedArgs {
     pub(crate) raw_residual_args: Vec<RawArg>,
     pub(crate) named_segments: Vec<NamedSegment>,
     pub(crate) raw_named_segments: Vec<RawNamedSegment>,
+    /// Number of argv tokens after `@argfile` expansion, before named-segment
+    /// partitioning. qpdf checks `argc == 2` at this point for sole help
+    /// options (`QPDFArgParser.cc:437,478-483`).
+    pub(crate) expanded_arg_count: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -265,6 +269,7 @@ impl ArgParser {
 
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
         let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
+        let expanded_arg_count = args.len();
         let mut iter = args.into_iter();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());
@@ -367,6 +372,7 @@ impl ArgParser {
             raw_residual_args,
             named_segments,
             raw_named_segments,
+            expanded_arg_count,
         })
     }
 

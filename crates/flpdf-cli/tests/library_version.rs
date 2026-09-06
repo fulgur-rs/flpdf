@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::*;
 
 #[path = "support/eol.rs"]
 mod eol;
@@ -67,6 +68,31 @@ fn qpdf_version_from_argfile_is_handled_after_expansion() {
         .success()
         .stdout(qpdf_version_output())
         .stderr("");
+}
+
+#[test]
+fn version_is_not_a_sole_option_when_a_named_group_precedes_it() {
+    // qpdf's sole-option check uses argc == 2 on the fully expanded argv,
+    // before named-group parsing (QPDFArgParser.cc:437,478-483). A --version
+    // that is not the sole expanded token (e.g. after an --overlay group) must
+    // not be treated as the version request; qpdf rejects it as an
+    // unrecognized argument (exit 2) rather than printing the version.
+    let directory = tempfile::tempdir().expect("argument-file directory");
+    let source = directory.path().join("source.pdf");
+    std::fs::write(&source, b"%PDF-1.4\n%%EOF\n").expect("write overlay source");
+
+    Command::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "--overlay".to_string(),
+            source.display().to_string(),
+            "--".to_string(),
+            "--version".to_string(),
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicates::str::contains("qpdf version").not());
 }
 
 #[test]
