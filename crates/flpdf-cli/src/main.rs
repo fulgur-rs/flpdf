@@ -71,6 +71,7 @@ struct WriterOptions {
     recompress_flate: bool,
     compression_level: Option<i32>,
     progress: bool,
+    verbose: bool,
     static_id: bool,
     deterministic_id: bool,
     static_aes_iv: bool,
@@ -103,6 +104,7 @@ impl Default for WriterOptions {
             recompress_flate: false,
             compression_level: None,
             progress: false,
+            verbose: false,
             static_id: false,
             deterministic_id: false,
             static_aes_iv: false,
@@ -204,6 +206,7 @@ fn top_level_writer_options(
         no_original_object_ids: args.no_original_object_ids,
         preserve_unreferenced_objects: args.preserve_unreferenced,
         progress: args.progress,
+        verbose: args.verbose,
         recompress_flate: args.recompress_flate,
         compression_level,
         object_streams: args.object_streams.into(),
@@ -350,7 +353,16 @@ fn writer_configuration(
     if let Some(source) = options.copy_encryption.clone() {
         configuration.copy_encryption_parameters(source);
     }
-    let warning_count = configuration.normalize_encryption_passwords(options.password_mode)?;
+    let (info_count, warning_count) =
+        configuration.normalize_encryption_passwords(options.password_mode)?;
+    if options.verbose {
+        for _ in 0..info_count {
+            emit_logger_info(format!(
+                "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
+                progname()
+            ));
+        }
+    }
     for _ in 0..warning_count {
         emit_logger_error(format!(
             "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
@@ -3052,6 +3064,7 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
             progress: args.progress,
+            verbose: args.verbose,
             recompress_flate: args.recompress_flate,
             compression_level: top_level_compression_level,
             object_streams: args.object_streams.into(),
@@ -3951,6 +3964,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 no_original_object_ids: cmd.no_original_object_ids,
                 preserve_unreferenced_objects: cmd.preserve_unreferenced,
                 progress: cmd.progress,
+                verbose: cmd.verbose,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
