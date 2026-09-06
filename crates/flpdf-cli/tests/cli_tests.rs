@@ -7419,7 +7419,7 @@ fn add_attachment_missing_segment_terminator_is_a_usage_error() {
 }
 
 #[test]
-fn add_attachment_equals_form_with_no_positional_fails_instead_of_silently_embedding_nothing() {
+fn add_attachment_equals_form_with_no_positional_matches_qpdf_usage() {
     // qpdf's `--add-attachment` is a bare option: `--add-attachment=x --`
     // silently discards `x` and, finding no positional file token before
     // the terminator, exits 2 ("add attachment: no file specified";
@@ -7435,6 +7435,7 @@ fn add_attachment_equals_form_with_no_positional_fails_instead_of_silently_embed
 
     Command::cargo_bin("flpdf")
         .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
         .args([
             input.path().to_str().unwrap(),
             &format!("--add-attachment={}", attachment.to_str().unwrap()),
@@ -7442,9 +7443,84 @@ fn add_attachment_equals_form_with_no_positional_fails_instead_of_silently_embed
             output.to_str().unwrap(),
         ])
         .assert()
-        .failure();
+        .code(2)
+        .stderr(format!("qpdf: add attachment: no file specified{EOL}"));
 
     assert!(!output.exists());
+}
+
+#[test]
+fn add_attachment_without_file_matches_qpdf_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--add-attachment",
+            "--",
+        ])
+        .assert()
+        .code(2)
+        .stderr(format!("qpdf: add attachment: no file specified{EOL}"));
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn add_attachment_invalid_creation_date_matches_qpdf_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("payload.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&attachment, b"payload").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--creationdate=potato",
+            "--",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::starts_with(format!(
+            "qpdf: potato is not a valid PDF timestamp{EOL}"
+        )));
+}
+
+#[test]
+fn add_attachment_invalid_modification_date_matches_qpdf_usage() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("payload.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&attachment, b"payload").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--moddate=potato",
+            "--",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::starts_with(format!(
+            "qpdf: potato is not a valid PDF timestamp{EOL}"
+        )));
 }
 
 #[test]
@@ -8120,13 +8196,14 @@ fn show_attachment_errors_on_missing_key() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
         .args([
             "--show-attachment=nosuchkey",
             input.path().to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("nosuchkey"));
+        .code(2)
+        .stderr(format!("qpdf: attachment nosuchkey not found{EOL}"));
 }
 
 #[test]
@@ -8498,7 +8575,7 @@ fn add_attachment_non_ascii_date_is_clean_error_not_panic() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("invalid PDF date"))
+        .stderr(predicate::str::contains("not a valid PDF timestamp"))
         .stderr(predicate::str::contains("panicked").not());
 }
 

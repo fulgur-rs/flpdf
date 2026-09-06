@@ -357,13 +357,9 @@ fn missing_show_attachment_diagnostic_preserves_non_utf8_key_bytes() {
 
     assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
     assert_preserves_raw_bytes(&output, key, "missing show-attachment diagnostic");
-    let mut expected = b"qpdf: --show-attachment: key \"missing-".to_vec();
+    let mut expected = b"qpdf: attachment missing-".to_vec();
     expected.push(0xff);
-    expected.extend_from_slice(
-        b"\" not found or unreadable: unsupported PDF feature: attachment \"missing-",
-    );
-    expected.push(0xff);
-    expected.extend_from_slice(b"\" not found\n");
+    expected.extend_from_slice(b" not found\n");
     assert_eq!(output.stderr, expected);
 }
 
@@ -390,7 +386,7 @@ fn missing_remove_attachment_diagnostic_preserves_non_utf8_key_bytes() {
 }
 
 #[test]
-fn missing_show_attachment_diagnostic_escapes_control_bytes_in_the_inner_message() {
+fn missing_show_attachment_diagnostic_preserves_control_bytes_in_the_key() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let input = raw_path(directory.path(), b"input.pdf");
     let key = b"bad\nkey-\xff";
@@ -402,22 +398,9 @@ fn missing_show_attachment_diagnostic_escapes_control_bytes_in_the_inner_message
     ]);
 
     assert_eq!(output.status.code(), Some(2), "stderr={:?}", output.stderr);
-    // The control byte must not split the single-line diagnostic in two: the
-    // key's raw `\n` is escaped in both the outer CLI-level quoting and the
-    // inner library-level "attachment ... not found" message.
-    assert_eq!(
-        output.stderr.iter().filter(|&&byte| byte == b'\n').count(),
-        1,
-        "stderr={:?}",
-        output.stderr
-    );
-    let mut expected = b"qpdf: --show-attachment: key \"bad\\nkey-".to_vec();
+    let mut expected = b"qpdf: attachment bad\nkey-".to_vec();
     expected.push(0xff);
-    expected.extend_from_slice(
-        b"\" not found or unreadable: unsupported PDF feature: attachment \"bad\\nkey-",
-    );
-    expected.push(0xff);
-    expected.extend_from_slice(b"\" not found\n");
+    expected.extend_from_slice(b" not found\n");
     assert_eq!(output.stderr, expected);
 }
 

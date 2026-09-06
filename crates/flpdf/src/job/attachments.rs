@@ -430,36 +430,10 @@ fn emit_show_attachment<R: Read + Seek>(
 }
 
 fn raw_attachment_error(key: &[u8], suffix: &[u8]) -> Error {
-    let mut message = b"unsupported PDF feature: attachment ".to_vec();
-    append_debug_quoted_bytes(&mut message, key);
+    let mut message = b"attachment ".to_vec();
+    message.extend_from_slice(key);
     message.extend_from_slice(suffix);
     Error::SystemBytes(message)
-}
-
-/// Append `bytes` in the crate's byte-safe debug-quoting convention: quotes,
-/// backslashes, and ASCII control bytes are escaped so a raw newline or
-/// terminal control sequence in an attachment key cannot corrupt a
-/// single-line diagnostic; every other byte (including non-UTF-8 high bytes)
-/// passes through unchanged. This mirrors the CLI's
-/// `append_debug_quoted_bytes` (`crates/flpdf-cli/src/main.rs`), which
-/// replaced the same crate's pre-existing `{bytes:?}` debug-quoting of a
-/// lossy `String` once the key itself became raw bytes.
-fn append_debug_quoted_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
-    output.push(b'"');
-    for &byte in bytes {
-        match byte {
-            b'"' => output.extend_from_slice(b"\\\""),
-            b'\\' => output.extend_from_slice(b"\\\\"),
-            b'\n' => output.extend_from_slice(b"\\n"),
-            b'\r' => output.extend_from_slice(b"\\r"),
-            b'\t' => output.extend_from_slice(b"\\t"),
-            byte if byte.is_ascii_control() => {
-                output.extend_from_slice(format!("\\x{byte:02x}").as_bytes());
-            }
-            byte => output.push(byte),
-        }
-    }
-    output.push(b'"');
 }
 
 /// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +
@@ -864,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn show_attachment_error_escapes_control_bytes_and_quotes_in_the_key() {
+    fn show_attachment_error_preserves_raw_key_bytes() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/minimal.pdf"
@@ -885,7 +859,7 @@ mod tests {
 
         assert_eq!(
             error.raw_message(),
-            Some(b"unsupported PDF feature: attachment \"quote-\\\"-\\\\-\\r-\\t-\\x01-\xff\" not found".as_slice())
+            Some(b"attachment quote-\"-\\-\r-\t-\x01-\xff not found".as_slice())
         );
     }
 
