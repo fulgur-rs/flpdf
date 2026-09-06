@@ -555,6 +555,16 @@ fn qpdf_differential_matches_missing_input_open_error_on_all_input_routes() {
             "--empty --pages",
             vec!["--empty", "--pages", missing, "--", pages_output],
         ),
+        (
+            "--copy-attachments-from",
+            vec![
+                "--copy-attachments-from",
+                missing,
+                "--",
+                ONE_PAGE,
+                rewrite_output,
+            ],
+        ),
     ];
     for (label, args) in cases {
         let qpdf = run_qpdf(&args);

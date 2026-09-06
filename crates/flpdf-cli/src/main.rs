@@ -8473,8 +8473,8 @@ fn run_copy_attachments_from(
             pdf_open_options_with_password_bytes(repair, &source_password, args.password);
         configure_document_logger(&mut src_options, &args.file);
         src_options.suppress_warnings |= suppress_warnings;
-        let src_file =
-            File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
+        let src_file = File::open(&args.file)
+            .map_err(|error| open_error_with_file(&args.file, error.into()))?;
         let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
             .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
         src.root_handle()
