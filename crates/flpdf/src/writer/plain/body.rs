@@ -4,8 +4,11 @@ use std::io::{Read, Seek};
 use std::rc::Rc;
 
 use crate::writer::object_streams;
-use crate::writer::plain::plan::{PlainWritePlan, PlannedIndirectObject};
+use crate::writer::plain::plan::{
+    PlainWritePlan, PlannedIndirectObject, PlannedMember, PlannedObjectStreamOrigin,
+};
 use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
+use crate::writer::write_object::WriteObject;
 use crate::writer::WriterOptions;
 use crate::writer::{serialize, CompressStreams, ObjectWriterEmission, QPDF_BINARY_MARKER};
 use crate::{ObjectHandle, ObjectRef, Pdf};
@@ -27,119 +30,55 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     bytes.extend_from_slice(QPDF_BINARY_MARKER);
 
     let mut layout = BodyLayout::default();
+    let mut emitter = PlainObjectEmitter {
+        pdf,
+        options,
+        plan,
+        bytes: &mut bytes,
+        layout: &mut layout,
+        lengths: BTreeMap::new(),
+        object_stream_to_objects: plan
+            .objects
+            .iter()
+            .filter_map(|planned| match planned {
+                PlannedIndirectObject::ObjectStream {
+                    origin: origin @ PlannedObjectStreamOrigin::SourceBacked(source),
+                    output,
+                    members,
+                } => Some((source.number, (origin, *output, members.as_slice()))),
+                _ => None,
+            })
+            .collect(),
+        encryption: crate::writer::encryption_state::WriterEncryptionState::new(
+            false,
+            Vec::new(),
+            false,
+            0,
+            0,
+        ),
+    };
     for planned in &plan.objects {
         match planned {
-            PlannedIndirectObject::Source { source, output } => {
-                let offset = bytes.len();
-                bytes.extend_from_slice(
-                    format!("{} {} obj\n", output.number, output.generation).as_bytes(),
-                );
-                emit_source_from_handle(pdf, options, plan, *source, &mut bytes)?;
-                bytes.extend_from_slice(b"\nendobj\n");
-                layout
-                    .uncompressed
-                    .insert(output.number, (output.generation, offset));
-                crate::writer::report_progress_event(options)?;
+            PlannedIndirectObject::Source { source, .. } => {
+                let handle = emitter.pdf.get_object_handle(*source);
+                emitter.write_object(&handle, None)?;
+            }
+            PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::SourceBacked(source),
+                ..
+            } => {
+                let handle = emitter.pdf.get_object_handle(*source);
+                emitter.write_object(&handle, None)?;
             }
             PlannedIndirectObject::ObjectStream {
                 origin,
                 output,
                 members,
             } => {
-                let mut handles = Vec::with_capacity(members.len());
-                for member in members {
-                    let handle = pdf.get_object_handle(member.source);
-                    pdf.resolve(&handle)?;
-                    handles.push((member.output, handle));
-                }
-                let map = |object_ref| {
-                    plan.new_for_original(object_ref).ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "plain writer: reference {} {} R absent from renumber map",
-                            object_ref.number, object_ref.generation
-                        ))
-                    })
-                };
-                let body = object_streams::emit_objstm_body_from_handles_with_writer(
-                    &handles,
-                    &mut |out, _member_index, _member_ref, handle| {
-                        let result = if handle.object_ref() == plan.root_source {
-                            handle.write_root_object_with_ref_map_and_removed(
-                                out,
-                                &map,
-                                &plan.removed_refs,
-                                &plan.version,
-                                plan.final_extension_level,
-                            )
-                        } else {
-                            handle.write_object_with_ref_map_and_removed(
-                                out,
-                                &map,
-                                &plan.removed_refs,
-                            )
-                        };
-                        if result.is_ok() {
-                            crate::writer::report_progress_event(options)?;
-                        }
-                        result
-                    },
-                )?;
-                let offset = bytes.len();
-                bytes.extend_from_slice(
-                    format!("{} {} obj\n", output.number, output.generation).as_bytes(),
-                );
-                let structural_compress = if plan.trailer.structural_filtered {
-                    CompressStreams::Yes
-                } else {
-                    CompressStreams::No
-                };
-                let extends = match origin {
-                    crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
-                        let source_handle = pdf.get_object_handle(*source);
-                        pdf.resolve(&source_handle)?;
-                        if let Some(source_dict) = source_handle.as_stream_dict() {
-                            let extends = source_dict.try_get_key(b"/Extends")?;
-                            match extends.object_ref() {
-                                Some(extends) => Some(
-                                    plan.old_to_new.get(&extends).copied().ok_or_else(|| {
-                                        crate::Error::Unsupported(format!(
-                                            "plain writer: source ObjStm /Extends {} {} R is absent from renumber map",
-                                            extends.number, extends.generation
-                                        ))
-                                    })?,
-                                ),
-                                _ => None,
-                            }
-                        } else {
-                            // qpdf permits a null or otherwise non-stream source
-                            // identity here as a placeholder for a reconstructed
-                            // object stream. The rebuilt container still carries
-                            // the surviving members, but has no /Extends key.
-                            None
-                        }
-                    }
-                    crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
-                };
-                serialize::write_objstm_stream_with_extends(
-                    &mut bytes,
-                    &body,
-                    structural_compress,
-                    options.newline_before_endstream,
-                    extends,
-                )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
-                bytes.extend_from_slice(b"\nendobj\n");
-                layout
-                    .uncompressed
-                    .insert(output.number, (output.generation, offset));
-                for (index, member) in members.iter().enumerate() {
-                    layout.compressed.insert(
-                        member.output.number,
-                        CompressedLocation {
-                            container: output.number,
-                            index: u32::try_from(index).unwrap_or(u32::MAX),
-                        },
-                    );
-                }
+                // Generated containers have no canonical source identity yet.
+                // Keep their existing owner until the allocation/queue cutover;
+                // never fabricate a source identity from the output number.
+                emitter.emit_planned_object_stream(origin, *output, members)?;
             }
         }
     }
@@ -147,15 +86,201 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     Ok((bytes, layout))
 }
 
-fn emit_source_from_handle<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+struct PlainObjectEmitter<'a, R: Read + Seek + 'static> {
+    pdf: &'a mut Pdf<R>,
+    options: &'a WriterOptions,
+    plan: &'a PlainWritePlan,
+    bytes: &'a mut Vec<u8>,
+    layout: &'a mut BodyLayout,
+    lengths: BTreeMap<u32, usize>,
+    object_stream_to_objects: BTreeMap<
+        u32,
+        (
+            &'a PlannedObjectStreamOrigin,
+            ObjectRef,
+            &'a [PlannedMember],
+        ),
+    >,
+    encryption: crate::writer::encryption_state::WriterEncryptionState,
+}
+
+impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
+    for PlainObjectEmitter<'a, R>
+{
+    type ObjectStreamContainer = (
+        &'a PlannedObjectStreamOrigin,
+        ObjectRef,
+        &'a [PlannedMember],
+    );
+
+    fn object_stream_container(&self, object: ObjectRef) -> Option<Self::ObjectStreamContainer> {
+        self.object_stream_to_objects.get(&object.number).copied()
+    }
+
+    fn write_object_stream(
+        &mut self,
+        _object: &ObjectHandle,
+        container: Self::ObjectStreamContainer,
+    ) -> crate::Result<()> {
+        self.emit_planned_object_stream(container.0, container.1, container.2)
+    }
+
+    fn indicate_progress(&mut self) -> crate::Result<()> {
+        crate::writer::report_progress_event(self.options)
+    }
+
+    fn output_number(&self, object: ObjectRef) -> crate::Result<u32> {
+        self.plan
+            .new_for_original(object)
+            .map(|output| output.number)
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "plain writer: reference {} {} R absent from renumber map",
+                    object.number, object.generation
+                ))
+            })
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn output_count(&self) -> usize {
+        self.bytes.len()
+    }
+    fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
+        &mut self.layout.uncompressed
+    }
+    fn lengths(&mut self) -> &mut BTreeMap<u32, usize> {
+        &mut self.lengths
+    }
+    fn encryption_state(&mut self) -> &mut crate::writer::encryption_state::WriterEncryptionState {
+        &mut self.encryption
+    }
+
+    fn unparse_object(
+        &mut self,
+        object: &ObjectHandle,
+        _in_object_stream: bool,
+    ) -> crate::Result<()> {
+        emit_source_from_handle(object, self.options, self.plan, self.bytes)
+    }
+}
+
+impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
+    fn emit_planned_object_stream(
+        &mut self,
+        origin: &PlannedObjectStreamOrigin,
+        output: ObjectRef,
+        members: &[PlannedMember],
+    ) -> crate::Result<()> {
+        let pdf = &mut *self.pdf;
+        let options = self.options;
+        let plan = self.plan;
+        let bytes = &mut *self.bytes;
+        let layout = &mut *self.layout;
+        let mut handles = Vec::with_capacity(members.len());
+        for member in members {
+            let handle = pdf.get_object_handle(member.source);
+            pdf.resolve(&handle)?;
+            handles.push((member.output, handle));
+        }
+        let map = |object_ref| {
+            plan.new_for_original(object_ref).ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "plain writer: reference {} {} R absent from renumber map",
+                    object_ref.number, object_ref.generation
+                ))
+            })
+        };
+        let body = object_streams::emit_objstm_body_from_handles_with_writer(
+            &handles,
+            &mut |out, _member_index, _member_ref, handle| {
+                let result = if handle.object_ref() == plan.root_source {
+                    handle.write_root_object_with_ref_map_and_removed(
+                        out,
+                        &map,
+                        &plan.removed_refs,
+                        &plan.version,
+                        plan.final_extension_level,
+                    )
+                } else {
+                    handle.write_object_with_ref_map_and_removed(out, &map, &plan.removed_refs)
+                };
+                if result.is_ok() {
+                    crate::writer::report_progress_event(options)?;
+                }
+                result
+            },
+        )?;
+        let offset = bytes.len();
+        bytes
+            .extend_from_slice(format!("{} {} obj\n", output.number, output.generation).as_bytes());
+        let structural_compress = if plan.trailer.structural_filtered {
+            CompressStreams::Yes
+        } else {
+            CompressStreams::No
+        };
+        let extends = match origin {
+            crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
+                let source_handle = pdf.get_object_handle(*source);
+                pdf.resolve(&source_handle)?;
+                if let Some(source_dict) = source_handle.as_stream_dict() {
+                    let extends = source_dict.try_get_key(b"/Extends")?;
+                    match extends.object_ref() {
+                        Some(extends) => Some(
+                            plan.old_to_new.get(&extends).copied().ok_or_else(|| {
+                                crate::Error::Unsupported(format!(
+                                    "plain writer: source ObjStm /Extends {} {} R is absent from renumber map",
+                                    extends.number, extends.generation
+                                ))
+                            })?,
+                        ),
+                        _ => None,
+                    }
+                } else {
+                    // qpdf permits a null or otherwise non-stream source
+                    // identity here as a placeholder for a reconstructed
+                    // object stream. The rebuilt container still carries
+                    // the surviving members, but has no /Extends key.
+                    None
+                }
+            }
+            crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
+        };
+        serialize::write_objstm_stream_with_extends(
+            bytes,
+            &body,
+            structural_compress,
+            options.newline_before_endstream,
+            extends,
+        )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
+        bytes.extend_from_slice(b"\nendobj\n");
+        layout
+            .uncompressed
+            .insert(output.number, (output.generation, offset));
+        for (index, member) in members.iter().enumerate() {
+            layout.compressed.insert(
+                member.output.number,
+                CompressedLocation {
+                    container: output.number,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+fn emit_source_from_handle(
+    handle: &ObjectHandle,
     options: &WriterOptions,
     plan: &PlainWritePlan,
-    source: crate::ObjectRef,
     bytes: &mut Vec<u8>,
 ) -> crate::Result<()> {
-    let handle = pdf.get_object_handle(source);
-    pdf.resolve(&handle)?;
+    handle.try_dereference()?;
+    let source = handle.object_ref();
     let map = |object_ref| {
         plan.new_for_original(object_ref).ok_or_else(|| {
             crate::Error::Unsupported(format!(
@@ -165,7 +290,7 @@ fn emit_source_from_handle<R: Read + Seek>(
         })
     };
 
-    if plan.root_source == Some(source) {
+    if plan.root_source == source {
         handle.write_root_object_with_ref_map_and_removed(
             bytes,
             &map,
@@ -177,9 +302,10 @@ fn emit_source_from_handle<R: Read + Seek>(
     }
 
     if handle.as_stream_dict().is_some() {
-        let cached = if let Some(cached) = plan.cached_stream_outputs.get(&source) {
-            if cached.fingerprint == crate::writer::plain::plan::stream_cache_fingerprint(&handle)?
-            {
+        let cached = if let Some(cached) =
+            source.and_then(|source| plan.cached_stream_outputs.get(&source))
+        {
+            if cached.fingerprint == crate::writer::plain::plan::stream_cache_fingerprint(handle)? {
                 Some(cached)
             } else {
                 None
@@ -190,7 +316,7 @@ fn emit_source_from_handle<R: Read + Seek>(
         let (dict, data, refiltered) = if let Some(cached) = cached {
             (cached.dict.clone(), cached.data.clone(), cached.refiltered)
         } else {
-            canonical_stream_output(&handle, options)?
+            canonical_stream_output(handle, options)?
         };
         dict.write_stream_body_with_ref_map_and_removed(
             bytes,
@@ -1174,5 +1300,195 @@ mod final_handle_tests {
         assert!(output
             .windows(b"stream\ndata\nendstream".len())
             .any(|window| { window == b"stream\ndata\nendstream" }));
+    }
+}
+
+#[cfg(test)]
+mod object_emitter_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap()
+    }
+
+    fn with_emitter(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        plan: &PlainWritePlan,
+        check: impl FnOnce(&mut PlainObjectEmitter<'_, Cursor<Vec<u8>>>),
+    ) {
+        let options = WriterOptions::default();
+        let mut bytes = Vec::new();
+        let mut layout = BodyLayout::default();
+        let mut emitter = PlainObjectEmitter {
+            pdf,
+            options: &options,
+            plan,
+            bytes: &mut bytes,
+            layout: &mut layout,
+            lengths: BTreeMap::new(),
+            object_stream_to_objects: BTreeMap::new(),
+            encryption: crate::writer::encryption_state::WriterEncryptionState::new(
+                false,
+                Vec::new(),
+                false,
+                0,
+                0,
+            ),
+        };
+        check(&mut emitter);
+    }
+
+    #[test]
+    fn a_new_source_missing_from_the_frozen_plan_fails_before_open_object() {
+        // The existing planner backend remains frozen until the live queue
+        // cutover. Its lookup error must cross the shared owner unchanged.
+        let mut pdf = pdf();
+        let plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let object = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        with_emitter(&mut pdf, &plan, |emitter| {
+            assert!(
+                matches!(emitter.write_object(&object, None), Err(crate::Error::Unsupported(message)) if message.contains("absent from renumber map"))
+            );
+            assert!(emitter.bytes.is_empty());
+            assert!(emitter.layout.uncompressed.is_empty());
+        });
+    }
+
+    #[test]
+    fn existing_container_member_mapping_errors_propagate_from_the_member_unparser() {
+        let mut pdf = pdf();
+        let child = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .unwrap();
+        let child_id = child.object_ref().unwrap();
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Child".to_vec(),
+                child,
+            )]))
+            .unwrap();
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/Member", member)
+            .unwrap();
+        let mut plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let members = [PlannedMember {
+            source: member_id,
+            output: plan.new_for_original(member_id).unwrap(),
+        }];
+        plan.old_to_new.remove(&child_id);
+        with_emitter(&mut pdf, &plan, |emitter| {
+            let result = emitter.emit_planned_object_stream(
+                &PlannedObjectStreamOrigin::Synthetic,
+                ObjectRef::new(9, 0),
+                &members,
+            );
+            assert!(
+                matches!(result, Err(crate::Error::Unsupported(message)) if message.contains("absent from renumber map"))
+            );
+            assert!(emitter.bytes.is_empty());
+        });
+    }
+
+    #[test]
+    fn source_container_extends_is_remapped_and_an_absent_target_is_reported() {
+        let mut pdf = pdf();
+        let target = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .unwrap();
+        let target_id = target.object_ref().unwrap();
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let member_id = member.object_ref().unwrap();
+        let source = pdf.new_stream_with_data(Rc::new(Vec::new())).unwrap();
+        let source_id = source.object_ref().unwrap();
+        source
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Extends", target)
+            .unwrap();
+        let root = pdf.root_handle().unwrap();
+        root.replace_key(b"/Source", source).unwrap();
+        root.replace_key(b"/Member", member).unwrap();
+        let mut plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let members = [PlannedMember {
+            source: member_id,
+            output: plan.new_for_original(member_id).unwrap(),
+        }];
+        let expected = format!(
+            "/Extends {} 0 R",
+            plan.new_for_original(target_id).unwrap().number
+        );
+        with_emitter(&mut pdf, &plan, |emitter| {
+            emitter
+                .emit_planned_object_stream(
+                    &PlannedObjectStreamOrigin::SourceBacked(source_id),
+                    ObjectRef::new(9, 0),
+                    &members,
+                )
+                .unwrap();
+            assert!(emitter
+                .bytes
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()));
+        });
+        plan.old_to_new.remove(&target_id);
+        with_emitter(&mut pdf, &plan, |emitter| {
+            let result = emitter.emit_planned_object_stream(
+                &PlannedObjectStreamOrigin::SourceBacked(source_id),
+                ObjectRef::new(9, 0),
+                &members,
+            );
+            assert!(
+                matches!(result, Err(crate::Error::Unsupported(message)) if message.contains("/Extends") && message.contains("absent from renumber map"))
+            );
+        });
+    }
+
+    #[test]
+    fn a_canonical_null_container_source_emits_members_without_extends() {
+        let mut pdf = pdf();
+        let source = pdf
+            .make_indirect_from_object_handle(ObjectHandle::null())
+            .unwrap();
+        let source_id = source.object_ref().unwrap();
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/Member", member)
+            .unwrap();
+        let plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let members = [PlannedMember {
+            source: member_id,
+            output: plan.new_for_original(member_id).unwrap(),
+        }];
+        with_emitter(&mut pdf, &plan, |emitter| {
+            emitter
+                .emit_planned_object_stream(
+                    &PlannedObjectStreamOrigin::SourceBacked(source_id),
+                    ObjectRef::new(9, 0),
+                    &members,
+                )
+                .unwrap();
+            assert!(emitter
+                .bytes
+                .windows(b"/Type /ObjStm".len())
+                .any(|window| window == b"/Type /ObjStm"));
+            assert!(!emitter
+                .bytes
+                .windows(b"/Extends".len())
+                .any(|window| window == b"/Extends"));
+        });
     }
 }

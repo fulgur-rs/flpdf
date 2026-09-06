@@ -70,7 +70,12 @@ impl WriterEncryptionState {
         result
     }
 
-    fn set_data_key(&mut self, emitted_object_number: u32) {
+    /// Clear the current key after successful qpdf object serialization.
+    pub(crate) fn clear_data_key(&mut self) {
+        self.cur_data_key = None;
+    }
+
+    pub(crate) fn set_data_key(&mut self, emitted_object_number: u32) {
         self.cur_data_key = Some(compute_data_key(
             &self.encryption_key,
             emitted_object_number,

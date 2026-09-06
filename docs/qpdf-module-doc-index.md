@@ -162,5 +162,6 @@
 | `crates/flpdf/src/writer/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/writer/serialize.rs` | correspondence | QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives |
 | `crates/flpdf/src/writer/settings.rs` | correspondence | QPDFWriter.cc writer-setting state and conversion to emission options |
+| `crates/flpdf/src/writer/write_object.rs` | correspondence | \`QPDFWriter::writeObject\`, \`openObject\`, and \`closeObject\` |
 | `crates/flpdf/src/xref.rs` | correspondence | QPDF.cc xref loading and repair |
 | `crates/flpdf/src/xref_entry.rs` | correspondence | QPDFXRefEntry.cc cross-reference entry value representation |
