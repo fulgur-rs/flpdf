@@ -19,6 +19,7 @@ use crate::reader::resolver::ResolverHandle;
 #[cfg(feature = "qtest-driver")]
 use crate::tokenizer::Tokenizer;
 use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm};
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -35,9 +36,16 @@ use crate::pdf::Pdf;
 /// of whether the source came from a file, memory, or a generated JSON seed.
 /// This trait is the Rust equivalent for job-owned documents: callers retain
 /// lazy reads while `JobDocument` can use one `Pdf` type for every source.
-pub trait ReadSeek: Read + Seek {}
+pub trait ReadSeek: Read + Seek {
+    /// Rust-native downcast boundary corresponding to qpdf InputSource RTTI.
+    fn as_any(&self) -> &dyn Any;
+}
 
-impl<T: Read + Seek> ReadSeek for T {}
+impl<T: Read + Seek + 'static> ReadSeek for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 /// Controller for a file source that can be closed between qpdf page-job
 /// operations and reopened at its last logical position.

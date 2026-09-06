@@ -1,12 +1,12 @@
-use std::any::Any;
 use std::ffi::OsStr;
 use std::io::{Cursor, Read, Seek, Write};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use flpdf::{
-    qutil, EncryptParams, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf,
-    PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle, PipelineResult, QPDFLogger,
+    pipeline::Discard, qutil, EncryptParams, Error, NameTree, ObjectHandle, PageDocumentHelper,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle,
+    PipelineResult, QPDFLogger, ReadSeek,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -381,36 +381,13 @@ pub(crate) fn run_test_60<R: Read + Seek + 'static>(
 /// shared-library vtable boundary to probe, but `Drop` is the corresponding
 /// ownership contract and remains directly observable by the qtest output.
 struct Test61ExtendNameTree<'a> {
+    _inner: NameTree,
     stdout: &'a mut dyn Write,
 }
 
 impl Drop for Test61ExtendNameTree<'_> {
     fn drop(&mut self) {
         let _ = writeln!(self.stdout, "~ExtendNameTree called");
-    }
-}
-
-struct Test61BufferInputSource;
-
-trait Test61InputSource {
-    fn as_any(&self) -> &dyn Any;
-}
-
-impl Test61InputSource for Test61BufferInputSource {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-struct Test61DiscardPipeline;
-
-trait Test61Pipeline {
-    fn as_any(&self) -> &dyn Any;
-}
-
-impl Test61Pipeline for Test61DiscardPipeline {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -479,21 +456,30 @@ pub(crate) fn run_test_61(
         }
     }
 
-    let input_source = Test61BufferInputSource;
-    let input_source_ref: &dyn Test61InputSource = &input_source;
+    // Rust's canonical InputSource substitute is ReadSeek. Its downcast
+    // hook exercises the same concrete-source RTTI boundary as qpdf's
+    // BufferInputSource dynamic_cast.
+    let input_source = Cursor::new(Vec::<u8>::new());
+    let input_source_ref: &dyn ReadSeek = &input_source;
     assert!(input_source_ref
         .as_any()
-        .downcast_ref::<Test61BufferInputSource>()
-        .is_some());
-    let pipeline = Test61DiscardPipeline;
-    let pipeline_ref: &dyn Test61Pipeline = &pipeline;
-    assert!(pipeline_ref
-        .as_any()
-        .downcast_ref::<Test61DiscardPipeline>()
+        .downcast_ref::<Cursor<Vec<u8>>>()
         .is_some());
 
+    // Pl_Discard is already the canonical Rust port of qpdf's terminal
+    // pipeline. Verify the actual trait-object route and lifecycle rather
+    // than creating a test-only pipeline stand-in.
+    let mut discard = Discard;
+    let pipeline: &mut dyn Pipeline = &mut discard;
+    assert_eq!(pipeline.identifier(), "discard");
+    pipeline.write(b"").map_err(Error::from)?;
+    pipeline.finish().map_err(Error::from)?;
+
     {
-        let _name_tree = Test61ExtendNameTree { stdout };
+        let _name_tree = Test61ExtendNameTree {
+            _inner: NameTree::new(ObjectHandle::null(), true),
+            stdout,
+        };
     }
     Ok(())
 }

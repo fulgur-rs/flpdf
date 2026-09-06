@@ -94,6 +94,7 @@ impl<R: Read + Seek> Pdf<R> {
             resolver,
             input_source_control: None,
             version: String::new(),
+            parsed: false,
             check_mode: false,
             trailer: ObjectHandle::uninitialized(),
             last_xref_form: XrefForm::Table,
@@ -296,6 +297,7 @@ impl<R: Read + Seek> Pdf<R> {
             resolver,
             input_source_control: None,
             version: loaded.version,
+            parsed: true,
             check_mode: false,
             trailer,
             last_xref_form: loaded.last_xref_form,
@@ -488,6 +490,11 @@ impl Pdf<Cursor<Vec<u8>>> {
         description: impl AsRef<[u8]>,
         bytes: Vec<u8>,
     ) -> crate::Result<()> {
+        if self.parsed {
+            return Err(crate::Error::Internal(
+                "QPDF::processMemoryFile must be called before a process method".to_owned(),
+            ));
+        }
         let options = PdfOpenOptions {
             repair: self.resolver.attempt_recovery(),
             logger: Some(self.resolver.logger()),
@@ -701,5 +708,19 @@ mod tests {
         assert!(!pdf.resolver.attempt_recovery());
         assert!(matches!(error, Error::Parse { .. }));
         assert!(pdf.suppress_warnings());
+    }
+
+    #[test]
+    fn memory_processing_rejects_reprocessing_a_parsed_document() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let _trailer = pdf.trailer();
+
+        let error = pdf
+            .process_memory_file(b"replacement", Vec::new())
+            .expect_err("qpdf process methods are pre-parse operations");
+
+        assert!(
+            matches!(error, Error::Internal(message) if message == "QPDF::processMemoryFile must be called before a process method")
+        );
     }
 }

@@ -116,6 +116,14 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// file-open factory installs it for `QPDFJob::handle_page_specs`.
     pub(crate) input_source_control: Option<InputSourceControl>,
     pub(crate) version: String,
+    /// Whether a process method has installed a parsed input source.
+    ///
+    /// qpdf permits `processMemoryFile`/`processFile` only before a process
+    /// method has been called; after that point the public contract permits
+    /// only parameter setters (`include/qpdf/QPDF.hh:71-75`). Keep this
+    /// state explicit so Rust does not silently replace a live resolver while
+    /// previously issued handles still point at it.
+    pub(crate) parsed: bool,
     /// Whether qpdf's enhanced `QPDF::getRoot` checks are enabled for a
     /// document check (`QPDF::JobSetter::setCheckMode`,
     /// `libqpdf/QPDFJob.cc:745-752`).
