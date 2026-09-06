@@ -149,6 +149,8 @@ fn correct_holder_reslices_payload_containing_endstream_bytes() {
 
 /// (2) qpdf 11.9.0 accepts the `endstream` token at the stale holder boundary,
 /// truncates to `AAAA`, and warns because the following `BBBB` is not `endobj`.
+/// The successful indirect `/Length` resolution leaves qpdf's current object
+/// description at the holder object when the trailing-token warning is made.
 #[test]
 fn stale_holder_pointing_at_interior_endstream_matches_qpdf() {
     let payload: &[u8] = b"AAAAendstream BBBB";
@@ -158,7 +160,7 @@ fn stale_holder_pointing_at_interior_endstream_matches_qpdf() {
     assert_metadata_stream_and_warnings(
         &mut pdf,
         b"AAAA",
-        &["(object 3 0, offset 175): expected endobj"],
+        &["(object 4 0, offset 175): expected endobj"],
     );
 }
 

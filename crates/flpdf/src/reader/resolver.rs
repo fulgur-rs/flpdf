@@ -341,8 +341,15 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     object_cache: BTreeMap<ObjectRef, ObjectHandle>,
     /// qpdf m->last_object_description (QPDF.hh:1457), retained for
     /// damaged-PDF warnings raised after a cache-preparing operation such as
-    /// QPDF::nextObjGen (QPDF.cc:1873-1879).
+    /// QPDF::nextObjGen (QPDF.cc:1873-1879). This UTF-8-facing projection is
+    /// kept for the existing generic warning sink; the raw qpdf bytes used by
+    /// `damagedPDF` are retained beside it.
     last_object_description: String,
+    /// The byte-preserving qpdf description state. `setLastObjectDescription`
+    /// composes the caller description and object identity in `std::string`,
+    /// and an indirect `/Length` resolve intentionally overwrites it with the
+    /// length object's identity (`QPDF.cc:1561,1725`).
+    last_object_description_bytes: Vec<u8>,
     /// Object-cache entries created by qpdf-shaped allocation/replacement,
     /// rather than by looking up an unresolved reference. qpdf keeps both
     /// cases in `m->obj_cache`, but the provenance is needed by the Pdf
@@ -972,6 +979,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 source_xref_entries,
                 object_cache: BTreeMap::new(),
                 last_object_description: String::new(),
+                last_object_description_bytes: Vec::new(),
                 allocated_object_refs: BTreeSet::new(),
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
@@ -1016,6 +1024,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 source_xref_entries: BTreeMap::new(),
                 object_cache: BTreeMap::new(),
                 last_object_description: String::new(),
+                last_object_description_bytes: Vec::new(),
                 allocated_object_refs: BTreeSet::new(),
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
@@ -1348,11 +1357,28 @@ impl<R: Read + Seek> ResolverHandle<R> {
         description
     }
 
-    /// Keep qpdf's current object description for later generic damaged-PDF
-    /// warnings (QPDF.hh:1457).
-    fn set_last_object_description(&self, object_ref: ObjectRef) {
-        self.core.borrow_mut().last_object_description =
-            format!("object {} {}", object_ref.number, object_ref.generation);
+    /// Keep qpdf's current object description for later damaged-PDF warnings
+    /// (`QPDF.hh:1457`). This is the direct Rust equivalent of
+    /// `setLastObjectDescription(description, og)` (`QPDF.cc:1298-1310`):
+    /// the caller's description is part of the state, not only a formatter
+    /// argument at the eventual warning site.
+    fn set_last_object_description(&self, object_ref: ObjectRef, description: Option<&[u8]>) {
+        let mut rendered = Vec::new();
+        if let Some(description) = description.filter(|description| !description.is_empty()) {
+            rendered.extend_from_slice(description);
+            if object_ref.number != 0 {
+                rendered.extend_from_slice(b": ");
+            }
+        }
+        if object_ref.number != 0 {
+            rendered.extend_from_slice(
+                format!("object {} {}", object_ref.number, object_ref.generation).as_bytes(),
+            );
+        }
+
+        let mut core = self.core.borrow_mut();
+        core.last_object_description = String::from_utf8_lossy(&rendered).into_owned();
+        core.last_object_description_bytes = rendered;
     }
 
     /// Append a generic damaged-PDF warning with the current object
@@ -1421,6 +1447,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         read_description: Option<&[u8]>,
     ) -> Result<()> {
+        let last_description = self.core.borrow().last_object_description_bytes.clone();
+        if !last_description.is_empty() {
+            // qpdf's damagedPDF("expected endobj") renders the current
+            // `m->last_object_description`, which may now be the indirect
+            // `/Length` object resolved by readStream (`QPDF.cc:1725`), not
+            // the stream object that entered readStream.
+            if read_description.is_none() {
+                let object_description = String::from_utf8_lossy(&last_description);
+                return self.push_warning_at(
+                    offset,
+                    format!("({object_description}, offset {offset}): expected endobj"),
+                );
+            }
+            return self.push_stream_warning_with_object_description(
+                &last_description,
+                offset,
+                "expected endobj",
+            );
+        }
         if read_description.is_some() {
             return self.push_stream_warning_with_description(
                 object_ref,
@@ -2411,7 +2456,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .map_err(|_| Error::parse(0, "object stream member offset is too large"))?;
             let description_template =
                 self.object_stream_description_template(stream_number, object_ref);
-            self.set_last_object_description(object_ref);
+            self.set_last_object_description(object_ref, None);
             let mut handles = ChildHandles {
                 resolver: self,
                 description_template: description_template.clone(),
@@ -3139,7 +3184,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         read_description: Option<Vec<u8>>,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
         if expected.number != 0 {
-            self.set_last_object_description(expected);
+            self.set_last_object_description(expected, read_description.as_deref());
         }
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
         let (found, parsed, trailing, trailing_start, object_header_offset) = {
@@ -3265,6 +3310,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )));
         }
         let found = found.expect("the range check above establishes the header object reference");
+        self.set_last_object_description(found, read_description.as_deref());
         if found != expected {
             self.push_warning_at(
                 offset,
@@ -3733,14 +3779,42 @@ impl<R: Read + Seek> ResolverHandle<R> {
         object_description.extend_from_slice(
             format!(": object {} {}", object_ref.number, object_ref.generation).as_bytes(),
         );
+        self.push_stream_warning_with_object_description(&object_description, offset, message)
+    }
+
+    /// Emit a stream warning using qpdf's already-composed object description.
+    ///
+    /// This is the `QPDF::warn(damagedPDF(...))` boundary: the caller may have
+    /// entered the stream through a described offset read, and a nested
+    /// indirect `/Length` resolution may have replaced that description before
+    /// the warning is emitted (`QPDF.cc:1298-1310,1725,2641-2644`).
+    fn push_stream_warning_with_object_description(
+        &self,
+        object_description: &[u8],
+        offset: u64,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let message = message.into();
         let (logger, suppress_warnings, what) = {
             let mut core = self.core.borrow_mut();
-            let what = format_input_warning_what(
-                &core.description,
-                &object_description,
-                offset,
-                message.as_bytes(),
-            );
+            let what = if core.description.is_empty() {
+                let mut what = b"(".to_vec();
+                what.extend_from_slice(object_description);
+                if offset > 0 {
+                    what.extend_from_slice(b", offset ");
+                    what.extend_from_slice(offset.to_string().as_bytes());
+                }
+                what.extend_from_slice(b"): ");
+                what.extend_from_slice(message.as_bytes());
+                what
+            } else {
+                format_input_warning_what(
+                    &core.description,
+                    object_description,
+                    offset,
+                    message.as_bytes(),
+                )
+            };
             // `QPDFExc` keeps the file position beside the rendered text
             // (`QPDFExc.cc:19-50`); retain it for `repair_diagnostics()`.
             let mut diagnostic = Diagnostic::object_warning_bytes(&what);
@@ -5458,6 +5532,7 @@ mod tests {
         {
             let mut core = resolver.core.borrow_mut();
             core.last_object_description = "object 7 0".to_owned();
+            core.last_object_description_bytes = b"object 7 0".to_vec();
             core.input.borrow().last_offset.set(0);
         }
 
@@ -5472,6 +5547,34 @@ mod tests {
         assert_eq!(
             output.lock().unwrap().as_slice(),
             b"WARNING: (object 7 0): no offset\n"
+        );
+    }
+
+    #[test]
+    fn expected_endobj_warning_falls_back_when_description_state_is_empty() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
+            0,
+        );
+
+        resolver
+            .push_expected_endobj_warning(ObjectRef::new(7, 0), 12, None)
+            .expect("warning delivery");
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: (object 7 0, offset 12): expected endobj\n"
         );
     }
 
@@ -11441,6 +11544,58 @@ mod tests {
         let diagnostic = diagnostics.entries().last().expect("recorded warning");
         assert!(diagnostic.is_object_warning());
         assert_eq!(diagnostic.offset, Some(trailing_offset as u64));
+    }
+
+    #[test]
+    fn indirect_length_resolution_clobbers_a_described_read_context_like_qpdf() {
+        let bytes = b"2 0 obj\n<< /Length 3 0 R >>\nstream\nabc\nendstream\nendobX\n3 0 obj\n3\nendobj\n%%EOF\n";
+        let length_offset = bytes
+            .windows(b"3 0 obj".len())
+            .position(|window| window == b"3 0 obj")
+            .expect("indirect length object");
+        let trailing_offset = bytes
+            .windows(b"endobX".len())
+            .position(|window| window == b"endobX")
+            .expect("trailing token");
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes.to_vec()),
+            0,
+            BTreeMap::from([
+                (ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 0 }),
+                (
+                    ObjectRef::new(3, 0),
+                    XrefEntry::Uncompressed {
+                        offset: length_offset as u64,
+                    },
+                ),
+            ]),
+            true,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, b"input.pdf".to_vec()),
+            0,
+        );
+
+        let (handle, _) = resolver
+            .resolve_at_offset_with_optional_description(
+                0,
+                ObjectRef::new(2, 0),
+                Some(b"linearization hint stream".to_vec()),
+            )
+            .expect("described stream read resolves");
+        assert!(handle.as_stream_dict().is_some());
+
+        let expected =
+            format!("WARNING: input.pdf (object 3 0, offset {trailing_offset}): expected endobj\n");
+        assert_eq!(
+            output.lock().expect("warning output").as_slice(),
+            expected.as_bytes()
+        );
     }
 
     #[test]
