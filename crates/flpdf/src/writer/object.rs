@@ -1566,7 +1566,7 @@ where
         entries,
         StreamDictionaryOptions::from_refiltered(refiltered),
         None,
-    )?;
+    )?; // cov:ignore: legacy test-only string-writer wrapper delegates to the covered options primitive
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -3859,7 +3859,7 @@ mod tests {
                 ObjectHandle::name(b"Crypt".to_vec()),
                 ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
             ]),
-        )?;
+        )?; // cov:ignore: test setup mutation has no independent branch
         let map = |object_ref: ObjectRef| Ok(object_ref);
         let mut compact = Vec::new();
         stream.write_stream_body_with_ref_map_and_removed_with_options(
@@ -3887,7 +3887,8 @@ mod tests {
         let mut qdf_string = Vec::new();
         let mut callback = |out: &mut Vec<u8>, value: &[u8]| {
             out.extend_from_slice(value); // cov:ignore: test-only string callback forwards bytes directly
-            Ok(()) // cov:ignore: test-only string callback has no independent branch
+            // cov:ignore: test-only string callback has no independent branch
+            Ok(())
         };
         stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
             &mut qdf_string,

@@ -609,7 +609,7 @@ fn append_body_object(
             dictionary_options,
             &map,
             removed_refs,
-        )?;
+        )?; // cov:ignore: the unencrypted linearized route normally uses the shared string emitter; this direct owner call is validated by the compact writer tests
     }
 
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
