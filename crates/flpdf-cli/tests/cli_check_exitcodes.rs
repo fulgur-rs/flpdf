@@ -885,6 +885,43 @@ fn parameter_options_require_qpdf_equals_form() {
 }
 
 #[test]
+fn required_choice_options_reject_invalid_equals_values_with_qpdf_usage() {
+    let input = "../../tests/fixtures/minimal.pdf";
+    let cases = [
+        ("compress-streams", "{n,y}"),
+        ("decode-level", "{all,generalized,none,specialized}"),
+        ("flatten-annotations", "{all,print,screen}"),
+        (
+            "json-key",
+            "{acroform,attachments,encrypt,objectinfo,objects,outlines,pagelabels,pages,qpdf}",
+        ),
+        ("json-stream-data", "{file,inline,none}"),
+        ("keep-files-open", "{n,y}"),
+        ("normalize-content", "{n,y}"),
+        ("object-streams", "{disable,generate,preserve}"),
+        ("password-mode", "{auto,bytes,hex-bytes,unicode}"),
+        ("remove-unreferenced-resources", "{auto,no,yes}"),
+        ("stream-data", "{compress,preserve,uncompress}"),
+    ];
+
+    for (option, choices) in cases {
+        let expected = format!("qpdf: --{option} must be given as --{option}={choices}");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args([
+                format!("--{option}=bogus"),
+                input.to_owned(),
+                "unused-output.pdf".to_owned(),
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("{expected}{EOL}")))
+            .stderr(predicate::str::contains(format!("For help:{EOL}")));
+    }
+}
+
+#[test]
 fn check_stream_length_warnings_match_qpdf_object_context() {
     if !qpdf_available() {
         return;
