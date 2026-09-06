@@ -82,6 +82,13 @@ fn rewrite_stream(
     configure_stream: impl FnOnce(&ObjectHandle),
     configure_writer: impl FnOnce(&mut PdfWriter<'_, std::io::Cursor<Vec<u8>>>),
 ) -> Vec<u8> {
+    rewrite_stream_result(configure_stream, configure_writer).unwrap()
+}
+
+fn rewrite_stream_result(
+    configure_stream: impl FnOnce(&ObjectHandle),
+    configure_writer: impl FnOnce(&mut PdfWriter<'_, std::io::Cursor<Vec<u8>>>),
+) -> flpdf::Result<Vec<u8>> {
     let mut pdf = Pdf::empty().unwrap();
     let stream = pdf
         .new_stream_with_data(Rc::new(b"71>\n".to_vec()))
@@ -92,8 +99,8 @@ fn rewrite_stream(
     configure_writer(&mut writer);
     writer.set_static_id(true);
     writer.set_output_memory().unwrap();
-    writer.write().unwrap();
-    writer.get_buffer().unwrap()
+    writer.write()?;
+    writer.get_buffer()
 }
 
 fn emitted_stream_dict(bytes: Vec<u8>) -> ObjectHandle {
@@ -345,7 +352,7 @@ fn unfiltered_stream_drops_only_an_empty_decode_parms_array_and_strips_crypt() {
 
 #[test]
 fn missing_decode_parms_still_removes_a_crypt_filter() {
-    let bytes = rewrite_stream(
+    let error = rewrite_stream_result(
         |stream| {
             add_external_keys(stream);
             stream
@@ -362,15 +369,40 @@ fn missing_decode_parms_still_removes_a_crypt_filter() {
             stream.set_filter_on_write(false).unwrap();
         },
         |writer| writer.set_compress_streams(true),
-    );
-    let dictionary = emitted_stream_dict(bytes);
+    )
+    .expect_err("qpdf propagates the contextual-null erase boundary");
     assert_eq!(
-        dictionary.try_get_key(b"/Filter").unwrap().unparse(),
-        b"[ /ASCIIHexDecode ]"
+        error.to_string(),
+        " -> dictionary key /DecodeParms: operation for array attempted on object of type null: ignoring attempt to erase item"
     );
+}
+
+#[test]
+fn empty_decode_parms_are_removed_before_crypt_cleanup() {
+    let error = rewrite_stream_result(
+        |stream| {
+            add_external_keys(stream);
+            let dictionary = stream.as_stream_dict().unwrap();
+            dictionary
+                .replace_key(
+                    b"/Filter",
+                    ObjectHandle::array(vec![
+                        ObjectHandle::name(b"Crypt".to_vec()),
+                        ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                    ]),
+                )
+                .unwrap();
+            dictionary
+                .replace_key(b"/DecodeParms", ObjectHandle::array(Vec::new()))
+                .unwrap();
+            stream.set_filter_on_write(false).unwrap();
+        },
+        |writer| writer.set_compress_streams(true),
+    )
+    .expect_err("qpdf re-reads the removed DecodeParms key as a null");
     assert_eq!(
-        dictionary.try_get_key(b"/DecodeParms").unwrap().unparse(),
-        b"null"
+        error.to_string(),
+        " -> dictionary key /DecodeParms: operation for array attempted on object of type null: ignoring attempt to erase item"
     );
 }
 

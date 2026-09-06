@@ -571,12 +571,11 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries(
             &entries,
             StreamDictionaryOptions::from_refiltered(refiltered),
             out,
-            dictionary_context.as_ref(),
         )
     }
 
@@ -598,7 +597,7 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, _dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_string_writer(&entries, refiltered, out, write_string)
     }
 
@@ -651,7 +650,7 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, _dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_qdf(&entries, indent, out)
     }
 
@@ -692,7 +691,7 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_qdf_with_ref_map(
             &entries,
             indent,
@@ -701,7 +700,6 @@ impl ObjectWriterEmission for ObjectHandle {
             removed_refs,
             length_ref,
             options,
-            dictionary_context.as_ref(),
         )
     }
 
@@ -750,7 +748,7 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer(
             &entries,
             indent,
@@ -759,7 +757,6 @@ impl ObjectWriterEmission for ObjectHandle {
             removed_refs,
             length_ref,
             options,
-            dictionary_context.as_ref(),
             write_string,
         )
     }
@@ -831,15 +828,8 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
-        unparse_stream_dict_entries_with_ref_map(
-            &entries,
-            options,
-            out,
-            map,
-            removed_refs,
-            dictionary_context.as_ref(),
-        )
+        let entries = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_ref_map(&entries, options, out, map, removed_refs)
     }
 
     #[cfg(test)]
@@ -871,7 +861,7 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_ref_map_and_length(
             &entries,
             options,
@@ -879,7 +869,6 @@ impl ObjectWriterEmission for ObjectHandle {
             map,
             removed_refs,
             Some(length),
-            dictionary_context.as_ref(),
         )
     }
 
@@ -920,14 +909,13 @@ impl ObjectWriterEmission for ObjectHandle {
         if self.is_reserved() {
             return Err(reserved_unparse_error());
         }
-        let (entries, dictionary_context) = stream_dictionary_entries_for_emission(self)?;
+        let entries = stream_dictionary_entries_for_emission(self)?;
         unparse_stream_dict_entries_with_ref_map_and_string_writer(
             &entries,
             options,
             out,
             map,
             removed_refs,
-            dictionary_context.as_ref(),
             write_string,
         )
     }
@@ -1176,7 +1164,6 @@ impl ObjectWriterEmission for ObjectHandle {
 fn prepare_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
-    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<Vec<(Vec<u8>, ObjectHandle)>> {
     let mut prepared: Vec<_> = entries.to_vec();
 
@@ -1201,7 +1188,7 @@ fn prepare_stream_dict_entries(
         prepared
             .retain(|(key, _)| key.as_slice() != b"/Filter" && key.as_slice() != b"/DecodeParms");
     } else {
-        remove_crypt_filter_from_entries(&mut prepared, dictionary_context)?;
+        remove_crypt_filter_from_entries(&mut prepared)?;
     }
     Ok(prepared)
 }
@@ -1209,10 +1196,7 @@ fn prepare_stream_dict_entries(
 /// Remove the first `/Crypt` filter and its paired decode parameters from a
 /// copied dictionary. This mutates only the copy, matching qpdf's shallow
 /// `unparseObject` preparation.
-fn remove_crypt_filter_from_entries(
-    entries: &mut Vec<(Vec<u8>, ObjectHandle)>,
-    dictionary_context: Option<&ObjectHandle>,
-) -> Result<()> {
+fn remove_crypt_filter_from_entries(entries: &mut Vec<(Vec<u8>, ObjectHandle)>) -> Result<()> {
     let Some(filter_index) = entries
         .iter()
         .position(|(key, _)| key.as_slice() == b"/Filter")
@@ -1251,10 +1235,19 @@ fn remove_crypt_filter_from_entries(
         // `getKey` returns qpdf's contextual null when the key is absent, and
         // qpdf still calls `eraseItem` on that handle. Preserve that lookup's
         // warning/error boundary instead of silently skipping the call.
-        let decode = dictionary_context
-            .map(|dictionary| dictionary.try_get_key(b"/DecodeParms"))
-            .transpose()?
-            .unwrap_or_else(ObjectHandle::null);
+        // qpdf asks the shallow output dictionary for `/DecodeParms` after an
+        // empty value has already been removed. Construct that same direct
+        // output dictionary here; its missing-key null retains the qpdf
+        // description but no owning-document context, so `eraseItem` keeps
+        // the warning/exception boundary rather than treating the old source
+        // array as still present.
+        let output_dictionary = ObjectHandle::dictionary(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        let decode = output_dictionary.try_get_key(b"/DecodeParms")?;
         decode.erase_array_item(crypt_index)?;
         return Ok(());
     };
@@ -1267,15 +1260,14 @@ fn remove_crypt_filter_from_entries(
 }
 
 type StreamDictionaryEntries = Vec<(Vec<u8>, ObjectHandle)>;
-type StreamDictionarySnapshot = (StreamDictionaryEntries, Option<ObjectHandle>);
 
-/// Snapshot a stream dictionary's entries together with the live dictionary
-/// handle qpdf uses for missing-key warning context. A stream's nested
-/// dictionary is the context for `getKey("/DecodeParms")`; the stream handle
-/// itself is not a dictionary and would report the wrong type warning.
+/// Snapshot a stream dictionary's entries after resolving the same nested
+/// dictionary handle qpdf's stream writer receives. The emission primitives
+/// build their own direct shallow-copy view when a removed key must be looked
+/// up again, so they do not accidentally inspect the live source dictionary.
 fn stream_dictionary_entries_for_emission(
     handle: &ObjectHandle,
-) -> Result<StreamDictionarySnapshot> {
+) -> Result<StreamDictionaryEntries> {
     handle.try_dereference()?;
     if let Some(entries) = handle.with_value(|value| match value {
         Some(ObjectValue::Dictionary(entries)) => Some(
@@ -1286,23 +1278,15 @@ fn stream_dictionary_entries_for_emission(
         ),
         _ => None,
     }) {
-        return Ok((entries, Some(handle.clone())));
+        return Ok(entries);
     }
 
     let Some(stream_dict) = handle.with_value(|value| match value {
         Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
         _ => None,
     }) else {
-        return Ok((Vec::new(), None));
+        return Ok(Vec::new());
     };
-    // Programmatically created stream dictionaries are direct children and
-    // may not carry the resolver that owns their indirect stream. qpdf's
-    // stream dictionary still inherits that document context, so retain the
-    // same warning boundary for a missing `/DecodeParms` lookup without
-    // changing any serialized dictionary bytes.
-    if stream_dict.context().is_none() && handle.context().is_some() {
-        stream_dict.set_child_description(handle, b" -> stream dictionary", b"");
-    }
     stream_dict.try_dereference()?;
     let entries = stream_dict.with_value(|value| match value {
         Some(ObjectValue::Dictionary(entries)) => entries
@@ -1311,7 +1295,7 @@ fn stream_dictionary_entries_for_emission(
             .collect(),
         _ => Vec::new(),
     });
-    Ok((entries, Some(stream_dict)))
+    Ok(entries)
 }
 
 // Writes a stream dictionary's own body -- `write_stream_body`'s sole
@@ -1350,9 +1334,8 @@ fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     options: StreamDictionaryOptions,
     out: &mut Vec<u8>,
-    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1404,7 +1387,7 @@ fn unparse_stream_dict_entries_qdf(
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, StreamDictionaryOptions::preserve(), None)?;
+    let entries = prepare_stream_dict_entries(entries, StreamDictionaryOptions::preserve())?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1442,9 +1425,8 @@ fn unparse_stream_dict_entries_qdf_with_ref_map(
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
-    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1494,13 +1476,12 @@ fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
     removed_refs: &BTreeSet<ObjectRef>,
     length_ref: Option<ObjectRef>,
     options: StreamDictionaryOptions,
-    dictionary_context: Option<&ObjectHandle>,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
-    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1569,7 +1550,6 @@ where
     let entries = prepare_stream_dict_entries(
         entries,
         StreamDictionaryOptions::from_refiltered(refiltered),
-        None,
     )?; // cov:ignore: legacy test-only string-writer wrapper delegates to the covered options primitive
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
@@ -1645,7 +1625,6 @@ fn unparse_stream_dict_entries_with_ref_map(
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
-    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
     unparse_stream_dict_entries_with_ref_map_and_length(
         entries,
@@ -1654,7 +1633,6 @@ fn unparse_stream_dict_entries_with_ref_map(
         map,
         removed_refs,
         None,
-        dictionary_context,
     )
 }
 
@@ -1665,9 +1643,8 @@ fn unparse_stream_dict_entries_with_ref_map_and_length(
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
     length_override: Option<usize>,
-    dictionary_context: Option<&ObjectHandle>,
 ) -> Result<()> {
-    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -1707,13 +1684,12 @@ fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
-    dictionary_context: Option<&ObjectHandle>,
     write_string: &mut F,
 ) -> Result<()>
 where
     F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
 {
-    let entries = prepare_stream_dict_entries(entries, options, dictionary_context)?;
+    let entries = prepare_stream_dict_entries(entries, options)?;
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(&entries)? {
@@ -3865,6 +3841,22 @@ mod tests {
             ]),
         )?; // cov:ignore: test setup mutation has no independent branch
         let map = |object_ref: ObjectRef| Ok(object_ref);
+        let missing_decode_error = stream
+            .write_stream_body_with_ref_map_and_removed_with_options(
+                &mut Vec::new(),
+                StreamDictionaryOptions::preserve(),
+                &map,
+                &BTreeSet::new(),
+            )
+            .expect_err("qpdf propagates a missing DecodeParms erase warning");
+        assert_eq!(
+            missing_decode_error.to_string(),
+            " -> dictionary key /DecodeParms: operation for array attempted on object of type null: ignoring attempt to erase item"
+        );
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/DecodeParms", ObjectHandle::array(Vec::new()))?;
         let mut compact = Vec::new();
         stream.write_stream_body_with_ref_map_and_removed_with_options(
             &mut compact,
