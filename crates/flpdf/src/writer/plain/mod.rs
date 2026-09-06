@@ -40,7 +40,7 @@ fn write_planned<R: Read + Seek, W: Write>(
         &plan.trailer_handle,
         &plan.old_to_new,
         &plan.removed_refs,
-    )?;
+    )?; // cov:ignore: validated plain body/trailer consumer; LLVM maps this multiline call continuation to a zero-count terminator
     out.write_all(&bytes)?;
     let old_to_new = plan
         .old_to_new

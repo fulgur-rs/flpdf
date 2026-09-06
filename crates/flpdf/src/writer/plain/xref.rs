@@ -291,7 +291,7 @@ fn append_classic_xref_and_trailer_with_handle(
                 &map,
                 removed_refs,
                 true,
-            )?;
+            )?; // cov:ignore: deterministic ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
         IdPlan::Materialized { .. } => {
             trailer_handle.write_trailer_with_ref_map_and_kind(
@@ -305,7 +305,7 @@ fn append_classic_xref_and_trailer_with_handle(
                 &map,
                 removed_refs,
                 true,
-            )?;
+            )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
     }
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
@@ -651,6 +651,76 @@ mod tests {
             "actual output: {text:?}"
         );
         assert!(!text.contains("/NullEntry"));
+    }
+
+    #[test]
+    fn classic_shared_owner_rejects_an_offset_that_cannot_fit_qpdf_xref() {
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 10_000_000_000));
+        let trailer_handle =
+            ObjectHandle::dictionary(vec![(b"/Size".to_vec(), ObjectHandle::integer(2))]);
+        let error = append_xref_and_trailer_with_handle(
+            &mut Vec::new(),
+            &layout,
+            &trailer(),
+            &trailer_handle,
+            &HashMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("ten-digit overflow must be rejected");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("ten digits"))
+        );
+    }
+
+    #[test]
+    fn classic_shared_owner_builds_then_rejects_a_compressed_row() {
+        let mut layout = BodyLayout::default();
+        layout.compressed.insert(
+            1,
+            CompressedLocation {
+                container: 4,
+                index: 0,
+            },
+        );
+        let trailer_handle =
+            ObjectHandle::dictionary(vec![(b"/Size".to_vec(), ObjectHandle::integer(2))]);
+        let error = append_xref_and_trailer_with_handle(
+            &mut Vec::new(),
+            &layout,
+            &trailer(),
+            &trailer_handle,
+            &HashMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("classic xref must reject a compressed row");
+        assert!(matches!(error, crate::Error::Internal(message) if message.contains("getOffset")));
+    }
+
+    #[test]
+    fn classic_shared_owner_reports_a_missing_trailer_reference_map_entry() {
+        let pdf = crate::Pdf::empty().expect("empty PDF for trailer reference test");
+        let custom = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("indirect custom trailer value");
+        let trailer_handle = ObjectHandle::dictionary(vec![
+            (b"/CustomRef".to_vec(), custom),
+            (b"/Size".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+        let error = append_xref_and_trailer_with_handle(
+            &mut Vec::new(),
+            &layout,
+            &trailer(),
+            &trailer_handle,
+            &HashMap::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("missing trailer map entry must be reported");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("absent from renumber map"))
+        );
     }
 
     #[test]

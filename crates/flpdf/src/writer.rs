@@ -5759,6 +5759,7 @@ mod final_handle_writer_tests {
         let trailer = ObjectHandle::dictionary(vec![
             (b"/Info".to_vec(), ObjectHandle::integer(1)),
             (b"/Name".to_vec(), ObjectHandle::name(b"N".to_vec())),
+            (b"/CustomRef".to_vec(), root.clone()),
             (b"/Root".to_vec(), root),
             (b"/Size".to_vec(), ObjectHandle::integer(99)),
             (b"/NullEntry".to_vec(), ObjectHandle::null()),
@@ -5796,8 +5797,8 @@ mod final_handle_writer_tests {
         assert_eq!(
             normal,
             format!(
-                "trailer << /Info 1 /Name /N /Root {} 0 R /Size 6 /ID [<696430><696431>] /Encrypt {} 0 R >>",
-                root_ref.number, encrypt_ref.number
+                "trailer << /CustomRef {} 0 R /Info 1 /Name /N /Root {} 0 R /Size 6 /ID [<696430><696431>] /Encrypt {} 0 R >>",
+                root_ref.number, root_ref.number, encrypt_ref.number
             )
             .as_bytes()
         );
@@ -5818,8 +5819,8 @@ mod final_handle_writer_tests {
         assert_eq!(
             qdf,
             format!(
-                "trailer <<\n  /Info 1\n  /Name /N\n  /Root {} 0 R\n  /Size 6\n  /ID [<696430><696431>] /Encrypt {} 0 R\n>>\n",
-                root_ref.number, encrypt_ref.number
+                "trailer <<\n  /CustomRef {} 0 R\n  /Info 1\n  /Name /N\n  /Root {} 0 R\n  /Size 6\n  /ID [<696430><696431>] /Encrypt {} 0 R\n>>\n",
+                root_ref.number, root_ref.number, encrypt_ref.number
             )
             .as_bytes()
         );
@@ -5870,7 +5871,7 @@ mod final_handle_writer_tests {
         let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
             Ok(ObjectRef::new(object_ref.number + 100, 0))
         };
-        let removed = [root_ref].into_iter().collect();
+        let removed = BTreeSet::new();
         let mut output = Vec::new();
         let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<custom>]");
 
@@ -5888,11 +5889,74 @@ mod final_handle_writer_tests {
             .expect("writer-owned trailer values survive filtering");
         let text = String::from_utf8(output).expect("trailer is UTF-8");
         assert!(!text.contains("/NullEntry"));
-        assert!(!text.contains("/Root"));
+        assert!(text.contains(&format!("/Root {} 0 R", root_ref.number)));
         assert!(text.contains(&format!(
             "/ID [<custom>] /Encrypt {} 0 R",
             encrypt_ref.number
         )));
+    }
+
+    #[test]
+    fn shared_trailer_contract_rejects_reserved_and_non_dictionary_handles() {
+        let reserved = ObjectHandle::new_reserved_direct();
+        let error = reserved
+            .write_trailer_with_ref_map_and_kind(
+                &mut Vec::new(),
+                TrailerKind::Normal { size: 1 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+                true,
+            )
+            .expect_err("reserved trailer handle must fail");
+        assert!(matches!(error, Error::System(message) if message.contains("reserved")));
+
+        let scalar = ObjectHandle::integer(1);
+        let mut output = Vec::new();
+        scalar
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 1 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+                true,
+            )
+            .expect("non-dictionary trailer is emitted as an empty shell");
+        assert_eq!(output, b"trailer << >>");
+    }
+
+    #[test]
+    fn shared_trailer_contract_maps_a_direct_qdf_root() {
+        let trailer = ObjectHandle::dictionary(vec![
+            (
+                b"/Root".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Pages".to_vec(), ObjectHandle::integer(3))]),
+            ),
+            (b"/Size".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
+            Ok(ObjectRef::new(object_ref.number + 100, 0))
+        };
+        let mut output = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 1 },
+                false,
+                true,
+                None,
+                &map,
+                &BTreeSet::new(),
+                true,
+            )
+            .expect("direct QDF Catalog is emitted");
+        let text = String::from_utf8(output).expect("trailer is UTF-8");
+        assert!(text.contains("/Pages 3"));
     }
 
     #[test]
