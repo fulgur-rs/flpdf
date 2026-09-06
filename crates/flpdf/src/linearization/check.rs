@@ -1062,7 +1062,7 @@ fn check_hint_tables<R: Read + Seek>(
 /// this way is not guaranteed to produce identical bytes to an unchecked
 /// `pdf` on a subsequent write, matching qpdf's own behavior.
 pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) -> CheckResult {
-    check_linearization_inner(pdf, file_bytes, false, false).map(|_| ())
+    check_linearization_inner(pdf, file_bytes, false, false, None).map(|_| ())
 }
 
 /// Run the linearization checks while retaining qpdf's soft warning messages.
@@ -1075,7 +1075,26 @@ pub(crate) fn check_linearization_warnings<R: Read + Seek>(
     file_bytes: &[u8],
     skip_first_page_warning: bool,
 ) -> std::result::Result<Vec<String>, LinearizationCheckError> {
-    check_linearization_inner(pdf, file_bytes, true, skip_first_page_warning)
+    check_linearization_inner(pdf, file_bytes, true, skip_first_page_warning, None)
+}
+
+/// Run warning-producing checks while reusing hint data already loaded by
+/// `show-linearization`. qpdf keeps this data in its linearization cache, so
+/// the second check must not resolve the hint stream again.
+pub(crate) fn check_linearization_warnings_with_hint_data<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    file_bytes: &[u8],
+    skip_first_page_warning: bool,
+    hint_dict: &ObjectHandle,
+    hint_bytes: &[u8],
+) -> std::result::Result<Vec<String>, LinearizationCheckError> {
+    check_linearization_inner(
+        pdf,
+        file_bytes,
+        true,
+        skip_first_page_warning,
+        Some((hint_dict, hint_bytes)),
+    )
 }
 
 fn check_linearization_inner<R: Read + Seek>(
@@ -1083,6 +1102,7 @@ fn check_linearization_inner<R: Read + Seek>(
     file_bytes: &[u8],
     collect_soft_warnings: bool,
     skip_first_page_warning: bool,
+    preloaded_hint: Option<(&ObjectHandle, &[u8])>,
 ) -> std::result::Result<Vec<String>, LinearizationCheckError> {
     let file_len = file_bytes.len() as u64;
     let mut warnings = Vec::new();
@@ -1252,6 +1272,8 @@ fn check_linearization_inner<R: Read + Seek>(
     for (index, item) in h_items.iter().enumerate() {
         let _ = as_u64(item, &format!("H[{index}]"))?;
     }
+    let h_offset = as_u64(&h_items[0], "H[0]")?;
+    let h_length = as_u64(&h_items[1], "H[1]")?;
     let mut load_checked_hint = |index: usize,
                                  offset: u64,
                                  length: u64|
@@ -1285,21 +1307,26 @@ fn check_linearization_inner<R: Read + Seek>(
         })
     };
 
-    let h_offset = as_u64(&h_items[0], "H[0]")?;
-    let h_length = as_u64(&h_items[1], "H[1]")?;
-    let (hint_dict, primary_decompressed) = load_checked_hint(0, h_offset, h_length)?;
-    let mut hint_bytes = (*primary_decompressed).clone();
-    if h_items.len() == 4 {
-        let overflow_offset = as_u64(&h_items[2], "H[2]")?;
-        let overflow_length = as_u64(&h_items[3], "H[3]")?;
-        if overflow_offset != 0 {
-            let (_overflow_dict, overflow_decompressed) =
-                load_checked_hint(2, overflow_offset, overflow_length)?;
-            // qpdf's readLinearizationData pipes both streams into one
-            // Pl_Buffer before reading /S and /O (`QPDF_linearization.cc:241-245`).
-            hint_bytes.extend_from_slice(&overflow_decompressed);
-        } // cov:ignore: llvm maps the overflow closure cleanup to this brace
-    }
+    let (hint_dict, hint_bytes) = if let Some((hint_dict, hint_bytes)) = preloaded_hint {
+        // `show-linearization` already performed the qpdf-shaped source read;
+        // reuse its resolved dictionary and concatenated decoded bytes.
+        (hint_dict.clone(), hint_bytes.to_vec())
+    } else {
+        let (hint_dict, primary_decompressed) = load_checked_hint(0, h_offset, h_length)?;
+        let mut hint_bytes = (*primary_decompressed).clone();
+        if h_items.len() == 4 {
+            let overflow_offset = as_u64(&h_items[2], "H[2]")?;
+            let overflow_length = as_u64(&h_items[3], "H[3]")?;
+            if overflow_offset != 0 {
+                let (_overflow_dict, overflow_decompressed) =
+                    load_checked_hint(2, overflow_offset, overflow_length)?;
+                // qpdf's readLinearizationData pipes both streams into one
+                // Pl_Buffer before reading /S and /O (`QPDF_linearization.cc:241-245`).
+                hint_bytes.extend_from_slice(&overflow_decompressed);
+            } // cov:ignore: llvm maps the overflow closure cleanup to this brace
+        }
+        (hint_dict, hint_bytes)
+    };
 
     let (shared_offset, outline_offset) = read_hint_offsets(&hint_dict).map_err(map_show_error)?;
     if shared_offset >= hint_bytes.len() {
@@ -1857,5 +1884,17 @@ mod tests {
             load_hint_stream_with_damage(&mut pdf, file_bytes, 601, 118),
             Err(super::HintStreamLoadError::Core(_))
         ));
+    }
+
+    #[test]
+    fn check_linearization_loads_the_four_item_overflow_hint_stream() {
+        let file_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ));
+        let bytes = super::add_overflow_hint_items_for_test(file_bytes.to_vec());
+
+        super::check_linearization_bytes(&bytes)
+            .expect("the checker should load and merge a four-item /H fixture");
     }
 }
