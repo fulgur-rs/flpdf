@@ -327,11 +327,11 @@ impl<R: Read + Seek> Pdf<R> {
         drop(bootstrap_cache);
         if let Err(error) = pdf.initialize_encryption_inspection() {
             // Same diagnostic-wrapping boundary as the authentication
-            // failure below: xref recovery may have already recorded
-            // repair warnings, and a consumer like `run_check` (which
-            // suppresses live open-time warnings and replays them via
-            // `Error::OpenFailure`/`report_open_failure`) must not lose
-            // them just because a malformed `/Encrypt` entry fails this
+            // failure below: xref recovery may have already recorded repair
+            // warnings, and a suppressed inspection consumer (such as the
+            // JSON check route, which replays them via
+            // `Error::OpenFailure`/`report_open_failure`) must not lose them
+            // just because a malformed `/Encrypt` entry fails this
             // password-independent parse before authentication even runs.
             let diagnostics = pdf.repair_diagnostics();
             return Err(Error::with_open_diagnostics(error, diagnostics));

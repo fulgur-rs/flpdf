@@ -165,10 +165,11 @@ impl QPDFJob {
         let input_name = self.input_name_bytes().to_owned();
         let message_prefix = self.message_prefix().to_owned();
 
-        // The top-level `--check` route suppresses document warnings while
-        // opening so the report can replay them after its banner. Job JSON
-        // opens with the job logger live, so replay only when the document's
-        // own warning delivery is suppressed.
+        // Top-level `--check` delivers open-time document warnings live unless
+        // `--no-warn` is active, matching qpdf's `doProcess`/`doCheck` order.
+        // Job JSON and other callers may deliberately suppress delivery while
+        // opening, so replay only when the document's own warning delivery is
+        // suppressed.
         let replay_diagnostics = pdf.suppress_warnings();
         pdf.set_logger(logger.clone());
         let outcome = check_document_with_suppression(
