@@ -1180,6 +1180,17 @@ mod tests {
     }
 
     #[test]
+    fn report_errors_detected_preserves_logger_failures() {
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+
+        assert!(matches!(
+            report_errors_detected(&logger, "qpdf"),
+            CheckError::Operation(Error::System(message)) if message == "logger failure"
+        ));
+    }
+
+    #[test]
     fn object_warning_diagnostic_replay_preserves_raw_description_bytes() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
@@ -2005,6 +2016,50 @@ mod tests {
     }
 
     #[test]
+    fn document_check_reports_page_parse_errors_after_successful_delivery() {
+        let mut pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"q\nQ\n")))
+            .expect("content fixture should open");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        page.try_dereference().expect("page should resolve");
+        page.replace_key(b"/Contents", ObjectHandle::integer(42))
+            .expect("page should be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation should be tracked");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let result = check_document(&mut pdf, &logger, "qpdf", "page-parse-error.pdf");
+
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains(
+            "ERROR: page 1: page object 3 0:  object is supposed to be a stream or an array of streams but is neither\n"
+        ));
+        assert!(output.ends_with("qpdf: errors detected\n"));
+    }
+
+    #[test]
+    fn document_check_propagates_page_parse_logger_failures() {
+        let mut pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"q\nQ\n")))
+            .expect("content fixture should open");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        page.try_dereference().expect("page should resolve");
+        page.replace_key(b"/Contents", ObjectHandle::integer(42))
+            .expect("page should be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation should be tracked");
+
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+
+        assert!(matches!(
+            check_document(&mut pdf, &logger, "qpdf", "page-parse-error.pdf"),
+            Err(CheckError::Operation(Error::System(message)))
+                if message == "logger failure"
+        ));
+    }
+
+    #[test]
     fn diagnostic_delivery_errors_cross_the_job_check_boundary() {
         let pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2021,6 +2076,26 @@ mod tests {
             result,
             Err(CheckError::Operation(Error::System(message))) if message == "logger failure"
         ));
+    }
+
+    #[test]
+    fn replayed_diagnostics_are_delivered_through_the_job_check_boundary() {
+        let pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/test_driver/missing_startxref.pdf"
+        ))))
+        .expect("warning fixture should open");
+        assert!(!pdf.repair_diagnostics().entries().is_empty());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+
+        let result =
+            emit_new_diagnostics_with_suppression(&pdf, 0, &logger, "qpdf", b"broken.pdf", false)
+                .expect("diagnostics should be delivered");
+
+        assert_eq!(result, (true, false));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("WARNING: broken.pdf"));
     }
 
     #[test]
