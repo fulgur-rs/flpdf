@@ -11,7 +11,8 @@ use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity, ResourceConflicts};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pdf_string::utf8_value;
-use crate::resource_replacer::{replace_resource_names_with_context, ResourceRenames};
+use crate::resource_finder::ResourceFinder;
+use crate::resource_replacer::{filter_resource_names_from_stream, ResourceRenames};
 use crate::{Error, Matrix, ObjectRef, Pdf, Rectangle, Result, DEFAULT_MAX_ACROFORM_DEPTH};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -1247,21 +1248,29 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         // bytes via `newString`, not re-encoded through `newUnicodeString`
         // (`:609`).
         let default_appearance = decode_field_name(&default_appearance).into_bytes();
-        // qpdf catches parse failures from the temporary /DA stream and
-        // re-warns through the field (`QPDFAcroFormDocumentHelper.cc:597-603`)
-        // instead of letting the scan error disappear at this boundary.
-        let rewritten = match replace_resource_names_with_context(
-            &default_appearance,
+        // qpdf creates a destination-owned temporary indirect stream before
+        // parsing `/DA`, so parser warnings carry `object N G stream N G` and
+        // the allocation is visible to later object numbering
+        // (`QPDFAcroFormDocumentHelper.cc:590-609`).
+        let default_appearance_stream = self
+            .pdf
+            .new_stream_with_data(Rc::new(default_appearance.clone()))?;
+        let mut finder = ResourceFinder::default();
+        if let Err(error) = default_appearance_stream.parse_as_contents(&mut finder) {
+            // qpdf catches parse failures from the temporary /DA stream and
+            // re-warns through the field (`QPDFAcroFormDocumentHelper.cc:597-603`)
+            // instead of letting the scan error disappear at this boundary.
+            let warning =
+                format!("Unable to parse /DA: {error}; this form field may not update properly");
+            field.warn_if_possible(&warning)?;
+            return Ok(());
+        }
+        let rewritten = match filter_resource_names_from_stream(
+            &default_appearance_stream,
             &resources.renames,
-            field.context(),
+            finder.names_by_resource_type(),
         ) {
-            Ok(Some(rewritten)) => rewritten,
-            Ok(None) => {
-                let warning =
-                    "Unable to parse /DA: malformed content; this form field may not update properly";
-                field.warn_if_possible(warning)?;
-                return Ok(());
-            }
+            Ok(rewritten) => rewritten,
             Err(error) => {
                 let warning = format!(
                     "Unable to parse /DA: {error}; this form field may not update properly"
@@ -2678,13 +2687,55 @@ mod final_handle_tests {
         let warning_bytes = warnings.lock().expect("acroform warning trace lock");
         let warnings = String::from_utf8_lossy(&warning_bytes);
         assert!(
-            warnings.contains("content, offset 11: parse error while reading object"),
+            warnings.contains("object ")
+                && warnings.contains(" stream ")
+                && warnings.contains("(content, offset 11): parse error while reading object"),
             "qpdf's exact /DA parser warning must be delivered: {warnings}"
         );
     }
 
     #[test]
-    fn detached_default_appearance_parse_failure_uses_the_non_context_fallback() {
+    fn foreign_default_appearance_hard_parse_failure_rewarns_through_field() {
+        let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
+        let field = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/DA".to_vec(),
+                ObjectHandle::string(b"/F1 12 Tf 999999999999999999999999".to_vec()),
+            )]))
+            .expect("field handle");
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(crate::PipelineHandle::new(RecordingWarningSink(
+            Arc::clone(&warnings),
+        ))));
+        pdf.set_logger(logger);
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).expect("AcroForm helper");
+        let mut renames = crate::resource_replacer::ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"F1".to_vec(), b"F2".to_vec());
+        helper
+            .adjust_foreign_field_resources(
+                &field,
+                &ForeignResourcePlan {
+                    destination_resources: ObjectHandle::dictionary(Vec::new()),
+                    renames,
+                },
+            )
+            .expect("hard parser failure is caught and re-warned through the field");
+
+        let warning_bytes = warnings.lock().expect("acroform warning trace lock");
+        let warnings = String::from_utf8_lossy(&warning_bytes);
+        assert!(
+            warnings.contains("Unable to parse /DA:"),
+            "qpdf's /DA catch warning must be delivered: {warnings}"
+        );
+    }
+
+    #[test]
+    fn foreign_default_appearance_uses_destination_temp_stream_for_detached_field() {
         let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
         let field = ObjectHandle::dictionary(vec![(
             b"/DA".to_vec(),
@@ -2704,6 +2755,6 @@ mod final_handle_tests {
                     renames,
                 },
             )
-            .expect("detached /DA fallback should remain non-fatal");
+            .expect("destination-owned /DA parsing should remain non-fatal");
     }
 }
