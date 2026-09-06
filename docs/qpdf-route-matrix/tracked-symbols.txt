@@ -39,8 +39,8 @@
 #                    `Error::Internal(` / `Error::System(` / `Error::parse(` を個別に数えている。
 #   run      (E-1) — `QPDFJob::run` 以外に `driver::run`（E-28）等。
 #   check    (E-8) — `QPDFJob::check` 以外に `linearization::check` 等。
-#   parse    — 使用不能（prod 292）。E-14 `RotateSpec::parse` と E-15 `PageRange::parse` は
-#              leaf ではなく **型名**（`RotateSpec` / `PageRange`）を登録して代用している。
+#   parse    — 使用不能（prod 292）。E-14/E-15 は qpdf の parser identifier を
+#              `parse_rotation_parameter` / `parse_numrange` として登録する。
 #   main     (E-21) — `fn main` は宣言行なので除外され、prod 0 になる（degenerate）。
 #   Plan     (D24) — `writer/pclm.rs::Plan` 以外の `Plan` も拾う。
 #
@@ -260,8 +260,9 @@ crates/flpdf/src/job/image_optimization.rs::optimize_images              # E-12 
 crates/flpdf/src/job/rotate.rs::flatten_rotation_on_pages                # E-12 CLI 直呼び
 crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations            # E-13
 crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages                    # E-13
-crates/flpdf/src/job/rotate_spec.rs::RotateSpec                          # E-14（leaf `parse` 使用不能）
-crates/flpdf/src/job/page_range.rs::PageRange                            # E-15（leaf `parse` 使用不能）
+crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter              # E-14
+crates/flpdf/src/job/rotate_spec.rs::RotationSpec                         # E-14
+crates/flpdf/src/qutil.rs::parse_numrange                                 # E-15
 crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources  # E-16
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv         # E-17
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::complete                     # E-19

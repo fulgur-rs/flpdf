@@ -66,4 +66,4 @@ pub use page_specs::{copy_duplicate_page_annotations, PageSpecInput, PageSpecJob
 pub use page_split::SplitPageOptions;
 pub use resource_pruning::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 pub use rotate::{apply_rotate_to_pages, flatten_rotation_on_pages, RotateMode, RotateOp};
-pub use rotate_spec::RotateSpec;
+pub use rotate_spec::{parse_rotation_parameter, RotationParameter, RotationSpec};

@@ -119,6 +119,45 @@ fn top_level_writer_mode_help_matches_qpdf_terms() {
         .stdout(predicate::str::contains("uncompress"));
 }
 
+#[cfg(unix)]
+#[test]
+fn invalid_rotate_usage_preserves_qpdf_raw_bytes_and_help_framing() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let input = b"../../tests/fixtures/compat/attachment-two-page.pdf";
+    let rotate = b"--rotate=90:1-\xff";
+    let output = tempfile::tempdir().unwrap().path().join("unused.pdf");
+    let qpdf = ProcessCommand::new("qpdf")
+        .arg(OsString::from_vec(rotate.to_vec()))
+        .arg(OsString::from_vec(input.to_vec()))
+        .arg(&output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(OsString::from_vec(rotate.to_vec()))
+        .arg(OsString::from_vec(input.to_vec()))
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), Some(2));
+    let mut expected = Vec::with_capacity(qpdf.stderr.len());
+    let mut cursor = 0;
+    while cursor < qpdf.stderr.len() {
+        if qpdf.stderr[cursor..].starts_with(b"qpdf") {
+            expected.extend_from_slice(b"flpdf");
+            cursor += b"qpdf".len();
+        } else {
+            expected.push(qpdf.stderr[cursor]);
+            cursor += 1;
+        }
+    }
+    assert_eq!(flpdf.stderr, expected);
+}
+
 #[test]
 fn required_parameter_help_uses_qpdf_equals_form() {
     let top_level = [

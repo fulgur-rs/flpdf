@@ -491,10 +491,12 @@ crates/flpdf/src/job/lifecycle.rs::apply_configured_rotations: prod 3 (1 files) 
     crates/flpdf/src/job/lifecycle.rs 3
 crates/flpdf/src/job/rotate.rs::apply_rotate_to_pages: prod 2 (2 files) / test 16
     crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/lifecycle.rs 1
-crates/flpdf/src/job/rotate_spec.rs::RotateSpec: prod 5 (3 files) / test 5
-    crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 2, crates/flpdf/src/job/rotate_spec.rs 1
-crates/flpdf/src/job/page_range.rs::PageRange: prod 39 (7 files) / test 74
-    crates/flpdf-cli/src/main.rs 13, crates/flpdf/src/job/overlay.rs 9, crates/flpdf/src/job/lifecycle.rs 6, crates/flpdf/src/job/page_combine.rs 4, crates/flpdf/src/job/rotate_spec.rs 4, crates/flpdf/src/job/page_specs.rs 2, crates/flpdf/src/job/page_plan.rs 1
+crates/flpdf/src/job/rotate_spec.rs::parse_rotation_parameter: prod 3 (2 files) / test 9
+    crates/flpdf-cli/src/main.rs 2, crates/flpdf/src/job/lifecycle.rs 1
+crates/flpdf/src/qutil.rs::parse_numrange: prod 4 (3 files) / test 22
+    crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/lifecycle.rs 1, crates/flpdf/src/job/rotate_spec.rs 1
+crates/flpdf/src/job/page_range.rs::PageRange: prod 35 (6 files) / test 70
+    crates/flpdf-cli/src/main.rs 13, crates/flpdf/src/job/overlay.rs 9, crates/flpdf/src/job/lifecycle.rs 6, crates/flpdf/src/job/page_combine.rs 4, crates/flpdf/src/job/page_specs.rs 2, crates/flpdf/src/job/page_plan.rs 1
 crates/flpdf/src/job/resource_pruning.rs::should_remove_unreferenced_resources: prod 2 (2 files) / test 10
     crates/flpdf-cli/src/main.rs 1, crates/flpdf/src/job/page_merge.rs 1
 crates/flpdf/src/job/lifecycle.rs::QPDFJob::initialize_from_argv: prod 3 (1 files) / test 16
@@ -542,7 +544,7 @@ crates/flpdf/src/job/lifecycle.rs::QPDFJob::open: prod 63 (28 files) / test 1283
 | E-12 | `optimize_images` | 6 | 23 | 同上（`crates/flpdf-cli/src/main.rs` 19 件 = `flpdf::optimize_images` の 6 呼び出し + `--optimize-images` の引数処理、`crates/flpdf/src/job/lifecycle.rs` 4 件 = configuration フィールド） | 行（leaf が曖昧） |
 | E-19 | `complete` / `has_warnings` | 13 / 8 | 22 / 12 | 行は `QPDFJob::complete()` / `QPDFJob::has_warnings()` の **呼び出しだけ**を数え、型位置・フィールド参照・同名の別項目を含めていない | tracker（分母として。`QPDFJob` メソッドの呼び出し数だけが要るときは行の数を使う） |
 | E-24 | `write_json` | 0（free 関数） | 10 | leaf が `crates/flpdf/src/document_json.rs` の同名関数（6 件、加えて `crates/flpdf-qtest-tools/src/driver/test_88_98.rs:342` からの同関数呼び出し 1 件）と `crates/flpdf/src/object_handle.rs` の 3 件にも衝突（計 10） | 行（leaf が曖昧）。free `write_json` 自身の prod caller は 0 のまま |
-| E-14 / E-15 | `RotateSpec::parse` / `PageRange::parse` | 2 / 14 | — | leaf `parse` は使用不能（workspace 全体で prod 292）。manifest には **型名** `RotateSpec`（prod 5）/ `PageRange`（prod 39）を登録して代用している | 行（型名の数字は別の量なので、method の caller 数は行の `rg` 手順で数え直す） |
+| E-14 / E-15 | `parse_rotation_parameter` / `parse_numrange` | 3 / 3 | — | rotation consumer sliceではqpdf parserとsigned `QUtil::parse_numrange`を共有化。旧`RotateSpec::parse`のPageRange AST依存は削除したが、CLI適用ownerと他PageRange consumerは後続issueに残るため行全体はmixed | 行 |
 
 領域 D は他の 4 領域より tracker との乖離が多い。原因は §8 X-6 に書いたとおり、D ファイルが
 「モジュール直下の最初の `#[cfg(test)] mod` より前＝prod」という単純化を採ったのに対し、

@@ -11,18 +11,37 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// catches `QPDFUsage` separately and sends it through its CLI usage/help
 /// exit path before any input or output file is touched.
 #[derive(Debug, thiserror::Error)]
-#[error("{message}")]
+#[error("{}", usage_what(.message))]
 pub struct UsageError {
-    message: String,
+    message: Vec<u8>,
 }
 
 impl UsageError {
     /// Construct a usage error with the given qpdf-compatible message.
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl AsRef<[u8]>) -> Self {
         Self {
-            message: message.into(),
+            message: message.as_ref().to_vec(),
         }
     }
+
+    /// Return qpdf's observable `what()` bytes, ending at the first NUL.
+    pub fn what_bytes(&self) -> &[u8] {
+        &self.message[..self
+            .message
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(self.message.len())]
+    }
+}
+
+fn usage_what(message: &[u8]) -> String {
+    String::from_utf8_lossy(
+        &message[..message
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(message.len())],
+    )
+    .into_owned()
 }
 
 /// The qpdf error-code family carried by [`QpdfExc`].
@@ -324,6 +343,7 @@ impl Error {
     pub fn raw_message(&self) -> Option<&[u8]> {
         match self {
             Self::SystemBytes(message) => Some(message),
+            Self::Usage(error) => Some(error.what_bytes()),
             Self::OpenFailure { source, .. } => source.raw_message(),
             _ => None,
         }
