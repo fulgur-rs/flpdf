@@ -7930,13 +7930,20 @@ fn open_error_with_file(
     input: &Path,
     error: Box<dyn std::error::Error>,
 ) -> Box<dyn std::error::Error> {
-    let message = if let Some(error) = error.downcast_ref::<std::io::Error>() {
-        qpdf_open_io_error_message(error)
-    } else if let Some(flpdf::Error::Io(error)) = error.downcast_ref::<flpdf::Error>() {
-        qpdf_open_io_error_message(error)
-    } else {
-        error.to_string()
+    let io_error = error.downcast_ref::<std::io::Error>().or_else(|| {
+        match error.downcast_ref::<flpdf::Error>() {
+            Some(flpdf::Error::FileIo {
+                operation: "open",
+                source,
+                ..
+            }) => Some(source),
+            _ => None,
+        }
+    });
+    let Some(io_error) = io_error else {
+        return error_with_file(input, error);
     };
+    let message = qpdf_open_io_error_message(io_error);
     Box::new(CliPathError {
         path: path_description(input),
         operation: Some("open"),
@@ -7949,8 +7956,17 @@ fn open_error_with_file(
 /// omit Rust's numeric `(os error N)` suffix. qpdf uses the portable
 /// not-found wording on every supported host.
 fn qpdf_open_io_error_message(error: &std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return "No such file or directory".to_owned();
+    let message = match error.kind() {
+        std::io::ErrorKind::NotFound => Some("No such file or directory"),
+        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        std::io::ErrorKind::AlreadyExists => Some("File exists"),
+        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
+        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
+        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return message.to_owned();
     }
     let rendered = error.to_string();
     error
@@ -8757,6 +8773,30 @@ mod tests {
             error.to_string(),
             "open missing.json: No such file or directory"
         );
+    }
+
+    #[test]
+    fn open_error_with_file_keeps_non_io_errors_outside_open_prefix() {
+        let error = open_error_with_file(
+            Path::new("bad.pdf"),
+            flpdf::Error::parse(0, "malformed PDF").into(),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "bad.pdf: parse error at byte 0: malformed PDF"
+        );
+    }
+
+    #[test]
+    fn qpdf_open_io_error_uses_portable_permission_text() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert_eq!(qpdf_open_io_error_message(&error), "Permission denied");
+        let error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert_eq!(qpdf_open_io_error_message(&error), "File exists");
+        let error = std::io::Error::other("native fallback");
+        assert_eq!(qpdf_open_io_error_message(&error), "native fallback");
     }
 
     #[test]

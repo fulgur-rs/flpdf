@@ -496,7 +496,8 @@ impl Pdf<Box<dyn crate::ReadSeek>> {
         options: PdfOpenOptions,
     ) -> crate::Result<Self> {
         let path = path.as_ref();
-        let source = ReopenableFile::new(path).map_err(crate::Error::Io)?;
+        let source = ReopenableFile::new(path)
+            .map_err(|error| crate::Error::file_io("open", path.to_path_buf(), error))?;
         let controller = source.controller();
         let mut pdf = Self::open_with_options(Box::new(source), options)?;
         pdf.input_source_control = Some(controller);

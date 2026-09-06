@@ -561,6 +561,30 @@ fn qpdf_differential_matches_missing_input_open_error_on_all_input_routes() {
         let flpdf = run_flpdf(&args);
         assert_observables_equal(label, &qpdf, &flpdf, true);
     }
+
+    let encrypted = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+    );
+    let qpdf = run_qpdf(&[
+        ONE_PAGE,
+        "--pages",
+        encrypted,
+        "--password=wrong",
+        "1",
+        "--",
+        pages_output,
+    ]);
+    let flpdf = run_flpdf(&[
+        ONE_PAGE,
+        "--pages",
+        encrypted,
+        "--password=wrong",
+        "1",
+        "--",
+        pages_output,
+    ]);
+    assert_observables_equal("secondary source authentication", &qpdf, &flpdf, true);
 }
 
 #[cfg(target_os = "linux")]
