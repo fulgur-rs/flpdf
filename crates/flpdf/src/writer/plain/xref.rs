@@ -300,8 +300,14 @@ pub(crate) fn write_xref_table(
         .checked_sub(first)
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| crate::Error::Internal("invalid xref table range".to_string()))?;
-    bytes.extend_from_slice(format!("xref\n{first} {count}\n").as_bytes());
+    // qpdf captures `space_before_zero` after writing `xref\n{first} {count}`
+    // but *before* the header's trailing newline (`QPDFWriter.cc:2356-2360`),
+    // so the returned offset identifies the whitespace immediately preceding
+    // the object-0 row. A linearized `/T` consumer relies on that exact byte,
+    // so the newline must be appended only after the snapshot.
+    bytes.extend_from_slice(format!("xref\n{first} {count}").as_bytes());
     let space_before_zero = bytes.len();
+    bytes.push(b'\n');
     for number in first..=last {
         if number == 0 {
             bytes.extend_from_slice(b"0000000000 65535 f \n");
@@ -540,6 +546,25 @@ mod tests {
         assert!(!bytes
             .windows(b"0000000012 00007 n \n".len())
             .any(|window| { window == b"0000000012 00007 n \n" }));
+    }
+
+    #[test]
+    fn classic_xref_returns_space_before_zero_at_the_header_newline() {
+        // qpdf's writeXRefTable returns `space_before_zero`, captured before
+        // the header's trailing newline (QPDFWriter.cc:2356-2360); a
+        // linearized `/T` identifies that whitespace byte immediately before
+        // the object-0 row, so the returned offset must point at the `\n`,
+        // not the first digit of the row after it.
+        let mut entries = BTreeMap::new();
+        entries.insert(1, XrefEntry::Uncompressed { offset: 100 });
+        let mut bytes = Vec::new();
+        let space_before_zero =
+            write_xref_table(&mut bytes, 0, 1, &entries, false, 0, 0, 0).expect("table writes");
+        assert_eq!(bytes[space_before_zero], b'\n');
+        assert_eq!(
+            &bytes[space_before_zero + 1..space_before_zero + 1 + b"0000000000 65535 f \n".len()],
+            b"0000000000 65535 f \n"
+        );
     }
 
     #[test]
