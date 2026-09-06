@@ -1,9 +1,10 @@
 //! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
 //!
 //! This module owns the qpdf `QUtil::string_to_int`, `QUtil::safe_fopen`,
-//! `QUtil::utf8_to_ascii`, `QUtil::utf8_to_win_ansi`, and
-//! `QUtil::utf8_to_mac_roman` behavior used by form appearance generation
-//! (`libqpdf/QUtil.cc:490-518,1528-1667` and
+//! `QUtil::int_to_string_base`, `QUtil::toUTF8`, `QUtil::utf8_to_ascii`,
+//! `QUtil::utf8_to_win_ansi`, and `QUtil::utf8_to_mac_roman` behavior used by
+//! form appearance generation (`libqpdf/QUtil.cc:294-350,490-518,997-1031,
+//! 1528-1667` and
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
 //! unrepresentable input to `?`, matching qpdf's default replacement argument.
 //! It does not own PDF resource lookup, font selection, or password policy.
@@ -150,6 +151,42 @@ pub fn int_to_string_base(number: i64, base: i32, length: i32) -> crate::Result<
         converted.extend(std::iter::repeat_n(' ', width - converted.len()));
     }
     Ok(converted)
+}
+
+/// Encode a qpdf Unicode code point as UTF-8 bytes.
+///
+/// This is qpdf's `QUtil::toUTF8` (`include/qpdf/QUtil.hh:280`,
+/// `libqpdf/QUtil.cc:997-1031`). qpdf accepts values through `0x7fffffff`
+/// using its historical 1-to-6-byte encoding and reports larger values as a
+/// runtime error, which maps to `Error::System` here.
+pub fn to_utf8(mut value: u32) -> crate::Result<Vec<u8>> {
+    if value > 0x7fff_ffff {
+        return Err(crate::Error::System(
+            "bounds error in QUtil::toUTF8".to_owned(),
+        ));
+    }
+    if value < 128 {
+        return Ok(vec![value as u8]);
+    }
+
+    let mut bytes = [0u8; 6];
+    let mut cursor = 5usize;
+    let mut max_value = 0x3fu8;
+    while value > u32::from(max_value) {
+        bytes[cursor] = 0x80 | (value as u8 & 0x3f);
+        value >>= 6;
+        max_value >>= 1;
+        if cursor == 0 {
+            return Err(crate::Error::Internal(
+                "QUtil::toUTF8: overflow error".to_owned(),
+            ));
+        }
+        cursor -= 1;
+    }
+    let first = 0xffu32 - (1 + (u32::from(max_value) << 1)) + value;
+    bytes[cursor] = u8::try_from(first)
+        .map_err(|_| crate::Error::Internal("QUtil::toUTF8: overflow error".to_owned()))?;
+    Ok(bytes[cursor..].to_vec())
 }
 
 #[derive(Clone, Copy)]
@@ -363,10 +400,29 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        int_to_string_base, qpdf_string_to_int_checked, safe_fopen, same_file, utf8_to_ascii,
-        utf8_to_mac_roman, utf8_to_win_ansi, QpdfIntParse,
+        int_to_string_base, qpdf_string_to_int_checked, safe_fopen, same_file, to_utf8,
+        utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi, QpdfIntParse,
     };
     use std::io::{Read, Write};
+
+    #[test]
+    fn to_utf8_matches_qpdf_for_ascii_and_multibyte_values() {
+        assert_eq!(to_utf8(0x41).unwrap(), b"A");
+        assert_eq!(to_utf8(0x20ac).unwrap(), vec![0xe2, 0x82, 0xac]);
+        assert_eq!(
+            to_utf8(0x7fff_ffff).unwrap(),
+            vec![0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf]
+        );
+    }
+
+    #[test]
+    fn to_utf8_rejects_values_above_qpdfs_31_bit_limit() {
+        let error = to_utf8(0xffff_ffff).expect_err("qpdf rejects values above 0x7fffffff");
+
+        assert!(
+            matches!(error, crate::Error::System(message) if message == "bounds error in QUtil::toUTF8")
+        );
+    }
 
     #[test]
     fn int_to_string_base_matches_qpdf_bases_and_widths() {
