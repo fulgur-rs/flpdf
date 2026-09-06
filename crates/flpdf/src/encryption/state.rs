@@ -134,29 +134,6 @@ impl EncryptionState {
         self.encryption_v < 4 || !matches!(method, EncryptionMode::Identity)
     }
 
-    /// qpdf `QPDF::compute_data_key` (`QPDF_encryption.cc:325-357`),
-    /// Algorithm 3.1 from the PDF 1.7 Reference Manual.
-    pub(crate) fn compute_data_key(&self, og: ObjectRef, use_aes: bool) -> Vec<u8> {
-        let mut result = self.file_key.clone();
-        if self.encryption_v >= 5 {
-            return result;
-        }
-
-        let objid = og.number;
-        let generation = u32::from(og.generation);
-        result.push((objid & 0xff) as u8);
-        result.push(((objid >> 8) & 0xff) as u8);
-        result.push(((objid >> 16) & 0xff) as u8);
-        result.push((generation & 0xff) as u8);
-        result.push(((generation >> 8) & 0xff) as u8);
-        if use_aes {
-            result.extend_from_slice(b"sAlT");
-        }
-
-        let digest = crate::encryption::primitives::md5(&result);
-        digest[..result.len().min(16)].to_vec()
-    }
-
     pub(crate) fn with_object_cipher<T>(
         &mut self,
         og: ObjectRef,
@@ -181,7 +158,13 @@ impl EncryptionState {
     /// object/generation pair; `use_aes` is intentionally omitted.
     pub(crate) fn key_for_object(&mut self, og: ObjectRef, use_aes: bool) -> &[u8] {
         if self.cached_key_og != Some(og) {
-            self.cached_object_encryption_key = self.compute_data_key(og, use_aes);
+            self.cached_object_encryption_key = crate::encryption::primitives::compute_data_key(
+                &self.file_key,
+                og.number,
+                og.generation,
+                use_aes,
+                self.encryption_v,
+            );
             self.cached_key_og = Some(og);
         }
         &self.cached_object_encryption_key

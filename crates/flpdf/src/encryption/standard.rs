@@ -881,7 +881,7 @@ pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8
 ///
 /// The file key is returned alongside the dictionary because the
 /// string/stream encryption passes need it
-/// to derive per-object keys via [`super::state::EncryptionState::compute_data_key`];
+/// to derive per-object keys via [`super::primitives::compute_data_key`];
 /// the dictionary alone does not carry it.
 ///
 /// Algorithmic order: `/O` (Algorithm 3) → file key (Algorithm 2, consumes
@@ -1524,7 +1524,7 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
 /// [`encrypt_cipher_bytes`].
 ///
 /// For V<5, the per-object key from
-/// [`super::state::EncryptionState::compute_data_key`] is the key material.
+/// [`super::primitives::compute_data_key`] is the key material.
 /// For V=5, the file key itself or a selected `/CF` key is used directly.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StringEncryptCipher<'a> {
