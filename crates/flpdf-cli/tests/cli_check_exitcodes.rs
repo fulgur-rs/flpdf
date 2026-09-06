@@ -113,6 +113,41 @@ fn recovered_indirect_size_header_mismatch_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// A reachable stream whose indirect `/Length` resolves successfully but whose
+/// trailing `endobj` token is damaged. qpdf's `readStream` resolves object 5
+/// while reading object 4 and leaves `last_object_description` at object 5
+/// when `readObject` reports the trailing-token damage.
+fn indirect_length_expected_endobj_pdf_bytes() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n"
+            .as_slice(),
+        b"4 0 obj\n<< /Length 5 0 R >>\nstream\nabc\nendstream\nendobX\n".as_slice(),
+        b"5 0 obj\n3\nendobj\n".as_slice(),
+    ];
+    let mut offsets = vec![0usize];
+    for object in objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object);
+    }
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 /// PDF that is irrecoverably corrupt — no valid objects reachable, causing
 /// the check to report errors → exit 2.
 fn corrupt_pdf_bytes() -> Vec<u8> {
@@ -708,6 +743,33 @@ fn check_with_repair_reports_size_mismatch_after_xref_reconstruction() {
         .stderr(predicate::str::contains(
             "reported number of objects (3) is not one plus the highest object number (4)",
         ));
+}
+
+#[test]
+fn check_indirect_length_expected_endobj_uses_length_object_context() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    let bytes = indirect_length_expected_endobj_pdf_bytes();
+    let trailing_offset = bytes
+        .windows(b"endobX".len())
+        .position(|window| window == b"endobX")
+        .expect("damaged trailing token");
+    f.write_all(&bytes).unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {path} (object 5 0, offset {trailing_offset}): expected endobj{EOL}"
+        )))
+        .stderr(
+            predicate::str::contains(format!(
+                "WARNING: {path} (object 4 0, offset {trailing_offset}): expected endobj{EOL}"
+            ))
+            .not(),
+        );
 }
 
 #[test]
