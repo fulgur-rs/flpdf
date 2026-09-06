@@ -1,7 +1,11 @@
 //! qpdf correspondence: QPDFWriter.cc classic and stream xref emission for the plain writer.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::writer::{serialize::xref_stream, write_deterministic_id_inline};
+use crate::writer::{
+    object::{ObjectWriterEmission, TrailerKind},
+    serialize::xref_stream,
+    write_deterministic_id_inline,
+};
 use crate::{ObjectHandle, ObjectRef, XrefEntry, XrefForm};
 
 /// Location of an object encoded inside an object-stream container.
@@ -81,6 +85,31 @@ pub(crate) fn append_xref_and_trailer(
 
     match trailer.form {
         XrefForm::Table => append_classic_xref_and_trailer(bytes, layout, trailer),
+        XrefForm::Stream => append_xref_stream_and_trailer(bytes, layout, trailer),
+    }
+}
+
+/// Append a plain xref section while sourcing classic trailer bytes from the
+/// live qpdf-shaped `ObjectHandle` owner. The xref-stream form remains with
+/// the existing physical dictionary writer until its D13 consumer slice.
+pub(crate) fn append_xref_and_trailer_with_handle(
+    bytes: &mut Vec<u8>,
+    layout: &BodyLayout,
+    trailer: &TrailerPlan,
+    trailer_handle: &ObjectHandle,
+    old_to_new: &HashMap<ObjectRef, ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+    layout.validate()?;
+    match trailer.form {
+        XrefForm::Table => append_classic_xref_and_trailer_with_handle(
+            bytes,
+            layout,
+            trailer,
+            trailer_handle,
+            old_to_new,
+            removed_refs,
+        ),
         XrefForm::Stream => append_xref_stream_and_trailer(bytes, layout, trailer),
     }
 }
@@ -191,6 +220,96 @@ fn append_xref_stream_and_trailer(
     }
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
     written_xref_stream(layout, xref_ref, xref_offset)
+}
+
+fn append_classic_xref_and_trailer_with_handle(
+    bytes: &mut Vec<u8>,
+    layout: &BodyLayout,
+    trailer: &TrailerPlan,
+    trailer_handle: &ObjectHandle,
+    old_to_new: &HashMap<ObjectRef, ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+    let xref_offset = bytes.len();
+    let size = layout
+        .max_number()
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("plain writer /Size overflows u32".into()))?;
+    if layout
+        .uncompressed
+        .values()
+        .any(|&(_, offset)| offset as u64 >= 10_000_000_000)
+    {
+        return Err(crate::Error::Unsupported(
+            "plain writer classic xref offset exceeds ten digits".into(),
+        ));
+    }
+
+    let mut entries = BTreeMap::new();
+    for (&number, &(_, offset)) in &layout.uncompressed {
+        entries.insert(
+            number,
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        );
+    }
+    for (&number, location) in &layout.compressed {
+        entries.insert(
+            number,
+            XrefEntry::Compressed {
+                stream: location.container,
+                index: location.index,
+            },
+        );
+    }
+    let _ = write_xref_table(bytes, 0, size - 1, &entries, false, 0, 0, 0)?;
+
+    let map = |object_ref: ObjectRef| {
+        old_to_new.get(&object_ref).copied().ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "plain writer: trailer reference {object_ref} absent from renumber map"
+            ))
+        })
+    };
+    match &trailer.id {
+        IdPlan::Deterministic {
+            source_id0,
+            info_suffix,
+        } => {
+            let mut id_writer = |out: &mut Vec<u8>| {
+                write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
+            };
+            trailer_handle.write_trailer_with_ref_map_and_kind(
+                bytes,
+                TrailerKind::Normal {
+                    size: i64::from(size),
+                },
+                false,
+                trailer.qdf,
+                Some(&mut id_writer),
+                &map,
+                removed_refs,
+                true,
+            )?;
+        }
+        IdPlan::Materialized { .. } => {
+            trailer_handle.write_trailer_with_ref_map_and_kind(
+                bytes,
+                TrailerKind::Normal {
+                    size: i64::from(size),
+                },
+                false,
+                trailer.qdf,
+                None,
+                &map,
+                removed_refs,
+                true,
+            )?;
+        }
+    }
+    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    written_xref_table(layout, size)
 }
 
 /// Read the writer-owned `/ID` value from the canonical handle graph.
@@ -514,7 +633,7 @@ mod tests {
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(1, (0, 12));
         let mut bytes = Vec::new();
-        let map = |object_ref: ObjectRef| -> crate::Result<ObjectRef> { Ok(object_ref) };
+        let map = HashMap::new();
 
         append_xref_and_trailer_with_handle(
             &mut bytes,
@@ -527,7 +646,10 @@ mod tests {
         .expect("live trailer owner emits classic output");
 
         let text = String::from_utf8(bytes).expect("classic output is UTF-8");
-        assert!(text.contains("trailer << /Info 1 /Custom /Value /Size 2 /ID [<696430><696431>] >>"));
+        assert!(
+            text.contains("trailer << /Custom /Value /Info 1 /Size 2 /ID [<696430><696431>] >>"),
+            "actual output: {text:?}"
+        );
         assert!(!text.contains("/NullEntry"));
     }
 

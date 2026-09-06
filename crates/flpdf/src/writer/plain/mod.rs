@@ -33,7 +33,14 @@ fn write_planned<R: Read + Seek, W: Write>(
 ) -> crate::Result<WriterResult> {
     plan.validate()?;
     let (mut bytes, layout) = body::emit_bodies(pdf, options, plan)?;
-    let written_xref = xref::append_xref_and_trailer(&mut bytes, &layout, &plan.trailer)?;
+    let written_xref = xref::append_xref_and_trailer_with_handle(
+        &mut bytes,
+        &layout,
+        &plan.trailer,
+        &plan.trailer_handle,
+        &plan.old_to_new,
+        &plan.removed_refs,
+    )?;
     out.write_all(&bytes)?;
     let old_to_new = plan
         .old_to_new

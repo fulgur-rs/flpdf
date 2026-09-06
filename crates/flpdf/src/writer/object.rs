@@ -12,6 +12,7 @@ use crate::{Error, ObjectRef, Result};
 use std::collections::BTreeSet;
 
 /// qpdf's `writeTrailer` form selector (`QPDFWriter.cc:1160-1236`).
+#[allow(dead_code)] // linearized consumers are migrated in the following D14 route slices
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrailerKind {
     Normal { size: i64 },
