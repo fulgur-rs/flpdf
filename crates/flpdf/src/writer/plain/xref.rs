@@ -282,6 +282,10 @@ fn append_classic_xref_and_trailer(
 /// compressed entry, so all three cases use the same `Error::Internal` path.
 /// Object generations are output as zero because qpdf's writer opens every
 /// emitted object as generation zero.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preserve QPDFWriter::writeXRefTable's full overload fields one-to-one"
+)]
 pub(crate) fn write_xref_table(
     bytes: &mut Vec<u8>,
     first: u32,
