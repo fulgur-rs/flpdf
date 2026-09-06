@@ -1302,3 +1302,193 @@ mod final_handle_tests {
             .any(|window| { window == b"stream\ndata\nendstream" }));
     }
 }
+
+#[cfg(test)]
+mod object_emitter_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap()
+    }
+
+    fn with_emitter(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        plan: &PlainWritePlan,
+        check: impl FnOnce(&mut PlainObjectEmitter<'_, Cursor<Vec<u8>>>),
+    ) {
+        let options = WriterOptions::default();
+        let mut bytes = Vec::new();
+        let mut layout = BodyLayout::default();
+        let mut emitter = PlainObjectEmitter {
+            pdf,
+            options: &options,
+            plan,
+            bytes: &mut bytes,
+            layout: &mut layout,
+            lengths: BTreeMap::new(),
+            object_stream_to_objects: BTreeMap::new(),
+            encryption: crate::writer::encryption_state::WriterEncryptionState::new(
+                false,
+                Vec::new(),
+                false,
+                0,
+                0,
+            ),
+        };
+        check(&mut emitter);
+    }
+
+    #[test]
+    fn a_new_source_missing_from_the_frozen_plan_fails_before_open_object() {
+        // The existing planner backend remains frozen until the live queue
+        // cutover. Its lookup error must cross the shared owner unchanged.
+        let mut pdf = pdf();
+        let plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let object = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        with_emitter(&mut pdf, &plan, |emitter| {
+            assert!(
+                matches!(emitter.write_object(&object, None), Err(crate::Error::Unsupported(message)) if message.contains("absent from renumber map"))
+            );
+            assert!(emitter.bytes.is_empty());
+            assert!(emitter.layout.uncompressed.is_empty());
+        });
+    }
+
+    #[test]
+    fn existing_container_member_mapping_errors_propagate_from_the_member_unparser() {
+        let mut pdf = pdf();
+        let child = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .unwrap();
+        let child_id = child.object_ref().unwrap();
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Child".to_vec(),
+                child,
+            )]))
+            .unwrap();
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/Member", member)
+            .unwrap();
+        let mut plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let members = [PlannedMember {
+            source: member_id,
+            output: plan.new_for_original(member_id).unwrap(),
+        }];
+        plan.old_to_new.remove(&child_id);
+        with_emitter(&mut pdf, &plan, |emitter| {
+            let result = emitter.emit_planned_object_stream(
+                &PlannedObjectStreamOrigin::Synthetic,
+                ObjectRef::new(9, 0),
+                &members,
+            );
+            assert!(
+                matches!(result, Err(crate::Error::Unsupported(message)) if message.contains("absent from renumber map"))
+            );
+            assert!(emitter.bytes.is_empty());
+        });
+    }
+
+    #[test]
+    fn source_container_extends_is_remapped_and_an_absent_target_is_reported() {
+        let mut pdf = pdf();
+        let target = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .unwrap();
+        let target_id = target.object_ref().unwrap();
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let member_id = member.object_ref().unwrap();
+        let source = pdf.new_stream_with_data(Rc::new(Vec::new())).unwrap();
+        let source_id = source.object_ref().unwrap();
+        source
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Extends", target)
+            .unwrap();
+        let root = pdf.root_handle().unwrap();
+        root.replace_key(b"/Source", source).unwrap();
+        root.replace_key(b"/Member", member).unwrap();
+        let mut plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let members = [PlannedMember {
+            source: member_id,
+            output: plan.new_for_original(member_id).unwrap(),
+        }];
+        let expected = format!(
+            "/Extends {} 0 R",
+            plan.new_for_original(target_id).unwrap().number
+        );
+        with_emitter(&mut pdf, &plan, |emitter| {
+            emitter
+                .emit_planned_object_stream(
+                    &PlannedObjectStreamOrigin::SourceBacked(source_id),
+                    ObjectRef::new(9, 0),
+                    &members,
+                )
+                .unwrap();
+            assert!(emitter
+                .bytes
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()));
+        });
+        plan.old_to_new.remove(&target_id);
+        with_emitter(&mut pdf, &plan, |emitter| {
+            let result = emitter.emit_planned_object_stream(
+                &PlannedObjectStreamOrigin::SourceBacked(source_id),
+                ObjectRef::new(9, 0),
+                &members,
+            );
+            assert!(
+                matches!(result, Err(crate::Error::Unsupported(message)) if message.contains("/Extends") && message.contains("absent from renumber map"))
+            );
+        });
+    }
+
+    #[test]
+    fn a_canonical_null_container_source_emits_members_without_extends() {
+        let mut pdf = pdf();
+        let source = pdf
+            .make_indirect_from_object_handle(ObjectHandle::null())
+            .unwrap();
+        let source_id = source.object_ref().unwrap();
+        let member = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let member_id = member.object_ref().unwrap();
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/Member", member)
+            .unwrap();
+        let plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
+        let members = [PlannedMember {
+            source: member_id,
+            output: plan.new_for_original(member_id).unwrap(),
+        }];
+        with_emitter(&mut pdf, &plan, |emitter| {
+            emitter
+                .emit_planned_object_stream(
+                    &PlannedObjectStreamOrigin::SourceBacked(source_id),
+                    ObjectRef::new(9, 0),
+                    &members,
+                )
+                .unwrap();
+            assert!(emitter
+                .bytes
+                .windows(b"/Type /ObjStm".len())
+                .any(|window| window == b"/Type /ObjStm"));
+            assert!(!emitter
+                .bytes
+                .windows(b"/Extends".len())
+                .any(|window| window == b"/Extends"));
+        });
+    }
+}

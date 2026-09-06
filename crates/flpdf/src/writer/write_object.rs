@@ -111,13 +111,11 @@ pub(crate) trait WriteObject {
 
         if object_stream_index.is_none() {
             if qdf.is_some_and(|info| !info.suppress_original_object_ids) {
-                self.write_bytes(
-                    format!(
-                        "%% Original object ID: {} {}\n",
-                        old_og.number, old_og.generation
-                    )
-                    .as_bytes(),
-                )?;
+                let comment = format!(
+                    "%% Original object ID: {} {}\n",
+                    old_og.number, old_og.generation
+                );
+                self.write_bytes(comment.as_bytes())?;
             }
             self.open_object(new_id)?;
             self.encryption_state().set_data_key(new_id);
@@ -376,8 +374,13 @@ mod tests {
         let (_pdf, object) = indirect(ObjectHandle::integer(42));
         let mut writer = MemoryWriter::new();
         writer.direct_stream_lengths = false;
+        writer.qdf = Some(QdfObjectInfo {
+            page_sequence: None,
+            contents_sequence: None,
+            suppress_original_object_ids: true,
+        });
         writer.write_object(&object, None).unwrap();
-        assert_eq!(writer.bytes, b"1 0 obj\n42\nendobj\n");
+        assert_eq!(writer.bytes, b"1 0 obj\n42\nendobj\n\n");
         assert_eq!(writer.xref.len(), 1);
     }
 
@@ -445,5 +448,60 @@ mod tests {
         assert!(writer.bytes.is_empty());
         assert!(writer.xref.is_empty());
         assert!(writer.encryption.current_data_key().is_none());
+    }
+    #[test]
+    fn compact_stream_uses_its_direct_length_without_a_qdf_newline() {
+        let (_pdf, object) = indirect(stream(b"abc"));
+        let mut writer = MemoryWriter::new();
+        writer.write_object(&object, None).unwrap();
+        assert_eq!(
+            writer.bytes,
+            b"1 0 obj\n<< /Length 3 >>\nstream\nabcendstream\nendobj\n"
+        );
+    }
+
+    #[test]
+    fn qdf_stream_preserves_indirect_dictionary_entries() {
+        let (pdf, object) = indirect(stream(b"abc"));
+        let peer = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(7))
+            .unwrap();
+        let peer_id = peer.object_ref().unwrap();
+        object
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Peer", peer)
+            .unwrap();
+        let mut writer = MemoryWriter::new();
+        writer.qdf = Some(QdfObjectInfo {
+            page_sequence: None,
+            contents_sequence: None,
+            suppress_original_object_ids: true,
+        });
+        writer.write_object(&object, None).unwrap();
+        let reference = format!("/Peer {} {} R", peer_id.number, peer_id.generation);
+        assert!(writer
+            .bytes
+            .windows(reference.len())
+            .any(|window| window == reference.as_bytes()));
+    }
+
+    #[test]
+    fn qdf_stream_dictionary_failure_does_not_close_the_object_or_clear_the_key() {
+        let (_pdf, object) = indirect(stream(b"abc"));
+        object
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Broken", ObjectHandle::uninitialized())
+            .unwrap();
+        let mut writer = MemoryWriter::new();
+        writer.qdf = Some(QdfObjectInfo {
+            page_sequence: None,
+            contents_sequence: None,
+            suppress_original_object_ids: true,
+        });
+        assert!(writer.write_object(&object, None).is_err());
+        assert!(writer.encryption.current_data_key().is_some());
+        assert!(writer.lengths.is_empty());
     }
 }
