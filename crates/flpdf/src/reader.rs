@@ -1244,6 +1244,71 @@ impl<R: Read + Seek> Pdf<R> {
             .unwrap_or(0))
     }
 
+    /// Collect compressible objects through qpdf's document-owned live walk.
+    ///
+    /// Ports `QPDF::getCompressibleObjGens` (`libqpdf/QPDF.cc:2393-2474`).
+    /// The cache is prepared before sizing a packed visited bitmap, matching
+    /// C++ `vector<bool>`. Stale generations are removed from the actual
+    /// document; all retained aliases become direct null rather than relying
+    /// on writer-side reference suppression. Stream `/Length` edges are
+    /// omitted here; filtering stream parameters belongs to the writer.
+    pub(crate) fn get_compressible_objgens(&mut self) -> Result<Vec<ObjectRef>> {
+        let encryption = self.trailer().try_get_key(b"/Encrypt")?.object_ref();
+        let max_object = self.get_object_count()? as usize;
+        let mut visited = vec![0u64; max_object.div_ceil(64)];
+        let mut queue = Vec::with_capacity(512);
+        queue.push(self.trailer());
+        let mut result = Vec::new();
+        while let Some(object) = queue.pop() {
+            if let Some(og) = object.object_ref().filter(|og| og.number > 0) {
+                let index = (og.number - 1) as usize;
+                if index >= max_object {
+                    return Err(Error::Internal(
+                        "unexpected object id encountered in getCompressibleObjGens".into(),
+                    ));
+                }
+                let bit = 1u64 << (index % 64);
+                if visited[index / 64] & bit != 0 {
+                    continue;
+                }
+                if self.resolver.has_newer_cached_generation(og) {
+                    self.resolver.remove_object(og)?;
+                    continue;
+                }
+                visited[index / 64] |= bit;
+                if Some(og) != encryption {
+                    object.try_dereference()?;
+                    if object.as_stream_dict().is_none()
+                        && !(object.try_is_dictionary_of_type(b"Sig", b"")?
+                            && object.try_has_key(b"/ByteRange")?
+                            && object.try_has_key(b"/Contents")?)
+                    {
+                        result.push(og);
+                    }
+                }
+            }
+            object.try_dereference()?;
+            if let Some(dict) = object.as_stream_dict() {
+                for key in dict.try_get_keys()?.into_iter().rev() {
+                    let value = dict.try_get_key(&key)?;
+                    if key != b"/Length" {
+                        queue.push(value);
+                    }
+                }
+            } else if object.try_is_dictionary()? {
+                for key in object.try_get_keys()?.into_iter().rev() {
+                    queue.push(object.try_get_key(&key)?);
+                }
+            } else if object.try_is_array()? {
+                let count = object.try_get_array_n_items()?;
+                for index in (0..count).rev() {
+                    queue.push(object.try_get_array_item(index as i64)?);
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Return the next qpdf-shaped generation-zero object identity from the
     /// prepared canonical cache. Allocation itself belongs to the document's
     /// resolver so legacy cache values cannot silently become object-number
@@ -2290,6 +2355,237 @@ mod encryption_state_commit_tests {
         assert!(
             pdf.encryption.borrow().is_none(),
             "authentication state must remain uncommitted when /Perms warning delivery fails"
+        );
+    }
+}
+
+#[cfg(test)]
+mod compressible_owner_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::Cursor;
+
+    fn pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn compressible_walk_removes_stale_aliases_without_invalidating_preparation() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(
+                "../../../tests/fixtures/compat/compressible-stale-generation-alias.pdf"
+            )
+            .to_vec(),
+        ))
+        .unwrap();
+        let versions = pdf
+            .root_handle()
+            .unwrap()
+            .try_get_key(b"/Versions")
+            .unwrap();
+        let old = versions.try_get_array_item(0).unwrap();
+        let current = versions.try_get_array_item(1).unwrap();
+        let result = pdf.get_compressible_objgens().unwrap();
+        assert_eq!(
+            result,
+            vec![
+                ObjectRef::new(1, 0),
+                ObjectRef::new(2, 0),
+                ObjectRef::new(3, 1)
+            ]
+        );
+        assert!(old.is_direct() && old.is_null());
+        assert_eq!(current.object_ref(), Some(ObjectRef::new(3, 1)));
+        assert!(pdf
+            .resolver
+            .registered_handle(ObjectRef::new(3, 0))
+            .is_none());
+        assert!(pdf.dangling_references_fixed());
+    }
+
+    #[test]
+    fn compressible_walk_checks_visited_before_stale_generation_removal() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(
+                "../../../tests/fixtures/compat/compressible-stale-generation-alias.pdf"
+            )
+            .to_vec(),
+        ))
+        .unwrap();
+        let root = pdf.root_handle().unwrap();
+        let versions = root.try_get_key(b"/Versions").unwrap();
+        let old = versions.try_get_array_item(0).unwrap();
+        let current = versions.try_get_array_item(1).unwrap();
+        versions
+            .set_array_items(vec![current, old.clone()])
+            .unwrap();
+        root.replace_key(b"/ZCycle", root.clone()).unwrap();
+        assert_eq!(
+            pdf.get_compressible_objgens().unwrap(),
+            vec![
+                ObjectRef::new(1, 0),
+                ObjectRef::new(2, 0),
+                ObjectRef::new(3, 1)
+            ]
+        );
+        assert_eq!(old.object_ref(), Some(ObjectRef::new(3, 0)));
+        assert!(old.is_indirect());
+    }
+
+    #[test]
+    fn compressible_walk_preserves_order_and_keeps_excluded_container_children() {
+        let mut pdf = pdf();
+        let root = pdf.root_handle().unwrap();
+        for key in root.try_get_keys().unwrap() {
+            root.remove_key(&key);
+        }
+        let a = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(1))
+            .unwrap();
+        let b = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .unwrap();
+        let c = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .unwrap();
+        let null = pdf
+            .make_indirect_from_object_handle(ObjectHandle::null())
+            .unwrap();
+        let length = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .unwrap();
+        let sig = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+                (b"/ByteRange".to_vec(), ObjectHandle::array(vec![])),
+                (
+                    b"/Contents".to_vec(),
+                    ObjectHandle::string(b"signature".to_vec()),
+                ),
+                (b"/Child".to_vec(), a.clone()),
+            ]))
+            .unwrap();
+        let incomplete_sig = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+                (b"/ByteRange".to_vec(), ObjectHandle::array(vec![])),
+                (b"/Contents".to_vec(), ObjectHandle::null()),
+            ]))
+            .unwrap();
+        let encryption = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Child".to_vec(),
+                b.clone(),
+            )]))
+            .unwrap();
+        let stream = pdf.new_stream_with_data(Rc::new(b"xyz".to_vec())).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let provider_calls = calls.clone();
+        stream
+            .replace_stream_data_with_callback(
+                move |pipeline| {
+                    provider_calls.set(provider_calls.get() + 1);
+                    pipeline.write(b"xyz")?;
+                    pipeline.finish()?;
+                    Ok(())
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let dict = stream.as_stream_dict().unwrap();
+        dict.replace_key(b"/Type", ObjectHandle::name(b"ObjStm".to_vec()))
+            .unwrap();
+        dict.replace_key(b"/Length", length.clone()).unwrap();
+        dict.replace_key(b"/Meta", c.clone()).unwrap();
+        root.replace_key(
+            b"/AArray",
+            ObjectHandle::array(vec![a.clone(), null.clone(), a.clone()]),
+        )
+        .unwrap();
+        root.replace_key(b"/BSig", sig.clone()).unwrap();
+        root.replace_key(b"/CIncomplete", incomplete_sig.clone())
+            .unwrap();
+        root.replace_key(b"/DNull", null.clone()).unwrap();
+        root.replace_key(b"/EStream", stream.clone()).unwrap();
+        root.replace_key(b"/ZLengthElsewhere", length.clone())
+            .unwrap();
+        pdf.trailer()
+            .replace_key(b"/Encrypt", encryption.clone())
+            .unwrap();
+        let expected: Vec<ObjectRef> =
+            [b, root.clone(), a, null, incomplete_sig, c, length.clone()]
+                .iter()
+                .map(|object| object.object_ref().unwrap())
+                .collect();
+        assert_eq!(pdf.get_compressible_objgens().unwrap(), expected);
+        assert_eq!(
+            calls.get(),
+            0,
+            "document traversal must not pipe stream providers"
+        );
+        root.remove_key(b"/ZLengthElsewhere");
+        let without_length = pdf.get_compressible_objgens().unwrap();
+        assert!(!without_length.contains(&length.object_ref().unwrap()));
+        assert!(!without_length.contains(&sig.object_ref().unwrap()));
+        assert!(!without_length.contains(&encryption.object_ref().unwrap()));
+        assert!(!without_length.contains(&stream.object_ref().unwrap()));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(stream.get_raw_stream_data().unwrap().as_slice(), b"xyz");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn compressible_walk_reports_qpdfs_prepared_object_count_bound() {
+        struct GrowOnDrop {
+            resolver: std::rc::Weak<ResolverHandle<Cursor<Vec<u8>>>>,
+            pending: ObjectHandle,
+        }
+        impl crate::StreamDataProvider for GrowOnDrop {}
+        impl Drop for GrowOnDrop {
+            fn drop(&mut self) {
+                let resolver = self.resolver.upgrade().unwrap();
+                let new_object = resolver
+                    .make_indirect_from_object_handle(ObjectHandle::integer(7))
+                    .unwrap();
+                self.pending.append_array_item(new_object).unwrap();
+            }
+        }
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .unwrap();
+        let old = pdf
+            .get_all_objects()
+            .unwrap()
+            .into_iter()
+            .find(|object| object.as_stream_dict().is_some())
+            .unwrap();
+        let old_id = old.object_ref().unwrap();
+        pdf.replace_object(
+            ObjectRef::new(old_id.number, old_id.generation + 1),
+            ObjectHandle::integer(42),
+        )
+        .unwrap();
+        let pending = ObjectHandle::array(vec![]);
+        pdf.root_handle()
+            .unwrap()
+            .replace_key(b"/ZPending", pending.clone())
+            .unwrap();
+        old.replace_stream_data_provider(
+            Rc::new(GrowOnDrop {
+                resolver: Rc::downgrade(&pdf.resolver),
+                pending,
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(pdf.get_compressible_objgens(), Err(Error::Internal(message)) if message == "unexpected object id encountered in getCompressibleObjGens")
         );
     }
 }

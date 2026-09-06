@@ -76,6 +76,7 @@ pub(crate) fn eligibility_context<R: std::io::Read + std::io::Seek>(
     })
 }
 
+// qpdf-deviation: remaining consumers discard the legacy removed-reference set instead of observing document removeObject.
 pub(crate) fn get_compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
@@ -99,6 +100,7 @@ pub(crate) struct CompressiblePlan {
     pub indirect_objstm_length_refs: BTreeSet<ObjectRef>,
 }
 
+// qpdf-deviation: remaining writer consumers use a generation snapshot and removed_refs; the canonical document walk mutates retained aliases.
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {

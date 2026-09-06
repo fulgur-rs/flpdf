@@ -1687,29 +1687,39 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(())
     }
 
-    /// Remove an object from the canonical xref/cache view and leave any
-    /// outstanding handle as a floating null value.
+    /// Whether qpdf's live cache upper_bound finds a newer generation of this number.
+    /// This is the per-object test in `getCompressibleObjGens`
+    /// (`libqpdf/QPDF.cc:2423-2430`), not a snapshot of the source xref table.
+    pub(crate) fn has_newer_cached_generation(&self, object_ref: ObjectRef) -> bool {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.core
+            .borrow()
+            .object_cache
+            .range((Excluded(object_ref), Unbounded))
+            .next()
+            .is_some_and(|(next, _)| next.number == object_ref.number)
+    }
+
+    /// Remove the exact source row, nullify retained aliases, then erase the cache slot.
     ///
-    /// qpdf erases the exact xref/cache entry after assigning a null value to
-    /// the cached object (`QPDF.cc:1996-2005`). This cache mutation is
-    /// separate from xref registration's transient `deleted_objects`: qpdf
-    /// uses that local set only while loading or reconstructing xrefs
-    /// (`QPDF.cc:686-708`, `:1187-1210`), so no mutation-history tombstone
-    /// belongs in the resolver. The handle is nullified first so aliases held
-    /// by callers observe the transition even after the cache entry is gone.
-    #[cfg(test)]
+    /// Matches `QPDF::removeObject` (`libqpdf/QPDF.cc:1996-2005`). Removing a
+    /// cached object does not invalidate qpdf's already-completed dangling
+    /// reference preparation. No resolver borrow spans value destruction.
     pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
         let cached = {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries.remove(&object_ref);
             core.default_xref_entries.remove(&object_ref);
-            core.fixed_dangling_refs = false;
-            core.allocated_object_refs.remove(&object_ref);
-            core.object_cache.remove(&object_ref)
+            core.object_cache.get(&object_ref).cloned()
         };
         if let Some(handle) = cached {
             handle.remove_from_document();
+            self.core.borrow_mut().object_cache.remove(&object_ref);
         }
+        self.core
+            .borrow_mut()
+            .allocated_object_refs
+            .remove(&object_ref);
         Ok(())
     }
 
@@ -10001,6 +10011,60 @@ mod tests {
             ObjectStreamResolutionError::Operation(Error::System(message))
                 if message == "pipeline failed"
         ));
+    }
+
+    #[test]
+    fn remove_object_drops_provider_after_xref_erasure_but_before_cache_erasure() {
+        use std::cell::RefCell;
+        use std::rc::Weak;
+        type ObservedRemoval = Rc<RefCell<Option<(bool, bool, bool)>>>;
+        struct ObserveDrop {
+            resolver: Weak<ResolverHandle<Cursor<Vec<u8>>>>,
+            object: ObjectRef,
+            observed: ObservedRemoval,
+        }
+        impl crate::StreamDataProvider for ObserveDrop {}
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                let resolver = self.resolver.upgrade().unwrap();
+                let handle = resolver.registered_handle(self.object).unwrap();
+                *self.observed.borrow_mut() = Some((
+                    resolver.xref_entry(self.object).is_none(),
+                    handle.is_null(),
+                    handle.is_indirect(),
+                ));
+            }
+        }
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        ))
+        .unwrap();
+        let object = pdf
+            .get_all_objects()
+            .unwrap()
+            .into_iter()
+            .find(|object| object.as_stream_dict().is_some())
+            .unwrap();
+        let object_ref = object.object_ref().unwrap();
+        let observed = Rc::new(RefCell::new(None));
+        object
+            .replace_stream_data_provider(
+                Rc::new(ObserveDrop {
+                    resolver: Rc::downgrade(&pdf.resolver),
+                    object: object_ref,
+                    observed: observed.clone(),
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        pdf.resolver.remove_object(object_ref).unwrap();
+        assert_eq!(*observed.borrow(), Some((true, true, true)));
+        assert!(object.is_direct() && object.is_null());
+        assert!(pdf.resolver.registered_handle(object_ref).is_none());
+        assert!(pdf.dangling_references_fixed());
+        pdf.resolver.remove_object(object_ref).unwrap();
+        assert!(pdf.dangling_references_fixed());
     }
 
     #[test]

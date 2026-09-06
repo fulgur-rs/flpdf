@@ -2155,7 +2155,6 @@ impl ObjectHandle {
 
     /// Turn an indirect canonical slot into the floating null object qpdf
     /// leaves behind after `removeObject`.
-    #[cfg(test)]
     pub(crate) fn remove_from_document(&self) {
         if !self.is_indirect() {
             return;
