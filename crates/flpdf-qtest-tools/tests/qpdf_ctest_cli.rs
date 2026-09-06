@@ -11,6 +11,36 @@ fn minimal_pdf() -> std::path::PathBuf {
         .join("tests/fixtures/minimal.pdf")
 }
 
+fn stream_pdf_without_trailing_payload_newline() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.3\n".to_vec();
+    let mut offsets = vec![0usize];
+    let mut append_object = |number: usize, body: &[u8]| {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    };
+
+    append_object(1, b"<< /Pages 2 0 R /Type /Catalog >>");
+    append_object(2, b"<< /Count 1 /Kids [3 0 R] /Type /Pages >>");
+    append_object(
+        3,
+        b"<< /Contents 4 0 R /MediaBox [0 0 612 792] /Parent 2 0 R /Type /Page >>",
+    );
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"4 0 obj\n<< /Length 7 >>\nstream\npayload\nendstream\nendobj\n");
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Root 1 0 R /Size 5 >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 fn encrypted_fixture(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -696,5 +726,35 @@ fn qpdf_ctest_20_writes_with_specialized_decode_level() {
     assert!(
         has_dct_stream,
         "specialized decode level must preserve the lossy DCT filter"
+    );
+}
+
+#[test]
+fn qpdf_ctest_22_writes_newline_before_endstream() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("input.pdf");
+    let output = directory.path().join("output.pdf");
+    fs::write(&input, stream_pdf_without_trailing_payload_newline())
+        .expect("write test22 input PDF");
+
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .args([
+            "22",
+            input.to_str().expect("input path is UTF-8"),
+            "",
+            output.to_str().expect("output path is UTF-8"),
+        ])
+        .assert()
+        .success()
+        .stdout("C test 22 done\n")
+        .stderr("");
+
+    let output = fs::read(output).expect("read test22 output PDF");
+    assert!(
+        output
+            .windows(b"payload\nendstream".len())
+            .any(|window| { window == b"payload\nendstream" }),
+        "test22 must insert a newline between the payload and endstream"
     );
 }

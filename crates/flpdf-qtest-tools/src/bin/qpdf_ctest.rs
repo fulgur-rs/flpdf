@@ -79,6 +79,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         Some("18") => run_test18(&args[2], &args[3], &args[4]),
         Some("19") => run_test19(&args[2], &args[3], &args[4]),
         Some("20") => run_test20(&args[2], &args[3], &args[4]),
+        Some("22") => run_test22(&args[2], &args[3], &args[4]),
         Some("42") => run_test42(&args[2], &args[4]),
         Some("43") => run_test43(&args[2], &args[4]),
         Some("44") => run_test44(
@@ -675,6 +676,28 @@ fn run_test20(
     writer.set_decode_level(DecodeLevel::Specialized);
     writer.write()?;
     println!("C test 20 done");
+    Ok(())
+}
+
+/// Run qpdf's C API writer configuration case (`qpdf-ctest.c:test22`).
+///
+/// Keep the setter order from qpdf's helper: static IDs and AES IVs are set
+/// before disabling stream compression and enabling the newline policy
+/// (`qpdf/qpdf-ctest.c:470-479`).
+fn run_test22(
+    input_arg: &std::ffi::OsStr,
+    password_arg: &std::ffi::OsStr,
+    output_arg: &std::ffi::OsStr,
+) -> Result<()> {
+    let mut pdf = open_input(input_arg, password_arg)?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(PathBuf::from(output_arg))?;
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_compress_streams(false);
+    writer.set_newline_before_endstream(true);
+    writer.write()?;
+    println!("C test 22 done");
     Ok(())
 }
 
