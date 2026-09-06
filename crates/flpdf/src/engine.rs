@@ -113,7 +113,6 @@ impl<R: Read + Seek> Pdf<R> {
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
-            qpdf_trailer_references: BTreeSet::new(),
             qpdf_parsed_xref_stream_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,
@@ -291,6 +290,16 @@ impl<R: Read + Seek> Pdf<R> {
             warning_options,
             unique_id,
         );
+        // QPDF's parser registers indirect references while reading every
+        // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
+        // Transfer that existing bootstrap parse result into the canonical
+        // cache before any count/allocation or encryption consumer can run.
+        // These cache-only entries stay unresolved until an accessor needs them.
+        for object_ref in trailer_references {
+            if object_ref.number != 0 && object_ref.generation != u16::MAX {
+                resolver.get_object_handle(object_ref);
+            }
+        }
         // qpdf's readTrailer resets InputSource::last_offset to the xref
         // read position before initializeEncryption runs
         // (QPDF.cc:1313-1327). Xref loading happens in a byte snapshot before
@@ -330,7 +339,6 @@ impl<R: Read + Seek> Pdf<R> {
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
-            qpdf_trailer_references: trailer_references,
             qpdf_parsed_xref_stream_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             ever_pushed_inherited_attributes_to_pages: false,

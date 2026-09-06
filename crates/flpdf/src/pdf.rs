@@ -207,9 +207,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// Valid indirect references discovered while preparing qpdf JSON whose
     /// exact object generation has no live xref/cache target.
     pub(crate) qpdf_dangling_refs: BTreeSet<ObjectRef>,
-    /// Valid indirect references parsed from every classic trailer and xref
-    /// stream dictionary in the source `/Prev` chain.
-    pub(crate) qpdf_trailer_references: BTreeSet<ObjectRef>,
     /// Historical xref-stream object identities promoted into the canonical
     /// resolver cache while following the source `/Prev` chain. The parsed
     /// values themselves live on their [`ObjectHandle`]s; this set only keeps

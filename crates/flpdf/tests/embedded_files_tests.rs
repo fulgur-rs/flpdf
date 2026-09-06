@@ -1443,7 +1443,7 @@ fn helper_replace_rejects_foreign_indirect_filespec_without_mutation() {
 }
 
 #[test]
-fn helper_replace_rejects_foreign_direct_filespec_without_mutation() {
+fn helper_accepts_a_contextless_direct_filespec_from_a_promoted_container() {
     let mut source = open(build_no_names_pdf());
     let owner = make_indirect(
         &source,
@@ -1456,15 +1456,20 @@ fn helper_replace_rejects_foreign_direct_filespec_without_mutation() {
     let foreign = owner.get_key(b"/FS");
 
     let mut destination = open(build_no_names_pdf());
-    assert!(destination
+    // makeIndirectObject changes only its top value's owner. The nested
+    // programmatic filespec is still contextless, as in qpdf 11.9.0.
+    assert_eq!(foreign.owning_pdf_unique_id(), None);
+    destination
         .embedded_files()
-        .replace_embedded_file(b"foreign", foreign)
-        .is_err());
-    assert!(destination
+        .replace_embedded_file(b"foreign", foreign.clone())
+        .unwrap();
+    let actual = destination
         .embedded_files()
-        .get_embedded_files()
-        .expect("list")
-        .is_empty());
+        .get_embedded_file(b"foreign")
+        .unwrap()
+        .unwrap();
+    assert!(actual.is_same_object_as(&foreign));
+    assert!(foreign.is_direct());
 }
 
 #[test]

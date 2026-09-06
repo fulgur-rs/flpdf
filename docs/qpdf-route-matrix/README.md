@@ -111,8 +111,8 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 | **型アクセサは必ず dereference する** — 未解決の間接 handle でも `asInteger` / `isNull` は正しい型と値を返す | `libqpdf/QPDFObjectHandle.cc:240-446` / `libqpdf/QPDFObjectHandle.cc:2375-2383` | A6 mixed。解決しない `as_*` / `is_null` 族が prod 合計 686、解決する `try_as_integer` が prod 28 | 未解決の間接 handle に `as_dictionary()` が `None`、`is_null()` が `false` を返す。`/Filter` や `/Type` の判定でこれが起きると分岐が落ち、書き出しバイトが変わる |
 | **object cache に「削除済み」の永続 tombstone は存在しない** — `removeObject` は cache cell ごと erase し、`deleted_objects` は xref 構築が終われば clear される | `libqpdf/QPDF.cc:1995-2005` / `libqpdf/QPDF.cc:706-708` / `libqpdf/QPDF.cc:575` | A2 mixed（`CacheEntry` の `Missing` / `Deleted` に qpdf 対応物なし）。A17 は tombstone を手で消す分岐を持ち、`crates/flpdf/src/reader.rs:1569-1575` のコメント自身が逸脱を明記 | `get_all_objects`（A9）と `live_object_refs`（A10）の列挙が食い違い、writer の到達性集合が経路ごとに変わる。同じ入力で出力 object 数が route 依存になる |
 | **通常の document-owned 型不一致は warning + null/false。dereference や contextless warning は throw しうる** | `libqpdf/QPDFObjectHandle.cc:2168-2189,965-989` | A8 mixed。両 accessor 族とも resolve し、convenience `get_key` / `has_key` が `try_*` の `Err` を panic に変換する | 通常の型不一致自体は panic の証拠ではない。lazy resolution・warning 配送・contextless warning の例外経路を fallible accessor へ移し、warning と例外伝播の境界を保つ |
-| **採番は `getObjectCount()+1` の 1 本**（`obj_cache` の最大 key に基づく） | `libqpdf/QPDF.cc:1872-1880` / `libqpdf/QPDF.cc:1271-1283` | A11 mixed。facade 側 `Pdf::next_available_object_ref` は `Pdf::object_refs()`（A10、legacy cache 混じり）と canonical の max を取る | legacy 側にしか無い ref が採番を押し上げ、新規 object の番号が qpdf と 1 つ以上ずれる。以降の全 xref offset が変わる |
-| **`makeIndirectObject` は同じ `shared_ptr` を cache に登録する（alias が保たれる）** | `libqpdf/QPDF.cc:1882-1888` / `libqpdf/QPDF.cc:1890-1897` | A12 mixed。`Pdf::make_indirect_object_handle` は `direct_value_clone()` で shallow copy するのでコンテナが分離する | promote 後に元 handle を `appendItem` / `replaceKey` しても新 object 側に反映されない。probe A-2 |
+| **採番は `getObjectCount()+1` の 1 本**（`obj_cache` の最大 key に基づく） | `libqpdf/QPDF.cc:1872-1880` / `libqpdf/QPDF.cc:1271-1283` | A11 mixed。facade 側 `Pdf::next_available_object_ref` は `Pdf::object_refs()`（A10、legacy cache 混じり）と canonical の max を取る | public makeIndirect factoryは`.48.20`でcanonical採番へ移行済み。残るfacade consumerではlegacy-only refが採番を押し上げる可能性が残る |
+| **`makeIndirectObject` は同じ `shared_ptr` を cache に登録する（alias が保たれる）** | `libqpdf/QPDF.cc:1882-1888` / `libqpdf/QPDF.cc:1890-1897` | A12 canonical。`.48.20`で両public factoryを同じresolver promotionへ移し、共有ValueIdentityとcache lookupの再設定を接続した | promote 後に元 handle を `appendItem` / `replaceKey` しても新 object 側に反映されない。probe A-2 |
 | **teardown は `xref_table.clear()` → `obj_cache` 全件 disconnect の 1 本** | `libqpdf/QPDF.cc:215-236` / `libqpdf/QPDFObject.cc:13-17` | A20 mixed。walk が 2 本（`crates/flpdf/src/reader/resolver.rs::disconnect_all` と `crates/flpdf/src/xref.rs:85-126` の `BootstrapCache` の `Drop`）で、qpdf が先に行う `xref_table.clear()` に対応する行が無い | bootstrap 側だけが持つ handle が canonical の teardown walk から漏れる。`xref_table` を先に潰さないため「teardown 後に resolve が成功する」窓が理論上残る。probe A-4 |
 
 ### 5.B parser / xref recovery / warning・error・diagnostics
@@ -963,7 +963,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | ID | 状態 | 影響する行 | 次の確認 / 保持する契約 |
 |---|---|---|---|
 | A-1 | 未観測 | A2/A10 | legacy/cache列挙差をfixture集合で比較し、bootstrap identityの前提を切り出す。常に空だったremoved-ref集合は `flpdf-3yn9.48.21` で撤去済みで、観測差の根拠ではない。 |
-| A-2 | 未観測 | A12 | qpdf/RustでmakeIndirectObject後に元handleのarray/dictを変更し、aliasが保たれるか比較する。 |
+| A-2 | RED→GREEN | A12 | `.48.20`: retained direct aliasのmutationが出力に反映される。再昇格・共有値・reserved/destroyed・cache lookup・最大IDはC++ oracleとRustで検証。 |
 | A-3 | 内部契約確認 | A13 | removeObjectのcache eraseとowner切断をinternal witnessで確認する。削除済みpublic wrapperをprobe前提に戻さない。 |
 | A-4 | 未観測 | A1/A20 | bootstrap handleの持越しidentityとdisconnect順序を確認する。 |
 | B-P1 | 既存probeで二重warningなし | B14 | 自己参照Prevでは双方同じ3 warning・exit 3。追加chainを調べ、二重pushを既知事実として扱わない。 |

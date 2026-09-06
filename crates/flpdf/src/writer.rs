@@ -2215,7 +2215,7 @@ fn replace_writer_catalog<R: Read + Seek>(
         return Ok(());
     }
     let root = pdf.root_handle()?;
-    root.share_value_state_with(&catalog)?;
+    root.assign_value_state(&catalog);
     pdf.mark_object_handle_dirty(&root)
 }
 

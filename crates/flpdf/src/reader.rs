@@ -1231,17 +1231,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// intentionally separate from fresh-object allocation, which belongs to
     /// `flpdf-25kg.3.24`.
     pub(crate) fn get_object_count(&mut self) -> Result<u32> {
-        // qpdf's getObjectCount observes the same prepared object cache that
-        // getAllObjects later enumerates. The document facade also owns
-        // historical trailer/xref-stream registrations that are not part of
-        // ResolverHandle's source-xref table, so prepare through the canonical
-        // document route before deriving the largest visible object number.
-        let objects = self.get_all_objects()?;
-        Ok(objects
-            .into_iter()
-            .filter_map(|handle| handle.object_ref().map(|object_ref| object_ref.number))
-            .max()
-            .unwrap_or(0))
+        self.resolver.get_object_count()
     }
 
     /// Collect compressible objects through qpdf's document-owned live walk.
@@ -1317,7 +1307,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.next_obj_gen()
     }
 
-    /// Promote and register an existing direct handle without cloning its
+    /// Promote and register an existing initialized handle without cloning its
     /// allocation or scheduling writer output. This is qpdf's
     /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`). The returned
     /// handle retains the existing object allocation and is not automatically
@@ -1557,74 +1547,21 @@ impl<R: Read + Seek> Pdf<R> {
         })
     }
 
-    /// Allocate a fresh object number and register `handle`'s value as its
-    /// indirect object, mirroring `QPDF::makeIndirectObject`
-    /// (`libqpdf/QPDF.cc:1891-1896`, allocating via `nextObjGen()` and
-    /// `obj_cache[next] = ObjCache(obj, -1, -1)`,
-    /// `libqpdf/QPDF.cc:1885-1888`).
+    /// Register the existing object allocation under a fresh indirect identity.
     ///
-    /// The returned handle is a new, distinct object identity: replacing
-    /// `handle`'s own top-level value afterward does not change the
-    /// returned object, or vice versa. `handle`'s current value is only
-    /// shallow-copied, though — an array or dictionary's own container is
-    /// cloned, but its direct children remain the same shared handles, so
-    /// mutating a nested child through either copy is visible through both.
-    ///
-    /// The new object uses the next unused generation-zero object number,
-    /// including object numbers registered by earlier calls.
-    ///
-    /// Indirect handles nested in `handle`'s direct value are not validated
-    /// or copied: they must already belong to this document. A nested
-    /// indirect handle from another `Pdf` is neither copied nor registered
-    /// here, so a later write can emit its foreign object number as a
-    /// dangling reference or resolve it to an unrelated object that happens
-    /// to share that number in this document. Use
-    /// [`Self::copy_foreign_object`] first for handles that belong to
-    /// another document.
+    /// qpdf's `makeIndirectObject` rejects only uninitialized input, prepares
+    /// the canonical cache through `getObjectCount`, and stores the same
+    /// object before setting its new identity (`libqpdf/QPDF.cc:1872-1897`).
+    /// Direct, indirect, and reserved inputs retain their aliases. Existing
+    /// cache entries for a re-promoted object remain present; looking one up
+    /// sets the shared value's active identity to that entry's key.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] if `handle` is indirect, mirroring
-    /// qpdf's own rejection of an already-indirect input
-    /// (`libqpdf/QPDF.cc:1891-1894`, `std::logic_error("attempted to make
-    /// an uninitialized QPDFObjectHandle indirect")` — this crate has no
-    /// "uninitialized handle" state to reject separately, since every
-    /// `ObjectHandle` is always validly constructed).
-    ///
-    /// Also returns [`Error::Unsupported`] for a *direct* reserved `handle`
-    /// (only reachable via [`ObjectHandle::shallow_copy`] on a reserved
-    /// handle). Such a handle is not indirect, so this crate cannot
-    /// honestly answer the "already indirect?" question with `false`
-    /// either: reserved values cannot be promoted by this method. Use
-    /// [`Self::make_indirect_from_object_handle`] when the existing handle
-    /// identity must be preserved.
+    /// Returns [`Error::Internal`] for an uninitialized handle, or propagates
+    /// cache preparation and object-number exhaustion errors.
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        let Some(value) = handle.direct_value_clone()? else {
-            return Err(Error::Unsupported(
-                "cannot make an already-indirect ObjectHandle indirect".to_string(),
-            ));
-        };
-        // qpdf's makeIndirectObject calls nextObjGen, which first calls
-        // getObjectCount and therefore prepares every effective xref entry
-        // before choosing the next object number. The shared helper below is
-        // also used by lazy reservation paths, so keep this preparation on
-        // the qpdf-shaped allocation boundary only.
-        self.resolver.get_object_count()?;
-        let new_ref = self.next_available_object_ref()?;
-        let indirect = self.get_object_handle(new_ref);
-        indirect.set_resolved(value);
-        handle.copy_description_and_parsed_offset_to(&indirect);
-        // QPDF::makeIndirectFromQPDFObject installs the same shared object
-        // pointer in obj_cache. `handle_registry` is this port's shared
-        // state, and `prepare_qpdf_json_objects` recognizes its resolved
-        // cache-miss handles directly; materializing here would duplicate a
-        // direct stream's payload into the legacy `Object` cache.
-        // A new object left out of the dirty set would never get its own body
-        // or xref entry in the canonical output, leaving any reference to it
-        // dangling — see `mark_object_dirty`'s own doc comment for the full
-        // explanation.
-        self.mark_object_dirty(new_ref);
-        Ok(indirect)
+        self.resolver.make_indirect_from_object_handle(handle)
     }
 
     /// Return an unused generation-zero object reference.
@@ -1796,19 +1733,6 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    fn register_trailer_references(&mut self) -> Vec<ObjectRef> {
-        let trailer_refs: Vec<_> = self
-            .qpdf_trailer_references
-            .iter()
-            .copied()
-            .filter(|object_ref| object_ref.number != 0 && object_ref.generation != u16::MAX)
-            .collect();
-        for object_ref in &trailer_refs {
-            self.get_object_handle(*object_ref);
-        }
-        trailer_refs
-    }
-
     /// Return qpdf's complete canonical object cache in `ObjectRef` order.
     ///
     /// `QPDF::getAllObjects` first calls `fixDanglingReferences` and then
@@ -1819,21 +1743,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// effective source table, matching qpdf's `insertFreeXrefEntry` split
     /// between `xref_table` and `deleted_objects`.
     pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
-        let trailer_refs = self.register_trailer_references();
-        self.resolver.fix_dangling_references()?;
-
-        // qpdf's parser creates trailer-reference cache entries before
-        // fixDanglingReferences. Resolve the registered seeds after the xref
-        // pass so a trailer-only reference with no row becomes an explicit
-        // missing/null cache entry rather than escaping enumeration as
-        // Unresolved.
-        for object_ref in trailer_refs {
-            self.get_object_handle(object_ref).try_dereference()?;
-        }
-
         Ok(self
             .resolver
-            .all_object_handles()
+            .get_all_objects()?
             .into_iter()
             .filter(|handle| {
                 handle.object_ref().is_none_or(|object_ref| {

@@ -1226,7 +1226,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Borrow discipline: the `borrow_mut()` spans only the map lookup and
     /// the `ObjectHandle` construction, neither of which resolves anything.
     pub(crate) fn get_object_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
-        self.core
+        let handle = self
+            .core
             .borrow_mut()
             .object_cache
             .entry(object_ref)
@@ -1239,7 +1240,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     resolver,
                 )
             })
-            .clone()
+            .clone();
+        handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone())
     }
 
     /// Return qpdf's `reserveObjectIfNotExists` result for one object identity.
@@ -1497,12 +1499,34 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .contains(&object_ref)
     }
 
-    /// Every canonical handle minted so far, in [`ObjectRef`] order.
-    ///
-    /// qpdf `QPDF::getAllObjects` walks `m->obj_cache` the same way
-    /// (`libqpdf/QPDF.cc:1285-1295`).
+    /// Raw cache values for internal inspection, without `newIndirect`'s
+    /// active-identity update. Public enumeration uses [`Self::get_all_objects`].
     pub(crate) fn all_object_handles(&self) -> Vec<ObjectHandle> {
         self.core.borrow().object_cache.values().cloned().collect()
+    }
+
+    /// Prepare and enumerate qpdf's cache in key order. Each `newIndirect`
+    /// updates the shared value's active identity, including cache entries
+    /// that hold the same QObject or QPDFValue (`QPDF.cc:1285-1295`).
+    pub(crate) fn get_all_objects(&self) -> Result<Vec<ObjectHandle>> {
+        self.fix_dangling_references()?;
+        let entries: Vec<_> = self
+            .core
+            .borrow()
+            .object_cache
+            .iter()
+            .map(|(object_ref, handle)| (*object_ref, handle.clone()))
+            .collect();
+        Ok(entries
+            .into_iter()
+            .map(|(object_ref, handle)| {
+                handle.promote_to_indirect(
+                    object_ref,
+                    self.pdf_unique_id.get(),
+                    self.self_weak.clone(),
+                )
+            })
+            .collect())
     }
 
     /// The largest object *number* any canonical handle occupies.
@@ -1589,37 +1613,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
         &self,
         handle: ObjectHandle,
     ) -> Result<ObjectHandle> {
-        if !handle.is_direct() {
-            return Err(Error::Unsupported(
-                "cannot make an already-indirect ObjectHandle indirect".to_string(),
-            ));
-        }
         if !handle.is_initialized() {
-            return Err(Error::Unsupported(
+            return Err(Error::Internal(
                 "attempted to make an uninitialized QPDFObjectHandle indirect".to_string(),
             ));
         }
         let object_ref = self.next_obj_gen()?;
-        // A contextless direct root already claimed by a name/number tree
-        // wrapper for a different Pdf must not be silently re-owned here:
-        // that wrapper's existing (cached) claim would otherwise go stale,
-        // letting it keep operating on what is now this Pdf's object. Run
-        // after next_obj_gen so a failed allocation leaves `handle`
-        // completely untouched, matching every other fallible step here.
-        handle.claim_tree_pdf(self.pdf_unique_id.get())?;
-        let promoted = handle.promote_to_indirect(
-            object_ref,
-            self.pdf_unique_id.get(),
-            self.self_weak.clone(),
-        );
-        let mut core = self.core.borrow_mut();
-        let previous = core.object_cache.insert(object_ref, promoted.clone());
-        core.allocated_object_refs.insert(object_ref);
-        debug_assert!(
-            previous.is_none(),
-            "next_obj_gen must return a fresh ObjGen"
-        );
-        Ok(promoted)
+        {
+            let mut core = self.core.borrow_mut();
+            core.object_cache.insert(object_ref, handle.clone());
+            core.allocated_object_refs.insert(object_ref);
+        }
+        Ok(
+            handle.promote_to_indirect(
+                object_ref,
+                self.pdf_unique_id.get(),
+                self.self_weak.clone(),
+            ),
+        )
     }
 
     /// Replace the canonical value for `object_ref` without replacing the
@@ -1630,13 +1641,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// calls `updateCache` (`QPDF.cc:1986-1993`). qpdf's
     /// `QPDFObjectHandle::isInitialized()` is only the non-null object-pointer
     /// check (`QPDFObjectHandle.hh:1636`), so qpdf Reserved/Destroyed values
-    /// are not rejected by that guard. flpdf deliberately retains its existing
-    /// narrower `Resolved(ObjectValue)` source contract; the preflight below
-    /// enforces that contract before minting an absent target cache entry.
+    /// are not rejected by that guard. The replacement receives its target
+    /// identity before the existing cache slot adopts the shared value; an
+    /// absent cache entry registers the replacement QObject itself.
     /// `QPDFObject::assign` inside that update shares the replacement's
     /// `QPDFValue` (`QPDF.cc:1986-1993,1835-1857`;
     /// `QPDFObject_private.hh:117-120`), which is represented by
-    /// [`ObjectHandle::share_value_state_with`].
+    /// [`ObjectHandle::assign_value_state`].
     pub(crate) fn replace_object(
         &self,
         object_ref: ObjectRef,
@@ -1652,13 +1663,26 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
             ));
         }
-        // `share_value_state_with` retains the same contract, but this
-        // preflight must run before `get_object_handle`: a failed replacement
+        // Preflight must run before preparing the replacement identity or
+        // `get_object_handle`: a failed replacement
         // must not leave an absent target in the canonical object cache.
         replacement.validate_replacement_source()?;
 
-        let target = self.get_object_handle(object_ref);
-        target.share_value_state_with(&replacement)?;
+        replacement.promote_to_indirect(
+            object_ref,
+            self.pdf_unique_id.get(),
+            self.self_weak.clone(),
+        );
+        let target = if let Some(target) = self.registered_handle(object_ref) {
+            target.assign_value_state(&replacement);
+            target
+        } else {
+            self.core
+                .borrow_mut()
+                .object_cache
+                .insert(object_ref, replacement.clone());
+            replacement
+        };
         target.clear_description();
         target.reset_parsed_offset();
         target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
@@ -1679,10 +1703,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// their value allocations. Unknown object generations therefore resolve
     /// to qpdf's ordinary null object before the swap.
     pub(crate) fn swap_objects(&self, first: ObjectRef, second: ObjectRef) -> Result<()> {
-        let first_handle = self.get_object_handle(first);
-        let second_handle = self.get_object_handle(second);
-        first_handle.try_dereference()?;
-        second_handle.try_dereference()?;
+        let first_handle = self
+            .registered_handle(first)
+            .unwrap_or_else(|| self.get_object_handle(first));
+        if !first_handle.is_resolved() {
+            self.resolve_indirect(first, &first_handle)?;
+        }
+        let second_handle = self
+            .registered_handle(second)
+            .unwrap_or_else(|| self.get_object_handle(second));
+        if !second_handle.is_resolved() {
+            self.resolve_indirect(second, &second_handle)?;
+        }
         first_handle.swap_value_state_with(&second_handle);
         Ok(())
     }
@@ -4839,7 +4871,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         result: Result<()>,
     ) -> Result<()> {
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
                 // qpdf catches QPDFExc/std::exception around both
                 // resolve dispatch arms, warns, and lets the common
@@ -4849,10 +4881,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // and diagnostic-channel failures remain caller errors.
                 self.push_caught_resolution_warning(error, object_ref)?;
                 handle.set_resolved(ObjectValue::Null);
-                Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
         }
+        // QPDF's successful/null updateCache writes the requested identity
+        // onto the installed value. This differs from a cache hit: a prior
+        // promotion can have left this unresolved QObject under another key.
+        handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone());
+        Ok(())
     }
 
     #[inline(never)]
@@ -14152,6 +14188,25 @@ mod tests {
             "a fixed preparation must not resolve the xref table again"
         );
         assert!(reads_after_first > reads_before);
+    }
+
+    #[test]
+    fn object_count_observes_cache_keys_without_rebinding_promoted_aliases() {
+        let mut pdf = Pdf::empty().unwrap();
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .unwrap();
+        let old_ref = source.object_ref().unwrap();
+        pdf.make_indirect_object_handle(source.clone()).unwrap();
+        let new_ref = source.object_ref().unwrap();
+        pdf.get_object_handle(old_ref);
+        assert_eq!(pdf.get_object_count().unwrap(), new_ref.number);
+        assert_eq!(source.object_ref(), Some(old_ref));
+        let next = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(2))
+            .unwrap();
+        assert_eq!(next.object_ref().unwrap().number, new_ref.number + 1);
+        assert_eq!(source.object_ref(), Some(old_ref));
     }
 
     #[test]
