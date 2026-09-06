@@ -287,9 +287,15 @@ impl ArgParser {
             };
             if let Some(parameter_name) = required_parameter_name(&option) {
                 if !has_attached_parameter(canonical.as_bytes()) {
-                    return Err(
-                        format!("--{option} must be given as --{option}={parameter_name}").into(),
-                    );
+                    // qpdf raises this through `QPDFArgParser::usage`
+                    // (`QPDFArgParser.cc:506-508`), so it must render the
+                    // blank-line + `For help:` usage block, not a bare
+                    // `<prog>: <msg>` line. Route it through the shared
+                    // `UsageError` boundary that `usage_exit` formats.
+                    return Err(flpdf::UsageError::new(format!(
+                        "--{option} must be given as --{option}={parameter_name}"
+                    ))
+                    .into());
                 }
             }
             let Some(kind) = SegmentKind::from_option(&option) else {
