@@ -11,6 +11,14 @@ use crate::object_handle::{legacy_dictionary_key, ObjectHandle, ObjectValue};
 use crate::{Error, ObjectRef, Result};
 use std::collections::BTreeSet;
 
+/// qpdf's `writeTrailer` form selector (`QPDFWriter.cc:1160-1236`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrailerKind {
+    Normal { size: i64 },
+    LinearizedFirst { size: i64, prev: u64 },
+    LinearizedSecond { size: i64 },
+}
+
 /// The single writer-owned emission surface for live `ObjectHandle` values.
 ///
 /// This is deliberately crate-private: it is the writer-owned replacement for
@@ -151,6 +159,18 @@ pub(crate) trait ObjectWriterEmission {
     fn write_trailer_with_ref_map(
         &self,
         out: &mut Vec<u8>,
+        xref_stream: bool,
+        qdf: bool,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        suppress_null_values: bool,
+    ) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn write_trailer_with_ref_map_and_kind(
+        &self,
+        out: &mut Vec<u8>,
+        kind: TrailerKind,
         xref_stream: bool,
         qdf: bool,
         id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
@@ -973,6 +993,44 @@ impl ObjectWriterEmission for ObjectHandle {
             };
             unparse_trailer_entries_with_ref_map(
                 &entries,
+                xref_stream,
+                qdf,
+                id_writer,
+                map,
+                removed_refs,
+                suppress_null_values,
+                out,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_trailer_with_ref_map_and_kind(
+        &self,
+        out: &mut Vec<u8>,
+        kind: TrailerKind,
+        xref_stream: bool,
+        qdf: bool,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        suppress_null_values: bool,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            unparse_trailer_entries_with_ref_map_and_kind(
+                &entries,
+                kind,
                 xref_stream,
                 qdf,
                 id_writer,
@@ -3144,6 +3202,131 @@ fn unparse_trailer_entries_with_ref_map(
         write_child(value, out)?;
     }
 
+    if qdf {
+        if id_value.is_some() || encrypt_value.is_some() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b">>\n");
+    } else {
+        out.extend_from_slice(b" >>");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unparse_trailer_entries_with_ref_map_and_kind(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    kind: TrailerKind,
+    xref_stream: bool,
+    qdf: bool,
+    mut id_writer: Option<crate::pdf_syntax::TrailerIdWriter>,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    suppress_null_values: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let (size, prev, second_half) = match kind {
+        TrailerKind::Normal { size } => (size, None, false),
+        TrailerKind::LinearizedFirst { size, prev } => (size, Some(prev), false),
+        TrailerKind::LinearizedSecond { size } => (size, None, true),
+    };
+    if qdf {
+        out.extend_from_slice(b"trailer <<\n");
+    } else if !xref_stream {
+        out.extend_from_slice(b"trailer <<");
+    }
+
+    let mut id_value: Option<&ObjectHandle> = None;
+    let mut encrypt_value: Option<&ObjectHandle> = None;
+    for (key, value) in entries {
+        match key.as_slice() {
+            b"/ID" => {
+                id_value = Some(value);
+                continue;
+            }
+            b"/Encrypt" => {
+                if !second_half {
+                    encrypt_value = Some(value);
+                }
+                continue;
+            }
+            b"/Prev" => continue,
+            _ if second_half && key.as_slice() != b"/Size" => continue,
+            _ => {}
+        }
+
+        if key.as_slice() == b"/Size" {
+            if qdf {
+                out.extend_from_slice(b"  ");
+            } else {
+                out.push(b' ');
+            }
+            write_dictionary_key(out, key);
+            out.extend_from_slice(b" ");
+            out.extend_from_slice(size.to_string().as_bytes());
+            if let Some(prev) = prev {
+                out.extend_from_slice(b" /Prev ");
+                let prev_text = prev.to_string();
+                out.extend_from_slice(prev_text.as_bytes());
+                let padding = 21usize.saturating_sub(prev_text.len());
+                out.extend(std::iter::repeat_n(b' ', padding));
+            }
+            if qdf {
+                out.push(b'\n');
+            }
+            continue;
+        }
+
+        if suppress_null_values && value.try_is_null()? {
+            continue;
+        }
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if qdf {
+            out.extend_from_slice(b"  ");
+        } else {
+            out.push(b' ');
+        }
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        if key.as_slice() == b"/Root" && value.object_ref().is_none() {
+            if qdf {
+                write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+            } else {
+                write_child_with_ref_map(value, out, map, removed_refs)?;
+            }
+        } else if key.as_slice() == b"/Root" {
+            if qdf {
+                write_child_qdf(value, 2, out)?;
+            } else {
+                write_child(value, out)?;
+            }
+        } else if qdf {
+            write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
+        } else {
+            write_child_with_ref_map(value, out, map, removed_refs)?;
+        }
+        if qdf {
+            out.push(b'\n');
+        }
+    }
+
+    if let Some(value) = id_value {
+        if qdf {
+            out.extend_from_slice(b"  /ID ");
+        } else {
+            out.extend_from_slice(b" /ID ");
+        }
+        match id_writer.as_mut() {
+            Some(write_id) => write_id(out),
+            None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
+        }
+    }
+    if let Some(value) = encrypt_value {
+        out.extend_from_slice(b" /Encrypt ");
+        write_child(value, out)?;
+    }
     if qdf {
         if id_value.is_some() || encrypt_value.is_some() {
             out.push(b'\n');

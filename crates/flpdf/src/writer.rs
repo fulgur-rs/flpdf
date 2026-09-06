@@ -5745,14 +5745,22 @@ mod final_handle_writer_tests {
         }
     }
 
-    fn shared_trailer_contract_fixture() -> ObjectHandle {
-        ObjectHandle::dictionary(vec![
+    fn shared_trailer_contract_fixture(
+    ) -> (Pdf<Cursor<Vec<u8>>>, ObjectHandle, ObjectRef, ObjectRef) {
+        let pdf = Pdf::empty().expect("empty PDF for trailer fixture");
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .expect("indirect root fixture");
+        let encrypt = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("indirect encryption fixture");
+        let root_ref = root.object_ref().expect("root object reference");
+        let encrypt_ref = encrypt.object_ref().expect("encryption object reference");
+        let trailer = ObjectHandle::dictionary(vec![
             (b"/Info".to_vec(), ObjectHandle::integer(1)),
             (b"/Name".to_vec(), ObjectHandle::name(b"N".to_vec())),
-            (
-                b"/Root".to_vec(),
-                ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), -1),
-            ),
+            (b"/Root".to_vec(), root),
+            (b"/Size".to_vec(), ObjectHandle::integer(99)),
             (b"/NullEntry".to_vec(), ObjectHandle::null()),
             (
                 b"/ID".to_vec(),
@@ -5761,16 +5769,14 @@ mod final_handle_writer_tests {
                     ObjectHandle::string(b"id1".to_vec()),
                 ]),
             ),
-            (
-                b"/Encrypt".to_vec(),
-                ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1),
-            ),
-        ])
+            (b"/Encrypt".to_vec(), encrypt),
+        ]);
+        (pdf, trailer, root_ref, encrypt_ref)
     }
 
     #[test]
     fn shared_trailer_contract_emits_normal_qdf_and_linearized_forms() {
-        let trailer = shared_trailer_contract_fixture();
+        let (_pdf, trailer, root_ref, encrypt_ref) = shared_trailer_contract_fixture();
         let map = |object_ref| Ok(object_ref);
         let removed = BTreeSet::new();
 
@@ -5789,7 +5795,11 @@ mod final_handle_writer_tests {
             .expect("normal shared trailer succeeds");
         assert_eq!(
             normal,
-            b"trailer << /Info 1 /Name /N /Root 2 0 R /Size 6 /ID [<696430><696431>] /Encrypt 9 0 R >>"
+            format!(
+                "trailer << /Info 1 /Name /N /Root {} 0 R /Size 6 /ID [<696430><696431>] /Encrypt {} 0 R >>",
+                root_ref.number, encrypt_ref.number
+            )
+            .as_bytes()
         );
 
         let mut qdf = Vec::new();
@@ -5807,7 +5817,11 @@ mod final_handle_writer_tests {
             .expect("QDF shared trailer succeeds");
         assert_eq!(
             qdf,
-            b"trailer <<\n  /Info 1\n  /Name /N\n  /Root 2 0 R\n  /Size 6\n  /ID [<696430><696431>]\n /Encrypt 9 0 R\n>>\n"
+            format!(
+                "trailer <<\n  /Info 1\n  /Name /N\n  /Root {} 0 R\n  /Size 6\n  /ID [<696430><696431>] /Encrypt {} 0 R\n>>\n",
+                root_ref.number, encrypt_ref.number
+            )
+            .as_bytes()
         );
 
         let mut first = Vec::new();
@@ -5825,8 +5839,14 @@ mod final_handle_writer_tests {
             .expect("linearized first trailer succeeds");
         let first_text = String::from_utf8(first).expect("trailer is UTF-8");
         let prev_start = first_text.find("/Prev ").expect("/Prev is present") + 6;
-        assert_eq!(&first_text.as_bytes()[prev_start..prev_start + 21], b"123                  ");
-        assert!(first_text.ends_with(" /ID [<696430><696431>] /Encrypt 9 0 R >>"));
+        assert_eq!(
+            &first_text.as_bytes()[prev_start..prev_start + 21],
+            b"123                  "
+        );
+        assert!(first_text.ends_with(&format!(
+            " /ID [<696430><696431>] /Encrypt {} 0 R >>",
+            encrypt_ref.number
+        )));
 
         let mut second = b"<< /Type /XRef".to_vec();
         trailer
@@ -5841,19 +5861,18 @@ mod final_handle_writer_tests {
                 true,
             )
             .expect("linearized second xref trailer succeeds");
-        assert_eq!(
-            second,
-            b"<< /Type /XRef /Size 6 /ID [<696430><696431>] >>"
-        );
+        assert_eq!(second, b"<< /Type /XRef /Size 6 /ID [<696430><696431>] >>");
     }
 
     #[test]
     fn shared_trailer_contract_preserves_writer_owned_keys_and_id_writer() {
-        let trailer = shared_trailer_contract_fixture();
-        let map = |object_ref| Ok(ObjectRef::new(object_ref.number + 100, 0));
-        let removed = [ObjectRef::new(2, 0)].into_iter().collect();
+        let (_pdf, trailer, root_ref, encrypt_ref) = shared_trailer_contract_fixture();
+        let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
+            Ok(ObjectRef::new(object_ref.number + 100, 0))
+        };
+        let removed = [root_ref].into_iter().collect();
         let mut output = Vec::new();
-        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<custom>]" );
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<custom>]");
 
         trailer
             .write_trailer_with_ref_map_and_kind(
@@ -5870,7 +5889,10 @@ mod final_handle_writer_tests {
         let text = String::from_utf8(output).expect("trailer is UTF-8");
         assert!(!text.contains("/NullEntry"));
         assert!(!text.contains("/Root"));
-        assert!(text.contains("/ID [<custom>] /Encrypt 9 0 R"));
+        assert!(text.contains(&format!(
+            "/ID [<custom>] /Encrypt {} 0 R",
+            encrypt_ref.number
+        )));
     }
 
     #[test]
