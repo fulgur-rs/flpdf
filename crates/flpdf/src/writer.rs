@@ -3611,7 +3611,7 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     // copy. It therefore needs no Catalog snapshot/restore; specialized routes
     // still retain that boundary until their own root consumers migrate.
     if plain::eligible(pdf.is_encrypted(), options, options.object_streams) {
-        return emit_canonical_pdf_inner(pdf, out, options, special_streams);
+        return emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
     }
 
     // Reuse the qpdf-shaped snapshot boundary so resolving the Catalog cannot
