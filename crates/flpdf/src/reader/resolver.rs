@@ -12362,8 +12362,10 @@ mod tests {
             }
         }
 
-        let mut options = crate::PdfOpenOptions::default();
-        options.description = b"input.pdf".to_vec();
+        let options = crate::PdfOpenOptions {
+            description: b"input.pdf".to_vec(),
+            ..Default::default()
+        };
         let mut pdf = Pdf::open_with_options(
             Breakable {
                 inner: std::io::Cursor::new(minimal_pdf_bytes()),
