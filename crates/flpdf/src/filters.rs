@@ -7,7 +7,7 @@ use crate::stream_filter::{
     decode_filter_specs_from_handle, encode_flate, encode_run_length,
     is_decoded_filter as stream_is_decoded_filter,
     passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
-    undecodable_filter_error, DecodeParams, FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED,
+    undecodable_filter_error, FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED,
 };
 use crate::{Error, Result};
 
@@ -327,7 +327,7 @@ pub(crate) fn encode_stream_data_from_handle(
 /// [`CRYPT_STAGE_UNSUPPORTED`] so that this provider and the registry-side
 /// `CryptStreamFilter::pipe_decode_recovering` report one definition rather
 /// than one literal per route.
-fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec<u8>> {
+fn reject_crypt_stage(_decode_params: &ObjectHandle, _data: &[u8]) -> Result<Vec<u8>> {
     Err(Error::Unsupported(CRYPT_STAGE_UNSUPPORTED.to_string()))
 }
 
@@ -430,7 +430,7 @@ fn decode_stream_data_from_handle_with_mode(
 /// function both the production handle reader and the test-only materialized
 /// fixture reader call. Plan decision D2 of `flpdf-25kg.3.4`
 /// keeps it an explicit parameter instead of a document hookup.
-type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>;
+type CryptProvider<'a> = &'a mut dyn FnMut(&ObjectHandle, &[u8]) -> Result<Vec<u8>>;
 
 /// Run the staging, codec, and warning-ordering engine over already-read
 /// filter specs.
@@ -444,7 +444,7 @@ type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u
 /// `/DecodeParms` object shape.
 ///
 /// [`DecodeLimits::max_filter_chain`] is applied above this function, before
-/// either reader snapshots its filter specs. The shared
+/// the handle reader copies its filter specs. The shared
 /// `validate_filter_chain_count` keeps the error text identical; the
 /// test-only equivalence corpus pins the placement against the handle reader.
 fn decode_prepared_specs(
@@ -477,16 +477,17 @@ fn decode_prepared_specs(
                 data
             }
             PreparedStage::Codec { adapter } => {
-                let mut next_pending_data_boundary = pending_data_boundary.map(|boundary| {
+                let mut next_pending_data_boundary = None;
+                if let Some(boundary) = pending_data_boundary {
                     let prefix_data = &decoded[..boundary.0];
-                    let prefix = decode_codec_prefix(&stage.spec, prefix_data, limits);
+                    let prefix = decode_codec_prefix(&stage.spec, prefix_data, limits)?;
                     let input_end = if boundary.1 {
                         prefix.data.len()
                     } else {
                         prefix.cleanup_data_start
                     };
-                    PendingDataBoundary(input_end, boundary.1)
-                });
+                    next_pending_data_boundary = Some(PendingDataBoundary(input_end, boundary.1));
+                }
                 let mut stage_warnings = Vec::new();
                 let outcome = adapter.pipe_decode_recovering(
                     decoded.as_ref(),
@@ -634,7 +635,7 @@ fn prepare_decode_filters(
         let Some(mut adapter) = stream_filter_for(filter_name) else {
             return Err(undecodable_filter_error(filter_name));
         };
-        if !adapter.set_decode_params(&spec.decode_params) {
+        if !adapter.set_decode_params(&spec.decode_params)? {
             return Err(Error::Unsupported(format!(
                 "stream filter {} does not support supplied /DecodeParms",
                 String::from_utf8_lossy(filter_name)
@@ -768,7 +769,7 @@ fn decode_codec_prefix(
     spec: &FilterSpec,
     data: &[u8],
     limits: DecodeLimits,
-) -> crate::stream_filter::FilterDecodeOutcome {
+) -> Result<crate::stream_filter::FilterDecodeOutcome> {
     let filter_name = spec.normalized_name();
     let mut adapter =
         stream_filter_for(filter_name).expect("a prepared codec has a registered prefix decoder");
@@ -776,12 +777,12 @@ fn decode_codec_prefix(
     // on, so applying the parameters *inside* the assertion silently skipped
     // the predictor in release builds and produced a different prefix length,
     // a different event boundary, and ultimately a different public error.
-    let applied = adapter.set_decode_params(&spec.decode_params);
+    let applied = adapter.set_decode_params(&spec.decode_params)?;
     debug_assert!(applied);
     adapter.set_tiff_memory_limit(limits.max_tiff_memory);
-    adapter
+    Ok(adapter
         .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
-        .expect("preflighted codec prefix pipeline is infallible")
+        .expect("preflighted codec prefix pipeline is infallible"))
 }
 
 fn encode_stream_data_from_specs(specs: Vec<FilterSpec>, stream_data: &[u8]) -> Result<Vec<u8>> {
@@ -805,7 +806,7 @@ fn encode_stream_data_from_specs(specs: Vec<FilterSpec>, stream_data: &[u8]) -> 
 /// target filter's DecodeParms contract before encoding.
 fn apply_encode_params(
     filter_name: &[u8],
-    decode_params: &DecodeParams,
+    decode_params: &ObjectHandle,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
     crate::stream_filter::encode_predictor(stream_data, filter_name, decode_params)

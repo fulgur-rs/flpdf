@@ -131,8 +131,8 @@ use crate::{
         Discard, Pipeline, PipelineError, PipelineRef, PlString,
     },
     stream_filter::{
-        decode_params_from_handle, normalize_filter_name, stream_filter_for, OwnedDecodePipeline,
-        StreamFilter, DECODE_PARMS_LENGTH_ERROR, FILTER_TYPE_ERROR,
+        normalize_filter_name, stream_filter_for, OwnedDecodePipeline, StreamFilter,
+        DECODE_PARMS_LENGTH_ERROR, FILTER_TYPE_ERROR,
     },
     writer::DecodeLevel,
 };
@@ -6668,21 +6668,23 @@ impl ObjectHandle {
             specialized_compression: false,
             lossy_compression: false,
         };
-        for ((name, mut filter), decode_params) in filter_names
-            .into_iter()
-            .zip(filters)
-            .zip(decode_param_handles)
-        {
-            let filter_name = normalize_filter_name(&name);
-            let decode_params = decode_params_from_handle(&decode_params, filter_name)?;
-            if !filter.set_decode_params(&decode_params) {
-                return Ok(None);
+        let mut filterable = true;
+        for (mut filter, decode_params) in filters.into_iter().zip(decode_param_handles) {
+            // qpdf calls every stage's setDecodeParms before returning the
+            // aggregate filterable result (`QPDF_Stream.cc:467-482`). Keep
+            // capability flags only from accepted stages; a rejected stage
+            // still has to run so its later warning/resolution effects remain
+            // observable.
+            let stage_filterable = filter.set_decode_params(&decode_params)?;
+            if !stage_filterable {
+                filterable = false;
+            } else {
+                plan.specialized_compression |= filter.is_specialized_compression();
+                plan.lossy_compression |= filter.is_lossy_compression();
             }
-            plan.specialized_compression |= filter.is_specialized_compression();
-            plan.lossy_compression |= filter.is_lossy_compression();
             plan.filters.push(filter);
         }
-        Ok(Some(plan))
+        Ok(filterable.then_some(plan))
     }
 
     /// qpdf `QPDF_Stream::getRawStreamData` (`libqpdf/QPDF_Stream.cc:362-376`).
@@ -14385,6 +14387,35 @@ mod mutation_tests {
 
         assert!(filtering_attempted);
         assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn prepare_filter_plan_runs_later_setters_after_an_earlier_rejection() {
+        let (huge_columns, recorder) =
+            super::warning_emission_tests::handle_resolving(ObjectValue::Integer(i64::MAX));
+        let first_params =
+            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(0))]);
+        let second_params = ObjectHandle::dictionary(vec![(b"Columns".to_vec(), huge_columns)]);
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"LZWDecode".to_vec()),
+                ]),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::array(vec![first_params, second_params]),
+            ),
+        ]);
+        let stream = ObjectHandle::stream(dict.clone(), Rc::new(Vec::new()));
+
+        assert!(stream.prepare_stream_filter_plan(&dict).unwrap().is_none());
+        assert!(super::warning_emission_tests::warnings(&recorder)
+            .iter()
+            .any(|warning| warning
+                .contains("requested value of integer is too big; returning INT_MAX")));
     }
 
     #[test]

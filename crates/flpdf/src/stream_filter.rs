@@ -1,49 +1,18 @@
-//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values.
+//! qpdf correspondence: `QPDFStreamFilter.cc` and `QPDF_Stream.cc` filter names, full `/DecodeParms` handles, and reverse decode-pipeline construction (`libqpdf/QPDF_Stream.cc:380-482`).
 //!
-//! # `SF_Crypt::setDecodeParms` validation is reproduced but unreached
+//! Each [`FilterSpec`] retains the native [`ObjectHandle`] supplied by the
+//! stream dictionary. This mirrors qpdf's shared `QPDFObjectHandle` across
+//! the filter chain: setters inspect the live handle in qpdf order, rather
+//! than through a reduced snapshot or copied parameter-value enum. In
+//! particular, the Flate/LZW and Crypt setters below perform their own
+//! qpdf-shaped key walks and validation, while filters inheriting the base
+//! setter only test whether the handle is null.
 //!
-//! qpdf refuses a `Crypt` stage whose `/DecodeParms` carry any key other than
-//! `/Type` or `/Name`, and validates a present `/Type` through
-//! `isDictionaryOfType("/CryptFilterDecodeParms")` — the whole body of
-//! `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:33-50`). It returns
-//! `false` on anything else, which `QPDF_Stream::filterable` turns into its
-//! own `filterable = false` at `:471`/`:479-481`.
-//!
-//! [`CryptStreamFilter`] reproduces that walk key for key, and
-//! [`stream_filter_for`] registers it under `Crypt` the way qpdf's
-//! `filter_factories` does (`QPDF_Stream.cc:85-94`). **No production decode
-//! reaches it.** `filters::prepare_decode_filters` routes a `Crypt` spec to
-//! `PreparedStage::Crypt` before it consults [`stream_filter_for`], so the
-//! installed crypt provider decides the outcome instead; for every
-//! non-decrypting entry point that provider is `filters::reject_crypt_stage`,
-//! which errors unconditionally, so no shape of `/DecodeParms` is
-//! distinguishable there. The filter's own answers are therefore pinned by
-//! unit tests rather than by an end-to-end decode.
-//!
-//! The check's input is intact: a `Crypt` stage's [`DecodeParams`] carries the
-//! whole key set it reads, with `/Type`'s name bytes preserved — see
-//! [`retains_decode_param_key`].
-//!
-//! # Recorded deviation: `DecodeParams` is an owned, reduced snapshot
-//!
-//! qpdf replicates one `QPDFObjectHandle` — a `shared_ptr` — across the filter
-//! chain and copies no dictionary. [`DecodeParams`] owns its entries instead,
-//! so it retains only what some consumer reads
-//! ([`retains_decode_param_key`]): [`RETAINED_DECODE_PARAM_KEYS`] under every
-//! filter, and **every key under `Crypt`**, whose `setDecodeParms` reads the
-//! whole key set. A name's bytes survive only under the two keys some consumer
-//! compares them against ([`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]); elsewhere
-//! a name reduces to [`ParamValue::Other`], which no consumer can tell apart.
-//!
-//! Output bytes and error timing are unaffected: nothing reconstructs an
-//! emitted `/DecodeParms` from this type — the writer copies the source
-//! dictionary. **Filterability is decided from this snapshot**, so the
-//! retained set has to be exactly what each `setDecodeParms` reads.
-//! `SF_FlateLzwDecode`'s key walk (`libqpdf/SF_FlateLzwDecode.cc:32-66`) has
-//! no `else` arm, so a key it does not name never reaches its `filterable` and
-//! the five geometry keys suffice there. `SF_Crypt::setDecodeParms`
-//! (`libqpdf/QPDF_Stream.cc:33-50`) has an `else` arm that refuses on any
-//! other key, which is why a `Crypt` stage keeps all of them.
+//! Crypt decryption remains owned by
+//! `reader::resolver::inspect_stream_encryption` and
+//! `reader::resolver::pipe_stream_data_from_input`; this module only preserves
+//! qpdf's filterability and no-stage pipeline contract. The `filters` layer
+//! supplies the non-decrypting rejection provider at that boundary.
 
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85_decoder::Ascii85Decoder;
@@ -58,7 +27,6 @@ use crate::pipeline::tiff_predictor::{TiffPredictor, TiffPredictorAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::{Error, Result};
 use std::cell::Cell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
@@ -75,105 +43,10 @@ pub(crate) const CRYPT_STAGE_UNSUPPORTED: &str = "unsupported stream filter: Cry
 
 type FilterWarningCallback = Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 'static>;
 
-/// Bounded `/DecodeParms` view: everything `StreamFilter::set_decode_params`
-/// needs, with no `Object` or `ObjectHandle` left in it.
-///
-/// `Absent` covers both a missing key and an explicit null, matching
-/// `QPDF_Stream::filterable`'s treatment of a null `/DecodeParms` and
-/// `SF_FlateLzwDecode::setDecodeParms`'s sole early return
-/// (`SF_FlateLzwDecode.cc:24-26`).
-/// `Present` carries the dictionary's entries in iteration order; a present
-/// non-dictionary yields `Present` with no entries, which is what qpdf sees:
-/// `setDecodeParms` asks `QPDFObjectHandle::getKeys`
-/// (`QPDFObjectHandle.cc:997-1009`) for every non-null object, and it is
-/// *`getKeys`* — not `setDecodeParms` — that warns
-/// `typeWarning("dictionary", "treating as empty")` (`:1005`) and hands back
-/// an empty key set. Live parser handles forward that warning through their
-/// document resolver; a contextless programmatic handle retains qpdf's
-/// throwing `typeWarning` branch.
-///
-/// **Entry order is not part of this type's contract.** qpdf iterates
-/// `getKeys()`'s `std::set<std::string>`, so it sees keys sorted. The `Object`
-/// shape reader agrees today by construction rather than by intent:
-/// `Dictionary` is a `BTreeMap` keyed by the raw name bytes, and because
-/// qpdf's keys differ only by a uniform leading `/`, the two orderings
-/// coincide. A handle-shaped reader entering through
-/// `ObjectHandle::as_dictionary` — a `BTreeMap` over the same keys — would
-/// coincide for the same reason. A `Vec` cannot state any of that, and nothing
-/// needs it to: every filter assigns each key independently and runs its only
-/// cross-key check after the loop (`SF_FlateLzwDecode.cc:68-70`). A future
-/// Crypt provider that reads [`Self::entries`] order-dependently would be the
-/// first code to care.
-#[derive(Debug, PartialEq)]
-pub(crate) enum DecodeParams {
-    Absent,
-    Present(Vec<(Vec<u8>, ParamValue)>),
-}
-
-/// A `/DecodeParms` value reduced to the bounded scalars any filter reads.
-///
-/// **Invariant:** `Int` appears exactly where `QPDFObjectHandle::isInteger`
-/// admits a value — `obj->getTypeCode() == ::ot_integer`
-/// (`QPDFObjectHandle.cc:358-362`) — carrying it already put through
-/// `getIntValueAsInt`'s both-ends saturation (`:526-543`). `Name` and `Other`
-/// are qpdf's `else` branch: `SF_FlateLzwDecode::setDecodeParms` reaches
-/// `getIntValueAsInt` only behind an `isInteger()` guard
-/// (`SF_FlateLzwDecode.cc:33`, `:43`, `:56`) and sets `filterable = false`
-/// otherwise, so a filter matching on those two variants reproduces that
-/// branch without re-inspecting the value.
-///
-/// `isInteger` also `dereference()`s first, and honoring that is each shape
-/// reader's job rather than this type's: the consuming
-/// [`param_value_from_handle`] path classifies values after qpdf-shaped
-/// dereference, while [`param_value_without_resolving`] classifies the shared
-/// snapshot without resolving children. qpdf dereferences a value only
-/// through `SF_FlateLzwDecode`'s `getKeys()`/`getKey()` walk, so for every
-/// other filter `decode_params_from_entries` reads the value without
-/// resolving. See [`filter_reads_decode_params`] for the boundary and
-/// [`param_value_without_resolving`] for the non-resolving classification.
-///
-/// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for the two
-/// name comparisons a `Crypt` stage's consumers make — `/Name` selects the
-/// crypt filter and `/Type` is matched against `/CryptFilterDecodeParms` — so
-/// carrying it now keeps Phase 3's AES/Crypt cutover from having to widen this
-/// shared type. Every other `StreamFilter` still treats the two variants
-/// identically.
-///
-/// **`Name` therefore carries a payload only where one of those comparisons
-/// reads it — the `/Name` and `/Type` keys of a `Crypt` stage**
-/// ([`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]). A name under any other key
-/// reduces to `Other`: `/Columns /Identity` is `Other`, not
-/// `Name(b"Identity")`, and so is a `Crypt` stage's own `/Foo /Identity`.
-/// Nothing can tell the difference, because the only production match on
-/// either variant is `set_decode_params`' shared
-/// `ParamValue::Name(_) | ParamValue::Other => filterable = false` arm, and
-/// qpdf's counterpart asks `isInteger()` and never inspects a non-integer's
-/// kind. Keeping the payload anyway is what made a `DecodeParams` grow with
-/// its input — see [`RETAINED_DECODE_PARAM_KEYS`]' bound.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ParamValue {
-    Int(i32),
-    Name(Vec<u8>),
-    Other,
-}
-
-impl DecodeParams {
-    pub(crate) fn is_absent(&self) -> bool {
-        matches!(self, Self::Absent)
-    }
-
-    pub(crate) fn entries(&self) -> &[(Vec<u8>, ParamValue)] {
-        match self {
-            Self::Absent => &[],
-            Self::Present(entries) => entries,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct FilterSpec {
     pub(crate) name: Vec<u8>,
-    pub(crate) decode_params: DecodeParams,
+    pub(crate) decode_params: ObjectHandle,
 }
 
 impl FilterSpec {
@@ -220,8 +93,7 @@ pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str
 ///
 /// [`stream_filter_for`] registers a factory for `Crypt` too, but
 /// `filters::prepare_decode_filters` always routes a `Crypt` spec to the
-/// installed crypt provider before consulting the registry (see the module
-/// doc's "`SF_Crypt::setDecodeParms`... unreached" section), so `Crypt` is
+/// installed crypt provider before consulting the registry, so `Crypt` is
 /// excluded here to keep this predicate honest about what a caller like
 /// `show-stream` will actually observe.
 pub(crate) fn is_decoded_filter(filter_name: &[u8]) -> bool {
@@ -278,7 +150,7 @@ pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
 /// Unlike qpdf, which caps nothing here, flpdf refuses pathological chains on
 /// the decode path; `filters::MAX_FILTER_CHAIN_LEN` documents that divergence.
 ///
-/// The handle reader calls this before it snapshots an array, so the cap's
+/// The handle reader calls this before it copies an array, so the cap's
 /// *body* — the comparison and the message — has exactly one definition.
 pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
     if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
@@ -303,8 +175,8 @@ pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) 
 /// `/DecodeParms` handle, and each `/DecodeParms` array item — every position
 /// `QPDF_Stream::filterable` itself inspects. It is *conditional* one level
 /// deeper: a `/DecodeParms` dictionary **value** is reached only by
-/// `SF_FlateLzwDecode::setDecodeParms`, so this reader resolves one only when
-/// [`filter_reads_decode_params`] holds for that spec's filter.
+/// `SF_FlateLzwDecode::setDecodeParms`, so this reader preserves the native
+/// handle and lets that setter resolve its values at the qpdf boundary.
 ///
 /// A missing key arrives here as a null handle, exactly as `getKey` hands one
 /// back (`libqpdf/QPDFObjectHandle.cc:979-988`), so absent and null share the
@@ -326,9 +198,9 @@ pub(crate) fn decode_filter_specs_from_handle(
         vec![name]
     } else if let Some(count) = filter.try_array_len()? {
         // Counted through `try_array_len`, not `try_as_array`, so a chain the
-        // cap is about to reject is never snapshotted — qpdf sizes this loop
+        // cap is about to reject is never copied — qpdf sizes this loop
         // with `getArrayNItems` (`libqpdf/QPDF_Stream.cc:398`), which reads
-        // the length off the borrowed array in place. The snapshot below
+        // the length off the borrowed array in place. The copy below
         // therefore only happens once the count is known to be acceptable.
         validate_filter_chain_count(count, max_filter_chain)?;
         // `try_array_len` already answered `Some`, so this cannot be `None`;
@@ -352,17 +224,17 @@ pub(crate) fn decode_filter_specs_from_handle(
 
     validate_filter_factories(names.iter().map(Vec::as_slice))?;
 
-    let params: Vec<DecodeParams> = if decode_params.try_is_null()? {
-        absent_params(names.len())
+    let params: Vec<ObjectHandle> = if decode_params.try_is_null()? {
+        (0..names.len()).map(|_| ObjectHandle::null()).collect()
     } else if let Some(count) = decode_params.try_array_len()? {
-        // Same length-before-snapshot shape as the `/Filter` arm: qpdf sizes
+        // Same length-before-copy shape as the `/Filter` arm: qpdf sizes
         // this loop with `getArrayNItems` as well (`libqpdf/QPDF_Stream.cc:443`
         // for the empty-array reduction, `:447` for the per-index walk), and
         // both the empty reduction and the length mismatch are decided from
         // the count alone — so a mismatched array is rejected without being
-        // snapshotted.
+        // copied.
         if count == 0 {
-            absent_params(names.len())
+            (0..names.len()).map(|_| ObjectHandle::null()).collect()
         } else {
             if count != names.len() {
                 return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
@@ -371,14 +243,12 @@ pub(crate) fn decode_filter_specs_from_handle(
                 .try_as_array()?
                 .into_iter()
                 .flatten()
-                .zip(&names)
-                .map(|(item, name)| decode_params_from_handle(&item, name))
-                .collect::<Result<_>>()?
+                .collect()
         }
     } else {
         // One handle replicated across the chain, exactly as qpdf pushes the
         // same `QPDFObjectHandle` per filter (`QPDF_Stream.cc:450-454`).
-        replicated_decode_params(decode_params, &names)?
+        (0..names.len()).map(|_| decode_params.clone()).collect()
     };
 
     validate_filter_chain_count(names.len(), max_filter_chain)?;
@@ -391,320 +261,6 @@ pub(crate) fn decode_filter_specs_from_handle(
             decode_params,
         })
         .collect())
-}
-
-fn absent_params(count: usize) -> Vec<DecodeParams> {
-    (0..count).map(|_| DecodeParams::Absent).collect()
-}
-
-/// [`decode_params_from_handle`] for the one `/DecodeParms` handle a non-null,
-/// non-array value replicates across the whole chain.
-///
-/// **Why not [`decode_params_from_handle`] in a loop.** Consuming stages use
-/// [`decode_params_from_consuming_handle`]'s `try_get_keys` path per stage,
-/// without taking a raw-map snapshot. Non-consuming stages use
-/// [`decode_params_from_entries`]'s [`ObjectHandle::try_as_dictionary`] path,
-/// which hands back a *clone* of the whole `BTreeMap` — every key copied, plus
-/// one `Rc` bump per value, `ObjectHandle` being a newtype over one. Calling
-/// that route once per filter turned an oversized `/DecodeParms` into one full
-/// snapshot per stage — measured, sixteen for a sixteen-filter chain — however
-/// few keys survive [`RETAINED_DECODE_PARAM_KEYS`], because the retention test
-/// runs inside the walk, after the snapshot. Nor was the stage count capped in
-/// general:
-/// `max_filter_chain` bounds it only where [`crate::filters::DecodeLimits`]
-/// carries one. `DecodeLimits::default()` does, but the field is a `pub
-/// Option` a caller may set to `None`, which the entry-point corpus sweeps.
-/// Taking the non-consuming snapshot here instead costs at most one whatever
-/// the chain length is, and those per-filter walks then borrow it.
-///
-/// **The per-filter walk itself is deliberately kept.** qpdf calls
-/// `filter->setDecodeParms(decode_item)` once per filter
-/// (`libqpdf/QPDF_Stream.cc:467-482`). Each consuming call uses
-/// `decode_parms.getKeys()` followed by retained `getKey(key)` calls
-/// (`libqpdf/SF_FlateLzwDecode.cc:29-31`): `getKeys` resolves every child and
-/// omits nullish keys before retention, including unrecognized keys. flpdf
-/// follows that order through [`decode_params_from_consuming_handle`].
-///
-/// Non-consuming stages do not inspect children in qpdf. They instead borrow
-/// one shared raw-map snapshot, so a child resolved by an earlier consuming
-/// stage remains live for a later non-consuming stage; see
-/// [`param_value_without_resolving`] and
-/// `handle_reader_lets_a_later_stage_see_a_value_an_earlier_stage_resolved`.
-///
-/// The null test [`decode_params_from_handle`] opens with is deliberately not
-/// repeated here: this is reached only from
-/// [`decode_filter_specs_from_handle`]'s final arm, past
-/// `decode_params.try_is_null()?` having answered `false`. That makes *that*
-/// call load-bearing rather than convergent — an indirect `/DecodeParms`
-/// resolving to null reads as `Absent` only because of it, which
-/// `handle_reader_reads_an_indirect_scalar_decode_parms_resolving_to_null_as_absent`
-/// pins.
-fn replicated_decode_params(params: &ObjectHandle, names: &[Vec<u8>]) -> Result<Vec<DecodeParams>> {
-    let entries = names
-        .iter()
-        .any(|name| !filter_reads_decode_params(name))
-        .then(|| params.try_as_dictionary())
-        .transpose()?;
-    names
-        .iter()
-        .map(|name| {
-            if filter_reads_decode_params(name) {
-                decode_params_from_consuming_handle(params, name)
-            } else {
-                decode_params_from_entries(
-                    entries.as_ref().and_then(|entries| entries.as_ref()),
-                    name,
-                )
-            }
-        })
-        .collect()
-}
-
-/// Does the filter named `filter_name` read `/DecodeParms` *entries*?
-///
-/// qpdf draws this line per filter, not per key. `QPDFStreamFilter`'s base
-/// `setDecodeParms` is `return decode_parms.isNull();`
-/// (`libqpdf/QPDFStreamFilter.cc:3-7`) — it inspects the parameter handle
-/// itself and never touches an entry — and ASCII85, ASCIIHex, and RunLength
-/// all inherit it. `SF_FlateLzwDecode::setDecodeParms` is the one that walks
-/// `decode_parms.getKeys()` and `getKey(key)`
-/// (`libqpdf/SF_FlateLzwDecode.cc:29-31`). Since every `QPDFObjectHandle`
-/// inspector dereferences first, a `/DecodeParms` value behind an indirect
-/// reference is resolved by qpdf iff its filter is in the second group.
-///
-/// **The source is the evidence.** A live probe cannot settle this by itself:
-/// qpdf resolves a dangling reference to null silently, so "qpdf printed
-/// nothing about object 99" is equally consistent with looking and with not
-/// looking. The 2026-08-03 qpdf 11.9.0 probe pins only the observable half —
-/// `/ASCIIHexDecode` with a present `/DecodeParms` fails at
-/// `setDecodeParms`, exiting 2 with "unable to filter stream data".
-///
-/// The predicate lives on [`StreamFilter`] and is reached through
-/// [`stream_filter_for`] rather than being a name list here, so it cannot
-/// drift from that registry the way a second list would. In qpdf the same
-/// distinction is implicit — it is simply whether a filter's `setDecodeParms`
-/// override calls `getKeys()`.
-///
-/// That covers the `StreamFilter`-backed half only. The `Crypt` arm below is
-/// [`is_crypt_filter`], which carries the note about shadowing
-/// `filters::prepare_decode_filters`' identical test.
-///
-/// Abbreviations are expanded first because qpdf expands them at
-/// `QPDF_Stream.cc:419-423`, ahead of the `filter_factories` lookup at `:425`,
-/// so `/Fl` reaches `SF_FlateLzwDecode` and consumes.
-///
-/// An unknown name has no registered filter, so it lands on `false`. The shape
-/// readers perform that factory lookup before `/DecodeParms` is read, matching
-/// qpdf's early return at `QPDF_Stream.cc:433-435` and leaving the later
-/// parameter-reduction code concerned only with registered filters.
-fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
-    // No caller's answer depends on this arm today, and no assertion can
-    // witness it: `CryptStreamFilter` is registered and its
-    // `reads_decode_params` answers `true` as well, so the lookup below would
-    // return the same for every input and deleting this arm would fail no
-    // test. It is kept because the registry is not what a `Crypt` stage's
-    // parameters are read for. `filters::prepare_decode_filters` peels the
-    // spec off into `PreparedStage::Crypt` before consulting
-    // `stream_filter_for`, and the crypt provider is then handed
-    // `&stage.spec.decode_params` after the crypt provider selects its filter
-    // from `/Name`. Leaving it out would make that reader's supply depend on a
-    // registry entry it never queries.
-    if is_crypt_filter(filter_name) {
-        return true;
-    }
-    stream_filter_for(normalize_filter_name(filter_name))
-        .is_some_and(|filter| filter.reads_decode_params())
-}
-
-/// Is this the one filter name whose stage flpdf decrypts rather than decodes?
-///
-/// [`CryptStreamFilter`] is a [`StreamFilter`] and is registered like any
-/// other, but `filters::prepare_decode_filters` routes a `Crypt` spec to
-/// `PreparedStage::Crypt` before it reaches the registry, so this predicate —
-/// not the registry — is what the parameter-retention rules turn on.
-///
-/// The single spelling of the `b"Crypt"` literal
-/// [`filter_reads_decode_params`], [`retains_decode_param_key`] and
-/// [`keeps_crypt_name_payload`] all turn on. It still shadows the identical
-/// test in `filters::prepare_decode_filters`; the two must move together,
-/// because the registry entry is not what keeps them in step.
-///
-/// Abbreviations are expanded first because qpdf expands them at
-/// `QPDF_Stream.cc:419-423`, ahead of the `filter_factories` lookup at `:425`.
-/// qpdf's `filter_abbreviations` table (`QPDF_Stream.cc:72-83`) holds `/AHx`,
-/// `/A85`, `/LZW`, `/Fl`, `/RL`, `/CCF`, `/DCT` and nothing else, and
-/// [`normalize_filter_name`] mirrors exactly those seven — so no abbreviation
-/// expands to `/Crypt` today and this call changes no answer. It is here so
-/// that adding one to either table cannot make this predicate disagree with
-/// [`filter_reads_decode_params`]' registry lookup, which normalizes too.
-fn is_crypt_filter(filter_name: &[u8]) -> bool {
-    normalize_filter_name(filter_name) == b"Crypt"
-}
-
-/// Read a `/DecodeParms` value into [`DecodeParams`].
-///
-/// `filter_name` determines whether this call follows qpdf's consuming
-/// `getKeys`/`getKey` reduction or a non-consuming stage borrows the shared
-/// raw dictionary snapshot.
-///
-/// `try_is_null` stays unconditional: qpdf's base `setDecodeParms` asks
-/// `decode_parms.isNull()` (`QPDFStreamFilter.cc:6`) for this array item.
-/// The consuming branch then lets `try_get_keys` resolve all children; only a
-/// non-consuming branch takes `try_as_dictionary`'s shared snapshot.
-///
-/// A replicated scalar goes through [`replicated_decode_params`], which calls
-/// [`decode_params_from_consuming_handle`] once per consuming stage and takes
-/// at most one shared snapshot for all non-consuming stages.
-///
-pub(crate) fn decode_params_from_handle(
-    params: &ObjectHandle,
-    filter_name: &[u8],
-) -> Result<DecodeParams> {
-    if params.try_is_null()? {
-        return Ok(DecodeParams::Absent);
-    }
-    if filter_reads_decode_params(filter_name) {
-        return decode_params_from_consuming_handle(params, filter_name);
-    }
-    decode_params_from_entries(params.try_as_dictionary()?.as_ref(), filter_name)
-}
-
-/// One consuming filter's qpdf-shaped `/DecodeParms` read.
-///
-/// `try_get_keys` resolves every child and omits nullish keys before this
-/// reader retains the bounded set. Retained values are then fetched with
-/// `try_get_key`, matching qpdf's `getKeys` then `getKey` order.
-fn decode_params_from_consuming_handle(
-    params: &ObjectHandle,
-    filter_name: &[u8],
-) -> Result<DecodeParams> {
-    let crypt_stage = is_crypt_filter(filter_name);
-    let mut retained = Vec::new();
-    for key in params.try_get_keys()? {
-        if !retains_decode_param_key(&key, crypt_stage) {
-            continue;
-        }
-        let value = params.try_get_key(&key)?;
-        let keeps_name = keeps_crypt_name_payload(&key, crypt_stage);
-        let consumes_integer = consumes_integer_decode_param_key(&key, filter_name);
-        retained.push((
-            key,
-            param_value_from_handle(&value, keeps_name, consumes_integer)?,
-        ));
-    }
-    Ok(DecodeParams::Present(retained))
-}
-
-/// One non-consuming filter's read of an already-snapshotted `/DecodeParms`
-/// dictionary. `None` is a present non-dictionary and yields `Present` with no
-/// entries. Non-consuming stages never resolve children.
-///
-/// Borrowing rather than owning is what lets [`replicated_decode_params`] run
-/// this once per filter off a single snapshot. The children are the live
-/// handles, not copies of their values, so a value an earlier stage resolved
-/// is resolved for a later one too — the same thing that held when every stage
-/// re-snapshotted the dictionary, since `ObjectHandle::clone` shares the
-/// indirect slot.
-fn decode_params_from_entries(
-    entries: Option<&BTreeMap<Vec<u8>, ObjectHandle>>,
-    filter_name: &[u8],
-) -> Result<DecodeParams> {
-    let Some(entries) = entries else {
-        return Ok(DecodeParams::Present(Vec::new()));
-    };
-    let crypt_stage = is_crypt_filter(filter_name);
-    let retained = entries
-        .iter()
-        .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
-        .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
-        .collect();
-    Ok(DecodeParams::Present(retained))
-}
-
-/// Does qpdf convert this retained key through `getIntValueAsInt`?
-///
-/// `SF_FlateLzwDecode::setDecodeParms` does so for the four geometry keys and
-/// for `/EarlyChange` only in its LZW instance
-/// (`libqpdf/SF_FlateLzwDecode.cc:34-57`). `SF_Crypt` walks every key but
-/// performs only its `/Type` and `/Name` checks
-/// (`libqpdf/QPDF_Stream.cc:33-50`), so an integer under an unknown key must
-/// not produce a saturation warning even though the key is retained.
-fn consumes_integer_decode_param_key(key: &[u8], filter_name: &[u8]) -> bool {
-    if is_crypt_filter(filter_name) {
-        return false;
-    }
-    match key {
-        b"/Predictor" | b"/Columns" | b"/Colors" | b"/BitsPerComponent" => true,
-        b"/EarlyChange" => normalize_filter_name(filter_name) == b"LZWDecode",
-        _ => false,
-    }
-}
-
-/// Classify one `/DecodeParms` value, dereferencing it as qpdf's `isInteger`
-/// does.
-///
-/// `keeps_name` is [`keeps_crypt_name_payload`] for the key this value sits
-/// under: the name payload is owned only where a `Crypt` stage's consumers
-/// compare it. Everywhere else — including a `Crypt` stage's own unknown keys,
-/// which are retained for their names alone — a name reduces to
-/// [`ParamValue::Other`], which no consumer can distinguish from `Name` — see
-/// [`ParamValue`]. `try_as_name` still runs, so the dereference qpdf performs
-/// is unchanged; only the payload is dropped. `consumes_integer` is the
-/// key-level qpdf boundary for `getIntValueAsInt` and its saturation warning.
-fn param_value_from_handle(
-    value: &ObjectHandle,
-    keeps_name: bool,
-    consumes_integer: bool,
-) -> Result<ParamValue> {
-    if let Some(int) = value.try_as_integer()? {
-        let int = if consumes_integer {
-            clamp_handle_value_to_i32(int, value)?
-        } else {
-            clamp_to_i32(int)
-        };
-        return Ok(ParamValue::Int(int));
-    }
-    Ok(match value.try_as_name()? {
-        Some(name) if keeps_name => ParamValue::Name(name),
-        _ => ParamValue::Other,
-    })
-}
-
-/// [`param_value_from_handle`] for a non-consuming filter that never reads an
-/// entry. It only classifies shared-snapshot children and never resolves them.
-///
-/// This deliberately uses the same non-resolving accessor as the snapshot
-/// reader, so a *direct* value reduces to the identical [`ParamValue`] all
-/// shape readers agree on.
-///
-/// **No name test at all**, where the other two readers have one. This is
-/// reached only when [`filter_reads_decode_params`] is false, and
-/// [`is_crypt_filter`] implies that predicate, so
-/// [`keeps_crypt_name_payload`] could never be true here: a payload kept at
-/// this position would be one nothing reads. A name reduces to `Other` exactly
-/// as it does under every other non-`Crypt` filter — see [`ParamValue`].
-///
-/// That same implication is what confines [`retains_decode_param_key`]'s
-/// keep-every-key arm to `Crypt`: [`decode_params_from_entries`] passes the
-/// flag on, but the flag is unreachably `true` here, so a non-consuming stage
-/// keeps [`RETAINED_DECODE_PARAM_KEYS`] and no more.
-///
-/// An indirect value that is *still unresolved* reduces to `Other` — the same
-/// thing a non-consuming stage observes for an unresolved indirect value. An indirect value
-/// that some earlier read already resolved does not: `ObjectHandle::as_integer`
-/// reports an indirect handle's already-resolved value, so a
-/// `/DecodeParms` value sharing an object with an earlier-visited position
-/// would classify as `Int` here. That distinction is intentionally not exposed
-/// by the non-consuming filter path: the filters routed here read nothing but
-/// `is_absent()`, and `is_absent()` distinguishes `Absent` from `Present`
-/// without looking at a single [`ParamValue`]. What must not vary is `Absent`
-/// versus `Present`, and that is decided upstream by the two unconditional
-/// calls on the parameter handle itself.
-fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
-    match value.as_integer() {
-        Some(int) => ParamValue::Int(clamp_to_i32(int)),
-        None => ParamValue::Other,
-    }
 }
 
 struct OutputBuffer {
@@ -854,26 +410,10 @@ pub(crate) trait StreamFilter {
     /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
     /// `return decode_parms.isNull();` — documented at
     /// `include/qpdf/QPDFStreamFilter.hh:41-42` as "The default implementation
-    /// accepts a null object and rejects everything else". `DecodeParams` has
-    /// already folded a missing key into the null case, so `is_absent()` is
-    /// that `isNull()`.
-    fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
-        decode_params.is_absent()
-    }
-
-    /// Does [`Self::set_decode_params`] look at the parameter *entries*?
-    ///
-    /// `false` alongside the default `set_decode_params` above, which reads
-    /// nothing but `is_absent()` — qpdf's `decode_parms.isNull()`. A filter
-    /// overriding one should consider the other: this is the flpdf-side
-    /// statement of whether qpdf's counterpart calls `getKeys()`.
-    ///
-    /// It is not a decode decision — it decides whether the `ObjectHandle`
-    /// shape reader *dereferences* each value, so that flpdf touches exactly
-    /// the objects qpdf touches. See [`filter_reads_decode_params`], which is
-    /// the only caller.
-    fn reads_decode_params(&self) -> bool {
-        false
+    /// accepts a null object and rejects everything else". A missing
+    /// `/DecodeParms` key is represented by the same null `ObjectHandle`.
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
+        decode_params.try_is_null()
     }
 
     /// Build the filter's decode pipeline without decoding anything.
@@ -981,220 +521,6 @@ impl FlateLzwStreamFilter {
     }
 }
 
-/// The `/DecodeParms` keys some flpdf consumer reads under *every* filter.
-///
-/// [`DecodeParams`] keeps only these, except under a `Crypt` stage, which
-/// keeps every key because its `setDecodeParms` reads every key — see
-/// [`retains_decode_param_key`]. qpdf has no
-/// counterpart, and needs none: it replicates a `QPDFObjectHandle` — a
-/// `shared_ptr` — across the filter chain and never copies the dictionary.
-/// `DecodeParams` owns its entries, so a scalar `/DecodeParms` replicated
-/// across an *n*-filter chain would otherwise be converted and stored *n*
-/// times.
-///
-/// These five are exactly the ones
-/// `<FlateLzwStreamFilter as StreamFilter>::set_decode_params` matches below —
-/// the one `setDecodeParms` override in qpdf 11.9.0 that reads entries at all
-/// (`libqpdf/SF_FlateLzwDecode.cc:32-66`). These constants retain qpdf's
-/// leading slash. A raw slashless key remains slashless in the snapshot and
-/// therefore does not accidentally match a qpdf filter key.
-///
-/// **These five are retained whatever the filter is named, and that is not
-/// laziness.** The encode path validates each registered filter's
-/// `set_decode_params` contract before applying a codec: Flate/LZW consume the
-/// predictor geometry, while ASCII85/ASCIIHex/RunLength reject a present
-/// `/DecodeParms` just as qpdf's default filter does. Dropping the geometry
-/// before that validation would turn a non-null parameter dictionary into an
-/// absent one. The keys beyond these five have no such second consumer, which
-/// is why they are kept per-filter — under `Crypt` and nowhere else.
-///
-/// This is *per key*, not per filter, within that set: `EarlyChange` survives
-/// under `/FlateDecode` even though `set_decode_params` consults it only for
-/// LZW. Bounding the set is the point; making it minimal per filter is not.
-///
-/// # The bound this states
-///
-/// For every filter but `Crypt`, a [`FilterSpec`]'s `DecodeParams` is a
-/// **constant** whatever the source dictionary holds: at most these five keys,
-/// 49 bytes of key text in total, each carrying a `ParamValue` that owns
-/// nothing on the heap.
-/// `retained_decode_parameter_bytes_do_not_grow_with_a_name_valued_parameter`
-/// pins that as an exact figure through both shape readers — 63 bytes per
-/// `ASCIIHexDecode` stage (49 of keys plus the 14-byte filter name), 1008 for
-/// a 16-stage chain — with a name of 16 bytes and of one mebibyte alike, in
-/// *every* retained slot at once rather than only under `/Name`.
-///
-/// **A `Crypt` stage is the exception. Per stage, it grows in key text.** It
-/// keeps every key, so its snapshot tracks the *number and length of the
-/// source's key names* — that is what makes filterability reproducible at all
-/// ([`retains_decode_param_key`]). It does not track the source's *values*:
-/// only [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`] carry a name payload, so an
-/// unknown key contributes its key bytes and nothing else.
-/// `a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry` pins that
-/// split as an exact figure, with an unknown key's value of one mebibyte.
-///
-/// **That is per stage, and the chain multiplies it.** An *n*-stage `/Crypt`
-/// chain sharing one scalar `/DecodeParms` holds *n* copies of that key text
-/// while the source grew by only *n* filter names, so the retained total is
-/// not bounded by the source's size — see
-/// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]' per-stage residual, which this
-/// widening enlarges from the `/Name` payload to the whole key set.
-/// `a_crypt_chain_holds_the_whole_key_set_once_per_stage` pins the product.
-///
-/// **The retained keys were never the unbounded part.** They are drawn from
-/// this fixed array, so their total is fixed too, and shrinking the array was
-/// never what this bound needed. `ParamValue::Name(Vec<u8>)` was the unbounded
-/// one: qpdf's object parser tokenizes with `QPDFTokenizer::nextToken`'s
-/// default `max_len` of 0 (`QPDFParser.cc:38`, `:141`;
-/// `include/qpdf/QPDFTokenizer.hh:205`), which
-/// `QPDFTokenizer.cc:948`'s `if (max_len && ...)` treats as no cap at all, and
-/// flpdf's `tokenizer::Tokenizer::read_token` mirrors that `max_len != 0`
-/// test. So a name is as long as the file makes it.
-///
-/// **Restricting the key `/Name` is not on its own enough**, because a name
-/// value fits any slot: `/Predictor /<one-mebibyte-name>` passes this key test
-/// and used to be copied per stage — 16,777,584 bytes retained across a
-/// 16-stage `ASCIIHexDecode` chain, measured. The payload rule in
-/// [`ParamValue`] is the other half, and it is what makes this a bound rather
-/// than a bound on one key.
-///
-/// **Retention is not resolution.** A consuming stage first calls
-/// [`decode_params_from_consuming_handle`], whose `try_get_keys` resolves every
-/// child and omits nullish keys before this retained-key bound applies. A
-/// non-consuming stage instead uses [`decode_params_from_entries`] over the
-/// shared snapshot and resolves no children. The former closes the
-/// `flpdf-h8mv` null-key divergence without widening either retained set.
-const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
-    b"/BitsPerComponent",
-    b"/Colors",
-    b"/Columns",
-    b"/EarlyChange",
-    b"/Predictor",
-];
-
-/// The two `/DecodeParms` keys whose *name payload* a `Crypt` stage's
-/// consumers read, and which are kept nowhere else.
-///
-/// `/Name` selects the crypt filter. Plan decision D2 of `flpdf-25kg.3.4` has
-/// the crypt provider doing that selection, and `filters::CryptProvider` is
-/// `FnMut(&DecodeParams, &[u8])` — no handle in it — so [`DecodeParams`] is
-/// that provider's only route to the name. qpdf needs no such route:
-/// `decryptStream` re-reads it off the live object graph
-/// (`decode_parms.getKey("/Name")`, `libqpdf/QPDF_encryption.cc:1072`, and the
-/// `/CF` filter's own `/Name` at `:1085-1087`).
-///
-/// `/Type` decides whether the stage is filterable at all.
-/// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:41-43`) admits a
-/// `/Type`-bearing dictionary only when
-/// `isDictionaryOfType("/CryptFilterDecodeParms")` holds, and that is
-/// `getKey("/Type").isNameAndEquals(...)` (`QPDFObjectHandle.cc:462-466`) — a
-/// comparison against the name's bytes. Reduced to [`ParamValue::Other`] the
-/// value would be indistinguishable from `/Type /Foo`, which qpdf refuses.
-///
-/// No other key's payload is read anywhere: the base
-/// `StreamFilter::set_decode_params` reads only `is_absent()`,
-/// `FlateLzwStreamFilter::set_decode_params` asks `isInteger`-shaped questions
-/// of [`RETAINED_DECODE_PARAM_KEYS`] and lets every other key fall through its
-/// `_ => {}` arm, and [`predictor_encode_geometry`] reaches the parameters through
-/// that same filter.
-///
-/// **This is a per-stage residual, not parity, and it is not a bound on the
-/// chain.** Each `Crypt` stage converts and keeps its own copy, so `/Filter
-/// [/Crypt /Crypt …]` sharing one scalar `/DecodeParms` holds, per stage, that
-/// dictionary's **whole key text** plus a payload for each of these two keys —
-/// [`retains_decode_param_key`] keeps every key under `Crypt`, so the residual
-/// is the key set and not just these two names. An *n*-stage chain therefore
-/// retains *n* × that quantity while the source grew by only the *n* filter
-/// names, which
-/// `a_crypt_chain_holds_the_whole_key_set_once_per_stage` pins as an exact
-/// figure at two chain lengths. It is capped by
-/// `filters::DecodeLimits::max_filter_chain` where a caller sets one (16 under
-/// `DecodeLimits::default()`) and uncapped where a caller passes `None`, which
-/// `filters::encode_stream_data` does unconditionally. qpdf holds one
-/// `shared_ptr` at any chain length.
-///
-/// Keeping every key is required — dropping one would accept a stream
-/// `SF_Crypt::setDecodeParms` rejects — so this residual is the cost of
-/// reproducing filterability, not an oversight to bound away. Restricting it
-/// to `Crypt` narrows the exposure to chains that name `Crypt`; it does not
-/// remove it.
-const CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS: [&[u8]; 2] = [b"/Name", b"/Type"];
-
-/// Does a stage's [`DecodeParams`] keep this key at all?
-///
-/// **A `Crypt` stage keeps every key, and that is this same rule rather than an
-/// exception to it.** The rule is "retain what the consumer reads", and
-/// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:33-50`) reads the whole
-/// key set: it walks `decode_parms.getKeys()` and sets `filterable = false` on
-/// the first key that is neither `/Type` nor `/Name`. A key dropped here is a
-/// key that stage could no longer refuse, so `/DecodeParms << /Foo 1 >>` would
-/// reach it as an empty entry set and be accepted where qpdf rejects.
-///
-/// Every other filter keeps [`RETAINED_DECODE_PARAM_KEYS`] only, because
-/// `SF_FlateLzwDecode::setDecodeParms` is the only other `setDecodeParms` that
-/// looks at an entry and it names exactly those five
-/// (`libqpdf/SF_FlateLzwDecode.cc:32-66`).
-///
-/// The cost of the `Crypt` arm is key bytes and nothing else:
-/// [`keeps_crypt_name_payload`] admits two keys, so an unknown key's value
-/// still reduces to [`ParamValue::Other`] — see [`RETAINED_DECODE_PARAM_KEYS`]'
-/// bound, which this widening therefore leaves standing for every filter but
-/// `Crypt`.
-fn retains_decode_param_key(key: &[u8], crypt_stage: bool) -> bool {
-    crypt_stage || RETAINED_DECODE_PARAM_KEYS.contains(&key)
-}
-
-/// Is this the entry whose *name payload* some consumer reads?
-///
-/// The only place a `ParamValue::Name` keeps its bytes.
-///
-/// **A payload is never owned under a key that is not kept**, and that holds
-/// structurally rather than by keeping two lists aligned: this answers `true`
-/// only when `crypt_stage` does, and [`retains_decode_param_key`] answers
-/// `true` for *every* key when `crypt_stage` does. The shared flag is what the
-/// two cannot drift apart on, in place of the single key literal they used to
-/// share.
-///
-/// `crypt_stage` changes no *read's* answer as the two arrays stand today.
-/// This runs only for keys [`retains_decode_param_key`] already kept, and
-/// under a non-`Crypt` filter those are [`RETAINED_DECODE_PARAM_KEYS`], whose
-/// five keys happen to be disjoint from the array above. That disjointness is
-/// a property of the two current arrays, not a standing invariant: adding
-/// `/Name` to the geometry array would make them overlap and, without this
-/// gate, hand the payload back to every filter — the amplification
-/// [`RETAINED_DECODE_PARAM_KEYS`]' bound exists to prevent.
-///
-/// No read's answer depends on this gate today, so it is asserted directly by
-/// `a_name_payload_is_kept_under_a_crypt_stage_and_only_there`.
-fn keeps_crypt_name_payload(key: &[u8], crypt_stage: bool) -> bool {
-    crypt_stage && CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS.contains(&key)
-}
-
-/// Apply `getIntValueAsInt`'s value saturation
-/// (`QPDFObjectHandle.cc:525-543`), which pins a value below `INT_MIN` to
-/// `INT_MIN` and one above `INT_MAX` to `INT_MAX` rather than failing.
-///
-/// This is the shape-independent half of the parity, kept separate from
-/// `clamped_int_param` so a second `/DecodeParms` shape reader clamps through
-/// this one copy instead of restating the bounds.
-fn clamp_to_i32(value: i64) -> i32 {
-    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
-/// Apply qpdf's saturation and its `warnIfPossible` diagnostics to a live
-/// handle. `QPDFObjectHandle::getIntValueAsInt` calls `warnIfPossible` only
-/// after the caller has established that the value is an integer
-/// (`SF_FlateLzwDecode.cc:34-57`), so this helper deliberately does not emit a
-/// type warning for names or other non-integer values.
-fn clamp_handle_value_to_i32(value: i64, handle: &ObjectHandle) -> Result<i32> {
-    if value < i64::from(i32::MIN) {
-        handle.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
-    } else if value > i64::from(i32::MAX) {
-        handle.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
-    }
-    Ok(clamp_to_i32(value))
-}
-
 /// Mirror `QIntC::to_uint`, whose range failure is a `std::runtime_error`.
 fn to_uint(value: i32) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
@@ -1205,56 +531,57 @@ fn to_uint(value: i32) -> Result<u32> {
 }
 
 impl StreamFilter for FlateLzwStreamFilter {
-    /// `SF_FlateLzwDecode::setDecodeParms` is the one override in qpdf 11.9.0
-    /// that walks `decode_parms.getKeys()` (`SF_FlateLzwDecode.cc:29-31`), so
-    /// this is the one filter whose parameter values qpdf dereferences.
-    fn reads_decode_params(&self) -> bool {
-        true
-    }
-
-    fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
         // The one early return SF_FlateLzwDecode::setDecodeParms has
         // (SF_FlateLzwDecode.cc:24-26), for a null /DecodeParms. Every other
         // shape walks the keys and then falls through to the trailing check at
         // :68-70, which a present-but-empty parameter set reaches.
-        if decode_params.is_absent() {
-            return true;
+        if decode_params.try_is_null()? {
+            return Ok(true);
         }
 
         let mut filterable = true;
-        for (key, value) in decode_params.entries() {
+        for key in decode_params.try_get_keys()? {
+            let value = decode_params.try_get_key(&key)?;
             let key = key.as_slice();
             match key {
-                b"/Predictor" => match *value {
-                    ParamValue::Int(predictor) => {
-                        self.predictor = predictor;
-                        if !((predictor == 1) || (predictor == 2) || (10..=15).contains(&predictor))
-                        {
-                            filterable = false;
-                        }
+                b"/Predictor" => {
+                    let Some(_) = value.try_as_integer()? else {
+                        filterable = false;
+                        continue;
+                    };
+                    let predictor = value.try_get_int_value_as_int()?;
+                    self.predictor = predictor;
+                    if !((predictor == 1) || (predictor == 2) || (10..=15).contains(&predictor)) {
+                        filterable = false;
                     }
-                    ParamValue::Name(_) | ParamValue::Other => filterable = false,
-                },
-                b"/Columns" | b"/Colors" | b"/BitsPerComponent" => match *value {
+                }
+                b"/Columns" | b"/Colors" | b"/BitsPerComponent" => {
+                    let Some(_) = value.try_as_integer()? else {
+                        filterable = false;
+                        continue;
+                    };
                     // qpdf stores these without range validation and defers
                     // rejection to pipeline construction.
-                    ParamValue::Int(parameter) => match key {
+                    let parameter = value.try_get_int_value_as_int()?;
+                    match key {
                         b"/Columns" => self.columns = parameter,
                         b"/Colors" => self.colors = parameter,
                         _ => self.bits_per_component = parameter,
-                    },
-                    ParamValue::Name(_) | ParamValue::Other => filterable = false,
-                },
-                // qpdf consults /EarlyChange only for LZW streams.
-                b"/EarlyChange" if self.lzw => match *value {
-                    ParamValue::Int(early_change) => {
-                        self.early_code_change = early_change == 1;
-                        if !((early_change == 0) || (early_change == 1)) {
-                            filterable = false;
-                        }
                     }
-                    ParamValue::Name(_) | ParamValue::Other => filterable = false,
-                },
+                }
+                // qpdf consults /EarlyChange only for LZW streams.
+                b"/EarlyChange" if self.lzw => {
+                    let Some(_) = value.try_as_integer()? else {
+                        filterable = false;
+                        continue;
+                    };
+                    let early_change = value.try_get_int_value_as_int()?;
+                    self.early_code_change = early_change == 1;
+                    if !((early_change == 0) || (early_change == 1)) {
+                        filterable = false;
+                    }
+                }
                 _ => {}
             }
         }
@@ -1263,7 +590,7 @@ impl StreamFilter for FlateLzwStreamFilter {
             filterable = false;
         }
 
-        filterable
+        Ok(filterable)
     }
 
     fn set_warning_callback(&mut self, callback: FilterWarningCallback) {
@@ -1640,54 +967,7 @@ impl StreamFilter for DctStreamFilter {
 /// its `getDecodePipeline` returns `nullptr`.
 struct CryptStreamFilter;
 
-/// Locate a `Crypt` stage's `Type` entry, or `None` when it has none.
-///
-/// **A plain entry-set lookup answers qpdf's `hasKey` only because a `Crypt`
-/// stage's parameters arrive with null values already dropped**, matching
-/// `QPDF_Dictionary::getKeys` (`QPDF_Dictionary.cc:118-127`) and
-/// `QPDF_Dictionary::hasKey` (`:98-101`), which both skip a null value. Both
-/// readers that can feed a `Crypt` stage do drop them —
-/// `decode_params_from_handle` gates on `filter_reads_decode_params`, and
-/// `decode_params_from_consuming_handle` takes its keys from `try_get_keys` —
-/// and the same [`filter_reads_decode_params`] arm selects them for `Crypt`.
-/// `decode_params_from_entries` keeps null values and is the reader a `Crypt`
-/// stage never reaches. These helpers are therefore private to this filter
-/// rather than methods on [`DecodeParams`]: under a non-consuming filter the
-/// same lookup would not mean qpdf's `hasKey`.
-fn crypt_params_type_entry(decode_params: &DecodeParams) -> Option<&ParamValue> {
-    decode_params
-        .entries()
-        .iter()
-        .find(|(key, _)| key.as_slice() == b"/Type")
-        .map(|(_, value)| value)
-}
-
-/// `decode_parms.hasKey("/Type")` (`QPDFObjectHandle.cc:965-976`), read off the
-/// located entry.
-fn crypt_params_have_type(type_entry: Option<&ParamValue>) -> bool {
-    type_entry.is_some()
-}
-
-/// `decode_parms.isDictionaryOfType("/CryptFilterDecodeParms")`
-/// (`QPDFObjectHandle.cc:462-466`), which with an empty `subtype` reduces to
-/// `isDictionary() && getKey("/Type").isNameAndEquals("/CryptFilterDecodeParms")`.
-///
-/// The `isDictionary()` conjunct needs no counterpart: a present
-/// non-dictionary `/DecodeParms` reduces to `Present` with no entries, so the
-/// key walk that reaches this predicate never runs. `getKey` returns null for
-/// an absent key and `isNameAndEquals` is then `false`, which is what `None`
-/// yields here.
-fn crypt_params_are_dictionary_of_type(type_entry: Option<&ParamValue>) -> bool {
-    matches!(type_entry, Some(ParamValue::Name(name)) if name.as_slice() == b"CryptFilterDecodeParms")
-}
-
 impl StreamFilter for CryptStreamFilter {
-    /// `SF_Crypt::setDecodeParms` walks `decode_parms.getKeys()`
-    /// (`QPDF_Stream.cc:40`), so it reads the parameter entries.
-    fn reads_decode_params(&self) -> bool {
-        true
-    }
-
     /// Port of `SF_Crypt::setDecodeParms` (`QPDF_Stream.cc:33-50`).
     ///
     /// Every key must be `Type` or `Name`, and a present `Type` must name
@@ -1699,39 +979,28 @@ impl StreamFilter for CryptStreamFilter {
     /// `<< /Type /CryptFilterDecodeParms /Foo 1 >>` exit 2 with "unable to
     /// filter stream data".
     ///
-    /// The `Type` validity test is evaluated *inside* the loop, as qpdf
-    /// evaluates it, even though hoisting the predicate would answer
-    /// identically on every shape — qpdf's loop shape is kept deliberately,
-    /// not because behaviour depends on it.
-    fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
-        // QPDF_Stream.cc:36-38. `DecodeParams` has already folded a missing
-        // key into the null case.
-        if decode_params.is_absent() {
-            return true;
+    /// The key test and its short-circuit order stay inside the loop, as qpdf
+    /// evaluates them. In particular, `hasKey` and
+    /// `isDictionaryOfType` are reached only for an allowed key, after
+    /// `getKeys` has inspected the parameter object; this preserves warning
+    /// and resolution timing for non-dictionary and malformed inputs.
+    fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
+        if decode_params.try_is_null()? {
+            return Ok(true);
         }
-        // qpdf looks the `/Type` entry up on the dictionary once per iteration.
-        // The answer cannot differ between iterations — `decode_params` is
-        // borrowed immutably for the whole loop — and locating the entry is not
-        // an observable operation: it reads an already-materialized `Vec`,
-        // resolves no indirect object, emits no warning, and cannot fail. It is
-        // therefore done once here and read per iteration. Both predicates stay
-        // where qpdf evaluates them, so every per-key decision and its position
-        // in the loop are unchanged. The `Vec`'s lookup cost against qpdf's
-        // `std::map` follows from the snapshot shape recorded at the top of
-        // this module; it is not what this is for.
-        let type_entry = crypt_params_type_entry(decode_params);
         let mut filterable = true;
-        for (key, _) in decode_params.entries() {
-            if ((key.as_slice() == b"/Type") || (key.as_slice() == b"/Name"))
-                && ((!crypt_params_have_type(type_entry))
-                    || crypt_params_are_dictionary_of_type(type_entry))
+        for key in decode_params.try_get_keys()? {
+            let is_allowed_key = (key.as_slice() == b"/Type") || (key.as_slice() == b"/Name");
+            if is_allowed_key
+                && (!decode_params.try_has_key(b"/Type")?
+                    || decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")?)
             {
                 // qpdf handles these two in decryptStream.
             } else {
                 filterable = false;
             }
         }
-        filterable
+        Ok(filterable)
     }
 
     /// Port of `SF_Crypt::getDecodePipeline` (`QPDF_Stream.cc:52-56`), whose
@@ -1876,7 +1145,7 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
 /// decode path uses, so both directions accept exactly the same dictionaries.
 fn predictor_encode_geometry(
     filter_name: &[u8],
-    decode_params: &DecodeParams,
+    decode_params: &ObjectHandle,
 ) -> Result<Option<PredictorGeometry>> {
     // qpdf's default QPDFStreamFilter::setDecodeParms accepts only a null
     // object. ASCII85, ASCIIHex, and RunLength inherit that contract; only
@@ -1888,7 +1157,7 @@ fn predictor_encode_geometry(
             // Let the codec encoder report an unknown or passthrough filter.
             return Ok(None);
         };
-        if !filter.set_decode_params(decode_params) {
+        if !filter.set_decode_params(decode_params)? {
             return Err(Error::Unsupported(format!(
                 "stream filter {} does not support supplied /DecodeParms",
                 String::from_utf8_lossy(filter_name)
@@ -1898,7 +1167,7 @@ fn predictor_encode_geometry(
     }
 
     let mut filter = FlateLzwStreamFilter::new(filter_name == b"LZWDecode");
-    if !filter.set_decode_params(decode_params) {
+    if !filter.set_decode_params(decode_params)? {
         return Err(Error::Unsupported(format!(
             "stream filter {} does not support supplied /DecodeParms",
             String::from_utf8_lossy(filter_name)
@@ -1911,7 +1180,7 @@ fn predictor_encode_geometry(
 pub(crate) fn encode_predictor(
     data: &[u8],
     filter_name: &[u8],
-    decode_params: &DecodeParams,
+    decode_params: &ObjectHandle,
 ) -> Result<Vec<u8>> {
     let Some(geometry) = predictor_encode_geometry(filter_name, decode_params)? else {
         return Ok(data.to_vec());
@@ -1942,38 +1211,57 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeParams, FlateLzwStreamFilter, ParamValue, StreamFilter};
+    use super::{FlateLzwStreamFilter, StreamFilter};
     use crate::pipeline::test_support::RecordingSink;
     use crate::pipeline::PipelineRef;
     use crate::ObjectHandle;
 
-    fn wide_tiff_decode_params() -> DecodeParams {
-        DecodeParams::Present(vec![
-            (b"/Predictor".to_vec(), ParamValue::Int(2)),
-            (b"/Columns".to_vec(), ParamValue::Int(536_870_911)),
-            (b"/Colors".to_vec(), ParamValue::Int(1)),
-            (b"/BitsPerComponent".to_vec(), ParamValue::Int(8)),
+    fn wide_tiff_decode_params() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"/Predictor".to_vec(), ObjectHandle::integer(2)),
+            (b"/Columns".to_vec(), ObjectHandle::integer(536_870_911)),
+            (b"/Colors".to_vec(), ObjectHandle::integer(1)),
+            (b"/BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
         ])
     }
 
     #[test]
     fn flate_filter_consumes_qpdf_canonical_slash_prefixed_keys() {
         let mut filter = FlateLzwStreamFilter::new(false);
-        let params = DecodeParams::Present(vec![(b"/Predictor".to_vec(), ParamValue::Int(2))]);
+        let params =
+            ObjectHandle::dictionary(vec![(b"/Predictor".to_vec(), ObjectHandle::integer(2))]);
 
-        assert!(filter.set_decode_params(&params));
+        assert!(filter.set_decode_params(&params).unwrap());
         assert_eq!(filter.predictor, 2);
     }
 
     #[test]
+    fn flate_setter_rejects_non_integer_geometry_parameters() {
+        for key in [b"/Predictor".as_slice(), b"/Columns"] {
+            let params = ObjectHandle::dictionary(vec![(
+                key.to_vec(),
+                ObjectHandle::name(b"not-an-integer".to_vec()),
+            )]);
+            let mut filter = FlateLzwStreamFilter::new(false);
+            assert!(!filter.set_decode_params(&params).unwrap());
+        }
+
+        let params = ObjectHandle::dictionary(vec![(
+            b"/EarlyChange".to_vec(),
+            ObjectHandle::name(b"not-an-integer".to_vec()),
+        )]);
+        let mut filter = FlateLzwStreamFilter::new(true);
+        assert!(!filter.set_decode_params(&params).unwrap());
+    }
+
+    #[test]
     fn flate_reader_preserves_canonical_key_matching_and_ignores_raw_unknown_keys() {
-        fn decode_params(key: &[u8]) -> DecodeParams {
+        fn decode_params(key: &[u8]) -> ObjectHandle {
             let params = ObjectHandle::dictionary(vec![]);
             params
                 .replace_key(key, ObjectHandle::integer(2))
                 .expect("decode parameter dictionary is mutable");
-            super::decode_params_from_handle(&params, b"FlateDecode")
-                .expect("decode parameters are readable")
+            params
         }
 
         let canonical = decode_params(b"/Predictor");
@@ -1981,24 +1269,128 @@ mod tests {
         let special_unknown = decode_params(b"/Predictor B");
 
         let mut canonical_filter = FlateLzwStreamFilter::new(false);
-        assert!(canonical_filter.set_decode_params(&canonical));
+        assert!(canonical_filter.set_decode_params(&canonical).unwrap());
         assert_eq!(canonical_filter.predictor, 2);
 
         let mut raw_filter = FlateLzwStreamFilter::new(false);
-        assert!(raw_filter.set_decode_params(&raw));
+        assert!(raw_filter.set_decode_params(&raw).unwrap());
         assert_eq!(raw_filter.predictor, 1);
 
         let mut special_filter = FlateLzwStreamFilter::new(false);
-        assert!(special_filter.set_decode_params(&special_unknown));
+        assert!(special_filter.set_decode_params(&special_unknown).unwrap());
         assert_eq!(special_filter.predictor, 1);
     }
 
     #[test]
+    fn flate_setter_warns_only_when_qpdf_reads_an_integer_parameter() {
+        let (huge, recorder) = crate::object_handle::warning_emission_tests::handle_resolving(
+            crate::object_handle::ObjectValue::Integer(i64::MAX),
+        );
+        let params = ObjectHandle::dictionary(vec![
+            (b"Columns".to_vec(), huge.clone()),
+            (b"Foo".to_vec(), huge.clone()),
+            (b"EarlyChange".to_vec(), huge),
+        ]);
+        let mut filter = FlateLzwStreamFilter::new(false);
+
+        assert!(filter.set_decode_params(&params).unwrap());
+        assert_eq!(
+            crate::object_handle::warning_emission_tests::warnings(&recorder),
+            vec!["object 3 0: requested value of integer is too big; returning INT_MAX"]
+        );
+    }
+
+    #[test]
+    fn filter_specs_keep_scalar_and_array_parameter_handle_mutations() {
+        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
+        let scalar_params =
+            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(1))]);
+        let scalar_specs =
+            super::decode_filter_specs_from_handle(&filter, &scalar_params, None).unwrap();
+        scalar_params
+            .replace_key(b"/Predictor", ObjectHandle::integer(2))
+            .unwrap();
+        let mut scalar_filter = FlateLzwStreamFilter::new(false);
+        assert!(scalar_filter
+            .set_decode_params(&scalar_specs[0].decode_params)
+            .unwrap());
+        assert_eq!(scalar_filter.predictor, 2);
+
+        let array_item =
+            ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(1))]);
+        let filter_array = ObjectHandle::array(vec![filter]);
+        let params_array = ObjectHandle::array(vec![array_item.clone()]);
+        let array_specs =
+            super::decode_filter_specs_from_handle(&filter_array, &params_array, None).unwrap();
+        array_item
+            .replace_key(b"/Predictor", ObjectHandle::integer(2))
+            .unwrap();
+        let mut array_filter = FlateLzwStreamFilter::new(false);
+        assert!(array_filter
+            .set_decode_params(&array_specs[0].decode_params)
+            .unwrap());
+        assert_eq!(array_filter.predictor, 2);
+    }
+
+    #[test]
+    fn filter_specs_expand_an_empty_decode_parameter_array_to_null_handles() {
+        let filters = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"LZWDecode".to_vec()),
+        ]);
+        let decode_params = ObjectHandle::array(vec![]);
+        let specs = super::decode_filter_specs_from_handle(&filters, &decode_params, None).unwrap();
+
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|spec| spec.decode_params.is_null()));
+    }
+
+    #[test]
+    fn filter_specs_preserve_unknown_stream_array_and_indirect_handles() {
+        let unknown_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![]),
+            std::rc::Rc::new(vec![1, 2, 3]),
+        );
+        let unknown_array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let unknown_indirect =
+            ObjectHandle::new_indirect_unresolved(crate::ObjectRef::new(90, 0), 0);
+        let params = ObjectHandle::dictionary(vec![
+            (b"UnknownStream".to_vec(), unknown_stream.clone()),
+            (b"UnknownArray".to_vec(), unknown_array.clone()),
+            (b"UnknownIndirect".to_vec(), unknown_indirect.clone()),
+        ]);
+        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
+        let specs = super::decode_filter_specs_from_handle(&filter, &params, None).unwrap();
+        let retained = &specs[0].decode_params;
+
+        let retained_stream = retained.try_get_key(b"/UnknownStream").unwrap();
+        assert!(retained_stream.is_same_object_as(&unknown_stream));
+        let retained_array = retained.try_get_key(b"/UnknownArray").unwrap();
+        assert!(retained_array.is_same_object_as(&unknown_array));
+        unknown_array
+            .append_array_item(ObjectHandle::integer(2))
+            .unwrap();
+        assert_eq!(retained_array.try_array_len().unwrap(), Some(2));
+
+        let retained_indirect = retained.try_get_key(b"/UnknownIndirect").unwrap();
+        assert!(retained_indirect.is_same_object_as(&unknown_indirect));
+        unknown_indirect.set_resolved(crate::object_handle::ObjectValue::Integer(7));
+        assert_eq!(retained_indirect.try_get_int_value().unwrap(), 7);
+    }
+
+    #[test]
+    fn base_stream_filter_accepts_only_null_decode_parameters() {
+        let mut filter = super::AsciiHexStreamFilter;
+        assert!(filter.set_decode_params(&ObjectHandle::null()).unwrap());
+        assert!(!filter
+            .set_decode_params(&ObjectHandle::dictionary(vec![]))
+            .unwrap());
+    }
+
+    #[test]
     fn crypt_reader_preserves_qpdf_name_and_type_validation() {
-        fn decode_params(entries: Vec<(Vec<u8>, ObjectHandle)>) -> DecodeParams {
-            let params = ObjectHandle::dictionary(entries);
-            super::decode_params_from_handle(&params, b"Crypt")
-                .expect("crypt decode parameters are readable")
+        fn decode_params(entries: Vec<(Vec<u8>, ObjectHandle)>) -> ObjectHandle {
+            ObjectHandle::dictionary(entries)
         }
 
         let mut identity_filter = super::CryptStreamFilter;
@@ -2006,36 +1398,58 @@ mod tests {
             b"/Name".to_vec(),
             ObjectHandle::name(b"Identity".to_vec()),
         )]);
-        assert!(identity_filter.set_decode_params(&identity));
+        assert!(identity_filter.set_decode_params(&identity).unwrap());
 
         let mut valid_type_filter = super::CryptStreamFilter;
         let valid_type = decode_params(vec![(
             b"/Type".to_vec(),
             ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
         )]);
-        assert!(valid_type_filter.set_decode_params(&valid_type));
+        assert!(valid_type_filter.set_decode_params(&valid_type).unwrap());
 
         let mut unknown_key_filter = super::CryptStreamFilter;
         let unknown_key = decode_params(vec![(b"/Foo".to_vec(), ObjectHandle::integer(1))]);
-        assert!(!unknown_key_filter.set_decode_params(&unknown_key));
+        assert!(!unknown_key_filter.set_decode_params(&unknown_key).unwrap());
 
         let mut invalid_type_filter = super::CryptStreamFilter;
         let invalid_type = decode_params(vec![(
             b"/Type".to_vec(),
             ObjectHandle::name(b"Foo".to_vec()),
         )]);
-        assert!(!invalid_type_filter.set_decode_params(&invalid_type));
+        assert!(!invalid_type_filter
+            .set_decode_params(&invalid_type)
+            .unwrap());
+
+        let mut null_filter = super::CryptStreamFilter;
+        assert!(null_filter
+            .set_decode_params(&ObjectHandle::null())
+            .unwrap());
+    }
+
+    #[test]
+    fn crypt_setter_reads_a_non_dictionary_once_before_accepting_empty_keys() {
+        let (params, recorder) = crate::object_handle::warning_emission_tests::handle_resolving(
+            crate::object_handle::ObjectValue::Integer(1),
+        );
+        let mut filter = super::CryptStreamFilter;
+
+        assert!(filter.set_decode_params(&params).unwrap());
+        assert_eq!(
+            crate::object_handle::warning_emission_tests::warnings(&recorder),
+            vec![
+                "object 3 0: operation for dictionary attempted on object of type integer: treating as empty"
+            ]
+        );
     }
 
     #[test]
     fn lzw_reader_consumes_only_canonical_early_change_keys() {
-        fn decode_params(filter_name: &[u8], key: &[u8], value: i64) -> DecodeParams {
+        fn decode_params(_filter_name: &[u8], key: &[u8], value: i64) -> ObjectHandle {
             let params = ObjectHandle::dictionary(vec![]);
             params
                 .replace_key(key, ObjectHandle::integer(value))
                 .expect("decode parameter dictionary is mutable");
-            super::decode_params_from_handle(&params, filter_name)
-                .expect("decode parameters are readable")
+            params
         }
 
         for (value, expected_filterable, expected_early_change) in
@@ -2043,24 +1457,29 @@ mod tests {
         {
             let params = decode_params(b"LZWDecode", b"/EarlyChange", value);
             let mut filter = FlateLzwStreamFilter::new(true);
-            assert_eq!(filter.set_decode_params(&params), expected_filterable);
+            assert_eq!(
+                filter.set_decode_params(&params).unwrap(),
+                expected_filterable
+            );
             assert_eq!(filter.early_code_change, expected_early_change);
         }
 
         let raw = decode_params(b"LZWDecode", b"EarlyChange", 0);
         let mut raw_filter = FlateLzwStreamFilter::new(true);
-        assert!(raw_filter.set_decode_params(&raw));
+        assert!(raw_filter.set_decode_params(&raw).unwrap());
         assert!(raw_filter.early_code_change);
 
         let flate = decode_params(b"FlateDecode", b"/EarlyChange", 0);
         let mut flate_filter = FlateLzwStreamFilter::new(false);
-        assert!(flate_filter.set_decode_params(&flate));
+        assert!(flate_filter.set_decode_params(&flate).unwrap());
         assert!(flate_filter.early_code_change);
     }
 
     fn wide_tiff_filter() -> FlateLzwStreamFilter {
         let mut filter = FlateLzwStreamFilter::new(false);
-        assert!(filter.set_decode_params(&wide_tiff_decode_params()));
+        assert!(filter
+            .set_decode_params(&wide_tiff_decode_params())
+            .unwrap());
         filter.set_tiff_memory_limit(Some(1 << 20));
         filter
     }
@@ -2092,11 +1511,11 @@ mod tests {
 
     #[test]
     fn encode_predictor_uses_the_tiff_stream_filter_pipeline() {
-        let params = DecodeParams::Present(vec![
-            (b"/Predictor".to_vec(), ParamValue::Int(2)),
-            (b"/Columns".to_vec(), ParamValue::Int(2)),
-            (b"/Colors".to_vec(), ParamValue::Int(1)),
-            (b"/BitsPerComponent".to_vec(), ParamValue::Int(8)),
+        let params = ObjectHandle::dictionary(vec![
+            (b"/Predictor".to_vec(), ObjectHandle::integer(2)),
+            (b"/Columns".to_vec(), ObjectHandle::integer(2)),
+            (b"/Colors".to_vec(), ObjectHandle::integer(1)),
+            (b"/BitsPerComponent".to_vec(), ObjectHandle::integer(8)),
         ]);
 
         assert_eq!(

@@ -141,7 +141,7 @@
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
 | `crates/flpdf/src/signatures.rs` | correspondence | no qpdf counterpart for signature inspection; qpdf-owned mutation lives in Pdf and AcroFormDocumentHelper |
-| `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values |
+| `crates/flpdf/src/stream_filter.rs` | correspondence | \`QPDFStreamFilter.cc\` and \`QPDF_Stream.cc\` filter names, full \`/DecodeParms\` handles, and reverse decode-pipeline construction (\`libqpdf/QPDF_Stream.cc:380-482\`) |
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
 | `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |
