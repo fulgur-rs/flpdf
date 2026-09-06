@@ -195,7 +195,7 @@ fn top_level_is_encrypted_requires_an_input() {
         .assert()
         .code(2)
         .stderr(predicate::eq(format!(
-            "flpdf: --is-encrypted requires an input file{EOL}"
+            "{EOL}flpdf: an input file name is required{EOL}{EOL}For help:{EOL}  flpdf --help=usage       usage information{EOL}  flpdf --help=topic       help on a topic{EOL}  flpdf --help=--option    help on an option{EOL}  flpdf --help             general help and a topic list{EOL}{EOL}"
         )));
 }
 
@@ -206,7 +206,7 @@ fn top_level_requires_password_requires_an_input() {
         .assert()
         .code(2)
         .stderr(predicate::eq(format!(
-            "flpdf: --requires-password requires an input file{EOL}"
+            "{EOL}flpdf: an input file name is required{EOL}{EOL}For help:{EOL}  flpdf --help=usage       usage information{EOL}  flpdf --help=topic       help on a topic{EOL}  flpdf --help=--option    help on an option{EOL}  flpdf --help             general help and a topic list{EOL}{EOL}"
         )));
 }
 

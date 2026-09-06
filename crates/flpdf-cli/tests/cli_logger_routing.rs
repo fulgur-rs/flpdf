@@ -549,6 +549,76 @@ fn qpdf_differential_matches_routed_output_matrix() {
     }
 }
 
+#[test]
+fn qpdf_differential_matches_missing_input_usage_error() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping missing-input usage differential");
+        return;
+    }
+
+    let cases: &[(&str, &[&str])] = &[
+        ("no input", &[]),
+        ("--is-encrypted without input", &["--is-encrypted"]),
+        (
+            "--requires-password without input",
+            &["--requires-password"],
+        ),
+        ("--show-encryption without input", &["--show-encryption"]),
+        ("--show-npages without input", &["--show-npages"]),
+        ("--show-pages without input", &["--show-pages"]),
+        ("--show-xref without input", &["--show-xref"]),
+        (
+            "--check-linearization without input",
+            &["--check-linearization"],
+        ),
+        (
+            "--show-linearization without input",
+            &["--show-linearization"],
+        ),
+        ("--show-object without input", &["--show-object=1"]),
+        ("--json without input", &["--json"]),
+        (
+            "--json-input --check without input",
+            &["--json-input", "--check"],
+        ),
+        (
+            "--update-from-json --check without input",
+            &["--update-from-json=foo", "--check"],
+        ),
+        ("--qdf without input", &["--qdf"]),
+        ("--list-attachments without input", &["--list-attachments"]),
+        (
+            "--show-attachment without input",
+            &["--show-attachment=foo"],
+        ),
+        (
+            "--remove-attachment without input",
+            &["--remove-attachment=foo"],
+        ),
+        (
+            "--check --pages without primary input",
+            &["--check", "--pages", "noxref.pdf", "--"],
+        ),
+        ("rewrite without output", &[MINIMAL]),
+        ("--qdf without output", &["--qdf", MINIMAL]),
+        (
+            "--add-attachment without output",
+            &["--add-attachment", MINIMAL, "--", MINIMAL],
+        ),
+        (
+            "--remove-attachment without output",
+            &["--remove-attachment=foo", "--", MINIMAL],
+        ),
+        (
+            "--copy-attachments-from without output",
+            &["--copy-attachments-from", MINIMAL, "--", MINIMAL],
+        ),
+    ];
+    for (label, args) in cases {
+        assert_observables_equal(label, &run_qpdf(args), &run_flpdf(args), true);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn qpdf_differential_preserves_open_warning_order_before_check_banner() {

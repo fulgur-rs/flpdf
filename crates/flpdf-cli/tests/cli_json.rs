@@ -1285,7 +1285,7 @@ fn json_key_without_json_flag_is_usage_error() {
     cmd.args(["--json-key", "pages", input.path().to_str().unwrap()])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("missing output file"));
+        .stderr(predicate::str::contains("an output file name is required"));
 }
 
 #[test]
@@ -1318,7 +1318,7 @@ fn json_stream_data_without_json_flag_is_usage_error() {
     ])
     .assert()
     .code(2)
-    .stderr(predicate::str::contains("missing output file"));
+    .stderr(predicate::str::contains("an output file name is required"));
 }
 
 // ---------------------------------------------------------------------------
