@@ -546,11 +546,11 @@ fn parse_numrange_integer(
     let text = std::str::from_utf8(digits)
         .map_err(|_| numrange_error(input, offset, b"invalid range syntax"))?;
     let number = match qpdf_string_to_int_checked(text) {
-        QpdfIntParse::Value(value) => value,
+        QpdfIntParse::Value(value) if value != 0 => value,
         QpdfIntParse::Overflow(message) => {
             return Err(numrange_error(input, offset, message.as_bytes()));
         }
-        QpdfIntParse::NoDigits => 0,
+        QpdfIntParse::Value(_) | QpdfIntParse::NoDigits => 0,
     };
     let value = if from_end {
         max.wrapping_add(1).wrapping_sub(number)
