@@ -297,6 +297,11 @@ impl ArgParser {
                     ))
                     .into());
                 }
+                if let Some(message) =
+                    invalid_required_choice_message(&option, canonical.as_bytes(), parameter_name)
+                {
+                    return Err(flpdf::UsageError::new(message).into());
+                }
             }
             let Some(kind) = SegmentKind::from_option(&option) else {
                 residual_args.push(canonical);
@@ -439,6 +444,23 @@ fn required_parameter_name(name: &str) -> Option<&'static str> {
     QPDF_REQUIRED_PARAMETER_OPTIONS
         .iter()
         .find_map(|(option, parameter)| (*option == name).then_some(*parameter))
+}
+
+fn invalid_required_choice_message(
+    option: &str,
+    arg: &[u8],
+    parameter_name: &str,
+) -> Option<String> {
+    let choices = parameter_name.strip_prefix('{')?.strip_suffix('}')?;
+    let equals = arg.iter().position(|byte| *byte == b'=')?;
+    let value = &arg[equals + 1..];
+    if choices.split(',').any(|choice| choice.as_bytes() == value) {
+        None
+    } else {
+        Some(format!(
+            "--{option} must be given as --{option}={parameter_name}"
+        ))
+    }
 }
 
 fn has_attached_parameter(arg: &[u8]) -> bool {
