@@ -1,4 +1,4 @@
-//! qpdf correspondence: `QPDFJob::parseRotationParameter`
+//! qpdf correspondence: `QPDFJob::parseRotationParameter`.
 //! (`libqpdf/QPDFJob.cc:369-415`) and its private `RotationSpec` state.
 //!
 //! Rotation parsing keeps qpdf's raw range bytes separate from the angle and
