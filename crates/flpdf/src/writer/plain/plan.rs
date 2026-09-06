@@ -97,6 +97,7 @@ pub(crate) struct PlainWritePlan {
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
     pub(crate) cached_stream_outputs: HashMap<ObjectRef, CachedStreamOutput>,
+    pub(crate) trailer_handle: crate::ObjectHandle,
     pub(crate) trailer: TrailerPlan,
 }
 
@@ -418,6 +419,7 @@ impl PlainWritePlan {
             old_to_new: placement.old_to_new,
             removed_refs: placement.removed_refs,
             cached_stream_outputs: cached_stream_outputs.into_inner(),
+            trailer_handle,
             trailer,
         };
         plan.validate()?;
@@ -1016,6 +1018,7 @@ mod tests {
             old_to_new: HashMap::from([(root_source, root_output)]),
             removed_refs: BTreeSet::new(),
             cached_stream_outputs: HashMap::new(),
+            trailer_handle: crate::ObjectHandle::dictionary(Vec::new()),
             trailer: TrailerPlan {
                 form: XrefForm::Table,
                 canonical_entries: Vec::new(),

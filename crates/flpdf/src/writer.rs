@@ -5738,6 +5738,7 @@ mod final_handle_writer_tests {
     use super::*;
     use crate::encryption::standard::ObjectKeyAlg;
     use crate::encryption::CopyEncryptionSource;
+    use crate::writer::object::TrailerKind;
     use std::io::{self, Cursor, Write};
 
     struct AlwaysFailingOutput;
@@ -5750,6 +5751,251 @@ mod final_handle_writer_tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn shared_trailer_contract_fixture(
+    ) -> (Pdf<Cursor<Vec<u8>>>, ObjectHandle, ObjectRef, ObjectRef) {
+        let pdf = Pdf::empty().expect("empty PDF for trailer fixture");
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .expect("indirect root fixture");
+        let encrypt = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("indirect encryption fixture");
+        let root_ref = root.object_ref().expect("root object reference");
+        let encrypt_ref = encrypt.object_ref().expect("encryption object reference");
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/Info".to_vec(), ObjectHandle::integer(1)),
+            (b"/Name".to_vec(), ObjectHandle::name(b"N".to_vec())),
+            (b"/CustomRef".to_vec(), root.clone()),
+            (b"/Root".to_vec(), root),
+            (b"/Size".to_vec(), ObjectHandle::integer(99)),
+            (b"/NullEntry".to_vec(), ObjectHandle::null()),
+            (
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"id0".to_vec()),
+                    ObjectHandle::string(b"id1".to_vec()),
+                ]),
+            ),
+            (b"/Encrypt".to_vec(), encrypt),
+        ]);
+        (pdf, trailer, root_ref, encrypt_ref)
+    }
+
+    #[test]
+    fn shared_trailer_contract_emits_normal_qdf_and_linearized_forms() {
+        let (_pdf, trailer, root_ref, encrypt_ref) = shared_trailer_contract_fixture();
+        let map = |object_ref| Ok(object_ref);
+        let removed = BTreeSet::new();
+
+        let mut normal = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut normal,
+                TrailerKind::Normal { size: 6 },
+                false,
+                false,
+                None,
+                &map,
+                &removed,
+                true,
+            )
+            .expect("normal shared trailer succeeds");
+        assert_eq!(
+            normal,
+            format!(
+                "trailer << /CustomRef {} 0 R /Info 1 /Name /N /Root {} 0 R /Size 6 /ID [<696430><696431>] /Encrypt {} 0 R >>",
+                root_ref.number, root_ref.number, encrypt_ref.number
+            )
+            .as_bytes()
+        );
+
+        let mut qdf = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut qdf,
+                TrailerKind::Normal { size: 6 },
+                false,
+                true,
+                None,
+                &map,
+                &removed,
+                true,
+            )
+            .expect("QDF shared trailer succeeds");
+        assert_eq!(
+            qdf,
+            format!(
+                "trailer <<\n  /CustomRef {} 0 R\n  /Info 1\n  /Name /N\n  /Root {} 0 R\n  /Size 6\n  /ID [<696430><696431>] /Encrypt {} 0 R\n>>\n",
+                root_ref.number, root_ref.number, encrypt_ref.number
+            )
+            .as_bytes()
+        );
+
+        let mut first = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut first,
+                TrailerKind::LinearizedFirst { size: 6, prev: 123 },
+                false,
+                false,
+                None,
+                &map,
+                &removed,
+                true,
+            )
+            .expect("linearized first trailer succeeds");
+        let first_text = String::from_utf8(first).expect("trailer is UTF-8");
+        let prev_start = first_text.find("/Prev ").expect("/Prev is present") + 6;
+        assert_eq!(
+            &first_text.as_bytes()[prev_start..prev_start + 21],
+            b"123                  "
+        );
+        assert!(first_text.ends_with(&format!(
+            " /ID [<696430><696431>] /Encrypt {} 0 R >>",
+            encrypt_ref.number
+        )));
+
+        let mut second = b"<< /Type /XRef".to_vec();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut second,
+                TrailerKind::LinearizedSecond { size: 6 },
+                true,
+                false,
+                None,
+                &map,
+                &removed,
+                true,
+            )
+            .expect("linearized second xref trailer succeeds");
+        assert_eq!(second, b"<< /Type /XRef /Size 6 /ID [<696430><696431>] >>");
+    }
+
+    #[test]
+    fn shared_trailer_contract_preserves_writer_owned_keys_and_id_writer() {
+        let (_pdf, trailer, root_ref, encrypt_ref) = shared_trailer_contract_fixture();
+        let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
+            Ok(ObjectRef::new(object_ref.number + 100, 0))
+        };
+        let removed = BTreeSet::new();
+        let mut output = Vec::new();
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<custom>]");
+
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 7 },
+                false,
+                false,
+                Some(&mut id_writer),
+                &map,
+                &removed,
+                true,
+            )
+            .expect("writer-owned trailer values survive filtering");
+        let text = String::from_utf8(output).expect("trailer is UTF-8");
+        assert!(!text.contains("/NullEntry"));
+        assert!(text.contains(&format!("/Root {} 0 R", root_ref.number)));
+        assert!(text.contains(&format!(
+            "/ID [<custom>] /Encrypt {} 0 R",
+            encrypt_ref.number
+        )));
+    }
+
+    #[test]
+    fn shared_trailer_contract_rejects_reserved_and_non_dictionary_handles() {
+        let reserved = ObjectHandle::new_reserved_direct();
+        let error = reserved
+            .write_trailer_with_ref_map_and_kind(
+                &mut Vec::new(),
+                TrailerKind::Normal { size: 1 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref), // cov:ignore: reserved handles exit before the callback can run
+                &BTreeSet::new(),
+                true,
+            )
+            .expect_err("reserved trailer handle must fail");
+        assert!(matches!(error, Error::System(message) if message.contains("reserved")));
+
+        let scalar = ObjectHandle::integer(1);
+        let mut output = Vec::new();
+        scalar
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 1 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref), // cov:ignore: scalar handles have no child reference to map
+                &BTreeSet::new(),
+                true,
+            )
+            .expect("non-dictionary trailer is emitted as an empty shell");
+        assert_eq!(output, b"trailer << >>");
+    }
+
+    #[test]
+    fn shared_trailer_contract_maps_a_direct_qdf_root() {
+        let trailer = ObjectHandle::dictionary(vec![
+            (
+                b"/Root".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Pages".to_vec(), ObjectHandle::integer(3))]),
+            ),
+            (b"/Size".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        // cov:ignore-start: this direct-root case has no indirect child to map
+        let map = |object_ref: ObjectRef| -> Result<ObjectRef> {
+            Ok(ObjectRef::new(object_ref.number + 100, 0))
+        };
+        // cov:ignore-end
+        let mut output = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 1 },
+                false,
+                true,
+                None,
+                &map,
+                &BTreeSet::new(),
+                true,
+            )
+            .expect("direct QDF Catalog is emitted");
+        let text = String::from_utf8(output).expect("trailer is UTF-8");
+        assert!(text.contains("/Pages 3"));
+    }
+
+    #[test]
+    fn shared_trailer_contract_filters_a_removed_reference() {
+        let pdf = Pdf::empty().expect("empty PDF for removed-reference test");
+        let custom = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("indirect custom trailer value");
+        let custom_ref = custom.object_ref().expect("custom object reference");
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/CustomRef".to_vec(), custom),
+            (b"/Size".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut output = Vec::new();
+        trailer
+            .write_trailer_with_ref_map_and_kind(
+                &mut output,
+                TrailerKind::Normal { size: 2 },
+                false,
+                false,
+                None,
+                &|object_ref| Ok(object_ref), // cov:ignore: removed references exit before the callback can run
+                &[custom_ref].into_iter().collect(),
+                true,
+            )
+            .expect("removed trailer reference is filtered");
+        assert!(!String::from_utf8(output)
+            .expect("trailer is UTF-8")
+            .contains("/CustomRef"));
     }
 
     #[test]
