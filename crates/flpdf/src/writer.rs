@@ -2773,7 +2773,7 @@ pub(crate) fn build_writer_setup<R: Read + Seek>(
                 // cov:ignore-start: build_writer_setup always creates this two-string ID
                 Error::Unsupported("writer setup: generated encryption ID is malformed".into())
                 // cov:ignore-end
-            })?;
+            })?; // cov:ignore: generated ID invariant makes this continuation unreachable
         let metadata_ref = if params.encrypt_metadata {
             None
         } else {
