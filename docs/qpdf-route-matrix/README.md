@@ -306,6 +306,10 @@ crates/flpdf/src/xref.rs::LoadedXref: prod 7 (1 files) / test 2
     crates/flpdf/src/xref.rs 7
 crates/flpdf/src/xref.rs::BootstrapHandleState: prod 7 (1 files) / test 10
     crates/flpdf/src/xref.rs 7
+crates/flpdf/src/error.rs::QpdfExc: prod 0 (0 files) / test 5
+    crates/flpdf/src/error.rs 5
+crates/flpdf/src/error.rs::QpdfErrorCode: prod 3 (1 files) / test 14
+    crates/flpdf/src/error.rs 3
 crates/flpdf/src/reader/resolver.rs::qpdf_exception_what: prod 1 (1 files) / test 0
     crates/flpdf/src/reader/resolver.rs 1
 crates/flpdf/src/reader/resolver.rs::route_warning: prod 5 (1 files) / test 3

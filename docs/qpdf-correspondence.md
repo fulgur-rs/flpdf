@@ -356,6 +356,12 @@ ownership 実装であり、PDF bytes、warning、xref/cache identity は変更�
 | `QPDF_pages.cc` | 319 | `pages/repair.rs`（`QPDF_pages.cc:39-75` の `getAllPages` root correction と `:77-150` の `getAllPagesInternal` repair/enumeration を canonical `ObjectHandle` graph 上で実装） + `optimization/inherited_attrs.rs`（canonical page promotion/clone と衝突しない `Pdf::next_obj_gen` allocation） + `pages.rs` / `pages/tree_rebuild.rs`（flatten/insert/remove と legacy consumer の残り） | 🔀 `flpdf-25kg.3.7` で repair/enumeration の canonical route を追加。`.3.2.6.15` では `QPDFPageObjectHelper::getAttribute` の bottom-up `/Parent` climb（`QPDFPageObjectHelper.cc:217-263`。`QPDF_optimization.cc:121-245`/`QPDF_pages.cc:154-180,205-248` は top-down push とツリー変異のオラクル）を、共有 `PageParentCursor` / `resolve_inherited_handle_with_max_depth` として live `ObjectHandle` で切り出した。直接親の identity、間接親の canonical `ObjectRef`、null/非辞書親、cycle/depth guard をこの境界で保持し、`/Rotate` の未指定を合成しない。`.3.2.6.16` では `tree_rebuild` の単一文書 consumer を canonical handle route に切り替え、選択ページの inherited `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を再親子付け前に push、直接 non-scalar は `make_indirect_from_object_handle` で共有 allocation を in-place 昇格、既存 indirect 値は identity を保持し、duplicate は `shallow_copy`、root `/Kids`・`/Count`・各 leaf `/Parent` は live handle を replace/remove する。qpdf の absent `/Rotate` は合成しない。`QPDFObjectHandle.cc:1199-1209,2072-2079` の live replace/remove・shallow-copy がこの consumerの mutation oracleである。`QPDFJob.cc:2360-2632` の page-selection orchestration はこの境界の外であり、`page_extract` uses canonical `copyForeignObject`/`ObjectHandle`; `page_merge` / `page_label` remain separate consumers |
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
 
+`.27.1` adds the public `QpdfExc` / `QpdfErrorCode` primitive in `error.rs`, mirroring
+qpdf's independent error code, raw filename/object/message fields, signed file position,
+and `createWhat` formatting. `QpdfExc::what_bytes()` intentionally exposes the observable
+NUL-terminated `what()` bytes; getters retain complete fields. Resolver/diagnostic consumer
+cutover and removal of duplicate formatters remain in the follow-up `.48.27` layers.
+
 `flpdf-15qk` completes the `QPDF_pages.cc` cache boundary: `Pdf::page_list_cache`
 stores the prepared root and ordered leaf identities after the canonical repair
 walk, `PageDocumentHelper` consumers reuse it across JSON sections, and

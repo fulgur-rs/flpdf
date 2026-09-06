@@ -172,7 +172,7 @@ pub use encryption::permissions::{
 pub use encryption::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, ObjectKeyAlg, PasswordMode,
 };
-pub use error::{EncryptedError, Error, Result, UsageError};
+pub use error::{EncryptedError, Error, QpdfErrorCode, QpdfExc, Result, UsageError};
 pub use filespec_helper::{
     encode_utf16be, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates, FileSpec,
     FileSpecBuilder,
