@@ -1212,6 +1212,11 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.reconstructed_xref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn dangling_references_fixed(&self) -> bool {
+        self.resolver.dangling_references_fixed()
+    }
+
     /// Prepare the canonical object cache and return qpdf's greatest object
     /// number (`QPDF::getObjectCount`, `libqpdf/QPDF.cc:1271-1283`). This is
     /// intentionally separate from fresh-object allocation, which belongs to
@@ -1762,6 +1767,18 @@ impl<R: Read + Seek> Pdf<R> {
                 })
             })
             .collect())
+    }
+
+    /// Prepare the canonical object cache through qpdf's
+    /// `QPDF::fixDanglingReferences` boundary.
+    ///
+    /// `QPDFWriter::prepareFileForWrite` calls this before it touches the
+    /// Catalog, and the writer must be able to perform that preparation
+    /// without taking the broader `getAllObjects` enumeration route. Keep the
+    /// resolver's idempotent fixed-state guard as the single owner of the
+    /// operation (`libqpdf/QPDF.cc:1259-1269`).
+    pub(crate) fn fix_dangling_references(&self) -> Result<()> {
+        self.resolver.fix_dangling_references()
     }
 
     /// Resolve `handle` in place if it is an unresolved indirect handle.

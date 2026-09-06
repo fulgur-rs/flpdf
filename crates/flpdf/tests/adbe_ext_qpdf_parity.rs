@@ -164,6 +164,59 @@ fn valid_zero_level_adbe_with_non_adbe_prefix_is_preserved_byte_identical_to_qpd
     );
 }
 
+#[test]
+fn common_writer_preparation_keeps_indirect_extensions_direct_on_live_catalog() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearize-indirect-extensions.pdf");
+    let file = std::fs::File::open(&path).expect("open indirect extensions fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture");
+
+    let before = pdf
+        .root_handle()
+        .expect("fixture has a Catalog")
+        .try_get_key(b"/Extensions")
+        .expect("read source Extensions");
+    assert!(
+        before.is_indirect(),
+        "fixture must start with indirect Extensions"
+    );
+
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &strip_options()).expect("rewrite succeeds");
+
+    let after = pdf
+        .root_handle()
+        .expect("Catalog remains available after write")
+        .try_get_key(b"/Extensions")
+        .expect("read live Extensions after write");
+    assert!(
+        after.is_direct(),
+        "qpdf prepareFileForWrite is permanent graph preparation, not an output snapshot"
+    );
+}
+
+#[test]
+fn common_writer_preparation_is_shared_by_linearized_output() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearize-indirect-extensions.pdf");
+    let file = std::fs::File::open(&path).expect("open indirect extensions fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture");
+
+    write_linearized_with_settings(&mut pdf, &strip_options()).expect("linearization succeeds");
+
+    let extensions = pdf
+        .root_handle()
+        .expect("Catalog remains available after linearization")
+        .try_get_key(b"/Extensions")
+        .expect("read live Extensions after linearization");
+    assert!(
+        extensions.is_direct(),
+        "linearized output must consume the same permanent graph preparation"
+    );
+}
+
 mod common;
 #[allow(unused_imports)]
-use common::{write_default, write_with_settings, WriterTestSettings};
+use common::{
+    write_default, write_linearized_with_settings, write_with_settings, WriterTestSettings,
+};

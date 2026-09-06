@@ -58,3 +58,29 @@ fn linearization_id_construction_is_handle_native() {
         .expect("linearization implementation exists");
     assert!(!implementation.contains("id_object_to_handle"));
 }
+
+#[test]
+fn prepare_file_for_write_is_owned_by_the_common_writer_boundary() {
+    let writer_source = include_str!("../src/writer.rs").replace("\r\n", "\n");
+    let write = writer_source
+        .split_once("pub fn write(&mut self) -> Result<()>")
+        .and_then(|(_, rest)| rest.split_once("    /// Return the output identity"))
+        .map(|(function, _)| function)
+        .expect("PdfWriter::write exists");
+    assert_eq!(
+        write.matches("prepare_file_for_write").count(),
+        1,
+        "the common PdfWriter route must prepare the graph exactly once"
+    );
+
+    let linearization_source = include_str!("../src/linearization/writer.rs").replace("\r\n", "\n");
+    let linearization_route = linearization_source
+        .split_once("pub(crate) fn write_linearized_for_pdf_writer")
+        .and_then(|(_, rest)| rest.split_once("/// Write the pass-1 body"))
+        .map(|(function, _)| function)
+        .expect("PdfWriter linearization route exists");
+    assert!(
+        !linearization_route.contains("prepare_linearization_catalog"),
+        "linearization must consume the common preparation boundary"
+    );
+}

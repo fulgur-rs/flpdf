@@ -2953,75 +2953,6 @@ struct CatalogAdbeStatus {
     has_adbe: bool,
 }
 
-/// Prepare the destination Catalog using qpdf's pre-optimization writer setup.
-///
-/// QPDFWriter::prepareFileForWrite (libqpdf/QPDFWriter.cc:2034-2055)
-/// shallow-copies a dictionary-valued indirect /Extensions value onto the
-/// Catalog and recursively makes an indirect /ADBE value direct. The
-/// linearization plan must observe those replacements before it partitions
-/// the graph, so the old indirect objects do not enter the part layout.
-///
-/// Returns whether the live Catalog was changed. The caller uses that result
-/// only to manage flpdf's dirty bookkeeping around this writer-owned
-/// preparation; the graph mutation itself remains canonical and live.
-fn prepare_linearization_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(false);
-    };
-    let root = pdf.get_object_handle(root_ref);
-    pdf.resolve(&root)?;
-    if root.try_as_dictionary()?.is_none() {
-        return Ok(false);
-    }
-    let extensions = root.try_get_key(b"/Extensions")?;
-    if extensions.try_as_dictionary()?.is_none() {
-        return Ok(false);
-    }
-
-    let mut changed = false;
-    let extensions = if extensions.is_indirect() {
-        let direct = extensions.shallow_copy()?;
-        root.replace_key(b"/Extensions", direct.clone())?;
-        changed = true;
-        direct
-    } else {
-        extensions
-    };
-
-    if extensions.try_has_key(b"/ADBE")? {
-        let mut adbe = extensions.try_get_key(b"/ADBE")?;
-        if adbe.is_indirect() {
-            adbe.make_direct(false)?;
-            // `extensions` may still be the exact handle stored in the
-            // source Pdf's /Extensions slot (when /Extensions itself was
-            // already direct, so the branch above never replaced it):
-            // mutating it in place here would corrupt
-            // `snapshot_catalog_extensions`'s pre-write capture, since
-            // `ObjectHandle` clones share the same underlying cell.
-            // Rebuild a fresh top-level dictionary from the current entries
-            // (an `ObjectHandle` clone, not a deep copy) instead of
-            // `shallow_copy()`: that recursively validates every direct
-            // descendant and rejects a direct stream sibling
-            // (`libqpdf/QPDF_Stream.cc:140-145`'s "stream objects cannot be
-            // cloned"), which would wrongly fail this qpdf-owned
-            // preparation step for an unrelated `/Extensions` entry qpdf
-            // itself never touches.
-            let mut entries = extensions
-                .try_as_dictionary()?
-                .expect("checked is_some above");
-            entries.insert(b"/ADBE".to_vec(), adbe);
-            let extensions = ObjectHandle::dictionary(entries.into_iter().collect());
-            root.replace_key(b"/Extensions", extensions)?;
-            changed = true;
-        }
-    }
-
-    if changed {
-        pdf.mark_object_handle_dirty(&root)?;
-    }
-    Ok(changed)
-}
-
 fn finish_linearization_write<T>(result: Result<T>, restore: Result<()>) -> Result<T> {
     match (result, restore) {
         (Err(error), _) => Err(error),
@@ -3135,25 +3066,13 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     options: &WriterOptions,
     pass1_path: Option<&Path>,
 ) -> Result<(LinearizedDocument, WriterResult)> {
-    // Capture the caller's raw extension entry before qpdf's permanent
-    // pre-plan directization. The output-only ADBE mutation is restored
-    // afterward, while the plan observes the prepared live graph.
+    // Capture the already-prepared Catalog extension entry before the
+    // output-only ADBE mutation. PdfWriter::write performs qpdf's permanent
+    // prepareFileForWrite boundary before choosing this route, so restoration
+    // cannot undo graph preparation.
     let mut catalog_snapshot = crate::writer::snapshot_catalog_extensions(pdf)?;
-    let root_ref_before = pdf.root_ref();
-    let root_was_dirty_before = root_ref_before.is_some_and(|root_ref| pdf.is_dirty(root_ref));
 
     let plan_result = (|| {
-        let catalog_prepared = prepare_linearization_catalog(pdf)?;
-        // The directization is writer-owned preparation, not a caller edit.
-        // Clear only its dirty bit when the Catalog started clean; the
-        // baseline is refreshed after planning so permanent plan mutations
-        // remain dirty through the restore boundary.
-        if catalog_prepared && !root_was_dirty_before {
-            if let Some(root_ref) = root_ref_before {
-                pdf.clear_dirty(root_ref);
-            }
-        }
-
         let mode = if crate::writer::force_version_below_1_5(options) {
             crate::writer::ObjectStreamMode::Disable
         } else {

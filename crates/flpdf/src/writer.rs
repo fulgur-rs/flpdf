@@ -768,6 +768,14 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             0,
             self.settings.linearization,
         )?; // cov:ignore: progress tests exercise this call; LLVM maps its successful multiline continuation to an unhit region
+
+        // QPDFWriter::write performs the one writer-owned graph preparation
+        // after the progress object-count snapshot and before it chooses
+        // writeLinearized or writeStandard (QPDFWriter.cc:2187-2200).
+        // Keep fixDanglingReferences and Catalog extension directization on
+        // this common boundary so the two output routes consume one live
+        // graph rather than maintaining route-local preparation bridges.
+        prepare_file_for_write(self.pdf)?;
         let result = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
@@ -1601,6 +1609,55 @@ pub(crate) struct WriterOptions {
 /// choose between a static ID and the deterministic digest.
 pub(crate) const fn uses_deterministic_id(options: &WriterOptions) -> bool {
     options.deterministic_id && !options.static_id
+}
+
+/// Translate qpdf's `QPDFWriter::prepareFileForWrite` graph preparation.
+///
+/// The qpdf writer calls `QPDF::fixDanglingReferences` and then makes a
+/// dictionary-valued Catalog `/Extensions` direct, followed by an indirect
+/// `/ADBE` child when present (`libqpdf/QPDFWriter.cc:2034-2055`). The ADBE
+/// add/remove decision is deliberately not here: qpdf makes that decision in
+/// the root dictionary's output-time `unparseObject` path, which remains the
+/// responsibility of [`inject_adbe_extension`] and
+/// [`strip_adbe_extension`].
+///
+/// This function is called once by [`PdfWriter::write`] before the standard or
+/// linearized route is selected. The directization is permanent on the live
+/// Catalog graph, matching qpdf; output-only ADBE reconciliation may still
+/// use the surrounding writer cleanup until that responsibility moves to the
+/// root serializer.
+pub(crate) fn prepare_file_for_write<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    pdf.fix_dangling_references()?;
+
+    let root = pdf.root_handle()?;
+    let extensions = root.try_get_key(b"/Extensions")?;
+    if extensions.try_as_dictionary()?.is_none() {
+        return Ok(());
+    }
+
+    let mut changed = false;
+    let extensions = if extensions.is_indirect() {
+        let direct = extensions.shallow_copy()?;
+        root.replace_key(b"/Extensions", direct.clone())?;
+        changed = true;
+        direct
+    } else {
+        extensions
+    };
+
+    if extensions.try_has_key(b"/ADBE")? {
+        let mut adbe = extensions.try_get_key(b"/ADBE")?;
+        if adbe.is_indirect() {
+            adbe.make_direct(false)?;
+            extensions.replace_key(b"/ADBE", adbe)?;
+            changed = true;
+        }
+    }
+
+    if changed {
+        pdf.mark_object_handle_dirty(&root)?;
+    }
+    Ok(())
 }
 
 /// Configure qpdf-shaped progress after the writer has completed the setup
@@ -5636,7 +5693,100 @@ mod final_handle_writer_tests {
     use super::*;
     use crate::encryption::standard::ObjectKeyAlg;
     use crate::encryption::CopyEncryptionSource;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Write};
+
+    struct AlwaysFailingOutput;
+
+    impl Write for AlwaysFailingOutput {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("writer test output failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prepare_file_for_write_fixes_dangling_cache_before_catalog_directization() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-ext-indirect.pdf").to_vec(),
+        ))
+        .expect("indirect Extensions fixture opens");
+        assert!(!pdf.dangling_references_fixed());
+
+        prepare_file_for_write(&mut pdf).expect("writer preparation succeeds");
+
+        assert!(
+            pdf.dangling_references_fixed(),
+            "fixDanglingReferences must resolve the source xref before Catalog work"
+        );
+        let root = pdf.root_handle().expect("Catalog remains available");
+        assert!(
+            root.try_get_key(b"/Extensions")
+                .expect("read prepared Extensions")
+                .is_direct(),
+            "an indirect Extensions dictionary must be direct on the live Catalog"
+        );
+    }
+
+    #[test]
+    fn prepare_file_for_write_directizes_an_indirect_adbe_child() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-ext-indirect.pdf").to_vec(),
+        ))
+        .expect("indirect Extensions fixture opens");
+        let root = pdf.root_handle().expect("Catalog exists");
+        let extensions = root
+            .try_get_key(b"/Extensions")
+            .expect("read source Extensions");
+        let adbe = extensions.try_get_key(b"/ADBE").expect("read source ADBE");
+        let indirect_adbe = pdf
+            .make_indirect_from_object_handle(adbe)
+            .expect("promote ADBE to an indirect object");
+        extensions
+            .replace_key(b"/ADBE", indirect_adbe)
+            .expect("install indirect ADBE");
+
+        prepare_file_for_write(&mut pdf).expect("writer preparation succeeds");
+
+        let root = pdf.root_handle().expect("Catalog remains available");
+        let extensions = root
+            .try_get_key(b"/Extensions")
+            .expect("read prepared Extensions");
+        assert!(extensions.is_direct());
+        assert!(
+            extensions
+                .try_get_key(b"/ADBE")
+                .expect("read prepared ADBE")
+                .is_direct(),
+            "an indirect ADBE value must be made direct by prepareFileForWrite"
+        );
+    }
+
+    #[test]
+    fn prepare_file_for_write_survives_a_later_emission_failure() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../tests/fixtures/compat/one-page-ext-indirect.pdf").to_vec(),
+        ))
+        .expect("indirect Extensions fixture opens");
+        let mut writer = PdfWriter::new(&mut pdf);
+        let mut output = AlwaysFailingOutput;
+        assert!(output.flush().is_ok());
+        writer
+            .set_output_writer(output)
+            .expect("install failing output");
+
+        assert!(writer.write().is_err(), "the output sink must fail");
+
+        let root = pdf.root_handle().expect("Catalog remains available");
+        assert!(
+            root.try_get_key(b"/Extensions")
+                .expect("read prepared Extensions after failure")
+                .is_direct(),
+            "a later write failure must not restore the pre-prepare indirect graph"
+        );
+    }
 
     #[test]
     fn minimum_version_replaces_an_unusable_existing_internal_value() {

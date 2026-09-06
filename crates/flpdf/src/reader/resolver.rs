@@ -1720,6 +1720,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().reconstructed_xref
     }
 
+    #[cfg(test)]
+    pub(crate) fn dangling_references_fixed(&self) -> bool {
+        self.core.borrow().fixed_dangling_refs
+    }
+
     /// Whether resolution-time damage recovery is enabled.
     ///
     /// qpdf's `m->attempt_recovery` (`include/qpdf/QPDF.hh:1461`) controls
