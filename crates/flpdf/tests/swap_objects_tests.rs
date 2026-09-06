@@ -140,11 +140,12 @@ fn swapping_two_slots_with_one_shared_value_is_a_noop() {
     let mut pdf = Pdf::empty().expect("empty PDF");
     let source = ObjectHandle::dictionary(vec![(b"/Marker".to_vec(), ObjectHandle::integer(7))]);
     let root_ref = ObjectRef::new(1, 0);
-    let pages_ref = ObjectRef::new(2, 0);
     pdf.replace_object(root_ref, source.clone())
         .expect("replace root with direct value");
-    pdf.replace_object(pages_ref, source)
-        .expect("replace pages with the same direct value");
+    let second = pdf
+        .make_indirect_object_handle(source)
+        .expect("register the replacement QObject under a fresh identity");
+    let pages_ref = second.object_ref().unwrap();
 
     pdf.swap_objects(root_ref, pages_ref)
         .expect("swap shared value slots");

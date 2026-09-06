@@ -93,7 +93,7 @@ crates/flpdf/src/reader.rs::Pdf::object_refs                             # A10
 crates/flpdf/src/reader.rs::Pdf::live_object_refs                        # A10
 crates/flpdf/src/reader.rs::Pdf::resolved_count                          # A10
 crates/flpdf/src/reader.rs::Pdf::next_available_object_ref               # A11 facade 側
-crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 shallow copy 版
+crates/flpdf/src/reader.rs::Pdf::make_indirect_object_handle             # A12 canonical public factory
 crates/flpdf/src/reader.rs::Pdf::synchronize_cache_with_resolver_xref    # A15
 crates/flpdf/src/pdf.rs::legacy_resolution_state_synced                  # A15（フィールド）
 crates/flpdf/src/reader.rs::Pdf::mark_object_handle_dirty                # A18
@@ -111,7 +111,7 @@ crates/flpdf/src/reader/resolver.rs::ResolverCore                        # A1/A2
 crates/flpdf/src/reader/resolver.rs::object_cache                        # A1（フィールド）
 crates/flpdf/src/object_handle.rs::ObjectHandle::try_as_integer          # A6 canonical
 crates/flpdf/src/object_handle.rs::ObjectHandle::try_get_key             # A8 canonical
-crates/flpdf/src/reader/resolver.rs::get_object_count                    # A11（facade+canonical 合流）
+crates/flpdf/src/reader/resolver.rs::get_object_count                    # A11 canonical count owner
 crates/flpdf/src/reader/resolver.rs::next_obj_gen                        # A11 canonical
 crates/flpdf/src/reader/resolver.rs::make_indirect_from_object_handle    # A12 canonical
 crates/flpdf/src/reader/resolver.rs::remove_object                       # A13 canonical（prod 到達不能）

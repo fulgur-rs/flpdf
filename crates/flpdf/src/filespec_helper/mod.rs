@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn filespec_constructor_rejects_a_direct_child_from_another_pdf() {
+    fn filespec_constructor_accepts_a_contextless_child_of_a_replacement_value() {
         let mut source = open_minimal();
         let owner_ref = ObjectRef::new(5, 0);
         let filespec = ObjectHandle::dictionary(vec![(
@@ -237,13 +237,9 @@ mod tests {
         assert!(foreign_direct_filespec.is_direct());
 
         let mut destination = open_minimal();
-        let error = FileSpec::new(foreign_direct_filespec, &mut destination)
-            .err()
-            .expect("a direct child owned by another Pdf must be rejected");
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: Filespec handle belongs to another Pdf"
-        );
+        assert_eq!(foreign_direct_filespec.owning_pdf_unique_id(), None);
+        FileSpec::new(foreign_direct_filespec, &mut destination)
+            .expect("updateCache assigns only the replacement top value's owner");
     }
 
     #[test]

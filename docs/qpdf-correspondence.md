@@ -1801,3 +1801,14 @@ document-neutralなエラーを、qpdfの`QPDFExc::createWhat`
 （`libqpdf/QPDFExc.cc:19-51`）と同じfilename付きbyte表示へ戻す処理は、driver
 boundaryに限定している。Pinned qpdfで非dictionary `/Root`を与えたtest93は、
 修復警告3行の後に`<filename>: unable to find /Root dictionary`を返す。
+
+`flpdf-3yn9.48.20`ではpublic `Pdf::make_indirect_object_handle`のclone/独自採番を撤去し、
+`QPDF.cc:1872-1897`のinitialized検査、canonical count、同じQObjectのcache登録、
+`newIndirect`の順に統一した。`ValueIdentity`は`QPDFValue.hh:68-72`の共有objgen/owning QPDFを
+表し、replacementで値を共有する別QObjectにも昇格が伝わる。cache lookupとgetAllObjectsは
+各keyでidentityを更新する一方、getObjectCountはkeyの最大値を読むだけで列挙しない。
+`tests/oracle/qpdf_make_indirect_object{,_states}_probe.cc`とRustのowner testsが
+alias/indirect/reserved/destroyed/未解決/最大ID/writer反映を検証する。
+履歴trailer参照は`QPDFParser.cc:168-175`のcache登録副作用に合わせ、既存bootstrapの
+参照集合をopen時にcanonical cacheへ未解決登録する。getAllObjects時のlate登録・強制解決と
+Pdf側の永続集合は撤去した。過去trailerにだけ99があるfixtureでも列挙前のfactoryが100を採番する。
