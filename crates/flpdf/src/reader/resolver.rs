@@ -12437,7 +12437,7 @@ mod tests {
                     std::io::SeekFrom::End(0) => {
                         Err(std::io::Error::other("EOF normalization seek failed"))
                     }
-                    _ => panic!("unexpected seek during the direct read probe"),
+                    _ => panic!("unexpected seek during the direct read probe"), // cov:ignore: the direct probe only issues Current(0) and End(0)
                 }
             }
         }
