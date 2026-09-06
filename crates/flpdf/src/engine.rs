@@ -20,6 +20,19 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// qpdf's initial `findFirst` scan asks its `FileInputSource` for 1024 bytes
+/// (`libqpdf/QPDF.cc:430-438`). A file-backed Rust bootstrap currently reads
+/// the source eagerly, so convert an I/O failure from that read into the same
+/// `QPDFExc` message before the generic `Error::Io` display adds platform text.
+fn qpdf_initial_read_error(description: &[u8], error: Error) -> Error {
+    if description.is_empty() || !matches!(&error, Error::Io(_)) {
+        return error;
+    }
+    let mut message = description.to_vec();
+    message.extend_from_slice(b": read 1024 bytes");
+    Error::SystemBytes(message)
+}
+
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 // Upper bound on read-to-end fallbacks during object resolution (see
 // `resolution_fallbacks_remaining`). Each fallback may scan to EOF, so the total
@@ -179,6 +192,7 @@ impl<R: Read + Seek> Pdf<R> {
         ) {
             Ok(state) => state,
             Err(error) => {
+                let error = qpdf_initial_read_error(&options.description, error);
                 if let Some((_, diagnostics)) = error.open_failure() {
                     warning_options.replay_warnings(diagnostics)?;
                 }

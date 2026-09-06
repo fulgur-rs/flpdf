@@ -3070,6 +3070,21 @@ fn main() {
             emit_logger_error(line);
             std::process::exit(2);
         }
+        if let Some(flpdf::Error::FileIo {
+            operation: "open",
+            path,
+            source,
+        }) = error.downcast_ref::<flpdf::Error>()
+        {
+            let mut line = progname().into_bytes();
+            line.extend_from_slice(b": open ");
+            line.extend_from_slice(&path_description(path));
+            line.extend_from_slice(b": ");
+            line.extend_from_slice(qpdf_open_io_error_message(source).as_bytes());
+            line.push(b'\n');
+            emit_logger_error(line);
+            std::process::exit(2);
+        }
         if let Some(path_error) = error.downcast_ref::<CliPathError>() {
             let mut line = progname().into_bytes();
             line.extend_from_slice(b": ");
@@ -7912,12 +7927,35 @@ fn finish_rewrite_warnings<R: Read + Seek>(
 ///
 /// This type-erases the error; do not downcast the result.
 fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
+    let message = qpdf_path_error_message(error.as_ref());
     Box::new(CliPathError {
         path: path_description(input),
         operation: None,
-        message: error.to_string(),
+        message,
         source: error,
     })
+}
+
+/// Preserve qpdf's `QPDFExc::createWhat` message when the terminal recovery
+/// failure has no object or positive offset (`libqpdf/QPDFExc.cc:16-48`). The
+/// public `Error::Parse` display includes a Rust-oriented byte prefix, but the
+/// CLI path wrapper already supplies the source filename and must not add a
+/// second location layer.
+fn qpdf_path_error_message(error: &(dyn std::error::Error + 'static)) -> String {
+    let Some(flpdf_error) = error.downcast_ref::<flpdf::Error>() else {
+        return error.to_string();
+    };
+    let terminal = flpdf_error
+        .open_failure()
+        .map_or(flpdf_error, |(source, _)| source);
+    match terminal {
+        flpdf::Error::Parse { offset: 0, message }
+            if message == "unable to find trailer dictionary while recovering damaged file" =>
+        {
+            message.clone()
+        }
+        _ => error.to_string(),
+    }
 }
 
 /// Prefix a fatal input-open error with qpdf's `open ` operation and normalize

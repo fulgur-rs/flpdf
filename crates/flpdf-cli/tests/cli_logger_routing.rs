@@ -597,6 +597,71 @@ fn qpdf_differential_matches_missing_input_open_error_on_all_input_routes() {
     assert_observables_equal("secondary source authentication", &qpdf, &flpdf, true);
 }
 
+#[test]
+fn qpdf_differential_matches_remaining_file_error_boundaries() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping file error-boundary differential");
+        return;
+    }
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input_directory = directory.path().join("input-directory");
+    std::fs::create_dir(&input_directory).expect("create directory input");
+    let input_directory = input_directory.to_str().expect("UTF-8 temporary path");
+    let output_path = directory.path().join("output.pdf");
+    let output = output_path.to_str().expect("UTF-8 temporary path");
+    let missing_parent_output_path = directory.path().join("missing-parent").join("output.pdf");
+    let missing_parent_output = missing_parent_output_path
+        .to_str()
+        .expect("UTF-8 temporary path");
+    let recovery_input = directory.path().join("bad.pdf");
+    std::fs::write(&recovery_input, b"not a PDF\n").expect("write malformed input");
+    let recovery_input = recovery_input.to_str().expect("UTF-8 temporary path");
+
+    let cases = [
+        ("directory input", vec![input_directory, output]),
+        (
+            "missing output parent",
+            vec![MINIMAL, missing_parent_output],
+        ),
+        ("recovery failure", vec![recovery_input, output]),
+    ];
+    for (label, args) in cases {
+        let qpdf = run_qpdf(&args);
+        let flpdf = run_flpdf(&args);
+        assert_observables_equal(label, &qpdf, &flpdf, true);
+    }
+
+    assert!(!output_path.exists(), "failed input must not create output");
+    assert!(
+        !missing_parent_output_path.exists(),
+        "failed output open must not create output"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn qpdf_differential_matches_permission_denied_output_open() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping permission-denied differential");
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let readonly = directory.path().join("readonly");
+    std::fs::create_dir(&readonly).expect("create read-only output directory");
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555))
+        .expect("make output directory read-only");
+    let output = readonly.join("output.pdf");
+    let output = output.to_str().expect("UTF-8 temporary path");
+
+    let qpdf = run_qpdf(&[MINIMAL, output]);
+    let flpdf = run_flpdf(&[MINIMAL, output]);
+    assert_observables_equal("permission-denied output", &qpdf, &flpdf, true);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_accepts_a_non_utf8_input_path_without_panicking() {

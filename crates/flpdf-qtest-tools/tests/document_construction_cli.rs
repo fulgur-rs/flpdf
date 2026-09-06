@@ -64,7 +64,7 @@ fn from_scratch_reports_output_write_failure() {
         .failure()
         .code(2)
         .stdout("")
-        .stderr(predicates::str::contains("open output"));
+        .stderr(predicates::str::contains("open a.pdf"));
 }
 
 #[test]
@@ -130,5 +130,5 @@ fn many_nulls_reports_output_write_failure() {
         .failure()
         .code(2)
         .stdout("")
-        .stderr(predicates::str::contains("open output"));
+        .stderr(predicates::str::contains("open a.pdf"));
 }

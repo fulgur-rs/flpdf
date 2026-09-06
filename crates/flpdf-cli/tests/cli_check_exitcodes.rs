@@ -801,7 +801,7 @@ fn check_terminal_open_failure_prints_repair_warnings_before_error_once() {
             "WARNING: {input}: file is damaged{EOL}\
              WARNING: {input}: can't find startxref{EOL}\
              WARNING: {input}: Attempting to reconstruct cross-reference table{EOL}\
-             flpdf: {input}: parse error at byte 0: unable to find trailer dictionary while recovering damaged file{EOL}"
+             flpdf: {input}: unable to find trailer dictionary while recovering damaged file{EOL}"
         )
     );
 }

@@ -645,7 +645,22 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// loop here is what makes a short `Read::read` — legal for any `R` —
     /// indistinguishable from that contract.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.input.borrow().read(buf)
+        let result = self.input.borrow().read(buf);
+        match result {
+            Ok(read) => Ok(read),
+            Err(Error::Io(_error)) if !self.description.is_empty() => {
+                let message = format!("read {} bytes", buf.len());
+                let offset = self.input.borrow().last_offset();
+                let what =
+                    format_input_warning_what(&self.description, &[], offset, message.as_bytes());
+                // qpdf's FileInputSource converts a failed fread into a
+                // QPDFExc carrying only the source name, offset, and
+                // requested read length (`FileInputSource.cc:116-132`);
+                // the platform errno is intentionally not part of what().
+                Err(Error::SystemBytes(what))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read all physical bytes of the input source from position 0, restoring the
@@ -12320,6 +12335,56 @@ mod tests {
             pdf.resolver.core.borrow().resolving.is_empty(),
             "and must not leave the reference marked in progress"
         );
+    }
+
+    /// A named file source uses qpdf's `FileInputSource::read` exception shape
+    /// for a lazy read failure, including the source name and requested length;
+    /// the platform I/O message is intentionally omitted.
+    #[test]
+    fn a_described_input_source_formats_mid_resolution_read_failures_like_qpdf() {
+        struct Breakable {
+            inner: std::io::Cursor<Vec<u8>>,
+            broken: bool,
+        }
+
+        impl std::io::Read for Breakable {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.broken {
+                    return Err(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        impl std::io::Seek for Breakable {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let mut options = crate::PdfOpenOptions::default();
+        options.description = b"input.pdf".to_vec();
+        let mut pdf = Pdf::open_with_options(
+            Breakable {
+                inner: std::io::Cursor::new(minimal_pdf_bytes()),
+                broken: false,
+            },
+            options,
+        )
+        .expect("open");
+        let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolver.with_reader_mut(|reader| reader.broken = true);
+
+        let error = pdf
+            .resolve(&handle)
+            .expect_err("a named source read failure must be reported");
+        let Error::SystemBytes(message) = error else {
+            panic!("expected qpdf-shaped read failure, got {error:?}"); // cov:ignore: the assertion covers the defensive variant split
+        };
+        let rendered = String::from_utf8_lossy(&message);
+        assert!(rendered.starts_with("input.pdf"), "{rendered}");
+        assert!(rendered.contains(": read "), "{rendered}");
+        assert!(rendered.ends_with(" bytes"), "{rendered}");
     }
 
     /// Two nested [`super::ResolverHandle::read_stream`] frames each keep their
