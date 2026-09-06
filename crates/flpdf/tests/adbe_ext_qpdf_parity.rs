@@ -215,6 +215,68 @@ fn common_writer_preparation_is_shared_by_linearized_output() {
     );
 }
 
+fn suppressed_mode_restores_output_only_adbe_on_live_catalog(
+    object_streams: flpdf::ObjectStreamMode,
+) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/one-page-ext-indirect.pdf");
+    let file = std::fs::File::open(&path).expect("open indirect Extensions fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture");
+
+    let before = pdf
+        .root_handle()
+        .expect("fixture has a Catalog")
+        .try_get_key(b"/Extensions")
+        .expect("read source Extensions");
+    let before_adbe = before.try_get_key(b"/ADBE").expect("read source ADBE");
+    assert_eq!(
+        before_adbe
+            .try_get_key(b"/ExtensionLevel")
+            .expect("read source extension level")
+            .as_integer(),
+        Some(3)
+    );
+
+    let settings = WriterTestSettings {
+        object_streams,
+        force_version: Some("1.4.2".to_owned()),
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &settings).expect("rewrite succeeds");
+
+    let after = pdf
+        .root_handle()
+        .expect("Catalog remains available after write")
+        .try_get_key(b"/Extensions")
+        .expect("read live Extensions after write");
+    assert!(
+        after.as_dictionary().is_some(),
+        "output-only ADBE mutation must not remove the live Extensions dictionary"
+    );
+    let after_adbe = after
+        .try_get_key(b"/ADBE")
+        .expect("output-only ADBE mutation must be restored");
+    assert_eq!(
+        after_adbe
+            .try_get_key(b"/ExtensionLevel")
+            .expect("read restored extension level")
+            .as_integer(),
+        Some(3)
+    );
+}
+
+#[test]
+fn suppressed_generate_restores_output_only_adbe_on_live_catalog() {
+    suppressed_mode_restores_output_only_adbe_on_live_catalog(flpdf::ObjectStreamMode::Generate);
+}
+
+#[test]
+fn suppressed_preserve_restores_output_only_adbe_on_live_catalog() {
+    suppressed_mode_restores_output_only_adbe_on_live_catalog(flpdf::ObjectStreamMode::Preserve);
+}
+
 mod common;
 #[allow(unused_imports)]
 use common::{
