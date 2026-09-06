@@ -1235,6 +1235,25 @@ mod tests {
     }
 
     #[test]
+    fn flate_setter_rejects_non_integer_geometry_parameters() {
+        for key in [b"/Predictor".as_slice(), b"/Columns"] {
+            let params = ObjectHandle::dictionary(vec![(
+                key.to_vec(),
+                ObjectHandle::name(b"not-an-integer".to_vec()),
+            )]);
+            let mut filter = FlateLzwStreamFilter::new(false);
+            assert!(!filter.set_decode_params(&params).unwrap());
+        }
+
+        let params = ObjectHandle::dictionary(vec![(
+            b"/EarlyChange".to_vec(),
+            ObjectHandle::name(b"not-an-integer".to_vec()),
+        )]);
+        let mut filter = FlateLzwStreamFilter::new(true);
+        assert!(!filter.set_decode_params(&params).unwrap());
+    }
+
+    #[test]
     fn flate_reader_preserves_canonical_key_matching_and_ignores_raw_unknown_keys() {
         fn decode_params(key: &[u8]) -> ObjectHandle {
             let params = ObjectHandle::dictionary(vec![]);
@@ -1313,6 +1332,19 @@ mod tests {
     }
 
     #[test]
+    fn filter_specs_expand_an_empty_decode_parameter_array_to_null_handles() {
+        let filters = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"LZWDecode".to_vec()),
+        ]);
+        let decode_params = ObjectHandle::array(vec![]);
+        let specs = super::decode_filter_specs_from_handle(&filters, &decode_params, None).unwrap();
+
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|spec| spec.decode_params.is_null()));
+    }
+
+    #[test]
     fn filter_specs_preserve_unknown_stream_array_and_indirect_handles() {
         let unknown_stream = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![]),
@@ -1385,6 +1417,11 @@ mod tests {
         )]);
         assert!(!invalid_type_filter
             .set_decode_params(&invalid_type)
+            .unwrap());
+
+        let mut null_filter = super::CryptStreamFilter;
+        assert!(null_filter
+            .set_decode_params(&ObjectHandle::null())
             .unwrap());
     }
 
