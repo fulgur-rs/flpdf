@@ -635,11 +635,13 @@ mod tests {
     fn initial_seek_failure_is_not_reported_as_a_read_failure() {
         struct SeekFails;
 
+        // cov:ignore-start: the test reader's seek always fails before any read can occur
         impl Read for SeekFails {
             fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
                 unreachable!("the bootstrap seek must fail before a read");
             }
         }
+        // cov:ignore-end
 
         impl Seek for SeekFails {
             fn seek(&mut self, _position: SeekFrom) -> std::io::Result<u64> {
@@ -651,10 +653,9 @@ mod tests {
             description: b"input.pdf".to_vec(),
             ..Default::default()
         };
-        let error = match Pdf::open_with_options(SeekFails, options) {
-            Ok(_) => panic!("the initial seek failure must abort opening"),
-            Err(error) => error,
-        };
+        let error = Pdf::open_with_options(SeekFails, options)
+            .err()
+            .expect("the initial seek failure must abort opening");
 
         assert!(matches!(error, Error::Io(error) if error.to_string() == "initial seek failed"));
     }
