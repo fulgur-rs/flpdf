@@ -347,8 +347,9 @@ impl ObjectWriterEmission for ObjectHandle {
     ///
     /// qpdf makes an unsafe shallow copy of the root dictionary before
     /// reconciling `/Extensions /ADBE` (`QPDFWriter.cc:1347-1435`). Keep that
-    /// copy local to serialization so the live Catalog is never changed merely
-    /// because a writer is producing output.
+    /// copy local to serialization. Existing direct Extensions remain shared:
+    /// replacing or removing ADBE there also changes the live graph. Creating
+    /// or removing the root's Extensions key changes only the output copy.
     fn write_root_object_with_ref_map_and_removed(
         &self,
         out: &mut Vec<u8>,
@@ -1574,71 +1575,67 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
         .is_some_and(|object_ref| removed_refs.contains(&object_ref))
 }
 
-/// Make qpdf's output-only shallow root copy and reconcile `/ADBE` on it.
+/// Copy the root container and reconcile `/ADBE` with qpdf's child aliasing.
 fn root_output_copy_with_adbe(
     source: &ObjectHandle,
     final_pdf_version: &str,
     final_extension_level: i64,
 ) -> Result<ObjectHandle> {
-    let entries = source
-        .try_as_dictionary()?
-        .ok_or_else(|| Error::Unsupported("root object is not a dictionary".into()))?;
-    let root = ObjectHandle::dictionary(entries.into_iter().collect());
-    let raw_extensions = root.try_get_key(b"/Extensions")?;
-    let extension_entries = raw_extensions.try_as_dictionary()?;
-
-    if final_extension_level <= 0 && extension_entries.is_none() {
-        return Ok(root);
+    let root = source.unsafe_shallow_copy()?;
+    let mut extensions = if root.try_has_key(b"/Extensions")?
+        && root.try_get_key(b"/Extensions")?.try_is_dictionary()?
+    {
+        Some(root.try_get_key(b"/Extensions")?)
+    } else {
+        None
+    };
+    let (have_adbe, have_other) = if let Some(extensions) = &extensions {
+        let mut keys = extensions.try_get_keys()?;
+        let have_adbe = keys.remove(b"/ADBE".as_slice());
+        (have_adbe, !keys.is_empty())
+    } else {
+        (false, false)
+    };
+    let need_adbe = final_extension_level > 0;
+    if need_adbe {
+        if !(have_other || have_adbe) {
+            let created = ObjectHandle::dictionary(Vec::new());
+            root.replace_key(b"/Extensions", created.clone())?;
+            extensions = Some(created);
+        }
+    } else if !have_other && have_adbe {
+        root.remove_key(b"/Extensions");
+        extensions = None;
     }
 
-    let extensions = extension_entries
-        .map(|entries| ObjectHandle::dictionary(entries.into_iter().collect()))
-        .unwrap_or_else(|| ObjectHandle::dictionary(Vec::new()));
-    let keys = extensions.try_get_keys()?;
-    let have_adbe = keys.iter().any(|key| key.as_slice() == b"/ADBE");
-    let have_other = keys.iter().any(|key| key.as_slice() != b"/ADBE");
-
-    if final_extension_level > 0 {
+    if let Some(extensions) = extensions {
         let adbe = extensions.try_get_key(b"/ADBE")?;
-        let preserves_existing = adbe.try_as_dictionary()?.is_some()
+        let preserves_existing = adbe.try_is_dictionary()?
             && adbe
                 .try_get_key(b"/BaseVersion")?
                 .try_is_name_and_equals(final_pdf_version.as_bytes())?
             && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()?
                 == Some(final_extension_level);
         if !preserves_existing {
-            extensions.replace_key(
-                b"/ADBE",
-                ObjectHandle::dictionary(vec![
-                    (
-                        b"/BaseVersion".to_vec(),
-                        ObjectHandle::name(final_pdf_version.as_bytes().to_vec()),
-                    ),
-                    (
-                        b"/ExtensionLevel".to_vec(),
-                        ObjectHandle::integer(final_extension_level),
-                    ),
-                ]),
-            )?; // cov:ignore: replacement mutates a local qpdf-shaped dictionary copy; the validated success path is not failure-injectable
-        }
-        root.replace_key(b"/Extensions", extensions)?;
-    } else if have_adbe {
-        if have_other {
-            let adbe = extensions.try_get_key(b"/ADBE")?;
-            let preserves_existing = adbe.try_as_dictionary()?.is_some()
-                && adbe
-                    .try_get_key(b"/BaseVersion")?
-                    .try_is_name_and_equals(final_pdf_version.as_bytes())?
-                && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()?
-                    == Some(final_extension_level);
-            if !preserves_existing {
+            if need_adbe {
+                extensions.replace_key(
+                    b"/ADBE",
+                    ObjectHandle::dictionary(vec![
+                        (
+                            b"/BaseVersion".to_vec(),
+                            ObjectHandle::name(final_pdf_version.as_bytes().to_vec()),
+                        ),
+                        (
+                            b"/ExtensionLevel".to_vec(),
+                            ObjectHandle::integer(final_extension_level),
+                        ),
+                    ]),
+                )?;
+            } else {
                 extensions.remove_key(b"/ADBE");
-                root.replace_key(b"/Extensions", extensions)?;
             }
-        } else {
-            root.remove_key(b"/Extensions");
         }
-    } // cov:ignore: LLVM maps this covered ADBE branch join to the unreachable continuation line
+    }
 
     Ok(root)
 }

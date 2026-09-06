@@ -6413,6 +6413,77 @@ mod final_handle_writer_tests {
     }
 
     #[test]
+    fn root_object_emission_reconciles_shared_extensions_like_qpdf() {
+        // QPDFWriter.cc:1352,1380,1425-1432 copies the Catalog container,
+        // but updates an existing direct Extensions dictionary through aliases.
+        let extensions = ObjectHandle::dictionary(vec![
+            (b"/ADBE".to_vec(), ObjectHandle::dictionary(vec![])),
+            (b"/ACME".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let root = ObjectHandle::dictionary(vec![(b"/Extensions".to_vec(), extensions.clone())]);
+        let map = |object_ref| Ok(object_ref);
+        let removed = BTreeSet::new();
+        let mut output = Vec::new();
+        root.write_root_object_with_ref_map_and_removed(&mut output, &map, &removed, "1.7", 8)
+            .expect("root output succeeds");
+        assert_eq!(
+            extensions
+                .try_get_key(b"/ADBE")
+                .unwrap()
+                .try_get_key(b"/ExtensionLevel")
+                .unwrap()
+                .try_as_integer()
+                .unwrap(),
+            Some(8)
+        );
+
+        output.clear();
+        root.write_root_object_with_ref_map_and_removed(&mut output, &map, &removed, "1.7", 0)
+            .expect("root output succeeds");
+        assert!(extensions.try_get_key(b"/ADBE").unwrap().is_null());
+        assert_eq!(
+            extensions
+                .try_get_key(b"/ACME")
+                .unwrap()
+                .try_as_integer()
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn root_object_emission_failure_retains_shared_extensions_reconciliation() {
+        let extensions =
+            ObjectHandle::dictionary(vec![(b"/ACME".to_vec(), ObjectHandle::integer(1))]);
+        let root = ObjectHandle::dictionary(vec![
+            (b"/Extensions".to_vec(), extensions.clone()),
+            (
+                b"/Pages".to_vec(),
+                ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), -1),
+            ),
+        ]);
+        let map = |_| Err(Error::Internal("test reference mapping failure".into()));
+        let result = root.write_root_object_with_ref_map_and_removed(
+            &mut Vec::new(),
+            &map,
+            &BTreeSet::new(),
+            "1.7",
+            8,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            extensions
+                .try_get_key(b"/ADBE")
+                .unwrap()
+                .try_get_key(b"/ExtensionLevel")
+                .unwrap()
+                .try_as_integer()
+                .unwrap(),
+            Some(8)
+        );
+    }
+
+    #[test]
     fn root_object_emission_injects_adbe_without_mutating_live_catalog() {
         let mut pdf = Pdf::open(Cursor::new(
             include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
