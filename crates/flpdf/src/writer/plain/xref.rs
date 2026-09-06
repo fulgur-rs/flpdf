@@ -80,12 +80,7 @@ pub(crate) fn append_xref_and_trailer(
     layout.validate()?;
 
     match trailer.form {
-        XrefForm::Table if layout.compressed.is_empty() => {
-            append_classic_xref_and_trailer(bytes, layout, trailer)
-        }
-        XrefForm::Table => Err(crate::Error::Unsupported(
-            "plain writer classic xref cannot represent compressed objects".into(),
-        )),
+        XrefForm::Table => append_classic_xref_and_trailer(bytes, layout, trailer),
         XrefForm::Stream => append_xref_stream_and_trailer(bytes, layout, trailer),
     }
 }
@@ -251,20 +246,93 @@ fn append_classic_xref_and_trailer(
         ));
     }
 
-    bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
-    bytes.extend_from_slice(b"0000000000 65535 f \n");
-    for number in 1..size {
-        if let Some(&(generation, offset)) = layout.uncompressed.get(&number) {
-            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
-        } else {
-            bytes.extend_from_slice(b"0000000000 00000 f \n");
-        }
+    let mut entries = BTreeMap::new();
+    for (&number, &(_, offset)) in &layout.uncompressed {
+        entries.insert(
+            number,
+            XrefEntry::Uncompressed {
+                offset: offset as u64,
+            },
+        );
     }
+    for (&number, location) in &layout.compressed {
+        entries.insert(
+            number,
+            XrefEntry::Compressed {
+                stream: location.container,
+                index: location.index,
+            },
+        );
+    }
+    let _ = write_xref_table(bytes, 0, size - 1, &entries, false, 0, 0, 0)?;
 
     bytes.extend_from_slice(b"trailer ");
     write_canonical_classic_trailer(bytes, trailer, size, &trailer.canonical_entries);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     written_xref_table(layout, size)
+}
+
+/// Write qpdf's classic xref table rows.
+///
+/// This is the direct Rust counterpart of
+/// `QPDFWriter::writeXRefTable` (`libqpdf/QPDFWriter.cc:2335-2379`). The
+/// nonzero rows require an uncompressed type-1 entry unless
+/// `suppress_offsets` is active; qpdf's `getOffset()` throws
+/// `"getOffset called for xref entry of type != 1"` for a missing, free, or
+/// compressed entry, so all three cases use the same `Error::Internal` path.
+/// Object generations are output as zero because qpdf's writer opens every
+/// emitted object as generation zero.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preserve QPDFWriter::writeXRefTable's full overload fields one-to-one"
+)]
+pub(crate) fn write_xref_table(
+    bytes: &mut Vec<u8>,
+    first: u32,
+    last: u32,
+    entries: &BTreeMap<u32, XrefEntry>,
+    suppress_offsets: bool,
+    hint_id: u32,
+    hint_offset: u64,
+    hint_length: u64,
+) -> crate::Result<usize> {
+    let count = last
+        .checked_sub(first)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| crate::Error::Internal("invalid xref table range".to_string()))?;
+    // qpdf captures `space_before_zero` after writing `xref\n{first} {count}`
+    // but *before* the header's trailing newline (`QPDFWriter.cc:2356-2360`),
+    // so the returned offset identifies the whitespace immediately preceding
+    // the object-0 row. A linearized `/T` consumer relies on that exact byte,
+    // so the newline must be appended only after the snapshot.
+    bytes.extend_from_slice(format!("xref\n{first} {count}").as_bytes());
+    let space_before_zero = bytes.len();
+    bytes.push(b'\n');
+    for number in first..=last {
+        if number == 0 {
+            bytes.extend_from_slice(b"0000000000 65535 f \n");
+            continue;
+        }
+
+        let mut offset = 0;
+        if !suppress_offsets {
+            offset = match entries.get(&number) {
+                Some(XrefEntry::Uncompressed { offset }) => *offset,
+                Some(XrefEntry::Free { .. }) | Some(XrefEntry::Compressed { .. }) | None => {
+                    return Err(crate::Error::Internal(
+                        "getOffset called for xref entry of type != 1".to_string(),
+                    ));
+                }
+            };
+            if hint_id != 0 && number != hint_id && offset >= hint_offset {
+                offset = offset
+                    .checked_add(hint_length)
+                    .ok_or_else(|| crate::Error::Internal("xref offset overflow".to_string()))?;
+            }
+        }
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    Ok(space_before_zero)
 }
 
 fn write_canonical_classic_trailer(
@@ -408,4 +476,154 @@ fn written_xref_stream(
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trailer() -> TrailerPlan {
+        TrailerPlan {
+            form: XrefForm::Table,
+            canonical_entries: Vec::new(),
+            root: None,
+            direct_root: None,
+            id: IdPlan::Materialized { value: None },
+            encrypt: None,
+            structural_filtered: false,
+            qdf: false,
+        }
+    }
+
+    #[test]
+    fn classic_xref_missing_row_is_qpdf_logic_error_not_a_fake_free_row() {
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 12));
+        layout.uncompressed.insert(3, (0, 34));
+        let mut bytes = Vec::new();
+
+        let error = append_xref_and_trailer(&mut bytes, &layout, &trailer())
+            .expect_err("a missing nonzero row must not be serialized as free");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message)
+                if message == "getOffset called for xref entry of type != 1"
+        ));
+    }
+
+    #[test]
+    fn classic_xref_type2_row_is_qpdf_logic_error() {
+        let mut layout = BodyLayout::default();
+        layout.compressed.insert(
+            1,
+            CompressedLocation {
+                container: 4,
+                index: 0,
+            },
+        );
+        let mut bytes = Vec::new();
+
+        let error = append_xref_and_trailer(&mut bytes, &layout, &trailer())
+            .expect_err("a classic table must reject a compressed xref entry");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message)
+                if message == "getOffset called for xref entry of type != 1"
+        ));
+    }
+
+    #[test]
+    fn classic_xref_rows_always_emit_generation_zero() {
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (7, 12));
+        let mut bytes = Vec::new();
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer()).expect("valid xref");
+
+        assert!(bytes
+            .windows(b"0000000012 00000 n \n".len())
+            .any(|window| { window == b"0000000012 00000 n \n" }));
+        assert!(!bytes
+            .windows(b"0000000012 00007 n \n".len())
+            .any(|window| { window == b"0000000012 00007 n \n" }));
+    }
+
+    #[test]
+    fn classic_xref_returns_space_before_zero_at_the_header_newline() {
+        // qpdf's writeXRefTable returns `space_before_zero`, captured before
+        // the header's trailing newline (QPDFWriter.cc:2356-2360); a
+        // linearized `/T` identifies that whitespace byte immediately before
+        // the object-0 row, so the returned offset must point at the `\n`,
+        // not the first digit of the row after it.
+        let mut entries = BTreeMap::new();
+        entries.insert(1, XrefEntry::Uncompressed { offset: 100 });
+        let mut bytes = Vec::new();
+        let space_before_zero =
+            write_xref_table(&mut bytes, 0, 1, &entries, false, 0, 0, 0).expect("table writes");
+        assert_eq!(bytes[space_before_zero], b'\n');
+        assert_eq!(
+            &bytes[space_before_zero + 1..space_before_zero + 1 + b"0000000000 65535 f \n".len()],
+            b"0000000000 65535 f \n"
+        );
+    }
+
+    #[test]
+    fn classic_xref_full_contract_supports_range_and_hint_adjustment() {
+        let mut entries = BTreeMap::new();
+        entries.insert(1, XrefEntry::Uncompressed { offset: 100 });
+        entries.insert(2, XrefEntry::Uncompressed { offset: 200 });
+        let mut bytes = Vec::new();
+
+        write_xref_table(&mut bytes, 1, 2, &entries, false, 2, 50, 7)
+            .expect("range and hint-adjusted table");
+        let text = String::from_utf8(bytes).expect("xref is ASCII");
+        assert!(text.starts_with("xref\n1 2\n"));
+        assert!(text.contains("0000000107 00000 n \n"));
+        assert!(text.contains("0000000200 00000 n \n"));
+        assert!(!text.contains("65535 f"));
+    }
+
+    #[test]
+    fn classic_xref_suppress_offsets_does_not_resolve_rows() {
+        let mut bytes = Vec::new();
+
+        write_xref_table(&mut bytes, 0, 2, &BTreeMap::new(), true, 0, 0, 0)
+            .expect("suppressed pass-1 rows do not require offsets");
+        let text = String::from_utf8(bytes).expect("xref is ASCII");
+        assert!(text.contains("0000000000 65535 f \n"));
+        assert_eq!(text.matches("0000000000 00000 n \n").count(), 2);
+    }
+
+    #[test]
+    fn classic_xref_free_row_uses_the_qpdf_get_offset_error() {
+        let mut entries = BTreeMap::new();
+        entries.insert(1, XrefEntry::Free { next: 0 });
+        let mut bytes = Vec::new();
+
+        let error = write_xref_table(&mut bytes, 1, 1, &entries, false, 0, 0, 0)
+            .expect_err("free rows cannot be emitted as classic live rows");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(message)
+                if message == "getOffset called for xref entry of type != 1"
+        ));
+    }
+
+    #[test]
+    fn classic_xref_rejects_invalid_ranges_and_offset_overflow() {
+        let mut bytes = Vec::new();
+        let error = write_xref_table(&mut bytes, 2, 1, &BTreeMap::new(), false, 0, 0, 0)
+            .expect_err("reversed ranges are invalid");
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message == "invalid xref table range")
+        );
+
+        let mut entries = BTreeMap::new();
+        entries.insert(1, XrefEntry::Uncompressed { offset: u64::MAX });
+        let error = write_xref_table(&mut bytes, 1, 1, &entries, false, 2, 0, 1)
+            .expect_err("hint adjustment must reject offset overflow");
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message == "xref offset overflow")
+        );
+    }
 }
