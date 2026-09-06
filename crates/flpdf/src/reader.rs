@@ -825,6 +825,15 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.source_xref_entries()
     }
 
+    /// Append source ObjStm membership without resolving object values.
+    ///
+    /// Ports the writer-private `QPDF::getObjectStreamData` document operation
+    /// (`libqpdf/QPDF.cc:2381-2390`; `include/qpdf/QPDF.hh:757-761`). Existing
+    /// map entries survive unless a type-2 source row overwrites their key.
+    pub(crate) fn get_object_stream_data(&self, mapping: &mut BTreeMap<u32, u32>) {
+        self.resolver.get_object_stream_data(mapping);
+    }
+
     /// Return qpdf's effective source cross-reference table.
     ///
     /// This is the reader-owned table represented by qpdf's

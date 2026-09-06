@@ -215,7 +215,9 @@ crates/flpdf/src/writer/rewrite_renumber.rs::ObjectStreamRenumber        # D2 ca
 crates/flpdf/src/writer/object_streams/planning.rs::ObjectStreamGroup    # D5
 crates/flpdf/src/writer/object_streams/planning.rs::plan_qpdf_preserve_object_streams_with_unreferenced  # D6 canonical
 crates/flpdf/src/writer/object_streams/eligibility.rs::compressible_objgens_qpdf_plan      # D8 canonical
-crates/flpdf/src/reader/resolver.rs::source_xref_entries                 # D9 canonical
+crates/flpdf/src/reader/resolver.rs::source_xref_entries                 # D9 source view, retained
+crates/flpdf/src/reader/resolver.rs::get_object_stream_data              # D9 canonical mapping
+crates/flpdf/src/reader.rs::get_object_stream_data                       # D9 document entry
 crates/flpdf/src/writer/plain/body.rs::emit_bodies                       # D11 canonical
 crates/flpdf/src/writer/plain/xref.rs::append_xref_and_trailer           # D12/D13 canonical
 crates/flpdf/src/writer/plain/plan.rs::canonical_trailer_entries_with_visibility           # D14

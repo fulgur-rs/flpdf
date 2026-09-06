@@ -219,6 +219,13 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
     pdf: &mut crate::Pdf<R>,
     preserve_unreferenced: bool,
 ) -> crate::Result<ObjectStreamPlan> {
+    // QPDFWriter captures source membership before the compressible-object
+    // walk, which can resolve/recover objects and update the document xref.
+    let mut source_membership = BTreeMap::new();
+    pdf.get_object_stream_data(&mut source_membership);
+    if source_membership.is_empty() {
+        return Ok(ObjectStreamPlan::default());
+    }
     let compressible = (!preserve_unreferenced)
         .then(|| compressible_objgens_qpdf_plan(pdf))
         .transpose()?;
@@ -233,13 +240,11 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
         .unwrap_or_default();
     let mut by_container: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
 
-    for (member, entry) in pdf.source_xref_entries() {
-        if let XrefEntry::Compressed { stream, .. } = entry {
-            by_container
-                .entry(ObjectRef::new(stream, 0))
-                .or_default()
-                .push(member);
-        }
+    for (member, stream) in source_membership {
+        by_container
+            .entry(ObjectRef::new(stream, 0))
+            .or_default()
+            .push(ObjectRef::new(member, 0));
     }
 
     let mut groups = Vec::new();
