@@ -653,7 +653,8 @@ warning の flush 位置（B27 / E-7）の問題である。
 6. **A20** — teardown walk 2 本の統合。bootstrap 構造（A1）が 1 に依存する。
 
 qpdf 呼び出し順を壊さない理由: §5.A 第 3 行（「object cache に永続 tombstone は存在しない」）が
-1〜4 の責務を分ける。ただし `qpdf_removed_refs` は insert 0件の空集合であり、現在の観測差の根拠にはならない。
+1〜4 の責務を分ける。`qpdf_removed_refs` は insert 0件の空集合だったため、`flpdf-3yn9.48.21` でfield・初期化・全filter・無効なremoveを撤去した。
+qpdfのcanonical removeObject、xref/cacheの列挙と変異は既存ownerを使用する。A9/A10/A13/A16/A17に残るfacade責務は別sliceであり、分類集計はこの削除だけでは変わらない。
 このdead filter削除は、bootstrap cache / trailer child登録のowner統合から独立に進められる。§5.A 第 5 行（採番は `getObjectCount()+1` の 1 本）が
 A11 を A10 の後に置く理由で、facade の `next_available_object_ref` は A10 の結果と canonical の max を
 取るため A10 が 1 本にならないと採番が確定しない。§5.A 第 1 行・第 2 行（`getObject` は resolve しない /
@@ -961,7 +962,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 
 | ID | 状態 | 影響する行 | 次の確認 / 保持する契約 |
 |---|---|---|---|
-| A-1 | 未観測 | A2/A10 | legacy/cache列挙差をfixture集合で比較し、bootstrap identityの前提を切り出す。空のqpdf_removed_refsは観測差の根拠にしない。 |
+| A-1 | 未観測 | A2/A10 | legacy/cache列挙差をfixture集合で比較し、bootstrap identityの前提を切り出す。常に空だったremoved-ref集合は `flpdf-3yn9.48.21` で撤去済みで、観測差の根拠ではない。 |
 | A-2 | 未観測 | A12 | qpdf/RustでmakeIndirectObject後に元handleのarray/dictを変更し、aliasが保たれるか比較する。 |
 | A-3 | 内部契約確認 | A13 | removeObjectのcache eraseとowner切断をinternal witnessで確認する。削除済みpublic wrapperをprobe前提に戻さない。 |
 | A-4 | 未観測 | A1/A20 | bootstrap handleの持越しidentityとdisconnect順序を確認する。 |
