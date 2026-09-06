@@ -699,20 +699,15 @@ fn json_key_pages_limits_output() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "--json",
-        "--json-key",
-        "pages",
-        input.path().to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("\"pages\""))
-    // With --json-key pages, the "qpdf" top-level key must not appear
-    // (it would contain the object map).
-    .stdout(predicate::str::contains("\"qpdf\"").not())
-    // The "encrypt" top-level key must not appear.
-    .stdout(predicate::str::contains("\"encrypt\"").not());
+    cmd.args(["--json", "--json-key=pages", input.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"pages\""))
+        // With --json-key pages, the "qpdf" top-level key must not appear
+        // (it would contain the object map).
+        .stdout(predicate::str::contains("\"qpdf\"").not())
+        // The "encrypt" top-level key must not appear.
+        .stdout(predicate::str::contains("\"encrypt\"").not());
 }
 
 // ---------------------------------------------------------------------------
@@ -724,18 +719,13 @@ fn json_object_selector_limits_qpdf_section() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "--json",
-        "--json-object",
-        "3",
-        input.path().to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    // Object 3 is the page dict; it should appear.
-    .stdout(predicate::str::contains("\"obj:3 0 R\""))
-    // Object 1 (catalog) should NOT appear.
-    .stdout(predicate::str::contains("\"obj:1 0 R\"").not());
+    cmd.args(["--json", "--json-object=3", input.path().to_str().unwrap()])
+        .assert()
+        .success()
+        // Object 3 is the page dict; it should appear.
+        .stdout(predicate::str::contains("\"obj:3 0 R\""))
+        // Object 1 (catalog) should NOT appear.
+        .stdout(predicate::str::contains("\"obj:1 0 R\"").not());
 }
 
 // ---------------------------------------------------------------------------
@@ -749,8 +739,7 @@ fn json_key_invalid_exits_nonzero_with_error() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-key",
-        "invalidkey",
+        "--json-key=invalidkey",
         input.path().to_str().unwrap(),
     ])
     .assert()
@@ -767,8 +756,7 @@ fn json_v2_rejects_v1_only_object_keys_before_input_io() {
         let assert = cmd
             .args([
                 "--json=2",
-                "--json-key",
-                key,
+                &format!("--json-key={key}"),
                 "/definitely/missing/json-key-validation.pdf",
             ])
             .assert()
@@ -837,8 +825,7 @@ fn json_object_invalid_exits_nonzero_with_error() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-object",
-        "xyz",
+        "--json-object=xyz",
         input.path().to_str().unwrap(),
     ])
     .assert()
@@ -860,8 +847,7 @@ fn json_stream_data_inline_includes_data_field() {
     cmd.args([
         "--json",
         "--json-output=2",
-        "--json-stream-data",
-        "inline",
+        "--json-stream-data=inline",
         input.path().to_str().unwrap(),
     ])
     .assert()
@@ -881,14 +867,13 @@ fn json_stream_data_file_creates_side_files() {
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("out.json");
     let prefix = temp.path().join("sf").to_str().unwrap().to_string();
+    let prefix_arg = format!("--json-stream-prefix={prefix}");
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-stream-data",
-        "file",
-        "--json-stream-prefix",
-        &prefix,
+        "--json-stream-data=file",
+        &prefix_arg,
         input.path().to_str().unwrap(),
         out_path.to_str().unwrap(),
     ])
@@ -1035,9 +1020,8 @@ fn json_stream_data_file_to_stdout_uses_explicit_prefix() {
         .args([
             "--json=2",
             "--json-stream-data=file",
-            "--json-stream-prefix",
+            &format!("--json-stream-prefix={}", prefix.display()),
         ])
-        .arg(&prefix)
         .arg(&input_path)
         .output()
         .unwrap();
@@ -1245,16 +1229,14 @@ fn json_key_pages_does_not_write_side_files_for_filtered_streams() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let temp = tempfile::tempdir().unwrap();
     let prefix = temp.path().join("sf").to_str().unwrap().to_string();
+    let prefix_arg = format!("--json-stream-prefix={prefix}");
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-key",
-        "pages",
-        "--json-stream-data",
-        "file",
-        "--json-stream-prefix",
-        &prefix,
+        "--json-key=pages",
+        "--json-stream-data=file",
+        &prefix_arg,
         input.path().to_str().unwrap(),
     ])
     .assert()
@@ -1282,7 +1264,7 @@ fn json_key_pages_does_not_write_side_files_for_filtered_streams() {
 fn json_key_without_json_flag_is_usage_error() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--json-key", "pages", input.path().to_str().unwrap()])
+    cmd.args(["--json-key=pages", input.path().to_str().unwrap()])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("an output file name is required"));
@@ -1311,14 +1293,10 @@ fn json_output_without_json_flag_is_a_json_mode() {
 fn json_stream_data_without_json_flag_is_usage_error() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "--json-stream-data",
-        "inline",
-        input.path().to_str().unwrap(),
-    ])
-    .assert()
-    .code(2)
-    .stderr(predicate::str::contains("an output file name is required"));
+    cmd.args(["--json-stream-data=inline", input.path().to_str().unwrap()])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("an output file name is required"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,8 +1381,7 @@ fn json_flag_conflicts_with_linearize_pass1() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--linearize-pass1",
-        p1.to_str().unwrap(),
+        &format!("--linearize-pass1={}", p1.display()),
         input.path().to_str().unwrap(),
     ])
     .assert()
@@ -1843,15 +1820,14 @@ fn json_stream_data_file_side_file_holds_decoded_content() {
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("out.json");
     let prefix = temp.path().join("sf").to_str().unwrap().to_string();
+    let prefix_arg = format!("--json-stream-prefix={prefix}");
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
         "--json-output=2",
-        "--json-stream-data",
-        "file",
-        "--json-stream-prefix",
-        &prefix,
+        "--json-stream-data=file",
+        &prefix_arg,
         input.path().to_str().unwrap(),
         out_path.to_str().unwrap(),
     ])
@@ -1878,8 +1854,7 @@ fn json_stream_data_inline_holds_decoded_content() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "--json",
-        "--json-stream-data",
-        "inline",
+        "--json-stream-data=inline",
         input.path().to_str().unwrap(),
     ])
     .assert()

@@ -26,7 +26,7 @@ fn check_rejects_output_file() {
 
 #[test]
 fn show_object_rejects_output_file() {
-    assert_rejects_output(&["--show-object", "1 0"]);
+    assert_rejects_output(&["--show-object=1 0"]);
 }
 
 #[test]
@@ -56,5 +56,5 @@ fn list_attachments_rejects_output_file() {
 
 #[test]
 fn show_attachment_rejects_output_file() {
-    assert_rejects_output(&["--show-attachment", "missing"]);
+    assert_rejects_output(&["--show-attachment=missing"]);
 }

@@ -1942,9 +1942,9 @@ fn encrypted_writer_copy_encryption_tuple_is_byte_identical_to_qpdf() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--static-id", "--static-aes-iv", "--object-streams=disable"])
-        .args(["--copy-encryption"])
-        .arg(&donor)
-        .args(["--encryption-file-password", "", "--"])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=")
+        .arg("--")
         .arg(&input)
         .arg(&flpdf_output)
         .assert()
@@ -2093,10 +2093,10 @@ fn encrypted_generate_objstm_direct_and_copy_are_byte_identical_to_qpdf() {
             "--static-id",
             "--static-aes-iv",
             "--object-streams=generate",
-            "--copy-encryption",
         ])
-        .arg(&donor)
-        .args(["--encryption-file-password", "", "--"])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=")
+        .arg("--")
         .arg(&input)
         .arg(&copy_flpdf)
         .assert()
@@ -2277,9 +2277,8 @@ fn qdf_copy_encryption_works_on_top_level_and_rewrite_surfaces() {
         }
         command
             .args(["--qdf", "--static-id", "--static-aes-iv"])
-            .arg("--copy-encryption")
-            .arg(&donor)
-            .args(["--encryption-file-password", "donor-user"])
+            .arg(format!("--copy-encryption={}", donor.display()))
+            .arg("--encryption-file-password=donor-user")
             .arg(fixture(QDF_ENCRYPTION_FIXTURE))
             .arg(&output)
             .assert()
@@ -2300,12 +2299,8 @@ fn copy_encryption_output_has_encrypt_dict() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "secretuser",
-        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=secretuser")
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -2332,12 +2327,8 @@ fn copy_encryption_decrypts_with_donor_user_password_via_qpdf() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "donoruser",
-        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=donoruser")
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -2379,12 +2370,8 @@ fn copy_encryption_decrypts_with_donor_owner_password_via_qpdf() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "userpass",
-        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=userpass")
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -2419,12 +2406,8 @@ fn copy_encryption_round_trip_decrypts_cleanly_via_qpdf() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "pw",
-        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=pw")
         .arg(fixture(ONE_PAGE_FIXTURE))
         .arg(&encrypted)
         .assert()
@@ -2456,13 +2439,9 @@ fn rewrite_subcommand_copy_encryption_succeeds() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "rewrite",
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "donorpw",
-        ])
+        .args(["rewrite"])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=donorpw")
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -2495,9 +2474,9 @@ fn copy_encryption_floors_pdf_header_to_1_6() {
     let out = tmp.path().join("copied.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .arg("--copy-encryption")
-        .arg(&donor)
-        .args(["--encryption-file-password", "user-pw", "--"])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=user-pw")
+        .arg("--")
         .arg(fixture(ONE_PAGE_FIXTURE))
         .arg(&out)
         .assert()
@@ -2518,10 +2497,10 @@ fn copy_encryption_unencrypted_donor_is_rejected() {
     let out = tmp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            fixture(UNENCRYPTED_FIXTURE).to_str().unwrap(),
-        ])
+        .arg(format!(
+            "--copy-encryption={}",
+            fixture(UNENCRYPTED_FIXTURE).display()
+        ))
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -2554,12 +2533,8 @@ fn copy_encryption_non_v4_aes128_donor_is_rejected() {
     let out = tmp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "donoruser",
-        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=donoruser")
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -2578,12 +2553,8 @@ fn copy_encryption_wrong_password_is_rejected() {
     let out = tmp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--copy-encryption",
-            donor.to_str().unwrap(),
-            "--encryption-file-password",
-            "wrongpw",
-        ])
+        .arg(format!("--copy-encryption={}", donor.display()))
+        .arg("--encryption-file-password=wrongpw")
         .arg(fixture(UNENCRYPTED_FIXTURE))
         .arg(&out)
         .assert()
@@ -3274,33 +3245,16 @@ fn linearize_copy_encryption_produces_valid_encrypted_output() {
     let tmp = tempfile::tempdir().unwrap();
     let donor = make_donor_pdf(&tmp, "donor-user", "donor-owner");
 
-    for (surface, args) in [
-        (
-            "rewrite",
-            vec![
-                "rewrite",
-                "--linearize",
-                "--copy-encryption",
-                donor.to_str().unwrap(),
-                "--encryption-file-password",
-                "donor-user",
-            ],
-        ),
-        (
-            "top-level",
-            vec![
-                "--linearize",
-                "--copy-encryption",
-                donor.to_str().unwrap(),
-                "--encryption-file-password",
-                "donor-user",
-            ],
-        ),
-    ] {
+    for (surface, rewrite) in [("rewrite", true), ("top-level", false)] {
         let output = tmp.path().join(format!("lin-copy-enc-{surface}.pdf"));
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .args(args)
+        let mut command = Command::cargo_bin("flpdf").unwrap();
+        if rewrite {
+            command.arg("rewrite");
+        }
+        command
+            .arg("--linearize")
+            .arg(format!("--copy-encryption={}", donor.display()))
+            .arg("--encryption-file-password=donor-user")
             .arg(fixture(ONE_PAGE_FIXTURE))
             .arg(&output)
             .assert()

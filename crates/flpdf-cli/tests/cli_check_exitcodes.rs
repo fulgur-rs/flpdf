@@ -773,6 +773,39 @@ fn check_indirect_length_expected_endobj_uses_length_object_context() {
 }
 
 #[test]
+fn parameter_options_require_qpdf_equals_form() {
+    let input = "../../tests/fixtures/minimal.pdf";
+    let cases = [
+        (
+            vec!["--password", "u", input, "unused-output.pdf"],
+            "qpdf: --password must be given as --password=password",
+        ),
+        (
+            vec!["--force-version", "1.4", input, "unused-output.pdf"],
+            "qpdf: --force-version must be given as --force-version=version",
+        ),
+        (
+            vec!["--stream-data", "uncompress", input, "unused-output.pdf"],
+            "qpdf: --stream-data must be given as --stream-data={compress,preserve,uncompress}",
+        ),
+        (
+            vec!["--remove-attachment", "k1", input, "unused-output.pdf"],
+            "qpdf: --remove-attachment must be given as --remove-attachment=attachment",
+        ),
+    ];
+
+    for (args, expected) in cases {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(format!("{expected}{EOL}")));
+    }
+}
+
+#[test]
 fn check_object_warning_uses_qpdf_space_before_object_context() {
     let input = "../../tests/fixtures/compat/chained-indirect-contents.pdf";
 

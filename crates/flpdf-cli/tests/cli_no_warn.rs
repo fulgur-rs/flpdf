@@ -367,8 +367,7 @@ fn copy_encryption_no_warn_matches_qpdf_for_a_warning_bearing_donor() {
         .expect("flpdf binary")
         .args([
             "--no-warn",
-            "--copy-encryption",
-            donor,
+            &copy_option,
             "--encryption-file-password=",
             "--",
             destination,
