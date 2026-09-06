@@ -1804,6 +1804,25 @@ pub(crate) fn force_version_below_1_5(options: &WriterOptions) -> bool {
         .is_some_and(|version| version < QpdfVersionParts::new(1, 5))
 }
 
+/// Return the object-stream mode after qpdf's forced-version suppression.
+///
+/// `QPDFWriter::doWriteSetup` changes the writer's mode before route dispatch
+/// when a forced version below 1.5 cannot represent object streams
+/// (`QPDFWriter.cc:2103-2111`). Keep the coordinator's snapshot decision and
+/// the inner emitter on that same effective mode so an output-only Catalog
+/// mutation cannot bypass restoration.
+fn effective_object_stream_mode(options: &WriterOptions) -> ObjectStreamMode {
+    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
+    if force_version_below_1_5(options)
+        && (matches!(options.object_streams, ObjectStreamMode::Generate)
+            || (!encrypting && matches!(options.object_streams, ObjectStreamMode::Preserve)))
+    {
+        ObjectStreamMode::Disable
+    } else {
+        options.object_streams
+    }
+}
+
 /// Compute the effective PDF version to write given the source version, the
 /// caller-supplied options, and whether the output is linearized.
 ///
@@ -3622,7 +3641,11 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     // The plain route now reconciles ADBE on the root's output-only shallow
     // copy. It therefore needs no Catalog snapshot/restore; specialized routes
     // still retain that boundary until their own root consumers migrate.
-    if plain::eligible(pdf.is_encrypted(), options, options.object_streams) {
+    if plain::eligible(
+        pdf.is_encrypted(),
+        options,
+        effective_object_stream_mode(options),
+    ) {
         return emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
     }
 
@@ -3932,11 +3955,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // left byte-for-byte unchanged.
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     let requested_object_streams = options.object_streams;
+    let effective_object_streams = effective_object_stream_mode(options);
     let suppressed_options;
-    let options = if force_version_below_1_5(options)
-        && (matches!(options.object_streams, ObjectStreamMode::Generate)
-            || (!encrypting && matches!(options.object_streams, ObjectStreamMode::Preserve)))
-    {
+    let options = if effective_object_streams != options.object_streams {
         suppressed_options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,
             ..options.clone()
