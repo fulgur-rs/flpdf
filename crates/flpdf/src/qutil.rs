@@ -1,12 +1,15 @@
 //! qpdf correspondence: `QUtil.cc` integer conversion, filesystem identity, and UTF-8 single-byte encoding primitives.
 //!
-//! This module owns the qpdf `QUtil::string_to_int`, `QUtil::utf8_to_ascii`,
+//! This module owns the qpdf `QUtil::string_to_int`, `QUtil::safe_fopen`,
+//! `QUtil::int_to_string_base`, `QUtil::toUTF8`, `QUtil::utf8_to_ascii`,
 //! `QUtil::utf8_to_win_ansi`, and `QUtil::utf8_to_mac_roman` behavior used by
-//! form appearance generation (`libqpdf/QUtil.cc:1528-1667` and
+//! form appearance generation (`libqpdf/QUtil.cc:294-350,490-518,997-1031,
+//! 1528-1667` and
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
 //! unrepresentable input to `?`, matching qpdf's default replacement argument.
 //! It does not own PDF resource lookup, font selection, or password policy.
 
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 /// Return whether two existing paths identify the same filesystem object.
@@ -35,6 +38,160 @@ pub fn same_file(first: &Path, second: &Path) -> bool {
     {
         same_file::is_same_file(first, second).unwrap_or(false)
     }
+}
+
+/// Open a file with qpdf's `QUtil::safe_fopen` error boundary.
+///
+/// The mode grammar mirrors the portable `fopen` modes qpdf passes here:
+/// `r`, `w`, and `a`, optionally followed by `b` and/or `+`. The returned
+/// filesystem failure is promoted to `Error::System`, matching qpdf's
+/// `QPDFSystemError` rather than leaking a bare `std::io::Error` through a
+/// utility consumer.
+pub fn safe_fopen(filename: &str, mode: &str) -> crate::Result<File> {
+    let mut mode_bytes = mode.bytes();
+    let Some(kind) = mode_bytes.next() else {
+        return Err(crate::Error::System(format!(
+            "open {filename}: invalid fopen mode"
+        )));
+    };
+
+    let mut plus = false;
+    let mut exclusive = false;
+    for modifier in mode_bytes {
+        match modifier {
+            b'b' => {}
+            b'+' => plus = true,
+            b'x' => exclusive = true,
+            _ => {
+                return Err(crate::Error::System(format!(
+                    "open {filename}: invalid fopen mode"
+                )))
+            }
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    match kind {
+        b'r' => {
+            options.read(true);
+            if plus {
+                options.write(true);
+            }
+        }
+        b'w' => {
+            options.write(true);
+            if plus {
+                options.read(true);
+            }
+            if exclusive {
+                options.create_new(true);
+            } else {
+                options.create(true).truncate(true);
+            }
+        }
+        b'a' => {
+            options.append(true).create(true);
+            if plus {
+                options.read(true);
+            }
+            if exclusive {
+                options.create_new(true);
+            }
+        }
+        _ => {
+            return Err(crate::Error::System(format!(
+                "open {filename}: invalid fopen mode"
+            )))
+        }
+    }
+
+    options.open(filename).map_err(|error| {
+        // `QPDFSystemError::createWhat` renders `strerror(errno)`
+        // (`libqpdf/QPDFSystemError.cc:13-29`); drop Rust's numeric
+        // `(os error N)` suffix so the text matches qpdf's.
+        let rendered = error.to_string();
+        let message = error
+            .raw_os_error()
+            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+            .unwrap_or(&rendered);
+        crate::Error::System(format!("open {filename}: {message}"))
+    })
+}
+
+/// Format a signed integer using qpdf's supported bases and width rules.
+///
+/// This is qpdf's `QUtil::int_to_string_base` (`include/qpdf/QUtil.hh:46-48`,
+/// `libqpdf/QUtil.cc:294-300,337-350`). Positive lengths prepend zeroes;
+/// negative lengths append spaces. Unsupported bases are the qpdf
+/// `std::logic_error` boundary and therefore become `Error::Internal`.
+pub fn int_to_string_base(number: i64, base: i32, length: i32) -> crate::Result<String> {
+    let mut converted = match base {
+        // qpdf formats these through `std::ostringstream << std::setbase(base)
+        // << num` (`libqpdf/QUtil.cc:305-310`); C++ streams print a negative
+        // integer in octal or hexadecimal as its unsigned two's-complement
+        // representation, not as a sign plus magnitude.
+        8 => format!("{:o}", number as u64),
+        16 => format!("{:x}", number as u64),
+        10 => number.to_string(),
+        _ => {
+            return Err(crate::Error::Internal(
+                "int_to_string_base called with unsupported base".to_owned(),
+            ))
+        }
+    };
+
+    // cov:ignore-start: qpdf length is an i32 and the supported target is 64-bit
+    let width = usize::try_from(i64::from(length).unsigned_abs()).map_err(|_| {
+        crate::Error::Internal("int_to_string_base length does not fit usize".to_owned())
+    })?;
+    // cov:ignore-end
+    if length > 0 && converted.len() < width {
+        let mut padded = String::with_capacity(width);
+        padded.extend(std::iter::repeat_n('0', width - converted.len()));
+        padded.push_str(&converted);
+        converted = padded;
+    } else if length < 0 && converted.len() < width {
+        converted.extend(std::iter::repeat_n(' ', width - converted.len()));
+    }
+    Ok(converted)
+}
+
+/// Encode a qpdf Unicode code point as UTF-8 bytes.
+///
+/// This is qpdf's `QUtil::toUTF8` (`include/qpdf/QUtil.hh:280`,
+/// `libqpdf/QUtil.cc:997-1031`). qpdf accepts values through `0x7fffffff`
+/// using its historical 1-to-6-byte encoding and reports larger values as a
+/// runtime error, which maps to `Error::System` here.
+pub fn to_utf8(mut value: u32) -> crate::Result<Vec<u8>> {
+    if value > 0x7fff_ffff {
+        return Err(crate::Error::System(
+            "bounds error in QUtil::toUTF8".to_owned(),
+        ));
+    }
+    if value < 128 {
+        return Ok(vec![value as u8]);
+    }
+
+    let mut bytes = [0u8; 6];
+    let mut cursor = 5usize;
+    let mut max_value = 0x3fu8;
+    while value > u32::from(max_value) {
+        bytes[cursor] = 0x80 | (value as u8 & 0x3f);
+        value >>= 6;
+        max_value >>= 1;
+        // cov:ignore-start: qpdf accepts at most 31-bit values, which cannot exhaust the six-byte buffer
+        if cursor == 0 {
+            return Err(crate::Error::Internal(
+                "QUtil::toUTF8: overflow error".to_owned(),
+            ));
+        }
+        // cov:ignore-end
+        cursor -= 1;
+    }
+    let first = 0xffu32 - (1 + (u32::from(max_value) << 1)) + value;
+    bytes[cursor] = u8::try_from(first)
+        .map_err(|_| crate::Error::Internal("QUtil::toUTF8: overflow error".to_owned()))?; // cov:ignore: qpdf's bounded encoding keeps the leading byte within u8
+    Ok(bytes[cursor..].to_vec())
 }
 
 #[derive(Clone, Copy)]
@@ -248,9 +405,123 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        qpdf_string_to_int_checked, same_file, utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi,
-        QpdfIntParse,
+        int_to_string_base, qpdf_string_to_int_checked, safe_fopen, same_file, to_utf8,
+        utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi, QpdfIntParse,
     };
+    use std::io::{Read, Write};
+
+    #[test]
+    fn to_utf8_matches_qpdf_for_ascii_and_multibyte_values() {
+        assert_eq!(to_utf8(0x41).unwrap(), b"A");
+        assert_eq!(to_utf8(0x20ac).unwrap(), vec![0xe2, 0x82, 0xac]);
+        assert_eq!(
+            to_utf8(0x7fff_ffff).unwrap(),
+            vec![0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf]
+        );
+    }
+
+    #[test]
+    fn to_utf8_rejects_values_above_qpdfs_31_bit_limit() {
+        let error = to_utf8(0xffff_ffff).expect_err("qpdf rejects values above 0x7fffffff");
+
+        assert!(
+            matches!(error, crate::Error::System(message) if message == "bounds error in QUtil::toUTF8")
+        );
+    }
+
+    #[test]
+    fn int_to_string_base_matches_qpdf_bases_and_widths() {
+        assert_eq!(int_to_string_base(42, 8, 0).unwrap(), "52");
+        assert_eq!(int_to_string_base(42, 10, 4).unwrap(), "0042");
+        // `std::ostringstream << std::hex << -42LL` prints the unsigned
+        // two's-complement representation.
+        assert_eq!(int_to_string_base(-42, 16, 0).unwrap(), "ffffffffffffffd6");
+        assert_eq!(
+            int_to_string_base(-8, 8, 0).unwrap(),
+            "1777777777777777777770"
+        );
+        assert_eq!(int_to_string_base(-42, 10, 0).unwrap(), "-42");
+        assert_eq!(int_to_string_base(42, 10, -4).unwrap(), "42  ");
+    }
+
+    #[test]
+    fn int_to_string_base_rejects_an_unsupported_base_as_a_logic_error() {
+        let error = int_to_string_base(0, 12, 0).expect_err("base 12 is not supported by qpdf");
+
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message == "int_to_string_base called with unsupported base")
+        );
+    }
+
+    #[test]
+    fn safe_fopen_missing_path_is_a_qpdf_system_error() {
+        let error = safe_fopen("/definitely/not/a/flpdf/file", "rb")
+            .expect_err("opening a missing path must fail");
+
+        assert!(
+            matches!(&error, crate::Error::System(message) if message.starts_with("open /definitely/not/a/flpdf/file: "))
+        );
+        #[cfg(unix)]
+        assert!(
+            matches!(&error, crate::Error::System(message) if message == "open /definitely/not/a/flpdf/file: No such file or directory"),
+            "qpdf renders strerror without Rust's os-error suffix: {error:?}"
+        );
+    }
+
+    #[test]
+    fn safe_fopen_supports_qpdf_read_write_modes() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("safe-fopen.pdf");
+        let path = path.to_str().expect("temporary path is UTF-8");
+
+        let mut writer = safe_fopen(path, "wb").expect("open file for writing");
+        writer.write_all(b"first").expect("write first chunk");
+        drop(writer);
+
+        let mut appender = safe_fopen(path, "ab").expect("open file for appending");
+        appender
+            .write_all(b" second")
+            .expect("write appended chunk");
+        drop(appender);
+
+        let mut append_plus = safe_fopen(path, "a+").expect("open plus append mode");
+        append_plus
+            .write_all(b" third")
+            .expect("write plus append chunk");
+        drop(append_plus);
+
+        let mut reader = safe_fopen(path, "rb").expect("open file for reading");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read file");
+        assert_eq!(bytes, b"first second third");
+    }
+
+    #[test]
+    fn safe_fopen_covers_plus_exclusive_and_invalid_modes() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let plus_path = directory.path().join("plus");
+        let plus_path = plus_path.to_str().expect("temporary path is UTF-8");
+        let mut writer = safe_fopen(plus_path, "w+").expect("open plus write mode");
+        writer.write_all(b"plus").expect("write plus-mode data");
+        drop(writer);
+        let _reader = safe_fopen(plus_path, "r+").expect("open plus read mode");
+
+        let exclusive_path = directory.path().join("exclusive");
+        let exclusive_path = exclusive_path.to_str().expect("temporary path is UTF-8");
+        let _exclusive = safe_fopen(exclusive_path, "wx").expect("create exclusive file");
+        assert!(safe_fopen(exclusive_path, "wx").is_err());
+
+        let append_exclusive_path = directory.path().join("append-exclusive");
+        let append_exclusive_path = append_exclusive_path
+            .to_str()
+            .expect("temporary path is UTF-8");
+        let _append_exclusive =
+            safe_fopen(append_exclusive_path, "ax").expect("create append-exclusive file");
+
+        assert!(safe_fopen(plus_path, "").is_err());
+        assert!(safe_fopen(plus_path, "r?").is_err());
+        assert!(safe_fopen(plus_path, "z").is_err());
+    }
 
     #[test]
     fn qpdf_string_to_int_checked_handles_empty_and_negative_values() {

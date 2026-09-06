@@ -94,6 +94,7 @@ impl<R: Read + Seek> Pdf<R> {
             resolver,
             input_source_control: None,
             version: String::new(),
+            parsed: false,
             check_mode: false,
             trailer: ObjectHandle::uninitialized(),
             last_xref_form: XrefForm::Table,
@@ -202,9 +203,24 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn open_with_repair_mode(
+        reader: R,
+        options: PdfOpenOptions,
+        allow_bad_password: bool,
+    ) -> Result<Self> {
+        Self::open_with_repair_mode_as(reader, options, allow_bad_password, None)
+    }
+
+    /// The open path with an optional pre-assigned document identity.
+    ///
+    /// `QPDF::processMemoryFile` installs a source on an already constructed
+    /// `QPDF`, so every handle minted while parsing must carry that object's
+    /// identity rather than a fresh one; `None` allocates a new identity for
+    /// the ordinary factory functions.
+    fn open_with_repair_mode_as(
         mut reader: R,
         options: PdfOpenOptions,
         allow_bad_password: bool,
+        unique_id: Option<u64>,
     ) -> Result<Self> {
         let warning_options = ResolverWarningOptions::new(
             options
@@ -264,7 +280,7 @@ impl<R: Read + Seek> Pdf<R> {
         // Hoisted out of the struct literal because the resolver needs the
         // same id: it stamps `pdf_unique_id` onto every canonical handle it
         // mints, which `ObjectHandle::belongs_to_pdf` answers on.
-        let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
+        let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
         let initial_diagnostics = loaded.repair_diagnostics.clone();
         let resolver = ResolverHandle::new_shared(
             reader,
@@ -296,6 +312,7 @@ impl<R: Read + Seek> Pdf<R> {
             resolver,
             input_source_control: None,
             version: loaded.version,
+            parsed: true,
             check_mode: false,
             trailer,
             last_xref_form: loaded.last_xref_form,
@@ -474,6 +491,44 @@ impl Pdf<Cursor<Arc<[u8]>>> {
 }
 
 impl Pdf<Cursor<Vec<u8>>> {
+    /// Process an in-memory PDF through an already constructed document.
+    ///
+    /// This is qpdf's `QPDF::processMemoryFile` (`include/qpdf/QPDF.hh:91-97`,
+    /// `libqpdf/QPDF.cc:259-269`). The Rust document owns the replacement
+    /// byte vector, while the qpdf policy state that is observable before the
+    /// parse — recovery, warning suppression, logger, and source description
+    /// — is carried across to the normal opening path. A failed parse leaves
+    /// the existing document unchanged, just as qpdf does not install a new
+    /// parsed source until its process call succeeds.
+    pub fn process_memory_file(
+        &mut self,
+        description: impl AsRef<[u8]>,
+        bytes: Vec<u8>,
+    ) -> crate::Result<()> {
+        if self.parsed {
+            return Err(crate::Error::Internal(
+                "QPDF::processMemoryFile must be called before a process method".to_owned(),
+            ));
+        }
+        let options = PdfOpenOptions {
+            repair: self.resolver.attempt_recovery(),
+            logger: Some(self.resolver.logger()),
+            suppress_warnings: self.resolver.suppress_warnings(),
+            description: description.as_ref().to_vec(),
+            ..PdfOpenOptions::default()
+        };
+        // Parse with this document's identity so the handles minted during
+        // the open (trailer, root, cached objects) and any handle created
+        // afterwards agree on their owner.
+        *self = Self::open_with_repair_mode_as(
+            Cursor::new(bytes),
+            options,
+            false,
+            Some(self.unique_id),
+        )?;
+        Ok(())
+    }
+
     /// Open a PDF document from an owned byte vector without wrapping it in a `Cursor` manually.
     ///
     /// The sole-ownership counterpart to [`Pdf::open_mem`]: the handle takes the
@@ -627,7 +682,7 @@ impl Pdf<Cursor<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::Pdf;
+    use super::{Pdf, EMPTY_PDF_BYTES};
     use crate::{Error, PdfOpenOptions};
     use std::io::{Read, Seek, SeekFrom};
 
@@ -658,5 +713,55 @@ mod tests {
             .expect("the initial seek failure must abort opening");
 
         assert!(matches!(error, Error::Io(error) if error.to_string() == "initial seek failed"));
+    }
+
+    #[test]
+    fn uninitialized_memory_processing_honors_strict_recovery_policy() {
+        let mut pdf = Pdf::uninitialized();
+        pdf.set_attempt_recovery(false);
+        pdf.set_suppress_warnings(true);
+
+        let error = pdf
+            .process_memory_file(b"empty", Vec::new())
+            .expect_err("an empty strict input must fail at the qpdf parse boundary");
+
+        assert!(!pdf.resolver.attempt_recovery());
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(pdf.suppress_warnings());
+    }
+
+    #[test]
+    fn memory_processing_rejects_reprocessing_a_parsed_document() {
+        let mut pdf = Pdf::empty().expect("empty PDF should open");
+        let _trailer = pdf.trailer();
+
+        let error = pdf
+            .process_memory_file(b"replacement", Vec::new())
+            .expect_err("qpdf process methods are pre-parse operations");
+
+        assert!(
+            matches!(error, Error::Internal(message) if message == "QPDF::processMemoryFile must be called before a process method")
+        );
+    }
+
+    #[test]
+    fn memory_processing_installs_a_successful_source_and_preserves_document_identity() {
+        let mut pdf = Pdf::uninitialized();
+        let unique_id = pdf.unique_id;
+
+        pdf.process_memory_file(b"empty PDF", EMPTY_PDF_BYTES.to_vec())
+            .expect("qpdf memory processing should install a valid source");
+
+        assert!(pdf.parsed);
+        assert_eq!(pdf.unique_id, unique_id);
+        // Handles minted while parsing and handles created afterwards must
+        // share one owner: qpdf's processMemoryFile keeps working on the
+        // same QPDF object.
+        let root = pdf.root_handle().expect("root resolves");
+        let stream = pdf
+            .new_stream_with_data(std::rc::Rc::new(b"x".to_vec()))
+            .expect("new stream on the processed document");
+        root.replace_key(b"/X", stream)
+            .expect("a handle minted during the open accepts a later handle of the same document");
     }
 }

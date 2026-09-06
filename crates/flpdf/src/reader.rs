@@ -19,6 +19,7 @@ use crate::reader::resolver::ResolverHandle;
 #[cfg(feature = "qtest-driver")]
 use crate::tokenizer::Tokenizer;
 use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm};
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -35,9 +36,16 @@ use crate::pdf::Pdf;
 /// of whether the source came from a file, memory, or a generated JSON seed.
 /// This trait is the Rust equivalent for job-owned documents: callers retain
 /// lazy reads while `JobDocument` can use one `Pdf` type for every source.
-pub trait ReadSeek: Read + Seek {}
+pub trait ReadSeek: Read + Seek {
+    /// Rust-native downcast boundary corresponding to qpdf InputSource RTTI.
+    fn as_any(&self) -> &dyn Any;
+}
 
-impl<T: Read + Seek> ReadSeek for T {}
+impl<T: Read + Seek + 'static> ReadSeek for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 /// Controller for a file source that can be closed between qpdf page-job
 /// operations and reopened at its last logical position.
@@ -294,6 +302,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// Enable or disable warning delivery without changing warning collection.
     pub fn set_suppress_warnings(&mut self, suppress: bool) {
         self.resolver.set_suppress_warnings(suppress);
+    }
+
+    /// Enable or disable qpdf recovery on this live document.
+    ///
+    /// This is qpdf's `QPDF::setAttemptRecovery` (`include/qpdf/QPDF.hh:234`,
+    /// `libqpdf/QPDF.cc:334`). The policy is read both while loading the
+    /// cross-reference data and when a later object read considers rebuilding
+    /// that data, so this mutator intentionally reaches the shared resolver
+    /// state rather than changing a one-shot open option.
+    pub fn set_attempt_recovery(&mut self, attempt_recovery: bool) {
+        self.resolver.set_attempt_recovery(attempt_recovery);
     }
 
     /// Diagnostics emitted while opening the document — typically warnings from the

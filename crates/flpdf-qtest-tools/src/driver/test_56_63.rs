@@ -1,11 +1,12 @@
 use std::ffi::OsStr;
-use std::io::{Read, Seek, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use flpdf::{
-    EncryptParams, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfOpenOptions,
-    PdfWriter, Pipeline, PipelineError, PipelineHandle, PipelineResult, QPDFLogger,
+    pipeline::Discard, qutil, EncryptParams, Error, NameTree, ObjectHandle, PageDocumentHelper,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineError, PipelineHandle,
+    PipelineResult, QPDFLogger, ReadSeek,
 };
 
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
@@ -374,39 +375,112 @@ pub(crate) fn run_test_60<R: Read + Seek + 'static>(
     Ok(())
 }
 
-/// test_61 (test_driver.cc:2215-2260): verify exception types and RTTI
-/// (`dynamic_cast`) survive a shared-library boundary.
+/// Rust-native test helper equivalent to qpdf's `ExtendNameTree` subclass.
 ///
-/// Every line of this test is specific to qpdf's own C++/shared-library
-/// concerns with no Rust counterpart: `pdf.setAttemptRecovery(false)` — the
-/// very first statement (test_driver.cc:2221) — needs a public mutator to
-/// disable recovery on an *already-open* `Pdf`, but flpdf only accepts
-/// `repair`/`PdfOpenOptions::repair` at open time (`reader.rs`'s
-/// `PdfOpenOptions`); no `set_attempt_recovery` exists at any visibility
-/// (`Resolver::attempt_recovery` is a private query, never a public setter).
-/// `pdf.processMemoryFile(...)` two lines later reuses the same live `QPDF`
-/// instance to reopen unrelated in-memory bytes in place — flpdf's `Pdf<R>`
-/// has no such re-open operation; every open goes through a factory function
-/// that returns a fresh value, and this function's own `R` is fixed by its
-/// caller. The remaining lines (`QUtil::safe_fopen`,
-/// `QUtil::int_to_string_base`, `QUtil::toUTF8`, `BufferInputSource`/
-/// `Pl_Discard` `dynamic_cast` probes, and the `QPDFNameTreeObjectHelper`
-/// mingw-vtable regression check) are all qpdf-internal-utility or C++-RTTI
-/// concerns with no flpdf equivalent either. Since the very first statement
-/// already has no public port, the entire test body — including the four
-/// "Caught ... as expected" lines qpdf prints on its (expected) successful
-/// path — is not attempted.
-pub(crate) fn run_test_61<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+/// The C++ test observes the destructor's stdout side effect. Rust has no
+/// shared-library vtable boundary to probe, but `Drop` is the corresponding
+/// ownership contract and remains directly observable by the qtest output.
+struct Test61ExtendNameTree<'a> {
+    _inner: NameTree,
+    stdout: &'a mut dyn Write,
+}
+
+impl Drop for Test61ExtendNameTree<'_> {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdout, "~ExtendNameTree called");
+    }
+}
+
+/// test_61 (test_driver.cc:2215-2260): verify qpdf exception classifications,
+/// in-place memory processing, utility error boundaries, and the observable
+/// ownership/type checks in a Rust-native form.
+pub(crate) fn run_test_61(
+    pdf: &mut Pdf<Cursor<Vec<u8>>>,
     filename: &[u8],
     arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let _ = (pdf, filename, arg2, stdout, stderr, diagnostics_written);
-    // GAP(QPDF::setAttemptRecovery): see the function doc above — the entire test body
-    // depends on this and the following missing primitives from its first statement.
+    let _ = (filename, arg2, stderr, diagnostics_written);
+
+    // qpdf test_driver.cc:2221-2225. The strict parse raises the Rust
+    // Error::Parse counterpart of QPDFExc before any warning is delivered.
+    pdf.set_attempt_recovery(false);
+    pdf.set_suppress_warnings(true);
+    match pdf.process_memory_file(b"empty", Vec::new()) {
+        Err(Error::Parse { .. }) => writeln!(stdout, "Caught QPDFExc as expected")?,
+        Err(error) => return Err(error),
+        Ok(()) => {
+            return Err(Error::Internal(
+                "test 61 empty process unexpectedly succeeded".to_owned(),
+            ))
+        }
+    }
+
+    match qutil::safe_fopen("/does/not/exist", "r") {
+        Err(Error::System(_) | Error::SystemBytes(_)) => {
+            writeln!(stdout, "Caught QPDFSystemError as expected")?
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(Error::Internal(
+                "test 61 missing safe_fopen unexpectedly succeeded".to_owned(),
+            ))
+        }
+    }
+
+    match qutil::int_to_string_base(0, 12, 0) {
+        Err(Error::Internal(message))
+            if message == "int_to_string_base called with unsupported base" =>
+        {
+            writeln!(stdout, "Caught logic_error as expected")?
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(Error::Internal(
+                "test 61 unsupported base unexpectedly succeeded".to_owned(),
+            ))
+        }
+    }
+
+    match qutil::to_utf8(0xffff_ffff) {
+        Err(Error::System(message)) if message == "bounds error in QUtil::toUTF8" => {
+            writeln!(stdout, "Caught runtime_error as expected")?
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(Error::Internal(
+                "test 61 out-of-range UTF-8 unexpectedly succeeded".to_owned(),
+            ))
+        }
+    }
+
+    // Rust's canonical InputSource substitute is ReadSeek. Its downcast
+    // hook exercises the same concrete-source RTTI boundary as qpdf's
+    // BufferInputSource dynamic_cast.
+    let input_source = Cursor::new(Vec::<u8>::new());
+    let input_source_ref: &dyn ReadSeek = &input_source;
+    assert!(input_source_ref
+        .as_any()
+        .downcast_ref::<Cursor<Vec<u8>>>()
+        .is_some());
+
+    // Pl_Discard is already the canonical Rust port of qpdf's terminal
+    // pipeline. Verify the actual trait-object route and lifecycle rather
+    // than creating a test-only pipeline stand-in.
+    let mut discard = Discard;
+    let pipeline: &mut dyn Pipeline = &mut discard;
+    assert_eq!(pipeline.identifier(), "discard");
+    pipeline.write(b"").map_err(Error::from)?;
+    pipeline.finish().map_err(Error::from)?;
+
+    {
+        let _name_tree = Test61ExtendNameTree {
+            _inner: NameTree::new(ObjectHandle::null(), true),
+            stdout,
+        };
+    }
     Ok(())
 }
 
@@ -561,7 +635,7 @@ pub(crate) fn run_test_63<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{test_56_59_body, DefaultErrorCaptureSink};
+    use super::{run_test_61, test_56_59_body, DefaultErrorCaptureSink};
     use flpdf::{Pdf, Pipeline};
     use std::sync::{Arc, Mutex};
 
@@ -624,5 +698,33 @@ mod tests {
         sink.write(b"warning\n").expect("capture sink write");
         sink.finish().expect("capture sink finish");
         assert_eq!(&*captured.lock().unwrap(), b"warning\n");
+    }
+
+    #[test]
+    fn test_61_body_matches_qpdf_exception_output() {
+        let mut pdf = Pdf::uninitialized();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_61(
+            &mut pdf,
+            b"-",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test 61 should catch the expected qpdf error classes");
+
+        assert_eq!(
+            stdout,
+            b"Caught QPDFExc as expected\n\
+Caught QPDFSystemError as expected\n\
+Caught logic_error as expected\n\
+Caught runtime_error as expected\n\
+~ExtendNameTree called\n"
+        );
+        assert!(stderr.is_empty());
     }
 }
