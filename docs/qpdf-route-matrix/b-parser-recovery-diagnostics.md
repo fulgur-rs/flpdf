@@ -314,6 +314,19 @@ caller の数え方（領域 D と同じ規約。全行がこれに従う）: `r
 | B33 | `reconstruct_xref` の 3 連 warn（`file is damaged` → 引数 `e` → `Attempting to reconstruct cross-reference table`、順序固定） | `libqpdf/QPDF.cc:528-530` | `crates/flpdf/src/xref.rs::push_repair_diagnostics`（private、open 時） / `crates/flpdf/src/reader/resolver.rs:1626-1636`（resolve 時のインライン 3 連 `push_warning`） | `push_repair_diagnostics(` prod: 2 (xref.rs) / test: 0。resolver 側インラインは 1 箇所 (resolver.rs:1626-1636) | mixed | `crates/flpdf/src/xref.rs::push_repair_diagnostics` | B22 の帰結。2 実装があり、中央の「引数 `e` をそのまま warn する」部分の文言生成が別。`push_repair_diagnostics`（`crates/flpdf/src/xref.rs:2892-2921`）は trigger error のメッセージごとに 5 通りの分岐で `QPDFExc` 相当の文言を再構成するのに対し、resolver 側（`crates/flpdf/src/reader/resolver.rs:1631-1635`）は `"(object N G, offset X): message"` を固定書式で組む。qpdf はどちらも `warn(e)` の 1 行で、文言は `e` が作られた時点の `createWhat` が決めている（B30） |
 | B34 | （qpdf に対応物なし）bounded windowのread-to-end fallback予算 | absent — `libqpdf/QPDF.cc:1541-1697` はlive sourceをseek/parseする | `crates/flpdf/src/pdf.rs:200` の `resolution_fallbacks_remaining` と `crates/flpdf/src/engine.rs:74` の `MAX_RESOLUTION_FALLBACKS = 64` | 減算は `crates/flpdf/src/reader.rs:993,1032,1038` の3箇所 | bridge | absent | A22のqtest metadata/source-stream offset再parseだけが使う。`parse_source_file_object_at` はreader.rs:863から1件、qtest retryはplural metadata APIsから呼ばれ、最終consumerはtest_0_1.rs:260,267,282,343,389。E27/C28のcanonical pipe/logger移行後、両wrapper群と残testを移してcaller-zeroを確認し、window helperと予算を削除する。source stream data offsetとObjectHandle::getParsedOffsetは別の値であり、単純代用しない。 |
 
+`.27.1` で `error.rs::QpdfExc` / `QpdfErrorCode` を追加した。これはB30/B32の
+structured primitiveだけであり、既存resolverの3 formatter、prefix sniffing、
+`Error`/`Diagnostic` consumer移行は後続stack層で行う。特にB30の負offset・embedded
+NUL・non-UTF8挙動はqpdf C++ probe（`/tmp/qpdfexc_probe.out`）でgetter raw bytesと
+`std::string(e.what())` observable bytesを分離して確認済みである。
+
+B30の既存行にある「負値もoffset無し」という要約は不正確である。qpdfは
+`object.empty() && offset == 0` のときだけ位置部分を省略し、filenameが非空・
+objectが空・offsetが負値なら `filename (): message` を生成する。`.27.1` の
+`QpdfExc::create_what` とfocused testはこの分岐を正本に合わせている。
+このfilename-only/negative-offset形はpinned C++ probeの`case=filename-only`
+出力（`what_cstr=662028293a206d`）でも確認済みである。
+
 ### 分類集計
 
 | 分類 | 件数 | 行 |

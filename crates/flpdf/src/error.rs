@@ -25,6 +25,156 @@ impl UsageError {
     }
 }
 
+/// The qpdf error-code family carried by [`QpdfExc`].
+///
+/// These values mirror `qpdf_error_code_e` in `include/qpdf/Constants.h:84-95`.
+/// The code is deliberately separate from the rendered message: qpdf exposes
+/// both, and callers must not parse `what()` to recover the classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum QpdfErrorCode {
+    /// No error.
+    Success = 0,
+    /// Logic or programming error (`qpdf_e_internal`).
+    Internal,
+    /// I/O or other runtime error (`qpdf_e_system`).
+    System,
+    /// Unsupported PDF feature (`qpdf_e_unsupported`).
+    Unsupported,
+    /// Incorrect password (`qpdf_e_password`).
+    Password,
+    /// Malformed or damaged PDF (`qpdf_e_damaged_pdf`).
+    DamagedPdf,
+    /// Erroneous or unsupported page structure (`qpdf_e_pages`).
+    Pages,
+    /// Object type or bounds error (`qpdf_e_object`).
+    Object,
+    /// JSON error (`qpdf_e_json`).
+    Json,
+    /// Linearization warning (`qpdf_e_linearization`).
+    Linearization,
+}
+
+/// Structured counterpart of qpdf's public `QPDFExc` exception.
+///
+/// qpdf stores the error code, source filename, object description, signed
+/// file position, and detail as independent values, while `what()` is a
+/// derived diagnostic string (`include/qpdf/QPDFExc.hh:29-77`,
+/// `libqpdf/QPDFExc.cc:3-51`). Keep each field as bytes because qpdf's
+/// `std::string` accepts arbitrary bytes, including embedded NULs.
+///
+/// [`Self::what_bytes`] intentionally models the observable C-string returned
+/// by `std::runtime_error::what()`: it ends at the first NUL. The getters retain
+/// the complete original fields, so this distinction is not lost. [`std::fmt::Display`]
+/// is only a lossy UTF-8 projection of those observable bytes and must not be
+/// used as a replacement for byte-oriented qpdf logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QpdfExc {
+    error_code: QpdfErrorCode,
+    filename: Vec<u8>,
+    object: Vec<u8>,
+    offset: i64,
+    message: Vec<u8>,
+    what: Vec<u8>,
+}
+
+impl QpdfExc {
+    /// Construct a qpdf-shaped exception from its independent raw fields.
+    pub fn new(
+        error_code: QpdfErrorCode,
+        filename: impl AsRef<[u8]>,
+        object: impl AsRef<[u8]>,
+        offset: i64,
+        message: impl AsRef<[u8]>,
+    ) -> Self {
+        let filename = filename.as_ref().to_vec();
+        let object = object.as_ref().to_vec();
+        let message = message.as_ref().to_vec();
+        let what = Self::create_what(&filename, &object, offset, &message);
+        Self {
+            error_code,
+            filename,
+            object,
+            offset,
+            message,
+            what,
+        }
+    }
+
+    /// Return qpdf's independent error code.
+    pub fn get_error_code(&self) -> QpdfErrorCode {
+        self.error_code
+    }
+
+    /// Return the complete original filename bytes.
+    pub fn get_filename(&self) -> &[u8] {
+        &self.filename
+    }
+
+    /// Return the complete original object-description bytes.
+    pub fn get_object(&self) -> &[u8] {
+        &self.object
+    }
+
+    /// Return qpdf's signed file position.
+    pub fn get_file_position(&self) -> i64 {
+        self.offset
+    }
+
+    /// Return the complete original detail-message bytes.
+    pub fn get_message_detail(&self) -> &[u8] {
+        &self.message
+    }
+
+    /// Return the observable `what()` bytes, truncated at the first NUL.
+    pub fn what_bytes(&self) -> &[u8] {
+        let end = self
+            .what
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.what.len());
+        &self.what[..end]
+    }
+
+    fn create_what(filename: &[u8], object: &[u8], offset: i64, message: &[u8]) -> Vec<u8> {
+        let mut result = Vec::new();
+        if !filename.is_empty() {
+            result.extend_from_slice(filename);
+        }
+        if !(object.is_empty() && offset == 0) {
+            if !filename.is_empty() {
+                result.extend_from_slice(b" (");
+            }
+            if !object.is_empty() {
+                result.extend_from_slice(object);
+                if offset > 0 {
+                    result.extend_from_slice(b", ");
+                }
+            }
+            if offset > 0 {
+                result.extend_from_slice(b"offset ");
+                result.extend_from_slice(offset.to_string().as_bytes());
+            }
+            if !filename.is_empty() {
+                result.push(b')');
+            }
+        }
+        if !result.is_empty() {
+            result.extend_from_slice(b": ");
+        }
+        result.extend_from_slice(message);
+        result
+    }
+}
+
+impl std::fmt::Display for QpdfExc {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&String::from_utf8_lossy(self.what_bytes()))
+    }
+}
+
+impl std::error::Error for QpdfExc {}
+
 /// Errors produced by the public APIs of `flpdf`.
 ///
 /// Unscoped I/O failures bubble up via [`Error::Io`]. Filesystem operations
@@ -271,6 +421,81 @@ impl EncryptedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qpdf_exc_exposes_all_error_codes_and_preserves_raw_fields() {
+        let codes = [
+            QpdfErrorCode::Success,
+            QpdfErrorCode::Internal,
+            QpdfErrorCode::System,
+            QpdfErrorCode::Unsupported,
+            QpdfErrorCode::Password,
+            QpdfErrorCode::DamagedPdf,
+            QpdfErrorCode::Pages,
+            QpdfErrorCode::Object,
+            QpdfErrorCode::Json,
+            QpdfErrorCode::Linearization,
+        ];
+        for (expected, code) in codes.into_iter().enumerate() {
+            let error = QpdfExc::new(
+                code,
+                b"file-\xff\0tail",
+                b"object-\0\xfe",
+                -1,
+                b"detail-\0\xfd",
+            );
+            assert_eq!(error.get_error_code(), code);
+            assert_eq!(error.get_error_code() as u8, expected as u8);
+            assert_eq!(error.get_filename(), b"file-\xff\0tail");
+            assert_eq!(error.get_object(), b"object-\0\xfe");
+            assert_eq!(error.get_file_position(), -1);
+            assert_eq!(error.get_message_detail(), b"detail-\0\xfd");
+        }
+    }
+
+    #[test]
+    fn qpdf_exc_what_matches_qpdf_c_string_boundaries_and_display_projection() {
+        type QpdfWhatCase<'a> = (&'a str, &'a [u8], &'a [u8], i64, &'a [u8]);
+        let cases: &[QpdfWhatCase<'_>] = &[
+            ("empty-empty-negative", b"", b"", -1, b"m"),
+            ("empty-empty-zero", b"", b"", 0, b"m"),
+            ("empty-empty-positive", b"", b"", 7, b"offset 7: m"),
+            ("empty-object-negative", b"", b"o", -1, b"o: m"),
+            ("empty-object-zero", b"", b"o", 0, b"o: m"),
+            ("empty-object-positive", b"", b"o", 7, b"o, offset 7: m"),
+            ("filename-empty-negative", b"f", b"", -1, b"f (): m"),
+            ("filename-empty-zero", b"f", b"", 0, b"f: m"),
+            ("filename-empty-positive", b"f", b"", 7, b"f (offset 7): m"),
+            ("filename-object-negative", b"f", b"o", -1, b"f (o): m"),
+            ("filename-object-zero", b"f", b"o", 0, b"f (o): m"),
+            (
+                "filename-object-positive",
+                b"f",
+                b"o",
+                7,
+                b"f (o, offset 7): m",
+            ),
+        ];
+        for &(label, filename, object, offset, expected) in cases {
+            let error = QpdfExc::new(QpdfErrorCode::DamagedPdf, filename, object, offset, b"m");
+            assert_eq!(error.what_bytes(), expected, "{label}");
+            assert_eq!(
+                error.to_string(),
+                String::from_utf8_lossy(expected),
+                "{label}"
+            );
+        }
+
+        let nul_filename = QpdfExc::new(QpdfErrorCode::DamagedPdf, b"f\0x", b"o", 7, b"m");
+        assert_eq!(nul_filename.what_bytes(), b"f");
+        assert_eq!(nul_filename.to_string(), "f");
+
+        let nul_object = QpdfExc::new(QpdfErrorCode::DamagedPdf, b"f", b"o\0y", 7, b"m");
+        assert_eq!(nul_object.what_bytes(), b"f (o");
+
+        let nul_message = QpdfExc::new(QpdfErrorCode::DamagedPdf, b"f", b"o", 7, b"m\0z");
+        assert_eq!(nul_message.what_bytes(), b"f (o, offset 7): m");
+    }
     use crate::encryption::primitives::PrimitiveError;
     use crate::Diagnostic;
     use std::error::Error as _;

@@ -162,6 +162,8 @@ crates/flpdf/src/reader/resolver.rs::reconstructed_xref                  # B25 c
 crates/flpdf/src/reader/resolver.rs::attempt_recovery                    # B26 canonical
 crates/flpdf/src/reader/resolver.rs::repair_diagnostics                  # B27 単一 sink
 crates/flpdf/src/object_handle.rs::format_qpdf_exception_what            # B30 canonical
+crates/flpdf/src/error.rs::QpdfExc                                      # B30/B32 canonical primitive
+crates/flpdf/src/error.rs::QpdfErrorCode                                # B32 qpdf error-code family
 crates/flpdf/src/error.rs::Error                                         # B32（曖昧 leaf）
 crates/flpdf/src/xref.rs::push_repair_diagnostics                        # B33 canonical
 
