@@ -1618,19 +1618,17 @@ fn root_output_copy_with_adbe(
                 == Some(final_extension_level);
         if !preserves_existing {
             if need_adbe {
-                extensions.replace_key(
-                    b"/ADBE",
-                    ObjectHandle::dictionary(vec![
-                        (
-                            b"/BaseVersion".to_vec(),
-                            ObjectHandle::name(final_pdf_version.as_bytes().to_vec()),
-                        ),
-                        (
-                            b"/ExtensionLevel".to_vec(),
-                            ObjectHandle::integer(final_extension_level),
-                        ),
-                    ]),
-                )?;
+                let replacement = ObjectHandle::dictionary(vec![
+                    (
+                        b"/BaseVersion".to_vec(),
+                        ObjectHandle::name(final_pdf_version.as_bytes().to_vec()),
+                    ),
+                    (
+                        b"/ExtensionLevel".to_vec(),
+                        ObjectHandle::integer(final_extension_level),
+                    ),
+                ]);
+                extensions.replace_key(b"/ADBE", replacement)?;
             } else {
                 extensions.remove_key(b"/ADBE");
             }
