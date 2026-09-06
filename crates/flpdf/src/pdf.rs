@@ -215,12 +215,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// values themselves live on their [`ObjectHandle`]s; this set only keeps
     /// the qpdf JSON preparation/mutation boundary aware of cache-only refs.
     pub(crate) qpdf_parsed_xref_stream_refs: BTreeSet<ObjectRef>,
-    /// Legacy object references removed by compatibility-only test paths.
-    /// qpdf's object cache removal is persistent across repeated JSON
-    /// preparation; keep this separate from immutable source/trailer
-    /// discovery so those seeds cannot resurrect an explicitly removed
-    /// reference.
-    pub(crate) qpdf_removed_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     pub(crate) ever_called_get_all_pages: bool,
     /// Monotonic observation matching qpdf's

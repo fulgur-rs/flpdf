@@ -837,12 +837,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// (`QPDF.cc:1986-1993`), while a later physical recovery may register and
     /// expose that source row.
     pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        let removed = &self.qpdf_removed_refs;
-        self.resolver
-            .xref_entries()
-            .into_iter()
-            .filter(|(object_ref, _)| !removed.contains(object_ref))
-            .collect()
+        self.resolver.xref_entries()
     }
 
     /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
@@ -1132,7 +1127,6 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         refs.extend(self.canonical_object_refs(true));
-        refs.retain(|object_ref| !self.qpdf_removed_refs.contains(object_ref));
         refs.into_iter().collect()
     }
 
@@ -1409,7 +1403,6 @@ impl<R: Read + Seek> Pdf<R> {
         // without changing any other object-cache cell.
         self.synchronize_cache_with_resolver_xref();
         let target = self.resolver.replace_object(object_ref, replacement)?;
-        self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.mark_object_handle_mutated(object_ref);
@@ -1434,7 +1427,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.synchronize_cache_with_resolver_xref();
         self.resolver.swap_objects(first, second)?;
         for object_ref in [first, second] {
-            self.qpdf_removed_refs.remove(&object_ref);
             self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
             self.qpdf_dangling_refs.remove(&object_ref);
             self.mark_object_handle_mutated(object_ref);
@@ -1460,10 +1452,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// Remove a canonical object from the resolver's xref/cache view and
     /// leave outstanding handles as floating null values. The legacy snapshot
     /// metadata is maintained separately by the `Pdf` facade. This is qpdf
-    /// `removeObject`'s exact xref/cache mutation (`QPDF.cc:1996-2005`), not
-    /// the separate `qpdf_removed_refs` snapshot filter and not xref
-    /// registration's transient free-row state (`QPDF.cc:686-708`,
-    /// `:1187-1210`).
+    /// `removeObject`'s exact xref/cache mutation (`QPDF.cc:1996-2005`),
+    /// separate from xref registration's transient free-row state
+    /// (`QPDF.cc:686-708`, `:1187-1210`).
     #[cfg(test)]
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         // Refresh the legacy cache before removing the canonical value, or an
@@ -1710,7 +1701,6 @@ impl<R: Read + Seek> Pdf<R> {
         for (object_ref, source) in parsed_xref_streams {
             if object_ref.number == 0
                 || object_ref.generation == u16::MAX
-                || self.qpdf_removed_refs.contains(&object_ref)
                 || self.resolver.xref_entry(object_ref).is_some()
             {
                 continue;
@@ -1732,11 +1722,7 @@ impl<R: Read + Seek> Pdf<R> {
             .qpdf_trailer_references
             .iter()
             .copied()
-            .filter(|object_ref| {
-                object_ref.number != 0
-                    && object_ref.generation != u16::MAX
-                    && !self.qpdf_removed_refs.contains(object_ref)
-            })
+            .filter(|object_ref| object_ref.number != 0 && object_ref.generation != u16::MAX)
             .collect();
         for object_ref in &trailer_refs {
             self.get_object_handle(*object_ref);
@@ -1766,16 +1752,13 @@ impl<R: Read + Seek> Pdf<R> {
             self.get_object_handle(object_ref).try_dereference()?;
         }
 
-        let removed = self.qpdf_removed_refs.clone();
         Ok(self
             .resolver
             .all_object_handles()
             .into_iter()
             .filter(|handle| {
                 handle.object_ref().is_none_or(|object_ref| {
-                    object_ref.number != 0
-                        && object_ref.generation != u16::MAX
-                        && !removed.contains(&object_ref)
+                    object_ref.number != 0 && object_ref.generation != u16::MAX
                 })
             })
             .collect())
@@ -1899,13 +1882,7 @@ impl<R: Read + Seek> Pdf<R> {
             return;
         }
 
-        let removed = &self.qpdf_removed_refs;
-        let entries = self
-            .resolver
-            .source_xref_entries()
-            .into_iter()
-            .filter(|(object_ref, _)| !removed.contains(object_ref))
-            .collect();
+        let entries = self.resolver.source_xref_entries();
         self.cache.synchronize_with_xref(&entries);
         // Keep the direct object-stream provenance for a still-identical
         // compressed xref entry, but never let a mapping survive a rebuilt
