@@ -154,10 +154,20 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
                 return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);
             }
         },
-        None => match Pdf::empty() {
-            Ok(pdf) => pdf,
-            Err(error) => return write_error(stdout, stderr, &error.to_string()),
-        },
+        None => {
+            let result = if n == 61 {
+                // qpdf test 61 starts from a default-constructed QPDF and
+                // calls setAttemptRecovery/processMemoryFile inside the test;
+                // it does not call emptyPDF before entering that body.
+                Ok(Pdf::uninitialized())
+            } else {
+                Pdf::empty()
+            };
+            match result {
+                Ok(pdf) => pdf,
+                Err(error) => return write_error(stdout, stderr, &error.to_string()),
+            }
+        }
     };
 
     let mut diagnostics_written = 0;
