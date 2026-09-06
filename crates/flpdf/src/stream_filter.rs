@@ -1313,6 +1313,39 @@ mod tests {
     }
 
     #[test]
+    fn filter_specs_preserve_unknown_stream_array_and_indirect_handles() {
+        let unknown_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![]),
+            std::rc::Rc::new(vec![1, 2, 3]),
+        );
+        let unknown_array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let unknown_indirect =
+            ObjectHandle::new_indirect_unresolved(crate::ObjectRef::new(90, 0), 0);
+        let params = ObjectHandle::dictionary(vec![
+            (b"UnknownStream".to_vec(), unknown_stream.clone()),
+            (b"UnknownArray".to_vec(), unknown_array.clone()),
+            (b"UnknownIndirect".to_vec(), unknown_indirect.clone()),
+        ]);
+        let filter = ObjectHandle::name(b"FlateDecode".to_vec());
+        let specs = super::decode_filter_specs_from_handle(&filter, &params, None).unwrap();
+        let retained = &specs[0].decode_params;
+
+        let retained_stream = retained.try_get_key(b"/UnknownStream").unwrap();
+        assert!(retained_stream.is_same_object_as(&unknown_stream));
+        let retained_array = retained.try_get_key(b"/UnknownArray").unwrap();
+        assert!(retained_array.is_same_object_as(&unknown_array));
+        unknown_array
+            .append_array_item(ObjectHandle::integer(2))
+            .unwrap();
+        assert_eq!(retained_array.try_array_len().unwrap(), Some(2));
+
+        let retained_indirect = retained.try_get_key(b"/UnknownIndirect").unwrap();
+        assert!(retained_indirect.is_same_object_as(&unknown_indirect));
+        unknown_indirect.set_resolved(crate::object_handle::ObjectValue::Integer(7));
+        assert_eq!(retained_indirect.try_get_int_value().unwrap(), 7);
+    }
+
+    #[test]
     fn base_stream_filter_accepts_only_null_decode_parameters() {
         let mut filter = super::AsciiHexStreamFilter;
         assert!(filter.set_decode_params(&ObjectHandle::null()).unwrap());
