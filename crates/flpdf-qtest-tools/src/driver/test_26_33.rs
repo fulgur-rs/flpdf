@@ -125,34 +125,36 @@ pub(crate) fn run_test_26<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     // qpdf: `assert(arg2 != nullptr);` (test_driver.cc:987).
     let arg2 = arg2.expect("test 26 requires arg2, matching qpdf's own assert(arg2 != nullptr)");
-    let mut oldpdf = open_secondary_pdf(arg2, b"", stdout, stderr)?;
-    let qtest = oldpdf.trailer_key_handle(b"QTest");
-    let o3 = qtest.get_key(b"/O3");
-    // qpdf never checks that `/O3` is indirect before calling `addPage`; a
-    // page-tree entry is always an indirect object in a well-formed PDF,
-    // matching the fixture this test is designed for.
-    let o3_ref = o3
-        .object_ref()
-        .expect("/O3 is a page, always an indirect object");
-    PageDocumentHelper::new(pdf).add_page(PageInput::foreign(&mut oldpdf, o3_ref), false)?;
-    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    {
+        // qpdf keeps the foreign source alive through the two copies, then
+        // drops it before constructing the writer (`test_driver.cc:987-994`).
+        let mut oldpdf = open_secondary_pdf(arg2, b"", stdout, stderr)?;
+        let qtest = oldpdf.trailer_key_handle(b"QTest");
+        let o3 = qtest.get_key(b"/O3");
+        // qpdf never checks that `/O3` is indirect before calling `addPage`; a
+        // page-tree entry is always an indirect object in a well-formed PDF,
+        // matching the fixture this test is designed for.
+        let o3_ref = o3
+            .object_ref()
+            .expect("/O3 is a page, always an indirect object");
+        PageDocumentHelper::new(pdf).add_page(PageInput::foreign(&mut oldpdf, o3_ref), false)?;
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
-    // qpdf next does `pdf.getTrailer().replaceKey("/QTest",
-    // pdf.copyForeignObject(qtest))` (test_driver.cc:993). Run the copy for
-    // its own real, faithful side effect on `pdf`'s object graph (C++
-    // evaluates the argument expression before the call it feeds), but stop
-    // there:
-    let _ = pdf.copy_foreign_object(&qtest)?;
-    // GAP(QPDF::getTrailer().replaceKey): flpdf has no public API to mutate
-    // `Pdf::trailer()` after open. `ObjectHandle::replace_key` on
-    // `Pdf::trailer()` only mutates the legacy handle-bridge
-    // snapshot -- `emit_canonical_pdf`/`PdfWriter` never read it; the writer
-    // serializes from `Pdf::trailer()`'s own `Dictionary` directly (e.g.
-    // `writer.rs`'s `emit_canonical_pdf_inner`: `let mut trailer =
-    // pdf.trailer_dictionary().clone();`). Without a way to attach the copied `/QTest`,
-    // `PdfWriter::write()` cannot reproduce qpdf's real `a.pdf`, so it is
-    // not attempted here.
-    Ok(())
+        // qpdf replaces the live trailer key with the result of its canonical
+        // foreign graph copy (`test_driver.cc:993`). `Pdf::trailer()` is the
+        // live ObjectHandle, so this mutation is consumed by PdfWriter just
+        // like QPDF::getTrailer().replaceKey in qpdf.
+        let trailer = pdf.trailer();
+        let copied_qtest = pdf.copy_foreign_object(&qtest)?;
+        trailer.replace_key(b"/QTest", copied_qtest)?;
+        pdf.mark_object_handle_dirty(&trailer)?;
+    }
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_stream_data_mode(StreamDataMode::Preserve);
+    writer.write()
 }
 
 /// test_27 (test_driver.cc:1002-1076): copy `O3` and the page it refers to
