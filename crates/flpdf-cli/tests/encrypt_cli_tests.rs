@@ -1066,6 +1066,48 @@ fn encrypt_allow_insecure_ignores_an_attached_value() {
     }
 }
 
+#[test]
+fn weak_crypto_refusal_stderr_matches_qpdf_for_rc4_key_lengths() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
+    for key_len in ["40", "128"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let qpdf_output = tmp.path().join("qpdf.pdf");
+        let flpdf_output = tmp.path().join("flpdf.pdf");
+        let input = fixture(UNENCRYPTED_FIXTURE);
+
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--encrypt", "u", "o", key_len, "--"])
+            .arg(&input)
+            .arg(&qpdf_output)
+            .output()
+            .expect("qpdf should spawn");
+        assert_eq!(qpdf.status.code(), Some(2), "qpdf stderr: {:?}", qpdf);
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .expect("flpdf binary")
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["--encrypt", "u", "o", key_len, "--"])
+            .arg(&input)
+            .arg(&flpdf_output)
+            .output()
+            .expect("flpdf should spawn");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "weak-crypto exit status mismatch for {key_len}: {}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "weak-crypto stderr mismatch for key length {key_len}"
+        );
+    }
+}
+
 /// KEY-LEN=128 without `--use-aes=y` is qpdf's default V=2 R=3 RC4-128 — weak
 /// crypto. Refused without --allow-weak-crypto; with it,
 /// qpdf reports R=3.

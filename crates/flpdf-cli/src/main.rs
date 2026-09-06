@@ -2574,7 +2574,7 @@ fn main() {
     } = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
-            emit_logger_error(format!("flpdf: {error}\n"));
+            emit_logger_error(format!("{}: {error}\n", progname()));
             std::process::exit(2);
         }
     };
@@ -4164,7 +4164,7 @@ fn apply_encryption_options<T: RawCliArg>(
                 options.encrypt = Some(parsed.params);
             }
             Err(e) => {
-                emit_logger_error(format!("flpdf: {e}\n"));
+                emit_logger_error(format!("{}: {e}\n", progname()));
                 std::process::exit(2);
             }
         }
@@ -4650,12 +4650,14 @@ fn parse_encrypt_segment<T: RawCliArg>(
 
     let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {
         if !allow_weak_crypto && params.is_weak_rc4() {
-            return Err(
-                "refusing to write a file with RC4, a weak cryptographic algorithm. \
-                 Please use 256-bit keys for better security. Pass --allow-weak-crypto \
-                 to enable writing insecure files."
-                    .into(),
-            );
+            emit_logger_error(format!(
+                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\n\
+                 Please use 256-bit keys for better security.\n\
+                 Pass --allow-weak-crypto to enable writing insecure files.\n\
+                 See also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
+                progname()
+            ));
+            return Err("refusing to write a file with weak crypto".into());
         }
         Ok(params)
     };
