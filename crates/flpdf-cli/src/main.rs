@@ -3137,6 +3137,12 @@ fn missing_input_usage_error() -> UsageError {
     UsageError::new("an input file name is required")
 }
 
+/// `QPDFJob::checkConfiguration` raises this usage error whenever a route that
+/// writes output has no output file name (`libqpdf/QPDFJob.cc:591-593`).
+fn missing_output_usage_error() -> UsageError {
+    UsageError::new("an output file name is required; use - for standard output")
+}
+
 fn run_job_json_file(
     path: &Path,
     input: Option<&Path>,
@@ -4593,7 +4599,7 @@ fn run_rewrite(
     options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or("missing output file")?;
+    let output = output.ok_or_else(missing_output_usage_error)?;
     reject_same_job_output(&input, &output)?;
     let opened = open_job_pdf(
         &input,
@@ -6695,7 +6701,7 @@ fn run_qdf(
     preserve_unreferenced: bool,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or("missing output file")?;
+    let output = output.ok_or_else(missing_output_usage_error)?;
     let mut standard_output = prepare_pdf_standard_output(&output)?;
     let creates_output = standard_output.is_none();
     let mut pdf = open_pdf(&input, repair, password)?;
@@ -8263,7 +8269,7 @@ fn run_add_attachment(
     writer_options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or("--add-attachment: missing output PDF")?;
+    let output = output.ok_or_else(missing_output_usage_error)?;
     let attachment_options = segments
         .into_iter()
         .map(|tokens| {
@@ -8354,7 +8360,7 @@ fn run_remove_attachment(
     writer_options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or("--remove-attachment: missing output PDF")?;
+    let output = output.ok_or_else(missing_output_usage_error)?;
 
     // qpdf switches the logger to "save to standard output" before it opens
     // the input (`QPDFJob.cc:625`), so every `--verbose` info line — the
@@ -8477,7 +8483,7 @@ fn run_copy_attachments_from(
     writer_options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or_else(missing_input_usage_error)?;
-    let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
+    let output = output.ok_or_else(missing_output_usage_error)?;
     let donor_args = groups
         .into_iter()
         .map(parse_copy_attachments_segment)

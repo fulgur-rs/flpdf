@@ -599,6 +599,20 @@ fn qpdf_differential_matches_missing_input_usage_error() {
             "--check --pages without primary input",
             &["--check", "--pages", "noxref.pdf", "--"],
         ),
+        ("rewrite without output", &[MINIMAL]),
+        ("--qdf without output", &["--qdf", MINIMAL]),
+        (
+            "--add-attachment without output",
+            &["--add-attachment", MINIMAL, "--", MINIMAL],
+        ),
+        (
+            "--remove-attachment without output",
+            &["--remove-attachment=foo", "--", MINIMAL],
+        ),
+        (
+            "--copy-attachments-from without output",
+            &["--copy-attachments-from", MINIMAL, "--", MINIMAL],
+        ),
     ];
     for (label, args) in cases {
         assert_observables_equal(label, &run_qpdf(args), &run_flpdf(args), true);
