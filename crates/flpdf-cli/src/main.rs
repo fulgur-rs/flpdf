@@ -2712,7 +2712,7 @@ fn main() {
         } else {
             match args.input.as_ref() {
                 Some(input) => run_is_encrypted(input, args.repair, &args.password, args.no_warn),
-                None => Err("--is-encrypted requires an input file".into()),
+                None => Err(missing_input_usage_error().into()),
             }
         }
     } else if args.requires_password {
@@ -2723,7 +2723,7 @@ fn main() {
                 Some(input) => {
                     run_requires_password(input, args.repair, &args.password, args.no_warn)
                 }
-                None => Err("--requires-password requires an input file".into()),
+                None => Err(missing_input_usage_error().into()),
             }
         }
     } else if let Some(object_ref) = args.show_object.as_deref() {
@@ -2761,7 +2761,7 @@ fn main() {
                 args.no_warn,
                 args.show_encryption_key,
             ),
-            None => Err("--show-encryption requires an input file".into()),
+            None => Err(missing_input_usage_error().into()),
         }
     } else if args.check {
         run_check(
@@ -3133,6 +3133,10 @@ fn usage_exit(error: &UsageError) -> ! {
     std::process::exit(2);
 }
 
+fn missing_input_usage_error() -> UsageError {
+    UsageError::new("an input file name is required")
+}
+
 fn run_job_json_file(
     path: &Path,
     input: Option<&Path>,
@@ -3294,7 +3298,7 @@ fn run_json(cli: &Cli, image_options: ImageOptimizationOptions) -> CliResult<()>
     // truncating it. qpdf performs this check in QPDFJob.cc:627-630. Path
     // spelling alone is insufficient: relative aliases, symlinks, and hard
     // links can all name the same underlying file.
-    let input = cli.input.as_ref().ok_or("missing input file")?;
+    let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     if let Some(output) = cli
         .output
         .as_ref()
@@ -3449,7 +3453,7 @@ fn apply_json_page_specs<R: Read + Seek + 'static>(
 }
 
 fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
-    let input = cli.input.as_ref().ok_or("missing input file")?;
+    let input = cli.input.as_ref().ok_or_else(missing_input_usage_error)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
@@ -3904,7 +3908,7 @@ fn run_check(
     no_warn: bool,
     show_encryption_key: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -3933,7 +3937,7 @@ fn run_check_linearization(
     password: &PasswordArgs,
     no_warn: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -4588,7 +4592,7 @@ fn run_rewrite(
     no_warn: bool,
     options: WriterOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or("missing output file")?;
     reject_same_job_output(&input, &output)?;
     let opened = open_job_pdf(
@@ -6690,7 +6694,7 @@ fn run_qdf(
     password: &PasswordArgs,
     preserve_unreferenced: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or("missing output file")?;
     let mut standard_output = prepare_pdf_standard_output(&output)?;
     let creates_output = standard_output.is_none();
@@ -6959,7 +6963,7 @@ fn run_dump_object(
     object_ref: &str,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
@@ -7059,7 +7063,7 @@ fn run_show_object(
     // parsing, before QPDFJob::run() ever opens the input file, so a usage
     // error in the selector must surface even when no input file is given.
     let selector = parse_show_object_selector(selector)?;
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -7103,7 +7107,7 @@ fn run_show_npages(
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -7119,7 +7123,7 @@ fn run_show_pages(
     with_images: bool,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -7135,7 +7139,7 @@ fn run_show_xref(
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -7150,7 +7154,7 @@ fn run_show_linearization(
     password: &PasswordArgs,
     no_warn: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -8258,7 +8262,7 @@ fn run_add_attachment(
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or("--add-attachment: missing input PDF")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
     let attachment_options = segments
         .into_iter()
@@ -8349,7 +8353,7 @@ fn run_remove_attachment(
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or("--remove-attachment: missing input PDF")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
 
     // qpdf switches the logger to "save to standard output" before it opens
@@ -8415,7 +8419,7 @@ fn run_list_attachments(
     verbose: bool,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("--list-attachments: missing input PDF")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -8434,7 +8438,7 @@ fn run_show_attachment(
     key: &OsStr,
     suppress_warnings: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("--show-attachment: missing input PDF")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let mut pdf = open_pdf_with_suppression(&input, repair, password, suppress_warnings)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -8472,7 +8476,7 @@ fn run_copy_attachments_from(
     linearize_pass1: Option<&Path>,
     writer_options: WriterOptions,
 ) -> CliResult<()> {
-    let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
+    let input = input.ok_or_else(missing_input_usage_error)?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
     let donor_args = groups
         .into_iter()
