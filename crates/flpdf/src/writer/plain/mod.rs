@@ -14,8 +14,9 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
     options: &WriterOptions,
+    generated_id: Option<&crate::ObjectHandle>,
 ) -> crate::Result<WriterResult> {
-    let plan = plan::PlainWritePlan::build(pdf, options)?;
+    let plan = plan::PlainWritePlan::build_with_generated_id(pdf, options, generated_id)?;
     crate::writer::configure_progress_for_pdf(
         pdf,
         options,

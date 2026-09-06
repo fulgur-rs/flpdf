@@ -4004,7 +4004,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     }
 
     if plain_route {
-        return plain::write_plain(pdf, out, options);
+        return plain::write_plain(pdf, out, options, generated_id.as_ref());
     }
 
     // Only specialized modes reach the legacy coordinator below: QDF, output or
@@ -5795,6 +5795,36 @@ mod final_handle_writer_tests {
     use crate::encryption::CopyEncryptionSource;
     use crate::writer::object::TrailerKind;
     use std::io::{self, Cursor, Write};
+
+    #[test]
+    fn plain_route_consumes_the_prepared_generated_id() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let generated_id = ObjectHandle::array(vec![
+            ObjectHandle::string(b"setup-id-0".to_vec()),
+            ObjectHandle::string(b"setup-id-1".to_vec()),
+        ]);
+        let setup = WriterSetupState {
+            generated_id: Some(generated_id),
+            encryption_parameters: None,
+        };
+        let mut output = Vec::new();
+
+        emit_canonical_pdf_inner(
+            &mut pdf,
+            &mut output,
+            &WriterOptions::default(),
+            None,
+            setup,
+        )
+        .expect("plain writer route succeeds");
+
+        assert!(
+            output
+                .windows(b"<73657475702d69642d30>".len())
+                .any(|window| window == b"<73657475702d69642d30>"),
+            "plain route must emit the ID prepared by the shared writer setup"
+        );
+    }
 
     struct AlwaysFailingOutput;
 
