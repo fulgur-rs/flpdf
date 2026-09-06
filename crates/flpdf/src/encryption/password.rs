@@ -53,10 +53,17 @@ pub(crate) fn password_candidates_for_read(raw: &[u8], mode: PasswordMode) -> Re
     Ok(possible_repaired_encodings(&password))
 }
 
+/// The diagnostic outcome for one qpdf `maybeFixWritePassword` call.
+///
+/// A writer reports these values in the same order as qpdf invokes the
+/// routine: user password first, owner password second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PasswordWriteNotice {
+pub enum PasswordWriteNotice {
+    /// No diagnostic was generated for this password.
     None,
+    /// qpdf converted a Unicode password to PDFDoc encoding.
     Info,
+    /// qpdf retained a Unicode password that is not PDFDoc-encodable.
     Warning,
 }
 

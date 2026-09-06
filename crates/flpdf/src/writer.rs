@@ -40,7 +40,9 @@ where
     writer.get_buffer()
 }
 
-use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams, PasswordMode};
+use crate::encryption::{
+    CopyEncryptionSource, EncryptMethod, EncryptParams, PasswordMode, PasswordWriteNotice,
+};
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::pdf_version::{parse_qpdf_writer_version, PdfVersion, QpdfVersionParts, PDF_1_5};
 use crate::pipeline::{flate::Flate, Pipeline, PlString};
@@ -359,16 +361,16 @@ impl WriterConfiguration {
     /// Apply qpdf's `QPDFJob::maybeFixWritePassword` policy to configured
     /// encryption passwords before a writer emits its encryption dictionary.
     ///
-    /// The returned pair is `(verbose_info_count, warning_count)` for qpdf's
-    /// auto-mode password diagnostics. Password validation and conversion stay
-    /// in the encryption password module so direct CLI writers and `QPDFJob`
-    /// share one implementation.
+    /// The returned vector contains one notice per configured password in
+    /// qpdf's call order: user password first, owner password second.
+    /// Password validation and conversion stay in the encryption password
+    /// module so direct CLI writers and `QPDFJob` share one implementation.
     pub fn normalize_encryption_passwords(
         &mut self,
         password_mode: PasswordMode,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<Vec<PasswordWriteNotice>> {
         let Some(params) = self.settings.encryption_parameters.as_mut() else {
-            return Ok((0, 0));
+            return Ok(Vec::new());
         };
         let revision = match params.method {
             EncryptMethod::V1Rc440 => 2,
@@ -389,17 +391,7 @@ impl WriterConfiguration {
         )?;
         params.user_password = user_password;
         params.owner_password = owner_password;
-        let info_count =
-            usize::from(user_notice == crate::encryption::password::PasswordWriteNotice::Info)
-                + usize::from(
-                    owner_notice == crate::encryption::password::PasswordWriteNotice::Info,
-                );
-        let warning_count =
-            usize::from(user_notice == crate::encryption::password::PasswordWriteNotice::Warning)
-                + usize::from(
-                    owner_notice == crate::encryption::password::PasswordWriteNotice::Warning,
-                );
-        Ok((info_count, warning_count))
+        Ok(vec![user_notice, owner_notice])
     }
 
     /// Configure explicit encryption copied from an authenticated donor.
@@ -6329,7 +6321,7 @@ mod final_handle_writer_tests {
             empty
                 .normalize_encryption_passwords(PasswordMode::Bytes)
                 .unwrap(),
-            (0, 0)
+            Vec::<PasswordWriteNotice>::new()
         );
         for params in [
             EncryptParams::rc4(EncryptMethod::V1Rc440, b"u", b"o"),
@@ -6345,7 +6337,7 @@ mod final_handle_writer_tests {
                 configuration
                     .normalize_encryption_passwords(PasswordMode::Bytes)
                     .unwrap(),
-                (0, 0)
+                vec![PasswordWriteNotice::None, PasswordWriteNotice::None]
             );
         }
         let mut invalid = WriterConfiguration::default();
@@ -6354,7 +6346,7 @@ mod final_handle_writer_tests {
             invalid
                 .normalize_encryption_passwords(PasswordMode::HexBytes)
                 .unwrap(),
-            (0, 0)
+            vec![PasswordWriteNotice::None, PasswordWriteNotice::None]
         );
         let params = invalid
             .settings

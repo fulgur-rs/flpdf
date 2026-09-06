@@ -171,6 +171,7 @@ pub use encryption::permissions::{
 };
 pub use encryption::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, ObjectKeyAlg, PasswordMode,
+    PasswordWriteNotice,
 };
 pub use error::{EncryptedError, Error, QpdfErrorCode, QpdfExc, Result, UsageError};
 pub use filespec_helper::{

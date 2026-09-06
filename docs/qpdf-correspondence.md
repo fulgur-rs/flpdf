@@ -1071,6 +1071,12 @@ flpdf CLIもこのmutationを保持し、`--remove-restrictions` による `remo
 `QPDF::warn` のcollectionと通常のcompletion summaryへ進み、`--no-warn` はその表示だけを
 抑止する（`QPDF.cc:487-504`）。
 
+`flpdf-innn` では、`WriterConfiguration::normalize_encryption_passwords` が
+`maybeFixWritePassword` の user→owner 順を `PasswordWriteNotice` の列として保持し、
+CLI と `QPDFJob::write_qpdf` が各noticeをその場で対応する logger pipeline へ fallibly
+配送する。`write_qpdf` は `outputFile "-"` の save pipeline を診断より先に予約し、
+`QPDFJob.cc:339-345,614-626,2655-2723,2750-2751` の順序・失敗伝播を維持する。
+
 ### `QPDFLogger` の CLI consumer cutover と retained direct routes
 
 qpdf の route ownership は `QPDFJob.cc:343,498-502,625,709-925,2934,3051-3054,3094-3115`
