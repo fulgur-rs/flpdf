@@ -703,6 +703,40 @@ mod common;
 #[allow(unused_imports)]
 use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
 
+#[test]
+fn linearized_extra_header_starts_after_qpdf_separator_newline() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join("one-page.pdf");
+    let file = std::fs::File::open(&path).expect("open one-page fixture");
+    let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture as PDF");
+    let settings = WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        extra_header_text: "%% Comment\n% No newline".to_owned(),
+        ..WriterTestSettings::default()
+    };
+
+    let output = write_linearized_with_settings(&mut pdf, &settings)
+        .expect("write linearized output with extra header");
+    let marker = b"%% Comment\n% No newline\n";
+    let marker_start = output
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("extra header should be present");
+    assert!(marker_start > 0, "extra header must not start at byte zero");
+    assert_eq!(
+        output[marker_start - 1],
+        b'\n',
+        "qpdf writes a separator newline before linearized extra header text"
+    );
+    assert_eq!(
+        &output[marker_start + marker.len()..marker_start + marker.len() + 5],
+        b"xref\n",
+        "qpdf writes xref immediately after extra header's terminating newline"
+    );
+}
+
 /// Extract the page content-stream object body — the single-`/FlateDecode`
 /// stream whose dict has neither `/Type` (excludes xref/ObjStm/metadata) nor
 /// `/S` (excludes the linearization hint stream) — returning

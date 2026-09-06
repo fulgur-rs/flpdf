@@ -811,7 +811,9 @@ fn write_part1_xref_and_trailer(
     // emit the line-break separator here.  This lands the `xref` keyword at
     // qpdf's fixed offset (216 for the 15-byte header) once the pad width is
     // taken into account.
-    bytes.push(b'\n');
+    if bytes.last() != Some(&b'\n') {
+        bytes.push(b'\n');
+    }
     let xref_offset = bytes.len();
 
     // Subsection: the whole first-page section (objects param_slot..total).
@@ -1451,7 +1453,9 @@ fn write_first_page_xref_stream(
     // with spaces; qpdf starts the first-page xref stream on a fresh line, so emit
     // the line-break separator here (the classic path's analogue is in
     // `write_part1_xref_and_trailer`). This lands the object at qpdf's offset.
-    bytes.push(b'\n');
+    if bytes.last() != Some(&b'\n') {
+        bytes.push(b'\n');
+    }
     let obj_offset = bytes.len();
     // Space placeholder of exactly the region length, then the trailing newline
     // (outside the region, mirroring qpdf). The placeholder content is
@@ -2114,8 +2118,13 @@ fn do_write_pass<R: Read + Seek>(
     // qpdf deliberately writes extra header text after the linearization
     // parameter dictionary, rather than in `writeHeader`, so the dictionary
     // remains within the first 1024 bytes (QPDFWriter.cc:2718-2720). The
-    // setting has already been normalized with a trailing newline by
-    // PdfWriter, matching qpdf's `setExtraHeaderText` contract.
+    // qpdf writes a separator newline after the padded parameter dictionary
+    // before the extra header (`QPDFWriter.cc:2714-2720`). The setting has
+    // already been normalized with a trailing newline by PdfWriter, matching
+    // qpdf's `setExtraHeaderText` contract.
+    if !options.extra_header_text.is_empty() {
+        bytes.push(b'\n');
+    }
     bytes.extend_from_slice(options.extra_header_text.as_bytes());
     xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
 

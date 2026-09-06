@@ -355,7 +355,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
-        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     let writer_diagnostics_seen = diagnostic_count(pdf);
@@ -387,7 +387,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
-        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     let page_tree_diagnostics_seen = diagnostic_count(pdf);
@@ -421,11 +421,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                 return Err(CheckError::Operation(error));
             }
             page_errors = true;
-            logger.error(format!("ERROR: page {}: {error}\n", index + 1))?;
+            logger.error(format!(
+                "ERROR: page {}: {}\n",
+                index + 1,
+                qpdf_check_error_message(&error)
+            ))?;
         }
     }
     if page_errors {
-        return Err(CheckError::ErrorsDetected);
+        return Err(report_errors_detected(logger, message_prefix));
     }
 
     let (new_warnings, new_errors) = inspect_new_diagnostics(
@@ -439,7 +443,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     if new_errors {
-        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     if !warnings {
@@ -825,6 +829,33 @@ fn map_check_error(
     }
 }
 
+/// Render the check-layer equivalent of qpdf's `QPDFExc::what()` for content
+/// stream decode failures. qpdf's exception category is not part of the
+/// message; `Error::Unsupported` is the crate's transport for the same
+/// parser failure and its display prefix must not leak into `--check` output.
+fn qpdf_check_error_message(error: &crate::Error) -> String {
+    match error {
+        crate::Error::Unsupported(message)
+            if message.starts_with("content stream object ")
+                && message.ends_with("errors while decoding content stream") =>
+        {
+            let suffix = ": errors while decoding content stream";
+            let object = message
+                .strip_suffix(suffix)
+                .expect("content stream error must have a qpdf message suffix");
+            format!("content stream ({object}){suffix}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn report_errors_detected(logger: &QPDFLogger, message_prefix: &str) -> CheckError {
+    match logger.error(format!("{message_prefix}: errors detected\n")) {
+        Ok(()) => CheckError::ErrorsDetected,
+        Err(error) => CheckError::Operation(error),
+    }
+}
+
 #[cfg(test)]
 fn emit_new_diagnostics<R: Read + Seek>(
     pdf: &Pdf<R>,
@@ -1115,6 +1146,48 @@ mod tests {
             Some(PipelineHandle::new(Capture { bytes })),
         );
         logger
+    }
+
+    #[test]
+    fn qpdf_check_error_message_preserves_content_stream_exception_text() {
+        let content_error = Error::Unsupported(
+            "content stream object 6 0: errors while decoding content stream".to_owned(),
+        );
+        assert_eq!(
+            qpdf_check_error_message(&content_error),
+            "content stream (content stream object 6 0): errors while decoding content stream"
+        );
+
+        let other_error = Error::Unsupported("some other feature".to_owned());
+        assert_eq!(
+            qpdf_check_error_message(&other_error),
+            "unsupported PDF feature: some other feature"
+        );
+    }
+
+    #[test]
+    fn report_errors_detected_emits_qpdf_final_error() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        assert!(matches!(
+            report_errors_detected(&logger, "qpdf"),
+            CheckError::ErrorsDetected
+        ));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"qpdf: errors detected\n"
+        );
+    }
+
+    #[test]
+    fn report_errors_detected_preserves_logger_failures() {
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+
+        assert!(matches!(
+            report_errors_detected(&logger, "qpdf"),
+            CheckError::Operation(Error::System(message)) if message == "logger failure"
+        ));
     }
 
     #[test]
@@ -1943,6 +2016,50 @@ mod tests {
     }
 
     #[test]
+    fn document_check_reports_page_parse_errors_after_successful_delivery() {
+        let mut pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"q\nQ\n")))
+            .expect("content fixture should open");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        page.try_dereference().expect("page should resolve");
+        page.replace_key(b"/Contents", ObjectHandle::integer(42))
+            .expect("page should be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation should be tracked");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let result = check_document(&mut pdf, &logger, "qpdf", "page-parse-error.pdf");
+
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains(
+            "ERROR: page 1: page object 3 0:  object is supposed to be a stream or an array of streams but is neither\n"
+        ));
+        assert!(output.ends_with("qpdf: errors detected\n"));
+    }
+
+    #[test]
+    fn document_check_propagates_page_parse_logger_failures() {
+        let mut pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"q\nQ\n")))
+            .expect("content fixture should open");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        page.try_dereference().expect("page should resolve");
+        page.replace_key(b"/Contents", ObjectHandle::integer(42))
+            .expect("page should be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation should be tracked");
+
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+
+        assert!(matches!(
+            check_document(&mut pdf, &logger, "qpdf", "page-parse-error.pdf"),
+            Err(CheckError::Operation(Error::System(message)))
+                if message == "logger failure"
+        ));
+    }
+
+    #[test]
     fn diagnostic_delivery_errors_cross_the_job_check_boundary() {
         let pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1959,6 +2076,26 @@ mod tests {
             result,
             Err(CheckError::Operation(Error::System(message))) if message == "logger failure"
         ));
+    }
+
+    #[test]
+    fn replayed_diagnostics_are_delivered_through_the_job_check_boundary() {
+        let pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/test_driver/missing_startxref.pdf"
+        ))))
+        .expect("warning fixture should open");
+        assert!(!pdf.repair_diagnostics().entries().is_empty());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+
+        let result =
+            emit_new_diagnostics_with_suppression(&pdf, 0, &logger, "qpdf", b"broken.pdf", false)
+                .expect("diagnostics should be delivered");
+
+        assert_eq!(result, (true, false));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("WARNING: broken.pdf"));
     }
 
     #[test]
