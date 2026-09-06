@@ -3609,7 +3609,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             object_header_offset
         };
-        self.push_stream_warning_with_description(
+        self.push_stream_warning_with_current_description(
             object_ref,
             warning_offset,
             message,
@@ -3634,7 +3634,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         object_ref: ObjectRef,
         read_description: Option<&[u8]>,
     ) -> Result<usize> {
-        let warning = self.push_stream_warning_with_description(
+        let warning = self.push_stream_warning_with_current_description(
             object_ref,
             stream_offset,
             "attempting to recover stream length",
@@ -3669,7 +3669,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         if length == 0 {
-            self.push_stream_warning_with_description(
+            self.push_stream_warning_with_current_description(
                 object_ref,
                 stream_offset,
                 "unable to recover stream data; treating stream as empty",
@@ -3677,7 +3677,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )?;
         } else {
             let message = format!("recovered stream length: {length}");
-            self.push_stream_warning_with_description(
+            self.push_stream_warning_with_current_description(
                 object_ref,
                 stream_offset,
                 message,
@@ -3780,6 +3780,45 @@ impl<R: Read + Seek> ResolverHandle<R> {
             format!(": object {} {}", object_ref.number, object_ref.generation).as_bytes(),
         );
         self.push_stream_warning_with_object_description(&object_description, offset, message)
+    }
+
+    /// Emit a readStream warning using qpdf's current object description.
+    ///
+    /// Resolving an indirect `/Length` can replace that state with the
+    /// resolved length object's identity before the stream warning is raised
+    /// (`libqpdf/QPDF.cc:1371-1397,1482-1529,1725`). Direct `/Length` and
+    /// legacy callers that have no current state fall back to the entry
+    /// object's description, preserving the existing diagnostic shape.
+    fn push_stream_warning_with_current_description(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        message: impl Into<String>,
+        read_description: Option<&[u8]>,
+    ) -> Result<()> {
+        let (last_description, source_description_empty) = {
+            let core = self.core.borrow();
+            (
+                core.last_object_description_bytes.clone(),
+                core.description.is_empty(),
+            )
+        };
+        let message = message.into();
+        if !last_description.is_empty() {
+            if source_description_empty && read_description.is_none() {
+                let object_description = String::from_utf8_lossy(&last_description);
+                return self.push_warning_at(
+                    offset,
+                    format!("({object_description}, offset {offset}): {message}"),
+                );
+            }
+            return self.push_stream_warning_with_object_description(
+                &last_description,
+                offset,
+                message,
+            );
+        }
+        self.push_stream_warning_with_description(object_ref, offset, message, read_description)
     }
 
     /// Emit a stream warning using qpdf's already-composed object description.
@@ -11537,6 +11576,30 @@ mod tests {
             0,
         );
         (output, resolver)
+    }
+
+    #[test]
+    fn current_stream_warning_description_falls_back_to_entry_description() {
+        let (output, resolver) = described_read_warning_output(b"");
+        resolver
+            .core
+            .borrow_mut()
+            .last_object_description_bytes
+            .clear();
+
+        resolver
+            .push_stream_warning_with_current_description(
+                ObjectRef::new(2, 0),
+                12,
+                "fallback stream warning",
+                Some(b"linearization hint stream"),
+            )
+            .expect("fallback warning is delivered");
+
+        assert_eq!(
+            output.lock().expect("warning output").as_slice(),
+            b"WARNING: input.pdf (linearization hint stream: object 2 0, offset 12): fallback stream warning\n"
+        );
     }
 
     /// qpdf: `qpdf --check` on a linearized file whose hint stream lacks

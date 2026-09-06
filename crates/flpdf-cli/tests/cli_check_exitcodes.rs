@@ -18,10 +18,46 @@ use assert_cmd::Command;
 use flpdf::ObjectHandle;
 use predicates::prelude::*;
 use std::io::Write;
+use std::process::Command as ProcessCommand;
 
 #[path = "support/eol.rs"]
 mod eol;
 use eol::EOL;
+
+/// Expected qpdf version for the differential `--check` comparisons below.
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+/// Reports whether the pinned `qpdf` 11.9.0 executable is available for
+/// differential comparison. Mirrors the guard used by the other qpdf-dependent
+/// suites: on CI qpdf is mandatory (panic if absent or wrong version), while on
+/// developer machines without it the caller skips the comparison.
+fn qpdf_available() -> bool {
+    let output = match ProcessCommand::new("qpdf").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) => {
+            if std::env::var_os("CI").is_some() {
+                panic!("qpdf 11.9.0 is required on CI: {error}");
+            }
+            eprintln!("skipping: qpdf 11.9.0 is unavailable: {error}");
+            return false;
+        }
+    };
+    let version = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && version.lines().next() == Some(EXPECTED_QPDF_VERSION) {
+        return true;
+    }
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "qpdf 11.9.0 is required on CI; found {:?}",
+            version.lines().next()
+        );
+    }
+    eprintln!(
+        "skipping: qpdf 11.9.0 is required; found {:?}",
+        version.lines().next()
+    );
+    false
+}
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -133,6 +169,49 @@ fn indirect_length_expected_endobj_pdf_bytes() -> Vec<u8> {
         pdf.extend_from_slice(object);
     }
 
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// Reachable stream whose `/Length` is either direct or indirect. The stream
+/// framing is deliberately inconsistent with the declared length so qpdf
+/// enters its `readStream` recovery path and emits the three warnings covered
+/// by `flpdf-h6fe`.
+fn stream_length_warning_pdf_bytes(length: &[u8], indirect_length_value: &[u8]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n"
+            .to_vec(),
+        format!(
+            "4 0 obj\n<< /Length {} >>\nstream\nabc\nendstream\nendobj\n",
+            String::from_utf8_lossy(length)
+        )
+        .into_bytes(),
+        [
+            b"5 0 obj\n".as_slice(),
+            indirect_length_value,
+            b"\nendobj\n".as_slice(),
+        ]
+        .concat(),
+    ];
+    let mut offsets = vec![0usize];
+    for object in &objects {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(object);
+    }
     let xref_start = pdf.len();
     pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()).as_bytes());
     for offset in offsets.iter().skip(1) {
@@ -802,6 +881,63 @@ fn parameter_options_require_qpdf_equals_form() {
             .assert()
             .code(2)
             .stderr(predicate::str::contains(format!("{expected}{EOL}")));
+    }
+}
+
+#[test]
+fn check_stream_length_warnings_match_qpdf_object_context() {
+    if !qpdf_available() {
+        return;
+    }
+    for (name, length, indirect_length_value, expected_object) in [
+        (
+            "indirect-bad-length",
+            &b"5 0 R"[..],
+            &b"99"[..],
+            "object 5 0",
+        ),
+        ("direct-bad-length", &b"99"[..], &b"99"[..], "object 4 0"),
+        (
+            "indirect-noninteger-length",
+            &b"5 0 R"[..],
+            &b"(x)"[..],
+            "object 5 0",
+        ),
+        (
+            "direct-noninteger-length",
+            &b"(x)"[..],
+            &b"99"[..],
+            "object 4 0",
+        ),
+    ] {
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .write_all(&stream_length_warning_pdf_bytes(
+                length,
+                indirect_length_value,
+            ))
+            .unwrap();
+        let path = input.path().to_str().unwrap();
+
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(["--check", path])
+            .output()
+            .unwrap();
+        let flpdf = ProcessCommand::new(assert_cmd::cargo_bin!("flpdf"))
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["--check", path])
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), Some(3), "{name}: qpdf stderr");
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{name}");
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{name}: stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{name}: stderr");
+        assert!(
+            String::from_utf8_lossy(&qpdf.stderr).contains(expected_object),
+            "{name}: qpdf must report {expected_object}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
     }
 }
 
