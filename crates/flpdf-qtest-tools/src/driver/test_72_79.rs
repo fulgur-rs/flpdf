@@ -4,18 +4,9 @@
 //! through `super::emit_new_diagnostics`, and how deep qpdf-source-line
 //! comments justify each translation decision.
 //!
-//! `run_test_79` still hits the trailer-write primitive gap established in
-//! `driver/test_18_25.rs` (see that file's own module doc and `run_test_20`'s
-//! `GAP` comment):
-//! `Pdf::trailer().replace_key(...)` compiles and returns `Ok`, but
-//! `PdfWriter::write` reads `Pdf::trailer()` (a plain `&Dictionary` set once
-//! at construction, confirmed by `crates/flpdf/src/writer.rs:2865` reading
-//! `pdf.trailer_dictionary().clone()` directly), never the disconnected
-//! `trailer()` clone graph -- so a *new* trailer entry installed that
-//! way never reaches the written file. Each affected function's own `GAP`
-//! comment marks the precise call this blocks; qpdf statements that do not
-//! read the blocked trailer entry are still translated normally on either
-//! side of it.
+//! `run_test_79` uses the live `Pdf::trailer()` handle for `/Copies` and
+//! `/Originals`, then emits the graph through the canonical `PdfWriter` route,
+//! matching qpdf's `QPDF::getTrailer()` mutation and `QPDFWriter` output.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -752,19 +743,10 @@ pub(crate) fn run_test_79<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let copies = ObjectHandle::array(Vec::new());
-    // GAP(QPDFObjectHandle::replaceKey on the trailer): qpdf installs
-    // `copies` as `/Copies` here, and later builds
-    // `QPDFObjectHandle::newArray(streams)` and installs that as
-    // `/Originals` the same way (`test_driver.cc:2738`). Per the
-    // established gap (see this file's own module doc and
-    // `driver/test_18_25.rs`'s `run_test_20`): neither
-    // `Pdf::trailer().replace_key(...)` call has any effect on what
-    // `PdfWriter::write` emits, so neither installation (nor a closing
-    // `QPDFWriter` write, which qpdf's own test_79 does not even reach
-    // without them) is performed below. `copies` itself is still built and
-    // populated by the loop below for its own sake -- every other statement
-    // in this test operates on `pdf`'s canonical object graph directly and
-    // is real, faithful, trailer-independent logic.
+    let trailer = pdf.trailer();
+    trailer.replace_key(b"/Copies", copies.clone())?;
+    // qpdf/test_driver.cc:2705-2758 retains the original streams and their
+    // independent copies in the live trailer before the QDF writer runs.
 
     let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
     let page = pdf.get_object_handle(page_refs[0]);
@@ -808,6 +790,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
     );
 
     let streams = [s1, s2, s3];
+    trailer.replace_key(b"/Originals", ObjectHandle::array(streams.to_vec()))?;
     for (index, orig) in streams.iter().enumerate() {
         let i = index + 1;
         let istr = i.to_string();
@@ -831,12 +814,17 @@ pub(crate) fn run_test_79<R: Read + Seek>(
         copies.append_array_item(copy)?;
     }
 
-    Ok(())
+    pdf.mark_object_handle_dirty(&trailer)?;
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_qdf_mode(true);
+    writer.write()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{chase_array_item, chase_key, resolve_once, run_test_73, run_test_78};
+    use super::{chase_array_item, chase_key, resolve_once, run_test_73, run_test_78, run_test_79};
     use flpdf::{ObjectHandle, Pdf, PdfOpenOptions};
 
     fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
@@ -940,6 +928,51 @@ WARNING: closed input source: object 1/0: error reading object: QPDF operation a
             b"f2\nf2 done\nf2\nfailing\nf2\nwarning\nf2 done\n".to_vec()
         );
         assert!(directory.path().join("a.pdf").is_file());
+    }
+
+    #[test]
+    fn test_79_writes_stream_copies_through_the_live_trailer() {
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("acquire current-directory test lock");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let previous = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(directory.path()).expect("enter test directory");
+        let _restore = CurrentDirGuard(previous);
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            include_bytes!("../../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open one-page fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_79(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 79");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        let output =
+            std::fs::read(directory.path().join("a.pdf")).expect("test 79 must write a.pdf");
+        assert!(output
+            .windows(b"/Copies".len())
+            .any(|window| window == b"/Copies"));
+        assert!(output
+            .windows(b"/Originals".len())
+            .any(|window| window == b"/Originals"));
     }
 
     fn pdf_with_erase_trees() -> Vec<u8> {
