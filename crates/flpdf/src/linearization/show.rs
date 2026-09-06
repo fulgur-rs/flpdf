@@ -35,8 +35,9 @@
 //! preceding columns have zero width (`QPDF_linearization.cc:19-60`).
 
 use super::check::{
-    check_linearization_parameters, check_linearization_warnings, load_hint_stream_with_damage,
-    HintStreamLoadError, LinearizationCheckError, LinearizationParameterCheck,
+    check_linearization_parameters, check_linearization_warnings_with_hint_data,
+    load_hint_stream_with_damage, HintStreamLoadError, LinearizationCheckError,
+    LinearizationParameterCheck,
 };
 use crate::bit_stream::{BitStream, BitStreamError};
 #[cfg(test)]
@@ -868,7 +869,6 @@ fn show_with_pdf<R: Read + Seek>(
             // same way rather than silently decoding only the primary half.
             let mut decompressed =
                 Rc::try_unwrap(primary_decompressed).unwrap_or_else(|shared| (*shared).clone());
-
             if params.h_overflow_offset != 0 {
                 let overflow_offset = usize::try_from(params.h_overflow_offset)
                     // cov:ignore: on 64-bit usize is u64, so a non-negative overflow
@@ -916,7 +916,13 @@ fn show_with_pdf<R: Read + Seek>(
             // 837-846`). Keeping this after both hint streams have loaded is
             // also important for the qpdf damage offset: a failed first load
             // must not be retried after its object has entered the cache.
-            match check_linearization_warnings(pdf, file_bytes, true) {
+            match check_linearization_warnings_with_hint_data(
+                pdf,
+                file_bytes,
+                true,
+                &hint_dict,
+                &decompressed,
+            ) {
                 Ok(messages) => warnings.extend(messages.into_iter().map(String::into_bytes)),
                 // cov:ignore-start: a Cursor<Vec<u8>> cannot produce a source I/O error;
                 // retain the defensive mapping for the generic checker contract.

@@ -190,6 +190,55 @@ fn top_level_show_linearization_open_failure_delivers_warnings_once() {
 }
 
 #[test]
+fn top_level_show_linearization_hint_stream_warning_is_emitted_once() {
+    if !qpdf_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temporary directory should exist");
+    let linearized = temp.path().join("linearized.pdf");
+    let input = temp.path().join("hint-no-endobj.pdf");
+    let source = fixture("two-page.pdf");
+    let generated = ProcessCommand::new("/usr/bin/qpdf")
+        .args([
+            "--linearize",
+            "--stream-data=uncompress",
+            "--static-id",
+            source.to_str().expect("source path should be UTF-8"),
+            linearized.to_str().expect("output path should be UTF-8"),
+        ])
+        .output()
+        .expect("qpdf should generate a linearized fixture");
+    assert!(
+        generated.status.success(),
+        "qpdf linearization failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let mut bytes = std::fs::read(&linearized).expect("linearized fixture should be readable");
+    let endstream = 601
+        + bytes[601..]
+            .windows(b"endstream".len())
+            .position(|window| window == b"endstream")
+            .expect("linearized fixture should contain a hint stream");
+    let endobj = endstream
+        + bytes[endstream..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .expect("hint stream object should have an endobj marker");
+    bytes[endobj..endobj + b"endobj".len()].copy_from_slice(b"endobX");
+    std::fs::write(&input, bytes).expect("damaged fixture should be written");
+    let input = input.to_str().expect("temporary path should be UTF-8");
+
+    let expected = run_qpdf(&["--show-linearization", input]);
+    let actual = run_flpdf(&["--show-linearization", input]);
+
+    assert_eq!(expected.status.code(), Some(3));
+    assert_output_matches(&actual, &expected);
+    assert_eq!(warning_lines(&actual).len(), 1);
+    assert!(String::from_utf8_lossy(&actual.stderr).contains("expected endobj"));
+}
+
+#[test]
 fn check_linearization_subcommand_uses_the_same_canonical_route() {
     let input = fixture("linearized-one-page.pdf");
     let input = input.to_str().expect("fixture path should be UTF-8");
