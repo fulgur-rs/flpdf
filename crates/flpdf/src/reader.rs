@@ -1252,13 +1252,27 @@ impl<R: Read + Seek> Pdf<R> {
     /// document; all retained aliases become direct null rather than relying
     /// on writer-side reference suppression. Stream `/Length` edges are
     /// omitted here; filtering stream parameters belongs to the writer.
+    #[cfg(test)]
     pub(crate) fn get_compressible_objgens(&mut self) -> Result<Vec<ObjectRef>> {
+        self.get_compressible_objgens_with_removed()
+            .map(|(eligible, _)| eligible)
+    }
+
+    /// Collect qpdf's compressible objects together with the stale generations
+    /// removed by the same live walk. The writer must carry this operation-
+    /// specific removal set into any later preserve-unreferenced seed pass:
+    /// `QPDF::removeObject` erases the resolver cache entry, while flpdf's
+    /// compatibility cache remains a separate enumeration source.
+    pub(crate) fn get_compressible_objgens_with_removed(
+        &mut self,
+    ) -> Result<(Vec<ObjectRef>, BTreeSet<ObjectRef>)> {
         let encryption = self.trailer().try_get_key(b"/Encrypt")?.object_ref();
         let max_object = self.get_object_count()? as usize;
         let mut visited = vec![0u64; max_object.div_ceil(64)];
         let mut queue = Vec::with_capacity(512);
         queue.push(self.trailer());
         let mut result = Vec::new();
+        let mut removed = BTreeSet::new();
         while let Some(object) = queue.pop() {
             if let Some(og) = object.object_ref().filter(|og| og.number > 0) {
                 let index = (og.number - 1) as usize;
@@ -1272,6 +1286,7 @@ impl<R: Read + Seek> Pdf<R> {
                     continue;
                 }
                 if self.resolver.has_newer_cached_generation(og) {
+                    removed.insert(og);
                     self.resolver.remove_object(og)?;
                     continue;
                 }
@@ -1306,7 +1321,7 @@ impl<R: Read + Seek> Pdf<R> {
                 }
             }
         }
-        Ok(result)
+        Ok((result, removed))
     }
 
     /// Return the next qpdf-shaped generation-zero object identity from the

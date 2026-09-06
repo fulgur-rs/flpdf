@@ -230,15 +230,17 @@ impl PlainWritePlan {
                 }
             }
             ObjectStreamMode::Generate => {
-                let mut eligible = pdf.get_compressible_objgens()?;
-                eligible.retain(|member| !explicitly_removed.contains(member));
+                let (mut eligible, mut removed_refs) =
+                    pdf.get_compressible_objgens_with_removed()?;
+                removed_refs.extend(explicitly_removed.iter().copied());
+                eligible.retain(|member| !removed_refs.contains(member));
                 let groups = object_streams::even_split_into_streams(&eligible);
                 let mut renumber_groups: Vec<ObjectStreamGroup> = groups
                     .iter()
                     .cloned()
                     .map(|members| ObjectStreamGroup::Synthetic { members })
                     .collect();
-                let removed = &explicitly_removed;
+                let removed = &removed_refs;
                 // qpdf's Generate pass only puts its reachable compressible set
                 // into synthetic ObjStms (`QPDFWriter.cc:1970-2007`), while
                 // `enqueueObjectsStandard` separately seeds every source object
@@ -261,7 +263,7 @@ impl PlainWritePlan {
                     options.preserve_unreferenced_objects,
                     Some(&stream_parameters_removed),
                 )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the Generate preserve path is exercised by the writer contract test.
-                build_container_aware(renumber, renumber_groups, explicitly_removed)?
+                build_container_aware(renumber, renumber_groups, removed_refs)?
             }
         };
 

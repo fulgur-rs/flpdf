@@ -1,6 +1,6 @@
 //! qpdf getCompressibleObjGens removes stale generations from the live graph.
 
-use flpdf::{ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{ObjectHandle, ObjectRef, ObjectStreamMode, Pdf, PdfWriter};
 use std::io::Cursor;
 
 #[test]
@@ -32,6 +32,46 @@ fn generate_turns_a_retained_stale_generation_handle_into_direct_null() {
     assert!(old.is_null());
     assert_eq!(old.object_ref(), None);
     assert_eq!(current.object_ref(), Some(ObjectRef::new(3, 1)));
+}
+
+#[test]
+fn generate_preserve_does_not_seed_a_removed_generation() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+    ))
+    .unwrap();
+    let old = pdf
+        .get_all_objects()
+        .unwrap()
+        .into_iter()
+        .find(|object| object.as_stream_dict().is_some())
+        .unwrap();
+    let old_ref = old.object_ref().unwrap();
+    pdf.replace_object(
+        ObjectRef::new(old_ref.number, old_ref.generation + 1),
+        ObjectHandle::integer(42),
+    )
+    .unwrap();
+    let pending = ObjectHandle::array(vec![]);
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/ZPending", pending)
+        .unwrap();
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+
+    let actual = writer.get_buffer().unwrap();
+    assert!(
+        !actual
+            .windows(b"\nnull\nendobj\n".len())
+            .any(|window| { window == b"\nnull\nendobj\n" }),
+        "qpdf removes the superseded generation instead of seeding an indirect null"
+    );
 }
 
 #[cfg(feature = "qpdf-zlib-compat")]
