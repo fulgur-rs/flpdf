@@ -231,9 +231,10 @@ fn verbose_auto_password_conversion_reports_qpdf_info() {
         .unwrap();
 
     assert!(result.status.success());
-    assert!(String::from_utf8_lossy(&result.stdout).contains(
-        "flpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n"
-    ));
+    let expected = format!(
+        "flpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption{EOL}"
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains(&expected));
 }
 
 #[test]
