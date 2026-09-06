@@ -355,7 +355,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
-        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     let writer_diagnostics_seen = diagnostic_count(pdf);
@@ -387,7 +387,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
-        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     let page_tree_diagnostics_seen = diagnostic_count(pdf);
@@ -421,11 +421,15 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                 return Err(CheckError::Operation(error));
             }
             page_errors = true;
-            logger.error(format!("ERROR: page {}: {error}\n", index + 1))?;
+            logger.error(format!(
+                "ERROR: page {}: {}\n",
+                index + 1,
+                qpdf_check_error_message(&error)
+            ))?;
         }
     }
     if page_errors {
-        return Err(CheckError::ErrorsDetected);
+        return Err(report_errors_detected(logger, message_prefix));
     }
 
     let (new_warnings, new_errors) = inspect_new_diagnostics(
@@ -439,7 +443,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     if new_errors {
-        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
+        return Err(report_errors_detected(logger, message_prefix)); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     if !warnings {
@@ -825,6 +829,33 @@ fn map_check_error(
     }
 }
 
+/// Render the check-layer equivalent of qpdf's `QPDFExc::what()` for content
+/// stream decode failures. qpdf's exception category is not part of the
+/// message; `Error::Unsupported` is the crate's transport for the same
+/// parser failure and its display prefix must not leak into `--check` output.
+fn qpdf_check_error_message(error: &crate::Error) -> String {
+    match error {
+        crate::Error::Unsupported(message)
+            if message.starts_with("content stream object ")
+                && message.ends_with("errors while decoding content stream") =>
+        {
+            let suffix = ": errors while decoding content stream";
+            let object = message
+                .strip_suffix(suffix)
+                .expect("content stream error must have a qpdf message suffix");
+            format!("content stream ({object}){suffix}")
+        }
+        _ => error.to_string(),
+    }
+}
+
+fn report_errors_detected(logger: &QPDFLogger, message_prefix: &str) -> CheckError {
+    match logger.error(format!("{message_prefix}: errors detected\n")) {
+        Ok(()) => CheckError::ErrorsDetected,
+        Err(error) => CheckError::Operation(error),
+    }
+}
+
 #[cfg(test)]
 fn emit_new_diagnostics<R: Read + Seek>(
     pdf: &Pdf<R>,
@@ -1115,6 +1146,37 @@ mod tests {
             Some(PipelineHandle::new(Capture { bytes })),
         );
         logger
+    }
+
+    #[test]
+    fn qpdf_check_error_message_preserves_content_stream_exception_text() {
+        let content_error = Error::Unsupported(
+            "content stream object 6 0: errors while decoding content stream".to_owned(),
+        );
+        assert_eq!(
+            qpdf_check_error_message(&content_error),
+            "content stream (content stream object 6 0): errors while decoding content stream"
+        );
+
+        let other_error = Error::Unsupported("some other feature".to_owned());
+        assert_eq!(
+            qpdf_check_error_message(&other_error),
+            "unsupported PDF feature: some other feature"
+        );
+    }
+
+    #[test]
+    fn report_errors_detected_emits_qpdf_final_error() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        assert!(matches!(
+            report_errors_detected(&logger, "qpdf"),
+            CheckError::ErrorsDetected
+        ));
+        assert_eq!(
+            output.lock().expect("capture output").as_slice(),
+            b"qpdf: errors detected\n"
+        );
     }
 
     #[test]
