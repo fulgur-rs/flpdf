@@ -2315,6 +2315,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().source_xref_entries.clone()
     }
 
+    /// Append qpdf's type-2 source object-to-container mapping.
+    ///
+    /// `QPDF::getObjectStreamData` (`libqpdf/QPDF.cc:2381-2390`) reads the
+    /// document xref table without resolving objects or clearing the caller's
+    /// map. Default lookup-created rows are all type 0, so only the physical
+    /// source table can contribute type-2 entries.
+    pub(crate) fn get_object_stream_data(&self, mapping: &mut BTreeMap<u32, u32>) {
+        for (object, entry) in &self.core.borrow().source_xref_entries {
+            if let XrefEntry::Compressed { stream, .. } = entry {
+                mapping.insert(object.number, *stream);
+            }
+        }
+    }
+
     /// A snapshot of the whole effective cross-reference table. qpdf inserts
     /// a default type-0 row into `m->xref_table` when an object-stream header
     /// names an absent member (`libqpdf/QPDF.cc:1823`); expose that row in the
@@ -10288,6 +10302,107 @@ mod tests {
             self.seeks += 1;
             self.inner.seek(position)
         }
+    }
+
+    #[test]
+    fn object_stream_data_uses_object_numbers_and_keeps_members_lazy() {
+        // qpdf --show-xref: 2 is index 1 and 3 is index 0 in stream 4.
+        let mut pdf = Pdf::open(CountingReader::new(
+            include_bytes!("../../../../tests/fixtures/compat/nonmonotonic-objstm-index.pdf")
+                .to_vec(),
+        ))
+        .unwrap();
+        let members = [
+            pdf.get_object_handle(ObjectRef::new(2, 0)),
+            pdf.get_object_handle(ObjectRef::new(3, 0)),
+        ];
+        assert!(members.iter().all(|member| !member.is_resolved()));
+        let before = pdf
+            .resolver
+            .with_reader_mut(|reader| (reader.reads, reader.seeks));
+        let mut mapping = BTreeMap::from([(1, 99), (2, 42), (9, 88)]);
+        pdf.get_object_stream_data(&mut mapping);
+        assert_eq!(mapping, BTreeMap::from([(1, 99), (2, 4), (3, 4), (9, 88)]));
+        assert!(members.iter().all(|member| !member.is_resolved()));
+        assert_eq!(
+            pdf.resolver
+                .with_reader_mut(|reader| (reader.reads, reader.seeks)),
+            before
+        );
+    }
+
+    #[test]
+    fn object_stream_data_before_parsing_does_not_clear_the_supplied_map() {
+        let resolver = bare_resolver();
+        let mut mapping = BTreeMap::from([(9, 13)]);
+        resolver.get_object_stream_data(&mut mapping);
+        assert_eq!(mapping, BTreeMap::from([(9, 13)]));
+    }
+
+    #[test]
+    fn object_stream_data_reads_current_type2_rows_across_multiple_containers() {
+        let resolver = bare_resolver();
+        resolver.insert_xref_entry(ObjectRef::new(5, 0), XrefEntry::Uncompressed { offset: 11 });
+        resolver.insert_xref_entry(ObjectRef::new(6, 0), XrefEntry::Free { next: 0 });
+        resolver.insert_xref_entry(
+            ObjectRef::new(7, 0),
+            XrefEntry::Compressed {
+                stream: 20,
+                index: 2,
+            },
+        );
+        resolver.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Compressed {
+                stream: 20,
+                index: 0,
+            },
+        );
+        resolver.insert_xref_entry(
+            ObjectRef::new(9, 0),
+            XrefEntry::Compressed {
+                stream: 21,
+                index: 5,
+            },
+        );
+        resolver.insert_default_xref_entry_for_test(ObjectRef::new(55, 0));
+        let mut mapping = BTreeMap::new();
+        resolver.get_object_stream_data(&mut mapping);
+        assert_eq!(mapping, BTreeMap::from([(7, 20), (8, 20), (9, 21)]));
+
+        resolver.insert_xref_entry(ObjectRef::new(7, 0), XrefEntry::Uncompressed { offset: 12 });
+        resolver.insert_xref_entry(
+            ObjectRef::new(9, 0),
+            XrefEntry::Compressed {
+                stream: 22,
+                index: 1,
+            },
+        );
+        let mut fresh = BTreeMap::new();
+        resolver.get_object_stream_data(&mut fresh);
+        assert_eq!(fresh, BTreeMap::from([(8, 20), (9, 22)]));
+    }
+
+    #[test]
+    fn preserve_without_source_object_streams_does_not_resolve_the_document() {
+        // QPDFWriter.cc:1941-1945 returns before getCompressibleObjGens when
+        // getObjectStreamData finds no type-2 rows.
+        let mut pdf = Pdf::open(CountingReader::new(minimal_pdf_bytes())).unwrap();
+        let before = pdf
+            .resolver
+            .with_reader_mut(|reader| (reader.reads, reader.seeks));
+        let plan =
+            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                &mut pdf, false,
+            )
+            .unwrap();
+        assert!(plan.groups.is_empty());
+        assert!(plan.removed_refs.is_empty());
+        assert_eq!(
+            pdf.resolver
+                .with_reader_mut(|reader| (reader.reads, reader.seeks)),
+            before
+        );
     }
 
     struct RejectRewindReader {
