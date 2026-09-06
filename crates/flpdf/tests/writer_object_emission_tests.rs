@@ -2,6 +2,7 @@
 
 use flpdf::{ObjectHandle, ObjectStreamMode, Pdf, PdfWriter};
 use std::io::Cursor;
+use std::rc::Rc;
 
 #[test]
 fn progress_callback_mutation_is_visible_in_the_current_root_output() {
@@ -28,4 +29,37 @@ fn progress_callback_mutation_is_visible_in_the_current_root_output() {
     assert!(output
         .windows(b"/ProgressProbe 42".len())
         .any(|window| window == b"/ProgressProbe 42"));
+}
+
+#[test]
+fn progress_callback_stream_replacement_invalidates_the_planned_payload() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let stream = pdf
+        .new_stream_with_data(Rc::new(b"before".to_vec()))
+        .unwrap();
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/ProbeStream", stream.clone())
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_compress_streams(false);
+    writer.set_output_memory().unwrap();
+    writer.register_progress_reporter(Box::new(move |percent| {
+        if percent == 0 {
+            stream.replace_stream_data(Rc::new(b"after".to_vec()), None, None);
+        }
+        Ok(())
+    }));
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"stream\nafter".len())
+        .any(|window| window == b"stream\nafter"));
+    assert!(!output
+        .windows(b"before".len())
+        .any(|window| window == b"before"));
 }

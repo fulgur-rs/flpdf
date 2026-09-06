@@ -16,6 +16,8 @@ pub(crate) mod rewrite_renumber;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
 mod settings;
+#[path = "writer/write_object.rs"]
+pub(crate) mod write_object;
 pub(crate) use object::ObjectWriterEmission;
 pub use object_streams::ObjectStreamMode;
 pub use serialize::write_stream_to_buf;
