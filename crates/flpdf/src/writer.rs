@@ -744,6 +744,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 Flate::set_compression_level(level)?;
             }
         }
+        let setup = build_writer_setup(self.pdf, &options)?;
         // Page-tree repair below mutates `self.pdf`'s object graph in place
         // (promoting direct /Kids leaves, cloning duplicate leaves) and is not
         // safe to retry from a partially-mutated state on failure. Close off
@@ -778,7 +779,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
             let (mut document, result) =
-                write_linearized_for_pdf_writer(self.pdf, &options, pass1_path)?;
+                write_linearized_for_pdf_writer(self.pdf, &options, pass1_path, setup)?;
             document.back_patch()?;
             self.output
                 .as_mut()
@@ -796,6 +797,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 &mut sink,
                 &options,
                 special_streams.as_ref(),
+                setup,
             ) {
                 Ok(result) => {
                     sink.finish_output()?;
@@ -2658,23 +2660,6 @@ pub(crate) fn build_encryption_parameters(
     })
 }
 
-/// Compatibility wrapper for route consumers during the setup-state cutover.
-pub(crate) fn build_encryption_context(
-    options: &WriterOptions,
-    params: &crate::encryption::EncryptParams,
-    existing_max: u32,
-    metadata_ref: Option<ObjectRef>,
-    id0: &[u8],
-) -> Result<EncryptionContext> {
-    let parameters = build_encryption_parameters(options, params, metadata_ref, id0)?;
-    let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
-        crate::Error::Unsupported(
-            "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
-        )
-    })?;
-    Ok(parameters.into_context(ObjectRef::new(encrypt_num, 0)))
-}
-
 /// Generate the fresh CSPRNG secret material V=5 R=6 encryption needs: the
 /// 32-byte file key, four 8-byte password salts, and the 4-byte `/Perms`
 /// tail. OS-RNG failure is surfaced as [`crate::Error::Unsupported`] rather
@@ -2742,22 +2727,6 @@ pub(crate) fn build_copy_encryption_parameters(
         encrypt_metadata,
         metadata_ref: if encrypt_metadata { None } else { metadata_ref },
     })
-}
-
-/// Compatibility wrapper for route consumers during the setup-state cutover.
-pub(crate) fn build_copy_encryption_context(
-    src: &crate::encryption::CopyEncryptionSource,
-    options: &WriterOptions,
-    existing_max: u32,
-    metadata_ref: Option<ObjectRef>,
-) -> Result<EncryptionContext> {
-    let parameters = build_copy_encryption_parameters(src, options, metadata_ref)?;
-    let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
-        crate::Error::Unsupported(
-            "full-rewrite copy-encryption: /Encrypt object number overflows u32".to_string(),
-        )
-    })?;
-    Ok(parameters.into_context(ObjectRef::new(encrypt_num, 0)))
 }
 
 /// The immutable result of qpdf's one-time writer setup. Route consumers may
@@ -3615,11 +3584,16 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
+    let setup = build_writer_setup(pdf, options)?;
     let special_streams = initialize_special_streams(pdf, options);
     match special_streams {
-        Ok(special_streams) => {
-            emit_canonical_pdf_with_special_streams(pdf, out, options, special_streams.as_ref())
-        }
+        Ok(special_streams) => emit_canonical_pdf_with_special_streams(
+            pdf,
+            out,
+            options,
+            special_streams.as_ref(),
+            setup,
+        ),
         Err(error) => Err(error),
     }
 }
@@ -3629,6 +3603,7 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
+    setup: WriterSetupState,
 ) -> Result<WriterResult> {
     // The plain route now reconciles ADBE on the root's output-only shallow
     // copy. It therefore needs no Catalog snapshot/restore; specialized routes
@@ -3651,7 +3626,7 @@ fn emit_canonical_pdf_with_special_streams<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams);
+    let result = emit_canonical_pdf_inner(pdf, out, options, special_streams, setup);
     if let Some(snapshot) = catalog_snapshot {
         restore_catalog_extensions(pdf, Some(snapshot))?;
     }
@@ -3917,7 +3892,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriterOptions,
     special_streams: Option<&SpecialStreams>,
+    setup: WriterSetupState,
 ) -> Result<WriterResult> {
+    let WriterSetupState {
+        generated_id,
+        encryption_parameters,
+    } = setup;
     let deterministic_id = uses_deterministic_id(options);
 
     // A forced sub-1.5 header suppresses object-stream generation: object
@@ -4495,20 +4475,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         .enumerate()
         .filter_map(|(batch_idx, source)| source.map(|source| (source, batch_idx)))
         .collect();
-    // Resolve /Metadata stream ref up front for --cleartext-metadata support.
-    let metadata_ref = if options
-        .encrypt
-        .as_ref()
-        .is_some_and(|p| !p.encrypt_metadata)
-        || options
-            .copy_encryption
-            .as_ref()
-            .is_some_and(|source| !copy_encryption_encrypts_metadata(source))
-    {
-        resolve_metadata_stream_ref(pdf)?
-    } else {
-        None
-    };
     // ── QDF emission pre-scan ─────────────────────────────────────────────────
     // qpdf --qdf emits each stream's /Length holder IMMEDIATELY after that
     // stream object (numbered in emission order), so file positions are strictly
@@ -4670,61 +4636,21 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         member_new_to_batch.insert(member_number, (container_num, index));
     }
 
-    // Generate qpdf's ordinary/static identifier once before either encryption
-    // key derivation or trailer emission. The complete array is reused at every
-    // trailer site so the emitted /ID[0] is the exact salt used by the context.
-    let generated_id = if deterministic_id {
-        if encrypting {
-            // QPDFWriter::generateID is called by the encryption setup before
-            // the deterministic MD5 pipeline can produce its data.
-            return Err(generate_id_without_data());
-        }
-        None
-    } else if options.copy_encryption.is_some() {
-        None
-    } else {
-        let id_handle = pdf.trailer_key_handle(b"ID");
-        let source_id0 = source_permanent_id_value_handle(&id_handle);
-        Some(generate_id_handle(source_id0.as_deref(), options.static_id))
-    };
-
-    // ── encryption context ────────────────────────────────────────────────
-    // Built ONCE up front so /ID[0] is decided before any object is encrypted.
-    // Compact /Encrypt follows existing objects and generated ObjStm containers.
-    // QDF /Encrypt follows the final interleaved /Length holder from the pre-scan.
-    let encrypt_ctx: Option<EncryptionContext> = if let Some(ref params) = options.encrypt {
+    // Encryption parameters were built once at the common writer setup
+    // boundary. The standard route assigns the qpdf slot after body planning,
+    // while linearization assigns its own slot from the same parameters.
+    let encrypt_ctx = if let Some(parameters) = encryption_parameters {
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
         } else {
             compact_body_max
         };
-        let id0 = generated_id
-            .as_ref()
-            .and_then(ObjectHandle::as_array)
-            .and_then(|values| values.first().and_then(ObjectHandle::as_string))
-            .ok_or_else(|| {
-                // cov:ignore-start: generate_id_handle always returns a valid two-string array here
-                crate::Error::Unsupported(
-                    "full-rewrite: ordinary/static ID generator returned an invalid /ID array"
-                        .to_string(),
-                )
-                // cov:ignore-end
-            })?; // cov:ignore: invalid ID guard is unreachable after generate_id_handle
-        let context =
-            build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
-        Some(context?)
-    } else if let Some(ref src) = options.copy_encryption {
-        let base_for_encrypt = if options.qdf {
-            qdf_max_emission
-        } else {
-            compact_body_max
-        };
-        Some(build_copy_encryption_context(
-            src,
-            options,
-            base_for_encrypt,
-            metadata_ref,
-        )?)
+        let encrypt_ref = base_for_encrypt.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported(
+                "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
+            )
+        })?;
+        Some(parameters.into_context(ObjectRef::new(encrypt_ref, 0)))
     } else {
         None
     };
