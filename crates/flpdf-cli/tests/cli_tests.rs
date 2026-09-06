@@ -120,6 +120,109 @@ fn top_level_writer_mode_help_matches_qpdf_terms() {
 }
 
 #[test]
+fn required_parameter_help_uses_qpdf_equals_form() {
+    let top_level = [
+        "compression-level",
+        "copy-encryption",
+        "encryption-file-password",
+        "force-version",
+        "ii-min-bytes",
+        "job-json-file",
+        "json-object",
+        "keep-files-open-threshold",
+        "linearize-pass1",
+        "min-version",
+        "oi-min-area",
+        "oi-min-height",
+        "oi-min-width",
+        "password",
+        "password-file",
+        "remove-attachment",
+        "rotate",
+        "show-attachment",
+        "show-object",
+        "json-stream-prefix",
+        "update-from-json",
+        "compress-streams",
+        "decode-level",
+        "flatten-annotations",
+        "json-key",
+        "json-stream-data",
+        "keep-files-open",
+        "normalize-content",
+        "object-streams",
+        "password-mode",
+        "remove-unreferenced-resources",
+        "stream-data",
+    ];
+    let rewrite = [
+        "password",
+        "password-file",
+        "password-mode",
+        "copy-encryption",
+        "encryption-file-password",
+        "min-version",
+        "force-version",
+        "object-streams",
+        "compress-streams",
+        "decode-level",
+        "normalize-content",
+        "remove-unreferenced-resources",
+        "stream-data",
+        "compression-level",
+        "flatten-annotations",
+        "oi-min-width",
+        "oi-min-height",
+        "oi-min-area",
+        "ii-min-bytes",
+        "keep-files-open",
+        "keep-files-open-threshold",
+        "rotate",
+    ];
+
+    fn assert_equals_form(help: &str, options: &[&str], surface: &str) {
+        for option in options {
+            let space_form = format!("--{option} ");
+            let equals_form = format!("--{option}=");
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(&space_form))
+                .or_else(|| {
+                    help.lines()
+                        .find(|line| line.trim_start().starts_with(&equals_form))
+                })
+                .unwrap_or_else(|| panic!("{surface} help is missing --{option}"));
+            assert!(
+                line.contains(&equals_form),
+                "{surface} help must advertise --{option}=..., got {line:?}"
+            );
+        }
+    }
+
+    let top_help = String::from_utf8(
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg("--help")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_equals_form(&top_help, &top_level, "top-level");
+
+    let rewrite_help = String::from_utf8(
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["rewrite", "--help"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_equals_form(&rewrite_help, &rewrite, "rewrite");
+}
+
+#[test]
 fn suppress_recovery_matches_qpdf_on_a_recoverable_xref_error() {
     Command::cargo_bin("flpdf")
         .unwrap()

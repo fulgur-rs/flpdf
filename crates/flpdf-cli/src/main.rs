@@ -614,7 +614,7 @@ struct Cli {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
-    #[arg(long, conflicts_with = "output")]
+    #[arg(long, require_equals = true, conflicts_with = "output")]
     show_object: Option<String>,
     /// Emit stored stream bytes for `--show-object` (qpdf --raw-stream-data).
     #[arg(long = "raw-stream-data", requires = "show_object")]
@@ -777,6 +777,7 @@ struct Cli {
     #[arg(
         long = "json-key",
         value_name = "KEY",
+        require_equals = true,
         help = "This option is repeatable. If given, only the specified \
                 top-level keys will be included in the JSON output. \
                 Otherwise, all keys will be included."
@@ -788,6 +789,7 @@ struct Cli {
     #[arg(
         long = "json-object",
         value_name = "SELECTOR",
+        require_equals = true,
         help = "This option is repeatable. If given, only specified objects \
                 will be shown in the \"qpdf\" key of the JSON output. \
                 Otherwise, all objects will be shown. Format: trailer, N, \
@@ -801,6 +803,7 @@ struct Cli {
     #[arg(
         long = "json-stream-data",
         value_name = "MODE",
+        require_equals = true,
         help = "When used with --json, this option controls whether streams \
                 in json output should be omitted, written inline \
                 (base64-encoded), or written to a file. If \"file\" is \
@@ -816,6 +819,7 @@ struct Cli {
     #[arg(
         long = "json-stream-prefix",
         value_name = "PREFIX",
+        require_equals = true,
         help = "Prefix for side files with --json-stream-data=file. With --json-output, \
                 defaults to the JSON output path; with JSON on stdout, an explicit \
                 non-empty prefix is required. An empty prefix is treated as absent."
@@ -834,12 +838,12 @@ struct Cli {
 
     /// Set a minimum PDF version for the output header. An optional third
     /// component is qpdf's Adobe extension level, e.g. `1.7.3`.
-    #[arg(long = "min-version")]
+    #[arg(long = "min-version", require_equals = true)]
     min_version: Option<String>,
 
     /// Force the output PDF version and optional Adobe extension level,
     /// ignoring the input version (qpdf `--force-version`).
-    #[arg(long = "force-version")]
+    #[arg(long = "force-version", require_equals = true)]
     force_version: Option<String>,
 
     /// Use a fixed value for the trailer /ID's changing identifier
@@ -909,7 +913,7 @@ struct Cli {
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
     /// currently a no-op: flpdf does not re-encode stream contents on
     /// rewrite.  Provided so qtest commands parse cleanly.
-    #[arg(long = "compress-streams")]
+    #[arg(long = "compress-streams", require_equals = true)]
     compress_streams: Option<String>,
     /// Re-encode streams that are already a lone `/FlateDecode` (qpdf
     /// `--recompress-flate`).
@@ -917,12 +921,16 @@ struct Cli {
     recompress_flate: bool,
     /// Set the zlib compression level used when emitting Flate streams
     /// (qpdf `--compression-level=level`).
-    #[arg(long = "compression-level", value_name = "LEVEL")]
+    #[arg(
+        long = "compression-level",
+        value_name = "LEVEL",
+        require_equals = true
+    )]
     compression_level: Option<String>,
     /// Control which qpdf stream filters are decoded during rewrite.
     /// Values are ordered from least to most decoding: none, generalized,
     /// specialized, and all.
-    #[arg(long = "decode-level", value_enum)]
+    #[arg(long = "decode-level", value_enum, require_equals = true)]
     decode_level: Option<CliDecodeLevel>,
     /// Control what qpdf does regarding object streams. `preserve` preserves
     /// original object streams (the default), `disable` creates output with no
@@ -931,6 +939,7 @@ struct Cli {
     #[arg(
         long = "object-streams",
         value_enum,
+        require_equals = true,
         default_value_t = CliObjectStreamMode::Preserve
     )]
     object_streams: CliObjectStreamMode,
@@ -938,7 +947,7 @@ struct Cli {
     /// same as `--compress-streams=y --decode-level=generalized`, `preserve`
     /// is the same as `--compress-streams=n --decode-level=none`, and
     /// `uncompress` is the same as `--compress-streams=n --decode-level=generalized`.
-    #[arg(long = "stream-data", value_enum)]
+    #[arg(long = "stream-data", value_enum, require_equals = true)]
     stream_data: Option<CliStreamDataMode>,
     /// Insert a newline before each `endstream` keyword (qpdf
     /// `--newline-before-endstream`). The `y` and `n` spellings both select
@@ -949,7 +958,7 @@ struct Cli {
     newline_before_endstream: CliNewlineBeforeEndstream,
     /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
     /// linearization writer's distinct pass-1 intermediate file.
-    #[arg(long = "linearize-pass1")]
+    #[arg(long = "linearize-pass1", require_equals = true)]
     linearize_pass1: Option<PathBuf>,
     /// Omit the `%% Original object ID: N M` comments that QDF output would
     /// otherwise carry (top-level alias of `flpdf rewrite
@@ -985,6 +994,7 @@ struct Cli {
     #[arg(
         long = "remove-unreferenced-resources",
         value_enum,
+        require_equals = true,
         default_value_t = CliRemoveUnreferencedResources::Auto,
         help = "Remove unreferenced page resources (qpdf default: auto)"
     )]
@@ -998,6 +1008,7 @@ struct Cli {
     #[arg(
         long = "normalize-content",
         value_enum,
+        require_equals = true,
         help = "Normalize page content streams (qpdf default: n; --qdf default: y)"
     )]
     normalize_content: Option<CliYesNo>,
@@ -1035,6 +1046,7 @@ struct Cli {
         long = "flatten-annotations",
         value_enum,
         value_name = "MODE",
+        require_equals = true,
         conflicts_with_all = [
             "check", "show_object",
             "show_npages", "show_pages", "show_xref", "show_linearization",
@@ -1089,16 +1101,16 @@ struct Cli {
     #[arg(long = "keep-inline-images")]
     keep_inline_images: bool,
     /// Minimum image width for `--optimize-images` (qpdf default: 128).
-    #[arg(long = "oi-min-width", value_name = "WIDTH")]
+    #[arg(long = "oi-min-width", value_name = "WIDTH", require_equals = true)]
     oi_min_width: Option<String>,
     /// Minimum image height for `--optimize-images` (qpdf default: 128).
-    #[arg(long = "oi-min-height", value_name = "HEIGHT")]
+    #[arg(long = "oi-min-height", value_name = "HEIGHT", require_equals = true)]
     oi_min_height: Option<String>,
     /// Minimum image area for `--optimize-images` (qpdf default: 16384).
-    #[arg(long = "oi-min-area", value_name = "AREA")]
+    #[arg(long = "oi-min-area", value_name = "AREA", require_equals = true)]
     oi_min_area: Option<String>,
     /// Minimum inline-image payload to externalize (qpdf default: 1024).
-    #[arg(long = "ii-min-bytes", value_name = "BYTES")]
+    #[arg(long = "ii-min-bytes", value_name = "BYTES", require_equals = true)]
     ii_min_bytes: Option<String>,
 
     // ── Page-operation flags ──────────────────────────────────────────────
@@ -1176,6 +1188,7 @@ struct Cli {
     #[arg(
         long = "remove-attachment",
         value_name = "KEY",
+        require_equals = true,
         help = "Remove the embedded file with the given key (qpdf --remove-attachment)"
     )]
     remove_attachment: Vec<OsString>,
@@ -1208,6 +1221,7 @@ struct Cli {
         long = "show-attachment",
         conflicts_with = "output",
         value_name = "KEY",
+        require_equals = true,
         help = "Extract the embedded file with the given key to stdout \
                 (qpdf --show-attachment)"
     )]
@@ -1282,6 +1296,7 @@ struct Cli {
     #[arg(
         long = "copy-encryption",
         value_name = "FILE",
+        require_equals = true,
         conflicts_with_all = [
             "encrypt",
             "check", "show_object",
@@ -1302,6 +1317,7 @@ struct Cli {
     #[arg(
         long = "encryption-file-password",
         value_name = "PW",
+        require_equals = true,
         requires = "copy_encryption",
         help = "User password to open the donor PDF for --copy-encryption"
     )]
@@ -1331,12 +1347,16 @@ struct PageOpArgs {
     /// Manage whether qpdf keeps secondary `--pages` input files open
     /// (`--keep-files-open=y|n`). When omitted, qpdf selects the value from
     /// the distinct page-spec source count and [`Self::keep_files_open_threshold`].
-    #[arg(long = "keep-files-open", value_enum)]
+    #[arg(long = "keep-files-open", value_enum, require_equals = true)]
     keep_files_open: Option<CliYesNo>,
 
     /// Distinct page-spec source count at which qpdf automatically switches
     /// `--keep-files-open` off (default 200).
-    #[arg(long = "keep-files-open-threshold", value_name = "COUNT")]
+    #[arg(
+        long = "keep-files-open-threshold",
+        value_name = "COUNT",
+        require_equals = true
+    )]
     keep_files_open_threshold: Option<String>,
 
     /// Select pages from one or more input files (qpdf `--pages`).
@@ -1376,6 +1396,7 @@ struct PageOpArgs {
         long = "rotate",
         action = clap::ArgAction::Append,
         value_name = "[+|-]angle[:range]",
+        require_equals = true,
         help = "Rotate pages by 0/90/180/270 degrees (qpdf --rotate); repeatable"
     )]
     rotate: Vec<String>,
@@ -1698,6 +1719,7 @@ struct RewriteCommand {
     #[arg(
         long = "copy-encryption",
         value_name = "FILE",
+        require_equals = true,
         conflicts_with_all = [
             "encrypt",
             "remove_restrictions", "decrypt",
@@ -1712,6 +1734,7 @@ struct RewriteCommand {
     #[arg(
         long = "encryption-file-password",
         value_name = "PW",
+        require_equals = true,
         requires = "copy_encryption",
         help = "User password to open the donor PDF for --copy-encryption"
     )]
@@ -1725,13 +1748,13 @@ struct RewriteCommand {
     ///
     /// The effective version is `max(source_version, min_version)`.
     /// Mirrors `qpdf --min-version`.
-    #[arg(long = "min-version")]
+    #[arg(long = "min-version", require_equals = true)]
     min_version: Option<String>,
     /// Force the output PDF version header to exactly this value.
     ///
     /// Overrides source version and the linearize 1.2 floor.
     /// Mirrors `qpdf --force-version`.
-    #[arg(long = "force-version")]
+    #[arg(long = "force-version", require_equals = true)]
     force_version: Option<String>,
     /// Omit the `%% Original object ID: N M` comments that QDF output would
     /// otherwise carry. Mirrors `qpdf --no-original-object-ids`.
@@ -1766,7 +1789,7 @@ struct RewriteCommand {
     ///   containers.
     ///
     /// Applies to the canonical qpdf writer output.
-    #[arg(long = "object-streams", value_enum, default_value_t = CliObjectStreamMode::Preserve)]
+    #[arg(long = "object-streams", value_enum, require_equals = true, default_value_t = CliObjectStreamMode::Preserve)]
     object_streams: CliObjectStreamMode,
 
     /// Apply FlateDecode compression to output streams (qpdf --compress-streams=y|n).
@@ -1779,12 +1802,13 @@ struct RewriteCommand {
     #[arg(
         long = "compress-streams",
         value_enum,
+        require_equals = true,
         help = "Compress output streams with FlateDecode (qpdf default: y)"
     )]
     compress_streams: Option<CliYesNo>,
 
     /// Control which qpdf stream filters are decoded during rewrite.
-    #[arg(long = "decode-level", value_enum)]
+    #[arg(long = "decode-level", value_enum, require_equals = true)]
     decode_level: Option<CliDecodeLevel>,
 
     /// Normalize PDF content streams (qpdf --normalize-content=y|n).
@@ -1798,6 +1822,7 @@ struct RewriteCommand {
     #[arg(
         long = "normalize-content",
         value_enum,
+        require_equals = true,
         help = "Normalize page content streams (qpdf default: n)"
     )]
     normalize_content: Option<CliYesNo>,
@@ -1825,7 +1850,7 @@ struct RewriteCommand {
     /// - `no`: leave all /Resources entries untouched.
     ///
     /// Requires a full rewrite when set to `yes` or `auto`.
-    #[arg(long = "remove-unreferenced-resources", value_enum,
+    #[arg(long = "remove-unreferenced-resources", value_enum, require_equals = true,
           default_value_t = CliRemoveUnreferencedResources::Auto,
           help = "Remove unreferenced /Resources entries (qpdf default: auto)")]
     remove_unreferenced_resources: CliRemoveUnreferencedResources,
@@ -1860,7 +1885,7 @@ struct RewriteCommand {
     /// Default: not set (falls back to --compress-streams).
     /// When both are supplied explicitly, --compress-streams wins.
     /// Only affects the full-rewrite path.
-    #[arg(long = "stream-data", value_enum)]
+    #[arg(long = "stream-data", value_enum, require_equals = true)]
     stream_data: Option<CliStreamDataMode>,
 
     /// Re-encode streams that are already a lone /FlateDecode (default: preserve
@@ -1870,7 +1895,11 @@ struct RewriteCommand {
 
     /// Set the zlib compression level used when emitting Flate streams
     /// (qpdf `--compression-level=level`).
-    #[arg(long = "compression-level", value_name = "LEVEL")]
+    #[arg(
+        long = "compression-level",
+        value_name = "LEVEL",
+        require_equals = true
+    )]
     compression_level: Option<String>,
 
     /// Flatten annotations into page content (qpdf `--flatten-annotations`).
@@ -1887,6 +1916,7 @@ struct RewriteCommand {
         long = "flatten-annotations",
         value_enum,
         value_name = "MODE",
+        require_equals = true,
         help = "Flatten annotations into page content; MODE is all, screen, or print"
     )]
     flatten_annotations: Option<CliFlattenMode>,
@@ -1914,16 +1944,16 @@ struct RewriteCommand {
     #[arg(long = "keep-inline-images")]
     keep_inline_images: bool,
     /// Minimum image width for `--optimize-images` (qpdf default: 128).
-    #[arg(long = "oi-min-width", value_name = "WIDTH")]
+    #[arg(long = "oi-min-width", value_name = "WIDTH", require_equals = true)]
     oi_min_width: Option<String>,
     /// Minimum image height for `--optimize-images` (qpdf default: 128).
-    #[arg(long = "oi-min-height", value_name = "HEIGHT")]
+    #[arg(long = "oi-min-height", value_name = "HEIGHT", require_equals = true)]
     oi_min_height: Option<String>,
     /// Minimum image area for `--optimize-images` (qpdf default: 16384).
-    #[arg(long = "oi-min-area", value_name = "AREA")]
+    #[arg(long = "oi-min-area", value_name = "AREA", require_equals = true)]
     oi_min_area: Option<String>,
     /// Minimum inline-image payload to externalize (qpdf default: 1024).
-    #[arg(long = "ii-min-bytes", value_name = "BYTES")]
+    #[arg(long = "ii-min-bytes", value_name = "BYTES", require_equals = true)]
     ii_min_bytes: Option<String>,
 
     /// Flatten page rotation by baking `/Rotate` into page content
@@ -2197,16 +2227,16 @@ struct PasswordArgs {
     #[arg(skip)]
     raw_password: Option<Vec<u8>>,
     /// Password bytes for encrypted PDFs.
-    #[arg(long, conflicts_with = "password_file")]
+    #[arg(long, require_equals = true, conflicts_with = "password_file")]
     password: Option<OsString>,
     /// File containing password bytes. Only the first LF-delimited line is
     /// used; a trailing CR before that LF is stripped. `-` reads from stdin.
-    #[arg(long = "password-file", value_name = "PATH")]
+    #[arg(long = "password-file", value_name = "PATH", require_equals = true)]
     password_file: Option<PathBuf>,
     /// How qpdf-style password modes interpret --password bytes. On read
     /// paths, only `hex-bytes` transforms the bytes; `auto`, `bytes`, and
     /// `unicode` pass them through unchanged. Mirrors qpdf's flag.
-    #[arg(long = "password-mode", value_enum, default_value_t = CliPasswordMode::Auto)]
+    #[arg(long = "password-mode", value_enum, require_equals = true, default_value_t = CliPasswordMode::Auto)]
     password_mode: CliPasswordMode,
     /// Permit creating deprecated RC4-backed handlers and revision 5
     /// encryption. Reading existing weakly encrypted PDFs does not require it.
@@ -2483,8 +2513,8 @@ fn apply_raw_overrides(args: &mut Cli, overrides: RawCliOverrides) {
 // Windows' default process stack after a small option addition. Keep every
 // production command-construction boundary on a grown stack; the returned
 // command itself and all parsing behavior remain unchanged.
-const CLI_COMMAND_STACK_RED_ZONE: usize = 1024 * 1024;
-const CLI_COMMAND_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+const CLI_COMMAND_STACK_RED_ZONE: usize = 4 * 1024 * 1024;
+const CLI_COMMAND_STACK_GROWTH_SIZE: usize = 4 * 1024 * 1024;
 
 fn cli_command() -> clap::Command {
     stacker::maybe_grow(
