@@ -474,6 +474,34 @@ impl Pdf<Cursor<Arc<[u8]>>> {
 }
 
 impl Pdf<Cursor<Vec<u8>>> {
+    /// Process an in-memory PDF through an already constructed document.
+    ///
+    /// This is qpdf's `QPDF::processMemoryFile` (`include/qpdf/QPDF.hh:91-97`,
+    /// `libqpdf/QPDF.cc:259-269`). The Rust document owns the replacement
+    /// byte vector, while the qpdf policy state that is observable before the
+    /// parse — recovery, warning suppression, logger, and source description
+    /// — is carried across to the normal opening path. A failed parse leaves
+    /// the existing document unchanged, just as qpdf does not install a new
+    /// parsed source until its process call succeeds.
+    pub fn process_memory_file(
+        &mut self,
+        description: impl AsRef<[u8]>,
+        bytes: Vec<u8>,
+    ) -> crate::Result<()> {
+        let options = PdfOpenOptions {
+            repair: self.resolver.attempt_recovery(),
+            logger: Some(self.resolver.logger()),
+            suppress_warnings: self.resolver.suppress_warnings(),
+            description: description.as_ref().to_vec(),
+            ..PdfOpenOptions::default()
+        };
+        let mut replacement = Self::open_mem_owned_with_options(bytes, options)?;
+        replacement.resolver.set_pdf_unique_id(self.unique_id);
+        replacement.unique_id = self.unique_id;
+        *self = replacement;
+        Ok(())
+    }
+
     /// Open a PDF document from an owned byte vector without wrapping it in a `Cursor` manually.
     ///
     /// The sole-ownership counterpart to [`Pdf::open_mem`]: the handle takes the
@@ -658,5 +686,20 @@ mod tests {
             .expect("the initial seek failure must abort opening");
 
         assert!(matches!(error, Error::Io(error) if error.to_string() == "initial seek failed"));
+    }
+
+    #[test]
+    fn uninitialized_memory_processing_honors_strict_recovery_policy() {
+        let mut pdf = Pdf::uninitialized();
+        pdf.set_attempt_recovery(false);
+        pdf.set_suppress_warnings(true);
+
+        let error = pdf
+            .process_memory_file(b"empty", Vec::new())
+            .expect_err("an empty strict input must fail at the qpdf parse boundary");
+
+        assert!(!pdf.resolver.attempt_recovery());
+        assert!(matches!(error, Error::Parse { .. }));
+        assert!(pdf.suppress_warnings());
     }
 }

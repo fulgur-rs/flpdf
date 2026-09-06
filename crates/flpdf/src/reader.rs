@@ -296,6 +296,17 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.set_suppress_warnings(suppress);
     }
 
+    /// Enable or disable qpdf recovery on this live document.
+    ///
+    /// This is qpdf's `QPDF::setAttemptRecovery` (`include/qpdf/QPDF.hh:234`,
+    /// `libqpdf/QPDF.cc:334`). The policy is read both while loading the
+    /// cross-reference data and when a later object read considers rebuilding
+    /// that data, so this mutator intentionally reaches the shared resolver
+    /// state rather than changing a one-shot open option.
+    pub fn set_attempt_recovery(&mut self, attempt_recovery: bool) {
+        self.resolver.set_attempt_recovery(attempt_recovery);
+    }
+
     /// Diagnostics emitted while opening the document — typically warnings from the
     /// xref/trailer recovery path. Always non-empty when the parse hit a soft failure.
     ///

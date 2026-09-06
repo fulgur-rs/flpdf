@@ -790,9 +790,10 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// (`include/qpdf/QPDF.hh:283`, `libqpdf/QPDF.cc:2294-2296`).
     ///
     /// Duplicated from `Pdf::unique_id` rather than reached through it: the
-    /// resolver has no `&Pdf`, and the value is assigned once before either
-    /// is constructed, so the two copies cannot drift.
-    pdf_unique_id: u64,
+    /// resolver has no `&Pdf`. The value is assigned before either side is
+    /// constructed and is re-bound only when qpdf's process-memory boundary
+    /// installs a new source on the same document.
+    pdf_unique_id: Cell<u64>,
 }
 
 /// The `QPDF::StringDecrypter` qpdf binds to one indirect object immediately
@@ -992,7 +993,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
-            pdf_unique_id,
+            pdf_unique_id: Cell::new(pdf_unique_id),
         })
     }
 
@@ -1031,7 +1032,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             immediate_copy_from: Cell::new(false),
-            pdf_unique_id,
+            pdf_unique_id: Cell::new(pdf_unique_id),
         })
     }
 
@@ -1061,7 +1062,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn new_reserved_handle(&self) -> Result<ObjectHandle> {
         let object_ref = self.next_obj_gen()?;
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
-        let reserved = ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id, resolver);
+        let reserved =
+            ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
         let mut core = self.core.borrow_mut();
         let previous = core.object_cache.insert(object_ref, reserved.clone());
         core.allocated_object_refs.insert(object_ref);
@@ -1224,7 +1226,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 ObjectHandle::new_indirect_for_pdf_with_resolver(
                     object_ref,
                     NO_PARSED_OFFSET,
-                    self.pdf_unique_id,
+                    self.pdf_unique_id.get(),
                     resolver,
                 )
             })
@@ -1248,7 +1250,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
-        let reserved = ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id, resolver);
+        let reserved =
+            ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id.get(), resolver);
         let mut core = self.core.borrow_mut();
         let previous = core.object_cache.insert(object_ref, reserved.clone());
         core.allocated_object_refs.insert(object_ref);
@@ -1558,9 +1561,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // letting it keep operating on what is now this Pdf's object. Run
         // after next_obj_gen so a failed allocation leaves `handle`
         // completely untouched, matching every other fallible step here.
-        handle.claim_tree_pdf(self.pdf_unique_id)?;
-        let promoted =
-            handle.promote_to_indirect(object_ref, self.pdf_unique_id, self.self_weak.clone());
+        handle.claim_tree_pdf(self.pdf_unique_id.get())?;
+        let promoted = handle.promote_to_indirect(
+            object_ref,
+            self.pdf_unique_id.get(),
+            self.self_weak.clone(),
+        );
         let mut core = self.core.borrow_mut();
         let previous = core.object_cache.insert(object_ref, promoted.clone());
         core.allocated_object_refs.insert(object_ref);
@@ -1596,7 +1602,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "QPDF::replaceObject called with indirect object handle".to_string(),
             ));
         }
-        if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id) {
+        if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id.get()) {
             return Err(Error::Unsupported(
                 "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
             ));
@@ -1675,6 +1681,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// whether a failed object read may trigger `reconstruct_xref`.
     pub(crate) fn attempt_recovery(&self) -> bool {
         self.core.borrow().attempt_recovery
+    }
+
+    /// Set qpdf's live `m->attempt_recovery` policy.
+    ///
+    /// This is the resolver-side state mutation for `QPDF::setAttemptRecovery`
+    /// (`include/qpdf/QPDF.hh:234`, `libqpdf/QPDF.cc:334`). The flag is read
+    /// at both the xref-load boundary and the later object-resolution retry
+    /// boundary, so changing it on the live resolver must affect both paths.
+    pub(crate) fn set_attempt_recovery(&self, value: bool) {
+        self.core.borrow_mut().attempt_recovery = value;
+    }
+
+    /// Rebind the resolver's qpdf document identity when an already
+    /// constructed document installs a new input source.
+    pub(crate) fn set_pdf_unique_id(&self, value: u64) {
+        self.pdf_unique_id.set(value);
     }
 
     fn stream_recovery_enabled(&self) -> bool {
@@ -4459,7 +4481,7 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     fn pdf_unique_id(&self) -> Option<u64> {
-        Some(self.pdf_unique_id)
+        Some(self.pdf_unique_id.get())
     }
 
     fn input_description(&self) -> Vec<u8> {
