@@ -7444,7 +7444,7 @@ fn add_attachment_equals_form_with_no_positional_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr("qpdf: add attachment: no file specified\n");
+        .stderr(format!("qpdf: add attachment: no file specified{EOL}"));
 
     assert!(!output.exists());
 }
@@ -7466,7 +7466,7 @@ fn add_attachment_without_file_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr("qpdf: add attachment: no file specified\n");
+        .stderr(format!("qpdf: add attachment: no file specified{EOL}"));
 
     assert!(!output.exists());
 }
@@ -7492,9 +7492,9 @@ fn add_attachment_invalid_creation_date_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::starts_with(
-            "qpdf: potato is not a valid PDF timestamp\n",
-        ));
+        .stderr(predicate::str::starts_with(format!(
+            "qpdf: potato is not a valid PDF timestamp{EOL}"
+        )));
 }
 
 #[test]
@@ -7518,9 +7518,9 @@ fn add_attachment_invalid_modification_date_matches_qpdf_usage() {
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::starts_with(
-            "qpdf: potato is not a valid PDF timestamp\n",
-        ));
+        .stderr(predicate::str::starts_with(format!(
+            "qpdf: potato is not a valid PDF timestamp{EOL}"
+        )));
 }
 
 #[test]
@@ -8203,7 +8203,7 @@ fn show_attachment_errors_on_missing_key() {
         ])
         .assert()
         .code(2)
-        .stderr("qpdf: attachment nosuchkey not found\n");
+        .stderr(format!("qpdf: attachment nosuchkey not found{EOL}"));
 }
 
 #[test]
