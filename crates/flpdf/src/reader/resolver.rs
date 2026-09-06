@@ -3797,24 +3797,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let message = message.into();
         let (logger, suppress_warnings, what) = {
             let mut core = self.core.borrow_mut();
-            let what = if core.description.is_empty() {
-                let mut what = b"(".to_vec();
-                what.extend_from_slice(object_description);
-                if offset > 0 {
-                    what.extend_from_slice(b", offset ");
-                    what.extend_from_slice(offset.to_string().as_bytes());
-                }
-                what.extend_from_slice(b"): ");
-                what.extend_from_slice(message.as_bytes());
-                what
-            } else {
-                format_input_warning_what(
-                    &core.description,
-                    object_description,
-                    offset,
-                    message.as_bytes(),
-                )
-            };
+            // `QPDFExc::createWhat` omits the wrapping parentheses when the
+            // filename is empty (`libqpdf/QPDFExc.cc:19-50`), so an unnamed
+            // in-memory PDF must keep `<object>, offset N: <message>` rather
+            // than adding literal parens. `format_input_warning_what` already
+            // reproduces that empty-filename shape, so use it for both cases.
+            let what = format_input_warning_what(
+                &core.description,
+                object_description,
+                offset,
+                message.as_bytes(),
+            );
             // `QPDFExc` keeps the file position beside the rendered text
             // (`QPDFExc.cc:19-50`); retain it for `repair_diagnostics()`.
             let mut diagnostic = Diagnostic::object_warning_bytes(&what);
@@ -5547,6 +5540,42 @@ mod tests {
         assert_eq!(
             output.lock().unwrap().as_slice(),
             b"WARNING: (object 7 0): no offset\n"
+        );
+    }
+
+    /// `QPDFExc::createWhat` omits the wrapping parentheses for an unnamed
+    /// input (`libqpdf/QPDFExc.cc:19-50`), so a described stream warning on an
+    /// empty-filename in-memory PDF must read `<object>, offset N: <message>`
+    /// without the parens the object-description path could otherwise add.
+    #[test]
+    fn described_stream_warning_omits_parens_for_an_unnamed_input() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, Vec::new()),
+            0,
+        );
+
+        resolver
+            .push_stream_warning_with_object_description(
+                b"linearization hint stream: object 2 0",
+                55,
+                "expected endobj",
+            )
+            .expect("warning delivery");
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: linearization hint stream: object 2 0, offset 55: expected endobj\n"
         );
     }
 
