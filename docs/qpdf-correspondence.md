@@ -443,6 +443,14 @@ is mode-independent, while `removed_refs` separately excludes explicitly
 deleted identities. The regression and qpdf 11.9.0 probe are tracked in
 `flpdf-9hc.42`.
 
+The D14 plain-classic slice now keeps the live trimmed trailer handle in
+`writer/plain/plan.rs::PlainWritePlan::trailer_handle` and sends classic
+trailer bytes through `writer/object.rs::TrailerKind` and
+`ObjectWriterEmission::write_trailer_with_ref_map_and_kind`. The xref row and
+`startxref` framing remain in `writer/plain/xref.rs`; specialized/PCLm,
+legacy xref-stream, and linearized trailer callers remain follow-up route
+consumers rather than new semantic trailer implementations.
+
 ### `test_driver` test 29
 
 `qpdf/test_driver.cc:1096-1145` deliberately constructs a mixed-ownership
