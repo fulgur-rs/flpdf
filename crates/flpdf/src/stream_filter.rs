@@ -979,10 +979,11 @@ impl StreamFilter for CryptStreamFilter {
     /// `<< /Type /CryptFilterDecodeParms /Foo 1 >>` exit 2 with "unable to
     /// filter stream data".
     ///
-    /// The `Type` validity test is evaluated *inside* the loop, as qpdf
-    /// evaluates it, even though hoisting the predicate would answer
-    /// identically on every shape — qpdf's loop shape is kept deliberately,
-    /// not because behaviour depends on it.
+    /// The key test and its short-circuit order stay inside the loop, as qpdf
+    /// evaluates them. In particular, `hasKey` and
+    /// `isDictionaryOfType` are reached only for an allowed key, after
+    /// `getKeys` has inspected the parameter object; this preserves warning
+    /// and resolution timing for non-dictionary and malformed inputs.
     fn set_decode_params(&mut self, decode_params: &ObjectHandle) -> Result<bool> {
         if decode_params.try_is_null()? {
             return Ok(true);
