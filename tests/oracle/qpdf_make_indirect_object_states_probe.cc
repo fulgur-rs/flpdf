@@ -1,4 +1,5 @@
 #include <qpdf/QPDF.hh>
+#include <qpdf/JSON.hh>
 #include <iostream>
 #include <limits>
 int main(int argc, char** argv) {
@@ -13,6 +14,8 @@ int main(int argc, char** argv) {
     auto missing = pdf.getObjectByID(99, 0);
     result = pdf.makeIndirectObject(missing);
     std::cout << "missing=" << result.getObjGen().unparse(' ') << " warnings=" << pdf.getWarnings().size() << '\n';
+    std::cout << "json_ref=" << result.getJSON(2, false).unparse()
+              << " json_value=" << result.getJSON(2, true).unparse() << '\n';
     QPDF limit; limit.emptyPDF();
     limit.getObjectByID(std::numeric_limits<int>::max()-1, 0);
     auto last = limit.makeIndirectObject(QPDFObjectHandle::newNull());

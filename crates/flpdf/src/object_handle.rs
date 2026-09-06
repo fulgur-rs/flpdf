@@ -7807,6 +7807,24 @@ mod object_json_writer_tests {
     }
 
     #[test]
+    fn json_writer_resolves_a_repromoted_unresolved_value_only_when_requested() {
+        let mut pdf = crate::Pdf::empty().unwrap();
+        let original = pdf.get_object_handle(ObjectRef::new(99, 0));
+        let promoted = pdf.make_indirect_object_handle(original.clone()).unwrap();
+        for (dereference, expected) in [
+            (false, b"\"100 0 R\"".as_slice()),
+            (true, b"null".as_slice()),
+        ] {
+            let mut bytes = Vec::new();
+            let mut output = PlString::new("promoted-json", None, &mut bytes);
+            promoted.write_json(2, &mut output, dereference, 0).unwrap();
+            assert_eq!(bytes, expected);
+            assert_eq!(original.is_resolved(), dereference);
+            assert!(original.is_same_object_as(&promoted));
+        }
+    }
+
+    #[test]
     fn writer_rejects_a_direct_reserved_handle_before_type_dispatch() {
         let handle = ObjectHandle::new_reserved_direct();
         let mut bytes = Vec::new();
