@@ -20,12 +20,43 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Track whether a bootstrap source has reached its first read operation.
+/// `load_xref_state_with_options` seeks to the beginning before reading the
+/// whole source, so the caller must distinguish a seek failure from a failed
+/// read before applying qpdf's `FileInputSource::read` wording.
+struct BootstrapReadTracker<'a, R> {
+    reader: &'a mut R,
+    read_attempted: bool,
+}
+
+impl<R> BootstrapReadTracker<'_, R> {
+    fn new(reader: &mut R) -> BootstrapReadTracker<'_, R> {
+        BootstrapReadTracker {
+            reader,
+            read_attempted: false,
+        }
+    }
+}
+
+impl<R: Read> Read for BootstrapReadTracker<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.read_attempted = true;
+        self.reader.read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for BootstrapReadTracker<'_, R> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.reader.seek(position)
+    }
+}
+
 /// qpdf's initial `findFirst` scan asks its `FileInputSource` for 1024 bytes
 /// (`libqpdf/QPDF.cc:430-438`). A file-backed Rust bootstrap currently reads
 /// the source eagerly, so convert an I/O failure from that read into the same
 /// `QPDFExc` message before the generic `Error::Io` display adds platform text.
-fn qpdf_initial_read_error(description: &[u8], error: Error) -> Error {
-    if description.is_empty() || !matches!(&error, Error::Io(_)) {
+fn qpdf_initial_read_error(description: &[u8], read_attempted: bool, error: Error) -> Error {
+    if description.is_empty() || !read_attempted || !matches!(&error, Error::Io(_)) {
         return error;
     }
     let mut message = description.to_vec();
@@ -183,8 +214,9 @@ impl<R: Read + Seek> Pdf<R> {
             options.suppress_warnings,
             options.description.clone(),
         );
+        let mut bootstrap_reader = BootstrapReadTracker::new(&mut reader);
         let loaded_state = match load_xref_state_with_options(
-            &mut reader,
+            &mut bootstrap_reader,
             XrefLoadOptions {
                 allow_repair: options.repair,
                 ignore_xref_streams: options.ignore_xref_streams,
@@ -192,13 +224,18 @@ impl<R: Read + Seek> Pdf<R> {
         ) {
             Ok(state) => state,
             Err(error) => {
-                let error = qpdf_initial_read_error(&options.description, error);
+                let error = qpdf_initial_read_error(
+                    &options.description,
+                    bootstrap_reader.read_attempted,
+                    error,
+                );
                 if let Some((_, diagnostics)) = error.open_failure() {
                     warning_options.replay_warnings(diagnostics)?;
                 }
                 return Err(error);
             }
         };
+        drop(bootstrap_reader);
         // Keep the temporary bootstrap resolver alive until every returned
         // handle has been rebound to this Pdf's canonical resolver. Its Drop
         // intentionally disconnects the temporary cache to break cycles, so
@@ -584,5 +621,40 @@ impl Pdf<Cursor<Vec<u8>>> {
     /// ```
     pub fn empty() -> crate::Result<Self> {
         Self::open_mem_owned(EMPTY_PDF_BYTES.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pdf;
+    use crate::{Error, PdfOpenOptions};
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn initial_seek_failure_is_not_reported_as_a_read_failure() {
+        struct SeekFails;
+
+        impl Read for SeekFails {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!("the bootstrap seek must fail before a read");
+            }
+        }
+
+        impl Seek for SeekFails {
+            fn seek(&mut self, _position: SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::Error::other("initial seek failed"))
+            }
+        }
+
+        let options = PdfOpenOptions {
+            description: b"input.pdf".to_vec(),
+            ..Default::default()
+        };
+        let error = match Pdf::open_with_options(SeekFails, options) {
+            Ok(_) => panic!("the initial seek failure must abort opening"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::Io(error) if error.to_string() == "initial seek failed"));
     }
 }

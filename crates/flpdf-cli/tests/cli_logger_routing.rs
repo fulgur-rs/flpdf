@@ -654,12 +654,28 @@ fn qpdf_differential_matches_permission_denied_output_open() {
     std::fs::create_dir(&readonly).expect("create read-only output directory");
     std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555))
         .expect("make output directory read-only");
-    let output = readonly.join("output.pdf");
-    let output = output.to_str().expect("UTF-8 temporary path");
+    let output_path = readonly.join("output.pdf");
+    let output = output_path.to_str().expect("UTF-8 temporary path");
 
     let qpdf = run_qpdf(&[MINIMAL, output]);
     let flpdf = run_flpdf(&[MINIMAL, output]);
+    if qpdf.status.code() != Some(2) {
+        eprintln!(
+            "skipping permission-denied differential: qpdf could write in the read-only directory"
+        );
+        return;
+    }
+    assert_eq!(
+        flpdf.status.code(),
+        Some(2),
+        "flpdf must fail when qpdf observes permission denied: {:?}",
+        flpdf.stderr
+    );
     assert_observables_equal("permission-denied output", &qpdf, &flpdf, true);
+    assert!(
+        !output_path.exists(),
+        "permission failure must not create output"
+    );
 }
 
 #[cfg(target_os = "linux")]
