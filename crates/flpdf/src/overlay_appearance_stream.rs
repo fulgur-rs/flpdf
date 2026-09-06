@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_adjust_appearance_stream_rewarns_and_preserves_content() {
+    fn canonical_adjust_appearance_stream_warns_and_rewrites_the_prefix() {
         let mut pdf = open_minimal();
         let resources = HandleFixture::dictionary({
             let mut d = HandleDictionary::new();
@@ -877,13 +877,13 @@ mod tests {
 
         assert_eq!(
             stream_bytes(&stream_handle(&mut pdf, ap_ref)),
-            b"/F1 18 Tf ["
+            b"/F1_1 18 Tf ["
         );
         let warning_bytes = warnings.lock().expect("appearance warning trace lock");
         let warnings = String::from_utf8_lossy(&warning_bytes);
         assert!(
-            warnings.contains("Unable to parse appearance stream:"),
-            "qpdf's appearance catch warning must be delivered: {warnings}"
+            warnings.contains("content, offset 11: parse error while reading object"),
+            "qpdf's appearance parser warning must be delivered: {warnings}"
         );
     }
 

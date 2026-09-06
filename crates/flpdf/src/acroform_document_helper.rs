@@ -2644,7 +2644,7 @@ mod final_handle_tests {
     }
 
     #[test]
-    fn foreign_default_appearance_parse_warning_uses_qpdf_text() {
+    fn foreign_default_appearance_container_eof_warning_uses_qpdf_text() {
         let mut pdf = fixture("form-fields-and-annotations-with-defaults.pdf");
         let field = pdf
             .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
@@ -2678,10 +2678,8 @@ mod final_handle_tests {
         let warning_bytes = warnings.lock().expect("acroform warning trace lock");
         let warnings = String::from_utf8_lossy(&warning_bytes);
         assert!(
-            warnings.contains(
-                "Unable to parse /DA: parse error at byte 11: unexpected EOF in array; this form field may not update properly"
-            ),
-            "qpdf's exact /DA catch warning must be delivered: {warnings}"
+            warnings.contains("content, offset 11: parse error while reading object"),
+            "qpdf's exact /DA parser warning must be delivered: {warnings}"
         );
     }
 

@@ -633,6 +633,51 @@ fn acroform_secondary_bad_da_pdf() -> Vec<u8> {
     ])
 }
 
+/// Single-page foreign source with the same `/DR/Font/F1` collision as the
+/// malformed-token fixture, but whose `/DA` ends inside an open array. qpdf's
+/// temporary content stream keeps the prefix and emits only its parser
+/// warning, so the copied field must retain the rewritten `/F1_1` prefix.
+fn acroform_secondary_eof_da_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx \
+          /T (ForeignEof) /DA (/F1 18 Tf [) /DR 6 0 R \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// Single-page foreign source with an appearance stream that ends inside an
+/// open array. The appearance's `/Resources` collides with the primary
+/// AcroForm `/DR`, forcing qpdf's ResourceReplacer path during overlay.
+fn acroform_secondary_eof_appearance_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx \
+          /T (ForeignAppearanceEof) /DA (/F1 18 Tf) /DR 6 0 R \
+          /AP << /N 8 0 R >> /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        b"8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+          /Resources 6 0 R /Length 9 0 R >>\nstream\n/F1 18 Tf [\nendstream\nendobj\n"
+            .to_vec(),
+        b"9 0 obj\n11\nendobj\n".to_vec(),
+    ])
+}
+
 /// One-page AcroForm source used to compare qpdf's lazy foreign-field setup
 /// when the primary input is `--empty`.
 fn acroform_need_appearances_source_pdf() -> Vec<u8> {
@@ -972,6 +1017,127 @@ fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
         da_parser_warning_message(&flpdf.stderr),
         da_parser_warning_message(&qpdf.stderr),
         "foreign /DA parser warning message must match qpdf",
+    );
+}
+
+#[test]
+fn truncated_foreign_default_appearance_rewrites_prefix_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("eof-da-source.pdf");
+    std::fs::write(&primary, acroform_primary_with_dr_pdf()).expect("write primary");
+    std::fs::write(&secondary, acroform_secondary_eof_da_pdf()).expect("write EOF /DA source");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {:?}", qpdf);
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "truncated /DA must retain qpdf's warning-only exit status; flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(
+        flpdf
+            .stderr
+            .windows(b"parse error while reading object".len())
+            .any(|window| window == b"parse error while reading object"),
+        "flpdf must emit qpdf's container EOF warning: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        "qpdf and flpdf must rewrite the same truncated /DA prefix",
+    );
+}
+
+#[test]
+fn truncated_foreign_appearance_rewrites_prefix_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/fxo-red-with-existing-acroform-dr.pdf");
+    let secondary = temp.path().join("eof-appearance-source.pdf");
+    std::fs::write(&secondary, acroform_secondary_eof_appearance_pdf())
+        .expect("write EOF appearance source");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .arg("--overlay")
+        .arg(&secondary)
+        .arg("--to=1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {:?}", qpdf);
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .arg("--overlay")
+        .arg(&secondary)
+        .arg("--to=1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "truncated appearance must retain qpdf's warning-only exit status; flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert!(
+        flpdf
+            .stderr
+            .windows(b"parse error while reading object".len())
+            .any(|window| window == b"parse error while reading object"),
+        "flpdf must emit qpdf's appearance parser warning: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        "qpdf and flpdf must rewrite the same truncated appearance prefix",
     );
 }
 

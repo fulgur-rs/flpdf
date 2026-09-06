@@ -1908,8 +1908,10 @@ mod tests {
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let logger = logger_with_capture(Arc::clone(&output));
-        let mut page_pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"<< /A 1")))
-            .expect("malformed content fixture should open");
+        let mut page_pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(
+            b"999999999999999999999999",
+        )))
+        .expect("malformed content fixture should open");
         assert!(matches!(
             check_document(&mut page_pdf, &logger, "qpdf", "page-failure.pdf"),
             Err(CheckError::ErrorsDetected)
