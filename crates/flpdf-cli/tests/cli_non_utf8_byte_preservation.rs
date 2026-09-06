@@ -72,8 +72,7 @@ fn password_option_accepts_non_utf8_bytes() {
     fs::copy(ONE_PAGE, &input).expect("copy input");
 
     let output = run([
-        OsString::from("--password"),
-        raw(b"password-\xff"),
+        OsString::from_vec([b"--password=".as_slice(), b"password-\xff"].concat()),
         OsString::from("--check"),
         input.into_os_string(),
     ]);
@@ -104,8 +103,7 @@ fn encrypt_segment_preserves_non_utf8_password_bytes() {
 
     let check = run([
         OsString::from("--password-mode=bytes"),
-        OsString::from("--password"),
-        raw(b"user-\xff"),
+        OsString::from_vec([b"--password=".as_slice(), b"user-\xff"].concat()),
         OsString::from("--check"),
         encrypted.into_os_string(),
     ]);
@@ -139,8 +137,13 @@ fn encryption_file_password_accepts_non_utf8_bytes() {
     );
 
     let copy = run([
-        OsString::from("--copy-encryption"),
-        donor.into_os_string(),
+        OsString::from_vec(
+            [
+                b"--copy-encryption=".as_slice(),
+                donor.as_os_str().as_bytes(),
+            ]
+            .concat(),
+        ),
         OsString::from_vec([b"--encryption-file-password=".as_slice(), b"user-\xff"].concat()),
         input.into_os_string(),
         copied.clone().into_os_string(),
@@ -149,8 +152,7 @@ fn encryption_file_password_accepts_non_utf8_bytes() {
 
     let check = run([
         OsString::from("--password-mode=bytes"),
-        OsString::from("--password"),
-        raw(b"user-\xff"),
+        OsString::from_vec([b"--password=".as_slice(), b"user-\xff"].concat()),
         OsString::from("--check"),
         copied.into_os_string(),
     ]);

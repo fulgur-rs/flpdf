@@ -349,7 +349,8 @@ fn update_from_json_requires_qpdf_equals_parameter_shape() {
     assert_eq!(flpdf.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&qpdf.stderr)
         .contains("--update-from-json must be given as --update-from-json=qpdf-json file"));
-    assert!(String::from_utf8_lossy(&flpdf.stderr).contains("equal sign is needed"));
+    assert!(String::from_utf8_lossy(&flpdf.stderr)
+        .contains("--update-from-json must be given as --update-from-json=qpdf-json file"));
 }
 
 #[test]

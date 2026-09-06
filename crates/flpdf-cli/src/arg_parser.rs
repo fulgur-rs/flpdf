@@ -59,6 +59,50 @@ const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
     "with-images",
 ];
 
+/// qpdf's main option table marks these options as requiring a parameter
+/// (`libqpdf/qpdf/auto_job_init.hh:92-126`). `QPDFArgParser::parseArgs`
+/// accepts a parameter only when it is attached with `=`; a following argv
+/// token remains positional and the parser raises the exact usage error below.
+/// Segment tables (`--pages`, `--encrypt`, attachments, overlay/underlay) are
+/// parsed separately and therefore never pass through this top-level check.
+const QPDF_REQUIRED_PARAMETER_OPTIONS: &[(&str, &str)] = &[
+    ("compression-level", "level"),
+    ("copy-encryption", "file"),
+    ("encryption-file-password", "password"),
+    ("force-version", "version"),
+    ("ii-min-bytes", "minimum"),
+    ("job-json-file", "file"),
+    ("json-object", "trailer"),
+    ("keep-files-open-threshold", "count"),
+    ("linearize-pass1", "filename"),
+    ("min-version", "version"),
+    ("oi-min-area", "minimum"),
+    ("oi-min-height", "minimum"),
+    ("oi-min-width", "minimum"),
+    ("password", "password"),
+    ("password-file", "password"),
+    ("remove-attachment", "attachment"),
+    ("rotate", "[+|-]angle"),
+    ("show-attachment", "attachment"),
+    ("show-object", "trailer"),
+    ("json-stream-prefix", "stream-file-prefix"),
+    ("update-from-json", "qpdf-json file"),
+    ("compress-streams", "{n,y}"),
+    ("decode-level", "{all,generalized,none,specialized}"),
+    ("flatten-annotations", "{all,print,screen}"),
+    (
+        "json-key",
+        "{acroform,attachments,encrypt,objectinfo,objects,outlines,pagelabels,pages,qpdf}",
+    ),
+    ("json-stream-data", "{file,inline,none}"),
+    ("keep-files-open", "{n,y}"),
+    ("normalize-content", "{n,y}"),
+    ("object-streams", "{disable,generate,preserve}"),
+    ("password-mode", "{auto,bytes,hex-bytes,unicode}"),
+    ("remove-unreferenced-resources", "{auto,no,yes}"),
+    ("stream-data", "{compress,preserve,uncompress}"),
+];
+
 /// One argv token with qpdf's raw byte representation and an OS-facing
 /// projection. Windows `OsString` cannot represent arbitrary bytes, so the
 /// projection is only for clap/path APIs; byte-oriented qpdf values must use
@@ -241,6 +285,19 @@ impl ArgParser {
                 residual_args.push(canonical);
                 continue;
             };
+            if let Some(parameter_name) = required_parameter_name(&option) {
+                if !has_attached_parameter(canonical.as_bytes()) {
+                    // qpdf raises this through `QPDFArgParser::usage`
+                    // (`QPDFArgParser.cc:506-508`), so it must render the
+                    // blank-line + `For help:` usage block, not a bare
+                    // `<prog>: <msg>` line. Route it through the shared
+                    // `UsageError` boundary that `usage_exit` formats.
+                    return Err(flpdf::UsageError::new(format!(
+                        "--{option} must be given as --{option}={parameter_name}"
+                    ))
+                    .into());
+                }
+            }
             let Some(kind) = SegmentKind::from_option(&option) else {
                 residual_args.push(canonical);
                 continue;
@@ -376,6 +433,16 @@ impl ArgParser {
             token
         }
     }
+}
+
+fn required_parameter_name(name: &str) -> Option<&'static str> {
+    QPDF_REQUIRED_PARAMETER_OPTIONS
+        .iter()
+        .find_map(|(option, parameter)| (*option == name).then_some(*parameter))
+}
+
+fn has_attached_parameter(arg: &[u8]) -> bool {
+    arg.contains(&b'=')
 }
 
 /// Expand qpdf's one-level `@file` argument syntax before option parsing.

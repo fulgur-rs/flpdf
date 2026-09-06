@@ -221,8 +221,7 @@ fn ignore_xref_streams_applies_to_a_copy_encryption_donor() {
         .unwrap()
         .args([
             "--ignore-xref-streams",
-            "--copy-encryption",
-            "../../tests/fixtures/compat/three-page-objstm.pdf",
+            "--copy-encryption=../../tests/fixtures/compat/three-page-objstm.pdf",
             "--encryption-file-password=",
             "../../tests/fixtures/minimal.pdf",
             output.to_str().unwrap(),
@@ -270,8 +269,7 @@ fn suppress_recovery_applies_to_a_copy_encryption_donor() {
         .unwrap()
         .args([
             "--suppress-recovery",
-            "--copy-encryption",
-            donor.to_str().unwrap(),
+            &format!("--copy-encryption={}", donor.display()),
             "--encryption-file-password=",
             "../../tests/fixtures/minimal.pdf",
             output.to_str().unwrap(),
@@ -2218,7 +2216,7 @@ fn check_with_repair_accepts_corrupt_xref() {
 #[test]
 fn dump_object_accepts_ref_without_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-object", "1 0", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["--show-object=1 0", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
@@ -2227,7 +2225,7 @@ fn dump_object_accepts_ref_without_suffix() {
 #[test]
 fn dump_object_accepts_ref_with_r_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-object", "1 0 R", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["--show-object=1 0 R", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
@@ -2236,7 +2234,7 @@ fn dump_object_accepts_ref_with_r_suffix() {
 #[test]
 fn show_object_invalid_selector_matches_qpdf_no_output() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-object", "bad", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["--show-object=bad", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
@@ -3010,6 +3008,7 @@ fn json_file_mode_writes_selected_historical_xref_stream_bytes_only() {
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let prefix = temp.path().join(format!("stream-{free_generation}"));
+        let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
         let output = Command::cargo_bin("flpdf")
             .unwrap()
             .args([
@@ -3017,9 +3016,8 @@ fn json_file_mode_writes_selected_historical_xref_stream_bytes_only() {
                 "--json-key=qpdf",
                 "--json-object=4,0",
                 "--json-stream-data=file",
-                "--json-stream-prefix",
             ])
-            .arg(&prefix)
+            .arg(&prefix_arg)
             .arg(fixture.path())
             .output()
             .unwrap();
@@ -3035,15 +3033,11 @@ fn json_file_mode_writes_selected_historical_xref_stream_bytes_only() {
         assert_eq!(std::fs::read(&side_path).unwrap().len(), 35);
 
         let unselected_prefix = temp.path().join(format!("unselected-{free_generation}"));
+        let unselected_prefix_arg = format!("--json-stream-prefix={}", unselected_prefix.display());
         let unselected = Command::cargo_bin("flpdf")
             .unwrap()
-            .args([
-                "--json=2",
-                "--json-key=pages",
-                "--json-stream-data=file",
-                "--json-stream-prefix",
-            ])
-            .arg(&unselected_prefix)
+            .args(["--json=2", "--json-key=pages", "--json-stream-data=file"])
+            .arg(&unselected_prefix_arg)
             .arg(fixture.path())
             .output()
             .unwrap();
@@ -3904,15 +3898,12 @@ fn json_side_file_error_emits_recorded_warning_after_partial_json_before_fatal_e
     let fixture = fixture_with_repaired_name_tree_and_stream();
     let temp = tempfile::tempdir().unwrap();
     let missing_prefix = temp.path().join("missing").join("stream");
+    let missing_prefix_arg = format!("--json-stream-prefix={}", missing_prefix.display());
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     let assert = cmd
-        .args([
-            "--json=2",
-            "--json-stream-data=file",
-            "--json-stream-prefix",
-        ])
-        .arg(&missing_prefix)
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&missing_prefix_arg)
         .arg(fixture.path())
         .assert()
         .code(2);
@@ -3972,15 +3963,12 @@ fn json_and_side_files_complete_before_warning_exit_three() {
     let temp = tempfile::tempdir().unwrap();
     let json_path = temp.path().join("out.json");
     let prefix = temp.path().join("stream");
+    let prefix_arg = format!("--json-stream-prefix={}", prefix.display());
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     let assert = cmd
-        .args([
-            "--json=2",
-            "--json-stream-data=file",
-            "--json-stream-prefix",
-        ])
-        .arg(&prefix)
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&prefix_arg)
         .arg(fixture.path())
         .arg(&json_path)
         .assert()
@@ -5786,13 +5774,7 @@ fn top_level_coalesce_contents_conflicts_with_rotate() {
     // Sibling of the --pages case.
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args([
-            "--coalesce-contents",
-            "--rotate",
-            "+90:1",
-            "in.pdf",
-            "out.pdf",
-        ])
+        .args(["--coalesce-contents", "--rotate=+90:1", "in.pdf", "out.pdf"])
         .assert()
         .failure()
         .code(2);
@@ -5889,8 +5871,7 @@ fn top_level_generate_appearances_conflicts_with_rotate() {
         .unwrap()
         .args([
             "--generate-appearances",
-            "--rotate",
-            "+90:1",
+            "--rotate=+90:1",
             "in.pdf",
             "out.pdf",
         ])

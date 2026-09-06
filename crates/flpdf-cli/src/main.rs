@@ -2574,6 +2574,14 @@ fn main() {
     } = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
+            // qpdf's arg parser raises its errors through
+            // `QPDFArgParser::usage` (`QPDFArgParser.cc:506-533`), rendered by
+            // the CLI's `usageExit` blank-line + `For help:` block. Route a
+            // pre-scan UsageError (e.g. `--password value`) through the same
+            // formatter so it matches qpdf byte-for-byte.
+            if let Some(usage_error) = find_usage_error(error.as_ref()) {
+                usage_exit(usage_error);
+            }
             emit_logger_error(format!("{}: {error}\n", progname()));
             std::process::exit(2);
         }
