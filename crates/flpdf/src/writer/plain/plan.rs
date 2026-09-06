@@ -117,9 +117,18 @@ impl PlainWritePlan {
             .count()
     }
 
+    #[cfg(test)]
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         options: &WriterOptions,
+    ) -> crate::Result<Self> {
+        Self::build_with_generated_id(pdf, options, None)
+    }
+
+    pub(crate) fn build_with_generated_id<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        options: &WriterOptions,
+        setup_generated_id: Option<&crate::ObjectHandle>,
     ) -> crate::Result<Self> {
         let source_root_ref = pdf.root_ref();
         let source_root_handle = if source_root_ref.is_none() {
@@ -311,10 +320,12 @@ impl PlainWritePlan {
         let generated_id = if deterministic_id || options.copy_encryption.is_some() {
             None
         } else {
-            Some(crate::writer::generate_id_handle(
-                source_id0.as_deref(),
-                options.static_id,
-            ))
+            setup_generated_id.cloned().or_else(|| {
+                Some(crate::writer::generate_id_handle(
+                    source_id0.as_deref(),
+                    options.static_id,
+                ))
+            })
         };
         let max_output = placement
             .objects
