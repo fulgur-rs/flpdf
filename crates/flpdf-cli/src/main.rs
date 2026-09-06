@@ -84,6 +84,7 @@ struct WriterOptions {
     copy_encryption: Option<CopyEncryptionSource>,
     preserve_encryption: bool,
     password_mode: PasswordMode,
+    allow_weak_crypto: bool,
 }
 
 impl Default for WriterOptions {
@@ -115,6 +116,7 @@ impl Default for WriterOptions {
             copy_encryption: None,
             preserve_encryption: true,
             password_mode: PasswordMode::default(),
+            allow_weak_crypto: false,
         }
     }
 }
@@ -211,6 +213,7 @@ fn top_level_writer_options(
         qdf: args.qdf,
         newline_before_endstream: args.newline_before_endstream.into(),
         password_mode: args.password.password_mode.into(),
+        allow_weak_crypto: args.password.allow_weak_crypto,
         ..WriterOptions::default()
     };
     apply_cli_decode_level(&mut options, args.decode_level);
@@ -353,6 +356,21 @@ fn writer_configuration(
             "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
             progname()
         ));
+    }
+    if !options.allow_weak_crypto
+        && options
+            .encrypt
+            .as_ref()
+            .is_some_and(EncryptParams::is_weak_rc4)
+    {
+        emit_logger_error(format!(
+            "{}: refusing to write a file with RC4, a weak cryptographic algorithm\n\
+             Please use 256-bit keys for better security.\n\
+             Pass --allow-weak-crypto to enable writing insecure files.\n\
+             See also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
+            progname()
+        ));
+        return Err("refusing to write a file with weak crypto".into());
     }
     Ok(configuration)
 }
@@ -3937,6 +3955,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // output preparation directly.
                 qdf: cmd.qdf,
                 password_mode: cmd.password.password_mode.into(),
+                allow_weak_crypto: cmd.password.allow_weak_crypto,
                 object_streams: cmd.object_streams.into(),
                 compress_streams: cmd.compress_streams.map(|mode| match mode {
                     CliYesNo::Yes => CompressStreams::Yes,
@@ -4208,7 +4227,7 @@ fn apply_encryption_options<T: RawCliArg>(
     suppress_warnings: bool,
 ) {
     if let Some(encrypt) = encrypt {
-        match parse_encrypt_segment(encrypt, password_args.allow_weak_crypto) {
+        match parse_encrypt_segment(encrypt) {
             Ok(parsed) => {
                 if parsed.accessibility_warning {
                     emit_logger_error(format!(
@@ -4434,10 +4453,7 @@ fn unrecognized_encrypt_argument(token: &str, key_len: Option<u32>) -> String {
     )
 }
 
-fn parse_encrypt_segment<T: RawCliArg>(
-    tokens: &[T],
-    allow_weak_crypto: bool,
-) -> CliResult<ParsedEncryptSegment> {
+fn parse_encrypt_segment<T: RawCliArg>(tokens: &[T]) -> CliResult<ParsedEncryptSegment> {
     if tokens.is_empty() {
         return Err("--encrypt requires USER-PW OWNER-PW KEY-LEN".into());
     }
@@ -4703,20 +4719,6 @@ fn parse_encrypt_segment<T: RawCliArg>(
         return Err("--encrypt KEY-LEN=256 does not accept --force-V4 or --use-aes".into());
     }
 
-    let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {
-        if !allow_weak_crypto && params.is_weak_rc4() {
-            emit_logger_error(format!(
-                "{}: refusing to write a file with RC4, a weak cryptographic algorithm\n\
-                 Please use 256-bit keys for better security.\n\
-                 Pass --allow-weak-crypto to enable writing insecure files.\n\
-                 See also https://qpdf.readthedocs.io/en/stable/weak-crypto.html\n",
-                progname()
-            ));
-            return Err("refusing to write a file with weak crypto".into());
-        }
-        Ok(params)
-    };
-
     let method = match key_len {
         40 => EncryptMethod::V1Rc440,
         128 if force_v4 || cleartext_metadata => {
@@ -4790,7 +4792,7 @@ fn parse_encrypt_segment<T: RawCliArg>(
     };
 
     Ok(ParsedEncryptSegment {
-        params: guard_weak(params)?,
+        params,
         accessibility_warning: accessibility_explicitly_disabled
             && matches!(
                 method,
@@ -9030,11 +9032,9 @@ mod tests {
             preprocessed.raw_overrides.raw_encrypt.as_ref().unwrap()[0],
             b"user-\xff"
         );
-        let parsed_encrypt = parse_encrypt_segment(
-            preprocessed.raw_overrides.raw_encrypt.as_ref().unwrap(),
-            true,
-        )
-        .expect("raw encrypt passwords should reach the byte parser");
+        let parsed_encrypt =
+            parse_encrypt_segment(preprocessed.raw_overrides.raw_encrypt.as_ref().unwrap())
+                .expect("raw encrypt passwords should reach the byte parser");
         assert_eq!(parsed_encrypt.params.user_password, b"user-\xff");
 
         let donor_path = directory.path().join("donor-args");
@@ -9853,7 +9853,7 @@ mod tests {
 
     #[test]
     fn non_bare_hyphen_encrypt_password_is_rejected() {
-        let err = parse_encrypt_segment(&strs(&["-user", "owner", "128"]), true)
+        let err = parse_encrypt_segment(&strs(&["-user", "owner", "128"]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("unrecognized argument -user"), "got: {err}");
@@ -9861,7 +9861,7 @@ mod tests {
 
     #[test]
     fn bare_hyphen_encrypt_password_is_accepted() {
-        let params = parse_encrypt_segment(&strs(&["-", "-", "128"]), true)
+        let params = parse_encrypt_segment(&strs(&["-", "-", "128"]))
             .unwrap()
             .params;
         assert_eq!(params.user_password, b"-");
@@ -9870,10 +9870,11 @@ mod tests {
 
     #[test]
     fn encrypt_parser_accepts_dashed_passwords_and_bits_before_the_terminator() {
-        let params = parse_encrypt_segment(
-            &strs(&["--user-password=u", "--bits=256", "--allow-insecure"]),
-            false,
-        )
+        let params = parse_encrypt_segment(&strs(&[
+            "--user-password=u",
+            "--bits=256",
+            "--allow-insecure",
+        ]))
         .expect("qpdf dashed encryption form")
         .params;
         assert_eq!(params.method, EncryptMethod::V5R6Aes256);
@@ -9883,7 +9884,7 @@ mod tests {
 
     #[test]
     fn encrypt_parser_rejects_mixed_positional_and_dashed_passwords() {
-        let error = parse_encrypt_segment(&strs(&["user", "--owner-password=owner", "128"]), true)
+        let error = parse_encrypt_segment(&strs(&["user", "--owner-password=owner", "128"]))
             .expect_err("mixed encryption form");
         assert!(error
             .to_string()
@@ -9892,18 +9893,15 @@ mod tests {
 
     #[test]
     fn encrypt_parser_keeps_r2_permissions_separate_from_r3_permissions() {
-        let parsed = parse_encrypt_segment(
-            &strs(&[
-                "user",
-                "owner",
-                "40",
-                "-print=n",
-                "-modify=y",
-                "-extract=n",
-                "-annotate=y",
-            ]),
-            true,
-        )
+        let parsed = parse_encrypt_segment(&strs(&[
+            "user",
+            "owner",
+            "40",
+            "-print=n",
+            "-modify=y",
+            "-extract=n",
+            "-annotate=y",
+        ]))
         .expect("R=2 encryption options");
         assert_eq!(parsed.params.method, EncryptMethod::V1Rc440);
         assert!(!parsed.params.r2_permissions.print);
@@ -9915,10 +9913,13 @@ mod tests {
 
     #[test]
     fn encrypt_parser_reports_ignored_accessibility_for_modern_revisions() {
-        let parsed = parse_encrypt_segment(
-            &strs(&["user", "owner", "128", "--force-V4", "--accessibility=n"]),
-            true,
-        )
+        let parsed = parse_encrypt_segment(&strs(&[
+            "user",
+            "owner",
+            "128",
+            "--force-V4",
+            "--accessibility=n",
+        ]))
         .expect("modern encryption options");
         assert!(parsed.accessibility_warning);
         assert_eq!(parsed.params.method, EncryptMethod::V4Rc4128);

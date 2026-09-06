@@ -169,6 +169,39 @@ fn top_level_encrypt_unicode_mode_rejects_invalid_utf8_password() {
 }
 
 #[test]
+fn auto_password_warning_precedes_weak_crypto_refusal() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let output = temp.path().join("encrypted.pdf");
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password-mode=auto",
+            "--encrypt",
+            "日本",
+            "owner",
+            "128",
+            "--",
+        ])
+        .arg(input)
+        .arg(output)
+        .output()
+        .unwrap();
+
+    assert_eq!(result.status.code(), Some(2));
+    let expected = format!(
+        "flpdf: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.){EOL}\
+flpdf: refusing to write a file with RC4, a weak cryptographic algorithm{EOL}\
+Please use 256-bit keys for better security.{EOL}\
+Pass --allow-weak-crypto to enable writing insecure files.{EOL}\
+See also https://qpdf.readthedocs.io/en/stable/weak-crypto.html{EOL}\
+flpdf: refusing to write a file with weak crypto{EOL}"
+    );
+    assert_eq!(result.stderr, expected.as_bytes());
+}
+
+#[test]
 fn auto_mode_authenticates_composed_nfc_password() {
     // The fixture was qpdf-encrypted with user password "café" (NFC composed).
     check_cmd("v5-aes-256-r6-utf8.pdf", "café", None)
