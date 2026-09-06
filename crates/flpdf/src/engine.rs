@@ -662,7 +662,7 @@ impl Pdf<Cursor<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::Pdf;
+    use super::{Pdf, EMPTY_PDF_BYTES};
     use crate::{Error, PdfOpenOptions};
     use std::io::{Read, Seek, SeekFrom};
 
@@ -722,5 +722,18 @@ mod tests {
         assert!(
             matches!(error, Error::Internal(message) if message == "QPDF::processMemoryFile must be called before a process method")
         );
+    }
+
+    #[test]
+    fn memory_processing_installs_a_successful_source_and_preserves_document_identity() {
+        let mut pdf = Pdf::uninitialized();
+        let unique_id = pdf.unique_id;
+
+        pdf.process_memory_file(b"empty PDF", EMPTY_PDF_BYTES.to_vec())
+            .expect("qpdf memory processing should install a valid source");
+
+        assert!(pdf.parsed);
+        assert_eq!(pdf.unique_id, unique_id);
+        assert!(pdf.root_handle().is_ok());
     }
 }

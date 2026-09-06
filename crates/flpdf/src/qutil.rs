@@ -139,9 +139,11 @@ pub fn int_to_string_base(number: i64, base: i32, length: i32) -> crate::Result<
         }
     };
 
+    // cov:ignore-start: qpdf length is an i32 and the supported target is 64-bit
     let width = usize::try_from(i64::from(length).unsigned_abs()).map_err(|_| {
         crate::Error::Internal("int_to_string_base length does not fit usize".to_owned())
     })?;
+    // cov:ignore-end
     if length > 0 && converted.len() < width {
         let mut padded = String::with_capacity(width);
         padded.extend(std::iter::repeat_n('0', width - converted.len()));
@@ -176,16 +178,18 @@ pub fn to_utf8(mut value: u32) -> crate::Result<Vec<u8>> {
         bytes[cursor] = 0x80 | (value as u8 & 0x3f);
         value >>= 6;
         max_value >>= 1;
+        // cov:ignore-start: qpdf accepts at most 31-bit values, which cannot exhaust the six-byte buffer
         if cursor == 0 {
             return Err(crate::Error::Internal(
                 "QUtil::toUTF8: overflow error".to_owned(),
             ));
         }
+        // cov:ignore-end
         cursor -= 1;
     }
     let first = 0xffu32 - (1 + (u32::from(max_value) << 1)) + value;
     bytes[cursor] = u8::try_from(first)
-        .map_err(|_| crate::Error::Internal("QUtil::toUTF8: overflow error".to_owned()))?;
+        .map_err(|_| crate::Error::Internal("QUtil::toUTF8: overflow error".to_owned()))?; // cov:ignore: qpdf's bounded encoding keeps the leading byte within u8
     Ok(bytes[cursor..].to_vec())
 }
 
@@ -467,10 +471,43 @@ mod tests {
             .expect("write appended chunk");
         drop(appender);
 
+        let mut append_plus = safe_fopen(path, "a+").expect("open plus append mode");
+        append_plus
+            .write_all(b" third")
+            .expect("write plus append chunk");
+        drop(append_plus);
+
         let mut reader = safe_fopen(path, "rb").expect("open file for reading");
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).expect("read file");
-        assert_eq!(bytes, b"first second");
+        assert_eq!(bytes, b"first second third");
+    }
+
+    #[test]
+    fn safe_fopen_covers_plus_exclusive_and_invalid_modes() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let plus_path = directory.path().join("plus");
+        let plus_path = plus_path.to_str().expect("temporary path is UTF-8");
+        let mut writer = safe_fopen(plus_path, "w+").expect("open plus write mode");
+        writer.write_all(b"plus").expect("write plus-mode data");
+        drop(writer);
+        let _reader = safe_fopen(plus_path, "r+").expect("open plus read mode");
+
+        let exclusive_path = directory.path().join("exclusive");
+        let exclusive_path = exclusive_path.to_str().expect("temporary path is UTF-8");
+        let _exclusive = safe_fopen(exclusive_path, "wx").expect("create exclusive file");
+        assert!(safe_fopen(exclusive_path, "wx").is_err());
+
+        let append_exclusive_path = directory.path().join("append-exclusive");
+        let append_exclusive_path = append_exclusive_path
+            .to_str()
+            .expect("temporary path is UTF-8");
+        let _append_exclusive =
+            safe_fopen(append_exclusive_path, "ax").expect("create append-exclusive file");
+
+        assert!(safe_fopen(plus_path, "").is_err());
+        assert!(safe_fopen(plus_path, "r?").is_err());
+        assert!(safe_fopen(plus_path, "z").is_err());
     }
 
     #[test]
