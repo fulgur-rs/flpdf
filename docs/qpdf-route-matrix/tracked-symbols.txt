@@ -103,7 +103,7 @@ crates/flpdf/src/pdf.rs::dirty_object_refs                               # A18�
 crates/flpdf/src/pdf.rs::handle_mutated_object_refs                      # A18（フィールド）
 crates/flpdf/src/xref.rs::BootstrapCache                                 # A20 第 2 の teardown walk
 crates/flpdf/src/reader/resolver.rs::read_window                         # A22
-crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23
+crates/flpdf/src/object_handle.rs::legacy_dictionary_key                 # A23（parser/writer残caller。stream_filterは.48.36でcutover済み）
 crates/flpdf/src/pdf.rs::compressed_member_parents                       # A24（フィールド）
 
 # --- (b) baseline denominator ---
