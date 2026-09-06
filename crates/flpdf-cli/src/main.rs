@@ -498,12 +498,16 @@ impl std::error::Error for CliExitError {}
 #[derive(Debug)]
 struct CliPathError {
     path: Vec<u8>,
+    operation: Option<&'static str>,
     message: String,
     source: Box<dyn std::error::Error>,
 }
 
 impl std::fmt::Display for CliPathError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(operation) = self.operation {
+            write!(formatter, "{operation} ")?;
+        }
         write!(
             formatter,
             "{}: {}",
@@ -3069,6 +3073,10 @@ fn main() {
         if let Some(path_error) = error.downcast_ref::<CliPathError>() {
             let mut line = progname().into_bytes();
             line.extend_from_slice(b": ");
+            if let Some(operation) = path_error.operation {
+                line.extend_from_slice(operation.as_bytes());
+                line.push(b' ');
+            }
             line.extend_from_slice(&path_error.path);
             line.extend_from_slice(b": ");
             line.extend_from_slice(path_error.message.as_bytes());
@@ -3436,7 +3444,7 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
         if cli.json_input {
             qpdf_json_input_open_error(input, error)
         } else {
-            error_with_file(input, error.into())
+            open_error_with_file(input, error.into())
         }
     })?;
 
@@ -3882,7 +3890,7 @@ fn run_check(
     show_encryption_key: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
@@ -3910,7 +3918,7 @@ fn run_check_linearization(
     no_warn: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
@@ -5328,7 +5336,7 @@ fn build_overlay_specs_with_suppression(
     let mut built = Vec::with_capacity(specs.len());
     for spec in specs {
         let path = PathBuf::from(spec.file.as_os_str());
-        let file = File::open(&path).map_err(|error| error_with_file(&path, error.into()))?;
+        let file = File::open(&path).map_err(|error| open_error_with_file(&path, error.into()))?;
         // Overlay sources are read-only; qpdf accepts weak-crypto opens
         // unconditionally because its flag only gates writes. Retain the
         // command-wide open policy (including recovery and xref handling),
@@ -7124,7 +7132,7 @@ fn run_show_linearization(
     no_warn: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
@@ -7184,7 +7192,7 @@ fn probe_encryption(
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<EncryptionProbe> {
-    let file = File::open(input)?;
+    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -7340,7 +7348,7 @@ fn run_show_encryption(
     no_warn: bool,
     show_encryption_key: bool,
 ) -> CliResult<()> {
-    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
@@ -7515,7 +7523,7 @@ fn open_page_source(
     configure_document_logger(&mut options, input);
     options.suppress_warnings = suppress_warnings;
     let mut pdf = Pdf::<Box<dyn flpdf::ReadSeek>>::open_file_with_options(input, options)
-        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+        .map_err(|error| open_error_with_file(input, actionable_password_error(error)))?;
     pdf.root_handle()
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     pdf.set_input_source_stay_open(stay_open);
@@ -7545,7 +7553,7 @@ fn open_pdf_for_inspection(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
     open_pdf_file_impl(input, file, repair, password, false, true)
 }
 
@@ -7573,7 +7581,7 @@ fn open_pdf_impl(
     password: &PasswordArgs,
     suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    let file = File::open(input).map_err(|error| open_error_with_file(input, error.into()))?;
     open_pdf_file_impl(input, file, repair, password, suppress_warnings, false)
 }
 
@@ -7899,16 +7907,73 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     finish_warning_state(true, creates_output, no_warn)
 }
 
-/// Prefix a fatal error with the input path so main() renders the observed
-/// qpdf shape `<progname>: <file>: <msg>` for open failures.
+/// Prefix a fatal post-open error with the input path so main() renders the
+/// qpdf shape `<progname>: <file>: <msg>` for path-scoped failures.
 ///
 /// This type-erases the error; do not downcast the result.
 fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn std::error::Error> {
     Box::new(CliPathError {
         path: path_description(input),
+        operation: None,
         message: error.to_string(),
         source: error,
     })
+}
+
+/// Prefix a fatal input-open error with qpdf's `open ` operation and normalize
+/// Rust's platform-specific I/O rendering. This mirrors `QUtil::safe_fopen`
+/// (`libqpdf/QUtil.cc:512-515`) and `QPDFSystemError::createWhat`
+/// (`libqpdf/QPDFSystemError.cc:13-29`). The path is kept as raw bytes so the
+/// CLI preserves non-UTF-8 Unix arguments just as qpdf's `std::string`
+/// boundary does.
+fn open_error_with_file(
+    input: &Path,
+    error: Box<dyn std::error::Error>,
+) -> Box<dyn std::error::Error> {
+    let io_error = error.downcast_ref::<std::io::Error>().or_else(|| {
+        match error.downcast_ref::<flpdf::Error>() {
+            Some(flpdf::Error::FileIo {
+                operation: "open",
+                source,
+                ..
+            }) => Some(source),
+            _ => None,
+        }
+    });
+    let Some(io_error) = io_error else {
+        return error_with_file(input, error);
+    };
+    let message = qpdf_open_io_error_message(io_error);
+    Box::new(CliPathError {
+        path: path_description(input),
+        operation: Some("open"),
+        message,
+        source: error,
+    })
+}
+
+/// Match qpdf's `QPDFSystemError::createWhat`: use the C-runtime wording and
+/// omit Rust's numeric `(os error N)` suffix. qpdf uses the portable
+/// not-found wording on every supported host.
+fn qpdf_open_io_error_message(error: &std::io::Error) -> String {
+    let message = match error.kind() {
+        std::io::ErrorKind::NotFound => Some("No such file or directory"),
+        std::io::ErrorKind::PermissionDenied => Some("Permission denied"),
+        std::io::ErrorKind::AlreadyExists => Some("File exists"),
+        std::io::ErrorKind::InvalidInput => Some("Invalid argument"),
+        std::io::ErrorKind::IsADirectory => Some("Is a directory"),
+        std::io::ErrorKind::NotADirectory => Some("Not a directory"),
+        _ => None,
+    };
+    if let Some(message) = message {
+        return message.to_owned();
+    }
+    let rendered = error.to_string();
+    error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered)
+        .to_owned()
 }
 
 fn json_error_with_file(
@@ -7923,6 +7988,7 @@ fn json_error_with_file(
         .map_or_else(|| error.to_string(), str::to_owned);
     Box::new(CliPathError {
         path,
+        operation: None,
         message,
         source: error,
     })
@@ -8178,7 +8244,7 @@ fn run_add_attachment(
     // info lines go to stderr when the PDF goes to stdout.
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
-    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -8376,7 +8442,7 @@ fn run_copy_attachments_from(
     // info lines go to stderr when the PDF goes to stdout.
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
-    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let file = File::open(&input).map_err(|error| open_error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
@@ -8407,8 +8473,8 @@ fn run_copy_attachments_from(
             pdf_open_options_with_password_bytes(repair, &source_password, args.password);
         configure_document_logger(&mut src_options, &args.file);
         src_options.suppress_warnings |= suppress_warnings;
-        let src_file =
-            File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
+        let src_file = File::open(&args.file)
+            .map_err(|error| open_error_with_file(&args.file, error.into()))?;
         let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
             .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
         src.root_handle()
@@ -8707,6 +8773,30 @@ mod tests {
             error.to_string(),
             "open missing.json: No such file or directory"
         );
+    }
+
+    #[test]
+    fn open_error_with_file_keeps_non_io_errors_outside_open_prefix() {
+        let error = open_error_with_file(
+            Path::new("bad.pdf"),
+            flpdf::Error::parse(0, "malformed PDF").into(),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "bad.pdf: parse error at byte 0: malformed PDF"
+        );
+    }
+
+    #[test]
+    fn qpdf_open_io_error_uses_portable_permission_text() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert_eq!(qpdf_open_io_error_message(&error), "Permission denied");
+        let error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+        assert_eq!(qpdf_open_io_error_message(&error), "File exists");
+        let error = std::io::Error::other("native fallback");
+        assert_eq!(qpdf_open_io_error_message(&error), "native fallback");
     }
 
     #[test]

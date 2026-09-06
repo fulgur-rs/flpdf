@@ -534,24 +534,67 @@ fn qpdf_differential_matches_routed_output_matrix() {
 }
 
 #[test]
-fn qpdf_differential_classifies_existing_native_open_error_text_gap() {
+fn qpdf_differential_matches_missing_input_open_error_on_all_input_routes() {
     if !qpdf_available() {
         eprintln!("qpdf not available; skipping logger routing differential");
         return;
     }
 
-    let missing = "/tmp/flpdf-qynx4-cli-logger-missing.pdf";
-    let qpdf = run_qpdf(&["--check", missing]);
-    let flpdf = run_flpdf(&["--check", missing]);
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing = directory.path().join("missing.pdf");
+    let rewrite_output = directory.path().join("rewrite-output.pdf");
+    let pages_output = directory.path().join("pages-output.pdf");
+    let missing = missing.to_str().expect("UTF-8 temporary path");
+    let rewrite_output = rewrite_output.to_str().expect("UTF-8 temporary path");
+    let pages_output = pages_output.to_str().expect("UTF-8 temporary path");
 
-    assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert!(!qpdf.stderr.is_empty());
-    assert!(!flpdf.stderr.is_empty());
-    assert_ne!(
-        flpdf.stderr, qpdf.stderr,
-        "native I/O error formatting is an existing oracle mismatch, not a logger route mismatch"
+    let cases = [
+        ("plain rewrite", vec![missing, rewrite_output]),
+        ("--check", vec!["--check", missing]),
+        (
+            "--empty --pages",
+            vec!["--empty", "--pages", missing, "--", pages_output],
+        ),
+        (
+            "--copy-attachments-from",
+            vec![
+                "--copy-attachments-from",
+                missing,
+                "--",
+                ONE_PAGE,
+                rewrite_output,
+            ],
+        ),
+    ];
+    for (label, args) in cases {
+        let qpdf = run_qpdf(&args);
+        let flpdf = run_flpdf(&args);
+        assert_observables_equal(label, &qpdf, &flpdf, true);
+    }
+
+    let encrypted = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/encrypted/v4-aes-128-r4.pdf"
     );
+    let qpdf = run_qpdf(&[
+        ONE_PAGE,
+        "--pages",
+        encrypted,
+        "--password=wrong",
+        "1",
+        "--",
+        pages_output,
+    ]);
+    let flpdf = run_flpdf(&[
+        ONE_PAGE,
+        "--pages",
+        encrypted,
+        "--password=wrong",
+        "1",
+        "--",
+        pages_output,
+    ]);
+    assert_observables_equal("secondary source authentication", &qpdf, &flpdf, true);
 }
 
 #[cfg(target_os = "linux")]
