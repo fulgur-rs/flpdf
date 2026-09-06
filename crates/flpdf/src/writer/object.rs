@@ -3935,4 +3935,64 @@ mod tests {
         assert!(error.to_string().contains("reserved object"));
         Ok(())
     }
+
+    #[test]
+    fn stream_dictionary_owner_handles_missing_crypt_parameters_and_qdf_filter_append() -> Result<()>
+    {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::name(b"Crypt".to_vec()),
+                        ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                    ]),
+                ),
+                (b"/Length".to_vec(), ObjectHandle::integer(3)),
+            ]),
+            Rc::new(b"abc".to_vec()),
+        );
+        let map = |object_ref: ObjectRef| Ok(object_ref);
+        let mut compact = Vec::new();
+        stream.write_stream_body_with_ref_map_and_removed_with_options(
+            &mut compact,
+            StreamDictionaryOptions::preserve(),
+            &map,
+            &BTreeSet::new(),
+        )?;
+        assert!(String::from_utf8_lossy(&compact).contains("/Filter [ /ASCIIHexDecode ]"));
+
+        let policy = StreamDictionaryOptions::new(true, true);
+        let mut qdf = Vec::new();
+        stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+            &mut qdf,
+            0,
+            &map,
+            &BTreeSet::new(),
+            None,
+            policy,
+        )?;
+        let qdf_text = String::from_utf8(qdf).unwrap();
+        assert!(qdf_text.contains("/Filter /FlateDecode"));
+        assert!(!qdf_text.contains("ASCIIHexDecode"));
+
+        let mut qdf_string = Vec::new();
+        let mut callback = |out: &mut Vec<u8>, value: &[u8]| {
+            out.extend_from_slice(value);
+            Ok(())
+        };
+        stream.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
+            &mut qdf_string,
+            0,
+            &map,
+            &BTreeSet::new(),
+            None,
+            policy,
+            &mut callback,
+        )?;
+        assert!(String::from_utf8(qdf_string)
+            .unwrap()
+            .contains("/Filter /FlateDecode"));
+        Ok(())
+    }
 }

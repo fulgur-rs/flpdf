@@ -53,6 +53,32 @@ fn refiltered_stream_retains_external_file_dictionary_keys() {
     );
 }
 
+#[test]
+fn linearized_unencrypted_stream_uses_the_same_dictionary_owner() {
+    let mut pdf = Pdf::open_mem_owned(
+        include_bytes!("../../../tests/fixtures/compat/lone-flate-l9.pdf").to_vec(),
+    )
+    .unwrap();
+    let stream = pdf
+        .new_stream_with_data(Rc::new(b"q Q\n".to_vec()))
+        .unwrap();
+    add_external_keys(&stream);
+    pdf.root_handle()
+        .unwrap()
+        .replace_key(b"/Extra", stream)
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_compress_streams(true);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let bytes = writer.get_buffer().unwrap();
+    assert!(bytes
+        .windows(b"external.bin".len())
+        .any(|window| window == b"external.bin"));
+}
+
 fn rewrite_stream(
     configure_stream: impl FnOnce(&ObjectHandle),
     configure_writer: impl FnOnce(&mut PdfWriter<'_, std::io::Cursor<Vec<u8>>>),

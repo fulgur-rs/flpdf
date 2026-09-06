@@ -348,3 +348,55 @@ pub(crate) fn write_encryption_dictionary_handle(
     out.extend_from_slice(b" >>");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encryption::standard::ObjectKeyAlg;
+    use crate::writer::{StreamDictionaryOptions, WriteCipher};
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+
+    #[test]
+    fn unencrypted_qdf_stream_dict_uses_the_shared_dictionary_policy() {
+        let context = EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let dict = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                ),
+                (b"/Length".to_vec(), ObjectHandle::integer(3)),
+            ]),
+            Rc::new(b"abc".to_vec()),
+        );
+        let mut output = Vec::new();
+        emitter
+            .write_handle_stream_dict_with_ref_map(
+                &mut output,
+                ObjectRef::new(3, 0),
+                None,
+                &dict,
+                StreamDictOptions::new(true, StreamDictionaryOptions::new(true, true), false),
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+                None,
+            )
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("/Filter /FlateDecode"));
+        assert!(!text.contains("ASCIIHexDecode"));
+    }
+}

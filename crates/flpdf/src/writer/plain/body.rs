@@ -1202,7 +1202,9 @@ fn planned_member_body_violation(
 
 #[cfg(test)]
 mod final_handle_tests {
-    use super::emit_content_container_from_handle_with_ref_map;
+    use super::{
+        canonical_stream_output_for_rewrite, emit_content_container_from_handle_with_ref_map,
+    };
     use crate::writer::{NewlineBeforeEndstream, WriterOptions};
     use crate::ObjectHandle;
     use std::collections::BTreeSet;
@@ -1240,6 +1242,23 @@ mod final_handle_tests {
         assert!(output
             .windows(b"stream\ndata\nendstream".len())
             .any(|window| { window == b"stream\ndata\nendstream" }));
+    }
+
+    #[test]
+    fn rewrite_wrapper_returns_the_shared_stream_dictionary_policy() {
+        let pdf = crate::Pdf::empty().unwrap();
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"q Q\n".to_vec()))
+            .unwrap();
+        let (dictionary, data, policy) =
+            canonical_stream_output_for_rewrite(&stream, &WriterOptions::default(), false)
+                .expect("canonical rewrite stream output");
+        assert!(!data.is_empty());
+        assert_eq!(
+            dictionary.try_get_key(b"/Length").unwrap().as_integer(),
+            Some(data.len() as i64)
+        );
+        assert!(policy.add_flate_filter);
     }
 }
 
