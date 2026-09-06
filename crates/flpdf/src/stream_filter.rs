@@ -2027,6 +2027,37 @@ mod tests {
         assert!(!invalid_type_filter.set_decode_params(&invalid_type));
     }
 
+    #[test]
+    fn lzw_reader_consumes_only_canonical_early_change_keys() {
+        fn decode_params(filter_name: &[u8], key: &[u8], value: i64) -> DecodeParams {
+            let params = ObjectHandle::dictionary(vec![]);
+            params
+                .replace_key(key, ObjectHandle::integer(value))
+                .expect("decode parameter dictionary is mutable");
+            super::decode_params_from_handle(&params, filter_name)
+                .expect("decode parameters are readable")
+        }
+
+        for (value, expected_filterable, expected_early_change) in
+            [(0, true, false), (1, true, true), (2, false, false)]
+        {
+            let params = decode_params(b"LZWDecode", b"/EarlyChange", value);
+            let mut filter = FlateLzwStreamFilter::new(true);
+            assert_eq!(filter.set_decode_params(&params), expected_filterable);
+            assert_eq!(filter.early_code_change, expected_early_change);
+        }
+
+        let raw = decode_params(b"LZWDecode", b"EarlyChange", 0);
+        let mut raw_filter = FlateLzwStreamFilter::new(true);
+        assert!(raw_filter.set_decode_params(&raw));
+        assert!(raw_filter.early_code_change);
+
+        let flate = decode_params(b"FlateDecode", b"/EarlyChange", 0);
+        let mut flate_filter = FlateLzwStreamFilter::new(false);
+        assert!(flate_filter.set_decode_params(&flate));
+        assert!(flate_filter.early_code_change);
+    }
+
     fn wide_tiff_filter() -> FlateLzwStreamFilter {
         let mut filter = FlateLzwStreamFilter::new(false);
         assert!(filter.set_decode_params(&wide_tiff_decode_params()));
