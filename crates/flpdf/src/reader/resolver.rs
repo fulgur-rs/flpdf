@@ -137,6 +137,26 @@ pub(crate) const CLOSED_INPUT_SOURCE_NAME: &str = "closed input source";
 /// `last_offset` in one `Rc` gives the Rust port the same ownership boundary:
 /// a deferred foreign-stream provider can outlive its source resolver while
 /// still using the source input and its logical offset coordinates.
+#[derive(Debug)]
+enum StreamReadError {
+    /// The wrapped reader failed while delivering the requested bytes. qpdf
+    /// turns this `fread`/`ferror` case into `read N bytes` when the source has
+    /// a description (`FileInputSource.cc:116-127`).
+    UnderlyingRead(Error),
+    /// A different input operation failed while implementing the read
+    /// contract, such as qpdf's EOF normalization seek. This must retain its
+    /// own error classification and message.
+    Operation(Error),
+}
+
+impl StreamReadError {
+    fn into_error(self) -> Error {
+        match self {
+            Self::UnderlyingRead(error) | Self::Operation(error) => error,
+        }
+    }
+}
+
 struct StreamInput<R: Read + Seek + 'static> {
     /// `None` is qpdf's `InvalidInputSource`. The input source is held behind
     /// an `Rc` and replaced, rather than mutated, when it is closed so a
@@ -213,17 +233,20 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         Ok(())
     }
 
-    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&self, buf: &mut [u8]) -> std::result::Result<usize, StreamReadError> {
         self.last_offset
             .set(self.tell().unwrap_or(self.last_offset.get()));
-        let mut reader = self.active_reader()?.borrow_mut();
+        let mut reader = self
+            .active_reader()
+            .map_err(StreamReadError::Operation)?
+            .borrow_mut();
         let mut filled = 0;
         while filled < buf.len() {
             match reader.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Ok(read) => filled += read,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(StreamReadError::UnderlyingRead(error.into())),
             }
         }
         if filled == 0 && !buf.is_empty() {
@@ -232,7 +255,9 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
             // (libqpdf/FileInputSource.cc:115-132). A seekable Rust reader
             // may retain an attempted position beyond EOF, so reproduce that
             // observable InputSource contract explicitly.
-            let end = reader.seek(SeekFrom::End(0))?;
+            let end = reader
+                .seek(SeekFrom::End(0))
+                .map_err(|error| StreamReadError::Operation(error.into()))?;
             self.last_offset
                 .set(end.saturating_sub(self.header_offset as u64));
         }
@@ -648,7 +673,9 @@ impl<R: Read + Seek> ResolverCore<R> {
         let result = self.input.borrow().read(buf);
         match result {
             Ok(read) => Ok(read),
-            Err(Error::Io(_error)) if !self.description.is_empty() => {
+            Err(StreamReadError::UnderlyingRead(Error::Io(_error)))
+                if !self.description.is_empty() =>
+            {
                 let message = format!("read {} bytes", buf.len());
                 let offset = self.input.borrow().last_offset();
                 let what =
@@ -659,7 +686,8 @@ impl<R: Read + Seek> ResolverCore<R> {
                 // the platform errno is intentionally not part of what().
                 Err(Error::SystemBytes(what))
             }
-            Err(error) => Err(error),
+            Err(StreamReadError::UnderlyingRead(error))
+            | Err(StreamReadError::Operation(error)) => Err(error),
         }
     }
 
@@ -4109,7 +4137,7 @@ fn attempt_pipe_stream_data_for_input<R: Read + Seek + 'static>(
         Err(error) => {
             return Some(PipeFailure::Decoding {
                 at: input.last_offset(),
-                detail: error.to_string(),
+                detail: error.into_error().to_string(),
             })
         }
     }
@@ -12387,6 +12415,53 @@ mod tests {
         assert!(rendered.starts_with("input.pdf"), "{rendered}");
         assert!(rendered.contains(": read "), "{rendered}");
         assert!(rendered.ends_with(" bytes"), "{rendered}");
+    }
+
+    /// A described source that reaches EOF but cannot perform qpdf's
+    /// normalization seek must preserve that seek failure instead of
+    /// reporting a failed read.
+    #[test]
+    fn a_described_input_source_preserves_eof_normalization_seek_failures() {
+        struct EofSeekFails;
+
+        impl std::io::Read for EofSeekFails {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl std::io::Seek for EofSeekFails {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                match position {
+                    std::io::SeekFrom::Current(0) => Ok(0),
+                    std::io::SeekFrom::End(0) => {
+                        Err(std::io::Error::other("EOF normalization seek failed"))
+                    }
+                    _ => panic!("unexpected seek during the direct read probe"),
+                }
+            }
+        }
+
+        let resolver = ResolverHandle::new_shared(
+            EofSeekFails,
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, b"input.pdf".to_vec()),
+            0,
+        );
+        let error = resolver
+            .core
+            .borrow_mut()
+            .read(&mut [0; 1])
+            .expect_err("the EOF normalization seek failure must propagate");
+
+        assert!(
+            matches!(&error, Error::Io(error) if error.to_string() == "EOF normalization seek failed"),
+            "the seek failure must not be rewritten as a read failure, got {error:?}"
+        );
     }
 
     /// Two nested [`super::ResolverHandle::read_stream`] frames each keep their
