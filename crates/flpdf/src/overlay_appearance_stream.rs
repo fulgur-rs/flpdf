@@ -27,6 +27,9 @@ use std::rc::Rc;
 
 use crate::acroform_document_helper::DrMap;
 use crate::object_handle::{ObjectHandle, ResourceConflicts};
+use crate::resource_finder::ResourceFinder;
+use crate::resource_replacer::filter_resource_names;
+#[cfg(test)]
 use crate::resource_replacer::replace_resource_names_with_context;
 use crate::writer::DecodeLevel;
 use crate::{Pdf, Result};
@@ -44,14 +47,24 @@ fn rewrite_appearance_content_with_context(
     dr_map: &DrMap,
     stream: &ObjectHandle,
 ) -> Result<Vec<u8>> {
-    match replace_resource_names_with_context(decoded, dr_map.renames(), stream.context()) {
-        Ok(Some(bytes)) => Ok(bytes),
-        Ok(None) => Ok(decoded.to_vec()),
+    // qpdf parses the actual appearance stream with parseAsContents before
+    // installing ResourceReplacer, so warnings identify the stream object
+    // rather than an anonymous decoded byte fragment
+    // (`QPDFAcroFormDocumentHelper.cc:680-695`).
+    let mut finder = ResourceFinder::default();
+    if let Err(error) = stream.parse_as_contents(&mut finder) {
+        // qpdf catches parseAsContents exceptions and sends this second
+        // warning through the appearance stream itself. A warning-sink
+        // failure from this call must escape the appearance adjustment.
+        stream.warn_if_possible(&format!("Unable to parse appearance stream: {error}"))?;
+        return Ok(decoded.to_vec());
+    }
+    match filter_resource_names(decoded, dr_map.renames(), finder.names_by_resource_type()) {
+        Ok(bytes) => Ok(bytes),
         Err(error) => {
-            // qpdf catches parseAsContents exceptions and sends this second
-            // warning through the appearance stream itself
-            // (QPDFAcroFormDocumentHelper.cc:680-695). A warning-sink failure
-            // from this call must escape the appearance adjustment.
+            // Filtering is still best effort at the existing eager
+            // decode/re-encode boundary; retain qpdf's catch-and-re-warn
+            // behavior for failures after the successful parse.
             stream.warn_if_possible(&format!("Unable to parse appearance stream: {error}"))?;
             Ok(decoded.to_vec())
         }
@@ -882,7 +895,9 @@ mod tests {
         let warning_bytes = warnings.lock().expect("appearance warning trace lock");
         let warnings = String::from_utf8_lossy(&warning_bytes);
         assert!(
-            warnings.contains("content, offset 11: parse error while reading object"),
+            warnings.contains(
+                "object 4 0 stream 4 0 (content, offset 11): parse error while reading object"
+            ),
             "qpdf's appearance parser warning must be delivered: {warnings}"
         );
     }
@@ -898,6 +913,31 @@ mod tests {
         )
         .expect("detached structural failure keeps the original bytes");
         assert_eq!(rewritten, b"/F1 18 Tf [");
+    }
+
+    #[test]
+    fn appearance_hard_parse_failure_rewarns_and_preserves_content() {
+        let mut pdf = open_minimal();
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[(
+                "Resources",
+                HandleFixture::dictionary(HandleDictionary::new()),
+            )],
+            b"/F1 18 Tf 999999999999999999999999",
+        );
+        let stream = stream_handle(&mut pdf, ap_ref);
+        let decoded = stream
+            .get_stream_data(DecodeLevel::Generalized)
+            .expect("appearance stream data");
+        let rewritten = rewrite_appearance_content_with_context(
+            &decoded,
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+            &stream,
+        )
+        .expect("appearance parse failure is caught and re-warned");
+        assert_eq!(rewritten.as_slice(), decoded.as_slice());
     }
 
     #[test]

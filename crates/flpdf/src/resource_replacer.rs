@@ -8,16 +8,22 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use crate::content_stream::{
     parse_content_stream_handles, parse_content_stream_handles_with_recoverable_warnings_and_status,
 };
+#[cfg(test)]
 use crate::object_handle::DocumentResolver;
+use crate::object_handle::ObjectHandle;
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::qpdf_tokenizer::QpdfTokenizer;
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
+#[cfg(test)]
+use crate::resource_finder::ResourceFinder;
+use crate::resource_finder::ResourceNamesByType;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
+#[cfg(test)]
 use std::rc::Rc;
 
 pub(crate) type ResourceRenames = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>;
@@ -103,6 +109,7 @@ pub(crate) fn replace_resource_names(
     replace_resource_names_with_context(input, renames, None)
 }
 
+#[cfg(test)]
 pub(crate) fn replace_resource_names_with_context(
     input: &[u8],
     renames: &ResourceRenames,
@@ -136,8 +143,38 @@ pub(crate) fn replace_resource_names_with_context(
         return Ok(None);
     }
 
+    Ok(Some(filter_resource_names(
+        input,
+        renames,
+        finder.names_by_resource_type(),
+    )?)) // cov:ignore: finite in-memory filtering only fails on impossible token-offset or pipeline overflow
+}
+
+/// Run qpdf's `filterAsContents`-shaped ResourceReplacer over an owned stream.
+/// The caller must have already parsed the same stream with ResourceFinder so
+/// the name offsets come from qpdf's canonical content description.
+pub(crate) fn filter_resource_names_from_stream(
+    stream: &ObjectHandle,
+    renames: &ResourceRenames,
+    names: &ResourceNamesByType,
+) -> crate::Result<Vec<u8>> {
     let mut buffer = Buffer::new("ResourceReplacer buffer", None);
-    let mut replacer = ResourceReplacer::new(renames, finder.names_by_resource_type());
+    let mut replacer = ResourceReplacer::new(renames, names);
+    stream.filter_as_contents(&mut replacer, Some(&mut buffer))?;
+    Ok(buffer.take_buffer()?)
+}
+
+/// Run the exact-byte ResourceReplacer filter over already-decoded content.
+/// Parsing and warning delivery are intentionally separate: callers that own
+/// a qpdf stream parse it first, then use the decoded bytes here when their
+/// surrounding filter pipeline needs a different decode level.
+pub(crate) fn filter_resource_names(
+    input: &[u8],
+    renames: &ResourceRenames,
+    names: &ResourceNamesByType,
+) -> crate::Result<Vec<u8>> {
+    let mut buffer = Buffer::new("ResourceReplacer buffer", None);
+    let mut replacer = ResourceReplacer::new(renames, names);
     let mut tokenizer = QpdfTokenizer::new(
         "ResourceReplacer tokenizer",
         &mut replacer,
@@ -146,8 +183,7 @@ pub(crate) fn replace_resource_names_with_context(
     tokenizer.write(input)?;
     tokenizer.finish()?;
     drop(tokenizer);
-
-    Ok(Some(buffer.take_buffer()?))
+    Ok(buffer.take_buffer()?)
 }
 
 #[cfg(test)]

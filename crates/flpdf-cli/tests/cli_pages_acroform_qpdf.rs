@@ -678,6 +678,30 @@ fn acroform_secondary_eof_appearance_pdf() -> Vec<u8> {
     ])
 }
 
+/// Single-page foreign source with a malformed token in an appearance stream.
+/// Its `/Resources` collides with the primary AcroForm `/DR`, forcing qpdf's
+/// `adjustAppearanceStream` parser path and its object/stream description.
+fn acroform_secondary_bad_appearance_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx \
+          /T (ForeignAppearanceBadToken) /DA (/F1 18 Tf) /DR 6 0 R \
+          /AP << /N 8 0 R >> /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] /DR 6 0 R >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Font << /F1 7 0 R >> >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_vec(),
+        b"8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+          /Resources 6 0 R /Length 9 0 R >>\nstream\n/F1 18 Tf <0g 0 g\nendstream\nendobj\n"
+            .to_vec(),
+        b"9 0 obj\n17\nendobj\n".to_vec(),
+    ])
+}
+
 /// One-page AcroForm source used to compare qpdf's lazy foreign-field setup
 /// when the primary input is `--empty`.
 fn acroform_need_appearances_source_pdf() -> Vec<u8> {
@@ -718,14 +742,39 @@ fn acroform_primary_with_dr_pdf() -> Vec<u8> {
     ])
 }
 
-fn da_parser_warning_message(stderr: &[u8]) -> String {
+fn parser_warning_line(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
-        .find_map(|line| {
-            line.contains("invalid character (g) in hexstring")
-                .then(|| line.rsplit_once(": ").unwrap().1.to_owned())
-        })
-        .expect("the command must report the malformed /DA token")
+        .find(|line| line.contains("invalid character (g) in hexstring"))
+        .expect("the command must report the malformed token")
+        .to_owned()
+}
+
+fn normalized_parser_warning_line(stderr: &[u8]) -> String {
+    let line = parser_warning_line(stderr);
+    let tokens: Vec<_> = line.split_whitespace().collect();
+    assert!(
+        tokens.len() >= 8,
+        "parser warning has an object description: {line}"
+    );
+    assert_eq!(tokens[0], "WARNING:", "parser warning prefix: {line}");
+    assert_eq!(
+        tokens[1], "object",
+        "parser warning object description: {line}"
+    );
+    assert_eq!(
+        tokens[4], "stream",
+        "parser warning stream description: {line}"
+    );
+    assert_eq!(
+        tokens[2], tokens[5],
+        "object and stream numbers must match: {line}"
+    );
+    assert_eq!(
+        tokens[3], tokens[6],
+        "object and stream generations must match: {line}"
+    );
+    format!("WARNING: object N G stream N G {}", tokens[7..].join(" "))
 }
 
 /// Unrelated single-page source with no AcroForm at all.
@@ -962,10 +1011,8 @@ fn unselected_primary_field_names_reserve_later_collision_suffixes() {
     );
 }
 
-/// qpdf parses foreign `/DA` through a temporary stream, while flpdf uses its
-/// document-owned content parser. Their source-description prefixes differ
-/// until `flpdf-1ks3`, but the parser warning message and warning-only exit
-/// status must already agree here.
+/// qpdf parses foreign `/DA` through a temporary stream, so the complete
+/// parser warning includes that stream's object description.
 #[test]
 fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
     if !qpdf_available() {
@@ -987,7 +1034,7 @@ fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
         .arg("1")
         .arg(&secondary)
         .arg("1")
-        .args(["--"])
+        .args(["--", "--static-id", "--stream-data=uncompress"])
         .arg(&qpdf_output)
         .output()
         .expect("qpdf should spawn");
@@ -1002,7 +1049,7 @@ fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
         .arg("1")
         .arg(&secondary)
         .arg("1")
-        .args(["--"])
+        .args(["--", "--static-id", "--stream-data=uncompress"])
         .arg(&flpdf_output)
         .output()
         .expect("flpdf should spawn");
@@ -1014,9 +1061,70 @@ fn malformed_foreign_default_appearance_parser_warning_matches_qpdf() {
         String::from_utf8_lossy(&flpdf.stderr)
     );
     assert_eq!(
-        da_parser_warning_message(&flpdf.stderr),
-        da_parser_warning_message(&qpdf.stderr),
-        "foreign /DA parser warning message must match qpdf",
+        normalized_parser_warning_line(&flpdf.stderr),
+        normalized_parser_warning_line(&qpdf.stderr),
+        "foreign /DA parser warning line must match qpdf",
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        "qpdf and flpdf must preserve the same malformed /DA output",
+    );
+}
+
+#[test]
+fn malformed_foreign_appearance_parser_warning_matches_qpdf() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/fxo-red-with-existing-acroform-dr.pdf");
+    let secondary = temp.path().join("bad-appearance-source.pdf");
+    std::fs::write(&secondary, acroform_secondary_bad_appearance_pdf())
+        .expect("write bad appearance source");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .arg("--overlay")
+        .arg(&secondary)
+        .arg("--to=1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {:?}", qpdf);
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .arg("--overlay")
+        .arg(&secondary)
+        .arg("--to=1")
+        .args(["--", "--static-id", "--stream-data=uncompress"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "foreign appearance parser warning must keep qpdf's warning exit status; flpdf stderr: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+    assert_eq!(
+        normalized_parser_warning_line(&flpdf.stderr),
+        normalized_parser_warning_line(&qpdf.stderr),
+        "foreign appearance parser warning line must match qpdf",
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_output).expect("flpdf output"),
+        std::fs::read(&qpdf_output).expect("qpdf output"),
+        "qpdf and flpdf must preserve the same malformed appearance output",
     );
 }
 
