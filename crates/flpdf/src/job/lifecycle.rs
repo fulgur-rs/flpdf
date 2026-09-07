@@ -2722,7 +2722,18 @@ impl QPDFJob {
             };
         match write_result {
             Ok(()) => {
-                self.drain_document_warnings(pdf);
+                // qpdf reads the document's warnings without draining them
+                // inside `writeOutfile` — `bool warnings = pdf.anyWarnings()`
+                // decides the backup name just before the rename
+                // (`libqpdf/QPDFJob.cc:3071`) — and only drains afterwards, in
+                // `writeQPDF`, where `!pdf.getWarnings().empty()` sets the
+                // job's own flag (`:493-494`). Draining up front would clear
+                // the document's collection before the verbose message and the
+                // rename have run, so a failure in either would leave a caller
+                // that still holds the `Pdf` with no diagnostics.
+                if pdf.any_warnings() {
+                    self.record_warnings();
+                }
                 if self.configuration.verbose && output != Path::new("-") && !splitting {
                     let message =
                         format!("{}: wrote file {}\n", self.message_prefix, output.display());
@@ -2743,6 +2754,9 @@ impl QPDFJob {
                     pdf.close_input_source();
                     self.finish_replace_input()?;
                 }
+                // The drain qpdf performs after `writeOutfile` returns
+                // (`libqpdf/QPDFJob.cc:493-494`).
+                self.drain_document_warnings(pdf);
                 self.complete(true)
             }
             Err(error) => {
