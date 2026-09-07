@@ -728,16 +728,13 @@ pub(crate) fn run_test_86<R: Read + Seek>(
     let utf8_val: &[u8] = b"\x1f";
     let utf16_val: &[u8] = b"\xfe\xff\x00\x1f";
 
-    // GAP(QUtil::utf8_to_ascii / QUtil::utf8_to_pdf_doc): both are thin
-    // wrappers over the shared internal `transcode_utf8`
-    // (`libqpdf/QUtil.cc:1527-1611`), which has no flpdf equivalent at any
-    // visibility -- not even the PDFDocEncoding table it would need is
-    // public (`pdf_string.rs`'s `PDFDOC_ENCODING` is a private `const`). The
-    // two assertions this would exercise --
-    //   assert(QUtil::utf8_to_ascii(utf8_val, result, '?')); assert(result == utf8_val);
-    //   assert(!QUtil::utf8_to_pdf_doc(utf8_val, result, '?')); assert(result == "?");
-    // -- cannot be reproduced. The remaining assertions below do not depend
-    // on `transcode_utf8` and are translated faithfully.
+    // QUtil::utf8_to_ascii/utf8_to_pdf_doc (`libqpdf/QUtil.cc:1652-1673`).
+    // U+001F is plain ASCII, so `utf8_to_ascii` round-trips it unchanged;
+    // PDFDocEncoding reassigns `0x18`-`0x1f` to accent glyphs
+    // (`libqpdf/QUtil.cc:1533-1546`), so `utf8_to_pdf_doc` cannot represent
+    // it and replaces it with `?` instead.
+    assert_eq!(flpdf::qutil::utf8_to_ascii(utf8_val), utf8_val);
+    assert_eq!(flpdf::qutil::utf8_to_pdf_doc(utf8_val), b"?");
 
     // QUtil::utf8_to_utf16 (`libqpdf/QUtil.cc:1621-1625`) is BOM + UTF-16BE
     // code units for every codepoint, which for this ASCII-range input is
