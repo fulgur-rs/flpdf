@@ -45,7 +45,7 @@ use crate::pdf::WriterObjectOrderKey;
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,
-    Pdf, Result,
+    Pdf, Result, XrefEntry,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -153,6 +153,113 @@ fn wire_primary_trailer<RS: Read + Seek, RT: Read + Seek>(
     }
     target_trailer.replace_key(b"/Root", target.get_object_handle(root_ref))?;
     Ok(())
+}
+
+/// Recreate qpdf's primary source-ObjStm ownership on a fresh merge target.
+///
+/// `QPDFJob::handlePageSpecs` keeps the primary QPDF in place, so the writer's
+/// `preserveObjectStreams` sees its original type-2 xref rows. flpdf's
+/// canonical foreign copier correctly transfers the logical member objects,
+/// but the fresh target needs an equivalent target-owned placeholder for each
+/// source container and a type-2 row for each copied member before the plain
+/// Preserve planner runs (`QPDFWriter.cc:1939-1967`). The placeholder stream
+/// carries only the source `/Extends` chain; the writer rebuilds its body from
+/// the copied member handles, as qpdf does (`QPDFWriter.cc:1621-1740`).
+fn install_primary_object_stream_membership<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    source_xref_entries: &BTreeMap<ObjectRef, XrefEntry>,
+    copied: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    let mut target_containers = BTreeMap::new();
+    for (&source_member, entry) in source_xref_entries {
+        let XrefEntry::Compressed { stream, index } = *entry else {
+            continue;
+        };
+        let Some(&target_member) = copied.get(&source_member) else {
+            continue;
+        };
+        let target_container = ensure_object_stream_container(
+            source,
+            target,
+            ObjectRef::new(stream, 0),
+            &mut target_containers,
+            copied,
+        )?; // cov:ignore: malformed source ObjStm container errors propagate at this boundary
+        target.install_object_stream_member(target_member, target_container, index);
+    }
+    Ok(())
+}
+
+/// Allocate one target-owned source-container placeholder and preserve its
+/// indirect `/Extends` chain. The body, `/N`, `/First`, and filter are emitted
+/// by the plain writer from the retained members rather than copied here.
+fn ensure_object_stream_container<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    source_container: ObjectRef,
+    target_containers: &mut BTreeMap<ObjectRef, ObjectRef>,
+    copied: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<ObjectRef> {
+    // Walk the `/Extends` chain iteratively. The chain is only bounded by the
+    // number of containers in the source, and a recursive walk would grow the
+    // stack with it, which `.claude/rules/pdf-rust-review-patterns.md` section 4
+    // rules out. qpdf has no counterpart to walk: it follows `/Extends` a single
+    // hop while unparsing the container dictionary
+    // (`QPDFWriter.cc:1727-1737`).
+    let mut chain = Vec::new();
+    let mut current = Some(source_container);
+    while let Some(container) = current {
+        if target_containers.contains_key(&container) || chain.contains(&container) {
+            break;
+        }
+        // The canonical foreign copier may already own this container: a source
+        // ObjStm without `/Type /ObjStm` is not skipped by the preserve loop,
+        // and qpdf identifies containers by the type-2 xref row rather than the
+        // dictionary key (`QPDF.cc:2381-2390`). Reusing that copy keeps one
+        // identity per container, as qpdf does — `writeObjectStream` knows a
+        // single `old_og` (`QPDFWriter.cc:1626-1629`).
+        if let Some(&already_copied) = copied.get(&container) {
+            target_containers.insert(container, already_copied);
+            break;
+        }
+        chain.push(container);
+        current = {
+            let source_stream = source.get_object_handle(container);
+            source.resolve(&source_stream)?;
+            source_stream
+                .as_stream_dict()
+                .map(|dictionary| dictionary.try_get_key(b"/Extends"))
+                .transpose()?
+                .and_then(|extends| extends.object_ref())
+        };
+    }
+
+    // Copy the containers themselves rather than allocating empty streams. A
+    // container whose members are all retained is rewritten from its members by
+    // the writer, but one with no retained member stays an ordinary stream in
+    // qpdf's output: `writeObjectStream` only runs for streams present in
+    // `object_stream_to_objects` (`QPDFWriter.cc:2163-2170`), so an
+    // `/Extends`-only target keeps its original `/Type /ObjStm`, `/N`, `/First`
+    // and body. Allocating a data-less stream instead both blanked that object
+    // and left routes that bypass the plain writer (`--qdf`,
+    // `--normalize-content`) with a stream that has no data to pipe.
+    for &container in chain.iter().rev() {
+        let source_stream = source.get_object_handle(container);
+        source.resolve(&source_stream)?;
+        let target_stream = copy_foreign_object_for_preserve(target, &source_stream)?;
+        let target_container = target_stream.object_ref().ok_or(Error::Internal(
+            "copied ObjStm container lost its object identity".to_owned(),
+        ))?;
+        target_containers.insert(container, target_container);
+    }
+
+    target_containers
+        .get(&source_container)
+        .copied()
+        .ok_or(Error::Internal(
+            "ObjStm container copy did not register its source identity".to_owned(),
+        ))
 }
 
 /// Resolve qpdf's `--pages` form-field name collision: return `base` when it is
@@ -925,6 +1032,16 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
             continue;
         }
 
+        // Capture the primary's physical type-2 rows before page mutation.
+        // qpdf keeps this source xref ownership on the primary QPDF until the
+        // writer's Preserve setup; the fresh target will install the copied
+        // rows after its canonical member map is complete.
+        let primary_source_xref_entries = if is_primary {
+            input.source.source_xref_entries()
+        } else {
+            BTreeMap::new()
+        };
+
         // Capture qpdf's original page list before the primary page tree is
         // cleared. `handlePageSpecs` calls `removePage` for every primary page
         // before it adds the selected pages back; that first removal flattens
@@ -1100,6 +1217,15 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
         // been populated only by the canonical foreign copier above.
         let map = target.take_foreign_object_map(source_id);
 
+        if is_primary {
+            install_primary_object_stream_membership(
+                input.source,
+                &mut target,
+                &primary_source_xref_entries,
+                &map,
+            )?; // cov:ignore: malformed source xref errors propagate at this boundary
+        }
+
         // qpdf keeps primary objects in their source object-number order and
         // assigns foreign objects in copy-discovery order. The destination
         // references alone cannot express that distinction after this route
@@ -1255,7 +1381,8 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
 mod tests {
     use super::super::resource_pruning::RemoveUnreferencedResources;
     use super::{
-        collect_retained_widget_refs, discover_primary_acroform, field_kid_refs, merge_documents,
+        collect_retained_widget_refs, discover_primary_acroform, field_kid_refs,
+        install_primary_object_stream_membership, merge_documents,
         merge_documents_with_resource_decisions_and_preserve_primary,
         merge_documents_with_resource_mode_and_preserve_primary, resolve_field_partial_name,
         rewrite_field_kids, trim_field_kids, unique_field_name, widget_page_ref, MergeInput,
@@ -1295,6 +1422,56 @@ mod tests {
 
     fn used(names: &[&[u8]]) -> BTreeSet<Vec<u8>> {
         names.iter().map(|n| n.to_vec()).collect()
+    }
+
+    fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+        let digits: Vec<u8> = hex.bytes().filter(u8::is_ascii_hexdigit).collect();
+        digits
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn primary_objstm_membership_preserves_an_extends_chain() {
+        let mut source = Pdf::open_mem_owned(decode_hex_fixture(include_str!(
+            "../../../../tests/fixtures/compat/objstm-extends-chain.pdf.hex"
+        )))
+        .expect("open ObjStm source");
+        let mut target = Pdf::empty().expect("empty target");
+        let source_xref_entries = source.source_xref_entries();
+        let mut copied = BTreeMap::new();
+        for source_member in [ObjectRef::new(2, 0), ObjectRef::new(3, 0)] {
+            let copied_handle = target
+                .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+                .expect("allocate copied member");
+            copied.insert(source_member, copied_handle.object_ref().unwrap());
+        }
+
+        install_primary_object_stream_membership(
+            &mut source,
+            &mut target,
+            &source_xref_entries,
+            &copied,
+        )
+        .expect("install source membership");
+
+        let member = *copied.values().next().expect("copied member");
+        let mut target_membership = BTreeMap::new();
+        target.get_object_stream_data(&mut target_membership);
+        let target_container = *target_membership
+            .get(&member.number)
+            .expect("copied member must have a compressed source row");
+        let stream_handle = target.get_object_handle(ObjectRef::new(target_container, 0));
+        target.resolve(&stream_handle).unwrap();
+        let extends = stream_handle
+            .as_stream_dict()
+            .unwrap()
+            .try_get_key(b"/Extends")
+            .unwrap()
+            .object_ref()
+            .expect("source ObjStm /Extends must remain indirect");
+        assert_ne!(ObjectRef::new(target_container, 0), extends);
     }
 
     #[test]

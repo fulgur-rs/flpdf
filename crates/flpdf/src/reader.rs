@@ -838,6 +838,27 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.get_object_stream_data(mapping);
     }
 
+    /// Record a target object's source-backed ObjStm membership for a fresh
+    /// multi-source page-selection document.
+    ///
+    /// The merge target has no physical input xref row for a copied primary
+    /// member, but the plain Preserve writer must see the qpdf-equivalent
+    /// type-2 row when it reconstructs the primary source container.
+    pub(crate) fn install_object_stream_member(
+        &self,
+        object_ref: ObjectRef,
+        stream: ObjectRef,
+        index: u32,
+    ) {
+        self.resolver.insert_source_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: stream.number,
+                index,
+            },
+        );
+    }
+
     /// Return qpdf's effective source cross-reference table.
     ///
     /// This is the reader-owned table represented by qpdf's

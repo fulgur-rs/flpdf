@@ -512,31 +512,12 @@ fn null_object_numbers(qdf: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// When the primary itself already uses object streams, a compressed
-/// member's own ref and its `/ObjStm` container's ref are both present in
-/// `live_object_refs()`. Copying the container verbatim (rather than only
-/// its still-live members, which the writer independently regenerates a
-/// fresh container for) would duplicate the container's members a second
-/// time as dead, dangling content nothing in the output references --
-/// confirmed by a probe of `job/page_merge.rs`'s copy_seed construction
-/// that showed exactly this: the `--object-streams=generate`-converted
-/// primary's original container reappeared byte-for-byte in flpdf's output
-/// (with source-side object numbers baked into its compressed payload,
-/// meaningless in the target's renumbering) alongside the correctly copied
-/// standalone member, inflating `/Size` and duplicating
-/// `/Marker (ExclusivePage2Font)`.
-///
-/// The dangling duplicate is unreferenced from the live graph either way,
-/// so a *further* qpdf normalization pass without `--preserve-unreferenced`
-/// sweeps it away identically regardless of whether flpdf produced it --
-/// that would launder away exactly the defect this test targets. Assert
-/// directly against the raw, unprocessed CLI output instead: this multi-source
-/// `--pages` route does not regenerate object streams, even without
-/// `--preserve-unreferenced`, so a correct raw
-/// output here has zero `/Type /ObjStm` objects and exactly one occurrence
-/// of the marker string.
-#[test]
-fn multi_source_pages_preserve_does_not_duplicate_source_object_stream_container() {
+/// When the primary itself already uses object streams, qpdf's default
+/// Preserve writer rebuilds the primary source container from the still-live
+/// members. The merged output must therefore retain the source-backed
+/// `/ObjStm` once, rather than declassifying every member to a classic object
+/// or copying the source container as an unrelated dangling stream.
+fn assert_multi_source_pages_rebuilds_source_object_stream_container(preserve_unreferenced: bool) {
     if !qpdf_available() {
         if std::env::var_os("CI").is_some() {
             panic!("qpdf 11.9.0 is required for this parity test on CI");
@@ -550,28 +531,42 @@ fn multi_source_pages_preserve_does_not_duplicate_source_object_stream_container
     let foreign = fixture("no-stream-one-page.pdf");
     let qpdf_output = temp.path().join("qpdf.pdf");
     let flpdf_output = temp.path().join("flpdf.pdf");
+    let qpdf_qdf_output = temp.path().join("qpdf-qdf.pdf");
+    let flpdf_qdf_output = temp.path().join("flpdf-qdf.pdf");
 
-    let qpdf_result = run_qpdf(&[
-        "--preserve-unreferenced",
+    let foreign_arg = foreign.to_str().unwrap();
+    let primary_arg = primary.to_str().unwrap();
+    let qpdf_output_arg = qpdf_output.to_str().unwrap();
+    let mut qpdf_args = Vec::new();
+    if preserve_unreferenced {
+        qpdf_args.push("--preserve-unreferenced");
+    }
+    qpdf_args.extend_from_slice(&[
         "--pages",
         ".",
         "1",
-        foreign.to_str().unwrap(),
+        foreign_arg,
         "1",
         "--",
         "--static-id",
-        primary.to_str().unwrap(),
-        qpdf_output.to_str().unwrap(),
+        primary_arg,
+        qpdf_output_arg,
     ]);
+    let qpdf_result = run_qpdf(&qpdf_args);
     assert!(
         qpdf_result.status.success(),
-        "qpdf multi-source --pages with --preserve-unreferenced failed: {}",
+        "qpdf multi-source --pages failed: {}",
         String::from_utf8_lossy(&qpdf_result.stderr)
     );
 
+    let mut flpdf_args = vec!["rewrite"];
+    if preserve_unreferenced {
+        flpdf_args.push("--preserve-unreferenced");
+    }
+    flpdf_args.extend_from_slice(&["--pages", ".", "1"]);
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--preserve-unreferenced", "--pages", ".", "1"])
+        .args(flpdf_args)
         .arg(&foreign)
         .arg("1")
         .arg("--")
@@ -581,31 +576,154 @@ fn multi_source_pages_preserve_does_not_duplicate_source_object_stream_container
         .assert()
         .success();
 
-    // A further qpdf normalization pass (with or without
-    // --preserve-unreferenced) sweeps away the dangling duplicate either
-    // way, since it is unreferenced from the live graph regardless of
-    // whether flpdf produced it -- that would launder away exactly the
-    // defect this test targets. Check the raw, unprocessed CLI output
-    // directly instead.
+    let qpdf_bytes = std::fs::read(&qpdf_output).expect("qpdf output should be readable");
     let flpdf_bytes = std::fs::read(&flpdf_output).expect("flpdf output should be readable");
-    let objstm_count = flpdf_bytes
+    let qpdf_objstm_count = qpdf_bytes
+        .windows(b"/Type /ObjStm".len())
+        .filter(|window| *window == b"/Type /ObjStm")
+        .count();
+    let flpdf_objstm_count = flpdf_bytes
         .windows(b"/Type /ObjStm".len())
         .filter(|window| *window == b"/Type /ObjStm")
         .count();
     assert_eq!(
-        objstm_count, 0,
-        "flpdf does not regenerate object streams for multi-source --pages \
-         output, so a correct raw output here has zero /Type /ObjStm objects; \
-         a non-zero count means the source's original container was copied \
-         verbatim as a dangling duplicate"
+        qpdf_objstm_count, 1,
+        "the qpdf Preserve output should rebuild exactly one source ObjStm"
     );
-    let marker_count = flpdf_bytes
+    assert_eq!(
+        flpdf_objstm_count, qpdf_objstm_count,
+        "flpdf multi-source --pages must preserve qpdf's source ObjStm count"
+    );
+    let qpdf_qdf = normalize_qdf(&qpdf_output, &qpdf_qdf_output);
+    let flpdf_qdf = normalize_qdf(&flpdf_output, &flpdf_qdf_output);
+    let qpdf_marker_count = qpdf_qdf
+        .windows(b"ExclusivePage2Font".len())
+        .filter(|window| *window == b"ExclusivePage2Font")
+        .count();
+    let flpdf_marker_count = flpdf_qdf
         .windows(b"ExclusivePage2Font".len())
         .filter(|window| *window == b"ExclusivePage2Font")
         .count();
     assert_eq!(
-        marker_count, 1,
-        "the preserved font must appear exactly once in flpdf's raw output, \
-         not duplicated via a dangling copy of the source object-stream container"
+        flpdf_marker_count, qpdf_marker_count,
+        "the preserved font content must match qpdf after ObjStm normalization, \
+         not be duplicated via a dangling source container"
     );
+}
+
+#[test]
+fn multi_source_pages_preserve_rebuilds_source_object_stream_container() {
+    assert_multi_source_pages_rebuilds_source_object_stream_container(true);
+}
+
+#[test]
+fn multi_source_pages_default_rebuilds_source_object_stream_container() {
+    assert_multi_source_pages_rebuilds_source_object_stream_container(false);
+}
+
+/// qpdf locates object-stream containers by the type-2 xref row, not by the
+/// dictionary key: `getObjectStreamData` inspects only `entry.getType() == 2`
+/// (`QPDF.cc:2381-2390`), and a container whose dictionary is not
+/// `/Type /ObjStm` merely warns before its members are expanded anyway
+/// (`QPDF.cc:1776-1780` calls `warn`, while only missing `/N` or `/First`
+/// throws at `:1782-1785`). Such a container therefore reaches the merge
+/// through the ordinary foreign copier, and the container walk must reuse that
+/// copy rather than allocate a second identity — `writeObjectStream` knows a
+/// single `old_og` per container (`QPDFWriter.cc:1626-1629`).
+fn assert_merging_a_container_without_the_objstm_type_key_matches_qpdf(
+    preserve_unreferenced: bool,
+) {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = fixture("untyped-objstm-container.pdf");
+    let foreign = fixture("no-stream-one-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let primary_arg = primary.to_str().unwrap();
+    let foreign_arg = foreign.to_str().unwrap();
+    let mut qpdf_args = vec!["--static-id", "--newline-before-endstream=n"];
+    if preserve_unreferenced {
+        qpdf_args.push("--preserve-unreferenced");
+    }
+    qpdf_args.extend_from_slice(&[
+        primary_arg,
+        "--pages",
+        ".",
+        "1",
+        foreign_arg,
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+    let qpdf_status = run_qpdf(&qpdf_args).status.code();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flpdf"));
+    command.env("FLPDF_PROGNAME", "qpdf");
+    command.args(["--static-id", "--newline-before-endstream=n"]);
+    if preserve_unreferenced {
+        command.arg("--preserve-unreferenced");
+    }
+    command
+        .args([primary_arg, "--pages", ".", "1", foreign_arg, "1", "--"])
+        .arg(&flpdf_output);
+    let output = command.output().expect("flpdf should spawn");
+    // Both tools finish with the warning exit status: the wrong-typed container
+    // is a recoverable diagnostic in qpdf (`QPDF.cc:1776-1780` warns and keeps
+    // expanding the members), not a fatal error.
+    assert_eq!(
+        output.status.code(),
+        qpdf_status,
+        "flpdf must merge a container that lacks /Type /ObjStm the way qpdf does: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The warning text matches qpdf's, but flpdf repeats it once per resolution
+    // on the merge route where qpdf emits it once (`m->resolved_object_streams`
+    // gates re-resolution, `QPDF.cc:1758-1761`). That duplication predates this
+    // change — it reproduces identically on the base revision — so it is tracked
+    // separately rather than pinned here.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("supposed object stream 1 has wrong type"),
+        "flpdf must report qpdf's wrong-type diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compare through qpdf's own QDF normalization rather than raw bytes: the
+    // default DEFLATE backend is miniz_oxide, whose compressed bytes legitimately
+    // differ from zlib's unless the `qpdf-zlib-compat` feature is on, and this
+    // suite also runs without it.
+    let qpdf_qdf = normalize_qdf(&qpdf_output, &temp.path().join("qpdf-qdf.pdf"));
+    let flpdf_qdf = normalize_qdf(&flpdf_output, &temp.path().join("flpdf-qdf.pdf"));
+    assert_eq!(
+        qdf_object_count(&flpdf_qdf),
+        qdf_object_count(&qpdf_qdf),
+        "a container identified only by its type-2 xref rows must be copied once, \
+         not duplicated into a second placeholder identity"
+    );
+    assert_eq!(
+        normalized_qdf_objects(&flpdf_qdf),
+        normalized_qdf_objects(&qpdf_qdf),
+        "the merged objects must match qpdf's for a container without /Type /ObjStm"
+    );
+}
+
+#[test]
+fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
+    assert_merging_a_container_without_the_objstm_type_key_matches_qpdf(false);
+}
+
+/// With `--preserve-unreferenced` the primary's live objects are copied up
+/// front, and a container that lacks `/Type /ObjStm` is not filtered out of
+/// that sweep, so the container walk meets a container the canonical copier
+/// already owns.
+#[test]
+fn merging_a_container_without_the_objstm_type_key_preserving_unreferenced_matches_qpdf() {
+    assert_merging_a_container_without_the_objstm_type_key_matches_qpdf(true);
 }
