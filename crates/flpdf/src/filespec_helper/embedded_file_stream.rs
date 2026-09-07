@@ -257,8 +257,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// runtime error (`libqpdf/QPDFObjectHandle.cc:319-324,2215-2223`).
     /// Returns [`Error::QpdfExc`] with
     /// [`QpdfErrorCode::Unsupported`](crate::QpdfErrorCode::Unsupported)
-    /// when the stream itself has no usable filter branch or filtering
-    /// fails, matching qpdf's `getStreamData` throw contract.
+    /// when the stream itself has no usable filter branch, matching qpdf's
+    /// `getStreamData` throw contract. A filter stage that is reached but
+    /// fails at run time — a registered token filter or a fatal codec error —
+    /// propagates as [`Error::System`], this crate's `std::runtime_error`.
     ///
     /// # Examples
     ///
