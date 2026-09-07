@@ -1063,7 +1063,7 @@ fn check_hint_tables<R: Read + Seek>(
 /// page count, `/E` is not less than the file length, `/H` is malformed, the
 /// hint stream cannot be located or decoded, or strict `/T` position
 /// comparison reports a mismatch against the xref parser's first item.
-
+///
 /// Returns [`LinearizationCheckError::QpdfExc`] when a damaged-PDF condition
 /// has qpdf's structured filename, object description, and offset context,
 /// such as an out-of-bounds hint-table offset.
