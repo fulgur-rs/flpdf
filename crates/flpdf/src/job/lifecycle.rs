@@ -2519,6 +2519,16 @@ impl QPDFJob {
     /// until the page-source cutover can return the merged erased document.
     fn finish_created_document(&mut self, mut pdf: JobDocument) -> Result<JobDocument> {
         let configuration = self.configuration.clone();
+        // qpdf leaves createQPDF before any stage when the job only reports
+        // encryption status: `if (m->check_is_encrypted ||
+        // m->check_requires_password) { return nullptr; }`
+        // (`libqpdf/QPDFJob.cc:455-456`) sits ahead of `updateFromJSON`
+        // (`:462`) and `handleRotations` (`:470`). Running them here would let
+        // a status-only job fail on a missing update file and would mutate a
+        // document that exists solely to be inspected.
+        if configuration.is_encrypted || configuration.requires_password {
+            return Ok(pdf);
+        }
         if !configuration.page_specs.is_empty() {
             return Ok(pdf);
         }
