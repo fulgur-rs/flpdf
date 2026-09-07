@@ -4331,6 +4331,7 @@ fn parse_xref_stream_with_canonical_owner(
         header_offset: 0,
         already_reconstructed: false,
     };
+    // cov:ignore-start: CanonicalXrefContext never defers reconstruction; the live resolver performs any read-time recovery internally.
     if let Some(error) = reconstruction_trigger {
         if let Some(sink) = error_diagnostics_sink.as_mut() {
             for diagnostic in state.loaded.repair_diagnostics.entries() {
@@ -4339,6 +4340,7 @@ fn parse_xref_stream_with_canonical_owner(
         }
         return Err(error);
     }
+    // cov:ignore-end
     Ok(state)
 }
 
@@ -5981,6 +5983,343 @@ mod final_handle_tests {
         );
         bytes.extend_from_slice(format!("startxref\n{classic_xref_offset}\n%%EOF\n").as_bytes());
         bytes
+    }
+
+    fn canonical_test_resolver(
+        bytes: Vec<u8>,
+        entries: BTreeMap<ObjectRef, XrefEntry>,
+        allow_repair: bool,
+        unique_id: u64,
+    ) -> Rc<ResolverHandle<std::io::Cursor<Vec<u8>>>> {
+        ResolverHandle::new_shared(
+            std::io::Cursor::new(bytes),
+            0,
+            entries,
+            allow_repair,
+            false,
+            Diagnostics::default(),
+            crate::reader::resolver::ResolverWarningOptions::new(
+                crate::QPDFLogger::create(),
+                true,
+                Vec::new(),
+            ),
+            unique_id,
+        )
+    }
+
+    struct FailingCanonicalOwner {
+        transport_error: bool,
+        diagnostics: RefCell<Diagnostics>,
+    }
+
+    impl CanonicalTrailerOwner for FailingCanonicalOwner {
+        fn indirect_handle(&self, _object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::uninitialized()
+        }
+
+        fn direct_handle(&self, value: ObjectValue) -> ObjectHandle {
+            ObjectHandle::from_value(value)
+        }
+
+        fn install_xref_entries(&self, _entries: BTreeMap<ObjectRef, XrefEntry>) {}
+
+        fn set_header_offset(&self, _offset: usize) {}
+
+        fn read_object_at_offset(
+            &self,
+            _offset: u64,
+            _expected: ObjectRef,
+            _description: Option<Vec<u8>>,
+        ) -> Result<(ObjectHandle, Option<u64>)> {
+            Err(Error::parse(0, "synthetic canonical read failure"))
+        }
+
+        fn read_xref_stream_at_offset(
+            &self,
+            _offset: u64,
+            _description: Option<Vec<u8>>,
+        ) -> Result<(ObjectHandle, Option<u64>)> {
+            self.diagnostics.borrow_mut().push(damaged_warning(
+                b"synthetic.pdf",
+                "synthetic canonical read failure",
+                Some(0),
+            ));
+            if self.transport_error {
+                Err(Error::Io(std::io::Error::other(
+                    "synthetic transport failure",
+                )))
+            } else {
+                Err(Error::parse(0, "synthetic canonical read failure"))
+            }
+        }
+
+        fn repair_diagnostics(&self) -> Diagnostics {
+            self.diagnostics.borrow().clone()
+        }
+
+        fn recovered_stream_eol(
+            &self,
+            _object_ref: ObjectRef,
+        ) -> Option<crate::parser::RecoveredStreamEol> {
+            None
+        }
+    }
+
+    #[test]
+    fn canonical_xref_context_handles_direct_and_malformed_stream_data() {
+        let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 3);
+        let mut context = CanonicalXrefContext::new(resolver.as_ref(), Vec::new());
+        let direct = ObjectHandle::integer(1);
+        assert!(matches!(
+            XrefObjectContext::raw_stream_data(&mut context, ObjectRef::new(1, 0), &direct),
+            Ok(None)
+        ));
+
+        let dictionary = |extra: Option<ObjectHandle>, size: i64| {
+            let mut entries = vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"XRef".to_vec())),
+                (
+                    b"/W".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(1),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                    ]),
+                ),
+                (b"/Size".to_vec(), ObjectHandle::integer(size)),
+            ];
+            if let Some(extra) = extra {
+                entries.push((b"/Filter".to_vec(), extra));
+            }
+            ObjectHandle::dictionary(entries)
+        };
+
+        let filtered = ObjectHandle::stream(
+            dictionary(Some(ObjectHandle::name(b"ASCIIHexDecode".to_vec())), 1),
+            Rc::new(b"not-hex".to_vec()),
+        );
+        let mut registration = XrefRegistration::default();
+        assert!(build_xref_stream(
+            &mut context,
+            10,
+            XrefStreamObjectRead {
+                object_ref: ObjectRef::new(2, 0),
+                object: filtered,
+                stream_data_offset: Some(20),
+            },
+            &mut registration,
+        )
+        .is_err());
+
+        let short = ObjectHandle::stream(dictionary(None, 2), Rc::new(vec![0]));
+        assert!(build_xref_stream(
+            &mut context,
+            11,
+            XrefStreamObjectRead {
+                object_ref: ObjectRef::new(3, 0),
+                object: short,
+                stream_data_offset: Some(21),
+            },
+            &mut registration,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn canonical_xref_stream_trims_a_recovered_payload_eol() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let xref_pos = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 0 0] /Size 1 >>\nstream\n\0\nendstream\nendobj\n%tail\n",
+        );
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), true, 4);
+        let mut registration = XrefRegistration::default();
+        let state = parse_xref_stream_with_canonical_owner(
+            xref_pos,
+            xref_pos as u64,
+            "1.4".to_owned(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            resolver.as_ref(),
+        )
+        .expect("a recovered canonical xref stream should parse after trimming its EOL");
+
+        assert_eq!(
+            resolver.recovered_stream_eol(ObjectRef::new(1, 0)),
+            Some(crate::parser::RecoveredStreamEol::Lf)
+        );
+        assert!(state.loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn canonical_xref_candidate_keeps_first_trailer_and_maximum_offset() {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let first_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 0 0] /Size 1 /Marker /First /Length 1 >>\nstream\n\0\nendstream\nendobj\n",
+        );
+        let second_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"2 0 obj\n<< /Type /XRef /W [1 0 0] /Size 1 /Marker /Second /Length 1 >>\nstream\n\0\nendstream\nendobj\n%tail\n",
+        );
+        let entries = BTreeMap::from([
+            (
+                ObjectRef::new(1, 0),
+                XrefEntry::Uncompressed {
+                    offset: first_offset,
+                },
+            ),
+            (
+                ObjectRef::new(2, 0),
+                XrefEntry::Uncompressed {
+                    offset: second_offset,
+                },
+            ),
+        ]);
+        let resolver = canonical_test_resolver(bytes.clone(), entries.clone(), false, 5);
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions::default(),
+            &Rc::from(vec![first_offset, second_offset]),
+            None,
+            Some(resolver.as_ref()),
+        );
+        let candidate = candidate.expect("at least one canonical xref candidate");
+        assert!(diagnostics.entries().is_empty(), "{diagnostics:?}");
+        assert_eq!(candidate.max_offset, second_offset);
+        assert_eq!(
+            candidate
+                .trailer
+                .try_get_key(b"/Marker")
+                .expect("marker")
+                .try_as_name()
+                .expect("name"),
+            Some(b"First".to_vec())
+        );
+    }
+
+    #[test]
+    fn canonical_xref_read_maps_owner_failures_like_qpdf() {
+        for transport_error in [false, true] {
+            let owner = FailingCanonicalOwner {
+                transport_error,
+                diagnostics: RefCell::new(Diagnostics::default()),
+            };
+            let mut registration = XrefRegistration::default();
+            let mut sink = Diagnostics::default();
+            let error = parse_xref_stream_with_canonical_owner(
+                0,
+                0,
+                "1.4".to_owned(),
+                XrefLoadOptions::default(),
+                &mut registration,
+                Some(&mut sink),
+                &owner,
+            )
+            .expect_err("synthetic owner read must fail");
+            if transport_error {
+                assert!(matches!(error, Error::Io(_)));
+            } else {
+                assert!(matches!(
+                    error,
+                    Error::Parse { message, .. } if message == "xref not found"
+                ));
+            }
+            assert_eq!(sink.entries().len(), 1);
+        }
+    }
+
+    #[test]
+    fn canonical_xref_read_keeps_a_recovered_null_out_of_the_cache_slot() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut bytes = b"%PDF-1.4\n1 0 obj\n".to_vec();
+        let offset = 9u64;
+        bytes.extend(std::iter::repeat_n(b'[', 501));
+        bytes.extend_from_slice(b"\nendobj\n%tail\n");
+        let resolver = canonical_test_resolver(
+            bytes,
+            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset })]),
+            false,
+            6,
+        );
+        let owner: &dyn CanonicalTrailerOwner = resolver.as_ref();
+        let (read, _) = owner
+            .read_xref_stream_at_offset(offset, None)
+            .expect("a malformed cached xref slot still returns a null handle");
+
+        assert_eq!(read.object_ref(), Some(object_ref));
+        assert!(read.is_null());
+        assert!(!resolver.get_object_handle(object_ref).is_resolved());
+    }
+
+    #[test]
+    fn ownerless_hybrid_resolution_forwards_a_reconstruction_trigger() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = b"%pad\n2 0 obj\n0\nendobj\n";
+        let object_offset = 5;
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            object_ref,
+            XrefEntry::Uncompressed {
+                offset: object_offset,
+            },
+        );
+        let shared = empty_bootstrap_cache();
+        let indirect = {
+            let context = XrefReadContext::new(
+                bytes,
+                XrefReadContextSpec::ActiveSectionWithCache {
+                    bootstrap_cache: &shared,
+                },
+                &registration,
+                XrefLoadOptions {
+                    allow_repair: true,
+                    ..XrefLoadOptions::default()
+                },
+            );
+            context.document.handle_for_reference(object_ref)
+        };
+        let mut loaded = loaded_state_with_trailer(ObjectHandle::dictionary(vec![(
+            b"/XRefStm".to_vec(),
+            indirect,
+        )]));
+        loaded.loaded.repair_diagnostics.push(damaged_warning(
+            b"existing.pdf",
+            "existing warning",
+            None,
+        ));
+        let mut sink = Diagnostics::default();
+
+        let error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut sink),
+            XrefReadContextSpec::ActiveSectionWithCache {
+                bootstrap_cache: &shared,
+            },
+            None,
+        )
+        .expect_err("a stale indirect /XRefStm must trigger reconstruction");
+
+        assert!(
+            matches!(
+                &error,
+                Error::Parse { message, .. } if message == "expected 1 0 obj"
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(sink.entries().len(), 1);
     }
 
     #[test]
