@@ -231,9 +231,45 @@ pub fn utf8_to_pdf_doc(input: &[u8]) -> Vec<u8> {
     transcode_utf8(input, SingleByteEncoding::PdfDoc)
 }
 
+/// Convert UTF-8 bytes to PDFDocEncoding, reporting whether every code point
+/// was representable.
+///
+/// This is qpdf's second `QUtil::utf8_to_pdf_doc` overload
+/// (`include/qpdf/QUtil.hh:332`, `libqpdf/QUtil.cc:1669-1673`), which returns
+/// that flag alongside the bytes; [`utf8_to_pdf_doc`] is the form that
+/// discards it. The bytes are identical either way, so a `?` in the output
+/// alone cannot distinguish an unrepresentable code point from a literal
+/// question mark in the input -- only this flag can.
+pub fn utf8_to_pdf_doc_checked(input: &[u8]) -> (Vec<u8>, bool) {
+    transcode_utf8_with_status(input, SingleByteEncoding::PdfDoc)
+}
+
+/// Convert UTF-8 bytes to ASCII, reporting whether every code point was
+/// representable.
+///
+/// qpdf's second `QUtil::utf8_to_ascii` overload
+/// (`include/qpdf/QUtil.hh:326`, `libqpdf/QUtil.cc:1651-1655`).
+pub fn utf8_to_ascii_checked(input: &[u8]) -> (Vec<u8>, bool) {
+    transcode_utf8_with_status(input, SingleByteEncoding::Ascii)
+}
+
 fn transcode_utf8(input: &[u8], encoding: SingleByteEncoding) -> Vec<u8> {
+    transcode_utf8_with_status(input, encoding).0
+}
+
+/// The transcoder qpdf's four `utf8_to_*` families share, returning both the
+/// bytes and whether every code point was representable.
+///
+/// qpdf's overloads differ only in this: the `std::string`-returning form
+/// discards the flag (`libqpdf/QUtil.cc:1614-1621`) while the
+/// `bool`-returning form hands it back (`:1651-1673`). The flag is cleared
+/// in exactly the places qpdf clears `okay` (`:1553,1565,1579,1588` and the
+/// unmapped-code-point fallthrough at `:1595-1608`).
+fn transcode_utf8_with_status(input: &[u8], encoding: SingleByteEncoding) -> (Vec<u8>, bool) {
+    let mut representable = true;
     let mut output = Vec::with_capacity(input.len());
     if matches!(encoding, SingleByteEncoding::PdfDoc) && pdf_doc_prefix_collides_with_a_bom(input) {
+        representable = false;
         // qpdf avoids emitting a PDFDocEncoding string that a reader would
         // mistake for a UTF-16 or UTF-8 BOM by checking the *input*
         // codepoints that would produce one, rather than the output bytes
@@ -245,16 +281,19 @@ fn transcode_utf8(input: &[u8], encoding: SingleByteEncoding) -> Vec<u8> {
     while position < input.len() {
         let (codepoint, error) = next_utf8_codepoint(input, &mut position);
         if error {
+            representable = false;
             output.push(b'?');
         } else if codepoint < 128 {
             if matches!(encoding, SingleByteEncoding::PdfDoc)
                 && (matches!(codepoint, 0x18..=0x1f) || codepoint == 127)
             {
+                representable = false;
                 output.push(b'?');
             } else {
                 output.push(codepoint as u8);
             }
         } else if codepoint == 0xad && matches!(encoding, SingleByteEncoding::PdfDoc) {
+            representable = false;
             output.push(b'?');
         } else if matches!(
             encoding,
@@ -265,10 +304,11 @@ fn transcode_utf8(input: &[u8], encoding: SingleByteEncoding) -> Vec<u8> {
         } else if let Some(byte) = encode_extended(codepoint, encoding) {
             output.push(byte);
         } else {
+            representable = false;
             output.push(b'?');
         }
     }
-    output
+    (output, representable)
 }
 
 /// Whether `input`'s leading UTF-8 bytes decode to `U+00FE U+00FF`,
@@ -378,7 +418,7 @@ fn encode_extended(codepoint: u32, encoding: SingleByteEncoding) -> Option<u8> {
 /// range (this crate's own decode-direction `PDFDOC_ENCODING` table in
 /// `pdf_string.rs`), plus `U+FFFD` (the Unicode replacement character)
 /// mapping to `0x9f`, which the decode table omits.
-const UNICODE_TO_PDF_DOC: [(u32, u8); 40] = [
+const UNICODE_TO_PDF_DOC: [(u32, u8); 41] = [
     (0x02d8, 0x18),
     (0x02c7, 0x19),
     (0x02c6, 0x1a),
@@ -419,6 +459,7 @@ const UNICODE_TO_PDF_DOC: [(u32, u8); 40] = [
     (0x0161, 0x9d),
     (0x017e, 0x9e),
     (0xfffd, 0x9f),
+    (0x20ac, 0xa0),
 ];
 
 /// Result of qpdf's two-stage decimal-integer conversion
@@ -1105,6 +1146,16 @@ mod tests {
     #[test]
     fn utf8_to_pdf_doc_preserves_ascii_and_the_direct_high_range() {
         assert_eq!(utf8_to_pdf_doc("Aé".as_bytes()), vec![b'A', 0xe9]);
+    }
+
+    #[test]
+    fn utf8_to_pdf_doc_maps_the_euro_sign_to_its_pdfdoc_byte() {
+        // PDFDocEncoding assigns U+20AC to 0xA0, which is outside the
+        // 0xA1-0xFF direct range, so it has to come from the table:
+        // qpdf's `unicode_to_pdf_doc` carries `{0x20ac, 0xa0}`
+        // (`libqpdf/QUtil.cc:289`). The WinAnsi table maps the same
+        // codepoint to 0x80 (`:255`), which is a different encoding.
+        assert_eq!(utf8_to_pdf_doc("€".as_bytes()), vec![0xa0]);
     }
 
     #[test]
