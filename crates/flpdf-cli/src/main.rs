@@ -9807,9 +9807,9 @@ mod tests {
     }
 
     #[test]
-    fn stdin_sentinel_and_options_terminator_untouched() {
+    fn stdin_sentinel_survives_top_level_section_reset() {
         let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-", "--"]));
-        assert_eq!(out, strs(&["flpdf", "-", "--"]));
+        assert_eq!(out, strs(&["flpdf", "-"]));
     }
 
     #[test]
@@ -9829,9 +9829,9 @@ mod tests {
     }
 
     #[test]
-    fn top_level_terminator_preserves_remaining_tokens() {
+    fn top_level_terminator_resets_to_main_parser() {
         let out = rewrite_qpdf_single_dash(strs(&["flpdf", "--", "-in.pdf", "-qdf"]));
-        assert_eq!(out, strs(&["flpdf", "--", "-in.pdf", "-qdf"]));
+        assert_eq!(out, strs(&["flpdf", "-in.pdf", "--qdf"]));
     }
 
     #[test]
