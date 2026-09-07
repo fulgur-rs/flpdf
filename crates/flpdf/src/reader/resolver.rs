@@ -2642,12 +2642,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
         f(&mut *guard)
     }
 
+    /// Install a source xref row for a document-owned merge artifact.
+    ///
+    /// qpdf keeps the primary QPDF's original type-2 rows in the same
+    /// document while `QPDFJob::handlePageSpecs` copies foreign pages. A
+    /// fresh flpdf merge target needs the equivalent source membership rows
+    /// after the canonical copy has assigned target identities; the plain
+    /// Preserve planner then consumes the rows through
+    /// `QPDF::getObjectStreamData`'s existing counterpart without resolving
+    /// the members (`QPDFWriter.cc:1939-1967`).
+    pub(crate) fn insert_source_xref_entry(&self, object_ref: ObjectRef, entry: XrefEntry) {
+        let mut core = self.core.borrow_mut();
+        core.source_xref_entries.insert(object_ref, entry);
+    }
+
     /// Test-only: install a cross-reference entry the source did not declare,
     /// for fixtures that drive resolution of a hand-built object.
     #[cfg(test)]
     pub(crate) fn insert_xref_entry(&self, object_ref: ObjectRef, entry: XrefEntry) {
-        let mut core = self.core.borrow_mut();
-        core.source_xref_entries.insert(object_ref, entry);
+        self.insert_source_xref_entry(object_ref, entry);
     }
 
     // ---- the input source, streamed ----
