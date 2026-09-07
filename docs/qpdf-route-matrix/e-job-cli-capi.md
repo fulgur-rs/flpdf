@@ -475,7 +475,7 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 | `E-28` | `flpdf-3yn9.48.11` | qtest test_driver consumerをcase・API責務単位でcanonical ownerに対応付ける |
 | `E-28` | `flpdf-83jc` | case 16: `Pdf::update_all_pages_cache`（`pub`）は実在し呼ばれている。未移植は後半の3 assert+書き出しで、原因は`get_all_pages`がowned snapshotを返す点（(B)逸脱） |
 | `E-28` | `flpdf-wd2e` | case 34: **解決済み** — `Pdf::get_version_as_pdf_version`/`Pdf::get_extension_level` を移植（qpdf 側も public）。残るのは `PdfVersion` の `u8` 幅と overflow の扱いで、別 issue |
-| `E-28` | `flpdf-jzj1` | case 86: `utf8_to_pdf_doc`相当が不在。`utf8_to_ascii`は`flpdf::qutil::utf8_to_ascii`（`pub`）として実在し、qpdfの2引数版が返すrepresentabilityの`bool`だけがsignature上落ちている |
+| `E-28` | `flpdf-jzj1` | case 86: **解決済み** — `utf8_to_pdf_doc` を移植し、representability を返す `utf8_to_pdf_doc_checked`/`utf8_to_ascii_checked` で bool assertion も移植 |
 | `E-28` | `flpdf-6f6h` | case 92: `owning_pdf_unique_id`（`pub`）が所有文書identityを公開しており同一性assertは移植可能。残るのは`unparse`のthrow挙動 |
 | `E-28` | `flpdf-cm84` | case 97: **解決済み** — `ObjectHandle::try_get_array_item`（`pub`）へ移行済み |
 | `E-28` | `flpdf-wkju` | case 98: **解決済み** — `write_json`/`get_json` を `pub` 化し test_98 を移植（qpdf 側も public）。`write_stream_json` は `get_stream_json` facade 経由で到達 |
