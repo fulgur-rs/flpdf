@@ -3661,11 +3661,38 @@ impl ObjectHandle {
         Self::new_direct(ObjectValue::Integer(value), NO_PARSED_OFFSET)
     }
 
-    /// The qpdf-compatible signed parsed offset. `-1` means the value was
-    /// not parsed from a source position (`QPDFObjectHandle::getParsedOffset`,
-    /// `include/qpdf/QPDFObjectHandle.hh:415-419`).
+    /// This handle's currently cached parsed offset, without resolving it
+    /// first. `-1` means no offset has been recorded on this slot yet --
+    /// including an as-yet-unresolved indirect handle, whose real object may
+    /// still carry a different offset once resolved. Prefer
+    /// [`Self::try_get_parsed_offset`], which matches
+    /// `QPDFObjectHandle::getParsedOffset` exactly; keep using this bare
+    /// accessor only where the handle is already known to be resolved (a
+    /// direct value, or an indirect one already dereferenced by the caller).
     pub fn get_parsed_offset(&self) -> i64 {
         self.0.borrow().parsed_offset
+    }
+
+    /// The qpdf-compatible signed parsed offset, resolving a lazy indirect
+    /// reference first when needed.
+    ///
+    /// Mirrors `QPDFObjectHandle::getParsedOffset`
+    /// (`include/qpdf/QPDFObjectHandle.hh:419`,
+    /// `libqpdf/QPDFObjectHandle.cc:1874-1881`): qpdf's `dereference()`
+    /// resolves the handle before reading the offset it recorded when the
+    /// object was actually parsed. An uninitialized handle returns `-1`
+    /// without an error, matching qpdf's `dereference()` returning `false`
+    /// there rather than throwing.
+    ///
+    /// # Errors
+    /// Returns `Err` if the handle is initialized but its owning document
+    /// has been dropped while this reference was still unresolved.
+    pub fn try_get_parsed_offset(&self) -> Result<i64> {
+        if !self.is_initialized() {
+            return Ok(NO_PARSED_OFFSET);
+        }
+        self.try_dereference()?;
+        Ok(self.get_parsed_offset())
     }
 
     // Record `offset` as the parsed offset, but only if none has been set
@@ -9932,6 +9959,92 @@ pub(crate) mod identity_tests {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(5, 0), 0);
         assert!(!direct.ptr_eq(&indirect));
         assert!(!indirect.ptr_eq(&direct));
+    }
+
+    #[test]
+    fn try_get_parsed_offset_returns_no_parsed_offset_for_an_uninitialized_handle() {
+        let handle = ObjectHandle::uninitialized();
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn try_get_parsed_offset_reads_a_direct_handles_offset_without_a_resolver() {
+        let handle = ObjectHandle::integer(9);
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), NO_PARSED_OFFSET);
+
+        handle.set_parsed_offset_if_unset(123);
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), 123);
+    }
+
+    #[test]
+    fn try_get_parsed_offset_forces_resolution_before_reading_an_unresolved_indirect_handle() {
+        struct OffsetSettingResolver;
+        impl DocumentResolver for OffsetSettingResolver {
+            fn resolve_indirect(
+                &self,
+                _object_ref: ObjectRef,
+                handle: &ObjectHandle,
+            ) -> crate::Result<()> {
+                handle.set_resolved(ObjectValue::Integer(7));
+                handle.set_parsed_offset_if_unset(200);
+                Ok(())
+            }
+        }
+
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(OffsetSettingResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(60, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        // The raw slot accessor sees the pre-resolution sentinel; only the
+        // forcing accessor observes the offset the resolver records.
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), 200);
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_get_parsed_offset_resets_to_no_parsed_offset_when_resolution_lands_on_null() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(MissingResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(61, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), NO_PARSED_OFFSET);
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_get_parsed_offset_propagates_a_resolver_error_instead_of_collapsing_to_negative_one() {
+        let (handle, _resolver) = error_resolving_handle(ObjectRef::new(62, 0));
+        assert_eq!(
+            handle.try_get_parsed_offset().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert!(!handle.is_resolved());
+    }
+
+    #[test]
+    fn try_get_parsed_offset_propagates_a_dropped_resolver_error() {
+        let (handle, resolver) = resolver_bearing_handle(ObjectValue::Integer(1));
+        drop(resolver);
+        assert!(
+            matches!(handle.try_get_parsed_offset().unwrap_err(), Error::Internal(message)
+            if message == "object 20 0 belongs to a dropped PDF")
+        );
+    }
+
+    #[test]
+    fn try_get_parsed_offset_does_not_re_resolve_an_already_resolved_handle() {
+        let (handle, _resolver, calls) = logged_resolver_bearing_handle(ObjectValue::Integer(3));
+
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), NO_PARSED_OFFSET);
+        handle.set_parsed_offset_if_unset(9);
+
+        assert_eq!(handle.try_get_parsed_offset().unwrap(), 9);
+        assert_eq!(*calls.borrow(), vec![ObjectRef::new(20, 0)]);
     }
 }
 

@@ -656,6 +656,47 @@ fn json_reactor_records_qpdf_validation_errors_and_ignores_unknown_keys() {
     assert!(messages.iter().all(|message| !message.contains("future")));
 }
 
+/// `QPDF_json.cc:441-445`: an object's `"value"` may not itself be an
+/// indirect reference. The reported offset comes from
+/// `replacement.getParsedOffset()`, ported as
+/// `ObjectHandle::try_get_parsed_offset` rather than the raw
+/// `get_parsed_offset` slot read -- this test pins the observable behavior of
+/// that primitive swap for a real reactor consumer. `999 0 R` is never
+/// independently defined anywhere in this input, so it stays qpdf's
+/// `Reserved` sentinel and reports no offset, exactly like a resolved dangling
+/// reference (`ObjectHandle::try_get_parsed_offset`'s own dangling-reference
+/// unit test).
+#[test]
+fn json_reactor_reports_the_source_offset_of_an_illegal_indirect_value() {
+    let json = br#"{
+        "qpdf": [
+            {"jsonversion": 2, "pdfversion": "1.3"},
+            {
+                "obj:1 0 R": {"value": "999 0 R"}
+            }
+        ]
+    }"#;
+
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "input.json", true);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+    assert!(reactor.any_errors());
+    drop(reactor);
+
+    let entries = pdf.repair_diagnostics();
+    let illegal_reference = entries
+        .entries()
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message_string()
+                .contains("the value of an object may not be an indirect object reference")
+        })
+        .expect("illegal indirect reference value must be reported");
+    assert_eq!(illegal_reference.get_file_position(), -1);
+}
+
 #[test]
 fn json_reactor_treats_jsonversion_overflow_as_fatal_not_a_soft_error() {
     // qpdf's `jsonversion` handler calls `QUtil::string_to_int` directly on

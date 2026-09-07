@@ -680,8 +680,18 @@ where
 
     fn replace_object(&mut self, replacement: ObjectHandle, value: &Json) {
         if replacement.is_indirect() {
+            let offset = match replacement.try_get_parsed_offset() {
+                Ok(offset) => offset,
+                // cov:ignore-start: replacement is always a same-Pdf handle
+                // vended by make_object/reserve_object_if_not_exists, so the
+                // resolver behind it cannot have been dropped mid-read.
+                Err(error) => {
+                    self.fatal(error.to_string());
+                    return;
+                } // cov:ignore-end
+            };
             self.error(
-                replacement.get_parsed_offset(),
+                offset,
                 "the value of an object may not be an indirect object reference",
             );
             return;

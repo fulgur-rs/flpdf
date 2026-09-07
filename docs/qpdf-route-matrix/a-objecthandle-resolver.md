@@ -208,6 +208,28 @@ parser内部の呼出（`crates/flpdf/src/parser.rs:428,1758`）はparse中に�
 起こさないqpdf契約も確認する必要があるため、全呼出の機械置換にはしない。
 E27の手製source metadata再parseと関連するが、stream data開始offsetとは別の値である。
 
+2026-09-08（`flpdf-3yn9.48.28` 実装時点での訂正）: 上記の `check.rs:652` 呼出は
+`e91e9913`（`flpdf-3yn9.48.27.2`、typed qpdf warnings/catches移行）で既に撤去
+済みであることを確認した — `linearization_parameter_offset` が
+`pdf.get_object_handle(candidate).get_parsed_offset()` を呼ぶ経路ごと
+`pdf.source_last_offset()` 直接呼出に置き換わっており、`job/check.rs` は
+もはや `get_parsed_offset` を一切呼ばない。記録された「check consumerを
+最初のslice」という前提は着手時点で無効だった（設計パターン4「記録された
+依存順序を疑う」の該当例）。canonical getter契約自体は
+`ObjectHandle::try_get_parsed_offset`（`crates/flpdf/src/object_handle.rs`、
+`get_parsed_offset` の直後）として実装し、代わりに
+`crates/flpdf/src/json/input.rs::JsonReactor::replace_object`
+（`QPDF_json.cc:441-445` の `replacement.getParsedOffset()` 呼出に対応、唯一の
+非parser内部・非E27対象の生きた consumer）を最初のsliceとして移行した。
+qpdf 11.9.0 オラクル確認: 一度も定義されないobject番号を不正値として使うと
+offsetなし（`-1`）で一致するが、既出objectを使うケースはqpdf実機で offset
+110・flpdf側で offset 126 と乖離することを発見した（`flpdf-0tsv` で追跡、
+`set_object_description`/`Json::start()` のcontainer位置トラッキングの
+真因調査が必要、本issueのlazy-dereference契約とは無関係な別種の逸脱）。
+CLI（`flpdf-cli/src/main.rs:7146`）・qtest metadata
+（`flpdf-qtest-tools/src/metadata.rs:261,286`）はE27の対象consumerのため
+引き続き未移行（`.25`/`.37`/`.44` が追跡）。
+
 ## unknown / probe
 
 本領域は 24 行すべてを source と実行済み probe で分類できたため、`unknown` に落ちた行は無い。
