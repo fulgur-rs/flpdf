@@ -2416,8 +2416,8 @@ impl ObjectHandle {
         }
     }
 
-    /// Sever this indirect handle's resolved value, dropping any `ObjectHandle`
-    /// children it holds. A no-op for a direct handle.
+    /// Recursively remove this handle's association with its owning
+    /// document, without changing its value.
     ///
     /// A resolved indirect value can hold direct-owning [`ObjectHandle`]
     /// children (array/dictionary/stream-dict entries) that are themselves
@@ -2427,36 +2427,106 @@ impl ObjectHandle {
     /// PDFs) therefore form a strong reference cycle once both are resolved,
     /// which `Rc` alone never collects.
     ///
-    /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache,
-    /// disconnects every cached indirect object, including unresolved entries,
-    /// and replaces only non-null values with `QPDF_Destroyed()`, specifically
-    /// to break cycles like this one
-    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Literal null values stay null. The
-    /// reader's `Pdf::drop` calls this for every entry in its handle
-    /// registry — the sole owner of the canonical `Rc`s — before the registry
-    /// itself is dropped, so no lingering cycle keeps a document's object
-    /// graph (and any reachable stream buffers) alive past the `Pdf` that
-    /// produced it.
+    /// Mirrors qpdf's `QPDFObjectHandle::disconnect()`
+    /// (`libqpdf/QPDFObjectHandle.cc:229-237`) plus its per-value-type
+    /// overrides (`QPDF_Dictionary.cc:51-56`, `QPDF_Array.cc:104-113`,
+    /// `QPDF_Stream.cc:167-171`): walk into every direct (non-indirect) child
+    /// first, then clear this value's own identity. An indirect child gets
+    /// its own call from the top-level `object_cache` walk
+    /// (`ResolverHandle::disconnect_all`), so recursing into it here would be
+    /// redundant; skipping it also matches qpdf, whose recursion is bounded
+    /// by the same indirect-object check rather than a cycle detector. A
+    /// direct object retained by an external caller beyond its owning
+    /// `Pdf`'s lifetime (e.g. a resolved `/Resources` dictionary held
+    /// separately from its owning page) is reached this way rather than
+    /// through the `object_cache` walk itself.
     ///
-    /// Resets the parsed offset to the no-offset sentinel only when the value
-    /// is destroyed. Surviving null values retain their existing parsed-offset
-    /// provenance.
+    /// This method alone never converts a value to `Destroyed` --
+    /// [`Self::disconnect_and_destroy`] does that, and only for the
+    /// top-level entry `ResolverHandle::disconnect_all` calls it on, exactly
+    /// as qpdf's `QPDF::~QPDF()` calls `object->destroy()` only on its own
+    /// `obj_cache` entries, never recursively (`libqpdf/QPDF.cc:229-233`).
+    ///
+    /// qpdf's own recursion has no cycle guard, because no parsed PDF can
+    /// produce a direct-object cycle (only this crate's public
+    /// `ObjectHandle` API can, e.g. two direct dictionaries built by hand
+    /// and pointed at each other). This method still bounds its recursion
+    /// with a currently-visiting stack -- the same crate-specific,
+    /// non-qpdf-parity guard `ForeignObjectCopier::direct_visiting` uses
+    /// (`object_copy.rs`) -- so that possibility can't stack-overflow a
+    /// `Pdf` drop.
     pub(crate) fn disconnect(&self) {
+        // An explicit heap worklist rather than recursion, for the same reason
+        // `drain_owned_descendants` uses one: a direct object graph's depth is
+        // bounded only by what the public `ObjectHandle` API allows a caller to
+        // build, and this module's own `drop_tests` pin stack independence at
+        // `DEEP_DROP_DEPTH` (100,000). The visited set records every allocation
+        // reached, not just the active path, so a direct DAG — an array holding
+        // the same child twice is enough — is walked once per node rather than
+        // once per path.
+        // Key on the raw allocation address rather than on a handle: the slot
+        // contains interior mutability, which clippy's `mutable_key_type`
+        // rightly rejects as a set key. Identity here is `Rc` identity, exactly
+        // what `is_same_object_as` compares, so the pointer is the whole key.
+        let mut visited: BTreeSet<*const RefCell<ObjectSlot>> = BTreeSet::new();
+        let mut pending = vec![self.clone()];
+        while let Some(handle) = pending.pop() {
+            if !visited.insert(Rc::as_ptr(&handle.0)) {
+                continue;
+            }
+            {
+                let slot = handle.0.borrow();
+                let state = slot.state.borrow();
+                match &*state {
+                    ObjectValue::Array(items) => {
+                        pending.extend(
+                            items
+                                .iter()
+                                .filter(|item| item.object_ref().is_none())
+                                .cloned(),
+                        );
+                    }
+                    ObjectValue::Dictionary(entries) => {
+                        pending.extend(
+                            entries
+                                .values()
+                                .filter(|value| value.object_ref().is_none())
+                                .cloned(),
+                        );
+                    }
+                    ObjectValue::Stream { stream_dict, .. }
+                        if stream_dict.object_ref().is_none() =>
+                    {
+                        pending.push(stream_dict.clone());
+                    }
+                    _ => {}
+                }
+            }
+            *handle.0.borrow().identity.borrow_mut() = ValueIdentity::default();
+            handle.0.borrow_mut().tree_pdf_unique_id = None;
+        }
+    }
+
+    /// [`Self::disconnect`] this top-level indirect object, then replace its
+    /// resolved value with qpdf's post-lifetime `Destroyed` sentinel.
+    ///
+    /// The sole caller is `ResolverHandle::disconnect_all`, once per
+    /// canonical registry entry -- the pairing qpdf's `QPDF::~QPDF()`
+    /// applies directly to each `obj_cache` entry: `object->disconnect();
+    /// if (... != ot_null) object->destroy();` (`libqpdf/QPDF.cc:229-233`).
+    /// Literal null values stay null; only a non-null value is replaced.
+    /// Resets the parsed offset to the no-offset sentinel only when the
+    /// value is destroyed.
+    pub(crate) fn disconnect_and_destroy(&self) {
+        self.disconnect();
         let should_destroy = {
             let slot = self.0.borrow();
             let state = slot.state.borrow();
             !matches!(&*state, ObjectValue::Null)
         };
-        // QPDF disconnect clears the shared value before the cached QObject
-        // is rebound to Destroyed. An external replacement alias keeps its
-        // value but loses the departing document's identity.
-        *self.0.borrow().identity.borrow_mut() = ValueIdentity::default();
         if should_destroy {
             self.replace_detached_state(ObjectValue::Destroyed);
-        }
-        let mut slot = self.0.borrow_mut();
-        slot.tree_pdf_unique_id = None;
-        if should_destroy {
+            let mut slot = self.0.borrow_mut();
             slot.description = None;
             slot.parsed_offset = NO_PARSED_OFFSET;
             slot.end_before_space = NO_PARSED_OFFSET;
@@ -8999,7 +9069,7 @@ pub(crate) mod identity_tests {
             4242,
             Rc::downgrade(&destroyed_resolver),
         );
-        destroyed.disconnect();
+        destroyed.disconnect_and_destroy();
         target.assign_value_state(&destroyed);
         assert!(target.is_resolved());
         assert_eq!(target.type_code().expect("destroyed type code"), 14);
@@ -9101,7 +9171,7 @@ pub(crate) mod identity_tests {
         *replacement.0.borrow().identity.borrow_mut() = target.0.borrow().identity.borrow().clone();
         target.assign_value_state(&replacement);
 
-        target.disconnect();
+        target.disconnect_and_destroy();
 
         assert_eq!(target.type_code().expect("type code"), 14);
         assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
@@ -10079,7 +10149,7 @@ mod uniform_identity_tests {
         let promoted =
             original.promote_to_indirect(ObjectRef::new(47, 0), 91, Rc::downgrade(&resolver));
 
-        promoted.disconnect();
+        promoted.disconnect_and_destroy();
 
         assert!(original.is_same_object_as(&promoted));
         assert!(original.is_direct());
@@ -10114,7 +10184,7 @@ mod uniform_identity_tests {
         let alias = handle.clone();
         handle.set_parsed_offset_if_unset(66);
 
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert!(alias.is_same_object_as(&handle));
         assert!(alias.is_direct());
@@ -10128,7 +10198,7 @@ mod uniform_identity_tests {
     fn disconnect_of_a_repromoted_destroyed_handle_resets_its_new_offset() {
         let resolver = resolver();
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(56, 0), -1);
-        handle.disconnect();
+        handle.disconnect_and_destroy();
         handle.promote_to_indirect(ObjectRef::new(58, 0), 94, Rc::downgrade(&resolver));
         handle.set_parsed_offset_if_unset(77);
         assert!(handle.is_indirect());
@@ -10136,7 +10206,7 @@ mod uniform_identity_tests {
         assert_eq!(handle.type_code().expect("type code"), 14);
         assert_eq!(handle.get_parsed_offset(), 77);
 
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert!(handle.is_direct());
         assert_eq!(handle.object_ref(), None);
@@ -10150,7 +10220,7 @@ mod uniform_identity_tests {
         let resolver = resolver();
         let handle = ObjectHandle::integer(1);
         handle.promote_to_indirect(ObjectRef::new(55, 0), 94, Rc::downgrade(&resolver));
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert!(handle.direct_value_clone().expect("destroyed").is_none());
         assert!(!handle.is_null(), "destroyed is distinct from literal null");
@@ -10867,7 +10937,7 @@ mod resolution_state_tests {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
 
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert!(handle.is_resolved());
         assert!(!handle.is_null());
@@ -10886,7 +10956,7 @@ mod resolution_state_tests {
         handle.set_parsed_offset_if_unset(100);
         assert_eq!(handle.get_parsed_offset(), 100);
 
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
@@ -10901,7 +10971,7 @@ mod resolution_state_tests {
             .windows(b"offset".len())
             .any(|window| window == b"offset"));
 
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert_eq!(handle.description(), b"");
     }
@@ -10909,7 +10979,7 @@ mod resolution_state_tests {
     #[test]
     fn disconnect_destroys_a_cached_non_null_object_even_if_its_identity_was_cleared() {
         let handle = ObjectHandle::integer(42);
-        handle.disconnect();
+        handle.disconnect_and_destroy();
         assert!(handle.is_direct());
         assert_eq!(handle.type_code().unwrap(), 14);
     }
@@ -10942,8 +11012,8 @@ mod resolution_state_tests {
         assert_eq!(a.strong_count(), 2, "held by this test and by b's value");
         assert_eq!(b.strong_count(), 2, "held by this test and by a's value");
 
-        a.disconnect();
-        b.disconnect();
+        a.disconnect_and_destroy();
+        b.disconnect_and_destroy();
 
         assert_eq!(a.strong_count(), 1, "only this test's own handle remains");
         assert_eq!(b.strong_count(), 1, "only this test's own handle remains");
@@ -10999,7 +11069,7 @@ mod resolution_state_tests {
 
         let destroyed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(3, 0), 0);
         destroyed.set_resolved(ObjectValue::Integer(1));
-        destroyed.disconnect();
+        destroyed.disconnect_and_destroy();
         assert!(format!("{destroyed:?}").contains("Destroyed"));
     }
 }
@@ -11261,7 +11331,7 @@ mod type_code_tests {
     fn destroyed_handle_reports_destroyed_after_indirect_metadata_is_cleared() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(1));
-        handle.disconnect();
+        handle.disconnect_and_destroy();
         assert_eq!(handle.type_code().expect("type code"), 14, "ot_destroyed");
         assert_eq!(handle.type_name().expect("type name"), "destroyed");
         assert!(!handle.is_reserved());
@@ -11430,7 +11500,7 @@ mod type_code_tests {
         // neither method has an exception channel to mirror that with.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
-        handle.disconnect();
+        handle.disconnect_and_destroy();
 
         assert_eq!(handle.unparse(), b"null");
         assert_eq!(handle.unparse_resolved(), b"null");
@@ -15651,7 +15721,7 @@ mod mutation_tests {
         array.promote_to_indirect(ObjectRef::new(50, 0), 51, Rc::downgrade(&resolver));
         let destroyed = ObjectHandle::integer(1);
         destroyed.promote_to_indirect(ObjectRef::new(52, 0), 51, Rc::downgrade(&resolver));
-        destroyed.disconnect();
+        destroyed.disconnect_and_destroy();
 
         let error = array
             .append_array_item(destroyed)
@@ -19514,6 +19584,53 @@ mod drop_tests {
             handle = ObjectHandle::array(vec![handle]);
         }
         drop(handle);
+    }
+
+    #[test]
+    fn deep_direct_disconnect_is_stack_independent() {
+        assert_drop_probe_succeeds(
+            "object_handle::drop_tests::deep_direct_disconnect_probe",
+            "FLPDF_DEEP_DIRECT_DISCONNECT_PROBE",
+        );
+    }
+
+    /// `disconnect` walks the same direct graph `Drop` does, so it owes the
+    /// same stack independence: qpdf's teardown reaches every direct child
+    /// (`QPDF_Dictionary.cc:50-56`, `QPDF_Array.cc:103-118`) and this module
+    /// pins the depth contract at `DEEP_DROP_DEPTH`.
+    #[test]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
+    fn deep_direct_disconnect_probe() {
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_DIRECT_DISCONNECT_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..DEEP_DROP_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+        handle.disconnect();
+        drop(handle);
+    }
+
+    /// A direct DAG: every level holds the same child twice. Walking once per
+    /// path would visit 2^depth nodes, so a visited set that only tracks the
+    /// active path turns a 28-level graph into hundreds of millions of visits.
+    /// Recording every allocation reached keeps this linear.
+    #[test]
+    fn direct_dag_disconnect_visits_each_node_once() {
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..28 {
+            handle = ObjectHandle::array(vec![handle.clone(), handle]);
+        }
+
+        let start = std::time::Instant::now();
+        handle.disconnect();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "disconnect must not walk a direct DAG once per path"
+        );
     }
 
     #[test]

@@ -374,16 +374,12 @@ pub(crate) fn run_test_92<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let file = std::fs::File::open("minimal.pdf")?;
     let mut qpdf = Pdf::open(std::io::BufReader::new(file))?;
+    let qpdf_unique_id = qpdf.unique_id();
 
-    // GAP(QPDFObjectHandle::getOwningQPDF): no public accessor exposes a
-    // handle's owning-document identity (`ObjectHandle::owning_pdf_unique_id`
-    // is `pub(crate)`), so the three `assert(*.getOwningQPDF() ==
-    // qpdf.get())` checks below (test_driver.cc:3202,3206,3210) and the
-    // later `assert(oh.getOwningQPDF() == nullptr)` (test_driver.cc:3218)
-    // are not ported; every other assertion in this test is.
     let root_h = root_handle(&mut qpdf);
     qpdf.resolve(&root_h)?;
     let root = root_h.clone();
+    assert_eq!(root.owning_pdf_unique_id(), Some(qpdf_unique_id));
     assert!(root.is_indirect());
     assert!(root.as_dictionary().is_some());
 
@@ -398,10 +394,12 @@ pub(crate) fn run_test_92<R: Read + Seek>(
         .expect("minimal.pdf's /Kids has at least one page");
     qpdf.resolve(&first_kid)?;
     let page1 = first_kid.clone();
+    assert_eq!(page1.owning_pdf_unique_id(), Some(qpdf_unique_id));
     assert!(page1.is_indirect());
     assert!(page1.as_dictionary().is_some());
 
     let resources = resolved_key(&mut qpdf, &page1, b"/Resources")?;
+    assert_eq!(resources.owning_pdf_unique_id(), Some(qpdf_unique_id));
     assert!(resources.as_dictionary().is_some());
     assert!(!resources.is_indirect());
 
@@ -413,11 +411,17 @@ pub(crate) fn run_test_92<R: Read + Seek>(
 
     drop(qpdf);
 
-    // All objects should no longer be indirect (`check`, test_driver.cc:3217-3220).
+    // All objects should no longer have an owning document or be indirect
+    // (`check`, test_driver.cc:3217-3220).
+    assert_eq!(root.owning_pdf_unique_id(), None);
     assert!(!root.is_indirect());
+    assert_eq!(page1.owning_pdf_unique_id(), None);
     assert!(!page1.is_indirect());
+    assert_eq!(resources.owning_pdf_unique_id(), None);
     assert!(!resources.is_indirect());
+    assert_eq!(contents.owning_pdf_unique_id(), None);
     assert!(!contents.is_indirect());
+    assert_eq!(contents_dict.owning_pdf_unique_id(), None);
     assert!(!contents_dict.is_indirect());
 
     // Objects that were originally indirect are destroyed; direct children
