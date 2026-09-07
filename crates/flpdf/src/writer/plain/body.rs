@@ -1810,7 +1810,7 @@ mod object_emitter_tests {
 
         let direct_array = ObjectHandle::array(vec![child.clone(), ObjectHandle::null()]);
         let mut seeds = Vec::new();
-        collect_live_seed_handles(&mut local_pdf, &direct_array, &mut seeds)?;
+        collect_live_seed_handles(&mut local_pdf, &direct_array, &mut seeds, 0)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
         let direct_dictionary = ObjectHandle::dictionary(vec![
@@ -1818,7 +1818,7 @@ mod object_emitter_tests {
             (b"/Null".to_vec(), ObjectHandle::null()),
         ]);
         seeds.clear();
-        collect_live_seed_handles(&mut local_pdf, &direct_dictionary, &mut seeds)?;
+        collect_live_seed_handles(&mut local_pdf, &direct_dictionary, &mut seeds, 0)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 
