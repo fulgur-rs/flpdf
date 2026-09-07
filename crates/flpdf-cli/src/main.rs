@@ -19,8 +19,9 @@ use flpdf::{
     normalize_content_stream, pages, parse_pdf_version, AcroFormDocumentHelper, CompressStreams,
     CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
     ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
-    PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission,
-    QPDFLogger, R2PermissionsConfig, StreamDataMode, UsageError, WriterConfiguration,
+    PasswordMode, PasswordWriteNotice, Pdf, PdfOpenOptions, PdfVersion, PdfWriter,
+    PermissionsConfig, PrintPermission, QPDFLogger, R2PermissionsConfig, StreamDataMode,
+    UsageError, WriterConfiguration,
 };
 use flpdf::{
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
@@ -353,22 +354,9 @@ fn writer_configuration(
     if let Some(source) = options.copy_encryption.clone() {
         configuration.copy_encryption_parameters(source);
     }
-    let (info_count, warning_count) =
-        configuration.normalize_encryption_passwords(options.password_mode)?;
-    if options.verbose {
-        for _ in 0..info_count {
-            emit_logger_info(format!(
-                "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
-                progname()
-            ));
-        }
-    }
-    for _ in 0..warning_count {
-        emit_logger_error(format!(
-            "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
-            progname()
-        ));
-    }
+    let notices = configuration.normalize_encryption_passwords(options.password_mode)?;
+    let prefix = progname();
+    emit_password_write_notices(&cli_logger(), &prefix, notices, options.verbose)?;
     if !options.allow_weak_crypto
         && options
             .encrypt
@@ -385,6 +373,33 @@ fn writer_configuration(
         return Err("refusing to write a file with weak crypto".into());
     }
     Ok(configuration)
+}
+
+/// Emit qpdf's per-password write diagnostics in the order returned by
+/// `QPDFJob::maybeFixWritePassword` (`QPDFJob.cc:2696-2710`). The logger is
+/// injected so the direct CLI boundary remains fallible under custom sinks.
+fn emit_password_write_notices(
+    logger: &QPDFLogger,
+    prefix: &str,
+    notices: impl IntoIterator<Item = PasswordWriteNotice>,
+    verbose: bool,
+) -> CliResult<()> {
+    for notice in notices {
+        match notice {
+            PasswordWriteNotice::Info if verbose => {
+                logger.info(format!(
+                    "{prefix}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n"
+                ))?;
+            }
+            PasswordWriteNotice::Warning => {
+                logger.error(format!(
+                    "{prefix}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n"
+                ))?;
+            }
+            PasswordWriteNotice::None | PasswordWriteNotice::Info => {}
+        }
+    }
+    Ok(())
 }
 
 fn configure_pdf_writer<R: Read + Seek + 'static>(
@@ -8924,6 +8939,67 @@ mod tests {
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+    }
+
+    struct FailingPasswordNoticeSink;
+
+    impl Pipeline for FailingPasswordNoticeSink {
+        // cov:ignore-start: the injected failure test only reaches write; the
+        // logger does not query the sink identifier.
+        fn identifier(&self) -> &str {
+            "failing password notice sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(flpdf::PipelineError::runtime(
+                "password notice sink failure",
+            ))
+        }
+
+        // cov:ignore-start: the injected failure test aborts during write.
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    #[test]
+    fn direct_password_notice_logging_propagates_info_sink_failure() {
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(FailingPasswordNoticeSink)));
+
+        let error =
+            emit_password_write_notices(&logger, "flpdf", [PasswordWriteNotice::Info], true)
+                .expect_err("direct CLI password notice logging must be fallible");
+        assert_eq!(error.to_string(), "password notice sink failure");
+    }
+
+    #[test]
+    fn direct_password_notice_logging_propagates_warning_sink_failure() {
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(FailingPasswordNoticeSink)));
+
+        let error =
+            emit_password_write_notices(&logger, "flpdf", [PasswordWriteNotice::Warning], true)
+                .expect_err("direct CLI warning logging must be fallible");
+        assert_eq!(error.to_string(), "password notice sink failure");
+    }
+
+    #[test]
+    fn direct_password_notice_logging_routes_warning_to_error_sink() {
+        let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(ChunkRecordingSink {
+            chunks: Arc::clone(&chunks),
+        })));
+
+        emit_password_write_notices(&logger, "flpdf", [PasswordWriteNotice::Warning], true)
+            .expect("warning notice must be written to the error sink");
+        assert_eq!(
+            chunks.lock().unwrap().concat(),
+            b"flpdf: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n"
+        );
     }
 
     fn strs(v: &[&str]) -> Vec<String> {

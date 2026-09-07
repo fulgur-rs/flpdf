@@ -2574,6 +2574,14 @@ impl QPDFJob {
         }) else {
             return Ok(JobExitCode::Error);
         };
+        // qpdf's checkConfiguration reserves the save pipeline before
+        // createQPDF and setEncryptionOptions, so auto-password diagnostics
+        // cannot consume stdout that is needed for the PDF output
+        // (`QPDFJob.cc:614-626`). Keep the direct write_qpdf entry point on
+        // the same boundary even when callers bypass run().
+        if output == Path::new("-") {
+            self.logger.save_to_standard_output(true)?;
+        }
         let mut writer_configuration = self.configuration.writer.clone();
         if let Some(path) = self.configuration.copy_encryption.clone() {
             match self.copy_encryption_source(&path) {
@@ -2584,28 +2592,32 @@ impl QPDFJob {
                 }
             }
         }
-        let (auto_password_infos, auto_password_warnings) = match writer_configuration
+        let auto_password_notices = match writer_configuration
             .normalize_encryption_passwords(self.configuration.password_mode)
         {
-            Ok(count) => count,
+            Ok(notices) => notices,
             Err(error) => {
                 self.report_job_error(&error)?;
                 return Ok(JobExitCode::Error);
             }
         };
-        if self.configuration.verbose {
-            for _ in 0..auto_password_infos {
-                self.logger.info(format!(
-                    "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
-                    self.message_prefix
-                ))?;
+        for notice in auto_password_notices {
+            match notice {
+                crate::encryption::PasswordWriteNotice::Info if self.configuration.verbose => {
+                    self.logger.info(format!(
+                        "{}: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n",
+                        self.message_prefix
+                    ))?;
+                }
+                crate::encryption::PasswordWriteNotice::Warning => {
+                    self.logger.error(format!(
+                        "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
+                        self.message_prefix
+                    ))?;
+                }
+                crate::encryption::PasswordWriteNotice::None
+                | crate::encryption::PasswordWriteNotice::Info => {}
             }
-        }
-        for _ in 0..auto_password_warnings {
-            self.logger.error(format!(
-                "{}: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n",
-                self.message_prefix
-            ))?;
         }
         writer_configuration.set_linearization(self.configuration.linearize);
         if let Some(path) = self.configuration.linearize_pass1.as_deref() {
@@ -4276,6 +4288,58 @@ mod tests {
     }
 
     #[test]
+    fn write_qpdf_emits_auto_password_notices_in_user_owner_order() {
+        let tempdir = tempfile::tempdir().expect("temporary output directory");
+        let output = tempdir.path().join("output.pdf");
+        let mut input = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        let sink = PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&bytes),
+        });
+        logger.set_info(Some(sink.clone()));
+        logger.set_warn(Some(logger.discard()));
+        logger.set_error(Some(sink));
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_output_file(&output)
+            .expect("output path is accepted");
+        job.set_verbose(true);
+        job.configuration.password_mode = PasswordMode::Auto;
+        job.configuration
+            .writer
+            .set_encryption_parameters(crate::EncryptParams::v4_aes128(
+                "日本".as_bytes().to_vec(),
+                "café".as_bytes().to_vec(),
+            ));
+
+        assert_eq!(
+            job.write_qpdf(&mut input).expect("job write succeeds"),
+            JobExitCode::Success
+        );
+        let output = bytes.lock().unwrap();
+        let warning = b"qpdf: WARNING: supplied password looks like a Unicode password with characters not allowed in passwords for 40-bit and 128-bit encryption; most readers will not be able to open this file with the supplied password. (Use --password-mode=bytes to suppress this warning and use the password anyway.)\n";
+        let info = b"qpdf: automatically converting Unicode password to single-byte encoding as required for 40-bit or 128-bit encryption\n";
+        let warning_at = output
+            .windows(warning.len())
+            .position(|window| window == warning);
+        let info_at = output.windows(info.len()).position(|window| window == info);
+        assert!(
+            warning_at
+                .is_some_and(|warning_at| info_at.is_some_and(|info_at| warning_at < info_at)),
+            "user warning must precede owner info in the shared logger stream"
+        );
+    }
+
+    #[test]
     fn write_qpdf_propagates_verbose_auto_password_info_sink_error() {
         let tempdir = tempfile::tempdir().expect("temporary output directory");
         let output = tempdir.path().join("output.pdf");
@@ -4311,6 +4375,47 @@ mod tests {
             error,
             Error::System(message) if message == "sink write failure 1"
         ));
+    }
+
+    #[test]
+    fn write_qpdf_reserves_stdout_before_auto_password_diagnostic() {
+        let mut input = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&errors),
+        })));
+        logger.set_warn(Some(logger.discard()));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_output_file("-").expect("stdout output is accepted");
+        job.set_verbose(true);
+        job.configuration.password_mode = PasswordMode::Auto;
+        job.configuration.writer.set_deterministic_id(true);
+        job.configuration
+            .writer
+            .set_encryption_parameters(crate::EncryptParams::v4_aes128(
+                "café".as_bytes().to_vec(),
+                b"owner".to_vec(),
+            ));
+
+        assert_eq!(
+            job.write_qpdf(&mut input)
+                .expect("writer preflight error must be reported as a job error"),
+            JobExitCode::Error
+        );
+        let error = String::from_utf8_lossy(&errors.lock().unwrap()).into_owned();
+        assert!(
+            error.contains("deterministic") && !error.contains("called setSave"),
+            "stdout reservation must precede the diagnostic: {error:?}"
+        );
     }
 
     #[test]

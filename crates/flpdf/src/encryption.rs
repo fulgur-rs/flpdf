@@ -40,7 +40,7 @@ pub(crate) mod standard;
 pub(crate) mod state;
 
 pub use keys::ObjectKeyAlg;
-pub use password::PasswordMode;
+pub use password::{PasswordMode, PasswordWriteNotice};
 pub use permissions::{Permissions, PermissionsConfig, PrintPermission, R2PermissionsConfig};
 
 /// Narrow a qpdf integer accessor to the signed 32-bit permission bitfield.
