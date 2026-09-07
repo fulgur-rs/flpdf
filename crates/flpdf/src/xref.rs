@@ -3784,11 +3784,7 @@ fn trailer_diagnostics(
         .into_iter()
         .map(|diagnostic| {
             let offset = (start as u64).saturating_add(diagnostic.relative_offset as u64);
-<<<<<<< HEAD
-            damaged_warning(filename, b"trailer", diagnostic.message, Some(offset))
-=======
             trailer_warning(filename, diagnostic.message, Some(offset))
->>>>>>> e04e2fb5 (Align xref trailer and previous-section routes with qpdf)
         })
         .collect()
 }
