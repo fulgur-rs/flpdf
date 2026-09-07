@@ -83,7 +83,7 @@ done | sort | uniq -c
 本表は「その責務に至る **経路が 1 本か**」を問う。✅ の行でも consumer 側に bridge が残っていれば
 本表では mixed / bridge になりうる。
 
-履歴行の例外: C44は未実装public責務を既知の未移植としてmixedに保持する。
+履歴行の例外: C44はpublic facadeとdeferred blobの責務を分離したmixed ownerとして追跡する。
 D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は当該pre-write sweep撤去完了としてcanonicalに分類する。
 この例外をproduction routeの重複や全体parityの証拠に広げない。
 
@@ -171,7 +171,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。現行の bridge / mixed は97行だが、
 manifest は行集合の完全な機械変換ではなく、削除済みsymbolの0確認とcanonical側の分母も保持する。
-B7 / C44 の未実装ownerには追跡すべきRust symbolがなく、B29は既存 `num_warnings` と未実装drainを区別する。
+B7 は未実装ownerに追跡すべきRust symbolがなく、C44 は `ObjectHandle::get_stream_json` を owner とする。B29 は既存 `num_warnings` と未実装drainを区別する。
 symbol数はmanifestの非comment・非空行から数え、行数と同一視しない。
 数え方の正本は `scripts/qpdf-route-callers.py` の module docstring と実装である。
 
@@ -686,7 +686,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
 4. **C42 / B11** — EOL 差し引きの決着は `flpdf-zvjf`（pipe）と `flpdf-hj7v`（show-stream）で完了。`RecoveredStreamEol` は `dump-object` 再シリアライズ専用として残る。前提: probe C-U1。
 5. **C27** — bootstrapのdocument/source ownerを整えてからxref stream payloadのdecodeをcanonical pipeへ移す（`flpdf-3yn9.48.43`）。B17のxref entry構文処理の正本とは別責務である。
-6. **C44** — 未実装public `getStreamJSON` / deferred `StreamBlobProvider`を別primitiveとして移植する。C-U2は直接APIをprobeする。canonical C24 `write_stream_json` を二重pipeへ変更しない。
+6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当を検証する。C-U2は直接APIをprobeする。canonical C24 `write_stream_json` を二重pipeへ変更しない。
 7. **C4 / C8 / C9 / C25〜C29 / C43、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。
 
 qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を

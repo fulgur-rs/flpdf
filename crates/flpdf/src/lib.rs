@@ -201,7 +201,8 @@ pub use nntree::{
 };
 pub use object_handle::{
     ArrayItemCursor, ArrayItems, DictItem, DictItemCursor, DictItems, ObjectHandle,
-    ObjectHandleMatrix, StreamDataProvider, STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
+    ObjectHandleMatrix, ObjectJsonError, QpdfStreamJsonData, StreamDataProvider,
+    STREAM_ENCODE_COMPRESS, STREAM_ENCODE_NORMALIZE,
 };
 pub use object_ref::{ObjectRef, ParseObjectRefError};
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
