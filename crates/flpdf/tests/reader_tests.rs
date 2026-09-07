@@ -6,7 +6,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     load_xref_and_trailer, DecodeLevel, EncryptMethod, EncryptParams, EncryptedError, Error,
-    ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
+    ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, PdfWriter, XrefEntry,
 };
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -3079,6 +3079,49 @@ fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
         }
     }
     assert!(stream_seen, "fixture must contain at least one stream");
+}
+
+#[test]
+fn recovered_xref_rebinds_a_reused_generation_catalog_before_writer_traversal() {
+    let mut pdf = Pdf::open_with_repair(std::io::Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/recovered-catalog-pagelabels.pdf").to_vec(),
+    ))
+    .expect("the malformed startxref should be recovered");
+
+    let catalog = pdf.root_handle().expect("the recovered catalog resolves");
+    let page_labels = catalog
+        .try_get_key(b"/PageLabels")
+        .expect("the recovered catalog must expose /PageLabels");
+    assert_eq!(
+        page_labels.object_ref(),
+        Some(ObjectRef::new(5, 1)),
+        "the canonical Catalog must use the later reused-generation label tree"
+    );
+    assert!(page_labels
+        .try_get_key(b"/Nums")
+        .expect("the label tree must expose /Nums")
+        .try_is_array()
+        .expect("/Nums type inspection"));
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_suppress_original_object_ids(true);
+    writer.set_output_memory().expect("memory output setup");
+    writer.write().expect("recovered graph should be writable");
+    let output = writer.get_buffer().expect("memory output retrieval");
+    assert!(
+        output
+            .windows(b"/PageLabels 2 0 R".len())
+            .any(|window| window == b"/PageLabels 2 0 R"),
+        "writer traversal must retain the recovered /PageLabels edge"
+    );
+    assert!(
+        output
+            .windows(b"/Nums [".len())
+            .any(|window| window == b"/Nums ["),
+        "writer traversal must retain the recovered /Nums tree"
+    );
 }
 
 /// A cyclic indirect-/Length holder chain
