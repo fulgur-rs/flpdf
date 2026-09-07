@@ -1977,6 +1977,129 @@ fn json_job_copies_attachments_from_every_donor_before_reporting_conflicts() {
 }
 
 #[test]
+fn json_job_opens_each_attachment_donor_at_its_verbose_boundary() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let minimal = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf"),
+    )
+    .unwrap();
+    let write_with_attachment = |name: &str, key: &[u8]| -> std::path::PathBuf {
+        let payload = tempdir.path().join(format!("{name}.bin"));
+        std::fs::write(&payload, name.as_bytes()).unwrap();
+        let mut job = QPDFJob::new();
+        let mut pdf = job
+            .open(
+                Cursor::new(minimal.clone()),
+                "fixture.pdf",
+                PdfOpenOptions::default(),
+            )
+            .unwrap();
+        job.add_attachments(
+            &mut pdf,
+            &[flpdf::job::AttachmentAddOptions {
+                path: payload,
+                key: key.to_vec(),
+                filename: key.to_vec(),
+                mimetype: None,
+                description: None,
+                creation_date: None,
+                modification_date: None,
+                replace: false,
+                verbose: false,
+            }],
+        )
+        .unwrap();
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+        let path = tempdir.path().join(format!("{name}.pdf"));
+        std::fs::write(&path, writer.get_buffer().unwrap()).unwrap();
+        path
+    };
+    let first = write_with_attachment("json-first", b"first");
+    let second = write_with_attachment("json-second", b"second");
+    let damaged = tempdir.path().join("json-damaged-second.pdf");
+    let mut damaged_bytes = std::fs::read(&second).unwrap();
+    let start = damaged_bytes
+        .windows(b"startxref\n".len())
+        .rposition(|window| window == b"startxref\n")
+        .unwrap();
+    let digits_start = start + b"startxref\n".len();
+    let digits_end = digits_start
+        + damaged_bytes[digits_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap();
+    damaged_bytes[digits_start..digits_end].fill(b'0');
+    std::fs::write(&damaged, damaged_bytes).unwrap();
+
+    let target = tempdir.path().join("json-target.pdf");
+    std::fs::write(&target, &minimal).unwrap();
+    let output = tempdir.path().join("json-output.pdf");
+    let logger = QPDFLogger::create();
+    let state = Arc::new(Mutex::new(SinkState::default()));
+    let sink = PipelineHandle::new(RecordingSink {
+        state: Arc::clone(&state),
+    });
+    logger.set_info(Some(sink.clone()));
+    logger.set_error(Some(sink));
+
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(
+        &serde_json::json!({
+            "inputFile": target,
+            "outputFile": output,
+            "verbose": "",
+            "copyAttachmentsFrom": [
+                {"file": first},
+                {"file": damaged},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    let diagnostics = state.lock().unwrap().bytes.clone();
+    let copy_first = format!(
+        "qpdfjob json: copying attachments from {}\n",
+        first.display()
+    );
+    let copy_second = format!(
+        "qpdfjob json: copying attachments from {}\n",
+        damaged.display()
+    );
+    let warning = format!("WARNING: {}: file is damaged", damaged.display());
+    let key_first = b"  first -> first\n";
+    let key_second = b"  second -> second\n";
+    let positions = [
+        copy_first.as_bytes(),
+        key_first,
+        copy_second.as_bytes(),
+        warning.as_bytes(),
+        key_second,
+    ]
+    .map(|needle| {
+        diagnostics
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| {
+                panic!(
+                    "diagnostic {:?} missing:\n{}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&diagnostics)
+                )
+            })
+    });
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "Job JSON donor diagnostics must be verbose, open warning, then copy: {}",
+        String::from_utf8_lossy(&diagnostics)
+    );
+}
+
+#[test]
 fn json_job_run_covers_update_page_labels_and_linearized_writer_stages() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/json-input/complete.json");
