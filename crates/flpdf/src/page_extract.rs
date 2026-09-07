@@ -53,6 +53,7 @@
 
 use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::pages::page_refs;
+use crate::pdf::WriterObjectOrderKey;
 use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -272,6 +273,7 @@ pub(crate) fn append_selection_kids(
     map: &std::collections::BTreeMap<ObjectRef, ObjectRef>,
     used: &mut BTreeSet<ObjectRef>,
     kids: &mut Vec<ObjectRef>,
+    writer_object_order: &mut BTreeMap<ObjectRef, WriterObjectOrderKey>,
 ) -> Result<()> {
     for &src_ref in selected {
         let copied_page_ref = *map
@@ -285,9 +287,15 @@ pub(crate) fn append_selection_kids(
             let page = target.get_object_handle(copied_page_ref);
             target.resolve(&page)?;
             let clone = target.make_indirect_object_handle(page.shallow_copy()?)?;
-            clone.object_ref().ok_or(Error::Missing(
+            let clone_ref = clone.object_ref().ok_or(Error::Missing(
                 "duplicate extracted page missing from target",
-            ))?
+            ))?;
+            // qpdf allocates this shallow clone before later foreign
+            // copyForeignObject allocations. It therefore belongs to the
+            // same destination-order group as those imported objects, not the
+            // fresh-object fallback after them.
+            writer_object_order.insert(clone_ref, WriterObjectOrderKey::foreign(clone_ref));
+            clone_ref
         };
         kids.push(kid);
     }
