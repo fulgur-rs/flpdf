@@ -1691,6 +1691,31 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .cloned())
     }
 
+    /// Return whether a copied annotation set contains a Widget that the
+    /// incremental field-tree update did not register.
+    ///
+    /// qpdf's `copyAnnotations` calls `addAndRenameFormFields` before it
+    /// appends the copied annotations (`QPDFAcroFormDocumentHelper.cc:992-1035`).
+    /// That call updates the warm association cache for every Widget reachable
+    /// through a newly added field's `/Kids` tree. A Widget without such a
+    /// field remains visible only to qpdf's full page orphan scan, so the
+    /// caller must invalidate the shared cache in that case. Non-Widget
+    /// annotations cannot affect the field association cache.
+    pub(crate) fn copied_annotations_require_cache_invalidation(
+        &mut self,
+        annotations: &[ObjectHandle],
+    ) -> Result<bool> {
+        for annotation in annotations {
+            let annotation = self.pdf.resolve_handle(annotation)?;
+            if annotation.try_is_dictionary_of_type(b"", b"Widget")?
+                && self.canonical_field_for_annotation(annotation)?.is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn canonical_acroform(&mut self) -> Result<Option<ObjectHandle>> {
         // `root_handle` accepts a direct trailer /Root the same way qpdf's
         // `getRoot` does; a missing/dangling/non-dictionary root degrades to

@@ -1158,7 +1158,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             return Ok(());
         }
 
-        let transformed = {
+        let (transformed, invalidate_cache) = {
             let mut acroform = if field_tree_only {
                 crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?
             } else {
@@ -1169,17 +1169,24 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 transformed.new_fields.clone(),
                 reserved_names,
             )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
-            transformed
+            let invalidate_cache = if field_tree_only {
+                true
+            } else {
+                acroform
+                    .copied_annotations_require_cache_invalidation(&transformed.new_annotations)?
+            };
+            (transformed, invalidate_cache)
         };
         append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
-        // qpdf's QPDFAcroFormDocumentHelper contract requires invalidateCache
-        // after manually changing a page's annotation dictionary when the
-        // association between widgets and fields may have changed
-        // (QPDFAcroFormDocumentHelper.hh:76-83). A foreign source without a
-        // /Fields tree contributes no new field through the transform above,
-        // so the shared destination cache cannot update itself via
-        // addFormField; the next lookup must rerun the orphan-widget fallback.
-        *self.pdf.acroform_cache.borrow_mut() = None;
+        if invalidate_cache {
+            // qpdf's QPDFAcroFormDocumentHelper contract requires
+            // invalidateCache after manually changing a page's annotation
+            // dictionary when an unregistered Widget may need the orphan
+            // fallback (`QPDFAcroFormDocumentHelper.hh:76-83`). Field-backed
+            // Widgets have already been registered by addFormField, so keep
+            // that warm cache instead of rescanning every destination page.
+            *self.pdf.acroform_cache.borrow_mut() = None;
+        }
         Ok(())
     }
 
@@ -2563,6 +2570,197 @@ mod tests {
                 .len(),
             1,
             "the orphan widget must be registered as its own field"
+        );
+    }
+
+    fn target_with_warm_empty_acroform() -> (Pdf<Cursor<Vec<u8>>>, ObjectRef) {
+        let mut target = Pdf::empty().expect("target should be constructible");
+        let direct_page = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ]);
+        let new_page = crate::PageDocumentHelper::new(&mut target)
+            .add_page(crate::PageInput::direct(direct_page), false)
+            .expect("direct page should be inserted")
+            .new_kids
+            .into_iter()
+            .next()
+            .expect("target should contain the inserted page");
+
+        {
+            let mut acroform = crate::AcroFormDocumentHelper::new(&mut target)
+                .expect("target AcroForm helper should initialize");
+            acroform
+                .canonical_get_or_create_acroform()
+                .expect("target AcroForm should be created");
+            acroform.invalidate_cache();
+        }
+        let _ = crate::AcroFormDocumentHelper::new(&mut target)
+            .expect("target AcroForm cache should warm");
+        assert!(target.acroform_cache.borrow().is_some());
+        (target, new_page)
+    }
+
+    fn orphan_widget_source() -> (Pdf<Cursor<Vec<u8>>>, ObjectRef) {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>"
+                        .to_owned(),
+                ),
+                (
+                    4,
+                    "<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] >>".to_owned(),
+                ),
+            ],
+        );
+        let mut source = Pdf::open(Cursor::new(bytes)).expect("orphan source should parse");
+        let page = crate::pages::page_refs(&mut source)
+            .expect("orphan source pages should resolve")
+            .into_iter()
+            .next()
+            .expect("orphan source should have one page");
+        (source, page)
+    }
+
+    #[test]
+    fn copy_annotations_keeps_warm_cache_for_multi_kid_field_widgets() {
+        let mut source = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/form-fields-and-annotations.pdf")
+                .to_vec(),
+        )
+        .expect("field source should parse");
+        let source_page_ref = crate::pages::page_refs(&mut source)
+            .expect("field source pages should resolve")
+            .into_iter()
+            .next()
+            .expect("field source should have one page");
+        let source_page = source.get_object_handle(source_page_ref);
+        let (mut target, new_page) = target_with_warm_empty_acroform();
+
+        PageObjectHelper::new(new_page, &mut target)
+            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .expect("field-backed annotations should copy");
+
+        assert!(
+            target.acroform_cache.borrow().is_some(),
+            "field-backed annotation copies must retain the incrementally updated cache"
+        );
+
+        let page = target.get_object_handle(new_page);
+        target.resolve(&page).expect("copied page should resolve");
+        let annots = target
+            .resolve_handle(&page.try_get_key(b"/Annots").expect("read /Annots"))
+            .expect("copied annotations should resolve");
+        let widget_refs: Vec<ObjectRef> = annots
+            .try_as_array()
+            .expect("/Annots should be an array")
+            .expect("/Annots should be present")
+            .into_iter()
+            .filter_map(|annotation| {
+                target
+                    .resolve(&annotation)
+                    .expect("annotation should resolve");
+                annotation
+                    .try_is_dictionary_of_type(b"", b"Widget")
+                    .expect("widget classification should resolve")
+                    .then(|| annotation.object_ref())
+                    .flatten()
+            })
+            .collect();
+        assert!(
+            widget_refs.len() >= 3,
+            "fixture should exercise a field with multiple widget kids"
+        );
+
+        let mut acroform = crate::AcroFormDocumentHelper::new(&mut target)
+            .expect("target AcroForm helper should reuse the warm cache");
+        for widget_ref in widget_refs {
+            assert!(
+                acroform
+                    .get_field_for_annotation(widget_ref)
+                    .expect("field association should resolve")
+                    .is_some(),
+                "every copied field-backed widget must be registered incrementally"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_annotations_keeps_warm_cache_for_non_widget_annotations() {
+        let mut source = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/link-annot-no-acroform.pdf").to_vec(),
+        )
+        .expect("link source should parse");
+        let source_page_ref = crate::pages::page_refs(&mut source)
+            .expect("link source pages should resolve")
+            .into_iter()
+            .next()
+            .expect("link source should have one page");
+        let source_page = source.get_object_handle(source_page_ref);
+        let (mut target, new_page) = target_with_warm_empty_acroform();
+
+        PageObjectHelper::new(new_page, &mut target)
+            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .expect("non-widget annotations should copy");
+
+        assert!(
+            target.acroform_cache.borrow().is_some(),
+            "non-Widget annotation copies must not invalidate the AcroForm cache"
+        );
+    }
+
+    #[test]
+    fn copy_annotations_invalidates_cache_for_an_unassociated_widget() {
+        let (mut source, source_page_ref) = orphan_widget_source();
+        let source_page = source.get_object_handle(source_page_ref);
+        let (mut target, new_page) = target_with_warm_empty_acroform();
+
+        PageObjectHelper::new(new_page, &mut target)
+            .copy_annotations_from(source_page, Matrix::default(), &mut source)
+            .expect("orphan annotation should copy");
+
+        assert!(
+            target.acroform_cache.borrow().is_none(),
+            "an unassociated copied Widget must invalidate the orphan-scan cache"
+        );
+
+        let page = target.get_object_handle(new_page);
+        target.resolve(&page).expect("copied page should resolve");
+        let annotation = target
+            .resolve_handle(&page.try_get_key(b"/Annots").expect("read /Annots"))
+            .expect("copied annotations should resolve")
+            .try_as_array()
+            .expect("/Annots should be an array")
+            .expect("/Annots should be present")
+            .into_iter()
+            .next()
+            .expect("copied orphan should be present");
+        target.resolve(&annotation).expect("orphan should resolve");
+        let annotation_ref = annotation
+            .object_ref()
+            .expect("orphan copy should be indirect");
+
+        let mut acroform = crate::AcroFormDocumentHelper::new(&mut target)
+            .expect("target AcroForm helper should rebuild after invalidation");
+        assert_eq!(
+            acroform
+                .get_field_for_annotation(annotation_ref)
+                .expect("orphan association should resolve"),
+            Some(annotation_ref),
+            "the rebuilt qpdf orphan scan must self-associate the copied Widget"
         );
     }
 
