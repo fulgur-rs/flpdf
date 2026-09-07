@@ -749,6 +749,55 @@ fn qdf_split_pages_applies_qdf_to_every_chunk() {
 }
 
 #[test]
+fn qdf_split_pages_preserves_foreign_original_object_ids() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--qdf", "--split-pages=1", "--static-id"])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf split should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf QDF split failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["rewrite", "--qdf", "--split-pages=1", "--static-id"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf QDF split failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    for page in 1..=3 {
+        let qpdf_chunk = temp.path().join(format!("qpdf-{page}.pdf"));
+        let flpdf_chunk = temp.path().join(format!("flpdf-{page}.pdf"));
+        assert_eq!(
+            std::fs::read(&flpdf_chunk).unwrap(),
+            std::fs::read(&qpdf_chunk).unwrap(),
+            "QDF split chunk {page} must preserve qpdf Original object IDs"
+        );
+    }
+}
+
+#[test]
 fn split_pages_reapplies_stream_data_policy_to_every_chunk() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
