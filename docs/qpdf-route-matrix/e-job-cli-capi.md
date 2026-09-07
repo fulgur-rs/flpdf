@@ -297,7 +297,7 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 | 13 | `qpdf/test_driver.cc:570-591` | `crates/flpdf-qtest-tools/src/driver/test_10_17.rs::run_test_13` | mixed | case 12 と同じ `show_linearization_pdf_with_warnings` core。E-7 に従属し `mixed`。 |
 | 14 | `qpdf/test_driver.cc:592-660` | `crates/flpdf-qtest-tools/src/driver/test_10_17.rs::run_test_14` | mixed | A17 が本ファイル（`crates/flpdf-qtest-tools/src/driver/test_10_17.rs:295,323`）を `Pdf::swap_objects` の production caller として明記済み、`mixed`（qpdf に無い tombstone 掃除分岐あり）。 |
 | 15 | `qpdf/test_driver.cc:661-744` | `crates/flpdf-qtest-tools/src/driver/test_10_17.rs::run_test_15` | mixed | `PageDocumentHelper::get_all_pages`/`add_page`/`add_page_at` に A-D 行なし（owned-snapshot vs qpdf live-vector、CLAUDE.md (B)、doc comment 記載済み）。`PdfWriter::write` は D1 mixed。 |
-| 16 | `qpdf/test_driver.cc:745-776` | `crates/flpdf-qtest-tools/src/driver/test_10_17.rs::run_test_16` | mixed | **未追跡ギャップ、`flpdf-83jc` で追跡開始**: `Pdf::update_all_pages_cache`（`pub`、`crates/flpdf/src/pdf.rs:369`）は実在し `run_test_16` も既に呼んでいる（`test_10_17.rs:635`）。未移植なのは qpdf test 後半の 3 assert + 書き出しのみで、原因は primitive の不在ではなく `get_all_pages` が owned snapshot を返す点（case 15/18 と同じ CLAUDE.md (B) 逸脱）— 更新後に再取得すれば移植可能。driver の GAP doc comment（`test_10_17.rs:582`）は 4 行下の実コードと矛盾しており stale。 |
+| 16 | `qpdf/test_driver.cc:745-776` | `crates/flpdf-qtest-tools/src/driver/test_10_17.rs::run_test_16` | mixed | `flpdf-83jc` で全件移植済み。qpdf の `getAllPages()` は自身の cache への live reference を返すため同じ binding を読み直すが、`PageDocumentHelper::get_all_pages` は owned snapshot を返す（case 15/18 と同じ CLAUDE.md (B) 逸脱）ので、`Pdf::update_all_pages_cache`（`pub`、`crates/flpdf/src/pdf.rs:369`）の後に再取得して同じ refreshed 状態を観測する。これで後半の 3 assert と `a.pdf` 書き出しまで qpdf と同じ順序で通る。 |
 | 17 | `qpdf/test_driver.cc:777-795` | `crates/flpdf-qtest-tools/src/driver/test_10_17.rs::run_test_17` | mixed | 直接 `get_key`（A8 mixed）。`PageDocumentHelper::get_all_pages`/`remove_page` に A-D 行なし。`get_stream_data` は C4/C5 canonical。 |
 | 18 | `qpdf/test_driver.cc:796-817` | `crates/flpdf-qtest-tools/src/driver/test_18_25.rs::run_test_18` | mixed | `PageDocumentHelper` 呼び出しに A-D 行なし（owned-snapshot vs qpdf live-cache、CLAUDE.md (B)）。`PdfWriter::write` は D1 mixed。 |
 | 19 | `qpdf/test_driver.cc:818-834` | `crates/flpdf-qtest-tools/src/driver/test_18_25.rs::run_test_19` | mixed | 末尾の `/Contents` objgen 比較で直接 `get_key`（A8 mixed）。`PageDocumentHelper` に A-D 行なし。writer 呼び出しなし。 |
@@ -473,7 +473,7 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 | `E-6` / `E-7` / `E-8` / `E-21` | `flpdf-3yn9.48.9` | CLI combined inspection・JSON consumer を canonical writeQPDF に移行する |
 | `E-9` / `E-21` / `E-29` | `flpdf-3yn9.48.10` | CLI attachment mutation入口を canonical Job lifecycle に移行する |
 | `E-28` | `flpdf-3yn9.48.11` | qtest test_driver consumerをcase・API責務単位でcanonical ownerに対応付ける |
-| `E-28` | `flpdf-83jc` | case 16: `Pdf::update_all_pages_cache`（`pub`）は実在し呼ばれている。未移植は後半の3 assert+書き出しで、原因は`get_all_pages`がowned snapshotを返す点（(B)逸脱） |
+| `E-28` | `flpdf-83jc` | case 16: **解決済み** — `update_all_pages_cache` 後に `get_all_pages` を再取得して後半の 3 assert と書き出しを移植（owned snapshot 由来の差は再取得で吸収） |
 | `E-28` | `flpdf-wd2e` | case 34: **解決済み** — `Pdf::get_version_as_pdf_version`/`Pdf::get_extension_level` を移植（qpdf 側も public）。残るのは `PdfVersion` の `u8` 幅と overflow の扱いで、別 issue |
 | `E-28` | `flpdf-jzj1` | case 86: **解決済み** — `utf8_to_pdf_doc` を移植し、representability を返す `utf8_to_pdf_doc_checked`/`utf8_to_ascii_checked` で bool assertion も移植 |
 | `E-28` | `flpdf-6f6h` | case 92: `owning_pdf_unique_id`（`pub`）が所有文書identityを公開しており同一性assertは移植可能。残るのは`unparse`のthrow挙動 |
