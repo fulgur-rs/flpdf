@@ -2621,6 +2621,41 @@ continue to consider qpdf to be licensed under those terms. Please\n\
     ));
 }
 
+fn qpdf_compat_help_usage_error(preprocessed: &PreprocessedArgs) -> Option<UsageError> {
+    if preprocessed.native_subcommand_mode {
+        return None;
+    }
+
+    let sole_option = preprocessed.expanded_arg_count == 2 && preprocessed.residual_args.len() == 2;
+    let args = &preprocessed.residual_args;
+    let mut index = 1;
+    while index < args.len() {
+        let bytes = arg_parser::os_bytes(&args[index]);
+        if is_named_segment_option(&bytes) {
+            index += 1;
+            while index < args.len() && arg_parser::os_bytes(&args[index]) != b"--" {
+                index += 1;
+            }
+            index += usize::from(index < args.len());
+            continue;
+        }
+
+        let is_help_table_option = bytes == b"-h"
+            || bytes == b"--help"
+            || bytes.starts_with(b"--help=")
+            || bytes == b"--version"
+            || bytes == b"--copyright";
+        if is_help_table_option && (!sole_option || bytes == b"-h") {
+            return Some(UsageError::new(format!(
+                "unrecognized argument {}",
+                args[index].to_string_lossy()
+            )));
+        }
+        index += 1;
+    }
+    None
+}
+
 fn main() {
     // One private qpdf-style logger owns all document routes for this
     // invocation. It is deliberately distinct from the library process
@@ -2657,6 +2692,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(error) = qpdf_compat_help_usage_error(&preprocessed) {
+        usage_exit(&error);
+    }
     // qpdf treats --version/--copyright/--help as a valid sole option only
     // when the whole expanded argv is exactly `<prog> <option>` (argc == 2),
     // checked after @argfile expansion but before named-group parsing
@@ -2677,13 +2715,23 @@ fn main() {
         }
     }
     let PreprocessedArgs {
-        residual_args,
+        mut residual_args,
         native_subcommand_mode,
         overlay_specs,
         attachment_segments,
         raw_overrides,
-        expanded_arg_count: _,
+        expanded_arg_count,
     } = preprocessed;
+    if !native_subcommand_mode
+        && expanded_arg_count == 2
+        && residual_args.len() == 2
+        && residual_args[1].to_str() == Some("--help=usage")
+    {
+        // qpdf's usage help is a valid sole help option. Reuse the existing
+        // top-level clap help renderer after the qpdf gate has established
+        // that the option is sole; non-sole --help=... was rejected above.
+        residual_args[1] = OsString::from("--help");
+    }
     let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but

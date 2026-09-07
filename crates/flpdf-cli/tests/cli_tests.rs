@@ -139,6 +139,49 @@ fn top_level_writer_mode_help_matches_qpdf_terms() {
         .stdout(predicate::str::contains("uncompress"));
 }
 
+#[test]
+fn qpdf_nonsole_help_table_options_are_usage_errors_after_a_reset() {
+    for token in ["--help", "--help=usage", "--version", "--copyright", "-h"] {
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(["--", token])
+            .output()
+            .expect("qpdf 11.9.0 must be available");
+        assert_eq!(qpdf.status.code(), Some(2), "qpdf token {token:?}");
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--", token])
+            .output()
+            .unwrap();
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "flpdf token {token:?} must preserve qpdf's usage exit"
+        );
+        assert!(
+            flpdf.stdout.is_empty(),
+            "flpdf token {token:?} must not emit help to stdout"
+        );
+        assert!(
+            String::from_utf8_lossy(&flpdf.stderr)
+                .contains(&format!("unrecognized argument {token}")),
+            "flpdf token {token:?} must use qpdf's unrecognized-argument boundary: {}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+    }
+}
+
+#[test]
+fn qpdf_sole_help_table_options_remain_available() {
+    for token in ["--help", "--help=usage", "--version", "--copyright"] {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg(token)
+            .assert()
+            .success();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn invalid_rotate_usage_preserves_qpdf_raw_bytes_and_help_framing() {
