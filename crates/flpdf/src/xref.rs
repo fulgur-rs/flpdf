@@ -1428,15 +1428,20 @@ impl<'owner> CanonicalXrefContext<'owner> {
         }
     }
 
+    /// Track how far the owner's diagnostics have advanced, without copying
+    /// them into this context.
+    ///
+    /// The document is the single emitter for its own warnings:
+    /// `push_qpdf_warning` logs them and records them on the document, and
+    /// `engine.rs` installs this context's collection onto that same
+    /// document afterwards. Mirroring them here would deliver one repair
+    /// twice, where qpdf delivers it once because it reconstructs once per
+    /// document (`libqpdf/QPDF.cc:518-522`). The counter is still advanced so
+    /// a future consumer can tell what the owner added during this read.
     fn sync_owner_diagnostics(&mut self) {
-        let owner_diagnostics = self.owner.repair_diagnostics();
-        let start = self
-            .owner_diagnostics_start
-            .saturating_add(self.owner_diagnostics_synced);
-        for diagnostic in owner_diagnostics.entries().iter().skip(start) {
-            self.diagnostics.push(diagnostic.clone());
-        }
-        self.owner_diagnostics_synced = owner_diagnostics
+        self.owner_diagnostics_synced = self
+            .owner
+            .repair_diagnostics()
             .entries()
             .len()
             .saturating_sub(self.owner_diagnostics_start);
@@ -1494,7 +1499,12 @@ impl XrefObjectContext for CanonicalXrefContext<'_> {
     }
 
     fn append_diagnostics_to(&mut self, diagnostics: &mut Diagnostics) {
-        self.sync_owner_diagnostics();
+        // Only this context's own diagnostics. The owner's are already on the
+        // document — `push_qpdf_warning` both logs them and records them — and
+        // `engine.rs` installs this collection onto that same document, so
+        // mirroring them here would report one repair twice. qpdf warns once
+        // per reconstruction because it reconstructs once per document
+        // (`libqpdf/QPDF.cc:518-522`).
         for diagnostic in self.diagnostics.entries() {
             diagnostics.push(diagnostic.clone());
         }
@@ -3152,12 +3162,13 @@ fn recover_trailer_from_xref_stream_candidate(
         canonical_trailer_owner,
     ) {
         Ok(reentry) => reentry,
-        Err(error) => {
+        Err(_) => {
+            // qpdf's message is exactly this, with no nested detail appended
+            // (`libqpdf/QPDF.cc:604`); the inner failure is what led here, not
+            // part of the public text.
             return Err(Error::parse(
                 0,
-                format!(
-                    "error decoding candidate xref stream while recovering damaged file: {error}"
-                ),
+                "error decoding candidate xref stream while recovering damaged file".to_string(),
             ));
         }
     };
@@ -6272,7 +6283,14 @@ mod final_handle_tests {
                     Error::Parse { message, .. } if message == "xref not found"
                 ));
             }
-            assert_eq!(sink.entries().len(), 1);
+            // The warning stays on the owner rather than being copied into the
+            // loader's sink: for a real document `push_qpdf_warning` both logs
+            // it and records it, and `engine.rs` installs this sink onto that
+            // same document afterwards, so copying would deliver one repair
+            // twice — qpdf delivers it once, reconstructing at most once per
+            // document (`libqpdf/QPDF.cc:518-522`).
+            assert_eq!(owner.repair_diagnostics().entries().len(), 1);
+            assert_eq!(sink.entries().len(), 0);
         }
     }
 
