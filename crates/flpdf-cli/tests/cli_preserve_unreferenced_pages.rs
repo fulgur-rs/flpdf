@@ -697,10 +697,21 @@ fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // Compare through qpdf's own QDF normalization rather than raw bytes: the
+    // default DEFLATE backend is miniz_oxide, whose compressed bytes legitimately
+    // differ from zlib's unless the `qpdf-zlib-compat` feature is on, and this
+    // suite also runs without it.
+    let qpdf_qdf = normalize_qdf(&qpdf_output, &temp.path().join("qpdf-qdf.pdf"));
+    let flpdf_qdf = normalize_qdf(&flpdf_output, &temp.path().join("flpdf-qdf.pdf"));
     assert_eq!(
-        std::fs::read(&flpdf_output).unwrap(),
-        std::fs::read(&qpdf_output).unwrap(),
+        qdf_object_count(&flpdf_qdf),
+        qdf_object_count(&qpdf_qdf),
         "a container identified only by its type-2 xref rows must be copied once, \
          not duplicated into a second placeholder identity"
+    );
+    assert_eq!(
+        normalized_qdf_objects(&flpdf_qdf),
+        normalized_qdf_objects(&qpdf_qdf),
+        "the merged objects must match qpdf's for a container without /Type /ObjStm"
     );
 }
