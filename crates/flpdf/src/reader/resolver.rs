@@ -3291,7 +3291,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let found = found.expect("the range check above establishes the header object reference");
         self.set_last_object_description(found, read_description.as_deref());
         let warning_filename = self.core.borrow().description.clone();
-        if found != expected {
+        if expected.number != 0 && found != expected {
             self.push_qpdf_warning(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
                 &warning_filename,
@@ -5169,6 +5169,66 @@ mod tests {
             1,
             "only the test handle should hold second"
         );
+    }
+
+    #[test]
+    fn canonical_owner_reads_an_object_into_the_existing_cache() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n7\nendobj\n%tail\n");
+        let object_ref = ObjectRef::new(1, 0);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset })]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        let owner: &dyn crate::xref::CanonicalTrailerOwner = resolver.as_ref();
+
+        let (read, damage_offset) = owner
+            .read_object_at_offset(offset, object_ref, None)
+            .expect("canonical owner read");
+
+        assert!(read.is_same_object_as(&resolver.get_object_handle(object_ref)));
+        assert_eq!(read.try_as_integer().expect("read integer"), Some(7));
+        assert!(damage_offset.is_some());
+    }
+
+    #[test]
+    fn canonical_owner_keeps_stream_recovery_diagnostics_and_eol_state() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< >>\nstream\nhello\nendstream\nendobj\n%tail\n");
+        let object_ref = ObjectRef::new(1, 0);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset })]),
+            true,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        let owner: &dyn crate::xref::CanonicalTrailerOwner = resolver.as_ref();
+
+        let (read, _) = owner
+            .read_object_at_offset(offset, object_ref, Some(b"xref stream".to_vec()))
+            .expect("canonical stream read");
+
+        assert!(read.as_stream_dict().is_some());
+        assert!(owner.recovered_stream_eol(object_ref).is_some());
+        assert!(owner
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| warning
+                .message_string()
+                .contains("stream dictionary lacks /Length")));
     }
 
     #[test]

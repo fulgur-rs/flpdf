@@ -83,6 +83,18 @@ pub(crate) trait CanonicalTrailerOwner {
     fn begin_parse(&self) -> crate::Result<()>;
     /// Leave that guard, mirroring `ParseGuard`'s destructor.
     fn end_parse(&self);
+    #[allow(dead_code)]
+    fn read_object_at_offset(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+        description: Option<Vec<u8>>,
+    ) -> Result<(ObjectHandle, Option<u64>)>;
+    fn repair_diagnostics(&self) -> Diagnostics;
+    fn recovered_stream_eol(
+        &self,
+        object_ref: ObjectRef,
+    ) -> Option<crate::parser::RecoveredStreamEol>;
 }
 
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
@@ -110,6 +122,26 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn set_header_offset(&self, offset: usize) {
         ResolverHandle::set_header_offset(self, offset);
+    }
+
+    fn read_object_at_offset(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+        description: Option<Vec<u8>>,
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        self.resolve_at_offset_with_optional_description(offset, expected, description)
+    }
+
+    fn repair_diagnostics(&self) -> Diagnostics {
+        ResolverHandle::repair_diagnostics(self)
+    }
+
+    fn recovered_stream_eol(
+        &self,
+        object_ref: ObjectRef,
+    ) -> Option<crate::parser::RecoveredStreamEol> {
+        ResolverHandle::recovered_stream_eol(self, object_ref)
     }
 }
 
