@@ -16,7 +16,7 @@
 //! warning sink, so the first recoverable diagnostic is returned as the
 //! corresponding `QPDFExc` error.
 
-use crate::parser::ContentHandleParser;
+use crate::parser::{parse_live_content_stream_object, ContentHandleResolver, SliceLiveInput};
 use crate::tokenizer::{TokenType, Tokenizer, TokenizerStateError};
 use crate::{
     object_handle::{DocumentResolver, ObjectHandle},
@@ -137,20 +137,29 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
 
     let mut tokenizer = Tokenizer::new(input);
     tokenizer.allow_eof();
+    // A parallel, canonical `LiveInput` over the same bytes: content-stream
+    // objects share `LiveFileParser`'s parser (`QPDFParser`'s own
+    // `content_stream=true` mode, `parse_live_content_stream_object`), which
+    // is driven by `LiveInput` rather than this module's own pull tokenizer.
+    // The pull tokenizer above stays only for the probe/inline-image steps
+    // below, which have no `LiveInput` equivalent; the two positions are
+    // resynchronized at each loop boundary.
+    let mut live_input = SliceLiveInput::new(input);
     let mut stopped_on_container_eof = false;
 
     while tokenizer.position() < input.len() {
         let probe = tokenizer.read_token(true, 0)?;
         let offset = probe.start;
         tokenizer.set_position(offset)?;
+        live_input.seek_to(offset)?;
 
         let (object, length, diagnostics) = {
-            let mut parser = ContentHandleParser::with_tokenizer(&mut tokenizer, context.clone());
-            let object = parser.parse_content_object()?;
-            let length = parser.position() - offset;
-            let diagnostics = parser.take_diagnostics();
-            (object, length, diagnostics)
+            let mut resolver = ContentHandleResolver::new(context.clone());
+            let parsed = parse_live_content_stream_object(&mut live_input, &mut resolver)?;
+            let length = live_input.position() - offset;
+            (parsed.value, length, parsed.diagnostics)
         };
+        tokenizer.set_position(live_input.position())?;
         for diagnostic in diagnostics {
             if diagnostic.message == "parse error while reading object" {
                 stopped_on_container_eof = true;
@@ -163,9 +172,9 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
                 &diagnostic.message,
             )?; // cov:ignore: LLVM attributes this successful diagnostic-delivery terminator to the fallible error edge.
         }
-        let Some(object) = object else {
+        if !object.is_initialized() {
             break;
-        };
+        }
         let is_id = object.as_operator().as_deref() == Some(b"ID");
 
         if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {

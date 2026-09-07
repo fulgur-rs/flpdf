@@ -127,9 +127,9 @@ crates/flpdf/src/object_handle.rs::canonical_dictionary_key              # A23 c
 # ===========================================================================
 
 # --- (a) deletable route ---
-crates/flpdf/src/parser.rs::ContentHandleParser                          # B2 第 2 の parser
-crates/flpdf/src/parser.rs::content_good_count                           # B4
-crates/flpdf/src/parser.rs::content_give_up                              # B4
+# ContentHandleParser / content_good_count / content_give_up (B2/B4) を
+# flpdf-3yn9.48.16 (2026-09-08) で撤去済み。LiveFileParser の content_stream
+# フィールドへ統合し、parse_live_content_stream_object が唯一のconsumer。
 crates/flpdf/src/xref.rs::read_uncompressed_object                       # B8 bootstrap 側
 crates/flpdf/src/reader/file_object.rs::finish_file_object_handle        # B9/B10 legacy・bootstrap 側
 crates/flpdf/src/reader/file_object.rs::recover_stream_boundary          # B11 第 2 実装

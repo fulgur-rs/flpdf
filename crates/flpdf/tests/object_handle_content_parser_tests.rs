@@ -380,12 +380,22 @@ fn parse_page_contents_reports_non_bad_token_diagnostics_and_nesting_limit() {
         .iter()
         .any(|diagnostic| detail(diagnostic).contains("name with stray #")));
 
+    // qpdf's 500-container limit is a recoverable warning, not a thrown
+    // error, in both file-object and content-stream parsing: the 501st
+    // nested container collapses the whole structure to null instead of
+    // aborting the parse (`libqpdf/QPDFParser.cc:311-318`).
     let mut nested = vec![b'['; 501];
     nested.extend(std::iter::repeat_n(b']', 501));
-    let error = page_with_contents(stream(&nested))
+    let (nested_pdf, nested_page) = owned_page_with_contents(&nested);
+    nested_page
         .parse_page_contents(&mut RecordingCallbacks::default())
-        .expect_err("qpdf content parser must bound nesting");
-    assert!(error.to_string().contains("object nesting too deep"));
+        .expect("qpdf recovers excessive nesting as null instead of erroring");
+    assert!(nested_pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|diagnostic| detail(diagnostic)
+            .contains("ignoring excessively deeply nested data structure")));
 }
 
 #[test]
