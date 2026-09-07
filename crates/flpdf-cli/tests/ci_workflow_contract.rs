@@ -13,7 +13,7 @@ const REQUIRED_TEST_MATRIX_OS: [&str; 4] = [
 const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
 const RELEASE_JOB_NAME: &str = "release";
 const RELEASE_JOB_RUNS_ON: &str = "ubuntu-latest";
-const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --release";
+const RELEASE_TEST_COMMAND: &str = "cargo test --workspace --profile release-ci";
 const LIBJPEG_COMPAT_TEST_CONDITION: &str = "${{ runner.os == 'Linux' && matrix.arch == 'amd64' }}";
 const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
     "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
@@ -823,7 +823,7 @@ steps:
   - shell: bash
     run: |
       set -euo pipefail
-      cargo test --workspace --release
+      cargo test --workspace --profile release-ci
 ",
     );
 
@@ -842,7 +842,7 @@ steps:
   - shell: bash
     run: |
       set -euo pipefail
-      cargo test --workspace --release
+      cargo test --workspace --profile release-ci
 ",
     );
 
@@ -864,7 +864,7 @@ steps:
     shell: bash
     run: |
       set -euo pipefail
-      cargo test --workspace --release
+      cargo test --workspace --profile release-ci
 ",
     );
 

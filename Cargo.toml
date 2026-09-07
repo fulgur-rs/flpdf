@@ -65,3 +65,17 @@ ar_archive_writer = "=0.5.3"
 stacker = "0.1.24"
 libjpeg-turbo-rs = "=0.8.0"
 cc = "1"
+
+# CI-only profile for the "Release" job's `cargo test --workspace --profile
+# release-ci` run. It exists to catch release-mode-only behavior (no
+# debug_assertions, no overflow-checks) across flpdf's large test suite (105+
+# integration test binaries) without paying opt-level 3's expensive
+# inlining/vectorization passes on every PR. It inherits every other
+# `[profile.release]` setting (debug-assertions off, overflow-checks off) and
+# only lowers opt-level, so release-mode panic/overflow semantics are
+# unchanged; only codegen effort is reduced. This profile is CI-only — it
+# never affects `cargo build --release`/`cargo install`/`release-plz`
+# packaging, all of which use the untouched `[profile.release]` above.
+[profile.release-ci]
+inherits = "release"
+opt-level = 1
