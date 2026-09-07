@@ -362,11 +362,16 @@ pub(crate) struct XrefLoadOptions {
     pub(crate) description: Vec<u8>,
 }
 
-fn damaged_warning(filename: &[u8], message: impl Into<String>, offset: Option<u64>) -> QpdfExc {
+fn damaged_warning(
+    filename: &[u8],
+    object: impl AsRef<[u8]>,
+    message: impl Into<String>,
+    offset: Option<u64>,
+) -> QpdfExc {
     QpdfExc::new(
         QpdfErrorCode::DamagedPdf,
         filename,
-        b"",
+        object,
         offset
             .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
             .unwrap_or(0),
@@ -619,6 +624,7 @@ impl BootstrapHandleDocument {
         // cov:ignore-start: bootstrap diagnostics are emitted only by the recoverable xref paths, which are covered through their public loader
         self.state.borrow_mut().diagnostics.push(damaged_warning(
             &self.options.description,
+            b"",
             message,
             offset,
         ));
@@ -1660,6 +1666,7 @@ pub(crate) fn load_xref_state_from_bytes(
             None => {
                 initial_diagnostics.push(damaged_warning(
                     &options.description,
+                    b"",
                     "can't find PDF header",
                     None,
                 ));
@@ -2742,6 +2749,7 @@ fn append_xref_size_warning_for(
     if size < 1 || size - 1 != i64::from(max_object) {
         repair_diagnostics.push(damaged_warning(
             filename,
+            b"",
             format!(
                 "reported number of objects ({size}) is not one plus the highest object number ({max_object})"
             ),
@@ -3757,7 +3765,7 @@ fn trailer_diagnostics(
         .into_iter()
         .map(|diagnostic| {
             let offset = (start as u64).saturating_add(diagnostic.relative_offset as u64);
-            damaged_warning(filename, diagnostic.message, Some(offset))
+            damaged_warning(filename, b"trailer", diagnostic.message, Some(offset))
         })
         .collect()
 }
@@ -6637,7 +6645,7 @@ mod final_handle_tests {
         );
         context
             .document
-            .push_diagnostic(damaged_warning(b"", "late diagnostic", None));
+            .push_diagnostic(damaged_warning(b"", b"", "late diagnostic", None));
         let mut diagnostics = Diagnostics::default();
         context.append_diagnostics_to(&mut diagnostics);
         assert_eq!(diagnostics.entries().len(), 1);
@@ -6646,7 +6654,7 @@ mod final_handle_tests {
     #[test]
     fn repair_diagnostics_preserve_each_qpdf_trigger_error_shape() {
         let errors = vec![
-            Error::QpdfExc(damaged_warning(b"input.pdf", "qpdf trigger", Some(4))),
+            Error::QpdfExc(damaged_warning(b"input.pdf", b"", "qpdf trigger", Some(4))),
             Error::parse(8, "xref not found"),
             Error::parse(9, "can't find startxref"),
             Error::parse(10, "loop detected following xref tables"),
@@ -6673,6 +6681,25 @@ mod final_handle_tests {
                 b"Attempting to reconstruct cross-reference table"
             );
         }
+    }
+
+    #[test]
+    fn trailer_parser_diagnostics_retain_qpdf_object_description() {
+        let diagnostics = trailer_diagnostics(
+            750,
+            vec![ParserDiagnostic {
+                relative_offset: 3,
+                message: "treating unexpected brace token as null".to_owned(),
+            }],
+            b"bad13.pdf",
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].get_object(), b"trailer");
+        assert_eq!(
+            diagnostics[0].what_bytes(),
+            b"bad13.pdf (trailer, offset 753): treating unexpected brace token as null"
+        );
     }
 
     #[test]

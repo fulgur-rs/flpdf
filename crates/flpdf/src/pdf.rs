@@ -6,7 +6,7 @@ use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
 use crate::pdf_version::{leading_major_minor, PdfVersion};
-use crate::reader::resolver::ResolverHandle;
+use crate::reader::resolver::{ResolverHandle, CLOSED_INPUT_SOURCE_NAME};
 use crate::reader::InputSourceControl;
 use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefForm};
 use std::cell::RefCell;
@@ -582,9 +582,14 @@ impl<R: Read + Seek> Pdf<R> {
         let root = candidate;
         if root.as_dictionary().is_none() {
             let message = "unable to find /Root dictionary";
+            let filename = if self.resolver.input_source_closed() {
+                CLOSED_INPUT_SOURCE_NAME.as_bytes().to_vec()
+            } else {
+                self.resolver.input_description()
+            };
             return Err(Error::QpdfExc(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
-                self.resolver.input_description(),
+                filename,
                 b"",
                 0,
                 message,

@@ -735,6 +735,18 @@ fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
             Ok(has_warnings)
         }
         Err(LinearizationCheckError::NotLinearized) => Ok(false), // cov:ignore: check_document accepts only a linearized candidate before this helper
+        Err(LinearizationCheckError::QpdfExc(error)) => {
+            let mut detail = b"error encountered while checking linearization data: ".to_vec();
+            detail.extend_from_slice(error.what_bytes());
+            pdf.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::Linearization,
+                input_name,
+                b"",
+                0,
+                detail,
+            ))?; // cov:ignore: qpdf logger-failure propagation is exercised at the enclosing warning route; LLVM attributes this terminator edge separately
+            Ok(true)
+        }
         Err(LinearizationCheckError::InvalidParam { message }) => {
             pdf.push_qpdf_warning(QpdfExc::new(
                 QpdfErrorCode::Linearization,
@@ -1650,6 +1662,52 @@ mod tests {
         assert!(output.contains(
             "linearized.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type"
         ), "{output}");
+    }
+
+    #[test]
+    fn document_check_preserves_nested_qpdf_exception_context_for_hint_bounds() {
+        let mut bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))
+        .to_vec();
+        let s_pos = bytes
+            .windows(3)
+            .position(|window| window == b"/S ")
+            .expect("hint stream has /S");
+        let value_start = s_pos + 3;
+        let value_end = value_start
+            + bytes[value_start..]
+                .iter()
+                .position(|byte| byte.is_ascii_whitespace())
+                .expect("/S value");
+        assert!(
+            value_end - value_start >= 2,
+            "fixture /S must have two digits"
+        );
+        bytes[value_start..value_end].copy_from_slice(b"99");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: b"linearization-bounds.pdf".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("linearized fixture should open");
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "linearization-bounds.pdf")
+            .expect("hint bounds failure is a warning");
+        assert!(outcome.warnings);
+
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(
+            output.contains(
+                "WARNING: linearization-bounds.pdf: error encountered while checking linearization data: linearization-bounds.pdf (linearization hint table, offset "
+            ) && output.contains(": /S (shared object) offset is out of bounds\n"),
+            "nested QPDFExc context must survive the warning migration: {output}"
+        );
     }
 
     #[test]

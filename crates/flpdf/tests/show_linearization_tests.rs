@@ -19,6 +19,7 @@
 
 use flpdf::linearization::{
     check_linearization_bytes, show_linearization_bytes, show_linearization_bytes_with_warnings,
+    LinearizationCheckError,
 };
 use std::path::{Path, PathBuf};
 
@@ -147,11 +148,14 @@ fn check_linearization_rejects_out_of_bounds_shared_hint_offset_directly() {
 
     let error = check_linearization_bytes(&bytes)
         .expect_err("the standalone checker must validate /S without show prechecking");
-    let message = error.to_string();
-    assert!(
-        message.contains("linearization hint table: /S (shared object) offset is out of bounds"),
-        "unexpected /S boundary error: {message}"
-    );
+    assert!(matches!(
+        error,
+        LinearizationCheckError::QpdfExc(warning)
+            if warning.get_filename().is_empty()
+                && warning.get_object() == b"linearization hint table"
+                && warning.get_file_position() == 660
+                && warning.get_message_detail() == b"/S (shared object) offset is out of bounds"
+    ));
 }
 
 #[test]

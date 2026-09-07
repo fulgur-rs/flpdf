@@ -42,7 +42,7 @@ use super::check::{
 use crate::bit_stream::{BitStream, BitStreamError};
 #[cfg(test)]
 use crate::ObjectRef;
-use crate::{ObjectHandle, Pdf};
+use crate::{ObjectHandle, Pdf, QpdfErrorCode, QpdfExc};
 use std::fmt;
 use std::io::{Cursor, Read, Seek};
 use std::rc::Rc;
@@ -930,6 +930,19 @@ fn show_with_pdf<R: Read + Seek>(
                 // mapping for the shared standalone-checker contract.
                 Err(LinearizationCheckError::InvalidParam { message }) => {
                     warnings.push(message.into_bytes());
+                }
+                Err(LinearizationCheckError::QpdfExc(error)) => {
+                    warnings.push(
+                        QpdfExc::new(
+                            QpdfErrorCode::Linearization,
+                            display_name,
+                            error.get_object(),
+                            error.get_file_position(),
+                            error.get_message_detail(),
+                        )
+                        .what_bytes()
+                        .to_vec(),
+                    );
                 }
                 // cov:ignore-end
                 // cov:ignore-start: show_with_pdf already confirmed

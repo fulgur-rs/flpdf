@@ -3225,9 +3225,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         try_recovery: bool,
         read_description: Option<Vec<u8>>,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
-        if expected.number != 0 {
+        let expected_description = if expected.number != 0 {
             self.set_last_object_description(expected, read_description.as_deref());
-        }
+            self.core.borrow().last_object_description_bytes.clone()
+        } else {
+            Vec::new()
+        };
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
         let (found, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
@@ -3358,7 +3361,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_qpdf_warning(QpdfExc::new(
                 QpdfErrorCode::DamagedPdf,
                 &warning_filename,
-                b"",
+                expected_description,
                 i64::try_from(offset).unwrap_or(i64::MAX),
                 format!("expected {} {} obj", expected.number, expected.generation).into_bytes(),
             ))
@@ -4912,7 +4915,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                             "object {} {} not found in file after regenerating cross reference table",
                                             object_ref.number, object_ref.generation
                                         );
-                                self.push_warning(warning)?;
+                                // qpdf uses damagedPDF("", 0, message) after
+                                // reconstruction cannot find the requested
+                                // object, so this warning must remain
+                                // filename-only with no offset
+                                // (QPDF.cc:1624-1632).
+                                self.push_warning_at(0, warning)?;
                                 handle.set_resolved(ObjectValue::Null);
                                 Ok(())
                             }
@@ -13783,6 +13791,13 @@ mod tests {
             .entries()
             .iter()
             .any(|entry| entry.message_string().contains("expected 1 0 obj")));
+        let diagnostics = pdf.repair_diagnostics();
+        let mismatch = diagnostics
+            .entries()
+            .iter()
+            .find(|entry| entry.get_message_detail() == b"expected 1 0 obj")
+            .expect("the header mismatch warning must be retained");
+        assert_eq!(mismatch.get_object(), b"object 1 0");
         assert!(!pdf.reconstructed_xref());
     }
 
@@ -13804,8 +13819,8 @@ mod tests {
 
         assert!(pdf.reconstructed_xref());
 
-        let warnings: Vec<String> = pdf
-            .repair_diagnostics()
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings: Vec<String> = diagnostics
             .entries()
             .iter()
             .map(|d| d.message_string())
@@ -13815,6 +13830,17 @@ mod tests {
                 .contains("object 1 0 not found in file after regenerating cross reference table")),
             "diagnostics must contain absent-after-rebuild warning: {warnings:?}"
         );
+        let missing = diagnostics
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.get_message_detail().starts_with(
+                    b"object 1 0 not found in file after regenerating cross reference table",
+                )
+            })
+            .expect("the absent-after-rebuild warning must be retained");
+        assert!(missing.get_object().is_empty());
+        assert_eq!(missing.get_file_position(), 0);
     }
 
     #[test]

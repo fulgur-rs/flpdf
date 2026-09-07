@@ -1896,15 +1896,15 @@ impl<K: TreeKey> NNTree<K> {
                         .get(index)
                         .expect("binary-search index is in range");
                     let filename = pdf.input_description();
-                    let kid_dictionary =
-                        LiveDictionary::new(kid.clone(), &filename).map_err(|error| {
-                            structuralize(
-                                &filename,
-                                error,
-                                root_diagnostic_ref,
-                                format!("invalid kid at index {index}"),
-                            )
-                        })?;
+                    kid.try_dereference()?;
+                    if kid.try_as_dictionary()?.is_none() {
+                        return Err(structural_error(
+                            &filename,
+                            root_diagnostic_ref,
+                            format!("invalid kid at index {index}"),
+                        ));
+                    }
+                    let kid_dictionary = LiveDictionary::new(kid.clone(), &filename)?;
                     self.within_limits(pdf, key, &kid_dictionary, kid.object_ref())
                 })?;
                 // cov:ignore-start: binary_search supplies an in-range index and validated limits for every kid
@@ -2568,7 +2568,7 @@ mod tests {
             error,
             Error::QpdfExc(warning)
                 if warning.get_object() == b"Name/Number tree node"
-                    && warning.get_message_detail() == b"bad node"
+                    && warning.get_message_detail() == b"invalid kid at index 1"
         ));
     }
 

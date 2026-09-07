@@ -25,6 +25,8 @@
 //! - `Err(LinearizationCheckError::NotLinearized)` — the first object in the
 //!   file (physical position, not object number) has no `/Linearized` key
 //! - `Err(LinearizationCheckError::InvalidParam { … })` — a param-dict invariant failed
+//! - `Err(LinearizationCheckError::QpdfExc(…))` — qpdf raised a structured
+//!   damaged-PDF exception while checking the hint data
 //! - `Err(LinearizationCheckError::Io(…))` — I/O failure reading the file
 
 use super::show::{
@@ -54,6 +56,9 @@ pub enum LinearizationCheckError {
     /// A param-dict invariant failed.  `message` describes what went wrong in
     /// actionable terms suitable for printing to stderr.
     InvalidParam { message: String },
+    /// A qpdf-shaped damaged-PDF exception whose complete location context
+    /// must survive the caller's warning conversion.
+    QpdfExc(crate::QpdfExc),
     /// An I/O or parse error occurred while reading the file.
     Io(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -70,6 +75,7 @@ impl fmt::Display for LinearizationCheckError {
             LinearizationCheckError::InvalidParam { message } => {
                 write!(f, "linearization check failed: {message}")
             }
+            LinearizationCheckError::QpdfExc(error) => error.fmt(f),
             LinearizationCheckError::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
@@ -79,7 +85,10 @@ impl std::error::Error for LinearizationCheckError {}
 
 impl From<crate::Error> for LinearizationCheckError {
     fn from(e: crate::Error) -> Self {
-        LinearizationCheckError::Io(Box::new(e))
+        match e {
+            crate::Error::QpdfExc(error) => LinearizationCheckError::QpdfExc(error),
+            other => LinearizationCheckError::Io(Box::new(other)),
+        }
     }
 }
 
@@ -1051,9 +1060,13 @@ fn check_hint_tables<R: Read + Seek>(
 /// invariant fails: a value (`/L`, `/N`, `/O`, `/E`, `/T`, `/H` elements) is
 /// not a non-negative integer, `/O` does not fit in `u32` or does not refer to
 /// a Page object, `/L` does not equal the file length, `/N` does not equal the
-/// page count, `/E` is not less than the file length, `/H` is malformed or out
-/// of bounds, the hint stream cannot be located or decoded, or strict `/T`
-/// position comparison reports a mismatch against the xref parser's first item.
+/// page count, `/E` is not less than the file length, `/H` is malformed, the
+/// hint stream cannot be located or decoded, or strict `/T` position
+/// comparison reports a mismatch against the xref parser's first item.
+
+/// Returns [`LinearizationCheckError::QpdfExc`] when a damaged-PDF condition
+/// has qpdf's structured filename, object description, and offset context,
+/// such as an out-of-bounds hint-table offset.
 ///
 /// Returns [`LinearizationCheckError::Io`] when resolving an object via `pdf`
 /// or enumerating the page references fails.
@@ -1336,7 +1349,14 @@ fn check_linearization_inner<R: Read + Seek>(
 
     let (shared_offset, outline_offset) = read_hint_offsets(&hint_dict).map_err(map_show_error)?;
     if shared_offset >= hint_bytes.len() {
-        fail!("linearization hint table: /S (shared object) offset is out of bounds");
+        let offset = pdf.source_last_offset();
+        return Err(LinearizationCheckError::QpdfExc(crate::QpdfExc::new(
+            crate::QpdfErrorCode::DamagedPdf,
+            pdf.input_description(),
+            b"linearization hint table",
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            b"/S (shared object) offset is out of bounds",
+        )));
     }
     // cov:ignore-start: an opened PDF page tree cannot contain more than u32::MAX pages on supported targets
     let n_pages = u32::try_from(n_val).map_err(|_| LinearizationCheckError::InvalidParam {
