@@ -1451,7 +1451,7 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .all(|entry| !entry.message.contains("foreign object")));
+                .all(|entry| !entry.message_string().contains("foreign object")));
         } // cov:ignore: structural close of the asserted InPlace result branch
     }
 

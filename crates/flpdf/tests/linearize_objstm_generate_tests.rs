@@ -1360,8 +1360,7 @@ fn linearize_generate_recovers_malformed_length_content_stream() {
          endstream, attempting to recover, recovered stream length"
     );
     assert!(
-        pdf.repair_diagnostics().entries()[2]
-            .message
+        String::from_utf8_lossy(pdf.repair_diagnostics().entries()[2].get_message_detail())
             .contains("recovered stream length: 37"),
         "qpdf recovers the full 37-byte payload for this fixture"
     );
@@ -1418,8 +1417,7 @@ fn writer_progress_preserves_recoverable_stream_content_in_all_routes() {
                      reporter={reporter_registered}: qpdf emits three recovery diagnostics"
                 );
                 assert!(
-                    diagnostics.entries()[2]
-                        .message
+                    String::from_utf8_lossy(diagnostics.entries()[2].get_message_detail())
                         .contains("recovered stream length: 37"),
                     "linearized={linearized} object_streams={object_streams:?} \
                      reporter={reporter_registered}: qpdf recovers the full payload"
@@ -1473,17 +1471,16 @@ fn writer_respects_explicit_recovery_suppression() {
                 "linearized={linearized} object_streams={object_streams:?}: suppressed recovery must retain only the initial endstream warning"
             );
             assert!(
-                diagnostics.entries()[0]
-                    .message
+                String::from_utf8_lossy(diagnostics.entries()[0].get_message_detail())
                     .contains("expected endstream"),
                 "linearized={linearized} object_streams={object_streams:?}: got {:?}",
-                diagnostics.entries()[0].message
+                diagnostics.entries()[0].get_message_detail()
             );
             assert!(
                 diagnostics
                     .entries()
                     .iter()
-                    .all(|entry| !entry.message.contains("recovered stream length")),
+                    .all(|entry| !String::from_utf8_lossy(entry.get_message_detail()).contains("recovered stream length")),
                 "linearized={linearized} object_streams={object_streams:?}: suppressed recovery must not recover the malformed stream"
             );
             assert!(

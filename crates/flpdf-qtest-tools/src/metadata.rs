@@ -12,7 +12,8 @@
 //! (`libqpdf/QPDFSystemError.cc:13-29`) by retaining the platform CRT text.
 
 use flpdf::{
-    Diagnostics, EncryptedError, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
+    Diagnostics, EncryptedError, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, QpdfExc,
+    XrefEntry,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -45,6 +46,7 @@ impl From<Error> for MetadataError {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
     let file = std::fs::File::open(path).map_err(|source| MetadataError::Open {
         source: Error::FileIo {
@@ -123,7 +125,11 @@ fn display_flpdf_error(
             for diagnostic in diagnostics.entries() {
                 write_diagnostic(message, path, diagnostic);
             }
-            append_error_with_path(message, path, source);
+            if let Error::QpdfExc(warning) = source.as_ref() {
+                message.extend_from_slice(warning.what_bytes());
+            } else {
+                append_error_with_path(message, path, source);
+            }
             if message.last() == Some(&b'\n') {
                 message.pop();
             }
@@ -139,6 +145,7 @@ fn display_flpdf_error(
             append_path(message, path);
             message.extend_from_slice(b": read 1024 bytes");
         }
+        Error::QpdfExc(warning) => message.extend_from_slice(warning.what_bytes()),
         other => message.extend_from_slice(other.to_string().as_bytes()),
     }
 }
@@ -155,6 +162,10 @@ fn append_path(output: &mut Vec<u8>, path: &Path) {
 }
 
 fn append_error_with_path(output: &mut Vec<u8>, path: &Path, error: &Error) {
+    if let Error::QpdfExc(warning) = error {
+        output.extend_from_slice(warning.what_bytes());
+        return;
+    }
     append_path(output, path);
     output.extend_from_slice(b": ");
     match error {
@@ -171,6 +182,7 @@ fn append_error_without_path(output: &mut Vec<u8>, error: &Error) {
         Error::Parse { message, .. } => output.extend_from_slice(message.as_bytes()),
         Error::Encrypted(encrypted) => append_encrypted_detail(output, encrypted),
         Error::OpenFailure { source, .. } => append_error_without_path(output, source),
+        Error::QpdfExc(warning) => output.extend_from_slice(warning.what_bytes()),
         other => output.extend_from_slice(other.to_string().as_bytes()),
     }
 }
@@ -183,22 +195,9 @@ fn append_encrypted_detail(output: &mut Vec<u8>, error: &EncryptedError) {
     }
 }
 
-fn write_diagnostic(output: &mut Vec<u8>, path: &Path, diagnostic: &flpdf::Diagnostic) {
+fn write_diagnostic(output: &mut Vec<u8>, _path: &Path, diagnostic: &QpdfExc) {
     output.extend_from_slice(b"WARNING: ");
-    if diagnostic.is_object_warning() {
-        output.extend_from_slice(diagnostic.message_bytes());
-        output.push(b'\n');
-        return;
-    }
-    append_path(output, path);
-    if diagnostic.message.starts_with('(') {
-        output.push(b' ');
-    } else if let Some(offset) = diagnostic.offset.filter(|offset| *offset > 0) {
-        output.extend_from_slice(format!(" (offset {offset}): ").as_bytes());
-    } else {
-        output.extend_from_slice(b": ");
-    }
-    output.extend_from_slice(diagnostic.message.as_bytes());
+    output.extend_from_slice(diagnostic.what_bytes());
     output.push(b'\n');
 }
 
@@ -211,6 +210,7 @@ fn repair_diagnostics<R: std::io::Read + std::io::Seek>(path: &Path, pdf: &Pdf<R
 }
 
 /// Format qpdf's `test_xref` output and return recovery warnings separately.
+#[allow(clippy::result_large_err)]
 pub fn format_xref_with_diagnostics(path: &Path) -> Result<(String, Vec<u8>)> {
     let pdf = open(path)?;
     let mut output = String::new();
@@ -343,6 +343,7 @@ fn render_parsed_groups(groups: &mut BTreeMap<u32, Vec<ParsedObject>>) -> String
 }
 
 /// Format qpdf's `test_parsedoffset` output and return recovery warnings separately.
+#[allow(clippy::result_large_err)]
 pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Vec<u8>)> {
     let mut pdf = open(path)?;
     let result: std::result::Result<String, Error> = (|| {
@@ -387,7 +388,7 @@ pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flpdf::{Diagnostic, Diagnostics};
+    use flpdf::{Diagnostics, QpdfErrorCode, QpdfExc};
 
     #[test]
     fn diagnostics_match_qpdf_path_and_offset_formatting() {
@@ -396,17 +397,35 @@ mod tests {
         write_diagnostic(
             &mut output,
             path,
-            &Diagnostic::warning("(object 1 0, offset 7): object warning", None),
+            &QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"input.pdf",
+                b"object 1 0",
+                7,
+                b"object warning",
+            ),
         );
         write_diagnostic(
             &mut output,
             path,
-            &Diagnostic::warning("xref warning", Some(12)),
+            &QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"input.pdf",
+                b"",
+                12,
+                b"xref warning",
+            ),
         );
         write_diagnostic(
             &mut output,
             path,
-            &Diagnostic::warning("zero offset warning", Some(0)),
+            &QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"input.pdf",
+                b"",
+                0,
+                b"zero offset warning",
+            ),
         );
         assert_eq!(
             output,
@@ -416,11 +435,20 @@ mod tests {
         );
 
         let mut diagnostics = Diagnostics::default();
-        diagnostics.push(Diagnostic::warning(
-            "(object 1 0, offset 7): object warning",
-            None,
+        diagnostics.push(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            b"input.pdf",
+            b"object 1 0",
+            7,
+            b"object warning",
         ));
-        diagnostics.push(Diagnostic::warning("xref warning", Some(12)));
+        diagnostics.push(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            b"input.pdf",
+            b"",
+            12,
+            b"xref warning",
+        ));
         let error = Error::OpenFailure {
             source: Box::new(Error::Internal("terminal failure".to_owned())),
             diagnostics,
@@ -596,7 +624,11 @@ mod tests {
         write_diagnostic(
             &mut output,
             Path::new("destination.pdf"),
-            &Diagnostic::object_warning_bytes(
+            &QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"",
+                b"",
+                0,
                 b"/tmp/object-warning-\xff.pdf, stream object 4 0: stream filter type is not name or array",
             ),
         );

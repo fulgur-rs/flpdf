@@ -160,7 +160,7 @@ pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
 pub use content_stream::{parse_content_operations, ObjectHandleParserCallbacks, ParseControl};
 pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
-pub use diagnostics::{Diagnostic, Diagnostics, Severity};
+pub use diagnostics::Diagnostics;
 pub use embedded_files::{
     delete_embedded_file, insert_embedded_file, list_embedded_files,
     list_embedded_files_with_max_depth, remove_attachment, EmbeddedFileDocumentHelper,

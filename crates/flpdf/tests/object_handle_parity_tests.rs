@@ -446,8 +446,8 @@ fn make_indirect_object_prepares_repaired_xref_before_allocating() {
     );
     assert!(
         pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-            diagnostic.message == "(object 1 0, offset 9): expected 1 0 obj"
-                && diagnostic.offset.is_none()
+            diagnostic.get_message_detail() == b"expected 1 0 obj"
+                && diagnostic.get_file_position() == 9
         }),
         "xref recovery must retain qpdf's object context in the trigger warning: {:?}",
         pdf.repair_diagnostics().entries()
@@ -632,7 +632,7 @@ fn recovery_resolves_catalog_when_root_lives_in_object_stream() {
     let diagnostics: Vec<_> = repair_diagnostics
         .entries()
         .iter()
-        .map(|entry| entry.message.as_str())
+        .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
         .collect();
     assert_eq!(
         diagnostics,
@@ -1199,7 +1199,7 @@ fn canonical_unterminated_dictionary_resolves_to_null_with_diagnostics() {
     let messages: Vec<_> = diagnostics
         .entries()
         .iter()
-        .map(|entry| entry.message.as_str())
+        .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
         .collect();
     assert!(messages
         .iter()
@@ -1225,7 +1225,7 @@ fn canonical_unterminated_array_resolves_to_null_with_diagnostics() {
     let messages: Vec<_> = diagnostics
         .entries()
         .iter()
-        .map(|entry| entry.message.as_str())
+        .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
         .collect();
     assert!(messages
         .iter()
@@ -1256,9 +1256,10 @@ fn canonical_nesting_past_max_parse_depth_resolves_to_null_with_warning() {
                 .expect("qpdf parser recovers excessive nesting");
 
             assert!(handle.is_null());
-            assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
-                .message
-                .ends_with("ignoring excessively deeply nested data structure")));
+            assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+                String::from_utf8_lossy(entry.get_message_detail())
+                    .ends_with("ignoring excessively deeply nested data structure")
+            }));
         })
         .expect("comparison thread must start")
         .join()

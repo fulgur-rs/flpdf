@@ -999,8 +999,7 @@ mod tests {
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let diagnostics = pdf.repair_diagnostics();
         assert!(!diagnostics.entries().iter().any(|diagnostic| {
-            diagnostic.message
-                == "document does not have updated appearance streams, so form fields will not be flattened"
+            diagnostic.message_string() == "document does not have updated appearance streams, so form fields will not be flattened"
         }));
     }
 
@@ -3151,7 +3150,9 @@ mod tests {
 
         let diagnostics = pdf.repair_diagnostics().entries().to_vec();
         assert!(
-            diagnostics.iter().all(|d| !d.message.contains("object 6")),
+            diagnostics
+                .iter()
+                .all(|d| !d.message_string().contains("object 6")),
             "a non-rectangle /BBox must short-circuit before /Rect (object 6) is ever \
              resolved: {diagnostics:?}"
         );

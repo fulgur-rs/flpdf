@@ -19,8 +19,8 @@
 use crate::parser::ContentHandleParser;
 use crate::tokenizer::{TokenType, Tokenizer, TokenizerStateError};
 use crate::{
-    object_handle::{format_qpdf_exception_what, DocumentResolver, ObjectHandle},
-    Error, Result,
+    object_handle::{DocumentResolver, ObjectHandle},
+    Error, QpdfErrorCode, QpdfExc, Result,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -66,17 +66,18 @@ fn deliver_diagnostic(
     offset: usize,
     message: &str,
 ) -> Result<()> {
-    let message = format_qpdf_exception_what(
-        source_description,
-        object_description,
-        offset as i64,
-        message,
+    let warning = QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        source_description.as_bytes(),
+        object_description.as_bytes(),
+        i64::try_from(offset).unwrap_or(i64::MAX),
+        message.as_bytes(),
     );
     if let Some(context) = context {
-        context.warn(message.into_bytes())?;
+        context.warn(warning)?;
         Ok(())
     } else {
-        Err(Error::System(message))
+        Err(Error::QpdfExc(warning))
     }
 }
 
@@ -236,7 +237,7 @@ fn parse_content_stream_handles_internal<C: ObjectHandleParserCallbacks>(
 
 #[derive(Default)]
 struct RecoverableWarningResolver {
-    warnings: RefCell<Vec<Vec<u8>>>,
+    warnings: RefCell<Vec<QpdfExc>>,
 }
 
 impl DocumentResolver for RecoverableWarningResolver {
@@ -250,8 +251,8 @@ impl DocumentResolver for RecoverableWarningResolver {
         ))
     }
 
-    fn warn(&self, message: Vec<u8>) -> Result<()> {
-        self.warnings.borrow_mut().push(message);
+    fn warn(&self, warning: QpdfExc) -> Result<()> {
+        self.warnings.borrow_mut().push(warning);
         Ok(())
     }
 }
@@ -348,8 +349,10 @@ mod tests {
             Err(Error::Internal("unexpected indirect resolution".to_owned()))
         }
 
-        fn warn(&self, message: Vec<u8>) -> Result<()> {
-            self.warnings.borrow_mut().push(message);
+        fn warn(&self, warning: QpdfExc) -> Result<()> {
+            self.warnings
+                .borrow_mut()
+                .push(warning.what_bytes().to_vec());
             Ok(())
         }
     }

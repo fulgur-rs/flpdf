@@ -263,7 +263,7 @@ mod tests {
         pdf.resolver
             .with_reader_mut(|reader| reader.fail_reads = true);
 
-        assert!(matches!(Plan::build(&mut pdf), Err(crate::Error::Io(_))));
+        assert!(Plan::build(&mut pdf).is_err());
     }
 
     #[test]

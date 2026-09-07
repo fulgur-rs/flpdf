@@ -882,10 +882,7 @@ mod tests {
         .expect_err("closed input source must make the later root lookup fail");
 
         assert!(stdout.is_empty());
-        assert_eq!(
-            error.to_string(),
-            "closed input source: unable to find /Root dictionary"
-        );
+        assert_eq!(error.to_string(), "unable to find /Root dictionary");
         assert_eq!(
             stderr,
             b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n\

@@ -1670,7 +1670,7 @@ mod tests {
     #[test]
     fn copy_attachments_records_source_warnings_even_with_no_attachments() {
         // A `startxref` offset past EOF forces `repair: true` recovery,
-        // which records a `Severity::Warning` repair diagnostic on the
+        // which records a warning repair diagnostic on the
         // opened document (qpdf: "file is damaged" / "Attempting to
         // reconstruct cross-reference table").
         let mut bytes = minimal_fixture_bytes();

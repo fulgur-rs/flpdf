@@ -158,10 +158,23 @@ fn pipe_page_contents_reports_a_provider_decode_failure_at_the_stream_boundary()
         .pipe_page_contents(&mut pipeline)
         .expect_err("qpdf reports a failed stream provider as a damaged content stream");
 
-    assert_eq!(
-        error.to_string(),
-        "unsupported PDF feature: content stream object 4 0: errors while decoding content stream"
-    );
+    match error {
+        flpdf::Error::QpdfExc(warning) => {
+            assert_eq!(warning.get_error_code(), flpdf::QpdfErrorCode::DamagedPdf);
+            assert_eq!(warning.get_filename(), b"content stream");
+            assert_eq!(warning.get_object(), b"content stream object 4 0");
+            assert_eq!(warning.get_file_position(), 0);
+            assert_eq!(
+                warning.get_message_detail(),
+                b"errors while decoding content stream"
+            );
+            assert_eq!(
+                warning.what_bytes(),
+                b"content stream (content stream object 4 0): errors while decoding content stream"
+            );
+        }
+        other => panic!("expected typed content-stream exception, got {other:?}"),
+    }
 }
 
 #[test]

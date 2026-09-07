@@ -136,7 +136,7 @@ use crate::{
     },
     writer::DecodeLevel,
 };
-use crate::{json::Json, Error, ObjectRef, Result};
+use crate::{json::Json, Error, ObjectRef, QpdfErrorCode, QpdfExc, Result};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -438,13 +438,8 @@ pub(crate) trait DocumentResolver {
     /// `libqpdf/QPDF_encryption.cc:1122-1128`). `description_override` carries
     /// that captured source description when set; `self`'s own description is
     /// used only for the ordinary (non-foreign) caller, which passes `None`.
-    fn warn_stream_data(
-        &self,
-        _offset: u64,
-        description_override: Option<&[u8]>,
-        message: String,
-    ) -> Result<()> {
-        let _ = (description_override, message);
+    fn warn_stream_data(&self, warning: QpdfExc) -> Result<()> {
+        let _ = warning;
         Err(Error::Internal(
             "stream data warning requested from a resolver without a document".to_owned(),
         ))
@@ -473,10 +468,9 @@ pub(crate) trait DocumentResolver {
     /// it; qpdf has no resolver that cannot warn, so reaching this default is
     /// the same condition as qpdf's null context, which `QPDFObjectHandle::warn`
     /// also turns into a thrown exception.
-    fn warn(&self, message: Vec<u8>) -> Result<()> {
+    fn warn(&self, warning: QpdfExc) -> Result<()> {
         Err(Error::Internal(format!(
-            "warning raised through a resolver with no document warning sink: {}",
-            String::from_utf8_lossy(&message)
+            "warning raised through a resolver with no document warning sink: {warning}"
         )))
     }
 
@@ -571,8 +565,9 @@ mod parse_tests {
 
         assert!(matches!(
             error,
-            crate::Error::System(message)
-                if message == "parsed object,  at offset 14: contextless explicit parse"
+            crate::Error::QpdfExc(warning)
+                if warning.get_object() == b"parsed object,  at offset 14"
+                    && warning.get_message_detail() == b"contextless explicit parse"
         ));
     }
 
@@ -593,8 +588,9 @@ mod parse_tests {
             .expect_err("an explicit parse must remain contextless");
         assert!(matches!(
             error,
-            crate::Error::System(message)
-                if message == "parsed object,  at offset 10: contextless explicit parse"
+            crate::Error::QpdfExc(warning)
+                if warning.get_object() == b"parsed object,  at offset 10"
+                    && warning.get_message_detail() == b"contextless explicit parse"
         ));
     }
 
@@ -731,13 +727,13 @@ mod parse_tests {
             diagnostics
                 .entries()
                 .first()
-                .map(|entry| entry.message.as_str()),
-            Some("parsed object (brace test): treating unexpected brace token as null")
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned()),
+            Some("parsed object (brace test): treating unexpected brace token as null".to_owned())
         );
         assert!(diagnostics
             .entries()
             .first()
-            .is_some_and(crate::Diagnostic::is_object_warning));
+            .is_some_and(|warning| !warning.get_object().is_empty()));
     }
 
     #[test]
@@ -758,8 +754,10 @@ mod parse_tests {
             diagnostics
                 .entries()
                 .first()
-                .map(|entry| entry.message.as_str()),
-            Some("parsed object (context test): treating unexpected brace token as null")
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned()),
+            Some(
+                "parsed object (context test): treating unexpected brace token as null".to_owned()
+            )
         );
     }
 
@@ -773,9 +771,12 @@ mod parse_tests {
         assert!(parsed.as_dictionary().is_some());
         let diagnostics = pdf.repair_diagnostics();
         assert_eq!(
-            diagnostics.entries().first().map(|entry| entry.message.as_str()),
+            diagnostics
+                .entries()
+                .first()
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned()),
             Some(
-                "parsed object (dictionary test, offset 2): expected dictionary key but found non-name object; inserting key /QPDFFake2"
+                "parsed object (dictionary test, offset 2): expected dictionary key but found non-name object; inserting key /QPDFFake2".to_owned()
             )
         );
     }
@@ -937,46 +938,6 @@ fn expand_description_template(
     let mut result = template.to_vec();
     replace_first(&mut result, b"$OG", &og);
     replace_first(&mut result, b"$PO", &offset);
-    result
-}
-
-/// Format the `QPDFExc::createWhat` boundary shared by qpdf exception users.
-///
-/// qpdf's `createWhat` (`libqpdf/QPDFExc.cc:16-48`) only skips the
-/// parenthesized `(object, offset)` segment when `object` is empty AND
-/// `offset` is exactly zero. A negative offset with an empty object still
-/// enters that branch and emits an empty `()` — qpdf's own literal behavior,
-/// not a special case flpdf adds. Only a strictly positive offset ever
-/// contributes "offset N" text inside the parentheses.
-pub(crate) fn format_qpdf_exception_what(
-    filename: &str,
-    object: &str,
-    offset: i64,
-    message: &str,
-) -> String {
-    let mut result = filename.to_owned();
-    if !(object.is_empty() && offset == 0) {
-        if !filename.is_empty() {
-            result.push_str(" (");
-        }
-        if !object.is_empty() {
-            result.push_str(object);
-            if offset > 0 {
-                result.push_str(", ");
-            }
-        }
-        if offset > 0 {
-            result.push_str("offset ");
-            result.push_str(&offset.to_string());
-        }
-        if !filename.is_empty() {
-            result.push(')');
-        }
-    }
-    if !result.is_empty() {
-        result.push_str(": ");
-    }
-    result.push_str(message);
     result
 }
 
@@ -2643,12 +2604,10 @@ impl ObjectHandle {
     /// object description and renders a bare message only when that
     /// description is empty; this port forms the same prefix before the
     /// contextless error is returned.
-    fn warn_through_context(&self, message: Vec<u8>) -> Result<()> {
+    fn warn_through_context(&self, warning: QpdfExc) -> Result<()> {
         match self.context() {
-            Some(context) => context.warn(message),
-            None => Err(Error::System(
-                String::from_utf8_lossy(&message).into_owned(),
-            )),
+            Some(context) => context.warn(warning),
+            None => Err(Error::QpdfExc(warning)),
         }
     }
 
@@ -2751,17 +2710,16 @@ impl ObjectHandle {
         self.try_dereference()?;
         let desc = self.description();
         let type_name = self.type_name()?;
-        let mut message = desc;
-        if !message.is_empty() {
-            message.extend_from_slice(b": ");
-        }
-        message.extend_from_slice(
+        self.warn_through_context(QpdfExc::new(
+            QpdfErrorCode::Object,
+            b"",
+            desc,
+            0,
             format!(
                 "operation for {expected_type} attempted on object of type {type_name}: {warning}"
             )
-            .as_bytes(),
-        );
-        self.warn_through_context(message)
+            .into_bytes(),
+        ))
     }
 
     /// Report damage this handle noticed about itself.
@@ -2789,12 +2747,13 @@ impl ObjectHandle {
         if let Some(context) = self.context() {
             self.try_dereference()?;
             let desc = self.description();
-            let mut message = desc;
-            if !message.is_empty() {
-                message.extend_from_slice(b": ");
-            }
-            message.extend_from_slice(warning.as_bytes());
-            context.warn(message)
+            context.warn(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"",
+                desc,
+                0,
+                warning.as_bytes(),
+            ))
         } else {
             crate::QPDFLogger::default_logger().error(format!("{warning}\n"))
         }
@@ -2814,12 +2773,13 @@ impl ObjectHandle {
     /// mirroring the exception qpdf throws instead of warning.
     pub(crate) fn object_warning(&self, warning: &str) -> Result<()> {
         let desc = self.description();
-        let mut message = desc;
-        if !message.is_empty() {
-            message.extend_from_slice(b": ");
-        }
-        message.extend_from_slice(warning.as_bytes());
-        self.warn_through_context(message)
+        self.warn_through_context(QpdfExc::new(
+            QpdfErrorCode::Object,
+            b"",
+            desc,
+            0,
+            warning.as_bytes(),
+        ))
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
@@ -5554,9 +5514,15 @@ impl ObjectHandle {
                 false,
             )?;
             if !succeeded {
-                return Err(Error::Unsupported(format!(
-                    "content stream object {}: errors while decoding content stream",
-                    object_generation_description(&stream)
+                return Err(Error::QpdfExc(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    b"content stream",
+                    format!(
+                        "content stream object {}",
+                        object_generation_description(&stream)
+                    ),
+                    0,
+                    b"errors while decoding content stream",
                 )));
             }
             last_char.finish()?;
@@ -5694,23 +5660,25 @@ impl ObjectHandle {
                 if item.type_code()? == 10 {
                     result.push(item);
                 } else {
-                    item.warn_through_context(
-                        format!(
-                            "{description}: item index {index} (from 0): ignoring non-stream in an array of streams"
-                        )
-                        .into_bytes(),
-                    )?;
+                    item.warn_through_context(QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        b"",
+                        format!("{description}: item index {index} (from 0)"),
+                        0,
+                        b"ignoring non-stream in an array of streams",
+                    ))?;
                 }
             }
         } else if self.type_code()? == 10 {
             result.push(self.clone());
         } else if !self.is_null() {
-            self.warn_through_context(
-                format!(
-                    "{description}:  object is supposed to be a stream or an array of streams but is neither"
-                )
-                .into_bytes(),
-            )?;
+            self.warn_through_context(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"",
+                description,
+                0,
+                b" object is supposed to be a stream or an array of streams but is neither",
+            ))?;
         }
 
         let mut all_description = description.to_owned();
@@ -6152,41 +6120,14 @@ impl ObjectHandle {
         )
     }
 
-    /// The object-stream resolver uses qpdf's resolve-time catch boundary for
-    /// codec failures raised while decoding replaced stream data. Ordinary
-    /// callers keep the original pipeline error so writer and inspection
-    /// paths do not silently turn their own sink failures into recovery.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pipe_stream_data_for_object_stream(
-        &self,
-        pipeline: &mut dyn Pipeline,
-        filtering_attempted: &mut bool,
-        encode_flags: u32,
-        decode_level: DecodeLevel,
-        suppress_warnings: bool,
-        will_retry: bool,
-    ) -> Result<bool> {
-        self.pipe_stream_data_inner(
-            pipeline,
-            filtering_attempted,
-            encode_flags,
-            decode_level,
-            suppress_warnings,
-            will_retry,
-            true,
-        )
-    }
-
     /// Return decoded stream data through the canonical source pipeline.
     ///
     /// This is qpdf's `QPDFObjectHandle::getStreamData`
     /// (`libqpdf/QPDFObjectHandle.cc:1289-1292`) over the same
     /// `QPDF_Stream::pipeStreamData` path used by page-content piping
-    /// (`libqpdf/QPDFObjectHandle.cc:1710-1722`). Unlike
-    /// [`Self::get_raw_stream_data`], this path decrypts document-backed
-    /// streams before applying their filters, so recovered stream framing is
-    /// handled at the source boundary rather than being exposed as decoded
-    /// page content.
+    /// (`libqpdf/QPDFObjectHandle.cc:1710-1722`). Both this path and
+    /// [`Self::get_raw_stream_data`] use the source pipeline's decryption;
+    /// this method additionally applies the requested decode filters.
     pub fn get_stream_data(&self, decode_level: DecodeLevel) -> Result<Rc<Vec<u8>>> {
         let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
         let mut filtering_attempted = false;
@@ -6203,19 +6144,15 @@ impl ObjectHandle {
                 .context()
                 .map(|context| context.input_description())
                 .unwrap_or_default();
-            let filename = String::from_utf8_lossy(&filename);
-            return Err(Error::Unsupported(format_qpdf_exception_what(
-                &filename,
-                "",
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::Unsupported,
+                filename,
+                b"",
                 self.get_parsed_offset(),
-                "getStreamData called on unfilterable stream",
+                b"getStreamData called on unfilterable stream",
             )));
         }
-        if !stream_data_succeeded {
-            return Err(Error::Unsupported(
-                "error getting decoded stream data".to_owned(),
-            ));
-        }
+        let _ = stream_data_succeeded;
         Ok(Rc::new(buffer.take_buffer()?))
     }
 
@@ -6569,7 +6506,13 @@ impl ObjectHandle {
         let offset = self.get_parsed_offset();
         if offset >= 0 {
             if let Some(context) = self.context() {
-                return context.warn_stream_data(offset as u64, None, message.to_owned());
+                return context.warn_stream_data(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    context.input_description(),
+                    b"",
+                    offset,
+                    message.as_bytes(),
+                ));
             } // cov:ignore: the return above makes this LLVM closing-branch artifact unreachable
         }
         self.object_warning(message)
@@ -6691,9 +6634,15 @@ impl ObjectHandle {
     pub fn get_raw_stream_data(&self) -> Result<Rc<Vec<u8>>> {
         let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
         if !self.pipe_raw_stream_data(&mut buffer)? {
-            return Err(Error::Unsupported(
-                "error getting raw stream data".to_owned(),
-            ));
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::Unsupported,
+                self.context()
+                    .map(|context| context.input_description())
+                    .unwrap_or_default(),
+                b"",
+                self.get_parsed_offset(),
+                b"error getting raw stream data",
+            )));
         }
         Ok(Rc::new(buffer.take_buffer()?))
     }
@@ -8714,7 +8663,13 @@ pub(crate) mod identity_tests {
                 if message == "original stream data provider requested from a resolver without a document"
         ));
         assert!(matches!(
-            resolver.warn_stream_data(17, None, "late warning".to_owned()),
+            resolver.warn_stream_data(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"",
+                b"",
+                17,
+                b"late warning",
+            )),
             Err(Error::Internal(message))
                 if message == "stream data warning requested from a resolver without a document"
         ));
@@ -9326,8 +9281,8 @@ pub(crate) mod identity_tests {
         let scalar = ObjectHandle::integer(1);
         assert!(matches!(
             scalar.try_has_key(b"/A"),
-            Err(Error::System(message))
-                if message == "operation for dictionary attempted on object of type integer: returning false for a key containment request"
+            Err(Error::QpdfExc(error))
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: returning false for a key containment request"
         ));
     }
 
@@ -13648,36 +13603,6 @@ mod mutation_tests {
     use super::*;
 
     #[test]
-    fn qpdf_exception_what_formats_object_and_offset_fields() {
-        assert_eq!(
-            format_qpdf_exception_what("input.pdf", "object 4 0", 28, "detail"),
-            "input.pdf (object 4 0, offset 28): detail"
-        );
-        assert_eq!(
-            format_qpdf_exception_what("", "object 4 0", -1, "detail"),
-            "object 4 0: detail"
-        );
-    }
-
-    #[test]
-    fn qpdf_exception_what_matches_createwhat_for_a_negative_offset_with_no_object() {
-        // qpdf's createWhat only skips the parenthesized segment when
-        // `object` is empty AND `offset == 0` -- a negative offset with an
-        // empty object still enters that branch and emits an empty `()`
-        // (QPDFExc.cc:16-48). Regression for a prior `offset <= 0` guard
-        // that instead skipped the parentheses entirely for any
-        // non-positive offset.
-        assert_eq!(
-            format_qpdf_exception_what("input.pdf", "", -1, "detail"),
-            "input.pdf (): detail"
-        );
-        assert_eq!(
-            format_qpdf_exception_what("input.pdf", "", 0, "detail"),
-            "input.pdf: detail"
-        );
-    }
-
-    #[test]
     fn make_direct_rebinds_only_the_receiver_and_isolates_repeated_indirect_children() {
         let shared_array = ObjectHandle::new_indirect_unresolved(ObjectRef::new(11, 0), -1);
         shared_array.set_resolved(ObjectValue::Array(vec![
@@ -13807,22 +13732,17 @@ mod mutation_tests {
     }
 
     impl DocumentResolver for SourcePipeResolver {
-        fn warn(&self, message: Vec<u8>) -> crate::Result<()> {
+        fn warn(&self, warning: QpdfExc) -> crate::Result<()> {
             self.warnings
                 .borrow_mut()
-                .push(String::from_utf8_lossy(&message).into_owned());
+                .push(String::from_utf8_lossy(warning.what_bytes()).into_owned());
             Ok(())
         }
 
-        fn warn_stream_data(
-            &self,
-            offset: u64,
-            _description_override: Option<&[u8]>,
-            message: String,
-        ) -> crate::Result<()> {
+        fn warn_stream_data(&self, warning: QpdfExc) -> crate::Result<()> {
             self.warnings
                 .borrow_mut()
-                .push(format!("offset {offset}: {message}"));
+                .push(String::from_utf8_lossy(warning.what_bytes()).into_owned());
             Ok(())
         }
 
@@ -14085,8 +14005,11 @@ mod mutation_tests {
             .expect_err("a failed filtered source must not be reported as decoded data");
         assert!(matches!(
             error,
-            Error::Unsupported(message)
-                if message == "offset 9: getStreamData called on unfilterable stream"
+            Error::QpdfExc(error)
+                if error.get_error_code() == QpdfErrorCode::Unsupported
+                    && error.get_file_position() == 9
+                    && error.get_object().is_empty()
+                    && error.get_message_detail() == b"getStreamData called on unfilterable stream"
         ));
         assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
     }
@@ -14111,8 +14034,9 @@ mod mutation_tests {
 
             assert!(matches!(
                 error,
-                Error::Unsupported(message)
-                    if message == "getStreamData called on unfilterable stream"
+                Error::QpdfExc(error)
+                    if error.get_error_code() == QpdfErrorCode::Unsupported
+                        && error.get_message_detail() == b"getStreamData called on unfilterable stream"
             ));
         }
     }
@@ -14618,9 +14542,9 @@ mod mutation_tests {
         let offsets: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.offset)
+            .map(|diagnostic| diagnostic.get_file_position())
             .collect();
-        assert_eq!(offsets, vec![Some(9); 3]);
+        assert_eq!(offsets, vec![9; 3]);
     }
 
     #[test]
@@ -14650,7 +14574,7 @@ mod mutation_tests {
         assert!(diagnostics
             .entries()
             .iter()
-            .all(|diagnostic| diagnostic.offset.is_none()));
+            .all(|diagnostic| diagnostic.get_file_position() == 0));
     }
 
     #[test]
@@ -14944,8 +14868,8 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(5);
         assert!(matches!(
             scalar.try_get_key(b"/A"),
-            Err(crate::Error::System(message))
-                if message == "operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"
+            Err(crate::Error::QpdfExc(error))
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"
         ));
     }
 
@@ -15013,8 +14937,8 @@ mod mutation_tests {
 
         assert!(matches!(
             error,
-            Error::System(message)
-                if message == "operation for dictionary attempted on object of type integer: ignoring key replacement request"
+            Error::QpdfExc(error)
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: ignoring key replacement request"
         ));
         assert_eq!(scalar.as_integer(), Some(1));
     }
@@ -15058,8 +14982,8 @@ mod mutation_tests {
 
         assert!(matches!(
             error,
-            Error::System(message)
-                if message == "operation for dictionary attempted on object of type integer: ignoring key replacement request"
+            Error::QpdfExc(error)
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: ignoring key replacement request"
         ));
         assert_eq!(scalar.as_integer(), Some(1));
     }
@@ -15199,16 +15123,16 @@ mod mutation_tests {
             .expect_err("bounds warning must run before the self-alias guard");
         assert!(matches!(
             set_error,
-            Error::System(message)
-                if message == "ignoring attempt to set out of bounds array item"
+            Error::QpdfExc(warning)
+                if warning.get_message_detail() == b"ignoring attempt to set out of bounds array item"
         ));
         let insert_error = array
             .insert_array_item(usize::MAX, array.clone())
             .expect_err("bounds warning must run before the self-alias guard");
         assert!(matches!(
             insert_error,
-            Error::System(message)
-                if message == "ignoring attempt to insert out of bounds array item"
+            Error::QpdfExc(warning)
+                if warning.get_message_detail() == b"ignoring attempt to insert out of bounds array item"
         ));
 
         assert_eq!(array.try_array_len().unwrap(), Some(1));
@@ -16102,9 +16026,10 @@ mod mutation_tests {
             .expect_err("missing-key null should retain its dictionary context");
         assert!(matches!(
             error,
-            crate::Error::System(ref message)
-                if message
-                    == " -> dictionary key /Missing: operation for dictionary attempted on object of type null: treating as empty"
+            crate::Error::QpdfExc(ref error)
+                if error.get_object() == b" -> dictionary key /Missing"
+                    && error.get_message_detail()
+                        == b"operation for dictionary attempted on object of type null: treating as empty"
         ));
     }
 
@@ -16113,8 +16038,8 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(1);
         assert!(matches!(
             scalar.try_has_key(b"/A"),
-            Err(crate::Error::System(message))
-                if message == "operation for dictionary attempted on object of type integer: returning false for a key containment request"
+            Err(crate::Error::QpdfExc(error))
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: returning false for a key containment request"
         ));
     }
 
@@ -17949,10 +17874,10 @@ pub(crate) mod warning_emission_tests {
             Ok(())
         }
 
-        fn warn(&self, message: Vec<u8>) -> crate::Result<()> {
+        fn warn(&self, warning: QpdfExc) -> crate::Result<()> {
             self.warnings
                 .borrow_mut()
-                .push(String::from_utf8_lossy(&message).into_owned());
+                .push(String::from_utf8_lossy(warning.what_bytes()).into_owned());
             Ok(())
         }
     }
@@ -18041,9 +17966,9 @@ pub(crate) mod warning_emission_tests {
 
         assert!(matches!(
             error,
-            crate::Error::System(ref message)
-                if message
-                    == "operation for dictionary attempted on object of type integer: \
+            crate::Error::QpdfExc(ref error)
+                if error.get_message_detail()
+                    == b"operation for dictionary attempted on object of type integer: \
                         treating as empty"
         ));
     }
@@ -18941,7 +18866,7 @@ pub(crate) mod warning_emission_tests {
 
         assert!(matches!(
             error,
-            crate::Error::System(ref message) if message == "unresolved name object"
+            crate::Error::QpdfExc(ref error) if error.get_message_detail() == b"unresolved name object"
         ));
     }
 
@@ -19189,8 +19114,8 @@ pub(crate) mod warning_emission_tests {
             .expect_err("qpdf does not lend a containment parent to a direct value");
         assert!(matches!(
             error,
-            crate::Error::System(message)
-                if message == "operation for dictionary attempted on object of type integer: treating as empty"
+            crate::Error::QpdfExc(error)
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: treating as empty"
         ));
         assert!(warnings(&recorder).is_empty());
     }
@@ -19203,9 +19128,9 @@ pub(crate) mod warning_emission_tests {
                 .expect_err("qpdf newNull has no owning document context");
             assert!(matches!(
                 error,
-                crate::Error::System(ref message)
-                    if message
-                        == "operation for dictionary attempted on object of type null: treating as empty"
+                crate::Error::QpdfExc(ref error)
+                    if error.get_message_detail()
+                        == b"operation for dictionary attempted on object of type null: treating as empty"
             ));
         }
 
@@ -19234,9 +19159,9 @@ pub(crate) mod warning_emission_tests {
             .expect_err("qpdf missing-key null has no context without a document");
         assert!(matches!(
             error,
-            crate::Error::System(ref message)
-                if message
-                    == " -> dictionary key /Missing: operation for dictionary attempted on object of type null: treating as empty"
+            crate::Error::QpdfExc(ref error)
+                if error.get_message_detail()
+                    == b"operation for dictionary attempted on object of type null: treating as empty"
         ));
 
         let (stream, stream_recorder) = handle_resolving(ObjectValue::Stream {
@@ -19266,8 +19191,8 @@ pub(crate) mod warning_emission_tests {
             .expect_err("a programmatic direct child must remain contextless");
         assert!(matches!(
             error,
-            crate::Error::System(message)
-                if message == "operation for dictionary attempted on object of type integer: treating as empty"
+            crate::Error::QpdfExc(error)
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: treating as empty"
         ));
         assert!(non_null_child.context().is_none());
         assert!(warnings(&non_null_recorder).is_empty());
@@ -19284,8 +19209,8 @@ pub(crate) mod warning_emission_tests {
             .expect_err("qpdf typeWarning must stay on the contextless route");
         assert!(matches!(
             error,
-            crate::Error::System(message)
-                if message == "operation for dictionary attempted on object of type integer: treating as empty"
+            crate::Error::QpdfExc(error)
+                if error.get_message_detail() == b"operation for dictionary attempted on object of type integer: treating as empty"
         ));
         assert!(warnings(&recorder).is_empty());
     }
@@ -19400,7 +19325,7 @@ mod qpdf_mutator_api_tests {
             pdf.repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
+                .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
                 .collect::<Vec<_>>(),
             ["test array: ignoring attempt to erase out of bounds array item"]
         );

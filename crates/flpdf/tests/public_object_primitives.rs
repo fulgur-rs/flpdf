@@ -67,8 +67,8 @@ fn ownerless_integer_type_error_uses_qpdf_object_error_boundary() {
 
     assert!(matches!(
         error,
-        Error::System(message)
-            if message == "operation for integer attempted on object of type null: returning 0"
+        Error::QpdfExc(warning)
+            if warning.get_error_code() == flpdf::QpdfErrorCode::Object
     ));
 }
 

@@ -235,6 +235,7 @@ impl<R: Read + Seek> Pdf<R> {
                 XrefLoadOptions {
                     allow_repair: options.repair,
                     ignore_xref_streams: options.ignore_xref_streams,
+                    description: options.description.clone(),
                 },
             ) {
                 Ok(state) => state,

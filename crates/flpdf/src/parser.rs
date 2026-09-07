@@ -82,6 +82,7 @@ pub(crate) trait LiveInput {
     fn seek(&mut self, offset: u64) -> Result<()>;
     fn read_byte(&mut self) -> Result<Option<u8>>;
     fn unread_byte(&mut self) -> Result<()>;
+    fn set_last_offset(&mut self, _offset: u64) {}
 }
 
 /// A decoded object-stream member is still consumed by qpdf's same
@@ -226,6 +227,7 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
             token.error_offset = start;
             token.end = end;
             self.last_offset = start;
+            self.input.set_last_offset(start as u64);
             return Ok(token);
         }
     }
@@ -859,7 +861,7 @@ mod live_input_tests {
     };
     use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
-    use crate::{Error, ObjectRef, Result};
+    use crate::{Error, ObjectRef, QpdfExc, Result};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::{Rc, Weak};
@@ -939,10 +941,10 @@ mod live_input_tests {
             Ok(())
         }
 
-        fn warn(&self, message: Vec<u8>) -> Result<()> {
+        fn warn(&self, warning: QpdfExc) -> Result<()> {
             self.warnings
                 .borrow_mut()
-                .push(String::from_utf8_lossy(&message).into_owned());
+                .push(String::from_utf8_lossy(warning.what_bytes()).into_owned());
             Ok(())
         }
     }

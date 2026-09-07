@@ -1006,7 +1006,7 @@ mod tests {
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
             .collect();
         assert_eq!(
             messages,
@@ -1036,7 +1036,7 @@ mod tests {
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
             .collect();
         assert_eq!(
             messages,
@@ -1105,7 +1105,7 @@ mod tests {
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| diagnostic.message_string())
             .collect();
         assert!(messages.iter().any(|message| message.contains(
             "ignoring attempt to set a checkbox field to a value whose type is not name"
@@ -1159,7 +1159,7 @@ mod tests {
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| diagnostic.message_string())
             .filter(|message| message.contains("unable to set the value of this radio button"))
             .collect();
         assert_eq!(messages.len(), 2);

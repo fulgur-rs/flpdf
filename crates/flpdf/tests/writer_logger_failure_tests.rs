@@ -84,10 +84,9 @@ fn full_rewrite_propagates_extension_preflight_logger_failure() {
     writer.set_output_memory().expect("memory output");
     let result = writer.write();
 
-    assert!(matches!(
-        &result,
-        Err(Error::System(message)) if message == "sink write failure 1"
-    ));
+    assert!(
+        matches!(&result, Err(Error::QpdfExc(warning)) if warning.get_message_detail() == b"unable to find /Root dictionary")
+    );
 }
 
 #[test]
@@ -103,8 +102,7 @@ fn linearized_rewrite_propagates_extension_preflight_logger_failure() {
     writer.set_output_memory().expect("memory output");
     let result = writer.write();
 
-    assert!(matches!(
-        &result,
-        Err(Error::System(message)) if message == "sink write failure 1"
-    ));
+    assert!(
+        matches!(&result, Err(Error::QpdfExc(warning)) if warning.get_message_detail() == b"unable to find /Root dictionary")
+    );
 }

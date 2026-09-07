@@ -25,7 +25,7 @@ use std::rc::Rc;
 use super::value::format_qpdf_real;
 use super::{Json, Reactor};
 use crate::filespec_helper::qpdf_style_open_error;
-use crate::object_handle::{ObjectValue, StreamDataProvider};
+use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider};
 use crate::pipeline::{Base64Action, Pipeline, PlBase64};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
@@ -546,12 +546,18 @@ where
 
     fn error(&mut self, offset: i64, message: impl Into<String>) {
         self.errors = true;
-        let result = self.pdf.resolver.push_json_warning(
-            &self.input_name,
-            &self.cur_object,
+        let mut object = self.cur_object.as_bytes().to_vec();
+        if self.input_name != self.pdf.resolver.input_description() {
+            object.extend_from_slice(b" from ");
+            object.extend_from_slice(&self.input_name);
+        }
+        let result = self.pdf.resolver.push_json_warning(crate::QpdfExc::new(
+            crate::QpdfErrorCode::Json,
+            self.pdf.resolver.input_description(),
+            object,
             offset,
-            message,
-        );
+            message.into().into_bytes(),
+        ));
         if let Err(error) = result {
             self.fatal(error.to_string());
         }

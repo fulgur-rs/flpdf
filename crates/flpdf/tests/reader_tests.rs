@@ -621,9 +621,11 @@ fn r6_perms_mismatch_warns_without_failing_open() {
     )
     .unwrap();
 
-    assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
-        entry.severity == flpdf::Severity::Warning && entry.message.contains("/Perms")
-    }));
+    assert!(pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|entry| { String::from_utf8_lossy(entry.get_message_detail()).contains("/Perms") }));
 }
 
 #[test]
@@ -637,11 +639,10 @@ fn r6_perms_wrong_length_warns_without_attempting_decryption() {
     )
     .unwrap();
 
-    assert!(pdf
-        .repair_diagnostics()
-        .entries()
-        .iter()
-        .any(|entry| { entry.message.contains("R=6 /Perms entry is not 16 bytes") }));
+    assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+        String::from_utf8_lossy(entry.get_message_detail())
+            .contains("R=6 /Perms entry is not 16 bytes")
+    }));
 }
 
 #[test]
@@ -1861,7 +1862,7 @@ fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .map(|entry| entry.message.to_string())
+        .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
         .filter(|message| message.contains("unknown encryption filter"))
         .collect();
     assert_eq!(

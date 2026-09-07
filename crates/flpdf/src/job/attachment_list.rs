@@ -697,7 +697,7 @@ mod tests {
             .iter()
             .filter(|diagnostic| {
                 diagnostic
-                    .message
+                    .message_string()
                     .contains("operation for dictionary attempted on object of type null")
             })
             .collect();
@@ -708,7 +708,7 @@ mod tests {
         );
         assert!(warnings
             .iter()
-            .all(|diagnostic| diagnostic.message.contains("treating as empty")));
+            .all(|diagnostic| diagnostic.message_string().contains("treating as empty")));
     }
 
     #[test]
@@ -840,7 +840,7 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|diagnostic| diagnostic
-                    .message
+                    .message_string()
                     .contains("Embedded file object is not a dictionary")),
             "QPDFFileSpecObjectHelper must warn for a direct non-dictionary Filespec"
         );
@@ -858,7 +858,7 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|diagnostic| diagnostic
-                    .message
+                    .message_string()
                     .contains("Embedded file object is not a dictionary")),
             "QPDFFileSpecObjectHelper must warn for a dangling Filespec"
         );

@@ -327,9 +327,15 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
                 if !inheritable_keys.contains(&key.as_slice())
                     && !structural_keys.contains(&key.as_slice())
                 {
-                    pdf.push_warning(format!(
-                        "({pages_object}): Unknown key {} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                        String::from_utf8_lossy(&key)
+                    pdf.push_qpdf_warning(crate::QpdfExc::new(
+                        crate::QpdfErrorCode::DamagedPdf,
+                        pdf.input_description(),
+                        pages_object.as_bytes(),
+                        0,
+                        format!(
+                            "Unknown key {} in /Pages object is being discarded as a result of flattening the /Pages tree",
+                            String::from_utf8_lossy(&key)
+                        ),
                     ))?;
                 }
             }
@@ -1198,12 +1204,12 @@ mod tests {
         let warnings: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|entry| entry.message.as_str())
+            .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
             .filter(|message| message.contains("Unknown key /UserUnit"))
             .collect();
         assert_eq!(
             warnings,
-            ["(Pages object: object 3 0): Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree"],
+            ["Pages object: object 3 0: Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree"],
             "only the flattened intermediate /Pages node should warn"
         );
 
@@ -1236,7 +1242,9 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("Unknown key /UserUnit")));
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("Unknown key /UserUnit")));
     }
 
     #[test]

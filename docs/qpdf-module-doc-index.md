@@ -12,7 +12,7 @@
 | `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/ContentNormalizer.cc |
 | `crates/flpdf/src/content_stream.rs` | correspondence | \`QPDFObjectHandle::ParserCallbacks\` and \`QPDFParser::warn\` content boundary |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
-| `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
+| `crates/flpdf/src/diagnostics.rs` | correspondence | \`QPDF::Members::warnings\` represented as Rust values |
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads. The input-side \`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` boundary lives in the private JSON document module (the output and input paths remain separate qpdf responsibilities) |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | \`EmbeddedFileDocumentHelper\` implements QPDFEmbeddedFileDocumentHelper.hh's public API (hasEmbeddedFiles, getEmbeddedFiles, getEmbeddedFile, replaceEmbeddedFile, removeEmbeddedFile) |
 | `crates/flpdf/src/encryption.rs` | correspondence | \`QPDF_encryption.cc\` encryption facade and domain configuration |

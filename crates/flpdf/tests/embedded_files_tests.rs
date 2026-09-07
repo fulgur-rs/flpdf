@@ -1395,7 +1395,8 @@ fn helper_listing_skips_a_later_non_string_name_tree_key() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .any(|entry| entry.message.contains("item 2 has the wrong type")));
+        .any(|entry| String::from_utf8_lossy(entry.get_message_detail())
+            .contains("item 2 has the wrong type")));
 }
 
 #[test]

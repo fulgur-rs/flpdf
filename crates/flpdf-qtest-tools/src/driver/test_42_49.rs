@@ -7,7 +7,7 @@ use flpdf::{
     PageLabelDocumentHelper, Pdf, PdfWriter, Rectangle,
 };
 
-use super::{emit_new_diagnostics, format_nntree_exception};
+use super::emit_new_diagnostics;
 use crate::output::write_bytes;
 
 // Shared helpers for test_46/test_48 (qpdf's number-tree/name-tree driver
@@ -808,15 +808,13 @@ pub(crate) fn run_test_46<R: Read + Seek>(
 
 fn write_nntree_error(
     stdout: &mut dyn Write,
-    filename: &[u8],
+    _filename: &[u8],
     error: &Error,
 ) -> std::io::Result<()> {
-    if let Error::Parse { message, .. } = error {
-        if let Some(exception) = format_nntree_exception(filename, message) {
-            stdout.write_all(&exception)?;
-            stdout.write_all(b"\n")?;
-            return Ok(());
-        }
+    if let Error::QpdfExc(warning) = error {
+        stdout.write_all(warning.what_bytes())?;
+        stdout.write_all(b"\n")?;
+        return Ok(());
     }
     writeln!(stdout, "{error}")
 }

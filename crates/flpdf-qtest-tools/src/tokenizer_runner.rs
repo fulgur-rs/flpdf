@@ -206,6 +206,7 @@ fn process(
 
     let options = PdfOpenOptions {
         repair: true,
+        description: filename_diagnostic.to_vec(),
         // This runner formats diagnostics through its explicit output
         // writers; keep the document logger from duplicating them on the
         // process stderr.

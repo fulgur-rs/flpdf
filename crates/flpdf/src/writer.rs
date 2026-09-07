@@ -6576,16 +6576,16 @@ mod final_handle_writer_tests {
         assert!(
             pdf.repair_diagnostics().entries().iter().any(|entry| {
                 entry
-                    .message
+                    .message_string()
                     .contains("error decoding stream data for object")
-                    && entry.message.contains("zlib stream error")
+                    && entry.message_string().contains("zlib stream error")
             }),
             "qpdf reports the invalid deflate initialization as a stream warning"
         );
         assert!(
             pdf.repair_diagnostics().entries().iter().any(|entry| {
                 entry
-                    .message
+                    .message_string()
                     .contains("stream will be re-processed without filtering")
             }),
             "qpdf reports the raw retry after the invalid compression level"

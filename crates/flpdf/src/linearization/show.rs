@@ -159,8 +159,10 @@ fn load_hint_stream_for_show<R: Read + Seek>(
             offset: damage.offset,
             detail: damage.detail,
         }),
-        Err(HintStreamLoadError::Core(crate::Error::Unsupported(message))) => {
-            Err(malformed!("{message}").into())
+        Err(HintStreamLoadError::Core(crate::Error::QpdfExc(error)))
+            if error.get_error_code() == crate::QpdfErrorCode::Unsupported =>
+        {
+            Err(malformed!("{error}").into())
         }
         Err(HintStreamLoadError::Core(error)) => Err(ShowLinearizationError::from(error).into()), // cov:ignore: Cursor<Vec<u8>> show inputs cannot produce this generic source-I/O arm
     }
@@ -567,14 +569,14 @@ fn param_u64(dict: &ObjectHandle, key: &'static str) -> ShowResult<u64> {
 /// Read a non-negative integer from an already-selected canonical value
 /// handle. This is used for array items such as qpdf's `/H` fields, where a
 /// second dictionary lookup would be a type error.
-fn integer_u64(value: &ObjectHandle, key: &str) -> ShowResult<u64> {
+fn integer_u64(value: &ObjectHandle, _key: &str) -> ShowResult<u64> {
     value
         .try_dereference()
         .map_err(ShowLinearizationError::from)?;
     match value.as_integer() {
         Some(n) if n >= 0 => Ok(n as u64),
         _ => Err(malformed!(
-            "/{key} is missing or not a non-negative integer in the linearization dictionary"
+            "some keys in linearization dictionary are of the wrong type"
         )),
     }
 }
@@ -639,7 +641,9 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
     } else if p.is_null() {
         0
     } else {
-        return Err(malformed!("/P is present but not an integer"));
+        return Err(malformed!(
+            "some keys in linearization dictionary are of the wrong type"
+        ));
     };
     // /H is [offset length] or [offset length offset length] for an overflow
     // table. qpdf rejects every other cardinality before reading the items.
@@ -648,13 +652,12 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
         .map_err(ShowLinearizationError::from)?;
     h.try_dereference().map_err(ShowLinearizationError::from)?;
     let Some(h_items) = h.as_array() else {
-        return Err(malformed!("/H is missing or not an [offset length] array"));
+        return Err(malformed!(
+            "some keys in linearization dictionary are of the wrong type"
+        ));
     };
     if !matches!(h_items.len(), 2 | 4) {
-        return Err(malformed!(
-            "/H has the wrong number of items (expected 2 or 4, got {})",
-            h_items.len()
-        ));
+        return Err(malformed!("H has the wrong number of items"));
     }
     let h_offset = integer_u64(&h_items[0], "H[0]")?;
     let h_length = integer_u64(&h_items[1], "H[1]")?;
@@ -681,40 +684,11 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
 }
 
 /// Format a qpdf `damagedPDF` warning raised while loading linearization data.
-fn linearization_parameter_warning(
-    pdf: &mut Pdf<impl Read + Seek>,
-    display_name: &[u8],
-    message: &str,
-) -> ShowResult<Vec<u8>> {
-    for object in ["linearization dictionary", "linearization hint table"] {
-        let prefix = format!("{object}: ");
-        if let Some(detail) = message.strip_prefix(&prefix) {
-            let offset = if object == "linearization dictionary" {
-                let candidate = pdf
-                    .linearization_candidate_ref()
-                    .map_err(ShowLinearizationError::from)?;
-                candidate
-                    .map(|object_ref| pdf.get_object_handle(object_ref).get_parsed_offset())
-                    .filter(|offset| *offset >= 0)
-                    .map(|offset| offset as u64)
-                    .unwrap_or_else(|| pdf.source_last_offset())
-            } else {
-                pdf.source_last_offset()
-            };
-            return Ok(linearization_damage_warning(
-                display_name,
-                object,
-                offset,
-                detail,
-            ));
-        }
-    }
-    // The checker supplies only the two qpdf damagedPDF categories above;
-    // keep a stable fallback for future diagnostics.
+fn linearization_runtime_warning(display_name: &[u8], detail: &str) -> Vec<u8> {
     let mut result = display_name.to_vec();
     result.extend_from_slice(b": ");
-    result.extend_from_slice(message.as_bytes());
-    Ok(result) // cov:ignore: unreachable fallback for unknown qpdf category
+    result.extend_from_slice(detail.as_bytes());
+    result
 }
 
 fn linearization_damage_warning(
@@ -794,15 +768,16 @@ fn show_with_pdf<R: Read + Seek>(
         })
     };
 
-    if !pdf.is_linearized().map_err(ShowLinearizationError::from)? {
-        return not_linearized();
-    }
     let Some(first_obj_ref) = pdf
         .linearization_candidate_ref()
         .map_err(ShowLinearizationError::from)?
     else {
         return not_linearized();
     };
+    let parameter_offset = pdf.source_last_offset();
+    if !pdf.is_linearized().map_err(ShowLinearizationError::from)? {
+        return not_linearized();
+    }
     let param_dict = pdf.get_object_handle(first_obj_ref);
     if param_dict
         .try_as_dictionary()
@@ -816,16 +791,7 @@ fn show_with_pdf<R: Read + Seek>(
     // then calls `checkLinearizationInternal`, and always dumps after the
     // check (`QPDF_linearization.cc:837-846`). The canonical warning route
     // preserves that order; the CLI owns logger emission and exit-3 completion.
-    let mut warnings = match check_linearization_parameters(pdf)? {
-        LinearizationParameterCheck::Clean => Vec::new(),
-        LinearizationParameterCheck::Warning(message) => vec![message.as_bytes().to_vec()],
-        LinearizationParameterCheck::Error(message) => {
-            return Ok(ShowLinearizationOutput {
-                dump: Vec::new(),
-                warnings: vec![linearization_parameter_warning(pdf, display_name, message)?],
-            });
-        }
-    };
+    let mut warnings = Vec::new();
 
     // qpdf's showLinearizationData wraps readLinearizationData,
     // checkLinearizationInternal, and dumpLinearizationDataInternal in a single try/catch
@@ -847,7 +813,28 @@ fn show_with_pdf<R: Read + Seek>(
         ShowTablesError,
     > {
             // 2. Param-dict values (qpdf's LinParameters).
-            let params = read_lin_parameters(&param_dict, file_size)?;
+            let params = read_lin_parameters(&param_dict, file_size).map_err(|error| match error {
+                ShowLinearizationError::Malformed { message } => ShowTablesError::QpdfDamage {
+                    object: "linearization dictionary",
+                    offset: parameter_offset,
+                    detail: message,
+                },
+                other => ShowTablesError::Other(other),
+            })?;
+            match check_linearization_parameters(pdf) {
+                Ok(LinearizationParameterCheck::Clean) => {}
+                Ok(LinearizationParameterCheck::Warning(message)) => {
+                    warnings.push(message.as_bytes().to_vec());
+                }
+                Ok(LinearizationParameterCheck::Error { object, message }) => {
+                    return Err(ShowTablesError::QpdfDamage {
+                        object,
+                        offset: pdf.source_last_offset(),
+                        detail: message.to_owned(),
+                    });
+                }
+                Err(error) => return Err(ShowTablesError::Other(error.into())),
+            }
             // 3. Locate, resolve, and decompress the hint stream object at /H[0].
             //
             // An unreadable/out-of-bounds/undecodable hint stream is caught here,
@@ -982,16 +969,7 @@ fn show_with_pdf<R: Read + Seek>(
         Err(ShowTablesError::Other(ShowLinearizationError::Malformed { message })) => {
             Ok(ShowLinearizationOutput {
                 dump: Vec::new(),
-                // cov:ignore-start: linearization_parameter_warning's only Err
-                // arm is a source I/O failure from linearization_candidate_ref,
-                // and a Cursor<Vec<u8>> cannot produce one (see the identical
-                // reasoning on the Io arm just below).
-                warnings: vec![linearization_parameter_warning(
-                    pdf,
-                    display_name,
-                    &message,
-                )?],
-                // cov:ignore-end
+                warnings: vec![linearization_runtime_warning(display_name, &message)],
             })
         }
         Err(ShowTablesError::Other(err @ ShowLinearizationError::Io(_))) => Err(err), // cov:ignore: Cursor<Vec<u8>> show inputs cannot produce this generic source-I/O arm
@@ -2540,7 +2518,7 @@ mod tests {
         assert_eq!(
             result.warnings,
             [
-                b"short-trailing.pdf (linearization dictionary, offset 660): hint table is not a stream"
+                b"short-trailing.pdf (linearization dictionary, offset 653): hint table is not a stream"
                     .to_vec()
             ]
         );
@@ -2565,7 +2543,7 @@ mod tests {
                 b"linearization hint stream",
             )
             .expect("first offset read should succeed");
-        assert_eq!(first_offset, Some(660));
+        assert_eq!(first_offset, Some(653));
         let error = load_hint_stream_with_damage(&mut pdf, &bytes, 601, 118)
             .expect_err("a cached non-stream hint object is damaged");
         match error {
@@ -2590,7 +2568,7 @@ mod tests {
         assert_eq!(
             result.warnings,
             [
-                b"uncached-trailing.pdf (linearization dictionary, offset 939): hint table is not a stream"
+                b"uncached-trailing.pdf (linearization dictionary, offset 932): hint table is not a stream"
                     .to_vec()
             ]
         );
@@ -2609,6 +2587,47 @@ mod tests {
         assert_eq!(
             result.warnings,
             [b"noN.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type".to_vec()]
+        );
+    }
+
+    #[test]
+    fn h_three_items_matches_qpdf_full_warning_context() {
+        let mut bytes = linearized_bytes();
+        let h = bytes
+            .windows(b"/H [".len())
+            .position(|w| w == b"/H [")
+            .unwrap();
+        let end = h + bytes[h..].iter().position(|&byte| byte == b']').unwrap();
+        let original = &bytes[h..=end];
+        let replacement = b"/H [ 509 1 15]";
+        assert_eq!(replacement.len(), original.len());
+        bytes[h..=end].copy_from_slice(replacement);
+        let file = tempfile::NamedTempFile::new().expect("temporary H3 PDF");
+        std::fs::write(file.path(), &bytes).expect("write H3 PDF");
+        let qpdf = std::process::Command::new("/usr/bin/qpdf")
+            .arg("--show-linearization")
+            .arg(file.path())
+            .output()
+            .expect("qpdf 11.9.0 oracle");
+        std::fs::write("/tmp/h3-qpdf-seekable.stdout", &qpdf.stdout).expect("save qpdf stdout");
+        std::fs::write("/tmp/h3-qpdf-seekable.stderr", &qpdf.stderr).expect("save qpdf stderr");
+        assert_eq!(qpdf.status.code(), Some(3));
+        assert_eq!(qpdf.stdout, b"");
+        let expected_qpdf_stderr = format!(
+            "WARNING: {}: {} (linearization dictionary, offset 23): H has the wrong number of items\nqpdf: operation succeeded with warnings\n",
+            file.path().display(),
+            file.path().display()
+        );
+        assert_eq!(qpdf.stderr, expected_qpdf_stderr.as_bytes());
+        let result = show_linearization_bytes_with_warnings(&bytes, "h3.pdf")
+            .expect("qpdf catches malformed H as a warning");
+        assert!(result.dump.is_empty());
+        assert_eq!(
+            result.warnings,
+            [
+                b"h3.pdf (linearization dictionary, offset 23): H has the wrong number of items"
+                    .to_vec()
+            ]
         );
     }
 

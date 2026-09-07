@@ -140,8 +140,6 @@ crates/flpdf/src/reader/resolver.rs::reconstruct_xref_and_retry          # B22 r
 crates/flpdf/src/xref.rs::XrefLoadOptions                                # B26 open 時の第 2 表現
 crates/flpdf/src/xref.rs::LoadedXref                                     # B27 staging
 crates/flpdf/src/xref.rs::BootstrapHandleState                           # B27/B12 並行 document 状態
-crates/flpdf/src/reader/resolver.rs::qpdf_exception_what                 # B30 第 2 実装
-crates/flpdf/src/reader/resolver.rs::route_warning                       # B30 第 3 実装
 crates/flpdf/src/pdf.rs::resolution_fallbacks_remaining                  # B34（フィールド）
 crates/flpdf/src/engine.rs::MAX_RESOLUTION_FALLBACKS                     # B34
 crates/flpdf/src/reader.rs::parse_source_file_object_at                  # B34
@@ -161,7 +159,6 @@ crates/flpdf/src/xref.rs::recover_xref_from_linear_scan                  # B22 c
 crates/flpdf/src/reader/resolver.rs::reconstructed_xref                  # B25 canonical
 crates/flpdf/src/reader/resolver.rs::attempt_recovery                    # B26 canonical
 crates/flpdf/src/reader/resolver.rs::repair_diagnostics                  # B27 単一 sink
-crates/flpdf/src/object_handle.rs::format_qpdf_exception_what            # B30 canonical
 crates/flpdf/src/error.rs::QpdfExc                                      # B30/B32 canonical primitive
 crates/flpdf/src/error.rs::QpdfErrorCode                                # B32 qpdf error-code family
 crates/flpdf/src/error.rs::Error                                         # B32（曖昧 leaf）
@@ -172,7 +169,7 @@ crates/flpdf/src/xref.rs::push_repair_diagnostics                        # B33 c
 # ===========================================================================
 
 # --- (a) deletable route ---
-crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream    # C4
+crates/flpdf/src/object_handle.rs::get_stream_data                       # C4 ObjStm canonical route
 crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle       # C9 filterable 第 3 実装
 crates/flpdf/src/filters.rs::decode_stream_data                          # C26
 crates/flpdf/src/filters.rs::decode_stream_data_from_handle              # C27

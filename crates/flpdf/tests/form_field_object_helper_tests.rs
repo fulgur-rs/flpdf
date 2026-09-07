@@ -795,7 +795,7 @@ fn get_parent_warns_before_returning_a_null_handle_for_a_non_dictionary_field() 
         .expect("get parent from non-dictionary field")
         .is_null());
     assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-        diagnostic.message.contains(
+        String::from_utf8_lossy(diagnostic.get_message_detail()).contains(
             "operation for dictionary attempted on object of type integer: returning null for attempted key retrieval",
         )
     }));

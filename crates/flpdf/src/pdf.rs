@@ -7,7 +7,7 @@ use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::InputSourceControl;
-use crate::{Error, ObjectHandle, ObjectRef, Result, XrefForm};
+use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -486,13 +486,13 @@ impl<R: Read + Seek> Pdf<R> {
         let root = candidate;
         if root.as_dictionary().is_none() {
             let message = "unable to find /Root dictionary";
-            if self.resolver.input_source_closed() {
-                return Err(Error::System(format!(
-                    "{}: {message}",
-                    self.resolver.input_source_name()
-                )));
-            }
-            return Err(Error::System(message.into()));
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                self.resolver.input_description(),
+                b"",
+                0,
+                message,
+            )));
         }
         if self.check_mode
             && !root
@@ -503,8 +503,13 @@ impl<R: Read + Seek> Pdf<R> {
             // `QPDF::getRoot` (`libqpdf/QPDF.cc:2354-2366`). The replacement
             // is on the live handle so later inspection branches observe the
             // same repaired Catalog.
-            self.resolver
-                .push_warning("catalog /Type entry missing or invalid")?;
+            self.resolver.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                self.resolver.input_description(),
+                b"",
+                0,
+                b"catalog /Type entry missing or invalid",
+            ))?;
             root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))?;
             self.mark_object_handle_dirty(&root)?;
         }

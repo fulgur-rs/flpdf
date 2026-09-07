@@ -1,13 +1,17 @@
 use flpdf::{
     parse_content_operations, pipeline::PlString, ContentToken, ContentTokenType, ObjectHandle,
-    ObjectHandleParserCallbacks, ObjectRef, ParseControl, Pdf, PipelineResult, TokenFilter,
-    TokenFilterOutput,
+    ObjectHandleParserCallbacks, ObjectRef, ParseControl, Pdf, PipelineResult, QpdfExc,
+    TokenFilter, TokenFilterOutput,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
 
 fn stream(data: &[u8]) -> ObjectHandle {
     ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(data.to_vec()))
+}
+
+fn detail(diagnostic: &QpdfExc) -> String {
+    String::from_utf8_lossy(diagnostic.get_message_detail()).into_owned()
 }
 
 fn page_with_contents(contents: ObjectHandle) -> ObjectHandle {
@@ -156,8 +160,10 @@ fn detached_parse_throws_the_first_recovery_warning_before_callbacks() {
 
     assert!(matches!(
         error,
-        flpdf::Error::System(message)
-            if message == "object 0 0 stream 0 0 (content, offset 1): invalid character (g) in hexstring"
+        flpdf::Error::QpdfExc(warning)
+            if warning.get_object() == b"content"
+                && warning.get_file_position() == 1
+                && warning.get_message_detail() == b"invalid character (g) in hexstring"
     ));
     assert_eq!(callbacks.size, Some(4));
     assert!(callbacks.objects.is_empty());
@@ -195,8 +201,10 @@ fn detached_parse_throws_inline_image_eof_warning_before_normal_eof() {
 
     assert!(matches!(
         error,
-        flpdf::Error::System(message)
-            if message == "object 0 0 stream 0 0 (stream data, offset 12): EOF found while reading inline image"
+        flpdf::Error::QpdfExc(warning)
+            if warning.get_object() == b"stream data"
+                && warning.get_file_position() == 12
+                && warning.get_message_detail() == b"EOF found while reading inline image"
     ));
     assert!(!callbacks.objects.is_empty());
     assert!(!callbacks
@@ -217,8 +225,10 @@ fn detached_parse_throws_id_at_eof_warning_before_normal_eof() {
 
     assert!(matches!(
         error,
-        flpdf::Error::System(message)
-            if message == "object 0 0 stream 0 0 (stream data, offset 2): EOF found while reading inline image"
+        flpdf::Error::QpdfExc(warning)
+            if warning.get_object() == b"stream data"
+                && warning.get_file_position() == 2
+                && warning.get_message_detail() == b"EOF found while reading inline image"
     ));
     assert_eq!(callbacks.objects.len(), 1);
     assert_eq!(
@@ -300,22 +310,16 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
     let mut recovered = RecordingCallbacks::default();
     page.parse_page_contents(&mut recovered).unwrap();
     let diagnostics = pdf.repair_diagnostics();
-    let messages = diagnostics
-        .entries()
-        .iter()
-        .map(|diagnostic| diagnostic.message.as_str())
-        .collect::<Vec<_>>();
+    let messages = diagnostics.entries().iter().map(detail).collect::<Vec<_>>();
     assert!(messages
         .iter()
         .any(|message| message.contains("invalid character (g) in hexstring")));
-    assert!(messages.iter().any(|message| {
-        message.contains("page object 3 0 stream 4 0 (content, offset ")
-            && message.ends_with("treating unexpected array close token as null")
-    }));
-    assert!(messages.iter().any(|message| {
-        message.contains("page object 3 0 stream 4 0 (content, offset ")
-            && message.ends_with("unexpected dictionary close token")
-    }));
+    assert!(messages
+        .iter()
+        .any(|message| message.ends_with("treating unexpected array close token as null")));
+    assert!(messages
+        .iter()
+        .any(|message| message.ends_with("unexpected dictionary close token")));
     assert_eq!(recovered.eof_calls, 1);
 
     let (pdf, page) = owned_page_with_contents(b"<< /QPDFFake1 9 7 } /A >>");
@@ -329,7 +333,7 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .any(|diagnostic| diagnostic.message.contains("inserting key /QPDFFake2")));
+        .any(|diagnostic| detail(diagnostic).contains("inserting key /QPDFFake2")));
 
     for input in [b"<< } } } } } } >>".as_slice(), b"<< /A [ } } } } } } ] >>"] {
         let (pdf, page) = owned_page_with_contents(input);
@@ -339,8 +343,8 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
         assert_eq!(callbacks.eof_calls, 1);
         assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
             diagnostic
-                .message
-                .ends_with("too many errors; giving up on reading object")
+                .get_message_detail()
+                .ends_with(b"too many errors; giving up on reading object")
         }));
     }
 
@@ -350,8 +354,8 @@ fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
     assert!(
         !pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
             diagnostic
-                .message
-                .ends_with("too many errors; giving up on reading object")
+                .get_message_detail()
+                .ends_with(b"too many errors; giving up on reading object")
         })
     );
 
@@ -374,7 +378,7 @@ fn parse_page_contents_reports_non_bad_token_diagnostics_and_nesting_limit() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .any(|diagnostic| diagnostic.message.contains("name with stray #")));
+        .any(|diagnostic| detail(diagnostic).contains("name with stray #")));
 
     let mut nested = vec![b'['; 501];
     nested.extend(std::iter::repeat_n(b']', 501));
@@ -418,8 +422,8 @@ fn parse_page_contents_records_recovery_diagnostics_in_document_sink() {
         .entries()
         .iter()
         .any(|diagnostic| diagnostic
-            .message
-            .ends_with("dictionary ended prematurely; using null as value for last key")));
+            .get_message_detail()
+            .ends_with(b"dictionary ended prematurely; using null as value for last key")));
 }
 
 #[test]
@@ -443,15 +447,17 @@ fn parse_page_contents_records_qpdf_stream_diagnostic_context_in_order() {
 
     page.parse_page_contents(&mut callbacks).unwrap();
 
-    let expected_prefix = format!(
-        "page object 3 0 stream {} {}, stream {} {} (content, offset ",
+    let expected_filename = format!(
+        "page object 3 0 stream {} {}, stream {} {}",
         first_ref.number, first_ref.generation, second_ref.number, second_ref.generation
     );
     assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-        diagnostic.message.starts_with(&expected_prefix)
+        diagnostic.get_filename() == expected_filename.as_bytes()
+            && diagnostic.get_object() == b"content"
+            && diagnostic.get_file_position() > 0
             && diagnostic
-                .message
-                .ends_with("dictionary ended prematurely; using null as value for last key")
+                .get_message_detail()
+                .ends_with(b"dictionary ended prematurely; using null as value for last key")
     }));
 }
 

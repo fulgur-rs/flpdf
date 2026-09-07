@@ -189,7 +189,11 @@ pub(crate) fn run_test_81<R: Read + Seek>(
     let error = ObjectHandle::null()
         .try_get_int_value()
         .expect_err("test 81 integer accessor must raise the qpdf object error");
-    assert!(matches!(error, Error::System(_)));
+    assert!(matches!(
+        error,
+        Error::QpdfExc(warning)
+            if warning.get_error_code() == flpdf::QpdfErrorCode::Object
+    ));
     Ok(())
 }
 

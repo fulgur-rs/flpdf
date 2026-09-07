@@ -1264,7 +1264,7 @@ mod tests {
             .entries()
             .iter()
             .any(|warning| warning
-                .message
+                .message_string()
                 .contains("update ivalue: items array is too short")));
     }
 

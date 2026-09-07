@@ -965,7 +965,7 @@ mod tests {
                 .iter()
                 .filter(|entry| {
                     entry
-                        .message
+                        .message_string()
                         .contains("this widget annotation is not reachable from /AcroForm")
                 })
                 .count(),

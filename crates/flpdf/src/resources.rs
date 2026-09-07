@@ -631,7 +631,7 @@ mod final_handle_tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("invalid character (g) in hexstring")));
         let resources = form
             .as_stream_dict()
