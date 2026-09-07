@@ -695,8 +695,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         let acroform = catalog.try_get_key(b"/AcroForm")?;
-        self.resolve(&acroform)?;
-        if acroform.as_dictionary().is_some() && acroform.try_has_key(b"/SigFlags")? {
+        if acroform.try_is_dictionary()? && acroform.try_has_key(b"/SigFlags")? {
             // qpdf replaces the key whenever its visible hasKey test
             // succeeds, including an already-zero direct integer. The
             // changed result is a crate-specific observation of structural
@@ -705,8 +704,8 @@ impl<R: Read + Seek> Pdf<R> {
             // QPDF::removeSecurityRestrictions is void, so nothing classifies
             // the prior /SigFlags value.
             let previous = acroform.try_get_key(b"/SigFlags")?;
-            self.resolve(&previous)?;
-            let already_zero = previous.object_ref().is_none() && previous.as_integer() == Some(0);
+            let already_zero =
+                previous.object_ref().is_none() && previous.try_as_integer()? == Some(0);
             // qpdf-deviation-end
             acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
             self.mark_object_handle_dirty(&acroform)?;
@@ -824,10 +823,16 @@ impl<R: Read + Seek> Pdf<R> {
 
     fn encrypt_dictionary_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let encrypt = self.trailer_key_handle(b"Encrypt");
-        if encrypt.is_null() {
+        // qpdf gates on `m->trailer.hasKey("/Encrypt")`
+        // (`libqpdf/QPDF_encryption.cc:729`), which treats a key that
+        // resolves to null the same as an absent key
+        // (`QPDF_Dictionary::hasKey`, `libqpdf/QPDF_Dictionary.cc:98-101`).
+        // A lazily-resolved indirect `/Encrypt` reference must go through
+        // that same resolving check rather than the non-resolving
+        // `ObjectHandle::is_null`, which only sees a direct null literal.
+        if encrypt.try_is_null()? {
             return Ok(None);
         }
-        self.resolve(&encrypt)?;
         if encrypt.try_as_dictionary()?.is_none() {
             return Err(EncryptedError::Malformed {
                 reason: "/Encrypt object is not a dictionary".into(),
