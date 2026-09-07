@@ -505,7 +505,7 @@ impl PlainWritePlan {
                     &version,
                     final_extension_level,
                     false,
-                )?;
+                )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
                 arbitrated.write_object_qdf_with_ref_map_and_removed(
                     &mut bytes,
                     0,

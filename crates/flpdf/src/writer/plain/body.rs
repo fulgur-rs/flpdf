@@ -777,7 +777,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                         &plan.version,
                         plan.final_extension_level,
                         true,
-                    )?;
+                    )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
                     arbitrated.write_object_qdf_with_ref_map_and_removed(
                         out,
                         0,
