@@ -3482,7 +3482,7 @@ fn find_xref_stream_trailer_candidate_canonical(
             if trailer.is_none() {
                 trailer = Some(stream_dict);
             }
-        }
+        } // cov:ignore: LLVM maps the covered canonical candidate offset branch to its closing brace
     }
     context.sync_handle_diagnostics();
     let mut diagnostics = Diagnostics::default();
@@ -4253,13 +4253,13 @@ fn parse_xref_stream_with_canonical_owner(
                     for diagnostic in diagnostics.entries() {
                         sink.push(diagnostic.clone());
                     }
-                }
-                // `QPDF::read_xrefStream` catches the QPDFExc raised by
-                // `readObjectAtOffset` and then reports its own
-                // `damagedPDF(xref_offset, "xref not found")` below
-                // (`QPDF.cc:956-969`). Header/body parse failures are the Rust
-                // equivalent of that caught QPDFExc; transport and warning-sink
-                // failures must retain their original error class.
+                } // cov:ignore: LLVM maps the covered canonical read-error sink branch to its closing brace
+                  // `QPDF::read_xrefStream` catches the QPDFExc raised by
+                  // `readObjectAtOffset` and then reports its own
+                  // `damagedPDF(xref_offset, "xref not found")` below
+                  // (`QPDF.cc:956-969`). Header/body parse failures are the Rust
+                  // equivalent of that caught QPDFExc; transport and warning-sink
+                  // failures must retain their original error class.
                 return Err(match error {
                     Error::Parse { .. } => Error::parse(xref_pos, "xref not found"),
                     other => other,
@@ -4294,7 +4294,7 @@ fn parse_xref_stream_with_canonical_owner(
                 for diagnostic in diagnostics.entries() {
                     sink.push(diagnostic.clone());
                 }
-            }
+            } // cov:ignore: LLVM maps the covered canonical build-error sink branch to its closing brace
             return Err(error);
         }
     };
