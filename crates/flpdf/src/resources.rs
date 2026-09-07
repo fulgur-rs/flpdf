@@ -13,8 +13,6 @@
 //! stream dictionary, so lazy indirect resource values remain live through
 //! the complete pruning walk.
 
-use crate::content_stream::parse_content_stream_handles;
-use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::page_object_helper::PageObjectHelper;
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
@@ -272,28 +270,33 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             .try_as_dictionary()?
             .map(|_| resources)
             .filter(|handle| !handle.is_null());
-        let decoded = (|| -> Result<Vec<u8>> {
-            let stream_data = form_handle.get_raw_stream_data()?;
-            decode_stream_data_from_handle(
-                &stream_dict,
-                stream_data.as_ref(),
-                DecodeLimits::default(),
-            )
-        })();
-        let Ok(bytes) = decoded else {
+        // qpdf's removeUnreferencedResourcesHelper (QPDFPageObjectHelper.cc:539-556)
+        // is the single function called for every Form and for the page
+        // itself: parse through ResourceFinder and reject the scope if
+        // parsing failed or emitted a new warning, matching the page-level
+        // block in remove_unreferenced_resources_on_page above.
+        let diagnostics_before = diagnostic_count(pdf);
+        let (finder, parse_ok) = {
+            let mut helper = PageObjectHelper::from_object_handle(form_handle.clone(), pdf);
+            let mut finder = ResourceFinder::default();
+            let parse_ok =
+                helper.parse_contents(&mut finder).is_ok() && !finder.has_pending_operands();
+            (finder, parse_ok)
+        };
+        if !parse_ok || diagnostic_count(pdf) > diagnostics_before {
             any_failures = true;
             if let Some(resources) = resources.as_ref() {
                 pending.extend(form_xobjects_in_resources(pdf, resources)?);
             } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
             continue;
-        };
-        let Some(used) = collect_used_names_for_form(&bytes) else {
-            any_failures = true;
-            if let Some(resources) = resources.as_ref() {
-                pending.extend(form_xobjects_in_resources(pdf, resources)?);
-            } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
-            continue;
-        };
+        }
+        // qpdf's removeUnreferencedResourcesHelper parses each Form
+        // independently: a resource-less descendant's names only enter the
+        // containing page's unresolved-name protection set (via
+        // unresolved_resource_names below), never this Form's own /Font or
+        // /XObject dictionaries, so only directly-parsed names are recorded.
+        let mut used = BTreeMap::new();
+        record_direct_names(&mut used, finder.names_by_resource_type(), true);
         let local_unresolved = unresolved_resource_names(resources.as_ref(), &used)?;
         unresolved.extend(local_unresolved.iter().cloned());
         // qpdf's forEachFormXObject retains the original child object handle
@@ -392,25 +395,6 @@ fn form_xobjects_in_resources<R: Read + Seek>(
         }
     }
     Ok(forms)
-}
-
-/// Collect only the names used directly by a Form's content stream.
-///
-/// qpdf's `removeUnreferencedResourcesHelper` parses each Form independently.
-/// Its resource-less descendants contribute unresolved names only to the
-/// containing page's protection set; they do not keep entries in this Form's
-/// own `/Font` or `/XObject` dictionaries.
-fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
-    let mut used = BTreeMap::new();
-    let mut finder = ResourceFinder::default();
-    let complete = parse_content_stream_handles(stream_bytes, None, "", &mut finder).is_ok()
-        && !finder.has_pending_operands();
-    if complete {
-        record_direct_names(&mut used, finder.names_by_resource_type(), true);
-        Some(used)
-    } else {
-        None
-    }
 }
 
 /// Shallow-copy qpdf's mutable resource categories then remove names not used
@@ -643,11 +627,6 @@ mod final_handle_tests {
             .try_get_key(b"/Unused")
             .expect("unused font")
             .is_null());
-    }
-
-    #[test]
-    fn collect_used_names_for_form_returns_none_for_malformed_content() {
-        assert!(super::collect_used_names_for_form(b"<0g>").is_none());
     }
 
     /// Build a page whose single declared Form XObject is malformed (either
