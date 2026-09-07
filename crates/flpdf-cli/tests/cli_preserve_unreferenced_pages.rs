@@ -620,3 +620,87 @@ fn multi_source_pages_preserve_rebuilds_source_object_stream_container() {
 fn multi_source_pages_default_rebuilds_source_object_stream_container() {
     assert_multi_source_pages_rebuilds_source_object_stream_container(false);
 }
+
+/// qpdf locates object-stream containers by the type-2 xref row, not by the
+/// dictionary key: `getObjectStreamData` inspects only `entry.getType() == 2`
+/// (`QPDF.cc:2381-2390`), and a container whose dictionary is not
+/// `/Type /ObjStm` merely warns before its members are expanded anyway
+/// (`QPDF.cc:1776-1780` calls `warn`, while only missing `/N` or `/First`
+/// throws at `:1782-1785`). Such a container therefore reaches the merge
+/// through the ordinary foreign copier, and the container walk must reuse that
+/// copy rather than allocate a second identity — `writeObjectStream` knows a
+/// single `old_og` per container (`QPDFWriter.cc:1626-1629`).
+#[test]
+fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = fixture("untyped-objstm-container.pdf");
+    let foreign = fixture("no-stream-one-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let primary_arg = primary.to_str().unwrap();
+    let foreign_arg = foreign.to_str().unwrap();
+    let qpdf_run = run_qpdf(&[
+        "--static-id",
+        "--newline-before-endstream=n",
+        primary_arg,
+        "--pages",
+        ".",
+        "1",
+        foreign_arg,
+        "1",
+        "--",
+        qpdf_output.to_str().unwrap(),
+    ]);
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flpdf"));
+    command
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--static-id",
+            "--newline-before-endstream=n",
+            primary_arg,
+            "--pages",
+            ".",
+            "1",
+            foreign_arg,
+            "1",
+            "--",
+        ])
+        .arg(&flpdf_output);
+    let output = command.output().expect("flpdf should spawn");
+    // Both tools finish with the warning exit status: the wrong-typed container
+    // is a recoverable diagnostic in qpdf (`QPDF.cc:1776-1780` warns and keeps
+    // expanding the members), not a fatal error.
+    assert_eq!(
+        output.status.code(),
+        qpdf_run.status.code(),
+        "flpdf must merge a container that lacks /Type /ObjStm the way qpdf does: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The warning text matches qpdf's, but flpdf repeats it once per resolution
+    // on the merge route where qpdf emits it once (`m->resolved_object_streams`
+    // gates re-resolution, `QPDF.cc:1758-1761`). That duplication predates this
+    // change — it reproduces identically on the base revision — so it is tracked
+    // separately rather than pinned here.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("supposed object stream 1 has wrong type"),
+        "flpdf must report qpdf's wrong-type diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "a container identified only by its type-2 xref rows must be copied once, \
+         not duplicated into a second placeholder identity"
+    );
+}
