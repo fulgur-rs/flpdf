@@ -755,8 +755,8 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 mod tests {
     use super::{
         int_to_string_base, parse_numrange, qpdf_size_to_int, qpdf_string_to_int_checked,
-        safe_fopen, same_file, to_utf8, utf8_to_ascii, utf8_to_mac_roman, utf8_to_pdf_doc,
-        utf8_to_win_ansi, QpdfIntParse,
+        safe_fopen, same_file, to_utf8, utf8_to_ascii, utf8_to_ascii_checked, utf8_to_mac_roman,
+        utf8_to_pdf_doc, utf8_to_pdf_doc_checked, utf8_to_win_ansi, QpdfIntParse,
     };
     use std::io::{Read, Write};
 
@@ -1146,6 +1146,28 @@ mod tests {
     #[test]
     fn utf8_to_pdf_doc_preserves_ascii_and_the_direct_high_range() {
         assert_eq!(utf8_to_pdf_doc("Aé".as_bytes()), vec![b'A', 0xe9]);
+    }
+
+    #[test]
+    fn checked_transcoders_separate_substitution_from_a_literal_question_mark() {
+        // The whole point of qpdf's second overload: the bytes alone cannot
+        // tell these apart, only the flag can (`libqpdf/QUtil.cc:1669-1673`).
+        assert_eq!(utf8_to_pdf_doc_checked(b"\x1f"), (b"?".to_vec(), false));
+        assert_eq!(utf8_to_pdf_doc_checked(b"?"), (b"?".to_vec(), true));
+        // U+00AD is the other PDFDoc-specific omission (`:1586-1589`).
+        assert_eq!(
+            utf8_to_pdf_doc_checked("\u{ad}".as_bytes()),
+            (b"?".to_vec(), false)
+        );
+        assert_eq!(utf8_to_pdf_doc_checked("€".as_bytes()), (vec![0xa0], true));
+
+        // ASCII keeps 0x1f, so the same input is representable there
+        // (`:1651-1655`); a high code point is not.
+        assert_eq!(utf8_to_ascii_checked(b"\x1f"), (b"\x1f".to_vec(), true));
+        assert_eq!(
+            utf8_to_ascii_checked("é".as_bytes()),
+            (b"?".to_vec(), false)
+        );
     }
 
     #[test]
