@@ -369,7 +369,7 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
-          shared-key: ubuntu-latest-flpdf-release
+          shared-key: ubuntu-latest-flpdf-release-ci
 
       - name: Install qpdf 11.9.0
         run: bash scripts/ci-apt-install.sh qpdf
@@ -382,12 +382,19 @@ jobs:
           qpdf --version
           test "$(qpdf --version | sed -n '1p' | tr -d '\r')" = "qpdf version ${QPDF_VERSION}"
 
+      # Uses the release-ci profile (Cargo.toml), not --release: same
+      # release-mode panic/overflow semantics (debug-assertions and
+      # overflow-checks stay off), lower opt-level so this job's ~105
+      # integration test binaries don't pay opt-level 3's full
+      # inlining/vectorization cost on every PR. cargo build --release /
+      # release-plz packaging are unaffected -- they use [profile.release]
+      # directly and never pass --profile release-ci.
       - name: Run workspace release test suite
         shell: bash
         run: |
           set -euo pipefail
 
-          cargo test --workspace --release
+          cargo test --workspace --profile release-ci
 
   coverage:
     name: Coverage
