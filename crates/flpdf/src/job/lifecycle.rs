@@ -2580,7 +2580,10 @@ impl QPDFJob {
         // (`QPDFJob.cc:614-626`). Keep the direct write_qpdf entry point on
         // the same boundary even when callers bypass run().
         if output == Path::new("-") {
-            self.logger.save_to_standard_output(true)?;
+            if let Err(error) = self.logger.save_to_standard_output(true) {
+                self.report_job_error(&error)?;
+                return Ok(JobExitCode::Error);
+            }
         }
         let mut writer_configuration = self.configuration.writer.clone();
         if let Some(path) = self.configuration.copy_encryption.clone() {
@@ -4415,6 +4418,47 @@ mod tests {
         assert!(
             error.contains("deterministic") && !error.contains("called setSave"),
             "stdout reservation must precede the diagnostic: {error:?}"
+        );
+    }
+
+    #[test]
+    fn write_qpdf_maps_direct_stdout_reservation_failure_to_job_error() {
+        let mut input = Pdf::open(Cursor::new(
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/minimal.pdf"),
+            )
+            .expect("committed minimal fixture"),
+        ))
+        .expect("minimal fixture parses");
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_error(Some(PipelineHandle::new(RecordingInfoSink {
+            bytes: std::sync::Arc::clone(&errors),
+        })));
+        logger.set_warn(Some(logger.discard()));
+
+        // A direct write_qpdf caller can use the job's info logger before the
+        // two-stage write boundary reserves stdout for the binary output.
+        logger
+            .info(b"")
+            .expect("empty info write marks stdout as used");
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_output_file("-").expect("stdout output is accepted");
+
+        assert_eq!(
+            job.write_qpdf(&mut input)
+                .expect("stdout reservation failure is a job error"),
+            JobExitCode::Error
+        );
+        let error = String::from_utf8_lossy(&errors.lock().unwrap()).into_owned();
+        assert!(
+            error.contains(
+                "called setSave on standard output after standard output has already been used"
+            ),
+            "direct write_qpdf must report the reservation failure: {error:?}"
         );
     }
 
