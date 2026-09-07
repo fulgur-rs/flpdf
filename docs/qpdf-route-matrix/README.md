@@ -686,7 +686,7 @@ warning collectionやtoken primitiveの移植を、領域A全体の統合完了�
 3. **C22** — C-U3 library harnessでplain/QDF cacheとlinearized probeの挙動を照合する。非対称だけで早期return撤去を決めない。
 4. **C42 / B11** — EOL 差し引きの決着は `flpdf-zvjf`（pipe）と `flpdf-hj7v`（show-stream）で完了。`RecoveredStreamEol` は `dump-object` 再シリアライズ専用として残る。前提: probe C-U1。
 5. **C27** — bootstrapのdocument/source ownerを整えてからxref stream payloadのdecodeをcanonical pipeへ移す（`flpdf-3yn9.48.43`）。B17のxref entry構文処理の正本とは別責務である。
-6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当を検証する。C-U2は直接APIをprobeする。canonical C24 `write_stream_json` を二重pipeへ変更しない。
+6. **C44** — public `getStreamJSON` facade と deferred `StreamBlobProvider` 相当は `.48.47` で実装済み。残る C-U2 は provider 回数と lifetime を C++ harness で固定する probe。canonical C24 `write_stream_json` を二重pipeへ変更しない。
 7. **C4 / C8 / C9 / C25〜C29 / C43、E-27 / E-28** — provider/copy/decodeの不足primitiveを明示し、xrefとdriver test 0/1など既知consumerからbounded cutoverする。
 
 qpdf 呼び出し順を壊さない理由: §5.C 第 4 行（`willFilterStream` の判定順序）が 2 と 3 を
@@ -974,7 +974,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | B-P7 | owner対応確認済み | B7 | ObjStm headerの2 token読取をQPDF::readTokenへ対応付ける。classic xrefのByteCursorはreadLine/parse_xrefEntry責務であり一律trueへ変えない。 |
 | B-P8 | 一部旧記述訂正 | B13/B17 | unknown xref stream entry typeは現src/testに存在する。stream keyword found in trailer等の残条件を個別fixtureで照合する。 |
 | C-U1 | 既存sliceで解決 | C42 | flpdf-zvjf/flpdf-hj7vのrecovered full-length pipe/show-streamを維持する。dump-objectのframing metadataは別責務。 |
-| C-U2 | API欠落確定 | C44 | 直接getStreamJSONとdeferred blobのC++ harnessでprovider回数とlifetimeを固定する。CLIのwriteStreamJSON/C24を二重pipeへ変更しない。 |
+| C-U2 | API実装済・probe未了 | C44 | `.48.47` で public `get_stream_json` と deferred blob を実装済み（API欠落は解消）。残るのは直接getStreamJSONとdeferred blobのC++ harnessでprovider回数とlifetimeを固定すること。CLIのwriteStreamJSON/C24を二重pipeへ変更しない。 |
 | C-U3 | 未観測 | C22/C39 | token filter/providerを登録したlibrary harnessでplain/QDF cacheとlinearized optimizer probeを比較する。非対称だけでbugとはしない。 |
 | C-U4 | 完了 | C17/C18 | pinned qpdf headerをincludeしたC++ oracle probeと32固定vectorで、V/R・key長5/16/24/32・AES/RC4・非zero generationを確認し、単一primitiveへ統合した。 |
 | D-U1 | mixed確定・出力差を追加確認 | D6/D31 | source-index順のlinearized Preserveと共有membershipのobjgen順を比較する。既存strict Preserve byte testsを利用する。 |

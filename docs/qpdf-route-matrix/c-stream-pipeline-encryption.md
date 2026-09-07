@@ -456,7 +456,7 @@ U3 は「分類は決まっているが、残る実装差と出力への影響�
 `unknown` 行にはせず、対応する mixed 行（C22）から参照している。U4 は C17/C18 の
 shared primitive 統合と oracle vector 検証が完了しているため、未完了 probe としては扱わない。
 旧 U2 は `writeStreamJSON` と未実装 `getStreamJSON` の責務を取り違えていたため除外した。
-C44 はその API 欠落を追跡し、既存 C24 の不一致とは扱わない。
+C44 はその API を追跡する枠で、既存 C24 の不一致とは扱わない。`.48.47` で public `get_stream_json` と deferred blob が実装され API 欠落は解消したため、C-U2 に残るのは provider 回数と lifetime の harness probe のみである。
 
 `bridge` の判定基準は README §3 の通り **経路（route）に qpdf 対応物が無いこと** で、
 責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域の 2 行はこの区別で読む:
