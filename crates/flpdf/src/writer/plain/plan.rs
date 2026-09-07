@@ -13,7 +13,9 @@ use crate::writer::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber, StreamParametersRemoved,
 };
 use crate::writer::{ObjectWriterEmission, WriterOptions};
-use crate::{CompressStreams, ObjectHandle, ObjectRef, Pdf, XrefEntry, XrefForm};
+use crate::{
+    CompressStreams, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, XrefEntry, XrefForm,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -97,6 +99,12 @@ pub(crate) struct PlainWritePlan {
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
     pub(crate) cached_stream_outputs: HashMap<ObjectRef, CachedStreamOutput>,
+    /// QDF re-numbers the same planned objects in emission order and inserts
+    /// a synthetic length holder after each ordinary stream. The holder map is
+    /// kept beside the plan so the body emitter can use the qpdf numbering
+    /// without manufacturing source identities for those output-only objects.
+    pub(crate) qdf_holder_map: HashMap<u32, u32>,
+    pub(crate) qdf_holder_numbers: BTreeSet<u32>,
     pub(crate) trailer_handle: crate::ObjectHandle,
     pub(crate) trailer: TrailerPlan,
 }
@@ -128,6 +136,16 @@ impl PlainWritePlan {
         let source_had_compressed_objects = source_has_compressed_entries(pdf);
         let explicitly_removed: BTreeSet<ObjectRef> =
             pdf.deleted_object_refs().into_iter().collect();
+        let normalized_content_refs: BTreeSet<ObjectRef> = if options.content_normalization {
+            let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+            let mut refs = BTreeSet::new();
+            for page in pages {
+                refs.extend(crate::writer::collect_content_stream_refs(pdf, page)?);
+            }
+            refs
+        } else {
+            BTreeSet::new()
+        };
         let cached_stream_outputs: RefCell<HashMap<ObjectRef, CachedStreamOutput>> =
             RefCell::new(HashMap::new());
         let stream_parameters_removed = |handle: &crate::ObjectHandle| {
@@ -148,8 +166,12 @@ impl PlainWritePlan {
             // later unparseObject emission (`QPDFWriter.cc:1239-1314,1539-1560`).
             // Cache every indirect source stream, not only data-modified ones,
             // so deferred providers are invoked once across planning and emit.
-            let (dict, data, dictionary_options) =
-                body::canonical_stream_output_with_status(handle, options, true, false)?;
+            let (dict, data, dictionary_options) = body::canonical_stream_output_with_status(
+                handle,
+                options,
+                true,
+                normalized_content_refs.contains(&source),
+            )?;
             let fingerprint = stream_cache_fingerprint(handle)?;
             cached_stream_outputs.borrow_mut().insert(
                 source,
@@ -163,7 +185,7 @@ impl PlainWritePlan {
             Ok(dictionary_options.remove_filter_parameters)
         };
 
-        let placement = match options.object_streams {
+        let mut placement = match options.object_streams {
             ObjectStreamMode::Disable => {
                 let renumber = CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
                     pdf,
@@ -266,6 +288,74 @@ impl PlainWritePlan {
                 build_container_aware(renumber, renumber_groups, removed_refs)?
             }
         };
+
+        let qdf_emission = if options.qdf {
+            Some(build_qdf_emission_plan(pdf, &placement)?)
+        } else {
+            None
+        };
+        if let Some(qdf) = &qdf_emission {
+            for object in &mut placement.objects {
+                match object {
+                    PlannedIndirectObject::Source { source, output } => {
+                        // cov:ignore-start: the emission map is constructed
+                        // from this same placement immediately above, so a
+                        // missing source is an internal invariant failure.
+                        *output = qdf.map.get(source).copied().ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "plain writer QDF: source {source} absent from emission map"
+                            ))
+                        })?;
+                        // cov:ignore-end
+                    }
+                    PlannedIndirectObject::ObjectStream {
+                        origin,
+                        output,
+                        members,
+                    } => {
+                        *output = match origin {
+                            PlannedObjectStreamOrigin::SourceBacked(source)
+                            | PlannedObjectStreamOrigin::Generated(source) => {
+                                // cov:ignore-start: every source-backed
+                                // placement is inserted into the same QDF map
+                                // during emission-plan construction.
+                                qdf.map.get(source).copied().ok_or_else(|| {
+                                    crate::Error::Unsupported(format!(
+                                        "plain writer QDF: ObjStm source {source} absent from emission map"
+                                    ))
+                                })?
+                                // cov:ignore-end
+                            }
+                            PlannedObjectStreamOrigin::Synthetic => {
+                                // cov:ignore-start: every synthetic container
+                                // is keyed in container_map before placement
+                                // mutation reaches this arm.
+                                qdf.container_map.get(output).copied().ok_or_else(|| {
+                                    crate::Error::Unsupported(
+                                        "plain writer QDF: synthetic ObjStm absent from emission map"
+                                            .to_string(),
+                                    )
+                                })?
+                                // cov:ignore-end
+                            }
+                        };
+                        for member in members {
+                            // cov:ignore-start: every member is inserted into
+                            // the QDF map by the same placement traversal.
+                            member.output =
+                                qdf.map.get(&member.source).copied().ok_or_else(|| {
+                                    crate::Error::Unsupported(format!(
+                                    "plain writer QDF: ObjStm member {} absent from emission map",
+                                    member.source
+                                ))
+                                })?;
+                            // cov:ignore-end
+                        }
+                    }
+                }
+            }
+            placement.old_to_new = qdf.map.clone();
+        }
 
         let root = source_root_ref.and_then(|source| placement.old_to_new.get(&source).copied());
         if source_root_ref.is_some() && root.is_none() {
@@ -378,13 +468,22 @@ impl PlainWritePlan {
                     }) // cov:ignore: the direct-root reference map is exercised; LLVM places the successful closure-exit counter on this continuation line.
             };
             let mut bytes = Vec::new();
-            root_handle.write_root_object_with_ref_map_and_removed(
-                &mut bytes,
-                &map,
-                &placement.removed_refs,
-                &version,
-                final_extension_level,
-            )?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+            if options.qdf {
+                root_handle.write_object_qdf_with_ref_map_and_removed(
+                    &mut bytes,
+                    0,
+                    &map,
+                    &placement.removed_refs,
+                )?; // cov:ignore: direct Catalog QDF serialization is exercised; LLVM maps this validated continuation to the call setup.
+            } else {
+                root_handle.write_root_object_with_ref_map_and_removed(
+                    &mut bytes,
+                    &map,
+                    &placement.removed_refs,
+                    &version,
+                    final_extension_level,
+                )?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
+            }
             Some(bytes)
         } else {
             None
@@ -418,6 +517,14 @@ impl PlainWritePlan {
             old_to_new: placement.old_to_new,
             removed_refs: placement.removed_refs,
             cached_stream_outputs: cached_stream_outputs.into_inner(),
+            qdf_holder_map: qdf_emission
+                .as_ref()
+                .map(|qdf| qdf.holder_map.clone())
+                .unwrap_or_default(),
+            qdf_holder_numbers: qdf_emission
+                .as_ref()
+                .map(|qdf| qdf.holder_numbers.clone())
+                .unwrap_or_default(),
             trailer_handle,
             trailer,
         };
@@ -528,7 +635,7 @@ impl PlainWritePlan {
 
         if let Some(&max_output) = outputs.last() {
             for number in 1..=max_output {
-                if !outputs.contains(&number) {
+                if !outputs.contains(&number) && !self.qdf_holder_numbers.contains(&number) {
                     return Err(crate::Error::Unsupported(format!(
                         "plain writer plan: output object {number} has no placement"
                     )));
@@ -563,6 +670,83 @@ struct PlacementPlan {
     objects: Vec<PlannedIndirectObject>,
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     removed_refs: BTreeSet<ObjectRef>,
+}
+
+#[derive(Debug, Default)]
+struct QdfEmissionPlan {
+    map: HashMap<ObjectRef, ObjectRef>,
+    container_map: HashMap<ObjectRef, ObjectRef>,
+    holder_map: HashMap<u32, u32>,
+    holder_numbers: BTreeSet<u32>,
+}
+
+/// Assign qpdf's sequential QDF emission numbers to the already-selected
+/// plain placements. QDF emits source objects in the writer queue order and
+/// inserts an output-only `/Length` holder immediately after every ordinary
+/// stream; ObjStm members are part of the container body and do not receive
+/// holders of their own (`QPDFWriter.cc:1621-1775`).
+fn build_qdf_emission_plan<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    placement: &PlacementPlan,
+) -> crate::Result<QdfEmissionPlan> {
+    let mut result = QdfEmissionPlan::default();
+    let mut next = 0_u32;
+    let mut next_number = || {
+        // cov:ignore-start: the supported PDF object space cannot emit more
+        // than u32::MAX QDF objects.
+        next = next.checked_add(1).ok_or_else(|| {
+            crate::Error::Unsupported("plain writer QDF number overflows u32".to_string())
+        })?;
+        // cov:ignore-end
+        Ok::<u32, crate::Error>(next)
+    };
+
+    for object in &placement.objects {
+        match object {
+            PlannedIndirectObject::Source { source, .. } => {
+                let emission = next_number()?;
+                result.map.insert(*source, ObjectRef::new(emission, 0));
+                // A source stream's length is represented by a synthetic
+                // next-number holder in QDF. An unretained source ObjStm is an
+                // ordinary stream in qpdf's output and receives the same
+                // holder. Only the rebuilt XRef stream is structural here;
+                // retained/generated ObjStm containers are represented by the
+                // dedicated placement arm below (`QPDFWriter.cc:1620-1775`).
+                let handle = pdf.get_object_handle(*source);
+                pdf.resolve(&handle)?;
+                let is_real_stream = handle.as_stream_dict().is_some()
+                    && !handle.try_is_stream_of_type(b"XRef", b"")?;
+                if is_real_stream {
+                    let holder = next_number()?;
+                    result.holder_map.insert(emission, holder);
+                    result.holder_numbers.insert(holder);
+                }
+            }
+            PlannedIndirectObject::ObjectStream {
+                origin,
+                output,
+                members,
+            } => {
+                let container = next_number()?;
+                result
+                    .container_map
+                    .insert(*output, ObjectRef::new(container, 0));
+                if let PlannedObjectStreamOrigin::SourceBacked(source)
+                | PlannedObjectStreamOrigin::Generated(source) = origin
+                {
+                    result.map.insert(*source, ObjectRef::new(container, 0));
+                }
+                for member in members {
+                    let emission = next_number()?;
+                    result
+                        .map
+                        .insert(member.source, ObjectRef::new(emission, 0));
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 pub(crate) fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec<u8>>> {
@@ -1003,6 +1187,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qdf_plan_serializes_a_direct_catalog_in_qdf_layout() {
+        let mut pdf = Pdf::empty().unwrap();
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.trailer()
+            .replace_key(
+                b"/Root",
+                ObjectHandle::dictionary(vec![
+                    (b"Type".to_vec(), ObjectHandle::name(b"Catalog".to_vec())),
+                    (b"Pages".to_vec(), pages),
+                ]),
+            )
+            .unwrap();
+        let mut options = write_options(ObjectStreamMode::Disable);
+        options.qdf = true;
+
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+
+        let direct_root = plan
+            .trailer
+            .direct_root
+            .as_ref()
+            .expect("direct root bytes");
+        assert!(direct_root.starts_with(b"<<\n"));
+    }
+
     fn source(source: u32, output: u32) -> PlannedIndirectObject {
         PlannedIndirectObject::Source {
             source: ObjectRef::new(source, 0),
@@ -1023,6 +1233,8 @@ mod tests {
             old_to_new: HashMap::from([(root_source, root_output)]),
             removed_refs: BTreeSet::new(),
             cached_stream_outputs: HashMap::new(),
+            qdf_holder_map: HashMap::new(),
+            qdf_holder_numbers: BTreeSet::new(),
             trailer_handle: crate::ObjectHandle::dictionary(Vec::new()),
             trailer: TrailerPlan {
                 form: XrefForm::Table,

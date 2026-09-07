@@ -93,6 +93,31 @@ pub(crate) fn write_objstm_stream_with_extends(
     Ok(())
 }
 
+/// Emit an object-stream container in qpdf QDF layout. QDF keeps the body
+/// uncompressed, writes the structural dictionary one entry per line, and
+/// applies the QDF stream framing rule (`QPDFWriter.cc:1620-1775`).
+pub(crate) fn write_objstm_stream_with_extends_qdf(
+    out: &mut Vec<u8>,
+    body: &object_streams::ObjStmBody,
+    extends: Option<crate::ObjectRef>,
+    first_offset: usize,
+    newline_before_endstream: NewlineBeforeEndstream,
+) -> crate::Result<()> {
+    let (_, data) = object_streams::wrap_objstm_body_as_handle(body, CompressStreams::No, extends)?;
+    out.extend_from_slice(b"<<\n  /Type /ObjStm\n");
+    out.extend_from_slice(format!("  /Length {}\n", data.len()).as_bytes());
+    out.extend_from_slice(format!("  /N {}\n", body.n_members).as_bytes());
+    out.extend_from_slice(format!("  /First {first_offset}\n").as_bytes());
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b">>");
+    write_stream_payload_with_qdf(out, &data, newline_before_endstream, true);
+    Ok(())
+}
+
 pub(crate) mod xref_stream {
     //! qpdf-faithful cross-reference *stream* encoder (ISO 32000-1 §7.5.8).
     //!

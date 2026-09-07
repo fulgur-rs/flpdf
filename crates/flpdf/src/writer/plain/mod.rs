@@ -18,7 +18,14 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     options: &WriterOptions,
     generated_id: Option<&crate::ObjectHandle>,
 ) -> crate::Result<WriterResult> {
-    if options.object_streams == ObjectStreamMode::Disable {
+    // The live Disable queue preserves the mutation/progress timing contract
+    // for the ordinary unnormalized route. QDF and page-content normalization
+    // need the planned writer's second dimension (QDF framing or normalized
+    // stream buffers), while the selected object-stream mode remains Disable.
+    if options.object_streams == ObjectStreamMode::Disable
+        && !options.qdf
+        && !options.content_normalization
+    {
         return write_plain_live_disable(pdf, out, options, generated_id);
     }
     let plan = plan::PlainWritePlan::build_with_generated_id(pdf, options, generated_id)?;
@@ -173,12 +180,13 @@ pub(crate) fn eligible(
     options: &WriterOptions,
     mode: ObjectStreamMode,
 ) -> bool {
+    // QDF and content normalization alter stream serialization, but qpdf
+    // dispatches the selected object-stream mode independently
+    // (`QPDFWriter.cc:2038-2140`). The planned writer owns both dimensions.
     mode == options.object_streams
-        && !options.qdf
         && !options.pclm
         && options.extra_header_text.is_empty()
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
-        && !options.content_normalization
         && !pdf_is_encrypted
 }

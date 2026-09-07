@@ -12,6 +12,8 @@ const DUPLICATE_PRIMARY: &str = "../../tests/fixtures/compat/multi-contents-one-
 const DUPLICATE_FOREIGN: &str = "../../tests/fixtures/compat/fxo-red.pdf";
 const LINEARIZED_PRIMARY: &str = "../../tests/fixtures/compat/multi-contents-one-page.pdf";
 const LINEARIZED_FOREIGN: &str = "../../tests/fixtures/compat/fxo-red.pdf";
+const QDF_PRIMARY: &str = "../../tests/fixtures/compat/primary-objstm-exclusive-font.pdf";
+const QDF_FOREIGN: &str = "../../tests/fixtures/compat/no-stream-one-page.pdf";
 
 /// Gate the differential probe on the pinned oracle, mirroring
 /// `cli_linearize_multi_source_qpdf`: skip locally when qpdf 11.9.0 is not
@@ -217,4 +219,65 @@ fn linearized_multi_source_generated_objstm_members_match_qpdf() {
         std::fs::read(&qpdf_output).unwrap(),
         "linearized multi-source generated ObjStm order must match qpdf"
     );
+}
+
+#[test]
+fn qdf_and_normalize_preserve_multi_source_objstm_bytes_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+
+    for (label, extra_flags) in [
+        ("default", Vec::new()),
+        ("qdf", vec!["--qdf"]),
+        ("normalize", vec!["--normalize-content=y"]),
+    ] {
+        let qpdf_output = temp.path().join(format!("qpdf-{label}.pdf"));
+        let flpdf_output = temp.path().join(format!("flpdf-{label}.pdf"));
+        let mut arguments = vec!["--static-id", "--newline-before-endstream=n"];
+        arguments.extend(extra_flags);
+        arguments.extend([QDF_PRIMARY, "--pages", ".", "1", QDF_FOREIGN, "1", "--"]);
+
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(&arguments)
+            .arg(&qpdf_output)
+            .output()
+            .expect("qpdf should spawn");
+        assert!(
+            qpdf.status.success(),
+            "qpdf {label} probe failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(&arguments)
+            .arg(&flpdf_output)
+            .assert()
+            .success();
+
+        let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+        let flpdf_bytes = std::fs::read(&flpdf_output).unwrap();
+        assert_eq!(
+            qpdf_bytes
+                .windows(b"/Type /ObjStm".len())
+                .filter(|window| *window == b"/Type /ObjStm")
+                .count(),
+            1,
+            "qpdf {label} probe must preserve the source ObjStm"
+        );
+        assert_eq!(
+            flpdf_bytes
+                .windows(b"/Type /ObjStm".len())
+                .filter(|window| *window == b"/Type /ObjStm")
+                .count(),
+            1,
+            "flpdf {label} probe must preserve the source ObjStm"
+        );
+        assert_eq!(
+            flpdf_bytes, qpdf_bytes,
+            "flpdf {label} QDF/content-normalization output must match qpdf byte-for-byte"
+        );
+    }
 }

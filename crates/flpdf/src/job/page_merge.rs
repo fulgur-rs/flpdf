@@ -989,6 +989,25 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
     let mut target = Pdf::empty()?;
     let pages_root_ref = target_pages_root(&mut target)?;
     let mut writer_object_order: BTreeMap<ObjectRef, WriterObjectOrderKey> = BTreeMap::new();
+    // qpdf keeps the primary QPDF object-number allocator alive while it
+    // copies foreign page graphs. Foreign copies therefore receive the next
+    // object numbers after the primary xref universe, not the fresh target's
+    // local references. Retain that QDF-visible identity separately from the
+    // destination order key (`QPDF.cc:2019-2213`).
+    let primary_max_object = inputs[0]
+        .source
+        .source_xref_entries()
+        .keys()
+        .map(|object| object.number)
+        .max()
+        .unwrap_or(0);
+    // cov:ignore-start: a source xref object-number universe ending at
+    // u32::MAX cannot allocate the next foreign identity in a representable
+    // PDF object space.
+    let mut next_foreign_original = primary_max_object.checked_add(1).ok_or_else(|| {
+        Error::Unsupported("foreign QDF object identity overflows u32".to_owned())
+    })?;
+    // cov:ignore-end
 
     // Output `/Kids`, accumulated across inputs in input/selection order.
     let mut kids: Vec<ObjectRef> = Vec::new();
@@ -1232,11 +1251,31 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
         // has copied both sources into a fresh target, so retain the ordering
         // key for the linearization planner. Newly created merge objects are
         // intentionally absent and use the planner's fresh-object fallback.
+        let mut foreign_originals = BTreeMap::new();
+        if !is_primary {
+            let mut target_refs: Vec<ObjectRef> = map.values().copied().collect();
+            target_refs.sort_unstable();
+            for target_ref in target_refs {
+                foreign_originals.insert(target_ref, ObjectRef::new(next_foreign_original, 0));
+                // cov:ignore-start: allocating more than the u32 PDF object
+                // space is infeasible for an in-memory page merge.
+                next_foreign_original = next_foreign_original.checked_add(1).ok_or_else(|| {
+                    Error::Unsupported("foreign QDF object identity overflows u32".to_owned())
+                })?;
+                // cov:ignore-end
+            }
+        }
         for (&source_ref, &target_ref) in &map {
             let order_key = if is_primary {
                 WriterObjectOrderKey::primary(source_ref)
             } else {
-                WriterObjectOrderKey::foreign(target_ref)
+                WriterObjectOrderKey::foreign_with_original(
+                    target_ref,
+                    foreign_originals
+                        .get(&target_ref)
+                        .copied()
+                        .unwrap_or(target_ref),
+                )
             };
             writer_object_order.insert(target_ref, order_key);
         }

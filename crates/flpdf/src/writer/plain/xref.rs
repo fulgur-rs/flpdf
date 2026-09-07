@@ -319,7 +319,11 @@ fn append_classic_xref_and_trailer_with_handle(
             )?; // cov:ignore: materialized ID writer call is covered; LLVM maps this multiline terminator to the call setup
         }
     }
-    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    if trailer.qdf {
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    } else {
+        bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    }
     written_xref_table(layout, size)
 }
 
