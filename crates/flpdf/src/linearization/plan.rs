@@ -2418,8 +2418,10 @@ impl LinearizationPlan {
     /// [`ContainerPart::FirstPageShared`], or
     /// [`ContainerPart::FirstPageOutlines`]) become first-half
     /// (`part3_batches`); every other container becomes second-half
-    /// (`part4_batches`). Within a container, members are ordered by ascending
-    /// source object number (qpdf's `object_stream_to_objects` is a
+    /// (`part4_batches`). Within a container, members use qpdf's
+    /// source/destination order key: ordinary and primary objects use their
+    /// source object number, while foreign and fresh merge objects use their
+    /// destination allocation order (`object_stream_to_objects` is a
     /// `std::set<QPDFObjGen>`).
     ///
     /// This replaces flpdf's earlier per-part greedy chunking, which diverged
@@ -2481,7 +2483,7 @@ impl LinearizationPlan {
         let mut part4_shared: Vec<RoutedObjStmBatch> = Vec::new();
         let mut part4_rest: Vec<RoutedObjStmBatch> = Vec::new();
         for (mut members, route) in containers.into_iter().zip(routes) {
-            members.sort_unstable_by_key(|r| r.number);
+            members.sort_unstable_by_key(|r| pdf.writer_object_order_key(*r));
             push_routed_objstm_batch(
                 members,
                 route,
@@ -2767,6 +2769,13 @@ pub(crate) fn objstm_membership_linearized_with_eligibility<R: Read + Seek>(
     };
     // Drop refs without a renumber slot before the split (see doc above).
     eligible.retain(|r| assigned.contains(r));
+    // A fresh multi-source page-selection target carries qpdf's primary source
+    // and foreign destination order separately from its target references.
+    // Apply that provenance before the GLOBAL split, matching the plain
+    // Generate planner and qpdf's `generateObjectStreams` input sequence.
+    if pdf.writer_object_order.is_some() {
+        eligible.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+    }
     let mut streams = crate::writer::object_streams::even_split_into_streams(&eligible);
 
     // qpdf's setup removes every page dictionary and the Catalog after

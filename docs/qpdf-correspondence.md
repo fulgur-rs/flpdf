@@ -1392,6 +1392,16 @@ object number 順に member を予約するため（`QPDFJob.cc:2515-2555`;
 order group に登録する。`cli_pages_objstm_order_qpdf.rs` の duplicate-page
 qpdf-zlib gate が clone と後続 foreign page の全 bytes を比較する。
 
+`flpdf-kgsv` では、multi-source page-selection target の writer provenance を
+linearized Generate にも渡す。qpdf は `getCompressibleObjGens` の候補を一度
+global に split してから、`assignCompressedObjectNumbers` が各 ObjStm の
+member を source/destination order で予約するため（`QPDF.cc:2393-2474`;
+`QPDFWriter.cc:1057-1118,1970-2005`; `QPDF_linearization.cc:963-1045`）、
+`linearization/plan.rs` は split 前と container 内の両方で
+`Pdf::writer_object_order_key` を使う。qpdf-zlib differential test は
+multi-source `--pages` + `--linearize` + `--object-streams=generate` の全 bytes
+を固定する。
+
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
 接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの
