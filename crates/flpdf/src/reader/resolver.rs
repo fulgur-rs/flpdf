@@ -1717,8 +1717,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.fixed_dangling_refs = false;
         }
 
-        // Push repair warnings (QPDF.cc:528-530)
-        self.push_warning("file is damaged")?;
+        // Push repair warnings (QPDF.cc:528-530). qpdf builds both bracketing
+        // warnings with `damagedPDF("", 0, ...)`, i.e. an explicit offset of 0,
+        // so neither carries a file position; only the triggering exception in
+        // between reports one. Using the input's last offset here would attach a
+        // position qpdf never prints.
+        self.push_warning_at(0, "file is damaged")?;
 
         match trigger_error {
             Error::QpdfExc(warning) => self.push_qpdf_warning(warning)?,
@@ -1734,7 +1738,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
             _ => unreachable!("guard above ensures a qpdf damage variant"), // cov:ignore: unreachable after guard
         }
-        self.push_warning("Attempting to reconstruct cross-reference table")?;
+        self.push_warning_at(0, "Attempting to reconstruct cross-reference table")?;
 
         // Read logical bytes (header_offset already consumed), matching qpdf's
         // OffsetInputSource which seeks to logical-0 at QPDF.cc:543.
@@ -2832,6 +2836,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// required at the handoff boundary.
     pub(crate) fn install_source_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
         let mut core = self.core.borrow_mut();
+        if core.reconstructed_xref {
+            // The document reconstructed its own table while the loader was
+            // still resolving the trailer, so the loader's table is the stale
+            // one. qpdf keeps the repaired offsets in the same place it repairs
+            // them: `reconstruct_xref` rewrites `m->xref_table` in situ
+            // (`QPDF.cc:518-620`) and the caller resumes against that table
+            // rather than reinstating what it had read.
+            return;
+        }
         core.source_xref_entries = entries;
         core.fixed_dangling_refs = false;
     }
@@ -2839,14 +2852,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Carry the open-time reconstruction bit into the resolver that owned
     /// the document during xref parsing.
     pub(crate) fn set_reconstructed_xref(&self, value: bool) {
-        self.core.borrow_mut().reconstructed_xref = value;
+        // Never clear the flag: qpdf reconstructs at most once per document
+        // (`QPDF.cc:518-522` returns immediately when `reconstructed_xref` is
+        // already set), so a loader that did not observe the reconstruction
+        // must not reopen that door.
+        let mut core = self.core.borrow_mut();
+        core.reconstructed_xref |= value;
     }
 
     /// Install diagnostics collected by the xref reader without replaying
     /// them to the logger.  The document warning collection remains the single
     /// source after the pre-parse handoff.
     pub(crate) fn install_repair_diagnostics(&self, diagnostics: Diagnostics) {
-        self.core.borrow_mut().repair_diagnostics = diagnostics;
+        let mut core = self.core.borrow_mut();
+        if core.repair_diagnostics.is_empty() {
+            core.repair_diagnostics = diagnostics;
+            return;
+        }
+        // Warnings the document already recorded during the trailer resolution
+        // come first, matching the order they reached the logger; the loader's
+        // own set is appended rather than replacing them, since qpdf
+        // accumulates every warning on one document
+        // (`QPDF::warn` pushes onto `m->warnings`, `QPDF.cc:1250-1258`).
+        for warning in diagnostics.entries() {
+            core.repair_diagnostics.push(warning.clone());
+        }
     }
 
     /// Return the logical source bytes while restoring the resolver's current
