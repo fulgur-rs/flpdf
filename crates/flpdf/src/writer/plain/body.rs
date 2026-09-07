@@ -252,7 +252,12 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     plan: &PlainWritePlan,
 ) -> crate::Result<(Vec<u8>, BodyLayout)> {
     validate_objstm_member_bodies(pdf, plan)?;
-    let (page_sequences, contents_sequences) = if options.qdf {
+    // `contents_sequences` identifies page content streams for normalization,
+    // which content-normalization needs whether or not QDF framing is on; only
+    // the `%% Page N` comments themselves are QDF-only. Building this map for
+    // QDF alone left the normalization fallback with an empty map, so a cache
+    // miss would emit the stream unnormalized.
+    let (page_sequences, contents_sequences) = if options.qdf || options.content_normalization {
         qdf_page_context(pdf)?
     } else {
         (BTreeMap::new(), BTreeMap::new())
@@ -559,7 +564,17 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
         self.current_stream_length = None;
         if self.plan.root_source == source {
             if self.options.qdf {
-                return handle.write_object_qdf_with_ref_map_and_removed(
+                // The ADBE arbitration is not a non-QDF detail: qpdf performs
+                // it inside the generic dictionary path, guarded by `is_root`
+                // rather than by mode, and its own trace point passes
+                // `m->qdf_mode ? 0 : 1` precisely because the branch runs in
+                // both (`QPDFWriter.cc:1396-1436`). Serialize the arbitrated
+                // copy with the QDF layout instead of skipping arbitration.
+                let arbitrated = handle.output_root_copy_with_adbe(
+                    &self.plan.version,
+                    self.plan.final_extension_level,
+                )?;
+                return arbitrated.write_object_qdf_with_ref_map_and_removed(
                     self.bytes,
                     0,
                     &map,
@@ -741,7 +756,30 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 }
             }
             let result = if options.qdf {
-                handle.write_object_qdf_with_ref_map_and_removed(out, 0, &map, &plan.removed_refs)
+                // A Catalog compressed into an ObjStm is still the root, and
+                // qpdf's ADBE arbitration keys on `is_root` rather than on the
+                // output mode (`QPDFWriter.cc:1396-1436`), so it applies here
+                // exactly as it does to an uncompressed root.
+                if handle.object_ref() == plan.root_source {
+                    match handle
+                        .output_root_copy_with_adbe(&plan.version, plan.final_extension_level)
+                    {
+                        Ok(arbitrated) => arbitrated.write_object_qdf_with_ref_map_and_removed(
+                            out,
+                            0,
+                            &map,
+                            &plan.removed_refs,
+                        ),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    handle.write_object_qdf_with_ref_map_and_removed(
+                        out,
+                        0,
+                        &map,
+                        &plan.removed_refs,
+                    )
+                }
             } else if handle.object_ref() == plan.root_source {
                 handle.write_root_object_with_ref_map_and_removed(
                     out,

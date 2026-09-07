@@ -289,6 +289,31 @@ impl PlainWritePlan {
             }
         };
 
+        if options.qdf {
+            // qpdf drops every source XRef stream from the writer queue in QDF
+            // mode before it is ever numbered: `enqueueObject` returns early
+            // for `isStreamOfType("/XRef")` because fix-qdf expects exactly one
+            // XRef stream, at the end of the file (`QPDFWriter.cc:1085-1093`).
+            // The comment there names this very case — a QDF made from a file
+            // with object streams while preserving unreferenced objects. Since
+            // the exclusion happens before numbering, keeping the placement and
+            // withholding only its length holder would both abort the emit and
+            // shift every later QDF number by one.
+            let mut retained = Vec::with_capacity(placement.objects.len());
+            for object in placement.objects.drain(..) {
+                if let PlannedIndirectObject::Source { source, .. } = &object {
+                    let handle = pdf.get_object_handle(*source);
+                    pdf.resolve(&handle)?;
+                    if handle.try_is_stream_of_type(b"XRef", b"")? {
+                        placement.old_to_new.remove(source);
+                        continue;
+                    }
+                }
+                retained.push(object);
+            }
+            placement.objects = retained;
+        }
+
         let qdf_emission = if options.qdf {
             Some(build_qdf_emission_plan(pdf, &placement)?)
         } else {
@@ -469,7 +494,13 @@ impl PlainWritePlan {
             };
             let mut bytes = Vec::new();
             if options.qdf {
-                root_handle.write_object_qdf_with_ref_map_and_removed(
+                // Same reasoning as the indirect root in `body.rs`: qpdf's ADBE
+                // arbitration is guarded by `is_root`, not by mode
+                // (`QPDFWriter.cc:1396-1436`), so the QDF layout must serialize
+                // the arbitrated copy rather than the raw Catalog.
+                let arbitrated =
+                    root_handle.output_root_copy_with_adbe(&version, final_extension_level)?;
+                arbitrated.write_object_qdf_with_ref_map_and_removed(
                     &mut bytes,
                     0,
                     &map,
