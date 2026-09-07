@@ -2889,7 +2889,29 @@ mod tests {
 
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
-        let appearance = pdf2.get_object_handle(ObjectRef::new(5, 0));
+        // Follow the renumbered appearance through the reopened page's
+        // /Resources/XObject entry instead of a hard-coded object number: the
+        // canonical writer renumbers every emitted object in breadth-first
+        // traversal order (`writer/rewrite_renumber.rs`), so the appearance's
+        // output object number is incidental to the current page graph.
+        let written_page_ref = crate::pages::page_refs(&mut pdf2).unwrap()[0];
+        let written_page = pdf2.get_object_handle(written_page_ref);
+        pdf2.resolve(&written_page).unwrap();
+        let resources = pdf2
+            .resolve_handle(&written_page.try_get_key(b"/Resources").unwrap())
+            .unwrap();
+        let xobjects = pdf2
+            .resolve_handle(&resources.try_get_key(b"/XObject").unwrap())
+            .unwrap();
+        let xobject_entries = xobjects
+            .as_dictionary()
+            .expect("flattened page must expose an /XObject dictionary");
+        assert_eq!(
+            xobject_entries.len(),
+            1,
+            "the flattened appearance should be the page's only XObject"
+        );
+        let appearance = xobject_entries.into_values().next().unwrap();
         pdf2.resolve(&appearance).unwrap();
         let appearance_dict = appearance
             .as_stream_dict()
