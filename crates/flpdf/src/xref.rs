@@ -1688,11 +1688,16 @@ pub(crate) fn load_xref_state_from_bytes(
     // syntactically valid `startxref` explicitly names offset 0.
     // parse_startxref's Ok(0) case (an explicit zero) and the Err fallback
     // below (a missing/malformed startxref) both leave `startxref == 0`
-    // here, and either way flpdf still runs the parse_xref_from_start call
-    // below as a real retry attempt at logical (header-relative) offset 0 in
-    // `bytes` before recovery; qpdf has no such detour, so a failure from
-    // that attempt (as opposed to the recorded "can't find startxref"
-    // trigger) has no qpdf counterpart.
+    // here. Below, the canonical-owner + repair-mode combination now skips
+    // the retry entirely (matching qpdf exactly, see the comment there); the
+    // remaining deviation is the owner-less bootstrap path, which still runs
+    // a real retry attempt at logical (header-relative) offset 0 in `bytes`
+    // before recovery -- qpdf has no such detour, so a failure from that
+    // attempt (as opposed to the recorded "can't find startxref" trigger)
+    // has no qpdf counterpart. The same retry also still runs, unfixed, for
+    // a canonical owner outside repair mode (an explicit `startxref 0` with
+    // `allow_repair == false`), which is unverified against qpdf and out of
+    // scope here.
     let startxref = match parse_startxref(bytes) {
         Ok(offset) => offset,
         Err(error) if allow_repair => {
@@ -1717,21 +1722,43 @@ pub(crate) fn load_xref_state_from_bytes(
     let mut initial_parse_diagnostics = Diagnostics::default();
     let mut observed_first_xref_item_offset = None;
     let initial_bootstrap_cache = empty_bootstrap_cache();
-    let mut loaded = match parse_xref_from_start_with_owner(
-        bytes,
-        xref_pos,
-        startxref,
-        &version,
-        options.clone(),
-        &mut registration,
-        Some(&mut initial_parse_diagnostics),
-        XrefReadContextSpec::ActiveSectionWithCache {
-            bootstrap_cache: &initial_bootstrap_cache,
-        },
-        Some(&mut observed_first_xref_item_offset),
-        true,
-        canonical_trailer_owner,
-    )
+    // Unlike the owner-less bootstrap path this retry otherwise shares, a
+    // canonical owner cannot safely attempt it at all --
+    // `CanonicalTrailerOwner::indirect_handle`/`read_xref_stream_at_offset`
+    // resolve through the live document, and any warning that resolution
+    // raises is pushed immediately (`ResolverHandle::push_qpdf_warning`,
+    // matching qpdf's own `warn()` mutating `m->warnings` as it is called,
+    // `QPDF.cc:1250-1258`), not buffered for later discard the way this
+    // function's own `initial_parse_diagnostics` is. Skip the attempt
+    // entirely for this owner so it matches qpdf's real control flow
+    // (`QPDF.cc:450-452`: never call `read_xref` when the offset is zero)
+    // instead of leaking a warning qpdf never produces. `allow_repair` is
+    // required in the guard because a non-repair open can only reach
+    // `startxref == 0` via an explicit `startxref 0` in the file (the
+    // Err-from-parse_startxref arm above returns immediately when
+    // `!allow_repair`); that narrower case is unverified against qpdf and
+    // left to the unfixed bootstrap-shaped retry below.
+    let initial_parse_result =
+        if allow_repair && startxref == 0 && canonical_trailer_owner.is_some() {
+            Err(Error::parse(0, "xref not found"))
+        } else {
+            parse_xref_from_start_with_owner(
+                bytes,
+                xref_pos,
+                startxref,
+                &version,
+                options.clone(),
+                &mut registration,
+                Some(&mut initial_parse_diagnostics),
+                XrefReadContextSpec::ActiveSectionWithCache {
+                    bootstrap_cache: &initial_bootstrap_cache,
+                },
+                Some(&mut observed_first_xref_item_offset),
+                true,
+                canonical_trailer_owner,
+            )
+        };
+    let mut loaded = match initial_parse_result
     // qpdf-deviation-end
     {
         Ok(loaded) => loaded,
@@ -5573,6 +5600,58 @@ mod final_handle_tests {
             .expect("canonical stream warning");
         assert_eq!(warning.get_object(), b"trailer");
         assert_eq!(warning.get_file_position(), warning_offset as i64);
+    }
+
+    #[test]
+    fn canonical_owner_skips_the_offset_zero_retry_when_startxref_is_missing() {
+        // No `startxref` at all, so `parse_startxref` fails and `startxref`
+        // becomes 0. Object 1 sits at logical offset 0 and its body has a
+        // stray token before `endobj`, which is exactly the shape that
+        // makes a real read of it warn. qpdf's `xref_offset == 0` check
+        // (`QPDF.cc:450-452`) never attempts this read at all; a canonical
+        // owner must match that, unlike the owner-less bootstrap path
+        // covered by `nonzero_xref_stream_decode_warning_is_kept_before_recovery`.
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nextra\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Size 3 /Root 1 0 R >>\n%%EOF\n".to_vec();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), true, 10);
+        let state = load_xref_state_from_bytes(
+            &bytes,
+            XrefLoadOptions {
+                allow_repair: true,
+                description: b"canonical-offset-zero.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            Some(resolver.as_ref()),
+        )
+        .expect("the trailer keyword is found directly, without candidate re-entry");
+        // A live canonical-owner read (unlike this function's own local
+        // `repair_diagnostics` buffer) pushes onto the document's own
+        // diagnostic collection immediately (`ResolverHandle::push_qpdf_warning`),
+        // which is why the skipped retry's absence must be checked here, not
+        // on `state.loaded.repair_diagnostics`.
+        let owner_diagnostics = resolver.repair_diagnostics();
+        assert!(
+            !owner_diagnostics
+                .entries()
+                .iter()
+                .any(|warning| warning.get_object().starts_with(b"xref stream: object")),
+            "the skipped retry must not leak an object-1 warning tagged as an xref stream read"
+        );
+        let trio: Vec<_> = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .map(|warning| String::from_utf8_lossy(warning.what_bytes()).into_owned())
+            .collect();
+        assert_eq!(
+            trio,
+            vec![
+                "canonical-offset-zero.pdf: file is damaged",
+                "canonical-offset-zero.pdf: can't find startxref",
+                "canonical-offset-zero.pdf: Attempting to reconstruct cross-reference table",
+            ],
+            "the retry must not run at all, leaving only the reconstruction trio"
+        );
     }
 
     #[test]
