@@ -662,8 +662,9 @@ A11 を A10 の後に置く理由で、facade の `next_available_object_ref` �
 
 #### 7.2.2 parser・diagnostics（領域 B）
 
-1. **B5 / B7 の欠落primitive** — document-owned ParseGuardとreadToken責務を先に移植し、
-   再入拒否・guard復元・ObjStm headerの2 token読取順を固定する。xref ByteCursorのfalseを一律trueにしない。
+1. **B7 の欠落primitive** — readToken責務を移植し、ObjStm headerの2 token読取順を固定する。
+   xref ByteCursorのfalseを一律trueにしない。B5のdocument-owned ParseGuard（再入拒否・guard復元）は
+   `flpdf-3yn9.48.17`（2026-09-07）で移植済み。
 2. **B29** — 既存warning collectionへgetWarningsのdrain / anyWarningsを移植し、Job完了consumerから移す。
    `num_warnings` は既存。loggerへ表示済みのwarningをdrain時に再出力しない。
 3. **B8〜B13 / B34** — canonical file-object/header/stream/trailer責務へbootstrap consumerを移す。
@@ -944,12 +945,15 @@ canonical readStreamのwarning context修正は済作業として扱い、bootst
 `U1` が 2 つの別物を指す。B は `P1`–`P8`、E は `P-1`–`P-4` でハイフン 1 つしか違わない。
 A は接頭辞なしの `1`–`4`。本節では領域接頭辞を付けて `A-1` … `E-P4` と表記する（全 26 件）。
 
-### 8.2 unknown 行（1件）と必要probe
+### 8.2 unknown 行（0件、2026-09-07に解消）
 
-**B5 / B-P5**だけが行単位でunknown。qpdfのdocument-owned `ParseGuard` は
+**B5 / B-P5**が唯一の unknown 行だったが、`flpdf-3yn9.48.17`
+（2026-09-07）で `ResolverHandle::in_parse` primitive を移植し canonical へ更新した
+（`docs/qpdf-route-matrix/b-parser-recovery-diagnostics.md` の B5 行 /
+P5 probe を参照）。qpdfのdocument-owned `ParseGuard` は
 `libqpdf/QPDF.cc:476-485` / `libqpdf/QPDFParser.cc:29-34` にある。
-通常parseがresolveしないことは省略理由にならない。再入triggerと正常/異常return時のguard復元を
-oracleで固定し、未移植primitiveをfile/content parserの前提にする。
+通常parseがresolveしないことは省略理由にならず、実際の再入triggerも存在しないため、
+対称チェックの両方向と失敗return時のguard復元を直接probeで固定した。
 
 B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは引き続きunknownであり、
 行分類の確定を全caseの照合完了とは扱わない。C42は以前のpipe/show-stream修正完了を反映した。

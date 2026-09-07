@@ -58,6 +58,21 @@ pub(crate) trait HandleResolver {
     fn description_template(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Enter this parse call's document-level re-entrancy guard, mirroring
+    /// `QPDF::ParseGuard`'s constructor calling `QPDF::inParse(true)`
+    /// (`include/qpdf/QPDF.hh:797-816`, `libqpdf/QPDF.cc:475-485`). qpdf skips
+    /// the guard entirely when its `QPDF*` is null; the default no-op gives
+    /// contextless/detached resolvers the same behavior.
+    fn begin_parse(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Leave this parse call's re-entrancy guard, mirroring `QPDF::ParseGuard`'s
+    /// destructor calling `QPDF::inParse(false)`. The live document parser
+    /// calls this after both a successful and a failed parse, matching
+    /// `ParseGuard` being a stack-local object whose destructor always runs.
+    fn end_parse(&self) {}
 }
 
 /// Decrypts one literal PDF string while the file-object parser still owns
@@ -399,7 +414,20 @@ enum LiveFrame {
 }
 
 impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
+    /// qpdf correspondence: `QPDFParser::parse` (`libqpdf/QPDFParser.cc:27-34`).
+    /// `QPDF::ParseGuard pg(context)` there is a stack-local RAII object whose
+    /// constructor/destructor bracket the entire method body, restoring the
+    /// guard on both the normal and every early-`return` exit; `begin_parse`/
+    /// `end_parse` bracket [`Self::parse_body`] the same way, since `Drop`
+    /// cannot run fallibly in Rust and this method has several `?` exits.
     fn parse(&mut self) -> Result<LiveParsedObject> {
+        self.resolver.begin_parse()?;
+        let result = self.parse_body();
+        self.resolver.end_parse();
+        result
+    }
+
+    fn parse_body(&mut self) -> Result<LiveParsedObject> {
         // QPDFParser records `input->tell()` before reading its first token,
         // deliberately including leading whitespace in a top-level scalar's
         // parsed offset (`QPDFParser.cc:32-36,413-421`).
@@ -918,6 +946,32 @@ mod live_input_tests {
         }
     }
 
+    /// Records `begin_parse`/`end_parse` call order so tests can pin
+    /// `LiveFileParser::parse`'s guard-bracketing contract without depending
+    /// on `reader::resolver::ResolverHandle`'s specific re-entrancy check.
+    struct GuardSpyResolver {
+        events: RefCell<Vec<&'static str>>,
+        reject_entry: bool,
+    }
+
+    impl HandleResolver for GuardSpyResolver {
+        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::new_indirect_unresolved(object_ref, -1)
+        }
+
+        fn begin_parse(&self) -> Result<()> {
+            self.events.borrow_mut().push("begin");
+            if self.reject_entry {
+                return Err(Error::Internal("test: re-entrant parse rejected".into()));
+            }
+            Ok(())
+        }
+
+        fn end_parse(&self) {
+            self.events.borrow_mut().push("end");
+        }
+    }
+
     struct ContextualResolver {
         resolver: Weak<dyn DocumentResolver>,
     }
@@ -1090,6 +1144,77 @@ mod live_input_tests {
 
         assert!(matches!(error, Error::Internal(message) if message == "decrypter failure"));
         assert_eq!(decrypter.calls, vec![b"ciphertext".to_vec()]);
+    }
+
+    // qpdf's `QPDF::ParseGuard` constructor (`include/qpdf/QPDF.hh:803-809`)
+    // throwing means its destructor never runs, so a rejected guard entry
+    // must leave the object body untouched and never call the matching exit.
+    #[test]
+    fn parse_short_circuits_before_the_body_when_the_guard_rejects_entry() {
+        let mut input = CountingInput::new(b"42");
+        let mut resolver = GuardSpyResolver {
+            events: RefCell::new(Vec::new()),
+            reject_entry: true,
+        };
+
+        let error = parse_live_file_object(&mut input, &mut resolver)
+            .expect_err("a rejected guard entry must fail the parse");
+
+        assert!(
+            matches!(&error, Error::Internal(message) if message == "test: re-entrant parse rejected")
+        );
+        assert_eq!(*resolver.events.borrow(), vec!["begin"]);
+        assert_eq!(
+            input.reads.iter().sum::<usize>(),
+            0,
+            "the body must never read from the input once entry is rejected"
+        );
+    }
+
+    // The ObjStm member route reaches the parser through
+    // `OffsetHandleResolver`, which rebases offsets and forwards every other
+    // resolver method. qpdf holds the guard on that route too:
+    // `QPDF::readObjectInStream` constructs the parser with `this` as its
+    // context (`libqpdf/QPDF.cc:1459`), exactly as `readObject` does. An
+    // adapter that forwarded the handle methods but not the guard would let
+    // this one route parse unguarded.
+    #[test]
+    fn the_rebasing_adapter_forwards_the_parse_guard() {
+        let resolver = GuardSpyResolver {
+            events: RefCell::new(Vec::new()),
+            reject_entry: false,
+        };
+        let mut resolver = resolver;
+
+        super::parse_qpdf_direct_object_handle_with_diagnostics(b"42", 0, None, &mut resolver)
+            .expect("the object parses");
+
+        assert_eq!(*resolver.events.borrow(), vec!["begin", "end"]);
+    }
+
+    // qpdf's `QPDF::ParseGuard` is a stack-local RAII object
+    // (`include/qpdf/QPDF.hh:797-816`): its destructor runs on every exit
+    // from `QPDFParser::parse`, a thrown exception included.
+    #[test]
+    fn parse_restores_the_guard_even_when_the_body_fails() {
+        // The leading `1 0 R` also exercises `GuardSpyResolver::indirect_handle`
+        // before the trailing string reaches the failing decrypter.
+        let mut input = CountingInput::new(b"[1 0 R (ciphertext)]");
+        let mut resolver = GuardSpyResolver {
+            events: RefCell::new(Vec::new()),
+            reject_entry: false,
+        };
+        let mut decrypter = RecordingDecrypter {
+            calls: Vec::new(),
+            fail: true,
+        };
+
+        let error =
+            parse_live_file_object_with_decrypter(&mut input, &mut resolver, Some(&mut decrypter))
+                .expect_err("a failing decrypter must fail the parse");
+
+        assert!(matches!(&error, Error::Internal(message) if message == "decrypter failure"));
+        assert_eq!(*resolver.events.borrow(), vec!["begin", "end"]);
     }
 
     // This catches a production regression where a completed signature
@@ -1804,6 +1929,19 @@ impl HandleResolver for OffsetHandleResolver<'_> {
 
     fn description_template(&self) -> Option<Vec<u8>> {
         self.resolver.description_template()
+    }
+
+    fn begin_parse(&self) -> Result<()> {
+        // Forward the guard like every other method: this adapter only rebases
+        // offsets. Falling back to the no-op default would drop the guard for
+        // the one route that reaches the parser through it -- ObjStm member
+        // parsing -- where qpdf does hold it, since `QPDF::readObjectInStream`
+        // passes `this` as the parser's context (`libqpdf/QPDF.cc:1459`).
+        self.resolver.begin_parse()
+    }
+
+    fn end_parse(&self) {
+        self.resolver.end_parse();
     }
 }
 

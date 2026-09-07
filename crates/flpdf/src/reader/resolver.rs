@@ -113,6 +113,9 @@ pub(crate) const CLOSED_INPUT_SOURCE_ERROR: &str =
     "QPDF operation attempted on a QPDF object with no input source. QPDF operations are invalid before processFile (or another process method) or after closeInputSource";
 pub(crate) const CLOSED_INPUT_SOURCE_NAME: &str = "closed input source";
 
+/// qpdf's `QPDF::inParse` re-entrancy exception text (`libqpdf/QPDF.cc:475-485`).
+const REENTRANT_PARSE_ERROR: &str = "QPDF: re-entrant parsing detected. This is a qpdf bug. Please report at https://github.com/qpdf/qpdf/issues.";
+
 /// The state `QPDF::resolve` and the functions it calls operate on.
 ///
 /// The field list is taken from qpdf's `QPDF::Members`
@@ -365,6 +368,16 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     ///
     /// Written only through [`ResolveMark`], never directly.
     resolving: BTreeSet<ObjectRef>,
+    /// qpdf `m->in_parse` (`include/qpdf/QPDF.hh:1483`), the flag
+    /// `QPDF::inParse` toggles and `QPDF::ParseGuard`
+    /// (`include/qpdf/QPDF.hh:797-816`) sets for the duration of one
+    /// `QPDFParser::parse` call. Distinct from `resolving` above:
+    /// `resolving` guards against an object resolving to itself, while this
+    /// guards against the file parser itself being re-entered while it is
+    /// already running (`libqpdf/QPDF.cc:475-485`).
+    ///
+    /// Written only through [`ResolverHandle::in_parse`], never directly.
+    in_parse: bool,
     /// qpdf `m->resolved_object_streams` (`QPDF.hh:1485`). Keyed by object
     /// stream *number* rather than by `ObjectRef`, matching qpdf's own
     /// `std::set<int>` and `resolveObjectsInStream(int obj_stream_number)`.
@@ -911,6 +924,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 last_object_description_bytes: Vec::new(),
                 allocated_object_refs: BTreeSet::new(),
                 resolving: BTreeSet::new(),
+                in_parse: false,
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
                 attempt_recovery,
@@ -956,6 +970,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 last_object_description_bytes: Vec::new(),
                 allocated_object_refs: BTreeSet::new(),
                 resolving: BTreeSet::new(),
+                in_parse: false,
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
                 attempt_recovery: true,
@@ -972,6 +987,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
             immediate_copy_from: Cell::new(false),
             pdf_unique_id: Cell::new(pdf_unique_id),
         })
+    }
+
+    /// qpdf `QPDF::inParse` (`libqpdf/QPDF.cc:475-485`): set the document's
+    /// file-parser re-entrancy flag to `value`, erroring if it already holds
+    /// `value`. `QPDF::ParseGuard`'s constructor/destructor
+    /// (`include/qpdf/QPDF.hh:797-816`) are its only two qpdf callers,
+    /// invoking it with `true`/`false` respectively;
+    /// [`crate::parser::HandleResolver`]'s `begin_parse`/`end_parse` on
+    /// [`ChildHandles`] are the flpdf equivalents.
+    pub(crate) fn in_parse(&self, value: bool) -> Result<()> {
+        let mut core = self.core.borrow_mut();
+        if core.in_parse == value {
+            return Err(Error::Internal(REENTRANT_PARSE_ERROR.to_owned()));
+        }
+        core.in_parse = value;
+        Ok(())
     }
 
     /// Create qpdf's owned empty stream object at the resolver boundary.
@@ -4500,6 +4531,20 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
     fn description_template(&self) -> Option<Vec<u8>> {
         Some(self.description_template.clone())
     }
+
+    fn begin_parse(&self) -> Result<()> {
+        self.resolver.in_parse(true)
+    }
+
+    fn end_parse(&self) {
+        // `begin_parse` above already set the flag to `true`, and nothing
+        // else in flpdf ever calls `in_parse`, so this pairing cannot
+        // observe the "already false" branch qpdf's symmetric check also
+        // guards against — that branch is exercised directly by this
+        // module's own unit tests on `ResolverHandle::in_parse` instead of
+        // through this call site.
+        let _ = self.resolver.in_parse(false);
+    }
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
@@ -4862,11 +4907,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
 #[cfg(test)]
 mod tests {
     use super::pipe_stream_data_from_input;
+    use super::ChildHandles;
     use super::ObjectStreamResolutionError;
     use super::ResolveMark;
     use super::ResolverHandle;
     use super::ResolverWarningOptions;
     use super::CLOSED_INPUT_SOURCE_ERROR;
+    use super::REENTRANT_PARSE_ERROR;
     use crate::encryption::state::{EncryptionMode, EncryptionState};
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
     use crate::{
@@ -5031,6 +5078,61 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         )
+    }
+
+    // qpdf's `QPDF::inParse` (`libqpdf/QPDF.cc:475-485`) throws when the flag
+    // already holds the value it is being set to, in either direction. This
+    // is the primitive `QPDF::ParseGuard`'s constructor/destructor rely on;
+    // the guard is entered only by `ChildHandles::begin_parse` below, and is
+    // otherwise pinned directly here.
+    #[test]
+    fn resolver_in_parse_rejects_a_reentrant_true_true_pair() {
+        let resolver = bare_resolver();
+        resolver.in_parse(true).expect("first entry is accepted");
+
+        let error = resolver
+            .in_parse(true)
+            .expect_err("a second entry while already true is re-entrant parsing");
+        assert!(matches!(&error, Error::Internal(message) if message == REENTRANT_PARSE_ERROR));
+
+        // The rejected re-entry must not have flipped the flag a second
+        // time, so the matching exit still succeeds exactly once.
+        resolver
+            .in_parse(false)
+            .expect("the original entry can exit");
+    }
+
+    #[test]
+    fn resolver_in_parse_rejects_a_reentrant_false_false_pair() {
+        let resolver = bare_resolver();
+
+        // A freshly built resolver starts with the flag already `false`
+        // (qpdf `bool in_parse{false}`, `include/qpdf/QPDF.hh:1483`), so
+        // exiting a guard that was never entered is itself a reentrancy
+        // violation in the other direction.
+        let error = resolver
+            .in_parse(false)
+            .expect_err("exiting an unentered guard is rejected symmetrically");
+        assert!(matches!(&error, Error::Internal(message) if message == REENTRANT_PARSE_ERROR));
+    }
+
+    #[test]
+    fn child_handles_begin_and_end_parse_delegate_to_the_resolver_guard() {
+        let resolver = bare_resolver();
+        let handles = ChildHandles {
+            resolver: &resolver,
+            description_template: Vec::new(),
+        };
+
+        crate::parser::HandleResolver::begin_parse(&handles).expect("guard begins clear");
+        let error = crate::parser::HandleResolver::begin_parse(&handles)
+            .expect_err("a nested entry through the same consumer is re-entrant");
+        assert!(matches!(&error, Error::Internal(message) if message == REENTRANT_PARSE_ERROR));
+
+        crate::parser::HandleResolver::end_parse(&handles);
+        // The guard was restored, so a fresh parse can enter it again.
+        crate::parser::HandleResolver::begin_parse(&handles).expect("guard is available again");
+        crate::parser::HandleResolver::end_parse(&handles);
     }
 
     #[test]
