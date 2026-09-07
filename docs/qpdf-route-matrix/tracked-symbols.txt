@@ -2,9 +2,9 @@
 #
 # 対象: docs/qpdf-route-matrix/{a..e}-*.md の 162 行のうち、classification が
 # `bridge` または `mixed` の 97 行の「flpdf current entrypoint」に現れる flpdf symbol
-# （167 個）。`canonical` 行は対象外。bridge/mixed で唯一 entrypoint が `absent` の
-# B7 も対象外（qpdf の `QPDF::readToken` に対応する flpdf の集約点が存在せず、
-# 追跡すべき symbol が無い）。B29 も `absent` だが `unknown` なので元から対象外。
+# （167 個）。`canonical` 行は対象外。bridge/mixed で entrypoint が `absent` の
+# B29 も `unknown` なので元から対象外。B7 は `.48.14` でObjStm header用の
+# `next_object_stream_integer` consumerを追加した。
 #
 # 使い方:
 #   python3 scripts/qpdf-route-callers.py --root .            # 全件を数える
@@ -123,7 +123,7 @@ crates/flpdf/src/object_handle.rs::canonical_dictionary_key              # A23 c
 
 # ===========================================================================
 # B. parser / xref recovery / warning・error・diagnostics
-#    B7 / B29 は entrypoint が absent のため対象外
+#    B29 は entrypoint が absent のため対象外
 # ===========================================================================
 
 # --- (a) deletable route ---
@@ -146,6 +146,7 @@ crates/flpdf/src/reader.rs::parse_source_file_object_at                  # B34
 
 # --- (b) baseline denominator ---
 crates/flpdf/src/parser.rs::too_many_bad_tokens                          # B4 canonical
+crates/flpdf/src/tokenizer.rs::Tokenizer::next_object_stream_integer      # B7 local qpdf readToken consumer
 crates/flpdf/src/reader/resolver.rs::read_object_at_offset_with_description  # B8 canonical
 crates/flpdf/src/reader/file_object.rs::parse_file_object_handle_syntax  # B9 canonical
 crates/flpdf/src/reader/resolver.rs::validate_stream_line_end            # B10 canonical

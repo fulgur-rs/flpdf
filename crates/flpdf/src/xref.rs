@@ -29,6 +29,7 @@
 //! (`libqpdf/QPDF.cc:450-469,516-531`).
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
+    parse_qpdf_direct_object_handle_with_diagnostics,
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
 };
 use crate::reader::file_object::{
@@ -505,6 +506,8 @@ struct ReferenceReadWindow {
 struct UncompressedObjectRead {
     value: ObjectValue,
     parsed_offset: i64,
+    end_before_space: i64,
+    end_after_space: i64,
     /// Whether `complete_handle_stream` fell back to
     /// `recover_stream_boundary`'s heuristic `endstream`/`endobj` search
     /// (signaled by `FileObjectDiagnosticKind::AttemptingStreamLengthRecovery`)
@@ -647,8 +650,21 @@ impl BootstrapHandleDocument {
                 self.resolve_length(object_ref)
             })
         });
-        let _ = (absolute_offset, description);
-        finish_file_object_handle(input, pending, resolved_length, policy)
+        let completed = finish_file_object_handle(input, pending, resolved_length, policy)?;
+        let absolute_offset = i64::try_from(absolute_offset).unwrap_or(i64::MAX);
+        let rebase = |relative: i64| {
+            if relative < 0 {
+                -1
+            } else {
+                absolute_offset.saturating_add(relative)
+            }
+        };
+        let (end_before_space, end_after_space) = completed.object.end_offsets();
+        completed
+            .object
+            .set_end_offsets(rebase(end_before_space), rebase(end_after_space));
+        let _ = description;
+        Ok(completed)
     }
 
     // Mirrors qpdf's own three-way `/Length` classification (an integer, a
@@ -683,7 +699,7 @@ impl BootstrapHandleDocument {
         &self,
         object_ref: ObjectRef,
         offset: u64,
-    ) -> Result<(ObjectValue, i64)> {
+    ) -> Result<(ObjectValue, i64, i64, i64)> {
         let start = usize::try_from(offset)
             .ok()
             .ok_or_else(|| Error::parse(0, "object offset does not fit usize"))?;
@@ -733,7 +749,12 @@ impl BootstrapHandleDocument {
         for diagnostic in accepted.diagnostics {
             self.push_diagnostic(diagnostic);
         }
-        Ok((accepted.value, accepted.parsed_offset))
+        Ok((
+            accepted.value,
+            accepted.parsed_offset,
+            accepted.end_before_space,
+            accepted.end_after_space,
+        ))
     }
 
     fn read_uncompressed_object_with_end(
@@ -808,6 +829,7 @@ impl BootstrapHandleDocument {
             })
             .collect();
         let parsed_offset = completed.object.get_parsed_offset();
+        let (end_before_space, end_after_space) = completed.object.end_offsets();
         let _ = completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
         let value = completed.object.into_direct_value().ok_or_else(|| {
@@ -820,6 +842,8 @@ impl BootstrapHandleDocument {
         Ok(UncompressedObjectRead {
             value: value.0,
             parsed_offset,
+            end_before_space,
+            end_after_space,
             used_heuristic_recovery,
             diagnostics,
         })
@@ -838,13 +862,14 @@ impl BootstrapHandleDocument {
 
         let stream_handle = self.handle_for_reference(ObjectRef::new(stream_number, 0));
         stream_handle.try_dereference()?;
+        let (stream_end_before_space, stream_end_after_space) = stream_handle.end_offsets();
         let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
             Error::parse(
                 0,
                 format!("supposed object stream {stream_number} is not a stream"),
             )
         })?;
-        if stream_dict.try_get_key(b"/Type")?.try_as_name()?.as_deref() != Some(b"ObjStm") {
+        if !stream_dict.try_is_dictionary_of_type(b"ObjStm", b"")? {
             self.push_warning(
                 format!("supposed object stream {stream_number} has wrong type"),
                 None,
@@ -852,61 +877,64 @@ impl BootstrapHandleDocument {
         }
         let object_count = self.handle_integer(&stream_dict, b"/N", "object stream /N")?;
         let first = self.handle_integer(&stream_dict, b"/First", "object stream /First")?;
-        let stream_data = stream_handle
-            .as_stream_data()
-            .ok_or_else(|| Error::parse(0, "supposed object stream has no data"))?;
-        let decoded = filters::decode_stream_data_from_handle(
-            &stream_dict,
-            &stream_data,
-            filters::DecodeLimits::default(),
-        )?;
+        // qpdf calls getStreamData(qpdf_dl_specialized) here, which routes
+        // through the stream's canonical filter pipeline rather than a
+        // separate whole-buffer decoder (`QPDF.cc:1792`).
+        let decoded = stream_handle.get_stream_data(DecodeLevel::Specialized)?;
 
         let mut tokenizer = Tokenizer::new(&decoded);
         let mut members = BTreeMap::new();
         for _ in 0..object_count {
-            let object_number = u32::try_from(tokenizer.next_integer()?)
+            let object_number = u32::try_from(tokenizer.next_object_stream_integer()?)
                 .map_err(|_| Error::parse(0, "object stream object number is invalid"))?;
-            let object_offset = usize::try_from(tokenizer.next_integer()?)
+            let object_offset = usize::try_from(tokenizer.next_object_stream_integer()?)
                 .map_err(|_| Error::parse(0, "object stream object offset is invalid"))?;
             members.insert(object_number, object_offset);
         }
 
         for (object_number, object_offset) in members {
             let object_ref = ObjectRef::new(object_number, 0);
-            if !matches!(
-                self.entry_lookup.borrow().get(&object_ref).copied(),
-                Some(XrefEntry::Compressed { stream, .. }) if stream == stream_number
-            ) {
+            let entry = self.entry_lookup.borrow().get(&object_ref).copied();
+            if !matches!(entry, Some(XrefEntry::Compressed { stream, .. }) if stream == stream_number)
+            {
+                if entry.is_none() {
+                    // qpdf's `m->xref_table[og]` inserts a default type-0
+                    // entry when an ObjStm header names an absent member
+                    // (`QPDF.cc:1821-1828`).
+                    self.entry_lookup
+                        .borrow_mut()
+                        .insert(object_ref, XrefEntry::Free { next: 0 });
+                }
                 continue;
             }
             let member_start = first
                 .checked_add(object_offset)
                 .ok_or_else(|| Error::parse(0, "object stream member offset overflow"))?;
-            if member_start > decoded.len() {
-                return Err(Error::parse(
-                    member_start,
-                    "object stream member offset is out of range",
-                ));
-            }
+            // qpdf seeks to the member offset even when it is past the
+            // decoded payload, then lets readObjectInStream report the normal
+            // EOF/empty-object result (`QPDF.cc:1825-1828`).
+            let diagnostic_start = member_start.min(decoded.len());
+            let member_data = decoded.get(diagnostic_start..).unwrap_or_default();
             let mut parser = BootstrapHandleParser {
                 document: self,
                 description: XrefObjectDescription::Ordinary,
             };
-            let parsed = match parse_qpdf_file_object_handle_with_diagnostics(
-                &decoded[member_start..],
-                i64::try_from(member_start).unwrap_or(i64::MAX),
-                Some(i64::try_from(member_start).unwrap_or(i64::MAX)),
-                &mut parser,
-            ) {
-                Ok(parsed) => parsed,
-                // Mirror `XrefReadContext::resolve_objects_in_stream`'s own
-                // member-context wrapping: a raw parse error must carry the
-                // same "object stream N (object M 0, offset ...)" identity
-                // and rebased offset a successfully-parsed member's
-                // diagnostics already get below, not the raw member-relative
-                // offset/message.
-                Err(error) => {
-                    return Err(match error.rebase_offset(member_start) {
+            let (value, parsed_offset, diagnostics) =
+                match parse_qpdf_direct_object_handle_with_diagnostics(
+                    member_data,
+                    i64::try_from(diagnostic_start).unwrap_or(i64::MAX),
+                    Some(i64::try_from(diagnostic_start).unwrap_or(i64::MAX)),
+                    &mut parser,
+                ) {
+                    Ok(parsed) => parsed,
+                    // Mirror `XrefReadContext::resolve_objects_in_stream`'s own
+                    // member-context wrapping: a raw parse error must carry the
+                    // same "object stream N (object M 0, offset ...)" identity
+                    // and rebased offset a successfully-parsed member's
+                    // diagnostics already get below, not the raw member-relative
+                    // offset/message.
+                    Err(error) => {
+                        return Err(match error.rebase_offset(diagnostic_start) {
                         Error::Parse { offset, message } => Error::parse(
                             offset,
                             format!(
@@ -916,24 +944,15 @@ impl BootstrapHandleDocument {
                         ),
                         other => other, // cov:ignore: byte-backed direct parser errors are parse errors
                     });
-                }
-            };
-            for diagnostic in &parsed.diagnostics {
-                let offset = member_start.saturating_add(diagnostic.relative_offset);
+                    }
+                };
+            let malformed = !diagnostics.is_empty() && matches!(&value, ObjectValue::Null);
+            for diagnostic in diagnostics {
+                let offset = diagnostic_start.saturating_add(diagnostic.relative_offset);
                 self.push_warning(
                     format!(
                         "object stream {stream_number} (object {} 0, offset {offset}): {}",
                         object_ref.number, diagnostic.message
-                    ),
-                    Some(offset as u64),
-                );
-            }
-            if let Some(empty_offset) = parsed.empty_offset {
-                let offset = member_start.saturating_add(empty_offset);
-                self.push_warning(
-                    format!(
-                        "object stream {stream_number} (object {} 0, offset {offset}): empty object treated as null",
-                        object_ref.number
                     ),
                     Some(offset as u64),
                 );
@@ -945,19 +964,35 @@ impl BootstrapHandleDocument {
             // resolved this handle to null, so do not let that provisional
             // value suppress the real member parse.
             let member_handle = self.handle_for_reference(object_ref);
-            let parsed_offset = parsed.parsed_offset;
-            // cov:ignore-start: the handle parser guarantees an exclusively owned direct member value
-            let value = parsed.value.into_direct_value().ok_or_else(|| {
-                Error::Internal(format!(
-                    "object stream member {} {} did not produce a direct value",
-                    object_ref.number, object_ref.generation
-                ))
-            })?;
-            // cov:ignore-end
-            member_handle.set_resolved(value.0);
-            member_handle.set_parsed_offset_if_unset(parsed_offset);
+            member_handle.set_resolved(value);
+            if !malformed {
+                member_handle.set_parsed_offset_if_unset(parsed_offset);
+                member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
+                if parsed_offset >= 0 && !member_handle.is_null() {
+                    member_handle.set_description(
+                        self.object_stream_description_template(stream_number, object_ref),
+                        parsed_offset,
+                    );
+                }
+            }
         }
         Ok(())
+    }
+
+    fn object_stream_description_template(
+        &self,
+        stream_number: u32,
+        object_ref: ObjectRef,
+    ) -> Vec<u8> {
+        let mut description = self.options.description.clone();
+        description.extend_from_slice(
+            format!(
+                " object stream {stream_number}, object {} {} at offset $PO",
+                object_ref.number, object_ref.generation
+            )
+            .as_bytes(),
+        );
+        description
     }
 
     fn handle_integer(&self, dictionary: &ObjectHandle, key: &[u8], label: &str) -> Result<usize> {
@@ -1052,7 +1087,7 @@ impl BootstrapHandleDocument {
             }
             Some(XrefEntry::Uncompressed { .. }) => {
                 self.push_warning("object has offset 0", Some(0));
-                Ok((ObjectValue::Null, -1))
+                Ok((ObjectValue::Null, -1, -1, -1))
             }
             // qpdf's `resolve` wraps `resolveObjectsInStream` in the same
             // try/catch as the type-1 branch above (`QPDF.cc:1719-1734`): a
@@ -1070,19 +1105,20 @@ impl BootstrapHandleDocument {
                             self.state.borrow_mut().resolving.remove(&object_ref);
                             return Ok(());
                         }
-                        Ok((ObjectValue::Null, -1))
+                        Ok((ObjectValue::Null, -1, -1, -1))
                     }
                     Err(error) => Err(error),
                 }
             }
-            Some(XrefEntry::Free { .. }) | None => Ok((ObjectValue::Null, -1)),
+            Some(XrefEntry::Free { .. }) | None => Ok((ObjectValue::Null, -1, -1, -1)),
         };
         self.state.borrow_mut().resolving.remove(&object_ref);
 
         match result {
-            Ok((value, parsed_offset)) => {
+            Ok((value, parsed_offset, end_before_space, end_after_space)) => {
                 handle.set_resolved(value);
                 handle.set_parsed_offset_if_unset(parsed_offset);
+                handle.set_end_offsets(end_before_space, end_after_space);
             }
             Err(error) => {
                 // A header-generation mismatch is qpdf's reconstruction
@@ -4952,6 +4988,320 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn bootstrap_objstm_uses_the_canonical_member_parser_and_metadata() {
+        let member_body = b"<< /Child 3 0 R >>";
+        let first = b"2 0 ".len();
+        let mut objstm_data = b"2 0 ".to_vec();
+        objstm_data.extend_from_slice(member_body);
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        let stream_header = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+            objstm_data.len()
+        );
+        bytes.extend_from_slice(stream_header.as_bytes());
+        bytes.extend_from_slice(&objstm_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n3 0 obj\nnull\nendobj\n");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 4,
+                index: 0,
+            },
+        );
+        entries.insert(
+            ObjectRef::new(3, 0),
+            XrefEntry::Uncompressed {
+                offset: (bytes.len() - b"3 0 obj\nnull\nendobj\n".len()) as u64,
+            },
+        );
+        entries.insert(
+            ObjectRef::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(&bytes),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+
+        document
+            .resolve_objects_in_stream(4)
+            .expect("ObjStm members resolve through the bootstrap owner");
+        let member = document.handle_for_reference(ObjectRef::new(2, 0));
+        assert!(member.is_resolved());
+        assert!(member
+            .description()
+            .windows(b"object stream 4".len())
+            .any(|window| window == b"object stream 4"));
+        let child = member
+            .try_get_key(b"/Child")
+            .expect("member dictionary child");
+        assert_eq!(child.object_ref(), Some(ObjectRef::new(3, 0)));
+
+        let source_stream = document.handle_for_reference(ObjectRef::new(4, 0));
+        assert!(source_stream.end_offsets().0 >= 0);
+        assert_eq!(member.end_offsets(), source_stream.end_offsets());
+    }
+
+    fn bootstrap_objstm_document(
+        object_count: usize,
+        header: &[u8],
+        member_body: &[u8],
+        mut entries: BTreeMap<ObjectRef, XrefEntry>,
+    ) -> Rc<BootstrapHandleDocument> {
+        let mut objstm_data = header.to_vec();
+        objstm_data.extend_from_slice(member_body);
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /ObjStm /N {object_count} /First {} /Length {} >>\nstream\n",
+                header.len(),
+                objstm_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&objstm_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
+        entries.insert(
+            ObjectRef::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        BootstrapHandleDocument::new_with_state(
+            Some(&bytes),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        )
+    }
+
+    #[test]
+    fn bootstrap_objstm_wraps_a_direct_member_parse_error() {
+        let member_ref = ObjectRef::new(7, 0);
+        let document = bootstrap_objstm_document(
+            1,
+            b"7 0 ",
+            b"[ 2147483648 0 R ]",
+            BTreeMap::from([(
+                member_ref,
+                XrefEntry::Compressed {
+                    stream: 4,
+                    index: 0,
+                },
+            )]),
+        );
+
+        let error = document
+            .resolve_objects_in_stream(4)
+            .expect_err("a malformed direct member must retain its parse error");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. }
+                if message.contains("object stream 4 (object 7 0, offset")
+        ));
+    }
+
+    #[test]
+    fn bootstrap_objstm_delivers_member_diagnostics_and_null_recovery() {
+        let member_ref = ObjectRef::new(7, 0);
+        let warning_document = bootstrap_objstm_document(
+            1,
+            b"7 0 ",
+            b"<< /A#zB 1 >>",
+            BTreeMap::from([(
+                member_ref,
+                XrefEntry::Compressed {
+                    stream: 4,
+                    index: 0,
+                },
+            )]),
+        );
+        warning_document
+            .resolve_objects_in_stream(4)
+            .expect("a recoverable member warning must not abort resolution");
+        assert!(warning_document
+            .state
+            .borrow()
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("object stream 4 (object 7 0, offset")));
+
+        let empty_document = bootstrap_objstm_document(
+            1,
+            b"7 0 ",
+            b"endobj",
+            BTreeMap::from([(
+                member_ref,
+                XrefEntry::Compressed {
+                    stream: 4,
+                    index: 0,
+                },
+            )]),
+        );
+        empty_document
+            .resolve_objects_in_stream(4)
+            .expect("an empty member follows qpdf's null recovery");
+        let empty_member = empty_document.handle_for_reference(member_ref);
+        assert!(empty_member.is_null());
+        assert_eq!(empty_member.end_offsets(), (-1, -1));
+        assert!(empty_document
+            .state
+            .borrow()
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("empty object treated as null")));
+    }
+
+    #[test]
+    fn bootstrap_offset_zero_and_unlisted_compressed_objects_follow_null_fallbacks() {
+        let offset_zero_ref = ObjectRef::new(1, 0);
+        let offset_zero_document = BootstrapHandleDocument::new_with_state(
+            Some(b""),
+            XrefEntryLookup::Registration(&BTreeMap::from([(
+                offset_zero_ref,
+                XrefEntry::Uncompressed { offset: 0 },
+            )])),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+        let offset_zero = offset_zero_document.handle_for_reference(offset_zero_ref);
+        offset_zero
+            .try_dereference()
+            .expect("offset zero resolves to qpdf's null fallback");
+        assert!(offset_zero.is_null());
+
+        let unlisted_ref = ObjectRef::new(7, 0);
+        let unlisted_document = bootstrap_objstm_document(
+            0,
+            b"",
+            b"",
+            BTreeMap::from([(
+                unlisted_ref,
+                XrefEntry::Compressed {
+                    stream: 4,
+                    index: 0,
+                },
+            )]),
+        );
+        let unlisted = unlisted_document.handle_for_reference(unlisted_ref);
+        unlisted
+            .try_dereference()
+            .expect("an unlisted compressed object resolves after a successful ObjStm scan");
+        assert!(unlisted.is_null());
+    }
+
+    #[test]
+    fn bootstrap_objstm_uses_effective_xref_and_records_absent_headers() {
+        let member_body = b"<< /Value 1 >>";
+        let header = b"7 0 8 0 9 0 ";
+        let mut objstm_data = header.to_vec();
+        objstm_data.extend_from_slice(member_body);
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        let stream_header = format!(
+            "4 0 obj\n<< /Type /ObjStm /N 3 /First {} /Length {} >>\nstream\n",
+            header.len(),
+            objstm_data.len()
+        );
+        bytes.extend_from_slice(stream_header.as_bytes());
+        bytes.extend_from_slice(&objstm_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
+
+        let stream_ref = ObjectRef::new(4, 0);
+        let active_ref = ObjectRef::new(7, 0);
+        let overridden_ref = ObjectRef::new(8, 0);
+        let absent_ref = ObjectRef::new(9, 0);
+        let entries = BTreeMap::from([
+            (
+                stream_ref,
+                XrefEntry::Uncompressed {
+                    offset: stream_offset,
+                },
+            ),
+            (
+                active_ref,
+                XrefEntry::Compressed {
+                    stream: stream_ref.number,
+                    index: 0,
+                },
+            ),
+            (overridden_ref, XrefEntry::Uncompressed { offset: 1 }),
+        ]);
+        let document = BootstrapHandleDocument::new_with_state(
+            Some(&bytes),
+            XrefEntryLookup::Registration(&entries),
+            XrefLoadOptions::default(),
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        );
+
+        document
+            .resolve_objects_in_stream(stream_ref.number)
+            .expect("the active member resolves through the bootstrap owner");
+        assert_eq!(
+            document
+                .handle_for_reference(active_ref)
+                .try_get_key(b"/Value")
+                .expect("active member dictionary")
+                .as_integer(),
+            Some(1)
+        );
+        assert!(
+            !document.handle_for_reference(overridden_ref).is_resolved(),
+            "an overridden member must not be populated from the ObjStm"
+        );
+        assert_eq!(
+            document.entry_lookup.borrow().get(&absent_ref),
+            Some(&XrefEntry::Free { next: 0 }),
+            "an absent header member receives qpdf's default free xref row"
+        );
+    }
+
+    #[test]
+    fn bootstrap_objstm_does_not_use_the_legacy_whole_buffer_route() {
+        let source = include_str!("xref.rs");
+        let method = source
+            .split("fn resolve_objects_in_stream(&self, stream_number: u32)")
+            .nth(1)
+            .and_then(|rest| rest.split("fn handle_integer").next())
+            .expect("bootstrap ObjStm method");
+
+        assert!(
+            method.contains("get_stream_data(DecodeLevel::Specialized)"),
+            "bootstrap ObjStm must use qpdf's specialized stream accessor"
+        );
+        assert!(
+            method.contains("parse_qpdf_direct_object_handle_with_diagnostics"),
+            "bootstrap ObjStm members must use the direct qpdf parser"
+        );
+        assert!(
+            method.contains("next_object_stream_integer()"),
+            "bootstrap ObjStm headers must use qpdf's allow_bad token consumer"
+        );
+        assert!(
+            !method.contains("decode_stream_data_from_handle"),
+            "bootstrap ObjStm must not use the whole-buffer decoder"
+        );
+        assert!(
+            !method.contains("parse_qpdf_file_object_handle_with_diagnostics"),
+            "bootstrap ObjStm members must not use file-object framing"
+        );
+    }
+
+    #[test]
     fn bootstrap_document_construction_defers_the_source_snapshot() {
         let entries = BTreeMap::new();
         let document = BootstrapHandleDocument::new_with_state(
@@ -5128,7 +5478,7 @@ mod final_handle_tests {
         );
         context.document.ensure_source_bytes(&bytes);
 
-        let (value, _) = context
+        let (value, _, _, _) = context
             .document
             .read_uncompressed_object(first_ref, 0)
             .expect("the fallback window must recover a valid stream");
@@ -5360,7 +5710,7 @@ mod final_handle_tests {
         );
         context.document.ensure_source_bytes(&bytes);
 
-        let (value, _) = context
+        let (value, _, _, _) = context
             .document
             .read_uncompressed_object(first_ref, 0)
             .expect("the fallback window must recover a valid stream");
@@ -5410,7 +5760,7 @@ mod final_handle_tests {
         );
         context.document.ensure_source_bytes(&bytes);
 
-        let (value, _) = context
+        let (value, _, _, _) = context
             .document
             .read_uncompressed_object(object_ref, 0)
             .expect("a missing /Length recovers through the endstream scan");
