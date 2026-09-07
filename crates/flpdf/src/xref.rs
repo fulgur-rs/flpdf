@@ -6026,6 +6026,12 @@ mod final_handle_tests {
 
         fn set_header_offset(&self, _offset: usize) {}
 
+        fn begin_parse(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn end_parse(&self) {}
+
         fn read_object_at_offset(
             &self,
             _offset: u64,
@@ -6240,6 +6246,8 @@ mod final_handle_tests {
             let _ = owner.direct_handle(ObjectValue::Integer(1));
             owner.install_xref_entries(BTreeMap::new());
             owner.set_header_offset(0);
+            owner.begin_parse().expect("synthetic parse guard");
+            owner.end_parse();
             assert!(owner
                 .read_object_at_offset(0, ObjectRef::new(1, 0), None)
                 .is_err());
