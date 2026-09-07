@@ -193,6 +193,11 @@ fn qpdf_sole_help_table_options_remain_available() {
 #[test]
 fn qpdf_unknown_help_topic_uses_the_usage_boundary() {
     if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!(
+                "{EXPECTED_QPDF_VERSION} is required for the qpdf unknown-help differential on CI"
+            );
+        }
         eprintln!(
             "skipping qpdf unknown-help differential: {EXPECTED_QPDF_VERSION} is not available"
         );
@@ -221,6 +226,11 @@ fn qpdf_unknown_help_topic_uses_the_usage_boundary() {
 #[test]
 fn qpdf_help_topics_render_their_source_topics() {
     if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!(
+                "{EXPECTED_QPDF_VERSION} is required for the qpdf help-topic differential on CI"
+            );
+        }
         eprintln!(
             "skipping qpdf help-topic differential: {EXPECTED_QPDF_VERSION} is not available"
         );
@@ -279,6 +289,11 @@ fn qpdf_help_topics_render_their_source_topics() {
 #[test]
 fn qpdf_help_table_gate_matches_command_position_and_first_error_order() {
     if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!(
+                "{EXPECTED_QPDF_VERSION} is required for the qpdf help-table differential on CI"
+            );
+        }
         eprintln!(
             "skipping qpdf help-table differential: {EXPECTED_QPDF_VERSION} is not available"
         );
@@ -322,18 +337,25 @@ fn qpdf_help_table_gate_matches_command_position_and_first_error_order() {
 
 #[test]
 fn native_help_remains_available_after_qpdf_help_gate() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["help", "rewrite"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Usage: flpdf"));
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args(["rewrite", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Usage: flpdf"));
+    // Assert the subcommand's own usage line, not just "Usage: flpdf": the
+    // top-level help prints "Usage: flpdf [OPTIONS] [INPUT] [OUTPUT]", so a
+    // prefix-only check still passes if the qpdf help gate swallows the
+    // subcommand and prints the top-level help instead — exactly the
+    // regression this test exists to catch. The optional `.exe` keeps it
+    // valid on Windows, where the program name carries the extension.
+    let subcommand_usage = predicate::str::is_match(r"Usage: flpdf(\.exe)? rewrite").unwrap();
+    for arguments in [
+        ["help", "rewrite"],
+        ["rewrite", "--help"],
+        ["rewrite", "-h"],
+    ] {
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(arguments)
+            .assert()
+            .success()
+            .stdout(subcommand_usage.clone());
+    }
 }
 
 #[cfg(unix)]
