@@ -1366,6 +1366,16 @@ flpdf の `job/page_merge.rs` はこの primary source order と foreign allocat
 `--static-id --stream-data=uncompress --linearize --pages` の全出力 bytes を比較する
 `cli_linearize_multi_source_qpdf.rs` でこの境界を固定する。
 
+`flpdf-j2bt` では、同じ primary page の重複選択で qpdf が
+`shallowCopyPage` を後続 foreign `copyForeignObject` より先に allocate する
+順序も writer provenance へ渡す。qpdf の generated ObjStm は
+`getCompressibleObjGens` の候補順を保ち、各 container 内では destination
+object number 順に member を予約するため（`QPDFJob.cc:2515-2555`;
+`QPDFWriter.cc:1057-1118,1970-2005`; `QPDFWriter.hh:680`）、flpdf の
+`page_extract.rs::append_selection_kids` は shallow clone を foreign/destination
+order group に登録する。`cli_pages_objstm_order_qpdf.rs` の duplicate-page
+qpdf-zlib gate が clone と後続 foreign page の全 bytes を比較する。
+
 `flpdf-obsc` では、`QPDFJob::doSplitPages` が chunk 作成前に行う
 `shouldRemoveUnreferencedResources` の verbose side effect も同じ job boundary に
 接続した。qpdf は Auto 判定の開始、最初の共有 resource finding、または共有なしの

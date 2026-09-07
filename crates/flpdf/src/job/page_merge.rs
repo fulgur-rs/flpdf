@@ -1200,7 +1200,14 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
         }
         // Append this input's pages to /Kids in selection order, with each
         // input resolved through its own copy map.
-        append_selection_kids(&mut target, &selected, &map, &mut used, &mut kids)?;
+        append_selection_kids(
+            &mut target,
+            &selected,
+            &map,
+            &mut used,
+            &mut kids,
+            &mut writer_object_order,
+        )?; // cov:ignore: malformed page-copy map errors propagate at this boundary
     }
 
     // Build the fresh single-level /Pages root over the accumulated kids
