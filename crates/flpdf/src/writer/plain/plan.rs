@@ -570,7 +570,7 @@ struct PlacementPlan {
     removed_refs: BTreeSet<ObjectRef>,
 }
 
-fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec<u8>>> {
+pub(crate) fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec<u8>>> {
     let id = pdf.trailer().try_get_key(b"/ID")?;
     let Some(values) = id.try_as_array()? else {
         return Ok(None);

@@ -1,5 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc plain object-body emission split from planning and xref output.
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -14,6 +15,183 @@ use crate::writer::{
     serialize, CompressStreams, ObjectWriterEmission, StreamDictionaryOptions, QPDF_BINARY_MARKER,
 };
 use crate::{ObjectHandle, ObjectRef, Pdf};
+
+/// The qpdf standard-writer queue for the bounded plain Disable consumer.
+/// Numbers are assigned when a reference is first observed, and the pending
+/// queue is allowed to grow while an object is being unparsed. This is the
+/// Rust counterpart of `QPDFWriter::enqueueObject` plus `object_queue`.
+struct LiveQueue {
+    old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+    pending: VecDeque<ObjectHandle>,
+    removed_refs: BTreeSet<ObjectRef>,
+}
+
+impl LiveQueue {
+    fn new(removed_refs: BTreeSet<ObjectRef>) -> Self {
+        Self {
+            old_to_new: BTreeMap::new(),
+            pending: VecDeque::new(),
+            removed_refs,
+        }
+    }
+
+    fn enqueue_handle<R: Read + Seek>(
+        &mut self,
+        pdf: &Pdf<R>,
+        handle: ObjectHandle,
+    ) -> crate::Result<Option<ObjectRef>> {
+        if handle.owning_pdf_unique_id() != Some(pdf.unique_id()) {
+            return Err(crate::Error::Internal(
+                "QPDFObjectHandle from different QPDF found while writing.  Use QPDF::copyForeignObject to add objects from another file."
+                    .to_string(),
+            ));
+        }
+        // cov:ignore-start: only indirect handles are enqueued by qpdf's object queue.
+        let Some(source) = handle.object_ref() else {
+            return Ok(None);
+        };
+        // cov:ignore-end
+        // cov:ignore-start: qpdf never registers object number zero as a live object.
+        if source.number == 0 {
+            return Ok(None);
+        }
+        // cov:ignore-end
+        if self.removed_refs.contains(&source) {
+            return Ok(None);
+        }
+        if let Some(output) = self.old_to_new.get(&source).copied() {
+            return Ok(Some(output));
+        }
+        let output = ObjectRef::new(self.old_to_new.len() as u32 + 1, 0);
+        self.old_to_new.insert(source, output);
+        self.pending.push_back(handle);
+        Ok(Some(output))
+    }
+
+    fn pop(&mut self) -> Option<ObjectHandle> {
+        self.pending.pop_front()
+    }
+}
+
+/// Output of the live Disable body pass. The trailer/xref layer consumes the
+/// completed map only after the queue has stopped growing.
+pub(crate) struct LiveBodyOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) layout: BodyLayout,
+    pub(crate) old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+}
+
+fn collect_live_seed_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+    found: &mut Vec<ObjectHandle>,
+) -> crate::Result<()> {
+    if handle.object_ref().is_some() {
+        found.push(handle.clone());
+        return Ok(());
+    }
+    pdf.resolve(handle)?;
+    if let Some(items) = handle.try_as_array()? {
+        for item in items {
+            collect_live_seed_handles(pdf, &item, found)?;
+        }
+    } else if let Some(entries) = handle.try_as_dictionary()? {
+        for (_, value) in entries {
+            if !value.try_is_null()? {
+                collect_live_seed_handles(pdf, &value, found)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit the plain Disable body using qpdf's live queue. Direct values are
+/// traversed only when they are queue seeds; indirect children are discovered
+/// by the writer-owned unparser while each queued object is emitted.
+pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    version: &str,
+    final_extension_level: i64,
+    root_source: Option<ObjectRef>,
+    removed_refs: BTreeSet<ObjectRef>,
+) -> crate::Result<LiveBodyOutput> {
+    let mut queue = LiveQueue::new(removed_refs.clone());
+    if options.preserve_unreferenced_objects {
+        for handle in pdf.get_all_objects()? {
+            queue.enqueue_handle(pdf, handle)?;
+        }
+    }
+
+    let root = pdf.root_handle()?;
+    let mut root_seeds = Vec::new();
+    collect_live_seed_handles(pdf, &root, &mut root_seeds)?;
+    for handle in root_seeds {
+        queue.enqueue_handle(pdf, handle)?;
+    }
+
+    let trailer = pdf.trailer();
+    let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
+    for (key, value) in trailer_entries {
+        if matches!(
+            key.as_slice(),
+            b"/ID"
+                | b"/Encrypt"
+                | b"/Prev"
+                | b"/Root"
+                | b"/Type"
+                | b"/W"
+                | b"/Index"
+                | b"/Length"
+                | b"/Filter"
+                | b"/DecodeParms"
+                | b"/XRefStm"
+        ) || value.try_is_null()?
+        {
+            continue;
+        }
+        let mut handles = Vec::new();
+        collect_live_seed_handles(pdf, &value, &mut handles)?;
+        for handle in handles {
+            queue.enqueue_handle(pdf, handle)?;
+        }
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
+    bytes.extend_from_slice(QPDF_BINARY_MARKER);
+    let mut layout = BodyLayout::default();
+    let mut emitter = LiveObjectEmitter {
+        pdf,
+        options,
+        bytes: &mut bytes,
+        layout: &mut layout,
+        queue: RefCell::new(queue),
+        root_source,
+        version,
+        final_extension_level,
+        removed_refs,
+        lengths: BTreeMap::new(),
+        encryption: crate::writer::encryption_state::WriterEncryptionState::new(
+            false,
+            Vec::new(),
+            false,
+            0,
+            0,
+        ),
+    };
+    loop {
+        let source = emitter.queue.borrow_mut().pop();
+        let Some(handle) = source else { break };
+        emitter.write_object(&handle, None)?;
+    }
+    let old_to_new = emitter.queue.into_inner().old_to_new;
+    Ok(LiveBodyOutput {
+        bytes,
+        layout,
+        old_to_new,
+    })
+}
 
 /// Emit every body placement already chosen by `plan`.
 ///
@@ -104,6 +282,123 @@ struct PlainObjectEmitter<'a, R: Read + Seek + 'static> {
         ),
     >,
     encryption: crate::writer::encryption_state::WriterEncryptionState,
+}
+
+struct LiveObjectEmitter<'a, R: Read + Seek + 'static> {
+    pdf: &'a mut Pdf<R>,
+    options: &'a WriterOptions,
+    bytes: &'a mut Vec<u8>,
+    layout: &'a mut BodyLayout,
+    queue: RefCell<LiveQueue>,
+    root_source: Option<ObjectRef>,
+    version: &'a str,
+    final_extension_level: i64,
+    removed_refs: BTreeSet<ObjectRef>,
+    lengths: BTreeMap<u32, usize>,
+    encryption: crate::writer::encryption_state::WriterEncryptionState,
+}
+
+impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
+    for LiveObjectEmitter<'a, R>
+{
+    type ObjectStreamContainer = ();
+
+    fn object_stream_container(&self, _object: ObjectRef) -> Option<()> {
+        None
+    }
+
+    // cov:ignore-start: Disable's live owner never exposes an object-stream container.
+    fn write_object_stream(&mut self, _object: &ObjectHandle, (): ()) -> crate::Result<()> {
+        Err(crate::Error::Internal(
+            "plain Disable live queue received an object-stream container".to_string(),
+        ))
+    }
+    // cov:ignore-end
+
+    fn indicate_progress(&mut self) -> crate::Result<()> {
+        crate::writer::report_progress_event(self.options)
+    }
+
+    fn output_number(&self, object: ObjectRef) -> crate::Result<u32> {
+        self.queue
+            .borrow()
+            .old_to_new
+            .get(&object)
+            .map(|output| output.number)
+            // cov:ignore-start: queue insertion precedes emission, so every emitted source is mapped.
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "plain live writer: reference {} {} R absent from queue",
+                    object.number, object.generation
+                ))
+            })
+        // cov:ignore-end
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> crate::Result<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn output_count(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn xref(&mut self) -> &mut BTreeMap<u32, (u16, usize)> {
+        &mut self.layout.uncompressed
+    }
+
+    fn lengths(&mut self) -> &mut BTreeMap<u32, usize> {
+        &mut self.lengths
+    }
+
+    fn encryption_state(&mut self) -> &mut crate::writer::encryption_state::WriterEncryptionState {
+        &mut self.encryption
+    }
+
+    fn unparse_object(
+        &mut self,
+        object: &ObjectHandle,
+        _in_object_stream: bool,
+    ) -> crate::Result<()> {
+        let mut map = |child: &ObjectHandle| {
+            self.queue
+                .borrow_mut()
+                .enqueue_handle(self.pdf, child.clone())?
+                // cov:ignore-start: dynamic child callbacks run only after the removed/direct filters.
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(
+                        "plain live writer: child is direct or removed".to_string(),
+                    )
+                })
+            // cov:ignore-end
+        };
+        if self.root_source == object.object_ref() {
+            object.write_root_object_with_dynamic_ref_map(
+                self.bytes,
+                &mut map,
+                &self.removed_refs,
+                self.version,
+                self.final_extension_level,
+            )?; // cov:ignore: LLVM attributes root emission's call terminator to callback cleanup.
+        } else if object.as_stream_dict().is_some() {
+            let (dict, data, dictionary_options) = canonical_stream_output(object, self.options)?;
+            dict.write_stream_body_with_dynamic_ref_map(
+                self.bytes,
+                dictionary_options,
+                &mut map,
+                &self.removed_refs,
+            )?; // cov:ignore: LLVM attributes stream dictionary emission's call terminator to callback cleanup.
+            serialize::write_stream_payload(
+                self.bytes,
+                &data,
+                self.options.newline_before_endstream,
+            );
+        } else {
+            object.write_object_with_dynamic_ref_map(self.bytes, &mut map, &self.removed_refs)?;
+        }
+        Ok(())
+    }
 }
 
 impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
@@ -1312,7 +1607,7 @@ mod object_emitter_tests {
     fn a_new_source_missing_from_the_frozen_plan_fails_before_open_object() {
         // The existing planner backend remains frozen until the live queue
         // cutover. Its lookup error must cross the shared owner unchanged.
-        let mut pdf = pdf();
+        let mut pdf = super::object_emitter_tests::pdf();
         let plan = PlainWritePlan::build(&mut pdf, &WriterOptions::default()).unwrap();
         let object = pdf
             .make_indirect_from_object_handle(ObjectHandle::integer(42))
@@ -1456,5 +1751,68 @@ mod object_emitter_tests {
                 .windows(b"/Extends".len())
                 .any(|window| window == b"/Extends"));
         });
+    }
+
+    #[test]
+    fn live_queue_checks_owner_deduplicates_and_walks_direct_seed_containers() -> crate::Result<()>
+    {
+        let mut local_pdf = super::object_emitter_tests::pdf();
+        let mut foreign_pdf = super::object_emitter_tests::pdf();
+        let foreign = foreign_pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .unwrap();
+        let mut queue = LiveQueue::new(BTreeSet::new());
+        let error = queue
+            .enqueue_handle(&local_pdf, foreign)
+            .expect_err("foreign live handles must be rejected");
+        assert!(error.to_string().contains("different QPDF"));
+
+        let child = local_pdf
+            .make_indirect_object_handle(ObjectHandle::integer(42))
+            .unwrap();
+        let child_ref = child.object_ref().unwrap();
+        let mut removed_queue = LiveQueue::new([child_ref].into_iter().collect());
+        assert_eq!(
+            removed_queue.enqueue_handle(&local_pdf, child.clone())?,
+            None
+        );
+
+        let output_ref = queue.enqueue_handle(&local_pdf, child.clone())?;
+        assert_eq!(output_ref, Some(ObjectRef::new(1, 0)));
+        assert_eq!(queue.enqueue_handle(&local_pdf, child.clone())?, output_ref);
+        assert_eq!(
+            queue.pop().and_then(|handle| handle.object_ref()),
+            Some(child_ref)
+        );
+        assert!(queue.pop().is_none());
+
+        let direct_array = ObjectHandle::array(vec![child.clone(), ObjectHandle::null()]);
+        let mut seeds = Vec::new();
+        collect_live_seed_handles(&mut local_pdf, &direct_array, &mut seeds)?;
+        assert_eq!(seeds.len(), 1);
+        assert!(seeds[0].is_same_object_as(&child));
+        let direct_dictionary = ObjectHandle::dictionary(vec![
+            (b"/Child".to_vec(), child.clone()),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+        ]);
+        seeds.clear();
+        collect_live_seed_handles(&mut local_pdf, &direct_dictionary, &mut seeds)?;
+        assert_eq!(seeds.len(), 1);
+        assert!(seeds[0].is_same_object_as(&child));
+
+        local_pdf
+            .trailer()
+            .replace_key(b"/DecodeParms", ObjectHandle::integer(1))?;
+        let root_source = local_pdf.root_ref();
+        let body = emit_live_disable(
+            &mut local_pdf,
+            &WriterOptions::default(),
+            "1.4",
+            0,
+            root_source,
+            BTreeSet::new(),
+        )?; // cov:ignore: LLVM attributes the live-body test call terminator to callback cleanup.
+        assert!(!body.bytes.is_empty());
+        Ok(())
     }
 }

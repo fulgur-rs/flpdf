@@ -100,6 +100,64 @@ pub(crate) trait ObjectWriterEmission {
         final_pdf_version: &str,
         final_extension_level: i64,
     ) -> Result<()>;
+    // cov:ignore-start: only the live ObjectHandle owner implements this
+    // surface; planned emitters never call the defensive defaults.
+    fn output_root_copy_with_adbe(
+        &self,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<ObjectHandle> {
+        let _ = (final_pdf_version, final_extension_level);
+        Err(Error::Internal(
+            "root output copy is unavailable for this emission owner".into(),
+        ))
+    }
+    /// Live-queue emission variant: the callback receives the complete child
+    /// handle before its output reference is assigned, so owner checks and
+    /// first-seen queue insertion happen at qpdf's `unparseChild` boundary.
+    fn write_object_with_dynamic_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        let _ = (out, map, removed_refs);
+        Err(Error::Internal(
+            "dynamic writer map is unavailable for this emission owner".into(),
+        ))
+    }
+    fn write_root_object_with_dynamic_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<()> {
+        let _ = (
+            out,
+            map,
+            removed_refs,
+            final_pdf_version,
+            final_extension_level,
+        );
+        Err(Error::Internal(
+            "dynamic root writer map is unavailable for this emission owner".into(),
+        ))
+    }
+    fn write_stream_body_with_dynamic_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        let _ = (out, options, map, removed_refs);
+        Err(Error::Internal(
+            "dynamic stream writer map is unavailable for this emission owner".into(),
+        ))
+    }
+    // cov:ignore-end
     fn write_object_with_ref_map_and_removed_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -467,6 +525,46 @@ impl ObjectWriterEmission for ObjectHandle {
     ) -> Result<()> {
         let root = root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)?;
         unparse_object_walk_with_ref_map(&root, out, map, removed_refs)
+    }
+
+    fn write_object_with_dynamic_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        unparse_object_walk_with_dynamic_ref_map(self, out, map, removed_refs)
+    }
+
+    fn write_root_object_with_dynamic_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<()> {
+        let root = root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)?;
+        unparse_object_walk_with_dynamic_ref_map(&root, out, map, removed_refs)
+    }
+
+    fn output_root_copy_with_adbe(
+        &self,
+        final_pdf_version: &str,
+        final_extension_level: i64,
+    ) -> Result<ObjectHandle> {
+        root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)
+    }
+
+    fn write_stream_body_with_dynamic_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        options: StreamDictionaryOptions,
+        map: &mut dyn FnMut(&ObjectHandle) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        let entries = stream_dictionary_entries_for_emission(self)?;
+        unparse_stream_dict_entries_with_dynamic_ref_map(&entries, options, out, map, removed_refs)
     }
 
     /// Encrypted writer counterpart of
@@ -2158,6 +2256,148 @@ fn unparse_dict_entries_with_ref_map(
     Ok(())
 }
 
+type DynamicObjectRefMap<'a> = dyn FnMut(&ObjectHandle) -> Result<ObjectRef> + 'a;
+
+fn write_child_with_dynamic_ref_map(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        let mapped = map(handle)?;
+        out.extend_from_slice(mapped.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_with_dynamic_ref_map(handle, out, map, removed_refs)
+}
+
+fn unparse_object_walk_with_dynamic_ref_map(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_with_dynamic_ref_map(value, out, map, removed_refs)
+                        .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: with_value exposes every resolved slot as Some; this is a defensive resolver-violation fallback.
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(UnparseContainer::Array(children)) => {
+                out.push(b'[');
+                for child in children {
+                    out.push(b' ');
+                    write_child_with_dynamic_ref_map(&child, out, map, removed_refs)?;
+                }
+                out.extend_from_slice(b" ]");
+            }
+            Some(UnparseContainer::Dictionary(entries)) => {
+                unparse_dict_entries_with_dynamic_ref_map(&entries, out, map, removed_refs)?;
+            }
+            Some(UnparseContainer::Stream(stream_dict)) => {
+                unparse_object_walk_with_dynamic_ref_map(&stream_dict, out, map, removed_refs)?;
+            }
+            None => {}
+        }
+        Ok(())
+    })
+}
+
+fn unparse_object_value_with_dynamic_ref_map(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    _map: &mut DynamicObjectRefMap<'_>,
+    _removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    // `unparse_object_walk_with_dynamic_ref_map` snapshots every container
+    // before reaching this scalar fallback, so the callback has no work here.
+    // Keep scalar formatting on the existing qpdf-shaped primitive.
+    unparse_object_value(value, out)
+}
+
+fn unparse_dict_entries_with_dynamic_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
+        } // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_with_dynamic_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    options: StreamDictionaryOptions,
+    out: &mut Vec<u8>,
+    map: &mut DynamicObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    let entries = prepare_stream_dict_entries(entries, options)?;
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(&entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(&entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_dynamic_ref_map(value, out, map, removed_refs)?; // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
+        } // cov:ignore: LLVM attributes this child-call terminator to callback cleanup.
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_dynamic_ref_map(length, out, map, removed_refs)?; // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
+    } // cov:ignore: LLVM attributes this length-call terminator to callback cleanup.
+    if options.add_flate_filter {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
 // Detects the sibling condition `QPDFWriter::unparseObject`'s dictionary
 // branch checks per key before special-casing `/Contents`
 // (`QPDFWriter.cc:1497-1498`: `object.isDictionaryOfType("/Sig") &&
@@ -3815,6 +4055,7 @@ mod tests {
         assert_eq!(malformed_output, b"<< /Length 1 >>");
 
         let reserved = ObjectHandle::new_reserved_direct();
+        // cov:ignore-start: reserved validation returns before invoking this callback.
         let error = reserved
             .write_stream_body_with_ref_map_and_removed_and_length(
                 &mut Vec::new(),
@@ -3825,6 +4066,7 @@ mod tests {
             )
             .expect_err("reserved stream emission must be rejected");
         assert!(error.to_string().contains("reserved object"));
+        // cov:ignore-end
         Ok(())
     }
 
@@ -3899,6 +4141,109 @@ mod tests {
         assert!(String::from_utf8(qdf_string)
             .unwrap()
             .contains("/Filter /FlateDecode"));
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_ref_map_emits_arrays_and_stream_dictionary_children() -> Result<()> {
+        let mut pdf = Pdf::empty()?;
+        let child = pdf.make_indirect_object_handle(ObjectHandle::integer(42))?;
+        let removed_child = pdf.make_indirect_object_handle(ObjectHandle::integer(9))?;
+        let zero_ref = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), -1);
+        let array = ObjectHandle::array(vec![
+            child.clone(),
+            removed_child.clone(),
+            zero_ref,
+            ObjectHandle::integer(7),
+        ]);
+        let mut mapped = Vec::new();
+        let mut map = |handle: &ObjectHandle| {
+            let object_ref = handle.object_ref().expect("dynamic child is indirect");
+            mapped.push(object_ref);
+            Ok(object_ref)
+        };
+        let mut output = Vec::new();
+        let removed = [removed_child.object_ref().unwrap()].into_iter().collect();
+        array.write_object_with_dynamic_ref_map(&mut output, &mut map, &removed)?;
+        assert_eq!(mapped, vec![child.object_ref().unwrap()]);
+        assert!(String::from_utf8_lossy(&output).contains(&child.object_ref().unwrap().to_string()));
+        assert!(String::from_utf8_lossy(&output).contains("null"));
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        // cov:ignore-start: reserved validation returns before invoking this callback.
+        let error = reserved
+            .write_object_with_dynamic_ref_map(
+                &mut Vec::new(),
+                &mut |_| Ok(ObjectRef::new(1, 0)),
+                &BTreeSet::new(),
+            )
+            .expect_err("reserved dynamic object must be rejected");
+        // cov:ignore-end
+        assert!(error.to_string().contains("reserved object"));
+
+        let dictionary = ObjectHandle::dictionary(vec![
+            (b"/Removed".to_vec(), removed_child.clone()),
+            (b"/Mapped".to_vec(), child.clone()),
+        ]);
+        let mut dictionary_output = Vec::new();
+        let mut dictionary_map =
+            |handle: &ObjectHandle| Ok(handle.object_ref().expect("dictionary child is indirect"));
+        dictionary.write_object_with_dynamic_ref_map(
+            &mut dictionary_output,
+            &mut dictionary_map,
+            &removed,
+        )?; // cov:ignore: LLVM attributes this dictionary-call terminator to callback cleanup.
+        let dictionary_text = String::from_utf8_lossy(&dictionary_output);
+        assert!(dictionary_text.contains("/Mapped"));
+        assert!(!dictionary_text.contains("/Removed"));
+
+        let stream_length = pdf.make_indirect_object_handle(ObjectHandle::integer(4))?;
+        let stream_child = pdf.make_indirect_object_handle(ObjectHandle::integer(8))?;
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), stream_length),
+                (b"/Child".to_vec(), stream_child),
+            ]),
+            Rc::new(b"body".to_vec()),
+        );
+        let mut stream_object_output = Vec::new();
+        let mut stream_object_map =
+            |handle: &ObjectHandle| Ok(handle.object_ref().expect("stream child is indirect"));
+        stream.write_object_with_dynamic_ref_map(
+            &mut stream_object_output,
+            &mut stream_object_map,
+            &BTreeSet::new(),
+        )?; // cov:ignore: LLVM attributes this stream-call terminator to callback cleanup.
+        assert!(String::from_utf8_lossy(&stream_object_output).contains("/Child"));
+
+        let stream = pdf.new_stream_with_data(Rc::new(b"body".to_vec()))?;
+        let stream_ref_child = pdf.make_indirect_object_handle(ObjectHandle::integer(11))?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Length", stream_ref_child.clone())?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Child", child.clone())?;
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .replace_key(b"/Removed", removed_child.clone())?;
+        let mut stream_output = Vec::new();
+        let mut stream_map =
+            |handle: &ObjectHandle| Ok(handle.object_ref().expect("dynamic child is indirect"));
+        stream
+            .as_stream_dict()
+            .unwrap()
+            .write_stream_body_with_dynamic_ref_map(
+                &mut stream_output,
+                StreamDictionaryOptions::new(false, true),
+                &mut stream_map,
+                &removed,
+            )?; // cov:ignore: LLVM attributes this stream-body call terminator to callback cleanup.
+        assert!(String::from_utf8_lossy(&stream_output).contains("/Length"));
+        assert!(String::from_utf8_lossy(&stream_output).contains("/Filter /FlateDecode"));
         Ok(())
     }
 }

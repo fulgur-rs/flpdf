@@ -63,3 +63,36 @@ fn progress_callback_stream_replacement_invalidates_the_planned_payload() {
         .windows(b"before".len())
         .any(|window| window == b"before"));
 }
+
+#[test]
+fn progress_callback_attaches_a_new_indirect_child_to_the_live_root() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/one-page-no-ext.pdf").to_vec(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+    let child = pdf
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/ProgressChild".to_vec(),
+            ObjectHandle::integer(42),
+        )]))
+        .unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_static_id(true);
+    writer.set_output_memory().unwrap();
+    writer.register_progress_reporter(Box::new(move |percent| {
+        if percent == 0 {
+            root.replace_key(b"/ProgressProbeRef", child.clone())?;
+        }
+        Ok(())
+    }));
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
+    assert!(output
+        .windows(b"/ProgressProbeRef".len())
+        .any(|window| window == b"/ProgressProbeRef"));
+    assert!(output
+        .windows(b"/ProgressChild 42".len())
+        .any(|window| window == b"/ProgressChild 42"));
+}
