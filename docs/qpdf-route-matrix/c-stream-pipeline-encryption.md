@@ -431,13 +431,19 @@ C44 は public facade と deferred blob provider の責務を追跡する行と�
   持たない。CLI consumer の移行後に metadata / classifier を削除する。
 
 C7 の `prepare_stream_filter_plan` は `.48.37` で `object_warning` から
-`stream_data_warning`（`object_handle.rs:6717,6722,6755`）へ移行済み。qpdf の
-`QPDF_Stream::warn`（`QPDF_Stream.cc:694-698`）は parsed offset 経路であり、
-test 0 の手製診断を撤去する前提となる malformed `/Filter` / `/DecodeParms` の
-warning は実機 qpdf 11.9.0 と一致することを確認済み。
+`stream_data_warning`（`object_handle.rs:6721,6726,6759`）へ移行済み。qpdf の
+`QPDF_Stream::warn`（`QPDF_Stream.cc:695-698`）は `QPDF::warn(..., parsed_offset, ...)`
+へ流す唯一の private helper で、`filterable` の malformed `/Filter` / `/DecodeParms`
+warning（`QPDF_Stream.cc:413,459`）も `pipeStreamData` の codec / content-normalization
+warning も同じ経路を共有する。実機 qpdf 11.9.0 と `(offset N): stream filter type is
+not name or array` まで一致することを確認済み。
+**この移行により C7 を `mixed` としていた診断分裂は解消した**が、C7 は引き続き `mixed`
+— 理由は診断ではなく責務の重複で、同じ `QPDF_Stream::filterable`（`QPDF_Stream.cc:386-461`）
+の spec 読み取りを C9 の `stream_filter.rs::decode_filter_specs_from_handle` が
+production 経路として別実装で持つ。C9 の consumer が C7 へ寄るまで `mixed` のまま。
 C10 の runtime `registerStreamFilter` 欠落は、`match` という入れ物だけでは説明できない
 public 契約の欠落。C21 の `/F` / `/FFilter` / `/FDecodeParms` 削除も現在
-`writer/plain/body.rs:861-865` に残る。C7/C21はこの診断分裂・責務混在によりmixedへ訂正した。
+`writer/plain/body.rs:861-865` に残る。C21 はこの診断分裂・責務混在により `mixed` へ訂正した（C7 は上記のとおり、診断分裂の解消後も C9 との責務重複で `mixed` を維持）。
 C10のcanonicalはbuilt-in lookupに限定し、runtime登録の公開契約は別issueで移植する。
 
 ## unknown / probe
