@@ -1255,6 +1255,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn content_refs_resolve_an_indirect_array_without_resolving_children() {
+        let mut pdf = one_page_pdf();
+        let contents_ref = ObjectRef::new(99, 0);
+        let child_ref = ObjectRef::new(100, 0);
+        let child = pdf.get_object_handle(child_ref);
+        pdf.replace_object(contents_ref, ObjectHandle::array(vec![child]))
+            .expect("install indirect contents array");
+
+        let contents = pdf.get_object_handle(contents_ref);
+        assert_eq!(
+            collect_content_refs(&contents).expect("collect indirect contents"),
+            vec!["100 0 R"]
+        );
+    }
+
+    #[test]
+    fn crypt_filter_projection_uses_resolving_handle_accessors_for_fallbacks() {
+        let mut revision_default = std::collections::BTreeMap::new();
+        revision_default.insert(b"/R".to_vec(), ObjectHandle::integer(5));
+        assert_eq!(
+            cf_method_string(&revision_default, None).expect("revision default"),
+            "AESv3"
+        );
+
+        let mut missing_cf = std::collections::BTreeMap::new();
+        missing_cf.insert(b"/R".to_vec(), ObjectHandle::integer(4));
+        assert_eq!(
+            cf_method_string(&missing_cf, Some("StdCF")).expect("missing CF fallback"),
+            "AESv2"
+        );
+
+        let mut empty_cf = std::collections::BTreeMap::new();
+        empty_cf.insert(b"/R".to_vec(), ObjectHandle::integer(2));
+        empty_cf.insert(b"/CF".to_vec(), ObjectHandle::dictionary(Vec::new()));
+        assert_eq!(
+            cf_method_string(&empty_cf, Some("StdCF")).expect("empty CF fallback"),
+            "RC4"
+        );
+
+        let unknown_filter = ObjectHandle::dictionary(vec![(
+            b"CFM".to_vec(),
+            ObjectHandle::name(b"Unknown".to_vec()),
+        )]);
+        let unknown_cf = ObjectHandle::dictionary(vec![(b"StdCF".to_vec(), unknown_filter)]);
+        let mut unknown_method = std::collections::BTreeMap::new();
+        unknown_method.insert(b"/R".to_vec(), ObjectHandle::integer(2));
+        unknown_method.insert(b"/CF".to_vec(), unknown_cf);
+        assert_eq!(
+            cf_method_string(&unknown_method, Some("StdCF")).expect("unknown CFM fallback"),
+            "RC4"
+        );
+
+        let empty_filter = ObjectHandle::dictionary(Vec::new());
+        let empty_filter_cf = ObjectHandle::dictionary(vec![(b"StdCF".to_vec(), empty_filter)]);
+        let mut missing_cfm = std::collections::BTreeMap::new();
+        missing_cfm.insert(b"/R".to_vec(), ObjectHandle::integer(4));
+        missing_cfm.insert(b"/CF".to_vec(), empty_filter_cf);
+        assert_eq!(
+            cf_method_string(&missing_cfm, Some("StdCF")).expect("missing CFM fallback"),
+            "AESv2"
+        );
+    }
+
     fn one_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/compat/one-page.pdf");
