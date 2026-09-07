@@ -882,7 +882,14 @@ mod tests {
         .expect_err("closed input source must make the later root lookup fail");
 
         assert!(stdout.is_empty());
-        assert_eq!(error.to_string(), "unable to find /Root dictionary");
+        assert!(matches!(
+            &error,
+            flpdf::Error::QpdfExc(warning)
+                if warning.get_filename() == b"closed input source"
+                    && warning.get_object().is_empty()
+                    && warning.get_file_position() == 0
+                    && warning.get_message_detail() == b"unable to find /Root dictionary"
+        ));
         assert_eq!(
             stderr,
             b"getRoot: attempted to dereference an uninitialized QPDFObjectHandle\n\
