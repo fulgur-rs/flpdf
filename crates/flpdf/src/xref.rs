@@ -5551,6 +5551,36 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn canonical_classic_read_trailer_reports_qpdf_stream_warning() {
+        let (mut bytes, _) = classic_xref_with_trailer("<< /Size 1 >> stream");
+        bytes.extend_from_slice(b"\n");
+        let warning_offset = bytes
+            .windows(b"stream".len())
+            .rposition(|window| window == b"stream")
+            .expect("stream token")
+            + b"stream".len();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 8);
+        let state = load_xref_state_from_bytes(
+            &bytes,
+            XrefLoadOptions {
+                description: b"canonical-stream-trailer.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            Some(resolver.as_ref()),
+        )
+        .expect("the canonical owner must use the shared classic trailer route");
+        let warning = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .find(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
+            .expect("canonical stream warning");
+        assert_eq!(warning.get_object(), b"trailer");
+        assert_eq!(warning.get_file_position(), warning_offset as i64);
+    }
+
+    #[test]
     fn reconstructed_read_trailer_attributes_empty_candidate_to_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
         let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
