@@ -6078,6 +6078,7 @@ mod final_handle_tests {
         ) -> Result<(ObjectHandle, Option<u64>)> {
             self.diagnostics.borrow_mut().push(damaged_warning(
                 b"synthetic.pdf",
+                b"",
                 "synthetic canonical read failure",
                 Some(0),
             ));
@@ -6397,6 +6398,7 @@ mod final_handle_tests {
         )]));
         loaded.loaded.repair_diagnostics.push(damaged_warning(
             b"existing.pdf",
+            b"",
             "existing warning",
             None,
         ));
