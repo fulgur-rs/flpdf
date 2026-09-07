@@ -232,6 +232,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/fulgur-rs/flpdf/compare/v0.5.1...v0.5.2) - 2026-09-07
+
+### Added
+
+- *(writer)* share qpdf trailer emission contract
+- add structured qpdf exception primitive
+- port qpdf UTF-8 utility
+- port qpdf integer base formatting
+- port qpdf safe_fopen utility
+- port qpdf memory-file recovery lifecycle
+
+### Fixed
+
+- *(content)* honor qpdf Form pipe false contract
+- *(job)* preserve auto password diagnostic order
+- *(reader)* preserve qpdf promotion and shared value identity
+- *(writer)* keep the writer-owned /Root out of source trailer filtering
+- *(writer)* return space_before_zero at the header newline
+- *(writer)* centralize classic xref table emission
+- *(linearization)* normalize extra header separator
+- *(check)* match qpdf parsing diagnostics
+- *(reader)* keep unnamed-input described stream warnings paren-free
+- *(reader)* preserve qpdf description after indirect length resolution
+- *(linearization)* reuse loaded hint data during show
+- *(overlay)* match qpdf QDF allocation order
+- *(acroform)* preserve qpdf stream warning descriptions
+- *(engine)* parse a processed memory file under the existing document identity
+- *(qutil)* match qpdf's stream and strerror rendering in the ported helpers
+- align test 61 with qpdf process and canonical types
+
+### Other
+
+- *(content)* clarify legacy pipe overload
+- Merge pull request #1602 from fulgur-rs/feature/flpdf-3yn9-48-64
+- Merge pull request #1601 from fulgur-rs/feature/flpdf-hv7d-1
+- Merge pull request #1600 from fulgur-rs/feature/flpdf-2yq5
+- *(flatten)* follow renumbered appearance via page /Resources/XObject
+- *(flatten)* verify written appearance form subtype
+- Merge pull request #1598 from fulgur-rs/feature/flpdf-innn
+- Merge pull request #1596 from fulgur-rs/feature/flpdf-lkat
+- Merge pull request #1595 from fulgur-rs/feature/flpdf-940i
+- Merge pull request #1593 from fulgur-rs/feature/flpdf-o8fm
+- Merge pull request #1594 from fulgur-rs/refactor/flpdf-3yn9-48-46
+- Merge pull request #1592 from fulgur-rs/feature/flpdf-3yn9-48-20
+- *(object-handle)* cover JSON resolution after re-promotion
+- *(object-handle)* remove redundant assignment ownership walk
+- *(reader)* expose makeIndirectObject alias and promotion differences
+- *(reader)* verify provider remains usable after candidate traversal
+- *(reader)* own qpdf compressible object traversal
+- *(reader)* reproduce stale-generation handle removal gap
+- Merge pull request #1586 from fulgur-rs/feature/flpdf-3yn9-48-62
+- Merge pull request #1587 from fulgur-rs/refactor/flpdf-3yn9-48-2
+- Merge pull request #1583 from fulgur-rs/feature/flpdf-3yn9-48-55
+- Merge pull request #1585 from fulgur-rs/feature/flpdf-3yn9-48-50
+- Merge pull request #1584 from fulgur-rs/feature/flpdf-3yn9-48-56
+- *(writer)* mark direct-root coverage fixture
+- *(writer)* annotate unreachable coverage callbacks
+- *(writer)* cover trailer filtering branches
+- *(writer)* cover shared trailer route boundaries
+- *(writer)* route plain trailer through shared owner
+- *(writer)* require live trailer owner in plain xref
+- *(writer)* pin shared qpdf trailer forms
+- Merge pull request #1581 from fulgur-rs/refactor/flpdf-3yn9-48-36
+- name qpdf what case tuple
+- Merge pull request #1578 from fulgur-rs/refactor/flpdf-3yn9-48-40
+- remove legacy JSON stream payload routes
+- Merge pull request #1577 from fulgur-rs/refactor/flpdf-3yn9-48-39
+- Merge pull request #1576 from fulgur-rs/feature/flpdf-3yn9-48-57
+- *(writer)* document xref overload shape
+- remove inert removed-object snapshot state
+- Merge pull request #1571 from fulgur-rs/feature/flpdf-25kg-45-parsing
+- *(check)* cover parsing error paths
+- Merge pull request #1567 from fulgur-rs/feature/flpdf-25kg-44-attachments
+- Merge pull request #1561 from fulgur-rs/feature/flpdf-atdi
+- cover qtest exception parity primitives
+
 ## [0.5.1](https://github.com/fulgur-rs/flpdf/compare/v0.5.0...v0.5.1) - 2026-09-06
 
 ### Added
