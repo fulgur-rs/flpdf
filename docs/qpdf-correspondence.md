@@ -1597,6 +1597,22 @@ CLI probes.
 
 ### coalesceContentStreams correspondence
 
+### Form pipe/filter overload contract (`flpdf-3yn9.48.66`)
+
+`QPDFPageObjectHelper::pipeContents` (`libqpdf/QPDFPageObjectHelper.cc:518-524`)
+and `QPDFObjectHandle::filterAsContents`
+(`libqpdf/QPDFObjectHandle.cc:1762-1767`) call the legacy
+`pipeStreamData` overload and intentionally ignore its boolean result. The
+overall-success boolean from the qpdf 10+ overload is distinct from
+`filtering_attempted` (`QPDFObjectHandle.cc:1301-1341`); a false result is not
+an exception on these Form routes. Provider/source/pipeline exceptions still
+propagate, while `pipeContentStreams` retains its explicit false-to-damaged
+content error (`QPDFObjectHandle.cc:1709-1737`). flpdf mirrors this through
+`ObjectHandle::filter_as_contents` and the Form branch of
+`PageObjectHelper::pipe_contents`; regression coverage exercises false,
+provider-error, unknown-filter, filter-setter, and sink-error boundaries
+against the pinned qpdf 11.9.0 probe.
+
 ### qtest document-construction helper ports (`flpdf-egzr.5`)
 
 `flpdf-qtest-tools::document_construction` ports the two qpdf test programs

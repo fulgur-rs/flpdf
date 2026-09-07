@@ -1270,22 +1270,19 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let (target, is_form) = self.resolved_attribute_target()?;
         if is_form {
             let mut filtering_attempted = false;
-            let succeeded = target.pipe_stream_data(
+            // QPDFPageObjectHelper::pipeContents calls the legacy
+            // pipeStreamData overload for Forms and ignores its bool. Only
+            // provider/source/sink errors cross this Result boundary; a
+            // false overall result is a valid no-op for this overload.
+            target.pipe_stream_data(
                 pipeline,
                 &mut filtering_attempted,
                 0,
                 DecodeLevel::Specialized,
                 false,
                 false,
-            )?; // cov:ignore: a failed Form provider is represented by succeeded=false; this is only the defensive provider-error edge
-            if succeeded {
-                Ok(())
-            } else {
-                Err(Error::Unsupported(format!(
-                    "object {}: errors while decoding content stream",
-                    object_handle_description(&target)
-                )))
-            }
+            )?;
+            Ok(())
         } else {
             target.pipe_page_contents(pipeline)
         }

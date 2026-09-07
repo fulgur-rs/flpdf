@@ -1,4 +1,4 @@
-use flpdf::{pipeline::PlString, DecodeLevel, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{pipeline::PlString, DecodeLevel, ObjectHandle, ObjectRef, PageObjectHelper, Pdf};
 use std::rc::Rc;
 
 fn stream(data: &[u8]) -> ObjectHandle {
@@ -162,6 +162,56 @@ fn pipe_page_contents_reports_a_provider_decode_failure_at_the_stream_boundary()
         error.to_string(),
         "unsupported PDF feature: content stream object 4 0: errors while decoding content stream"
     );
+}
+
+#[test]
+fn form_pipe_contents_ignores_an_unsuccessful_stream_pipe_like_qpdf() {
+    let mut pdf = Pdf::empty().unwrap();
+    let form = pdf.new_stream().unwrap();
+    let dictionary = form.as_stream_dict().unwrap();
+    dictionary
+        .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+        .unwrap();
+    dictionary
+        .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+        .unwrap();
+    form.replace_stream_data_with_retry_callback(|_, _, _| Ok(false), None, None)
+        .unwrap();
+
+    let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+    let mut output = Vec::new();
+    let mut pipeline = PlString::new("form content output", None, &mut output);
+    helper
+        .pipe_contents(&mut pipeline)
+        .expect("qpdf ignores false from Form pipeStreamData");
+    assert!(output.is_empty());
+}
+
+#[test]
+fn form_pipe_contents_propagates_provider_errors() {
+    let mut pdf = Pdf::empty().unwrap();
+    let form = pdf.new_stream().unwrap();
+    let dictionary = form.as_stream_dict().unwrap();
+    dictionary
+        .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+        .unwrap();
+    dictionary
+        .replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))
+        .unwrap();
+    form.replace_stream_data_with_callback(
+        |_| Err(flpdf::Error::System("provider failure".to_owned())),
+        None,
+        None,
+    )
+    .unwrap();
+
+    let mut helper = PageObjectHelper::from_object_handle(form, &mut pdf);
+    let mut output = Vec::new();
+    let mut pipeline = PlString::new("form content output", None, &mut output);
+    let error = helper
+        .pipe_contents(&mut pipeline)
+        .expect_err("provider exceptions must cross Form pipeContents");
+    assert_eq!(error.to_string(), "provider failure");
 }
 
 #[test]
