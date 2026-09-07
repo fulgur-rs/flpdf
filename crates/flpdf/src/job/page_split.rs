@@ -33,10 +33,13 @@
 //! - Each number is zero-padded to the digit-width of the **source page
 //!   count** (NOT the chunk count).  For 1–9 pages: no padding (width=1);
 //!   for 10–99 pages: width=2; for 100–999 pages: width=3, etc.
-//! - The extension (including the `.`) comes after the page number(s). If
-//!   the template has no extension, no `.` is added.
-//! - The split is at the **last** `.` in the filename portion of the path
-//!   (confirmed with `two.dots.pdf` → `two.dots-1-2.pdf`).
+//! - For a template ending in `.pdf`, the extension (including the `.`) comes
+//!   after the page number(s). For any other template, no extension is split
+//!   out and the suffix is appended directly.
+//! - Only a case-insensitive trailing `.pdf` is treated as an extension. Any
+//!   other suffix remains part of the template filename (`out.txt` →
+//!   `out.txt-1-2`). A valid PDF suffix is separated after the last dot
+//!   (`two.dots.pdf` → `two.dots-1-2.pdf`).
 
 use super::resource_pruning::{
     shared_resource_finding_message, should_remove_unreferenced_resources_with_report,
@@ -435,8 +438,9 @@ fn chunk_output_path(
 ///
 /// # Naming rule (observed with qpdf 11.9.0)
 ///
-/// - Split at the *last* `.` in the filename component.
-/// - If no `.` exists, append the page range suffix directly (no extension).
+/// - Split only a case-insensitive trailing `.pdf` in the filename component.
+/// - For any other suffix, append the page range suffix to the whole filename
+///   (for example, `out.txt` becomes `out.txt-1-2`).
 /// - Zero-pad `first` and `last` to `width` digits (width = digit count of
 ///   source page count, not chunk count).
 ///
@@ -475,12 +479,16 @@ fn split_template(template: &Path) -> (&Path, Vec<u8>, Vec<u8>) {
         .map(path_component_bytes)
         .unwrap_or_default();
 
-    let (stem, ext) = match filename.iter().rposition(|byte| *byte == b'.') {
-        Some(dot_pos) => {
+    let (stem, ext) = if filename.len() >= 4 {
+        let dot_pos = filename.len() - 4;
+        if filename[dot_pos..].eq_ignore_ascii_case(b".pdf") {
             let (s, e) = filename.split_at(dot_pos);
             (s.to_vec(), e.to_vec()) // e includes the leading '.'
+        } else {
+            (filename, Vec::new())
         }
-        None => (filename, Vec::new()),
+    } else {
+        (filename, Vec::new())
     };
     (parent, stem, ext)
 }
@@ -631,6 +639,14 @@ mod tests {
     }
 
     #[test]
+    fn chunk_output_path_non_pdf_extension_stays_in_filename() {
+        assert_eq!(
+            chunk_output_path(Path::new("out.txt"), 2, 2, 1, 1),
+            PathBuf::from("out.txt-2"),
+        );
+    }
+
+    #[test]
     fn chunk_output_path_chunk_size_ge_2_delegates_to_range_form() {
         // chunk_size >= 2 keeps the range form, including a trailing
         // single-page chunk (out-3-3.pdf) — must match split_output_path.
@@ -650,6 +666,30 @@ mod tests {
         assert_eq!(
             split_output_path(Path::new("out.pdf"), 1, 2, 1),
             PathBuf::from("out-1-2.pdf"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_non_pdf_extension_stays_in_filename() {
+        assert_eq!(
+            split_output_path(Path::new("out.txt"), 1, 2, 1),
+            PathBuf::from("out.txt-1-2"),
+        );
+        assert_eq!(
+            split_output_path(Path::new("two.dots.txt"), 3, 3, 1),
+            PathBuf::from("two.dots.txt-3-3"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_pdf_extension_is_case_insensitive() {
+        assert_eq!(
+            split_output_path(Path::new("out.PDF"), 1, 2, 1),
+            PathBuf::from("out-1-2.PDF"),
+        );
+        assert_eq!(
+            split_output_path(Path::new("out.PdF"), 3, 3, 1),
+            PathBuf::from("out-3-3.PdF"),
         );
     }
 
@@ -707,8 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn split_output_path_multiple_dots_splits_at_last() {
-        // "two.dots.pdf" → split at last `.` → "two.dots-1-2.pdf"
+    fn split_output_path_multiple_dots_before_pdf_extension() {
+        // "two.dots.pdf" → split before the trailing PDF extension.
         assert_eq!(
             split_output_path(Path::new("two.dots.pdf"), 1, 2, 1),
             PathBuf::from("two.dots-1-2.pdf"),
