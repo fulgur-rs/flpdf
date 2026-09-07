@@ -2036,11 +2036,15 @@ impl ContentHandleResolver {
 }
 
 impl HandleResolver for ContentHandleResolver {
+    // cov:ignore-start: content-stream integers always short-circuit to a
+    // scalar before any ref lookahead (QPDFParser.cc:313-320), so this trait
+    // method required by `HandleResolver` is never actually invoked.
     fn indirect_handle(&mut self, _object_ref: ObjectRef) -> ObjectHandle {
         unreachable!(
             "content-stream mode never buffers an integer as a reference candidate (QPDFParser.cc:313-320)"
-        ) // cov:ignore: content-stream integers always short-circuit to a scalar before any ref lookahead
+        )
     }
+    // cov:ignore-end
 
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
         match &self.resolver {
