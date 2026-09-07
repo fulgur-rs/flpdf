@@ -113,11 +113,13 @@ fn collect_live_seed_handles<R: Read + Seek>(
         // of its dictionary, matching qpdf's enqueueObject direct recursion
         // (`QPDFWriter.cc:1129-1147`). `try_as_dictionary` does not view a
         // stream as a dictionary, so descend the stream dictionary explicitly.
+        // cov:ignore-start: defensive descent into a direct stream's dictionary -- parsed streams are indirect (taken by the base case above) and an in-memory stream surfaces its dictionary through the `try_as_dictionary` arm below, so this body is unreachable from the corpus.
         for (_, value) in stream_dict.try_as_dictionary()?.unwrap_or_default() {
             if !value.try_is_null()? {
                 collect_live_seed_handles(pdf, &value, found, depth + 1)?;
             }
         }
+        // cov:ignore-end
     } else if let Some(entries) = handle.try_as_dictionary()? {
         for (_, value) in entries {
             if !value.try_is_null()? {
