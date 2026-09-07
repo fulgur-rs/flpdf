@@ -454,30 +454,6 @@ fn write_with_pdf_writer<R: Read + Seek + 'static>(
     Ok(())
 }
 
-fn write_qpdf_to_memory<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    output: &Path,
-    options: &WriterOptions,
-    chunks_linearized: bool,
-) -> CliResult<Vec<u8>> {
-    let mut writer = PdfWriter::new(pdf);
-    // qpdf's linearized writers clear QDF mode before deriving QDF's
-    // decode/uncompress defaults (`QPDFWriter.cc:2068-2080`). This memory
-    // rewrite is flpdf's internal preparation for split chunks, so when those
-    // chunks will be linearized it must not apply QDF either; otherwise a
-    // `--stream-data=preserve` chunk would lose the source filters the QDF
-    // pass decoded.
-    let intermediate = WriterOptions {
-        qdf: options.qdf && !chunks_linearized,
-        ..options.clone()
-    };
-    configure_pdf_writer(&mut writer, &intermediate, false, None)?;
-    configure_cli_progress(&mut writer, output, options.progress)?;
-    writer.set_output_memory()?;
-    writer.write()?;
-    Ok(writer.get_buffer()?)
-}
-
 // ---------------------------------------------------------------------------
 // qpdf-compatible exit-code infrastructure
 //
@@ -6569,15 +6545,14 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
 
     let split_progress = split_pages_active && options.progress;
     if split_progress {
-        // qpdf creates a fresh writer for each split output. The memory
-        // rewrite is flpdf's internal preparation step and is not an
-        // observable qpdf writer, so it must not consume the progress stream.
+        // qpdf creates a fresh writer for each split output. The source
+        // document does not have a separate observable write step, so only the
+        // per-chunk writers must consume the progress stream.
         options.progress = false;
     }
     if let Some(n) = split_pages.filter(|size| *size > 0) {
-        let bytes = write_qpdf_to_memory(pdf, output, &options, linearize)?;
-        let (_, mut split_job) = split_rewritten_pdf(
-            bytes,
+        let (_, mut split_job) = split_pdf(
+            pdf,
             n,
             output,
             input_path,
@@ -6588,12 +6563,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             remove_unref.into(),
             writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
-        // The intermediate rewrite may already have repaired the condition
-        // that produced a warning in the original source (e.g. --repair's
-        // xref reconstruction) or the source document `pdf` itself, so the
-        // freshly re-opened split source can look clean even though the
-        // original input was not. Fold both signals into the split job
-        // before completing it, matching what the non-split branch's
+        // Preserve any warnings raised while preparing the source before the
+        // split job started, matching the non-split branch's
         // `finish_operation_warnings_with_prior` checks below.
         split_job.record_document_warnings(pdf);
         if prior_warnings {
@@ -6673,16 +6644,15 @@ fn split_pages_active(raw: Option<&str>) -> bool {
     raw.is_some_and(|value| value.parse::<usize>().map_or(true, |size| size > 0))
 }
 
-/// Run qpdf's fresh-document split job on a rewritten in-memory source.
+/// Run qpdf's fresh-document split job on the already-transformed source.
 ///
-/// The page-operation pipeline has already applied its transforms to `bytes`;
-/// the job-level split owns the subsequent per-chunk page copy, naming,
-/// annotation, label, and output-file lifecycle. `input_path` remains the
-/// original command input so the qpdf same-file guard can reject a generated
-/// chunk that would truncate it.
+/// qpdf invokes `doSplitPages` on the same live document after page operations
+/// have completed. Keeping that source document intact preserves its object
+/// identities for QDF `Original object ID` comments and lets each fresh chunk
+/// writer observe the source graph directly.
 #[allow(clippy::too_many_arguments)]
-fn split_rewritten_pdf(
-    bytes: Vec<u8>,
+fn split_pdf<R: Read + Seek + 'static>(
+    source: &mut Pdf<R>,
     chunk_size: usize,
     output: &Path,
     input_path: &Path,
@@ -6696,6 +6666,7 @@ fn split_rewritten_pdf(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_input_name_bytes(path_description(input_path));
     // qpdf never creates a second job for `--split-pages`: `writeQPDF`
     // (`QPDFJob.cc:483-503`) calls `doSplitPages` on `this` and gates
     // "operation succeeded with warnings" on the same `m->suppress_warnings`
@@ -6704,8 +6675,6 @@ fn split_rewritten_pdf(
     // before `split_pages` runs so warnings raised during the split itself
     // are suppressed too, not only the final summary line.
     job.set_suppress_warnings(suppress_warnings);
-    let input_name = input_path.to_string_lossy().into_owned();
-    let mut pdf = job.open(Cursor::new(bytes), input_name, PdfOpenOptions::default())?;
     if progress {
         job.set_progress(true);
         job.set_output_file(output.to_path_buf())?;
@@ -6716,7 +6685,7 @@ fn split_rewritten_pdf(
         .with_verbose(verbose)
         .with_remove_unreferenced_resources(remove_unreferenced_resources)
         .with_writer_configuration(writer_configuration);
-    let written = job.split_pages(&mut pdf, options)?;
+    let written = job.split_pages(source, options)?;
     Ok((written, job))
 }
 
@@ -6813,9 +6782,8 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     // Page operations emit a fresh document and preserve encryption only when
     // the primary input itself was encrypted, matching qpdf's page copier.
     // `--split-pages` is the exception: qpdf's doSplitPages path makes a fresh
-    // empty output document per chunk, so its intermediate and final chunks
-    // are cleartext unless explicit encryption options are configured. Keep
-    // the memory intermediate decryptable before split_pages re-opens it.
+    // empty output document per chunk, so its direct source and final chunks
+    // are cleartext unless explicit encryption options are configured.
     let mut options = options;
     let split_pages = page_ops
         .split_pages
@@ -6834,9 +6802,8 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(n) = split_pages.filter(|size| *size > 0) {
         let suppress_warnings = pdf.suppress_warnings();
-        let bytes = write_qpdf_to_memory(&mut pdf, output, &options, linearize)?;
-        let (_, mut split_job) = split_rewritten_pdf(
-            bytes,
+        let (_, mut split_job) = split_pdf(
+            &mut pdf,
             n,
             output,
             input,
@@ -6847,10 +6814,8 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             remove_unref.into(),
             writer_configuration(&options, linearize, linearize_pass1)?,
         )?;
-        // The intermediate rewrite may already have repaired the condition
-        // that produced a warning on the original `pdf` (e.g. --repair's
-        // xref reconstruction), so the freshly re-opened split source can
-        // look clean even though the original input was not.
+        // Fold source warnings into the split job before completing it, as the
+        // ordinary write path does for its source document.
         split_job.record_document_warnings(&pdf);
         return finish_job_exit_status(split_job.complete(true)?);
     } else {
