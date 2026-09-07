@@ -25,7 +25,7 @@ pub(crate) struct CompressedMemberProvenance {
     pub(crate) source_index: u32,
 }
 
-/// Ordering key for objects that were imported into a fresh merge target.
+/// Ordering key for objects that were imported into a fresh writer target.
 ///
 /// qpdf keeps the primary input's objects in their original object-number
 /// space while `QPDF::copyForeignObject` allocates later-source objects in the
@@ -33,12 +33,12 @@ pub(crate) struct CompressedMemberProvenance {
 /// kinds of objects new local references, so the linearization planner carries
 /// this qpdf ordering separately from those references.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LinearizationObjectOrderKey {
+pub(crate) struct WriterObjectOrderKey {
     group: u8,
     object_ref: ObjectRef,
 }
 
-impl LinearizationObjectOrderKey {
+impl WriterObjectOrderKey {
     pub(crate) const fn primary(object_ref: ObjectRef) -> Self {
         Self {
             group: 0,
@@ -153,8 +153,9 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// multi-source page-selection target. `None` means this is an ordinary
     /// parsed document, for which the live object reference is already the
     /// source order. `Some` also distinguishes merge-created objects, which
-    /// retain their target allocation order as a fallback.
-    pub(crate) linearization_object_order: Option<BTreeMap<ObjectRef, LinearizationObjectOrderKey>>,
+    /// retain their target allocation order as a fallback. The same key feeds
+    /// linearization and generated ObjStm planning.
+    pub(crate) writer_object_order: Option<BTreeMap<ObjectRef, WriterObjectOrderKey>>,
     /// qpdf's `m->object_copiers[source unique_id].visiting` equivalent
     /// (`include/qpdf/QPDF.hh:891-897`). qpdf never rolls back
     /// `ObjCopier::object_map`/`visiting` when `copyForeignObject` fails
@@ -250,29 +251,26 @@ impl<R: Read + Seek> Drop for Pdf<R> {
 }
 
 impl<R: Read + Seek> Pdf<R> {
-    /// Return the qpdf-equivalent source/discovery order used by the
-    /// linearization planner. Ordinary parsed documents use their source
-    /// object references directly; fresh merge targets use the provenance
-    /// recorded by the page-selection copier and place later-created objects
-    /// after imported objects.
-    pub(crate) fn linearization_object_order_key(
-        &self,
-        object_ref: ObjectRef,
-    ) -> LinearizationObjectOrderKey {
-        match &self.linearization_object_order {
+    /// Return the qpdf-equivalent source/discovery order used by writer
+    /// planners. Ordinary parsed documents use their source object references
+    /// directly; fresh merge targets use the provenance recorded by the
+    /// page-selection copier and place later-created objects after imported
+    /// objects.
+    pub(crate) fn writer_object_order_key(&self, object_ref: ObjectRef) -> WriterObjectOrderKey {
+        match &self.writer_object_order {
             Some(order) => order
                 .get(&object_ref)
                 .copied()
-                .unwrap_or_else(|| LinearizationObjectOrderKey::fresh(object_ref)),
-            None => LinearizationObjectOrderKey::primary(object_ref),
+                .unwrap_or_else(|| WriterObjectOrderKey::fresh(object_ref)),
+            None => WriterObjectOrderKey::primary(object_ref),
         }
     }
 
-    pub(crate) fn set_linearization_object_order(
+    pub(crate) fn set_writer_object_order(
         &mut self,
-        order: BTreeMap<ObjectRef, LinearizationObjectOrderKey>,
+        order: BTreeMap<ObjectRef, WriterObjectOrderKey>,
     ) {
-        self.linearization_object_order = Some(order);
+        self.writer_object_order = Some(order);
     }
 
     /// Close the current qpdf input source while retaining the document's
@@ -524,32 +522,32 @@ impl<R: Read + Seek> Pdf<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinearizationObjectOrderKey, Pdf};
+    use super::{Pdf, WriterObjectOrderKey};
     use crate::ObjectRef;
     use std::collections::BTreeMap;
 
     #[test]
-    fn linearization_order_uses_source_mapped_and_fresh_keys() {
+    fn writer_order_uses_source_mapped_and_fresh_keys() {
         let mut pdf = Pdf::<std::io::Cursor<Vec<u8>>>::uninitialized();
         let source_ref = ObjectRef::new(3, 0);
         assert_eq!(
-            pdf.linearization_object_order_key(source_ref),
-            LinearizationObjectOrderKey::primary(source_ref)
+            pdf.writer_object_order_key(source_ref),
+            WriterObjectOrderKey::primary(source_ref)
         );
 
         let mapped_ref = ObjectRef::new(7, 0);
         let mut order = BTreeMap::new();
-        order.insert(mapped_ref, LinearizationObjectOrderKey::foreign(mapped_ref));
-        pdf.set_linearization_object_order(order);
+        order.insert(mapped_ref, WriterObjectOrderKey::foreign(mapped_ref));
+        pdf.set_writer_object_order(order);
         assert_eq!(
-            pdf.linearization_object_order_key(mapped_ref),
-            LinearizationObjectOrderKey::foreign(mapped_ref)
+            pdf.writer_object_order_key(mapped_ref),
+            WriterObjectOrderKey::foreign(mapped_ref)
         );
 
         let fresh_ref = ObjectRef::new(11, 0);
         assert_eq!(
-            pdf.linearization_object_order_key(fresh_ref),
-            LinearizationObjectOrderKey::fresh(fresh_ref)
+            pdf.writer_object_order_key(fresh_ref),
+            WriterObjectOrderKey::fresh(fresh_ref)
         );
     }
 }
