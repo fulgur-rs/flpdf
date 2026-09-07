@@ -296,7 +296,8 @@ impl ArgParser {
         // `flpdf help <subcommand>`. qpdf has no such surface to preserve, so
         // this only covers flpdf's own native help, not a qpdf-flat operand.
         let native_subcommand_mode = args.get(1).is_some_and(|arg| {
-            self.is_subcommand_token(arg) || matches!(arg.as_bytes(), b"help" | b"--help" | b"-h")
+            self.is_subcommand_token(arg)
+                || matches!(arg.as_bytes(), b"help" | b"--help" | b"-help" | b"-h")
         });
         let mut iter = args.into_iter().peekable();
         let Some(program) = iter.next() else {
