@@ -303,7 +303,6 @@ impl PlainWritePlan {
             for object in placement.objects.drain(..) {
                 if let PlannedIndirectObject::Source { source, .. } = &object {
                     let handle = pdf.get_object_handle(*source);
-                    pdf.resolve(&handle)?;
                     if handle.try_is_stream_of_type(b"XRef", b"")? {
                         placement.old_to_new.remove(source);
                         continue;
@@ -751,7 +750,7 @@ fn build_qdf_emission_plan<R: Read + Seek>(
                 // retained/generated ObjStm containers are represented by the
                 // dedicated placement arm below (`QPDFWriter.cc:1620-1775`).
                 let handle = pdf.get_object_handle(*source);
-                pdf.resolve(&handle)?;
+                handle.try_dereference()?;
                 let is_real_stream = handle.as_stream_dict().is_some()
                     && !handle.try_is_stream_of_type(b"XRef", b"")?;
                 if is_real_stream {
