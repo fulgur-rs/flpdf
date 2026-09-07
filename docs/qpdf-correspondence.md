@@ -567,6 +567,23 @@ legacy provider に抑制フラグを追加せず、qpdf の一回計算／再�
 specialized writer と linearized writer の別経路は、それぞれの qpdf 呼び出し契約を
 別 slice で扱う。
 
+### Plain Disable live writer queue (`flpdf-3yn9.48.53`, 2026-09-07)
+
+qpdf の standard writer は `enqueueObjectsStandard`（`QPDFWriter.cc:2907-2925`）で
+`/Root` と trimmed trailer の seed を queue に積み、`writeStandard`
+（`:2991-3044`）が queue の先頭から `writeObject` を呼ぶ。`unparseChild`
+（`:1144-1157`）は indirect child を書く直前に同じ queue へ追加するため、
+object number と emission order は事前 graph copy ではなく first-seen live order になる。
+辞書の null 値は seed/child から除外し、配列の null 要素は位置を保持する。
+
+plain Disable の bounded consumer は `writer/plain/body.rs::LiveQueue` と
+`LiveObjectEmitter` でこの境界を再現する。`WriteObject::write_object` の
+progress → live unparse 順序を保ち、reference-map callback が未採番の child を
+その場で queue へ追加する。body 完了後にだけ trailer handle、canonical trailer
+entries、xref を確定するため、progress callback が Catalog に追加した indirect child
+も同じ出力に現れる。Preserve/Generate、QDF、PCLm、specialized、linearized の
+legacy planner/queue はこの first consumer の範囲外で、後続 consumer slice が所有する。
+
 ### ObjectHandle emission-time encryption surface (`flpdf-egzr.3.2.15`, 2026-08-15)
 
 qpdf の暗号化は Object tree を事前に書き換えない。`QPDFWriter.cc:842-847`
