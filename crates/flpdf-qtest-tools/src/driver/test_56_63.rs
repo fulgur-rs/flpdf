@@ -132,7 +132,9 @@ fn test_56_59_body<R: Read + Seek>(
                 false,
             )?; // cov:ignore: valid qpdf fixtures cover placement success; this is only the defensive Result propagation edge
             resources.merge_resources(&ObjectHandle::parse(b"<< /XObject << >> >>")?, None)?;
-            resources.get_key(b"/XObject").replace_key(&name, form)?;
+            resources
+                .try_get_key(b"/XObject")?
+                .replace_key(&name, form)?;
             content
         };
 
@@ -318,21 +320,21 @@ pub(crate) fn run_test_60<R: Read + Seek + 'static>(
     for _ in 1..3 {
         let name = r1.get_unique_resource_name(b"/Quack", &mut min_suffix, None)?;
         r1.merge_resources(&ObjectHandle::parse(b"<< /Z << >> >>")?, None)?;
-        r1.get_key(b"/Z")
+        r1.try_get_key(b"/Z")?
             .replace_key(&name, ObjectHandle::string(b"moo".to_vec()))?;
     }
 
-    let z = r1.get_key(b"/Z");
+    let z = r1.try_get_key(b"/Z")?;
     r1.replace_key(b"/Y", ObjectHandle::dictionary(vec![]))?;
-    let y = r1.get_key(b"/Y");
+    let y = r1.try_get_key(b"/Y")?;
     make_resource(pdf, &z, b"/F1", b"r1.Z.F1")?;
     make_resource(pdf, &z, b"/F2", b"r1.Z.F2")?;
     make_resource(pdf, &y, b"/F2", b"r1.Y.F2")?;
     make_resource(pdf, &y, b"/F3", b"r1.Y.F3")?;
 
     let r2 = ObjectHandle::parse(b"<< /Z << >> /Y << >> >>")?;
-    let z = r2.get_key(b"/Z");
-    let y = r2.get_key(b"/Y");
+    let z = r2.try_get_key(b"/Z")?;
+    let y = r2.try_get_key(b"/Y")?;
     make_resource(pdf, &z, b"/F2", b"r2.Z.F2")?;
     make_resource(pdf, &y, b"/F3", b"r2.Y.F3")?;
     make_resource(pdf, &y, b"/F4", b"r2.Y.F4")?;
@@ -530,16 +532,22 @@ pub(crate) fn run_test_62<R: Read + Seek>(
         t.replace_key(b"/Q3", ObjectHandle::integer(q3))?;
 
         // qpdf: `assert_compare_numbers(q1, t.getKey("/Q1").getIntValue());` (test_driver.cc:2277).
-        assert_eq!(t.get_key(b"/Q1").try_get_int_value()?, q1);
-        assert_eq!(t.get_key(b"/Q1").try_get_uint_value()?, q1_l);
-        assert_eq!(t.get_key(b"/Q1").try_get_int_value_as_int()?, i32::MAX);
-        assert_eq!(t.get_key(b"/Q1").try_get_uint_value_as_uint()?, u32::MAX);
-        assert_eq!(t.get_key(b"/Q2").try_get_int_value()?, q2_l);
-        assert_eq!(t.get_key(b"/Q2").try_get_uint_value()?, 0);
-        assert_eq!(t.get_key(b"/Q2").try_get_int_value_as_int()?, i32::MIN);
-        assert_eq!(t.get_key(b"/Q2").try_get_uint_value_as_uint()?, 0);
-        assert_eq!(t.get_key(b"/Q3").try_get_int_value_as_int()?, i32::MAX);
-        assert_eq!(t.get_key(b"/Q3").try_get_uint_value_as_uint()?, u32::MAX);
+        assert_eq!(t.try_get_key(b"/Q1")?.try_get_int_value()?, q1);
+        assert_eq!(t.try_get_key(b"/Q1")?.try_get_uint_value()?, q1_l);
+        assert_eq!(t.try_get_key(b"/Q1")?.try_get_int_value_as_int()?, i32::MAX);
+        assert_eq!(
+            t.try_get_key(b"/Q1")?.try_get_uint_value_as_uint()?,
+            u32::MAX
+        );
+        assert_eq!(t.try_get_key(b"/Q2")?.try_get_int_value()?, q2_l);
+        assert_eq!(t.try_get_key(b"/Q2")?.try_get_uint_value()?, 0);
+        assert_eq!(t.try_get_key(b"/Q2")?.try_get_int_value_as_int()?, i32::MIN);
+        assert_eq!(t.try_get_key(b"/Q2")?.try_get_uint_value_as_uint()?, 0);
+        assert_eq!(t.try_get_key(b"/Q3")?.try_get_int_value_as_int()?, i32::MAX);
+        assert_eq!(
+            t.try_get_key(b"/Q3")?.try_get_uint_value_as_uint()?,
+            u32::MAX
+        );
 
         // qpdf's programmatic integers have no owning QPDF, so warnIfPossible
         // writes the six range warnings directly to the default error logger.
