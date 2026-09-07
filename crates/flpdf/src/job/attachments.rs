@@ -270,6 +270,14 @@ impl QPDFJob {
             self.report_copy_attachment_source(option)
                 .map_err(E::from)?;
             let mut source = open_source(self, option)?;
+            // This opener-owned donor is dropped at the end of the iteration,
+            // before `target` is written. qpdf's copyAttachments also drops
+            // each per-donor `QPDF` (`QPDFJob.cc:2100`), but a copied foreign
+            // stream that stays deferred would dangle once its provider-backed
+            // donor is gone (`pipeStreamData called for non-stream`). Reserve
+            // the copied stream data now via qpdf's immediate-copy contract
+            // (`QPDF::setImmediateCopyFrom`) so the donor can be released.
+            source.set_immediate_copy_from(true);
             self.copy_attachment_source(target, &mut source, option, &mut duplicates)
                 .map_err(E::from)?;
             self.record_document_warnings(&source);
@@ -1564,6 +1572,50 @@ mod tests {
             info.contains("  attachment.txt -> src-attachment.txt\n"),
             "info was: {info:?}"
         );
+    }
+
+    #[test]
+    fn copy_attachments_with_opener_survives_a_dropped_owned_donor() {
+        // The opener owns each donor and drops it at the end of its iteration,
+        // before the target is written -- matching qpdf's copyAttachments,
+        // which drops each per-donor `QPDF` (`QPDFJob.cc:2100`). The copied
+        // attachment must stay readable after the owned in-memory donor is
+        // released; `copy_attachments_with_opener` reserves stream data via
+        // qpdf's immediate-copy contract so a provider-backed donor cannot
+        // leave a dangling deferred stream behind either.
+        let donor_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/attachment-two-page.pdf"
+        ))
+        .to_vec();
+        let expected = {
+            let mut donor = Pdf::open(Cursor::new(donor_bytes.clone())).expect("open donor");
+            extract_attachment(&mut donor, b"attachment.txt").expect("donor attachment")
+        };
+
+        let mut target =
+            Pdf::open(Cursor::new(minimal_fixture_bytes())).expect("open target fixture");
+        let mut job = QPDFJob::new();
+        job.set_input_name("target.pdf");
+        let options = [copy_options(
+            std::path::PathBuf::from("donor.pdf"),
+            b"a_",
+            false,
+        )];
+
+        job.copy_attachments_with_opener::<_, _, crate::Error>(
+            &mut target,
+            &options,
+            |_job, _option| {
+                let reader: Box<dyn crate::ReadSeek> = Box::new(Cursor::new(donor_bytes.clone()));
+                Pdf::open(reader)
+            },
+        )
+        .expect("copy from an owned in-memory donor succeeds");
+
+        let copied = extract_attachment(&mut target, b"a_attachment.txt")
+            .expect("copied attachment survives the dropped donor");
+        assert_eq!(copied, expected);
     }
 
     #[test]
