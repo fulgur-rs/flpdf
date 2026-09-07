@@ -6939,22 +6939,30 @@ impl ObjectHandle {
         })
     }
 
-    /// Write this handle through qpdf 11.9.0's `QPDFObjectHandle::writeJSON`
-    /// pipeline boundary.
+    /// Write this handle's JSON encoding to a pipeline.
     ///
-    /// The writer is deliberately owned by the handle layer: qpdf dispatches
-    /// from `QPDFObjectHandle::writeJSON` into each `QPDF_*::writeJSON`
-    /// implementation using one `JSON::Writer`, and the caller retains the
-    /// outer pipeline's `finish` boundary. `dereference_indirect` applies only
-    /// to this handle. Array and dictionary children use qpdf's ordinary
+    /// This ports `QPDFObjectHandle::writeJSON`
+    /// (`include/qpdf/QPDFObjectHandle.hh:1205`,
+    /// `libqpdf/QPDFObjectHandle.cc:1630-1647`), which qpdf documents as
+    /// equivalent to, but more efficient than, calling
+    /// `getJSON(json_version, dereference_indirect).write(p, depth)` — see
+    /// [`Self::get_json`]. The writer is deliberately owned by the handle
+    /// layer: qpdf dispatches from `QPDFObjectHandle::writeJSON` into each
+    /// `QPDF_*::writeJSON` implementation using one `JSON::Writer`
+    /// (`QPDF_Array.cc:153-187`, `QPDF_Dictionary.cc:72-95`,
+    /// `qpdf/JSON_writer.hh:16-135`), and the caller retains the outer
+    /// pipeline's `finish` boundary. `dereference_indirect` applies only to
+    /// this handle: array and dictionary children use qpdf's ordinary
     /// non-dereferencing child dispatch, so an indirect child remains an
     /// `"N G R"` string even when the parent was requested with
     /// `dereference_indirect = true`.
     ///
-    /// Correspondence: `libqpdf/QPDFObjectHandle.cc:1630-1647`,
-    /// `QPDF_Array.cc:153-187`, `QPDF_Dictionary.cc:72-95`, and
-    /// `qpdf/JSON_writer.hh:16-135`.
-    pub(crate) fn write_json(
+    /// # Errors
+    ///
+    /// Returns [`ObjectJsonError::UnsupportedVersion`] unless `json_version`
+    /// is `1` or `2`, and otherwise propagates the pipeline and object-state
+    /// failures documented on [`ObjectJsonError`].
+    pub fn write_json(
         &self,
         json_version: i32,
         out: &mut dyn Pipeline,
@@ -6972,13 +6980,21 @@ impl ObjectHandle {
         )
     }
 
-    /// The qpdf `QPDFObjectHandle::getJSON` wrapper around [`Self::write_json`].
+    /// Return this handle's JSON encoding.
     ///
+    /// This ports `QPDFObjectHandle::getJSON(int json_version, bool
+    /// dereference_indirect)` (`include/qpdf/QPDFObjectHandle.hh:1198`).
     /// `PlString` is the flpdf equivalent of qpdf's `Pl_Buffer` at this
-    /// boundary. It is intentionally not exposed as a new serializer path:
-    /// `get_json` writes through the same canonical handle writer and only
-    /// parses the completed bytes after that writer returns.
-    pub(crate) fn get_json(
+    /// boundary: `get_json` writes through the same canonical handle writer
+    /// used by [`Self::write_json`] and only parses the completed bytes
+    /// after that writer returns, rather than exposing a second serializer
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::write_json`]'s errors, plus
+    /// [`ObjectJsonError::Json`] if the intermediate bytes fail to parse.
+    pub fn get_json(
         &self,
         json_version: i32,
         dereference_indirect: bool,

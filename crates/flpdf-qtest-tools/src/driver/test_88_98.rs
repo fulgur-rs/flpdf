@@ -2,7 +2,6 @@
 //!
 //! Several bodies in this range open on a qpdf primitive with no flpdf
 //! counterpart at any visibility (`QPDF::createFromJSON`/`updateFromJSON`,
-//! `QPDFObjectHandle::getJSON`/`writeJSON`/`getStreamJSON`,
 //! `QPDFPageObjectHelper`'s identity-preserving box getters). Those bodies
 //! are `// GAP(...)` stubs per this crate's translation contract; every
 //! `GAP` comment below names the missing qpdf symbol and stops at the exact
@@ -12,9 +11,10 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 
 use flpdf::json_inspect::{DecodeLevel, StreamDataMode};
+use flpdf::pipeline::PlString;
 use flpdf::{
     document_json, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf,
-    Pipeline, PipelineError, PipelineResult,
+    Pipeline, PipelineError, PipelineResult, QpdfStreamJsonData,
 };
 
 use super::{
@@ -734,25 +734,78 @@ pub(crate) fn run_test_97<R: Read + Seek>(
 // test_98 (test_driver.cc:3424-3454)
 // ---------------------------------------------------------------------------
 
-/// Test methods no longer used by qpdf as a result of
-/// `QPDFObjectHandle::writeJSON`. Built for `minimal.pdf`.
+/// Test `QPDFObjectHandle::getJSON`/`writeJSON`/`getStreamJSON`. Built for
+/// `minimal.pdf` (objects 1-6, with object 4 the page's content stream).
+///
+/// The first loop checks qpdf's own documented equivalence
+/// (`include/qpdf/QPDFObjectHandle.hh:1201-1203`) between `writeJSON` and
+/// `getJSON(...).write(...)` for every object; the second calls
+/// `getStreamJSON` on the content stream after mutating its dictionary and
+/// checks the exact encoded bytes against qpdf's fixture output
+/// (`test_driver.cc:3424-3454`).
 pub(crate) fn run_test_98<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+    pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&OsStr>,
     _stdout: &mut dyn Write,
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDFObjectHandle::getJSON / QPDFObjectHandle::writeJSON
-    // (per-object overload) / QPDFObjectHandle::getStreamJSON): test_98
-    // exists specifically to compare `ObjectHandle::write_json`/`get_json`/
-    // `write_stream_json` against each other -- but all three are
-    // `pub(crate)` in `object_handle.rs` (`:5283`, `:5307`, `:4560`), not
-    // reachable from this separate crate. qpdf's own first loop already
-    // only compares two of *its own* outputs against each other rather
-    // than against an independent oracle, so even a partial port here would
-    // be a self-comparison on top of being unreachable.
+    const JSON_LATEST: i32 = 2;
+
+    for i in 1..=6 {
+        let oh = pdf.get_object_handle(ObjectRef::new(i, 0));
+        pdf.resolve(&oh)?;
+
+        let mut written = Vec::new();
+        {
+            let mut out = PlString::new("write", None, &mut written);
+            oh.write_json(JSON_LATEST, &mut out, true, 7)
+                .map_err(|error| Error::System(error.to_string()))?;
+        }
+
+        let mut fetched = Vec::new();
+        {
+            let mut out = PlString::new("get", None, &mut fetched);
+            oh.get_json(JSON_LATEST, true)
+                .map_err(|error| Error::System(error.to_string()))?
+                .write(&mut out, 7)
+                .map_err(|error| Error::System(error.to_string()))?;
+        }
+
+        if written != fetched {
+            return Err(Error::System(format!(
+                "object {i} 0: writeJSON and getJSON().write() diverged"
+            )));
+        }
+    }
+
+    let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve(&stream)?;
+    let dict = stream
+        .as_stream_dict()
+        .expect("minimal.pdf object 4 is the page's content stream");
+    dict.replace_key(b"/Test", ObjectHandle::integer(42))?;
+
+    let json = stream
+        .get_stream_json(
+            JSON_LATEST,
+            QpdfStreamJsonData::Inline,
+            flpdf::writer::DecodeLevel::Generalized,
+            None,
+            "",
+        )
+        .map_err(|error| Error::System(error.to_string()))?;
+    let unparsed = json
+        .unparse()
+        .map_err(|error| Error::System(error.to_string()))?;
+    let expected: &[u8] = b"{\n  \"data\": \"QlQKICAvRjEgMjQgVGYKICA3MiA3MjAgVGQKICAoUG90YXRvKSBUagpFVAo=\",\n  \"dict\": {\n    \"/Test\": 42\n  }\n}";
+    if unparsed != expected {
+        return Err(Error::System(
+            "object 4 0: getStreamJSON output diverged from qpdf's expected encoding".to_owned(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -794,6 +847,45 @@ mod test_97_tests {
             &mut diagnostics_written,
         )
         .expect("run test 97");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod test_98_tests {
+    use super::run_test_98;
+    use flpdf::Pdf;
+
+    /// Byte-identical to qpdf's own `qpdf/qtest/qpdf/minimal.pdf`
+    /// (objects 1-6: Catalog, Pages, one Page, its content stream showing
+    /// "Potato", a `/ProcSet` array, and a `/F1` font) -- distinct from this
+    /// crate's own smaller `tests/fixtures/minimal.pdf`, which only has the
+    /// Catalog and an empty Pages tree.
+    fn minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/qpdf-test98-minimal.pdf").to_vec(),
+        )
+        .expect("open qpdf's real minimal.pdf fixture")
+    }
+
+    #[test]
+    fn test_98_compares_object_json_encodings_and_stream_json() {
+        let mut pdf = minimal_pdf();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+
+        run_test_98(
+            &mut pdf,
+            b"minimal.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test 98");
 
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
