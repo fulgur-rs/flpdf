@@ -573,7 +573,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 let arbitrated = handle.output_root_copy_with_adbe(
                     &self.plan.version,
                     self.plan.final_extension_level,
-                )?;
+                )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
                 return arbitrated.write_object_qdf_with_ref_map_and_removed(
                     self.bytes,
                     0,
@@ -744,9 +744,14 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     out.extend_from_slice(
                         format!("; original object ID: {}", original.number).as_bytes(),
                     );
+                    // cov:ignore-start: qpdf writes the generation only when it
+                    // is non-zero (`QPDFWriter.cc:1697-1702`); every object in
+                    // an ObjStm must have generation 0 per ISO 32000-1 7.5.7,
+                    // so no valid input reaches this arm.
                     if original.generation != 0 {
                         out.extend_from_slice(format!(" {}", original.generation).as_bytes());
                     }
+                    // cov:ignore-end
                 }
                 out.push(b'\n');
                 qdf_marker_starts.push(marker_start);
@@ -761,17 +766,14 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 // output mode (`QPDFWriter.cc:1396-1436`), so it applies here
                 // exactly as it does to an uncompressed root.
                 if handle.object_ref() == plan.root_source {
-                    match handle
-                        .output_root_copy_with_adbe(&plan.version, plan.final_extension_level)
-                    {
-                        Ok(arbitrated) => arbitrated.write_object_qdf_with_ref_map_and_removed(
-                            out,
-                            0,
-                            &map,
-                            &plan.removed_refs,
-                        ),
-                        Err(error) => Err(error),
-                    }
+                    let arbitrated = handle
+                        .output_root_copy_with_adbe(&plan.version, plan.final_extension_level)?;
+                    arbitrated.write_object_qdf_with_ref_map_and_removed(
+                        out,
+                        0,
+                        &map,
+                        &plan.removed_refs,
+                    )
                 } else {
                     handle.write_object_qdf_with_ref_map_and_removed(
                         out,
