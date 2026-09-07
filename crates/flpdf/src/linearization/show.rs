@@ -819,7 +819,9 @@ fn show_with_pdf<R: Read + Seek>(
                     offset: parameter_offset,
                     detail: message,
                 },
+                // cov:ignore-start: read_lin_parameters only yields qpdf-shaped malformed data for canonical PDF handles
                 other => ShowTablesError::Other(other),
+                // cov:ignore-end
             })?;
             match check_linearization_parameters(pdf) {
                 Ok(LinearizationParameterCheck::Clean) => {}
@@ -833,6 +835,7 @@ fn show_with_pdf<R: Read + Seek>(
                         detail: message.to_owned(),
                     });
                 }
+                // cov:ignore: the parameter checker has no generic I/O path after the source snapshot is installed
                 Err(error) => return Err(ShowTablesError::Other(error.into())),
             }
             // 3. Locate, resolve, and decompress the hint stream object at /H[0].

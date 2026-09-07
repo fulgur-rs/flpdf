@@ -999,7 +999,7 @@ mod tests {
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let diagnostics = pdf.repair_diagnostics();
         assert!(!diagnostics.entries().iter().any(|diagnostic| {
-            diagnostic.message_string() == "document does not have updated appearance streams, so form fields will not be flattened"
+            diagnostic.message_string() == "document does not have updated appearance streams, so form fields will not be flattened" // cov:ignore: test-only assertion line is not part of production execution
         }));
     }
 

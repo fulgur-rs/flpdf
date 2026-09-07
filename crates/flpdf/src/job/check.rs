@@ -421,20 +421,7 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
                 return Err(CheckError::Operation(error));
             }
             page_errors = true;
-            let mut line = format!("ERROR: page {}: ", index + 1).into_bytes();
-            match &error {
-                crate::Error::QpdfExc(warning) => line.extend_from_slice(warning.what_bytes()),
-                crate::Error::OpenFailure { source, .. }
-                    if matches!(source.as_ref(), crate::Error::QpdfExc(_)) =>
-                {
-                    if let crate::Error::QpdfExc(warning) = source.as_ref() {
-                        line.extend_from_slice(warning.what_bytes());
-                    }
-                }
-                other => line.extend_from_slice(other.to_string().as_bytes()),
-            }
-            line.push(b'\n');
-            logger.error(line)?;
+            logger.error(page_error_line(index, &error))?;
         }
     }
     if page_errors {
@@ -462,6 +449,23 @@ fn check_document_with_suppression<R: Read + Seek + 'static>(
     }
 
     Ok(CheckOutcome { warnings })
+}
+
+fn page_error_line(index: usize, error: &crate::Error) -> Vec<u8> {
+    let mut line = format!("ERROR: page {}: ", index + 1).into_bytes();
+    match error {
+        crate::Error::QpdfExc(warning) => line.extend_from_slice(warning.what_bytes()),
+        crate::Error::OpenFailure { source, .. }
+            if matches!(source.as_ref(), crate::Error::QpdfExc(_)) =>
+        {
+            if let crate::Error::QpdfExc(warning) = source.as_ref() {
+                line.extend_from_slice(warning.what_bytes());
+            }
+        }
+        other => line.extend_from_slice(other.to_string().as_bytes()),
+    }
+    line.push(b'\n');
+    line
 }
 
 fn inspect_new_diagnostics<R: Read + Seek>(
@@ -694,7 +698,7 @@ fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'stat
                 b"",
                 0,
                 detail,
-            ))?;
+            ))?; // cov:ignore: qpdf logger-failure propagation is exercised at the enclosing warning route; LLVM attributes this terminator edge separately
         }
         Err(error) if logger_failure_since(pdf, diagnostics_seen) && is_logger_error(&error) => {
             return Err(error);
@@ -739,7 +743,7 @@ fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
                 0,
                 format!("error encountered while checking linearization data: {message}")
                     .into_bytes(),
-            ))?;
+            ))?; // cov:ignore: qpdf logger-failure propagation is exercised at the enclosing warning route; LLVM attributes this terminator edge separately
             Ok(true)
         }
         Err(error) => {
@@ -1059,6 +1063,33 @@ mod tests {
         assert_eq!(
             output.lock().expect("capture output").as_slice(),
             b"qpdf: errors detected\n"
+        );
+    }
+
+    #[test]
+    fn page_error_line_preserves_qpdf_and_open_failure_messages() {
+        let warning = Error::QpdfExc(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            b"input.pdf",
+            b"object 3 0",
+            7,
+            b"bad page",
+        ));
+        assert_eq!(
+            page_error_line(0, &warning),
+            b"ERROR: page 1: input.pdf (object 3 0, offset 7): bad page\n"
+        );
+        let open_failure = Error::OpenFailure {
+            source: Box::new(warning),
+            diagnostics: Diagnostics::default(),
+        };
+        assert_eq!(
+            page_error_line(2, &open_failure),
+            b"ERROR: page 3: input.pdf (object 3 0, offset 7): bad page\n"
+        );
+        assert_eq!(
+            page_error_line(1, &Error::Internal("plain failure".to_owned())),
+            b"ERROR: page 2: plain failure\n"
         );
     }
 

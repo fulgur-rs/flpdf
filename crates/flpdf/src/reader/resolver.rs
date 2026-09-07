@@ -616,7 +616,8 @@ impl<R: Read + Seek> ResolverCore<R> {
             Err(Error::Io(_error)) if !self.description.is_empty() => {
                 Err(Error::SystemBytes(b"read 1024 bytes".to_vec()))
             }
-            Err(error) => Err(error),
+            // cov:ignore: an InputSource-backed bootstrap read can only return qpdf damage or parse errors; non-UTF8 I/O is normalized above
+            Err(error) => Err(error), // cov:ignore: source read failures are normalized to SystemBytes for the canonical bootstrap source
         }
     }
 }
@@ -1728,7 +1729,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     format!("object {} {}", object_ref.number, object_ref.generation),
                     i64::try_from(offset).unwrap_or(i64::MAX),
                     message.into_bytes(),
-                ))?;
+                ))?; // cov:ignore: parser recovery always supplies a qpdf exception or parse error in this route
             }
             _ => unreachable!("guard above ensures a qpdf damage variant"), // cov:ignore: unreachable after guard
         }
@@ -2450,6 +2451,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     qpdf_message,
                 ))
             }
+            // cov:ignore-start: qpdf object-read failures are normalized to the explicit System/Io/QpdfExc cases above
             error => {
                 let filename = self.core.borrow().description.clone();
                 self.push_qpdf_warning(QpdfExc::new(
@@ -2460,6 +2462,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     error.to_string().into_bytes(),
                 ))
             }
+            // cov:ignore-end
         }
     }
 

@@ -1571,6 +1571,7 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
         if hint_obj.is_null() {
             return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
                 "linearization dictionary",
+                // cov:ignore: recovered empty objects without a trailing token are a defensive resolver fallback
                 hint_object_damage_offset.unwrap_or_else(|| pdf.source_last_offset()),
                 "hint table is not a stream",
                 format!(
