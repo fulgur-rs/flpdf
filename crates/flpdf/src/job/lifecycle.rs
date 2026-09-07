@@ -2722,7 +2722,7 @@ impl QPDFJob {
             };
         match write_result {
             Ok(()) => {
-                self.record_document_warnings(pdf);
+                self.drain_document_warnings(pdf);
                 if self.configuration.verbose && output != Path::new("-") && !splitting {
                     let message =
                         format!("{}: wrote file {}\n", self.message_prefix, output.display());
@@ -3217,7 +3217,7 @@ impl QPDFJob {
         {
             self.show_attachment_report(pdf, key)?;
         }
-        self.record_document_warnings(pdf);
+        self.drain_document_warnings(pdf);
         self.complete(false)
     }
 
@@ -3231,7 +3231,7 @@ impl QPDFJob {
     /// preserves the configured input description.
     pub fn show_linearization<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode> {
         self.show_linearization_report(pdf)?;
-        self.record_document_warnings(pdf);
+        self.drain_document_warnings(pdf);
         self.complete(false)
     }
 
@@ -3380,17 +3380,12 @@ impl QPDFJob {
     /// This is qpdf's `writeOutfile` replace-input tail
     /// (`libqpdf/QPDFJob.cc:3068-3086`), which keeps the backup (and logs a
     /// message) when `pdf.anyWarnings()` is true at this point, or deletes it
-    /// otherwise. flpdf uses the job-level `self.warnings` flag here instead
-    /// of a live query against `pdf`: `self.warnings` is set from
-    /// `Pdf::repair_diagnostics()`, which only reflects *open-time*
-    /// diagnostics, whereas qpdf's `anyWarnings()` reflects the *whole*
-    /// lifecycle including any warning raised while writing. This can pick a
-    /// different backup filename (`.~qpdf-orig` vs `.~qpdf-orig#`) than qpdf
-    /// would for a document whose only warnings occurred during the write
-    /// itself (for example, from an overlay/underlay source or attachment
-    /// donor opened with warnings after the main document was already
-    /// clean). The whole-lifecycle warning drain is tracked separately
-    /// (`flpdf-3yn9.48.26`); this function is not the place to fix it.
+    /// otherwise. The job-level `self.warnings` flag is already updated from
+    /// foreign-source `any_warnings` checks and the primary document's
+    /// completion-time `get_warnings` drain before this helper is called. That
+    /// matches qpdf's `anyWarnings()` decision in `writeOutfile`
+    /// (`libqpdf/QPDFJob.cc:3068-3073`) and keeps write-time warnings on the
+    /// warning-preserving backup path (`flpdf-3yn9.48.26`).
     ///
     /// qpdf's `writeOutfile` performs this rename for every caller that
     /// reaches it, with no cleanup path if writing itself fails first (the
@@ -3817,7 +3812,7 @@ impl QPDFJob {
     {
         pdf.set_logger(self.logger.clone());
         inspection(pdf)?;
-        self.record_document_warnings(pdf);
+        self.drain_document_warnings(pdf);
         Ok(self.complete(false)?)
     }
 
@@ -3869,7 +3864,7 @@ impl QPDFJob {
             output,
             &self.logger,
         )?;
-        self.record_document_warnings(pdf);
+        self.drain_document_warnings(pdf);
         Ok(self.complete(creates_output)?)
     }
 
@@ -3883,7 +3878,23 @@ impl QPDFJob {
     where
         R: Read + Seek,
     {
-        if !pdf.repair_diagnostics().entries().is_empty() {
+        if pdf.any_warnings() {
+            self.record_warnings();
+        }
+    }
+
+    /// Drain a document's warnings at the qpdf job completion boundary.
+    ///
+    /// Intermediate stages use [`Self::record_document_warnings`] so foreign
+    /// documents and open-time diagnostics remain available to their later
+    /// consumers. qpdf's `writeQPDF` instead drains the live document warning
+    /// list after its selected operation (`libqpdf/QPDFJob.cc:483-511`); keep
+    /// that ownership transfer explicit here.
+    pub(crate) fn drain_document_warnings<R>(&mut self, pdf: &Pdf<R>)
+    where
+        R: Read + Seek,
+    {
+        if !pdf.get_warnings().is_empty() {
             self.record_warnings();
         }
     }
