@@ -1133,6 +1133,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn parser_records_a_non_utf8_unknown_option_with_its_raw_spelling() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let input = OsString::from_vec(b"--unknown-\xff".to_vec());
+        let parsed = ArgParser::from_command(clap::Command::new("flpdf"))
+            .parse_os(vec![OsString::from("flpdf"), input.clone()])
+            .expect("unknown raw option should remain available to the usage boundary");
+
+        let (index, argument) = parsed
+            .first_unknown_option
+            .as_ref()
+            .expect("non-UTF-8 option should be recorded as unknown");
+        assert_eq!(*index, 1);
+        assert_eq!(argument.as_bytes(), input.as_bytes());
+        assert_eq!(
+            parsed.original_residual_args[1].as_bytes(),
+            input.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn parser_discards_a_non_utf8_attached_value_for_a_qpdf_bare_option() {
         use std::os::unix::ffi::OsStringExt;
 
