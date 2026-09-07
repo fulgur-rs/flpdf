@@ -3154,6 +3154,69 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok((self.get_object_handle(object_ref), damage_offset))
     }
 
+    /// Read an xref stream through qpdf's `skip_cache_if_in_xref` branch.
+    ///
+    /// `QPDF::read_xrefStream` reads an xref stream before processing its
+    /// entries, but it deliberately avoids replacing an already-cached slot
+    /// when that exact object generation is already in the xref table
+    /// (`libqpdf/QPDF.cc:1668-1689`). This is observable for incremental files
+    /// that reuse an xref-stream object number: the older stream is still used
+    /// to process `/Prev`, while the newer cached value remains visible through
+    /// `getObject`/JSON. The ordinary offset reader must keep its unconditional
+    /// cache behavior for `QPDF::resolve` and linearization callers.
+    pub(crate) fn resolve_xref_stream_at_offset(
+        &self,
+        offset: u64,
+        description: Option<Vec<u8>>,
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        let parsed = self
+            .read_object_at_offset_with_description(
+                offset,
+                ObjectRef::new(0, 0),
+                true,
+                false,
+                description,
+            )
+            .map_err(ReadObjectAtOffsetError::into_error)?;
+        let damage_offset = parsed
+            .trailing_start
+            .or_else(|| u64::try_from(parsed.end_after_space).ok());
+        let object_ref = parsed.object_ref;
+        let cache_has_xref_value = self
+            .registered_handle(object_ref)
+            .is_some_and(|handle| handle.is_resolved() && !handle.is_null());
+        if self.xref_entry(object_ref).is_some() || cache_has_xref_value {
+            let ParsedObjectAtOffset {
+                value,
+                parsed_offset,
+                description,
+                end_before_space,
+                end_after_space,
+                malformed,
+                ..
+            } = parsed;
+            let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+                object_ref,
+                NO_PARSED_OFFSET,
+                self.pdf_unique_id.get(),
+                self.self_weak.clone(),
+            );
+            let is_null = matches!(&value, ObjectValue::Null);
+            handle.set_resolved(value);
+            if malformed && is_null {
+                return Ok((handle, damage_offset));
+            }
+            handle.set_parsed_offset_if_unset(parsed_offset);
+            handle.set_end_offsets(end_before_space, end_after_space);
+            if !description.is_empty() {
+                handle.set_description(description, parsed_offset);
+            }
+            return Ok((handle, damage_offset));
+        }
+        self.cache_parsed_object(parsed);
+        Ok((self.get_object_handle(object_ref), damage_offset))
+    }
+
     fn read_object_at_offset_with_description(
         &self,
         offset: u64,

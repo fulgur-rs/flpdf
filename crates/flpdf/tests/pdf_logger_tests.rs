@@ -262,7 +262,7 @@ fn warning_replays_initial_repair_diagnostics_once_in_original_order() {
         output.lock().unwrap().as_slice(),
         format!(
             "WARNING: input.pdf: file is damaged\n\
-             WARNING: input.pdf (offset {xref_start}): expected integer\n\
+             WARNING: input.pdf (offset {xref_start}): xref not found\n\
              WARNING: input.pdf: Attempting to reconstruct cross-reference table\n"
         )
         .as_bytes()
@@ -275,7 +275,7 @@ fn warning_replays_initial_repair_diagnostics_once_in_original_order() {
             .collect::<Vec<_>>(),
         [
             "file is damaged",
-            "expected integer",
+            "xref not found",
             "Attempting to reconstruct cross-reference table",
         ]
     );
@@ -388,7 +388,7 @@ fn terminal_open_failure_delivers_accumulated_repair_warnings_first() {
         output.lock().unwrap().as_slice(),
         format!(
             "WARNING: broken.pdf: file is damaged\n\
-             WARNING: broken.pdf (offset {xref_start}): expected integer\n\
+             WARNING: broken.pdf (offset {xref_start}): xref not found\n\
              WARNING: broken.pdf: Attempting to reconstruct cross-reference table\n"
         )
         .as_bytes()
