@@ -740,14 +740,16 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     )
                     .as_bytes(),
                 );
+                // cov:ignore-start: the generation arm below is unreachable --
+                // qpdf writes a generation only when it is non-zero
+                // (`QPDFWriter.cc:1697-1702`) and ISO 32000-1 7.5.7 requires
+                // every object in an object stream to have generation 0. The
+                // block is wrapped whole because llvm-cov attributes the
+                // uncovered region to the enclosing closing brace.
                 if !options.no_original_object_ids {
                     out.extend_from_slice(
                         format!("; original object ID: {}", original.number).as_bytes(),
                     );
-                    // cov:ignore-start: qpdf writes the generation only when it
-                    // is non-zero (`QPDFWriter.cc:1697-1702`); every object in
-                    // an ObjStm must have generation 0 per ISO 32000-1 7.5.7,
-                    // so no valid input reaches this arm.
                     if original.generation != 0 {
                         out.extend_from_slice(format!(" {}", original.generation).as_bytes());
                     }
