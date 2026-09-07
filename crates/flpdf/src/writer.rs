@@ -3952,7 +3952,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    let plain_route = plain::eligible(pdf.is_encrypted(), options, requested_object_streams);
+    // Match on the mode actually in force, not the one requested: forcing a
+    // version below 1.5 turns Preserve and Generate into Disable above, and
+    // qpdf treats all three identically once suppressed
+    // (`QPDFWriter.cc:2108-2111` clears the mode for such a version). Passing
+    // the requested mode here sent the suppressed cases down the legacy route,
+    // where a direct-root `/ADBE` was dropped — and Preserve is the CLI
+    // default, so the ordinary invocation took that path.
+    let plain_route = plain::eligible(pdf.is_encrypted(), options, effective_object_streams);
     // Compute the Adobe extension level before downstream dispatch. The plain
     // route applies it to the root's output-only shallow copy; legacy
     // specialized routes still apply the existing live-graph mutation below.

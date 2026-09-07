@@ -279,13 +279,23 @@ fn suppressed_preserve_restores_output_only_adbe_on_live_catalog() {
 
 #[test]
 fn direct_root_adbe_survives_forced_version_in_plain_disable_output() {
-    for force_version in ["1.4", "1.7", "2.0"] {
+    // All three requested modes, not only Disable: forcing a version below 1.5
+    // suppresses Preserve and Generate into Disable, and qpdf's output is
+    // identical across the three once suppressed. Preserve is also the CLI
+    // default, so exercising it here covers the ordinary invocation.
+    for (force_version, object_streams) in [
+        ("1.4", flpdf::ObjectStreamMode::Disable),
+        ("1.4", flpdf::ObjectStreamMode::Preserve),
+        ("1.4", flpdf::ObjectStreamMode::Generate),
+        ("1.7", flpdf::ObjectStreamMode::Disable),
+        ("2.0", flpdf::ObjectStreamMode::Disable),
+    ] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/compat/direct-root-adbe.pdf");
         let file = std::fs::File::open(&path).expect("open direct-root Extensions fixture");
         let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture");
         let settings = WriterTestSettings {
-            object_streams: flpdf::ObjectStreamMode::Disable,
+            object_streams,
             force_version: Some(force_version.to_owned()),
             static_id: true,
             newline_before_endstream: NewlineBeforeEndstream::Never,
