@@ -107,8 +107,7 @@ fn canonical_acroform_analysis_warns_for_a_non_array_fields_value() {
     let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
     assert!(acroform.get_form_fields().unwrap().is_empty());
     assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-        diagnostic
-            .message
+        String::from_utf8_lossy(diagnostic.get_message_detail())
             .contains("/Fields key of /AcroForm dictionary is not an array; ignoring")
     }));
 }

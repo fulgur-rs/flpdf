@@ -786,10 +786,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn captured_warning_description_accepts_and_emits_non_utf8_bytes() {
-        let diagnostic = flpdf::Diagnostic::warning_with_description(
-            "secondary warning",
-            Some(17),
+        let diagnostic = flpdf::QpdfExc::new(
+            flpdf::QpdfErrorCode::DamagedPdf,
             b"secondary-\xff.pdf",
+            b"",
+            17,
+            b"secondary warning",
         );
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();

@@ -36,7 +36,10 @@ fn removing_the_last_page_flattens_intermediate_pages_with_qpdf_warnings() {
         pdf.repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("Unknown key /UserUnit")),
+            .any(
+                |diagnostic| String::from_utf8_lossy(diagnostic.get_message_detail())
+                    .contains("Unknown key /UserUnit")
+            ),
         "flattening the intermediate /Pages node must retain qpdf's warning"
     );
 }

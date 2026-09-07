@@ -120,9 +120,19 @@ fn push_direct_node<R: Read + Seek>(
             if !INHERITABLE_KEYS.contains(&key.as_slice())
                 && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
             {
-                pdf.push_warning(format!(
-                    "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                    String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
+                let object = dict
+                    .object_ref()
+                    .map(|r| format!("Pages object: object {} {}", r.number, r.generation))
+                    .unwrap_or_else(|| "Pages object".to_owned());
+                pdf.push_qpdf_warning(crate::QpdfExc::new(
+                    crate::QpdfErrorCode::DamagedPdf,
+                    pdf.input_description(),
+                    object,
+                    0,
+                    format!(
+                        "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
+                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
+                    ),
                 ))?;
             }
         }
@@ -294,9 +304,19 @@ fn push_internal<R: Read + Seek>(
             if !INHERITABLE_KEYS.contains(&key.as_slice())
                 && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
             {
-                pdf.push_warning(format!(
-                    "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                    String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
+                let object = format!(
+                    "Pages object: object {} {}",
+                    node_ref.number, node_ref.generation
+                );
+                pdf.push_qpdf_warning(crate::QpdfExc::new(
+                    crate::QpdfErrorCode::DamagedPdf,
+                    pdf.input_description(),
+                    object,
+                    0,
+                    format!(
+                        "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
+                        String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
+                    ),
                 ))?;
             }
         }
@@ -492,8 +512,8 @@ mod tests {
         push(&mut pdf, &prepared, true, true).unwrap();
 
         assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-            diagnostic.message.contains("Unknown key /Unknown")
-                && diagnostic.message.contains("/Pages")
+            diagnostic.message_string().contains("Unknown key /Unknown")
+                && diagnostic.message_string().contains("/Pages")
         }));
         let page = pdf.get_object_handle(prepared.pages[0]);
         pdf.resolve(&page).unwrap();
@@ -518,7 +538,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("Unknown key /Unknown")));
+            .any(|diagnostic| diagnostic.message_string().contains("Unknown key /Unknown")));
     }
 
     #[test]

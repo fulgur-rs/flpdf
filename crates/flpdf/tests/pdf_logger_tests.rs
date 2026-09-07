@@ -233,14 +233,13 @@ fn object_warning_preserves_a_non_utf8_file_description() {
         .entries()
         .last()
         .expect("object warning diagnostic");
-    assert!(diagnostic.is_object_warning());
     assert!(
         diagnostic
-            .message_bytes()
+            .what_bytes()
             .windows(description.len())
             .any(|window| window == description),
         "diagnostic must retain the raw object warning bytes: {:?}",
-        diagnostic.message_bytes()
+        diagnostic.what_bytes()
     );
 }
 
@@ -272,7 +271,7 @@ fn warning_replays_initial_repair_diagnostics_once_in_original_order() {
         pdf.repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.as_str())
+            .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
             .collect::<Vec<_>>(),
         [
             "file is damaged",
@@ -435,7 +434,7 @@ fn unknown_xref_entry_type_matches_qpdf_after_reconstruction() {
         .expect_err("the recovered candidate has no /Root dictionary");
     assert!(matches!(
         error,
-        Error::System(ref message) if message == "unable to find /Root dictionary"
+        Error::QpdfExc(warning) if warning.get_message_detail() == b"unable to find /Root dictionary"
     ));
     assert_eq!(
         output.lock().unwrap().as_slice(),
@@ -471,7 +470,7 @@ fn unknown_second_xref_entry_type_reports_the_payload_offset_like_qpdf() {
         .expect_err("the recovered candidate has no /Root dictionary");
     assert!(matches!(
         error,
-        Error::System(ref message) if message == "unable to find /Root dictionary"
+        Error::QpdfExc(warning) if warning.get_message_detail() == b"unable to find /Root dictionary"
     ));
     assert_eq!(
         output.lock().unwrap().as_slice(),
@@ -501,7 +500,7 @@ fn indirect_xref_filter_keeps_cached_null_through_reconstruction() {
             .expect_err("the recovered candidate has no /Root dictionary");
         assert!(matches!(
             error,
-            Error::System(ref message) if message == "unable to find /Root dictionary"
+            Error::QpdfExc(warning) if warning.get_message_detail() == b"unable to find /Root dictionary"
         ));
         let expected = b"WARNING: input.pdf (xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 9\n\
              WARNING: input.pdf: file is damaged\n\
@@ -559,8 +558,8 @@ fn warning_delivery_failure_is_returned_after_the_diagnostic_is_appended() {
         Err(Error::System(ref message)) if message == "warning sink failed"
     ));
     assert_eq!(
-        pdf.repair_diagnostics().entries()[0].message,
-        "(object 5 0, offset 232): expected endobj"
+        pdf.repair_diagnostics().entries()[0].get_message_detail(),
+        b"expected endobj"
     );
 }
 
@@ -613,8 +612,14 @@ fn live_suppression_toggle_only_changes_delivery_not_collection() {
 
     let diagnostics = pdf.repair_diagnostics();
     assert_eq!(diagnostics.entries().len(), 2);
-    assert!(diagnostics.entries()[0].message.starts_with("(object 4 0,"));
-    assert!(diagnostics.entries()[1].message.starts_with("(object 5 0,"));
+    assert!(diagnostics.entries()[0]
+        .what_bytes()
+        .windows(b"object 4 0".len())
+        .any(|w| w == b"object 4 0"));
+    assert!(diagnostics.entries()[1]
+        .what_bytes()
+        .windows(b"object 5 0".len())
+        .any(|w| w == b"object 5 0"));
     let output = output.lock().unwrap();
     assert!(!output
         .windows(b"object 4 0".len())

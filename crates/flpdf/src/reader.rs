@@ -11,14 +11,14 @@ use crate::encryption::permissions::Permissions;
 use crate::encryption::standard::ObjectKeyAlg;
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
-use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
 #[cfg(feature = "qtest-driver")]
 use crate::parser::parse_qpdf_file_object_handle_with_diagnostics;
 use crate::parser::HandleResolver;
 use crate::reader::resolver::ResolverHandle;
 #[cfg(feature = "qtest-driver")]
 use crate::tokenizer::Tokenizer;
-use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm};
+use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, QpdfExc, Result, XrefEntry, XrefForm};
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -357,8 +357,12 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Record and route a complete qpdf warning value without rebuilding its
     /// source/object context at a higher layer.
-    pub(crate) fn push_qpdf_warning_bytes(&self, message: impl AsRef<[u8]>) -> Result<()> {
-        self.resolver.push_qpdf_warning_bytes(message)
+    pub(crate) fn push_qpdf_warning(&self, warning: QpdfExc) -> Result<()> {
+        self.resolver.push_qpdf_warning(warning)
+    }
+
+    pub(crate) fn input_description(&self) -> Vec<u8> {
+        self.resolver.input_description()
     }
 
     /// Exact source framing recorded by the canonical ObjectHandle resolver

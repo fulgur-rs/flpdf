@@ -159,7 +159,10 @@ impl<R: Read + Seek> Pdf<R> {
 pub(crate) enum LinearizationParameterCheck {
     Clean,
     Warning(&'static str),
-    Error(&'static str),
+    Error {
+        object: &'static str,
+        message: &'static str,
+    },
 }
 
 /// Replay the `/N`, `/O`, and `/P` responsibility boundary used by qpdf's
@@ -199,17 +202,20 @@ pub(crate) fn check_linearization_parameters<R: Read + Seek>(
         p.try_is_null()? || p.as_integer().is_some()
     };
     if !(h_is_array && o_is_integer && e_is_integer && n_is_integer && t_is_integer && p_is_valid) {
-        return Ok(LinearizationParameterCheck::Error(
-            "linearization dictionary: some keys in linearization dictionary are of the wrong type",
-        ));
+        return Ok(LinearizationParameterCheck::Error {
+            object: "linearization dictionary",
+            message: "some keys in linearization dictionary are of the wrong type",
+        });
     }
 
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     let page_count = pages.len() as i64;
+    n.try_dereference()?;
     if n.as_integer() != Some(page_count) {
-        return Ok(LinearizationParameterCheck::Error(
-            "linearization hint table: /N does not match number of pages",
-        ));
+        return Ok(LinearizationParameterCheck::Error {
+            object: "linearization hint table",
+            message: "/N does not match number of pages",
+        });
     }
 
     let Some(first_page) = pages.first() else {
@@ -1561,13 +1567,12 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
     // resolver returns the operation-specific last offset; retain the source
     // seam as a defensive fallback for recovered empty objects without a
     // trailing token.
-    let hint_object_damage_offset =
-        hint_object_damage_offset.unwrap_or_else(|| pdf.source_last_offset());
     let Some(hint_dict) = hint_obj.as_stream_dict() else {
         if hint_obj.is_null() {
             return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
                 "linearization dictionary",
-                hint_object_damage_offset,
+                // cov:ignore: recovered empty objects without a trailing token are a defensive resolver fallback
+                hint_object_damage_offset.unwrap_or_else(|| pdf.source_last_offset()), // cov:ignore: recovered empty objects without a trailing token are a defensive resolver fallback
                 "hint table is not a stream",
                 format!(
                     "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) does not exist"
@@ -1576,7 +1581,7 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
         }
         return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
             "linearization dictionary",
-            hint_object_damage_offset,
+            hint_object_damage_offset.unwrap_or_else(|| pdf.source_last_offset()),
             "hint table is not a stream",
             format!(
                 "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) is not a stream"

@@ -24,8 +24,8 @@ use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qutil::{qpdf_string_to_int_checked, QpdfIntParse};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectRef, ObjectStreamMode, PageDocumentHelper,
-    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, Severity,
-    UsageError, WriterConfiguration,
+    PageObjectHelper, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, ReadSeek, Result, UsageError,
+    WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -3800,12 +3800,7 @@ impl QPDFJob {
     where
         R: Read + Seek,
     {
-        if pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|entry| entry.severity == Severity::Warning)
-        {
+        if !pdf.repair_diagnostics().entries().is_empty() {
             self.record_warnings();
         }
     }
@@ -4006,7 +4001,7 @@ mod tests {
                 "dangling-root.pdf",
                 PdfOpenOptions::default(),
             ),
-            Err(Error::System(message)) if message == "unable to find /Root dictionary"
+            Err(Error::QpdfExc(warning)) if warning.get_message_detail() == b"unable to find /Root dictionary"
         ));
     }
 
@@ -4020,7 +4015,7 @@ mod tests {
                 "wrong-type-root.pdf",
                 PdfOpenOptions::default(),
             ),
-            Err(Error::System(message)) if message == "unable to find /Root dictionary"
+            Err(Error::QpdfExc(warning)) if warning.get_message_detail() == b"unable to find /Root dictionary"
         ));
     }
 
@@ -4159,7 +4154,10 @@ mod tests {
         );
 
         match result {
-            Err(Error::System(message)) => assert_eq!(message, "unable to find /Root dictionary"),
+            Err(Error::QpdfExc(warning)) => assert_eq!(
+                warning.get_message_detail(),
+                b"unable to find /Root dictionary"
+            ),
             // cov:ignore-start: diagnostic panic arms reachable only if this
             // regression test itself starts failing in an unexpected shape;
             // the passing-suite path always takes the arm above.

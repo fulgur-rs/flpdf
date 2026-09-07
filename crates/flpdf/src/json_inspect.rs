@@ -613,15 +613,17 @@ mod tests {
         let unknown = stream(b"raw".to_vec(), Some(b"UnknownDecode"));
         assert!(matches!(
             unknown.get_stream_data(crate::writer::DecodeLevel::All),
-            Err(crate::Error::Unsupported(message))
-                if message == "getStreamData called on unfilterable stream"
+            Err(crate::Error::QpdfExc(error))
+                if error.get_error_code() == crate::QpdfErrorCode::Unsupported
+                    && error.get_message_detail() == b"getStreamData called on unfilterable stream"
         ));
 
         let specialized = stream(b"raw".to_vec(), Some(b"RunLengthDecode"));
         assert!(matches!(
             specialized.get_stream_data(crate::writer::DecodeLevel::Generalized),
-            Err(crate::Error::Unsupported(message))
-                if message == "getStreamData called on unfilterable stream"
+            Err(crate::Error::QpdfExc(error))
+                if error.get_error_code() == crate::QpdfErrorCode::Unsupported
+                    && error.get_message_detail() == b"getStreamData called on unfilterable stream"
         ));
         assert!(!specialized
             .get_stream_data(crate::writer::DecodeLevel::Specialized)

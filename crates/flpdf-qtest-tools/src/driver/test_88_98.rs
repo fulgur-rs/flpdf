@@ -959,7 +959,12 @@ mod tests {
 
         assert!(matches!(
             error,
-            Error::System(message) if message == "unable to find /Root dictionary"
+            Error::QpdfExc(warning)
+                if warning.get_error_code() == flpdf::QpdfErrorCode::DamagedPdf
+                    && warning.get_filename() == b"bad-root.pdf"
+                    && warning.get_object().is_empty()
+                    && warning.get_file_position() == 0
+                    && warning.get_message_detail() == b"unable to find /Root dictionary"
         ));
         assert!(stdout.is_empty());
         assert_eq!(

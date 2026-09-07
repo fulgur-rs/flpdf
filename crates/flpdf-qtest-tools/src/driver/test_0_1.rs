@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
-use flpdf::{Diagnostic, Error, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc};
 
 use super::handle::{
     resolve_handle, resolve_stream_dictionary_handle, write_qpdf_object_handle,
@@ -350,7 +350,15 @@ fn write_object_details<R: Read + Seek>(
                             StreamDecodeEvent::Warning(warning) => {
                                 write_warning(
                                     filename,
-                                    &Diagnostic::warning(warning.message, offset),
+                                    &QpdfExc::new(
+                                        QpdfErrorCode::DamagedPdf,
+                                        filename,
+                                        b"",
+                                        offset
+                                            .and_then(|offset| i64::try_from(offset).ok())
+                                            .unwrap_or(0),
+                                        warning.message.as_bytes(),
+                                    ),
                                     stdout,
                                     stderr,
                                 )?;
@@ -365,12 +373,18 @@ fn write_object_details<R: Read + Seek>(
                                 let detail = stream_decode_error_detail(error);
                                 write_warning(
                                     filename,
-                                    &Diagnostic::warning(
+                                    &QpdfExc::new(
+                                        QpdfErrorCode::DamagedPdf,
+                                        filename,
+                                        b"",
+                                        offset
+                                            .and_then(|offset| i64::try_from(offset).ok())
+                                            .unwrap_or(0),
                                         format!(
                                             "error decoding stream data for object {} {}: {detail}",
                                             object_ref.number, object_ref.generation
-                                        ),
-                                        offset,
+                                        )
+                                        .as_bytes(),
                                     ),
                                     stdout,
                                     stderr,
@@ -389,7 +403,15 @@ fn write_object_details<R: Read + Seek>(
                         .map(|object_ref| pdf.source_stream_data_offset(object_ref))
                         .transpose()?
                         .flatten();
-                    let diagnostic = Diagnostic::warning(message, offset);
+                    let diagnostic = QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        filename,
+                        b"",
+                        offset
+                            .and_then(|offset| i64::try_from(offset).ok())
+                            .unwrap_or(0),
+                        message.as_bytes(),
+                    );
                     write_warning(filename, &diagnostic, stdout, stderr)?;
                     writeln!(stdout, "Stream data is not filterable.")?;
                 }
@@ -482,6 +504,7 @@ mod tests {
         let bytes = pdf_with_qtest(qtest, extras);
         let options = PdfOpenOptions {
             repair: true,
+            description: b"fixture.pdf".to_vec(),
             ..PdfOpenOptions::default()
         };
         let mut pdf =
@@ -575,6 +598,7 @@ mod tests {
 
         let options = PdfOpenOptions {
             repair: true,
+            description: b"fixture.pdf".to_vec(),
             ..PdfOpenOptions::default()
         };
         let mut pdf =
@@ -720,6 +744,7 @@ mod tests {
         let bytes = pdf_with_qtest(b"[ 100 0 R ]", &[]);
         let options = PdfOpenOptions {
             repair: true,
+            description: b"fixture.pdf".to_vec(),
             ..PdfOpenOptions::default()
         };
         let mut pdf =
@@ -776,6 +801,7 @@ mod tests {
             .expect("malformed child token");
         let options = PdfOpenOptions {
             repair: true,
+            description: b"fixture.pdf".to_vec(),
             ..PdfOpenOptions::default()
         };
         let mut pdf =

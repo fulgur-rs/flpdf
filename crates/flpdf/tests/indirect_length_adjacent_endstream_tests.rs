@@ -16,7 +16,7 @@
 mod common;
 use common::PdfCanonicalTestExt;
 
-use flpdf::{ObjectHandle, ObjectRef, Pdf, Severity};
+use flpdf::{ObjectHandle, ObjectRef, Pdf};
 use std::io::Cursor;
 
 /// Build a PDF-1.4 (xref table) with one content stream (obj 3) carrying
@@ -110,13 +110,10 @@ fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
     assert_eq!(
         diagnostics
             .iter()
-            .map(|entry| entry.message.as_str())
+            .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
             .collect::<Vec<_>>(),
         expected_messages
     );
-    assert!(diagnostics
-        .iter()
-        .all(|entry| entry.severity == Severity::Warning));
 
     let stream = metadata_stream_result(pdf).expect("cached stream recovery");
     assert_eq!(
@@ -157,11 +154,7 @@ fn stale_holder_pointing_at_interior_endstream_matches_qpdf() {
     let bytes = build_pdf_indirect_len_adjacent(payload, 4);
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    assert_metadata_stream_and_warnings(
-        &mut pdf,
-        b"AAAA",
-        &["(object 4 0, offset 175): expected endobj"],
-    );
+    assert_metadata_stream_and_warnings(&mut pdf, b"AAAA", &["expected endobj"]);
 }
 
 /// (2b) `endstreamendobj` has no boundary after `endstream`, so qpdf rejects
@@ -178,9 +171,9 @@ fn stale_holder_pointing_at_interior_endstreamendobj_matches_qpdf() {
         &mut pdf,
         b"AAAAendstream",
         &[
-            "(object 4 0, offset 165): expected endstream",
-            "(object 4 0, offset 161): attempting to recover stream length",
-            "(object 4 0, offset 161): recovered stream length: 13",
+            "expected endstream",
+            "attempting to recover stream length",
+            "recovered stream length: 13",
         ],
     );
 }
@@ -209,9 +202,9 @@ fn self_referential_holder_adjacent_endstream_recovers_like_qpdf() {
         b"AAAABBBB",
         &[
             "loop detected resolving object 3 0",
-            "(object 3 0, offset 133): stream dictionary lacks /Length key",
-            "(object 3 0, offset 161): attempting to recover stream length",
-            "(object 3 0, offset 161): recovered stream length: 8",
+            "stream dictionary lacks /Length key",
+            "attempting to recover stream length",
+            "recovered stream length: 8",
         ],
     );
 }
@@ -227,9 +220,9 @@ fn non_integer_holder_adjacent_endstream_recovers_like_qpdf() {
         &mut pdf,
         b"AAAABBBB",
         &[
-            "(object 4 0, offset 133): /Length key in stream dictionary is not an integer",
-            "(object 4 0, offset 161): attempting to recover stream length",
-            "(object 4 0, offset 161): recovered stream length: 8",
+            "/Length key in stream dictionary is not an integer",
+            "attempting to recover stream length",
+            "recovered stream length: 8",
         ],
     );
 }
@@ -385,12 +378,12 @@ fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
         pdf.repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.as_str())
+            .map(|entry| String::from_utf8_lossy(entry.get_message_detail()).into_owned())
             .collect::<Vec<_>>(),
         vec![
-            "(object 5 0, offset 65): /Length key in stream dictionary is not an integer",
-            "(object 5 0, offset 121): attempting to recover stream length",
-            "(object 5 0, offset 121): recovered stream length: 40",
+            "/Length key in stream dictionary is not an integer",
+            "attempting to recover stream length",
+            "recovered stream length: 40",
         ]
     );
 }

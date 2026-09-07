@@ -6,9 +6,11 @@
 //! materialization, page insertion/removal, resource pruning, and annotation
 //! flattening. The helper holds no copied page-tree state.
 
-use crate::object_handle::{format_qpdf_exception_what, DocumentResolver};
+use crate::object_handle::DocumentResolver;
 use crate::pages::tree_rebuild::{rebuild_page_tree, RebuildResult};
-use crate::{Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
+use crate::{
+    Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, QpdfErrorCode, QpdfExc, Result,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -275,15 +277,14 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             // text on the canonical page-helper error so callers do not need
             // to reconstruct it at the driver boundary.
             let description_bytes = self.pdf.resolver.input_description();
-            let description = String::from_utf8_lossy(&description_bytes);
             let object = format!("page object: object {} {}", page.number, page.generation);
-            let message = format_qpdf_exception_what(
-                &description,
-                &object,
+            return Err(Error::QpdfExc(QpdfExc::new(
+                QpdfErrorCode::Pages,
+                description_bytes,
+                object,
                 0,
-                "page object not referenced in /Pages tree",
-            );
-            return Err(Error::Pages(message));
+                b"page object not referenced in /Pages tree",
+            )));
         };
         self.remove_page_at(index)
     }

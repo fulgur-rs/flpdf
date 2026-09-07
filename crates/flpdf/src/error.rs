@@ -145,6 +145,15 @@ impl QpdfExc {
         &self.message
     }
 
+    /// Return the detail as a lossy UTF-8 projection for text-only callers.
+    ///
+    /// Byte-oriented qpdf output must use [`Self::get_message_detail`] or
+    /// [`Self::what_bytes`] instead.
+    #[cfg(test)]
+    pub(crate) fn message_string(&self) -> String {
+        String::from_utf8_lossy(&self.message).into_owned()
+    }
+
     /// Return the observable `what()` bytes, truncated at the first NUL.
     pub fn what_bytes(&self) -> &[u8] {
         let end = self
@@ -232,6 +241,11 @@ pub enum Error {
 
     #[error("parse error at byte {offset}: {message}")]
     Parse { offset: usize, message: String },
+
+    /// A qpdf exception whose code, source context, signed offset, and raw
+    /// detail remain independently available to warning/recovery owners.
+    #[error("{0}")]
+    QpdfExc(#[from] QpdfExc),
 
     #[error("unsupported PDF feature: {0}")]
     Unsupported(String),
@@ -342,6 +356,7 @@ impl Error {
     /// while leaving ordinary string errors unchanged.
     pub fn raw_message(&self) -> Option<&[u8]> {
         match self {
+            Self::QpdfExc(error) => Some(error.what_bytes()),
             Self::SystemBytes(message) => Some(message),
             Self::Usage(error) => Some(error.what_bytes()),
             Self::OpenFailure { source, .. } => source.raw_message(),
@@ -517,7 +532,7 @@ mod tests {
         assert_eq!(nul_message.what_bytes(), b"f (o, offset 7): m");
     }
     use crate::encryption::primitives::PrimitiveError;
-    use crate::Diagnostic;
+    use crate::QpdfExc;
     use std::error::Error as _;
 
     #[test]
@@ -548,7 +563,13 @@ mod tests {
     fn open_failure_delegates_display_and_error_source() {
         let source = Error::parse(7, "terminal repair failure");
         let mut diagnostics = crate::Diagnostics::default();
-        diagnostics.push(Diagnostic::warning("repair warning", None));
+        diagnostics.push(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            b"",
+            b"",
+            0,
+            b"repair warning",
+        ));
 
         let error = Error::with_open_diagnostics(source, diagnostics);
 
@@ -588,7 +609,13 @@ mod tests {
         assert_eq!(error.to_string(), "raw-error-�");
 
         let mut diagnostics = crate::Diagnostics::default();
-        diagnostics.push(Diagnostic::warning("preceding warning", None));
+        diagnostics.push(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            b"",
+            b"",
+            0,
+            b"preceding warning",
+        ));
         let wrapped = Error::with_open_diagnostics(error, diagnostics);
         assert_eq!(wrapped.raw_message(), Some(raw.as_slice()));
     }

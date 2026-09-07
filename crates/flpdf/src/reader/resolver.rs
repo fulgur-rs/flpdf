@@ -100,7 +100,9 @@ use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
-use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
+use crate::{
+    Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -497,113 +499,17 @@ impl ResolverWarningOptions {
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
-        for diagnostic in diagnostics.entries() {
-            let description = diagnostic
-                .description
-                .as_deref()
-                .unwrap_or(self.description.as_slice());
-            route_warning(
-                &self.logger,
-                self.suppress_warnings,
-                description,
-                diagnostic.offset,
-                &diagnostic.message,
-            )?;
+        if self.suppress_warnings {
+            return Ok(());
+        }
+        for warning in diagnostics.entries() {
+            let mut line = b"WARNING: ".to_vec();
+            line.extend_from_slice(warning.what_bytes());
+            line.push(b'\n');
+            self.logger.warn(line)?;
         }
         Ok(())
     }
-}
-
-fn route_warning(
-    logger: &crate::QPDFLogger,
-    suppress_warnings: bool,
-    description: &[u8],
-    offset: Option<u64>,
-    message: &str,
-) -> Result<()> {
-    if suppress_warnings {
-        return Ok(());
-    }
-    let mut line = b"WARNING: ".to_vec();
-    if message.starts_with("(object ") || message.starts_with("(trailer") {
-        line.extend_from_slice(description);
-        if !description.is_empty() {
-            line.push(b' ');
-        }
-        line.extend_from_slice(message.as_bytes());
-        line.push(b'\n');
-        return logger.warn(line);
-    }
-    let positive_offset = offset.filter(|offset| *offset > 0);
-    if !description.is_empty() {
-        line.extend_from_slice(description);
-        if let Some(offset) = positive_offset {
-            line.extend_from_slice(b" (offset ");
-            line.extend_from_slice(offset.to_string().as_bytes());
-            line.push(b')');
-        }
-    } else if let Some(offset) = positive_offset {
-        line.extend_from_slice(b"offset ");
-        line.extend_from_slice(offset.to_string().as_bytes());
-    }
-    if !description.is_empty() || positive_offset.is_some() {
-        line.extend_from_slice(if message.starts_with('(') {
-            &b" "[..]
-        } else {
-            &b": "[..]
-        });
-    }
-    line.extend_from_slice(message.as_bytes());
-    line.push(b'\n');
-    logger.warn(line)
-}
-
-/// Format the byte-preserving `QPDFExc::what()` shape for an input-source
-/// warning with an explicit object description (`QPDFExc.cc:19-50`).
-fn format_input_warning_what(
-    filename: &[u8],
-    object: &[u8],
-    offset: u64,
-    message: &[u8],
-) -> Vec<u8> {
-    let mut result = filename.to_vec();
-    if !(object.is_empty() && offset == 0) {
-        if !filename.is_empty() {
-            result.extend_from_slice(b" (");
-        }
-        if !object.is_empty() {
-            result.extend_from_slice(object);
-            if offset > 0 {
-                result.extend_from_slice(b", ");
-            }
-        }
-        if offset > 0 {
-            result.extend_from_slice(b"offset ");
-            result.extend_from_slice(offset.to_string().as_bytes());
-        }
-        if !filename.is_empty() {
-            result.push(b')');
-        }
-    }
-    if !result.is_empty() {
-        result.extend_from_slice(b": ");
-    }
-    result.extend_from_slice(message);
-    result
-}
-
-fn route_object_warning(
-    logger: &crate::QPDFLogger,
-    suppress_warnings: bool,
-    message: &[u8],
-) -> Result<()> {
-    if suppress_warnings {
-        return Ok(());
-    }
-    let mut line = b"WARNING: ".to_vec();
-    line.extend_from_slice(message);
-    line.push(b'\n');
-    logger.warn(line)
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -685,13 +591,17 @@ impl<R: Read + Seek> ResolverCore<R> {
             {
                 let message = format!("read {} bytes", buf.len());
                 let offset = self.input.borrow().last_offset();
-                let what =
-                    format_input_warning_what(&self.description, &[], offset, message.as_bytes());
                 // qpdf's FileInputSource converts a failed fread into a
                 // QPDFExc carrying only the source name, offset, and
                 // requested read length (`FileInputSource.cc:116-132`);
                 // the platform errno is intentionally not part of what().
-                Err(Error::SystemBytes(what))
+                Err(Error::QpdfExc(QpdfExc::new(
+                    QpdfErrorCode::System,
+                    &self.description,
+                    b"",
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    message.into_bytes(),
+                )))
             }
             Err(StreamReadError::UnderlyingRead(error))
             | Err(StreamReadError::Operation(error)) => Err(error),
@@ -701,7 +611,14 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// Read all physical bytes of the input source from position 0, restoring the
     /// logical position afterwards.
     fn read_underlying_bytes(&mut self) -> Result<Vec<u8>> {
-        self.input.borrow().read_underlying_bytes()
+        match self.input.borrow().read_underlying_bytes() {
+            Ok(bytes) => Ok(bytes),
+            Err(Error::Io(_error)) if !self.description.is_empty() => {
+                Err(Error::SystemBytes(b"read 1024 bytes".to_vec()))
+            }
+            // cov:ignore: an InputSource-backed bootstrap read can only return qpdf damage or parse errors; non-UTF8 I/O is normalized above
+            Err(error) => Err(error), // cov:ignore: source read failures are normalized to SystemBytes for the canonical bootstrap source
+        }
     }
 }
 
@@ -1301,11 +1218,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         };
         let parsed = parse_object_handle_with_context(input, &mut handles)?;
         for diagnostic in &parsed.diagnostics {
-            self.push_object_warning(qpdf_exception_what(
-                "parsed object",
-                object_description,
-                diagnostic.relative_offset,
-                &diagnostic.message,
+            self.push_object_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                b"parsed object",
+                object_description.as_bytes(),
+                i64::try_from(diagnostic.relative_offset).unwrap_or(i64::MAX),
+                diagnostic.message.as_bytes(),
             ))?;
         }
         if let Some(error) = trailing_data_error(input, parsed.next_offset, parsed.last_offset) {
@@ -1388,52 +1306,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// diagnostic when an object description exists so the qtest driver can
     /// add only its filename, matching qpdf's warning formatter.
     pub(crate) fn push_damaged_warning(&self, message: impl Into<String>) -> Result<()> {
-        let message = message.into();
-        let (diagnostic_message, diagnostic_offset, logger, suppress_warnings, description) = {
-            let mut core = self.core.borrow_mut();
+        let warning = {
+            let core = self.core.borrow();
             let offset = core.input.borrow().last_offset();
             let object = core.last_object_description.clone();
-            let (diagnostic_message, diagnostic_offset) = if object.is_empty() {
-                (message.clone(), (offset > 0).then_some(offset))
-            } else {
-                let offset_text = if offset > 0 {
-                    format!(", offset {offset}")
-                } else {
-                    String::new()
-                };
-                (format!("({object}{offset_text}): {message}"), None)
-            };
-            core.repair_diagnostics.push(Diagnostic::warning(
-                diagnostic_message.clone(),
-                diagnostic_offset,
-            ));
-            (
-                diagnostic_message,
-                diagnostic_offset,
-                core.logger.clone(),
-                core.suppress_warnings,
+            QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
                 core.description.clone(),
+                object.into_bytes(),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                message.into().into_bytes(),
             )
         };
-        route_warning(
-            &logger,
-            suppress_warnings,
-            &description,
-            diagnostic_offset,
-            &diagnostic_message,
-        )
-    }
-
-    /// qpdf's `damagedPDF("expected endobj")` is rendered with the object
-    /// identity and the input source's last offset already in the message
-    /// (`libqpdf/QPDF.cc:1297-1310,1331-1355,2641-2644`). Keeping that
-    /// location in the diagnostic text also lets the qtest driver add only
-    /// the filename, as qpdf's warning formatter does.
-    fn expected_endobj_warning(object_ref: ObjectRef, offset: u64) -> String {
-        format!(
-            "(object {} {}, offset {offset}): expected endobj",
-            object_ref.number, object_ref.generation
-        )
+        self.push_qpdf_warning(warning)
     }
 
     /// Warn `expected endobj` with qpdf's current object description.
@@ -1456,10 +1341,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             // `/Length` object resolved by readStream (`QPDF.cc:1725`), not
             // the stream object that entered readStream.
             if read_description.is_none() {
-                let object_description = String::from_utf8_lossy(&last_description);
-                return self.push_warning_at(
+                return self.push_stream_warning_with_object_description(
+                    &last_description,
                     offset,
-                    format!("({object_description}, offset {offset}): expected endobj"),
+                    "expected endobj",
                 );
             }
             return self.push_stream_warning_with_object_description(
@@ -1476,7 +1361,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 read_description,
             );
         }
-        self.push_warning(Self::expected_endobj_warning(object_ref, offset))
+        self.push_stream_warning(object_ref, offset, "expected endobj")
     }
 
     /// The canonical handle for `object_ref` **if one has already been
@@ -1821,7 +1706,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // unchanged so that the reconstructed_xref guard is not tripped by an
         // unrelated failure, and the guard state is not poisoned for a later
         // genuine xref mismatch.
-        if !matches!(trigger_error, Error::Parse { .. }) {
+        if !matches!(trigger_error, Error::QpdfExc(_) | Error::Parse { .. }) {
             return Err(trigger_error);
         }
 
@@ -1834,14 +1719,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // Push repair warnings (QPDF.cc:528-530)
         self.push_warning("file is damaged")?;
 
-        let Error::Parse { offset, message } = &trigger_error else {
-            unreachable!("guard above ensures Parse variant"); // cov:ignore: unreachable after guard
-        };
-        let location = format!(
-            "(object {} {}, offset {}): {}",
-            object_ref.number, object_ref.generation, offset, message
-        );
-        self.push_warning(location)?;
+        match trigger_error {
+            Error::QpdfExc(warning) => self.push_qpdf_warning(warning)?,
+            Error::Parse { offset, message } => {
+                let filename = self.core.borrow().description.clone();
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    format!("object {} {}", object_ref.number, object_ref.generation),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    message.into_bytes(),
+                ))?; // cov:ignore: parser recovery always supplies a qpdf exception or parse error in this route
+            }
+            _ => unreachable!("guard above ensures a qpdf damage variant"), // cov:ignore: unreachable after guard
+        }
         self.push_warning("Attempting to reconstruct cross-reference table")?;
 
         // Read logical bytes (header_offset already consumed), matching qpdf's
@@ -1861,7 +1752,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // `removeObject` is instead an exact cache/xref mutation
         // (`QPDF.cc:1996-2005`). A prior canonical removal therefore cannot
         // filter this fresh recovery scan.
-        let new_entries = crate::xref::recover_xref_entries(logical_bytes, false)?.entries;
+        let filename = self.core.borrow().description.clone();
+        let new_entries =
+            crate::xref::recover_xref_entries(logical_bytes, false, &filename)?.entries;
 
         {
             let mut core = self.core.borrow_mut();
@@ -1922,8 +1815,34 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Borrow discipline: the `borrow_mut()` is taken and dropped inside this
     /// expression, so it composes with a nested resolution — but it must not
     /// be called while a borrow of the core is already held.
+    pub(crate) fn push_qpdf_warning(&self, warning: QpdfExc) -> Result<()> {
+        let (logger, suppress_warnings) = {
+            let mut core = self.core.borrow_mut();
+            core.repair_diagnostics.push(warning.clone());
+            (core.logger.clone(), core.suppress_warnings)
+        };
+        if suppress_warnings {
+            return Ok(());
+        }
+        let mut line = b"WARNING: ".to_vec();
+        line.extend_from_slice(warning.what_bytes());
+        line.push(b'\n');
+        logger.warn(line)
+    }
+
     pub(crate) fn push_warning(&self, message: impl Into<String>) -> Result<()> {
-        self.push_warning_with_offset(None, None, message)
+        let warning = {
+            let core = self.core.borrow();
+            let offset = core.input.borrow().last_offset();
+            QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                core.description.clone(),
+                b"",
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                message.into().into_bytes(),
+            )
+        };
+        self.push_qpdf_warning(warning)
     }
 
     /// [`Self::push_warning`] with the offset qpdf attributes the warning to.
@@ -1931,10 +1850,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// qpdf carries the position inside the exception it throws — every
     /// `damagedPDF(file, object, offset, message)` overload takes one
     /// (`include/qpdf/QPDF.hh:1044-1050`) — where flpdf keeps it in
-    /// [`Diagnostic::offset`] beside the text.
+    /// the signed offset getter beside the independent detail bytes.
     ///
     pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) -> Result<()> {
-        self.push_warning_with_offset(Some(offset), None, message)
+        let warning = {
+            let core = self.core.borrow();
+            QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                core.description.clone(),
+                b"",
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                message.into().into_bytes(),
+            )
+        };
+        self.push_qpdf_warning(warning)
     }
 
     /// Append qpdf's `damagedPDF("trailer", message)` warning shape.
@@ -1950,68 +1879,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         message: impl Into<String>,
     ) -> Result<()> {
-        let (diagnostic_offset, location) = if offset > 0 {
-            (Some(offset), format!("(trailer, offset {offset})"))
-        } else {
-            (None, "(trailer)".to_owned())
-        };
-        self.push_warning_with_offset(
-            diagnostic_offset,
-            None,
-            format!("{location}: {}", message.into()),
-        )
-    }
-
-    /// Format the `QPDFExc::what()` bytes emitted by qpdf's JSON reactor.
-    fn format_json_warning_what(
-        description: &[u8],
-        input_name: &[u8],
-        object: &str,
-        offset: i64,
-        message: &[u8],
-    ) -> Vec<u8> {
-        let mut object = object.as_bytes().to_vec();
-        if input_name != description {
-            object.extend_from_slice(b" from ");
-            object.extend_from_slice(input_name);
-        }
-        let offset_text = if offset > 0 {
-            let mut text = b", offset ".to_vec();
-            text.extend_from_slice(offset.to_string().as_bytes());
-            text
-        } else {
-            Vec::new()
-        };
-        let mut what = Vec::new();
-        if object.is_empty() {
-            if offset > 0 {
-                if description.is_empty() {
-                    what.extend_from_slice(b"offset ");
-                    what.extend_from_slice(offset.to_string().as_bytes());
-                    what.extend_from_slice(b": ");
-                } else {
-                    what.extend_from_slice(description);
-                    what.extend_from_slice(b" (offset ");
-                    what.extend_from_slice(offset.to_string().as_bytes());
-                    what.extend_from_slice(b"): ");
-                }
-            } else if !description.is_empty() {
-                what.extend_from_slice(description);
-                what.extend_from_slice(b": ");
-            }
-        } else if description.is_empty() {
-            what.extend_from_slice(&object);
-            what.extend_from_slice(&offset_text);
-            what.extend_from_slice(b": ");
-        } else {
-            what.extend_from_slice(description);
-            what.extend_from_slice(b" (");
-            what.extend_from_slice(&object);
-            what.extend_from_slice(&offset_text);
-            what.extend_from_slice(b"): ");
-        }
-        what.extend_from_slice(message);
-        what
+        let filename = self.core.borrow().description.clone();
+        let warning = QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            filename,
+            b"trailer",
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            message.into().into_bytes(),
+        );
+        self.push_qpdf_warning(warning)
     }
 
     /// Emit a warning from qpdf's JSON input reactor.
@@ -2022,37 +1898,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// ordinary offset sink cannot express that shape without duplicating the
     /// filename or moving the offset into the message, so JSON input keeps a
     /// dedicated routing door here.
-    pub(crate) fn push_json_warning(
-        &self,
-        input_name: impl AsRef<[u8]>,
-        object: &str,
-        offset: i64,
-        message: impl Into<String>,
-    ) -> Result<()> {
-        let input_name = input_name.as_ref().to_vec();
-        let message = message.into();
-        let (logger, suppress_warnings, what) = {
-            let mut core = self.core.borrow_mut();
-            let what = Self::format_json_warning_what(
-                &core.description,
-                &input_name,
-                object,
-                offset,
-                message.as_bytes(),
-            );
-            let mut diagnostic = Diagnostic::object_warning_bytes(&what);
-            diagnostic.offset = (offset >= 0).then_some(offset as u64);
-            core.repair_diagnostics.push(diagnostic);
-            (core.logger.clone(), core.suppress_warnings, what)
-        };
-        if suppress_warnings {
-            return Ok(());
-        }
-
-        let mut line = b"WARNING: ".to_vec();
-        line.extend_from_slice(&what);
-        line.push(b'\n');
-        logger.warn(line)
+    pub(crate) fn push_json_warning(&self, warning: QpdfExc) -> Result<()> {
+        self.push_qpdf_warning(warning)
     }
 
     /// Emit a warning raised while parsing a canonical ObjStm member.
@@ -2061,8 +1908,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the source description plus `object stream N`, so the parser offset is
     /// relative to the decoded buffer rather than the source PDF
     /// (`libqpdf/QPDF.cc:1792-1807`). Keep that coordinate in the rendered
-    /// qpdf message, but do not publish it as [`Diagnostic::offset`], whose
-    /// contract is a source-file position.
+    /// qpdf message as the exception's signed file position.
     pub(crate) fn push_object_stream_warning(
         &self,
         stream_number: u32,
@@ -2070,74 +1916,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         message: impl Into<String>,
     ) -> Result<()> {
-        let detail = message.into();
-        let diagnostic_message = format!(
-            "object stream {stream_number} (object {} {}, offset {offset}): {detail}",
-            object_ref.number, object_ref.generation
-        );
-        let object_message = format!(
-            "(object {} {}, offset {offset}): {detail}",
-            object_ref.number, object_ref.generation
-        );
-        let (logger, suppress_warnings, description) = {
-            let mut core = self.core.borrow_mut();
-            core.repair_diagnostics
-                .push(Diagnostic::warning(diagnostic_message, None));
-            (
-                core.logger.clone(),
-                core.suppress_warnings,
-                core.description.clone(),
-            )
-        };
-        let mut object_stream_description = description;
-        if !object_stream_description.is_empty() {
-            object_stream_description.extend_from_slice(b" object stream ");
-        } else {
-            object_stream_description.extend_from_slice(b"object stream ");
+        let mut filename = self.core.borrow().description.clone();
+        if !filename.is_empty() {
+            filename.push(b' ');
         }
-        object_stream_description.extend_from_slice(stream_number.to_string().as_bytes());
-        route_warning(
-            &logger,
-            suppress_warnings,
-            &object_stream_description,
-            None,
-            &object_message,
-        )
-    }
-
-    /// `description_override` is `Some` only for a foreign stream's deferred
-    /// read: qpdf's `pipeForeignStreamData` builds its `QPDFExc` from the
-    /// captured source `InputSource`'s name, and `QPDF::warn(QPDFExc const&)`
-    /// pushes that exception into the destination's own warning list without
-    /// rewriting its filename (`libqpdf/QPDF.cc:488-494,2498-2500,2565-2585`).
-    /// `self` (the destination) still owns collection into
-    /// [`Diagnostic`]/`repair_diagnostics` and routing through its own
-    /// logger/`suppress_warnings`; only the location text substitutes the
-    /// source's description for `self`'s own.
-    fn push_warning_with_offset(
-        &self,
-        offset: Option<u64>,
-        description_override: Option<&[u8]>,
-        message: impl Into<String>,
-    ) -> Result<()> {
-        let message = message.into();
-        let (logger, suppress_warnings, own_description) = {
-            let mut core = self.core.borrow_mut();
-            let diagnostic = match description_override {
-                Some(description) => {
-                    Diagnostic::warning_with_description(message.clone(), offset, description)
-                }
-                None => Diagnostic::warning(message.clone(), offset),
-            };
-            core.repair_diagnostics.push(diagnostic);
-            (
-                core.logger.clone(),
-                core.suppress_warnings,
-                core.description.clone(),
-            )
-        };
-        let description = description_override.unwrap_or(own_description.as_slice());
-        route_warning(&logger, suppress_warnings, description, offset, &message)
+        filename.extend_from_slice(b"object stream ");
+        filename.extend_from_slice(stream_number.to_string().as_bytes());
+        let object = format!("object {} {}", object_ref.number, object_ref.generation);
+        self.push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            filename,
+            object,
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            message.into().into_bytes(),
+        ))
     }
 
     /// [`Self::push_warning`] for a warning an object raised about itself.
@@ -2163,59 +1955,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///
     /// Same borrow discipline as [`Self::push_warning`]: the `borrow_mut()`
     /// is taken and dropped before the logger write.
-    pub(crate) fn push_object_warning(&self, message: impl AsRef<[u8]>) -> Result<()> {
-        let message = message.as_ref().to_vec();
-        let (logger, suppress_warnings) = {
-            let mut core = self.core.borrow_mut();
-            core.repair_diagnostics
-                .push(Diagnostic::object_warning_bytes(&message));
-            (core.logger.clone(), core.suppress_warnings)
-        };
-        route_object_warning(&logger, suppress_warnings, &message)
-    }
-
-    /// Record and route a complete qpdf warning value whose
-    /// `QPDFExc::what()` has already been assembled by the owning consumer.
-    /// This is the byte-preserving equivalent of `QPDF::warn(QPDFExc const&)`:
-    /// deferred job replay must not prepend a second filename or discard a
-    /// non-UTF-8 source description (`libqpdf/QPDF.cc:488-504` and
-    /// `QPDFExc.cc:19-50`).
-    pub(crate) fn push_qpdf_warning_bytes(&self, message: impl AsRef<[u8]>) -> Result<()> {
-        let message = message.as_ref().to_vec();
-        let (logger, suppress_warnings) = {
-            let mut core = self.core.borrow_mut();
-            core.repair_diagnostics
-                .push(Diagnostic::object_warning_bytes(&message));
-            (core.logger.clone(), core.suppress_warnings)
-        };
-        route_object_warning(&logger, suppress_warnings, &message)
+    pub(crate) fn push_object_warning(&self, warning: QpdfExc) -> Result<()> {
+        self.push_qpdf_warning(warning)
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
-        let (logger, suppress_warnings, own_description) = {
+        let (logger, suppress_warnings) = {
             let core = self.core.borrow();
-            (
-                core.logger.clone(),
-                core.suppress_warnings,
-                core.description.clone(),
-            )
+            (core.logger.clone(), core.suppress_warnings)
         };
-        for diagnostic in diagnostics.entries() {
-            if diagnostic.is_object_warning() {
-                route_object_warning(&logger, suppress_warnings, diagnostic.message_bytes())?;
-                continue;
-            }
-            let description = diagnostic
-                .description
-                .as_deref()
-                .unwrap_or(own_description.as_slice());
-            route_warning(
-                &logger,
-                suppress_warnings,
-                description,
-                diagnostic.offset,
-                &diagnostic.message,
-            )?;
+        if suppress_warnings {
+            return Ok(());
+        }
+        for warning in diagnostics.entries() {
+            let mut line = b"WARNING: ".to_vec();
+            line.extend_from_slice(warning.what_bytes());
+            line.push(b'\n');
+            logger.warn(line)?;
         }
         Ok(())
     }
@@ -2232,7 +1988,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// later one and iterating with `.skip(start)` — `flpdf-cli`'s
     /// `finish_lazy_warnings` and `emit_warnings_since`
     /// (`crates/flpdf-cli/src/main.rs:5341-5364`) do exactly that.
-    /// [`Diagnostics`] is append-only: `push` and `push_encrypted` are its
+    /// [`Diagnostics`] is append-only: `push` is its
     /// only mutators and its entry vector is private, so an index valid in one
     /// snapshot names the same entry in every later one. Nothing replaces the
     /// collection wholesale either — `xref.rs` does that only on `LoadedXref`,
@@ -2312,6 +2068,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Return the name of the current qpdf input source. An active source uses
     /// the caller-provided description; the invalid replacement has qpdf's
     /// fixed `closed input source` name.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn input_source_name(&self) -> String {
         let core = self.core.borrow();
         if core.input.borrow().is_closed() {
@@ -2440,22 +2197,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .map_err(ObjectStreamResolutionError::WarningDelivery)?;
         }
 
-        let mut decoded_stream = crate::pipeline::buffer::Buffer::new("object stream", None);
-        let mut filtering_attempted = false;
-        let _success = stream_handle.pipe_stream_data_for_object_stream(
-            &mut decoded_stream,
-            &mut filtering_attempted,
-            0,
-            crate::writer::DecodeLevel::Specialized,
-            false,
-            false,
-        )?;
-        if !filtering_attempted {
-            return Err(ObjectStreamResolutionError::Operation(Error::Unsupported(
-                "getStreamData called on unfilterable stream".to_owned(),
-            )));
-        }
-        let decoded_stream_data = decoded_stream.take_buffer()?;
+        // qpdf calls QPDFObjectHandle::getStreamData(qpdf_dl_specialized)
+        // here. Keep its typed QPDFExc (source name, parsed offset, and empty
+        // object context) intact rather than manufacturing an offsetless
+        // Unsupported error when the stream cannot be filtered.
+        let decoded_stream_data =
+            stream_handle.get_stream_data(crate::writer::DecodeLevel::Specialized)?;
 
         let object_count = Self::object_stream_integer(&stream_dict, b"/N", "/N")?;
         let first = Self::object_stream_integer(&stream_dict, b"/First", "/First")?;
@@ -2490,17 +2237,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 continue;
             }
 
-            // A caller replacement is already the effective value for this
-            // member. Keep it authoritative when another unresolved member
-            // causes the source stream to be decoded; otherwise this pass
-            // would overwrite the live cache slot with the stale source
-            // bytes before the writer can consume the ObjectHandle. This is
-            // the same cache authority that makes qpdf's resolved object
-            // handles independent of the source container once materialized.
             let member_handle = self.get_object_handle(object_ref);
-            if member_handle.is_resolved() {
-                continue;
-            }
 
             let member_start = first
                 .checked_add(object_offset)
@@ -2587,7 +2324,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn resolve_object_stream_or_null(
         &self,
         stream_number: u32,
-        object_ref: ObjectRef,
         handle: &ObjectHandle,
     ) -> Result<()> {
         match self.resolve_object_stream_with_failure_kind(stream_number) {
@@ -2608,28 +2344,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     handle.set_resolved(ObjectValue::Null);
                 }
             }
-            Err(ObjectStreamResolutionError::Operation(error))
-                if Self::is_qpdf_caught_resolution_error(&error) =>
-            {
-                // `QPDF::resolve` catches the QPDFExc raised by
-                // `resolveObjectsInStream`, warns, and lets its common tail
-                // cache the requested object as null (`QPDF.cc:1724-1750`).
-                self.push_caught_resolution_warning(error, object_ref)?;
-                if !handle.is_resolved() {
-                    handle.set_resolved(ObjectValue::Null);
-                }
-            }
             Err(ObjectStreamResolutionError::Operation(error)) => return Err(error),
         }
         Ok(())
-    }
-
-    fn is_qpdf_caught_resolution_error(error: &Error) -> bool {
-        match error {
-            Error::Parse { .. } | Error::Unsupported(_) => true,
-            Error::Internal(message) => message == CLOSED_INPUT_SOURCE_ERROR,
-            _ => false,
-        }
     }
 
     /// Preserve the source position carried by qpdf's `QPDFExc` when its
@@ -2640,29 +2357,111 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// path.
     fn push_caught_resolution_warning(&self, error: Error, object_ref: ObjectRef) -> Result<()> {
         match error {
+            Error::QpdfExc(warning) => self.push_qpdf_warning(warning),
             Error::Parse { offset, message } => {
                 let object = self.core.borrow().last_object_description.clone();
-                let message = if object.is_empty() {
-                    message
-                } else if offset > 0 {
-                    format!("({object}, offset {offset}): {message}")
-                } else {
-                    format!("({object}): {message}")
-                };
-                self.push_warning_at(u64::try_from(offset).unwrap_or(u64::MAX), message)
+                let warning = QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    self.core.borrow().description.clone(),
+                    object.into_bytes(),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    message.into_bytes(),
+                );
+                self.push_qpdf_warning(warning)
             }
-            Error::Internal(message) if message == CLOSED_INPUT_SOURCE_ERROR => {
+            Error::Internal(message) => {
                 let message = format!(
                     "object {}/{}: error reading object: {message}",
                     object_ref.number, object_ref.generation
                 );
-                self.push_warning_with_offset(
-                    None,
-                    Some(CLOSED_INPUT_SOURCE_NAME.as_bytes()),
-                    message,
-                )
+                let filename = if self.input_source_closed() {
+                    CLOSED_INPUT_SOURCE_NAME.as_bytes().to_vec()
+                } else {
+                    self.core.borrow().description.clone()
+                };
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"",
+                    0,
+                    message.into_bytes(),
+                ))
             }
-            error => self.push_warning(error.to_string()),
+            Error::Unsupported(message) => {
+                let (filename, object) = {
+                    let core = self.core.borrow();
+                    (
+                        core.description.clone(),
+                        core.last_object_description.clone().into_bytes(),
+                    )
+                };
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::Unsupported,
+                    filename,
+                    object,
+                    0,
+                    message.into_bytes(),
+                ))
+            }
+            Error::SystemBytes(message) => {
+                let detail = message.split(|byte| *byte == 0).next().unwrap_or_default();
+                let mut qpdf_message = format!(
+                    "object {}/{}: error reading object: ",
+                    object_ref.number, object_ref.generation
+                )
+                .into_bytes();
+                qpdf_message.extend_from_slice(detail);
+                let filename = self.core.borrow().description.clone();
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"",
+                    0,
+                    qpdf_message,
+                ))
+            }
+            Error::System(message) => {
+                let detail = message.split('\0').next().unwrap_or_default();
+                let qpdf_message = format!(
+                    "object {}/{}: error reading object: {detail}",
+                    object_ref.number, object_ref.generation
+                );
+                let filename = self.core.borrow().description.clone();
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"",
+                    0,
+                    qpdf_message.into_bytes(),
+                ))
+            }
+            Error::Io(error) => {
+                let mut qpdf_message = format!(
+                    "object {}/{}: error reading object: ",
+                    object_ref.number, object_ref.generation
+                )
+                .into_bytes();
+                qpdf_message.extend_from_slice(error.to_string().as_bytes());
+                let filename = self.core.borrow().description.clone();
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    b"",
+                    0,
+                    qpdf_message,
+                ))
+            }
+            // cov:ignore-start: qpdf object-read failures are normalized to the explicit System/Io/QpdfExc cases above
+            error => {
+                let filename = self.core.borrow().description.clone();
+                self.push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    filename,
+                    format!("object {}/{}", object_ref.number, object_ref.generation),
+                    0,
+                    error.to_string().into_bytes(),
+                ))
+            } // cov:ignore-end
         }
     }
 
@@ -3222,15 +3021,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         expected: ObjectRef,
         description: Option<Vec<u8>>,
     ) -> Result<(ObjectHandle, Option<u64>)> {
-        let was_resolved = self.get_object_handle(expected).is_resolved();
         let parsed = self
             .read_object_at_offset_with_description(offset, expected, true, false, description)
             .map_err(ReadObjectAtOffsetError::into_error)?;
-        let damage_offset = if was_resolved {
-            parsed.trailing_start
-        } else {
-            u64::try_from(parsed.end_after_space).ok()
-        };
+        let damage_offset = parsed
+            .trailing_start
+            .or_else(|| u64::try_from(parsed.end_after_space).ok());
         let object_ref = parsed.object_ref;
         self.cache_parsed_object(parsed);
         Ok((self.get_object_handle(object_ref), damage_offset))
@@ -3372,38 +3168,39 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         let found = found.expect("the range check above establishes the header object reference");
         self.set_last_object_description(found, read_description.as_deref());
+        let warning_filename = self.core.borrow().description.clone();
         if found != expected {
-            self.push_warning_at(
-                offset,
-                format!(
-                    "(object {} {}, offset {offset}): expected {} {} obj",
-                    expected.number, expected.generation, expected.number, expected.generation
-                ),
-            )
+            self.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                &warning_filename,
+                b"",
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                format!("expected {} {} obj", expected.number, expected.generation).into_bytes(),
+            ))
             .map_err(ReadObjectAtOffsetError::Body)?;
         }
 
         let malformed = !parsed.diagnostics.is_empty();
         for warning in parsed.diagnostics {
             let warning_offset = warning.relative_offset as u64;
-            self.push_warning_at(
-                warning_offset,
-                format!(
-                    "(object {} {}, offset {warning_offset}): {}",
-                    found.number, found.generation, warning.message
-                ),
-            )
+            self.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                &warning_filename,
+                format!("object {} {}", found.number, found.generation),
+                i64::try_from(warning_offset).unwrap_or(i64::MAX),
+                warning.message.into_bytes(),
+            ))
             .map_err(ReadObjectAtOffsetError::Body)?;
         }
 
         if let Some(empty_offset) = parsed.empty {
-            self.push_warning_at(
-                empty_offset,
-                format!(
-                    "(object {} {}, offset {empty_offset}): empty object treated as null",
-                    found.number, found.generation
-                ),
-            )
+            self.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                &warning_filename,
+                format!("object {} {}", found.number, found.generation),
+                i64::try_from(empty_offset).unwrap_or(i64::MAX),
+                b"empty object treated as null",
+            ))
             .map_err(ReadObjectAtOffsetError::Body)?;
             let (value, parsed_offset) = parsed
                 .value
@@ -3808,15 +3605,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         message: impl Into<String>,
     ) -> Result<()> {
-        self.push_warning_at(
-            offset,
-            format!(
-                "(object {} {}, offset {offset}): {}",
-                object_ref.number,
-                object_ref.generation,
-                message.into()
-            ),
-        )
+        let filename = self.core.borrow().description.clone();
+        self.push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            filename,
+            format!("object {} {}", object_ref.number, object_ref.generation),
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            message.into().into_bytes(),
+        ))
     }
 
     /// Emit a stream warning from an offset read that supplied qpdf's own
@@ -3867,10 +3663,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let message = message.into();
         if !last_description.is_empty() {
             if source_description_empty && read_description.is_none() {
-                let object_description = String::from_utf8_lossy(&last_description);
-                return self.push_warning_at(
+                return self.push_stream_warning_with_object_description(
+                    &last_description,
                     offset,
-                    format!("({object_description}, offset {offset}): {message}"),
+                    message,
                 );
             }
             return self.push_stream_warning_with_object_description(
@@ -3894,31 +3690,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         message: impl Into<String>,
     ) -> Result<()> {
-        let message = message.into();
-        let (logger, suppress_warnings, what) = {
-            let mut core = self.core.borrow_mut();
-            // `QPDFExc::createWhat` omits the wrapping parentheses when the
-            // filename is empty (`libqpdf/QPDFExc.cc:19-50`), so an unnamed
-            // in-memory PDF must keep `<object>, offset N: <message>` rather
-            // than adding literal parens. `format_input_warning_what` already
-            // reproduces that empty-filename shape, so use it for both cases.
-            let what = format_input_warning_what(
-                &core.description,
-                object_description,
-                offset,
-                message.as_bytes(),
-            );
-            // `QPDFExc` keeps the file position beside the rendered text
-            // (`QPDFExc.cc:19-50`); retain it for `repair_diagnostics()`.
-            let mut diagnostic = Diagnostic::object_warning_bytes(&what);
-            diagnostic.offset = Some(offset);
-            core.repair_diagnostics.push(diagnostic);
-            (core.logger.clone(), core.suppress_warnings, what)
-        };
-        if suppress_warnings {
-            return Ok(());
-        }
-        route_object_warning(&logger, false, &what)
+        let filename = self.core.borrow().description.clone();
+        let warning = QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            filename,
+            object_description,
+            i64::try_from(offset).unwrap_or(i64::MAX),
+            message.into().into_bytes(),
+        );
+        self.push_qpdf_warning(warning)
     }
 
     /// The `PatternFinder`/`findEndstream` pair used by qpdf's
@@ -4133,15 +3913,21 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         }
     };
     if warn_unknown {
-        warning_sink.warn_stream_data(
-            input.last_offset(),
-            description_override,
+        let warning_filename = description_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| warning_sink.input_description());
+        warning_sink.warn_stream_data(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            warning_filename,
+            b"",
+            i64::try_from(input.last_offset()).unwrap_or(i64::MAX),
             format!(
                 "unknown encryption filter for streams (check {}); \
                  streams may be decrypted improperly",
                 inspection.method_source
-            ),
-        )?;
+            )
+            .into_bytes(),
+        ))?;
         let mut encryption = encryption_parameters.borrow_mut();
         if let Some(encryption) = encryption.as_mut() {
             encryption.commit_stream_method(inspection.method);
@@ -4246,8 +4032,18 @@ fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
     // source input this piping reads from, not the failure), so it is
     // captured once here rather than threaded as a fourth positional
     // argument to every `warn_stream_data` call below.
-    let warn =
-        |at: u64, message: String| warning_sink.warn_stream_data(at, description_override, message);
+    let warning_filename = description_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| warning_sink.input_description());
+    let warn = |at: u64, message: String| {
+        warning_sink.warn_stream_data(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            &warning_filename,
+            b"",
+            i64::try_from(at).unwrap_or(i64::MAX),
+            message.into_bytes(),
+        ))
+    };
 
     if !suppress_warnings {
         match failure {
@@ -4512,6 +4308,10 @@ impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
             self.seek(previous)
         }
     }
+
+    fn set_last_offset(&mut self, offset: u64) {
+        self.resolver.set_last_offset(offset);
+    }
 }
 
 impl<R: Read + Seek> ResolverLiveInput<'_, R> {
@@ -4597,35 +4397,6 @@ struct ChildHandles<'a, R: Read + Seek + 'static> {
     description_template: Vec<u8>,
 }
 
-fn qpdf_exception_what(filename: &str, object: &str, offset: usize, message: &str) -> String {
-    let mut result = String::new();
-    if !filename.is_empty() {
-        result.push_str(filename);
-    }
-    if !(object.is_empty() && offset == 0) {
-        if !filename.is_empty() {
-            result.push_str(" (");
-        }
-        if !object.is_empty() {
-            result.push_str(object);
-            if offset > 0 {
-                result.push_str(", ");
-            }
-        }
-        if offset > 0 {
-            result.push_str(&format!("offset {offset}"));
-        }
-        if !filename.is_empty() {
-            result.push(')');
-        }
-    }
-    if !result.is_empty() {
-        result.push_str(": ");
-    }
-    result.push_str(message);
-    result
-}
-
 impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
         self.resolver.get_object_handle(object_ref)
@@ -4683,17 +4454,12 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         self.immediate_copy_from()
     }
 
-    fn warn(&self, message: Vec<u8>) -> Result<()> {
-        self.push_object_warning(message)
+    fn warn(&self, warning: QpdfExc) -> Result<()> {
+        self.push_object_warning(warning)
     }
 
-    fn warn_stream_data(
-        &self,
-        offset: u64,
-        description_override: Option<&[u8]>,
-        message: String,
-    ) -> Result<()> {
-        self.push_warning_with_offset(Some(offset), description_override, message)
+    fn warn_stream_data(&self, warning: QpdfExc) -> Result<()> {
+        self.push_qpdf_warning(warning)
     }
 
     fn pipe_stream_data(
@@ -4772,12 +4538,10 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// `m->file->getLastOffset()`, and `QPDFExc::createWhat`
     /// (`libqpdf/QPDFExc.cc:19-49`) renders `"<filename>: <message>"` — the
     /// object description is empty here, so nothing else is interposed.
-    /// flpdf keeps the filename out of [`Diagnostic::message`] throughout
+    /// flpdf keeps the independent filename/detail fields throughout
     /// (`xref.rs`'s `"file is damaged"` is the same shape), so matching that
-    /// convention *is* matching qpdf's inner text. The offset is `None`
-    /// rather than qpdf's `getLastOffset()`: `getLastOffset` is the start of
-    /// the last token the tokenizer produced, which flpdf does not track —
-    /// the resolver's own input position (see [`ResolverCore::tell`]) is a
+    /// convention *is* matching qpdf's inner text. The resolver's own input
+    /// position (see [`ResolverCore::tell`]) is a
     /// different quantity, and reporting it instead would be a fabrication.
     ///
     /// Not ported for a different reason: qpdf's `isUnresolved(og)` early
@@ -4807,12 +4571,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     ///    they are the `updateCache` equivalent — and the mark's `drop` takes
     ///    the last borrow of the core.
     ///
-    /// Structural parse and unsupported-feature failures take qpdf's
-    /// `catch (QPDFExc& e) { warn(e); }` (`:1740-1743`) followed by the
-    /// resolve-to-null fallback (`:1745-1749`). I/O, encryption, and
-    /// diagnostic-channel failures remain errors because they are outside the
-    /// equivalent operation boundary in this crate. The damaged-object route
-    /// reaches this catch only after the `attempt_recovery` header gate above.
+    /// Every failure raised by the dispatch takes qpdf's
+    /// `QPDFExc`/`std::exception` catch (`:1737-1742`) followed by the
+    /// resolve-to-null fallback only when the requested cache slot remains
+    /// unresolved (`:1745-1749`). Failures from the loop guard, xref lookup,
+    /// and diagnostic delivery outside this dispatch remain caller errors.
     ///
     /// # Why the body is wrapped in `stacker::maybe_grow`
     ///
@@ -4849,12 +4612,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         // Keep this boundary small: enter the large dispatch frame only after
         // maybe_grow has had a chance to switch away from a small caller stack.
-        let result = stacker::maybe_grow(
+        stacker::maybe_grow(
             super::READER_STACK_RED_ZONE,
             super::READER_STACK_GROWTH_SIZE,
             || self.resolve_indirect_inner(object_ref, handle),
-        );
-        self.finish_indirect_resolution(object_ref, handle, result)
+        )
     }
 }
 
@@ -4863,35 +4625,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// dispatch frame. The `/Length` resolver can re-enter this frame once
     /// per indirect link, so even a small local-layout change compounds on
     /// the deep-chain path.
-    #[inline(never)]
-    fn finish_indirect_resolution(
-        &self,
-        object_ref: ObjectRef,
-        handle: &ObjectHandle,
-        result: Result<()>,
-    ) -> Result<()> {
-        match result {
-            Ok(()) => {}
-            Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
-                // qpdf catches QPDFExc/std::exception around both
-                // resolve dispatch arms, warns, and lets the common
-                // tail install a null cache value
-                // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
-                // flpdf's structural equivalent; I/O, encryption,
-                // and diagnostic-channel failures remain caller errors.
-                self.push_caught_resolution_warning(error, object_ref)?;
-                handle.set_resolved(ObjectValue::Null);
-            }
-            Err(error) => return Err(error),
-        }
-        // QPDF's successful/null updateCache writes the requested identity
-        // onto the installed value. This differs from a cache hit: a prior
-        // promotion can have left this unresolved QObject under another key.
-        handle.promote_to_indirect(object_ref, self.pdf_unique_id.get(), self.self_weak.clone());
-        Ok(())
-    }
-
-    #[inline(never)]
     fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         // ---- phase 1: short borrows only ----
 
@@ -4903,9 +4636,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
             // (`libqpdf/QPDF.cc:1710-1711`). Neither call may hold a
             // borrow across the other — `push_warning` takes its own
             // `borrow_mut`.
-            self.push_warning(format!(
+            let detail = format!(
                 "loop detected resolving object {} {}",
                 object_ref.number, object_ref.generation
+            );
+            let filename = self.core.borrow().description.clone();
+            self.push_qpdf_warning(QpdfExc::new(
+                QpdfErrorCode::DamagedPdf,
+                filename,
+                b"",
+                0,
+                detail.as_bytes(),
             ))?;
             handle.set_resolved(ObjectValue::Null);
             return Ok(());
@@ -4922,6 +4663,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         // ---- phase 2: no borrow is held across this ----
+        // qpdf's try/catch covers only this dispatch (`QPDF.cc:1718-1742`).
+        // Keep the loop guard, xref lookup, and common unresolved tail outside
+        // the catch so diagnostic failures there propagate naturally.
         let result = match entry {
             Some(XrefEntry::Uncompressed { offset }) => {
                 // qpdf's dedicated zero-offset arm
@@ -4984,7 +4728,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                 if let Some(XrefEntry::Compressed { stream, .. }) =
                                     self.xref_entry(object_ref)
                                 {
-                                    self.resolve_object_stream_or_null(stream, object_ref, handle)
+                                    self.resolve_object_stream_or_null(stream, handle)
                                 } else {
                                     Err(err)
                                 }
@@ -4997,7 +4741,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
             }
             Some(XrefEntry::Compressed { stream, .. }) => {
-                self.resolve_object_stream_or_null(stream, object_ref, handle)
+                self.resolve_object_stream_or_null(stream, handle)
             }
             Some(XrefEntry::Free { .. }) => {
                 handle.set_resolved(ObjectValue::Null);
@@ -5011,7 +4755,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         };
 
-        result
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.push_caught_resolution_warning(error, object_ref)?;
+                if !handle.is_resolved() {
+                    handle.set_resolved(ObjectValue::Null);
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -5026,7 +4779,7 @@ mod tests {
     use crate::encryption::state::{EncryptionMode, EncryptionState};
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
     use crate::{
-        Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry,
+        Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, QpdfErrorCode, QpdfExc, XrefEntry,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -5343,10 +5096,7 @@ mod tests {
 
         let diagnostics = destination.repair_diagnostics();
         assert_eq!(diagnostics.entries().len(), 1);
-        assert_eq!(
-            diagnostics.entries()[0].description.as_deref(),
-            Some(b"source.pdf".as_slice())
-        );
+        assert_eq!(diagnostics.entries()[0].get_filename(), b"source.pdf");
     }
 
     #[test]
@@ -5462,122 +5212,6 @@ mod tests {
     }
 
     #[test]
-    fn warning_location_omits_empty_description_and_zero_offset_like_qpdf() {
-        let logger = crate::QPDFLogger::create();
-        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
-            WarningRecordingSink(std::sync::Arc::clone(&output)),
-        )));
-
-        for (description, offset, message) in [
-            ("", None, "no location"),
-            ("", Some(0), "zero offset"),
-            ("", Some(7), "positive offset"),
-            ("input.pdf", Some(0), "named zero offset"),
-            ("input.pdf", Some(7), "named positive offset"),
-            (
-                "input.pdf",
-                None,
-                "(object 5 0, offset 232): expected endobj",
-            ),
-        ] {
-            super::route_warning(&logger, false, description.as_bytes(), offset, message).unwrap();
-        }
-
-        assert_eq!(
-            output.lock().unwrap().as_slice(),
-            b"WARNING: no location\n\
-              WARNING: zero offset\n\
-              WARNING: offset 7: positive offset\n\
-              WARNING: input.pdf: named zero offset\n\
-              WARNING: input.pdf (offset 7): named positive offset\n\
-              WARNING: input.pdf (object 5 0, offset 232): expected endobj\n"
-        );
-    }
-
-    #[test]
-    fn input_warning_what_matches_qpdf_context_shapes() {
-        for (filename, object, offset, expected) in [
-            (b"".as_slice(), b"".as_slice(), 0, b"message".as_slice()),
-            (
-                b"".as_slice(),
-                b"object 1 0".as_slice(),
-                0,
-                b"object 1 0: message".as_slice(),
-            ),
-            (
-                b"input.pdf".as_slice(),
-                b"".as_slice(),
-                7,
-                b"input.pdf (offset 7): message".as_slice(),
-            ),
-            (
-                b"input.pdf".as_slice(),
-                b"object 1 0".as_slice(),
-                0,
-                b"input.pdf (object 1 0): message".as_slice(),
-            ),
-            (
-                b"input.pdf".as_slice(),
-                b"object 1 0".as_slice(),
-                7,
-                b"input.pdf (object 1 0, offset 7): message".as_slice(),
-            ),
-        ] {
-            assert_eq!(
-                super::format_input_warning_what(filename, object, offset, b"message"),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn warning_location_does_not_repeat_offset_for_object_prefixed_message() {
-        let logger = crate::QPDFLogger::create();
-        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
-            WarningRecordingSink(std::sync::Arc::clone(&output)),
-        )));
-
-        super::route_warning(
-            &logger,
-            false,
-            b"input.pdf",
-            Some(123),
-            "(object 5 0, offset 123): expected endobj",
-        )
-        .unwrap();
-
-        assert_eq!(
-            output.lock().unwrap().as_slice(),
-            b"WARNING: input.pdf (object 5 0, offset 123): expected endobj\n"
-        );
-    }
-
-    #[test]
-    fn warning_location_does_not_repeat_offset_for_trailer_prefixed_message() {
-        let logger = crate::QPDFLogger::create();
-        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
-            WarningRecordingSink(std::sync::Arc::clone(&output)),
-        )));
-
-        super::route_warning(
-            &logger,
-            false,
-            b"input.pdf",
-            Some(416),
-            "(trailer, offset 416): invalid /ID in trailer dictionary",
-        )
-        .unwrap();
-
-        assert_eq!(
-            output.lock().unwrap().as_slice(),
-            b"WARNING: input.pdf (trailer, offset 416): invalid /ID in trailer dictionary\n"
-        );
-    }
-
-    #[test]
     fn trailer_warning_without_positive_offset_omits_offset_like_qpdf() {
         let logger = crate::QPDFLogger::create();
         let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5600,12 +5234,12 @@ mod tests {
             .expect("warning delivery");
 
         assert_eq!(
-            resolver.repair_diagnostics().entries()[0].message,
-            "(trailer): invalid /ID in trailer dictionary"
+            String::from_utf8_lossy(resolver.repair_diagnostics().entries()[0].what_bytes()),
+            "trailer: invalid /ID in trailer dictionary"
         );
         assert_eq!(
             output.lock().unwrap().as_slice(),
-            b"WARNING: (trailer): invalid /ID in trailer dictionary\n"
+            b"WARNING: trailer: invalid /ID in trailer dictionary\n"
         );
     }
 
@@ -5638,12 +5272,12 @@ mod tests {
             .expect("warning delivery");
 
         assert_eq!(
-            resolver.repair_diagnostics().entries()[0].message,
-            "(object 7 0): no offset"
+            String::from_utf8_lossy(resolver.repair_diagnostics().entries()[0].what_bytes()),
+            "object 7 0: no offset"
         );
         assert_eq!(
             output.lock().unwrap().as_slice(),
-            b"WARNING: (object 7 0): no offset\n"
+            b"WARNING: object 7 0: no offset\n"
         );
     }
 
@@ -5707,7 +5341,7 @@ mod tests {
 
         assert_eq!(
             output.lock().unwrap().as_slice(),
-            b"WARNING: (object 7 0, offset 12): expected endobj\n"
+            b"WARNING: object 7 0, offset 12: expected endobj\n"
         );
     }
 
@@ -5757,7 +5391,13 @@ mod tests {
         ] {
             output.lock().unwrap().clear();
             resolver
-                .push_json_warning("", object, offset, message)
+                .push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::Json,
+                    b"",
+                    object.as_bytes(),
+                    offset,
+                    message.as_bytes(),
+                ))
                 .unwrap();
             assert_eq!(
                 output.lock().unwrap().as_slice(),
@@ -5808,7 +5448,13 @@ mod tests {
         ] {
             output.lock().unwrap().clear();
             resolver
-                .push_json_warning("document.pdf", object, offset, message)
+                .push_qpdf_warning(QpdfExc::new(
+                    QpdfErrorCode::Json,
+                    b"document.pdf",
+                    object.as_bytes(),
+                    offset,
+                    message.as_bytes(),
+                ))
                 .unwrap();
             assert_eq!(
                 output.lock().unwrap().as_slice(),
@@ -5866,7 +5512,7 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
                 .collect::<Vec<_>>(),
             ["object 3 0: operation for dictionary attempted on object of type integer: treating as empty"]
         );
@@ -5912,7 +5558,7 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
                 .collect::<Vec<_>>(),
             [
                 ", object 1 0 at offset 24: deep container warning",
@@ -5987,12 +5633,9 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| entry.message_string())
                 .collect::<Vec<_>>(),
-            [
-                "input.pdf, object 1 0 at offset 25: deep container description",
-                "input.pdf, object 1 0 at offset 33: deep scalar description",
-            ]
+            ["deep container description", "deep scalar description",]
         );
     }
 
@@ -6017,7 +5660,7 @@ mod tests {
             .expect_err("a weak context must be gone with its resolver");
         assert!(matches!(
             error,
-            Error::System(message) if message == ", object 1 0 at offset 18: dropped document"
+            Error::QpdfExc(warning) if warning.get_object() == b", object 1 0 at offset 18" && warning.get_message_detail() == b"dropped document"
         ));
     }
 
@@ -6039,9 +5682,9 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| entry.message_string())
                 .collect::<Vec<_>>(),
-            [", object 1 0 at offset 10: stream dictionary warning"]
+            ["stream dictionary warning"]
         );
     }
 
@@ -6076,20 +5719,16 @@ mod tests {
         stream_dict
             .object_warning("stream dictionary warning")
             .expect("stream dictionary warning should reach the resolver");
-        let expected_dictionary_warning = format!(
-            "{}: stream dictionary warning",
-            String::from_utf8_lossy(&dictionary_description)
-        );
         assert_eq!(
             resolver
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.clone())
+                .map(|entry| entry.message_string())
                 .collect::<Vec<_>>(),
             vec![
-                "input.pdf, stream object 1 0: stream root warning".to_owned(),
-                expected_dictionary_warning,
+                "stream root warning".to_owned(),
+                "stream dictionary warning".to_owned(),
             ]
         );
     }
@@ -6099,9 +5738,13 @@ mod tests {
         let (resolver, output) = named_resolver_with_captured_warnings();
 
         resolver
-            .push_object_warning(
-                "operation for dictionary attempted on object of type integer: treating as empty",
-            )
+            .push_object_warning(QpdfExc::new(
+                QpdfErrorCode::Object,
+                b"",
+                b"",
+                0,
+                b"operation for dictionary attempted on object of type integer: treating as empty",
+            ))
             .unwrap();
 
         assert_eq!(
@@ -6116,19 +5759,32 @@ mod tests {
         let (resolver, output) = named_resolver_with_captured_warnings();
 
         resolver.push_warning("from the document").unwrap();
-        resolver.push_object_warning("from the object").unwrap();
+        resolver
+            .push_object_warning(QpdfExc::new(
+                QpdfErrorCode::Object,
+                b"",
+                b"",
+                0,
+                b"from the object",
+            ))
+            .unwrap();
 
         let collected: Vec<_> = resolver
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| (entry.message.clone(), entry.offset))
+            .map(|entry| {
+                (
+                    String::from_utf8_lossy(entry.what_bytes()).into_owned(),
+                    entry.get_file_position(),
+                )
+            })
             .collect();
         assert_eq!(
             collected,
             vec![
-                ("from the document".to_owned(), None),
-                ("from the object".to_owned(), None),
+                ("input.pdf: from the document".to_owned(), 0),
+                ("from the object".to_owned(), 0),
             ]
         );
         assert_eq!(
@@ -6142,8 +5798,12 @@ mod tests {
     fn replaying_an_object_warning_preserves_raw_message_bytes() {
         let (resolver, output) = named_resolver_with_captured_warnings();
         let mut diagnostics = Diagnostics::default();
-        diagnostics.push(Diagnostic::object_warning_bytes(
-            b"object-warning-\xff.pdf: malformed object",
+        diagnostics.push(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            b"object-warning-\xff.pdf",
+            b"",
+            0,
+            b"malformed object",
         ));
 
         resolver.replay_warnings(&diagnostics).unwrap();
@@ -6158,14 +5818,22 @@ mod tests {
     fn a_suppressed_object_warning_is_still_collected() {
         let resolver = resolver_over(Vec::new());
 
-        resolver.push_object_warning("from the object").unwrap();
+        resolver
+            .push_object_warning(QpdfExc::new(
+                QpdfErrorCode::Object,
+                b"",
+                b"",
+                0,
+                b"from the object",
+            ))
+            .unwrap();
 
         assert_eq!(
             resolver
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| entry.message_string())
                 .collect::<Vec<_>>(),
             ["from the object"]
         );
@@ -6352,12 +6020,7 @@ mod tests {
             Ok(())
         }
 
-        fn warn_stream_data(
-            &self,
-            _offset: u64,
-            _description_override: Option<&[u8]>,
-            _message: String,
-        ) -> crate::Result<()> {
+        fn warn_stream_data(&self, _warning: QpdfExc) -> crate::Result<()> {
             *self.target.encryption_parameters().borrow_mut() = None;
             Ok(())
         }
@@ -6374,12 +6037,7 @@ mod tests {
             Ok(())
         }
 
-        fn warn_stream_data(
-            &self,
-            _offset: u64,
-            _description_override: Option<&[u8]>,
-            _message: String,
-        ) -> crate::Result<()> {
+        fn warn_stream_data(&self, _warning: QpdfExc) -> crate::Result<()> {
             Err(Error::Internal("stream warning sink failed".to_owned()))
         }
     }
@@ -6847,12 +6505,13 @@ mod tests {
             diagnostics
                 .entries()
                 .iter()
-                .map(|diagnostic| (diagnostic.message.as_str(), diagnostic.offset))
+                .map(|diagnostic| (diagnostic.message_string(), diagnostic.get_file_position()))
                 .collect::<Vec<_>>(),
             vec![(
                 "unknown encryption filter for streams (check /StmF from /Encrypt dictionary); \
-                 streams may be decrypted improperly",
-                Some(0),
+                 streams may be decrypted improperly"
+                    .to_owned(),
+                0,
             )]
         );
         assert_eq!(
@@ -7198,12 +6857,13 @@ mod tests {
             diagnostics
                 .entries()
                 .iter()
-                .map(|diagnostic| (diagnostic.message.as_str(), diagnostic.offset))
+                .map(|diagnostic| (diagnostic.message_string(), diagnostic.get_file_position()))
                 .collect::<Vec<_>>(),
             vec![(
                 "unknown encryption filter for streams (check stream's Crypt decode parameters); \
-                 streams may be decrypted improperly",
-                Some(0),
+                 streams may be decrypted improperly"
+                    .to_owned(),
+                0,
             )]
         );
     }
@@ -7345,14 +7005,14 @@ mod tests {
         let entries: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|d| (d.message.as_str(), d.offset))
+            .map(|d| (d.message_string(), d.get_file_position()))
             .collect();
         assert_eq!(
             entries,
             [(
-                "unexpected EOF reading stream data",
+                "unexpected EOF reading stream data".to_owned(),
                 #[allow(clippy::cast_possible_truncation)]
-                Some(offset as u64 + available as u64)
+                (offset + available as i64)
             )]
         );
     }
@@ -7405,13 +7065,13 @@ mod tests {
         let entries: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|d| (d.message.as_str(), d.offset))
+            .map(|d| (d.message_string(), d.get_file_position()))
             .collect();
         assert_eq!(
             entries,
             [(
-                "error decoding stream data for object 4 0: sink write failure 1",
-                Some(9)
+                "error decoding stream data for object 4 0: sink write failure 1".to_owned(),
+                9
             )]
         );
     }
@@ -7436,7 +7096,7 @@ mod tests {
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|d| d.message.as_str())
+            .map(|d| d.message_string())
             .collect();
         assert_eq!(
             messages,
@@ -7445,7 +7105,10 @@ mod tests {
                 "stream will be re-processed without filtering to avoid data loss",
             ]
         );
-        assert!(diagnostics.entries().iter().all(|d| d.offset == Some(9)));
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .all(|d| d.get_file_position() == 9));
     }
 
     #[test]
@@ -7545,14 +7208,14 @@ mod tests {
         let entries: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|d| (d.message.as_str(), d.offset))
+            .map(|d| (d.message_string(), d.get_file_position()))
             .collect();
         assert_eq!(
             entries,
             [(
-                "unexpected EOF reading stream data",
+                "unexpected EOF reading stream data".to_owned(),
                 #[allow(clippy::cast_sign_loss)]
-                Some(past_end as u64)
+                past_end
             )]
         );
     }
@@ -7579,7 +7242,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|d| d.message.clone())
+            .map(|d| d.message_string())
             .collect();
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(
@@ -7661,7 +7324,7 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|d| d.message.clone())
+                .map(|d| d.message_string())
                 .collect();
             assert_eq!(messages.len(), 1, "{messages:?}");
             assert!(
@@ -7769,9 +7432,9 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|d| d.offset)
+            .map(|d| d.get_file_position())
             .collect();
-        assert_eq!(offsets, [Some(9)], "not the requested 1000");
+        assert_eq!(offsets, [9], "not the requested 1000");
     }
 
     /// qpdf allocates the declared length with `make_unique<char[]>`, whose
@@ -7801,7 +7464,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|d| d.message.clone())
+            .map(|d| d.message_string())
             .collect();
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(
@@ -8384,7 +8047,7 @@ mod tests {
                 .entries()
                 .iter()
                 .filter(|entry| entry
-                    .message
+                    .message_string()
                     .contains("unknown encryption filter for strings"))
                 .count(),
             1,
@@ -8393,7 +8056,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_string_filter_warning_sink_failure_propagates() {
+    fn unknown_string_filter_warning_failure_is_caught_inside_resolution_dispatch() {
         let encrypted = encrypted_info_fixture(
             b"<< /Title (TopSecretTitle) >>",
             crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
@@ -8425,47 +8088,10 @@ mod tests {
             .unwrap();
 
         let info: ObjectHandle = pdf.get_object_handle(info_ref);
-        assert!(matches!(
-            pdf.resolve(&info),
-            Err(Error::System(ref message)) if message == "sink write failure 1"
-        ));
-        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
-        assert_eq!(
-            pdf.resolver
-                .encryption_parameters()
-                .borrow()
-                .as_ref()
-                .expect("encryption state")
-                .cf_string,
-            crate::encryption::state::EncryptionMode::Unknown,
-            "qpdf commits the unknown-filter fallback only after warning delivery"
-        );
-
-        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let retry_logger = crate::QPDFLogger::create();
-        retry_logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
-            WarningRecordingSink(std::sync::Arc::clone(&output)),
-        )));
-        pdf.set_logger(retry_logger);
         pdf.resolve(&info)
-            .expect("healthy warning sink should allow the retry");
-        assert_eq!(
-            pdf.resolver
-                .encryption_parameters()
-                .borrow()
-                .as_ref()
-                .expect("encryption state")
-                .cf_string,
-            crate::encryption::state::EncryptionMode::Aes128
-        );
-        let warning_output = output.lock().unwrap();
-        assert_eq!(
-            warning_output
-                .windows(b"unknown encryption filter for strings".len())
-                .filter(|window| *window == b"unknown encryption filter for strings")
-                .count(),
-            1
-        );
+            .expect("warning failure is caught by the dispatch catch");
+        assert!(info.is_null());
+        assert!(!pdf.repair_diagnostics().entries().is_empty());
     }
 
     // This catches a production regression where a cipher-mode dispatch
@@ -8774,7 +8400,7 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("supposed object stream 9 is not a stream")));
 
         assert!(
@@ -8807,7 +8433,7 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("supposed object stream 9 is not a stream")));
     }
 
@@ -8957,7 +8583,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("2147483648")));
+            .any(|diagnostic| diagnostic.message_string().contains("2147483648")));
     }
 
     #[test]
@@ -9054,13 +8680,26 @@ mod tests {
             .try_dereference()
             .expect("qpdf catches an object-stream filter error and resolves the member to null");
         assert!(resolver.get_object_handle(member_ref).is_null());
-        assert!(resolver
-            .repair_diagnostics()
+        let diagnostics = resolver.repair_diagnostics();
+        let warning = diagnostics
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic
-                .message
-                .contains("getStreamData called on unfilterable stream")));
+            .find(|diagnostic| {
+                diagnostic.get_message_detail() == b"getStreamData called on unfilterable stream"
+            })
+            .expect("typed unfilterable-stream warning");
+        assert_eq!(warning.get_error_code(), QpdfErrorCode::Unsupported);
+        assert_eq!(warning.get_filename(), b"");
+        assert_eq!(warning.get_object(), b"");
+        assert_eq!(warning.get_file_position(), -1);
+        assert_eq!(
+            warning.get_message_detail(),
+            b"getStreamData called on unfilterable stream"
+        );
+        assert_eq!(
+            warning.what_bytes(),
+            b"getStreamData called on unfilterable stream"
+        );
     }
 
     #[test]
@@ -9119,11 +8758,13 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("incorrect header check")));
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("incorrect header check")));
     }
 
     #[test]
-    fn an_object_stream_codec_warning_delivery_failure_still_propagates() {
+    fn an_object_stream_codec_warning_failure_is_caught_by_dispatch() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = vec![0x78];
@@ -9173,17 +8814,15 @@ mod tests {
                 filter_on_write: true,
             });
 
-        assert!(matches!(
-            resolver
-                .get_object_handle(member_ref)
-                .try_dereference()
-                .expect_err("codec warning delivery must remain a caller error"),
-            Error::System(message) if message == "sink write failure 1"
-        ));
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("warning failure is caught by dispatch");
+        assert!(member.is_null());
     }
 
     #[test]
-    fn an_object_stream_source_codec_warning_delivery_failure_still_propagates() {
+    fn an_object_stream_source_codec_warning_failure_is_caught_by_dispatch() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = vec![0x78];
@@ -9235,13 +8874,11 @@ mod tests {
         });
         stream.set_parsed_offset_if_unset(1);
 
-        assert!(matches!(
-            resolver
-                .get_object_handle(member_ref)
-                .try_dereference()
-                .expect_err("source-backed codec warning delivery must remain a caller error"),
-            Error::System(message) if message == "sink write failure 1"
-        ));
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("warning failure is caught by dispatch");
+        assert!(member.is_null());
     }
 
     #[test]
@@ -9304,12 +8941,12 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("supposed object stream 4 has wrong type")));
     }
 
     #[test]
-    fn an_object_stream_operation_error_propagates_after_filter_inspection() {
+    fn an_object_stream_operation_error_is_caught_after_filter_inspection() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = b"7 0 << /Value 1 >>".to_vec();
@@ -9354,11 +8991,11 @@ mod tests {
                 filter_on_write: true,
             });
 
-        let error = resolver
-            .get_object_handle(member_ref)
+        let member = resolver.get_object_handle(member_ref);
+        member
             .try_dereference()
-            .expect_err("an operation error in filter inspection must propagate");
-        assert!(matches!(error, Error::System(message) if message == "resolver failed"));
+            .expect("operation errors in dispatch are caught like std::exception");
+        assert!(member.is_null());
     }
 
     #[test]
@@ -9408,7 +9045,6 @@ mod tests {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = b"7 0 << /Value 1 >>".to_vec();
-        let expected_eof_offset = stream_data.len();
         let stream_dict = ObjectHandle::dictionary(vec![
             (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
             (b"N".to_vec(), ObjectHandle::integer(1)),
@@ -9456,9 +9092,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains(&format!(
-                "object stream 4 (object 7 0, offset {expected_eof_offset}): unexpected EOF"
-            ))));
+            .any(|diagnostic| diagnostic.message_string().contains("unexpected EOF")));
     }
 
     #[test]
@@ -9509,16 +9143,14 @@ mod tests {
             .iter()
             .find(|diagnostic| {
                 diagnostic
-                    .message
+                    .message_string()
                     .contains("integer out of range converting 2147483648")
             })
             .expect("the caught parse failure must be warned");
-        assert_eq!(warning.offset, None);
+        assert_eq!(warning.get_file_position(), decoded_offset as i64);
         assert_eq!(
-            warning.message,
-            format!(
-                "object stream 4 (object 7 0, offset {decoded_offset}): integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
-            )
+            warning.get_message_detail(),
+            b"integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
         );
         assert_eq!(
             output.lock().unwrap().as_slice(),
@@ -9572,11 +9204,16 @@ mod tests {
             diagnostics
                 .entries()
                 .iter()
-                .map(|diagnostic| (diagnostic.offset, diagnostic.message.as_str()))
+            .map(|diagnostic| {
+                (
+                    diagnostic.get_file_position(),
+                    String::from_utf8_lossy(diagnostic.what_bytes()).into_owned(),
+                )
+            })
                 .collect::<Vec<_>>(),
             vec![(
-                None,
-                "object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2"
+                7,
+                "input.pdf object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2".to_owned()
             )]
         );
         assert_eq!(
@@ -9602,12 +9239,17 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|diagnostic| (diagnostic.offset, diagnostic.message.as_str()))
+                .map(|diagnostic| {
+                    (
+                        diagnostic.get_file_position(),
+                        String::from_utf8_lossy(diagnostic.what_bytes()).into_owned(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
                 (
-                    None,
-                    "object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2"
+                    7,
+                    "object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2".to_owned()
                 )
             ]
         );
@@ -9690,7 +9332,7 @@ mod tests {
             .iter()
             .any(|diagnostic| {
                 diagnostic
-                    .message
+                    .message_string()
                     .contains("integer out of range converting 2147483648")
             }));
     }
@@ -9747,11 +9389,13 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("empty object treated as null")));
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("empty object treated as null")));
     }
 
     #[test]
-    fn an_object_stream_warning_sink_failure_propagates_parser_diagnostics() {
+    fn an_object_stream_warning_sink_failure_is_caught_for_parser_diagnostics() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = b"7 0 << /A#zB 1 >>".to_vec();
@@ -9797,13 +9441,11 @@ mod tests {
                 filter_on_write: true,
             });
 
-        assert!(matches!(
-            resolver
-                .get_object_handle(member_ref)
-                .try_dereference()
-                .expect_err("diagnostic delivery failure must propagate"),
-            Error::System(message) if message == "sink write failure 1"
-        ));
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("diagnostic delivery failure is caught by dispatch");
+        assert!(member.is_null());
     }
 
     #[test]
@@ -9836,8 +9478,8 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .any(|entry| entry.message
-                    == "(object 1 0, offset 0): unable to recover stream data; treating stream as empty"));
+                .any(|entry| entry.message_string()
+                    == "unable to recover stream data; treating stream as empty"));
         }
     }
 
@@ -9968,7 +9610,7 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("object 8/0 has unexpected xref entry type")));
     }
 
@@ -10227,19 +9869,13 @@ mod tests {
         let messages = diagnostics
             .entries()
             .iter()
-            .map(|entry| entry.message.as_str())
+            .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
             .collect::<Vec<_>>();
         assert_eq!(messages, ["loop detected resolving object 1 0"]);
         assert_eq!(
-            diagnostics.entries()[0].severity,
-            Severity::Warning,
-            "qpdf warns and continues here rather than failing the resolution"
-        );
-        assert_eq!(
-            diagnostics.entries()[0].offset,
-            None,
-            "the resolver tracks no input position in this slice, so qpdf's \
-             getLastOffset() has no counterpart to report"
+            diagnostics.entries()[0].get_file_position(),
+            0,
+            "qpdf uses offset zero for this contextless warning"
         );
     }
 
@@ -10288,7 +9924,7 @@ mod tests {
         let messages = diagnostics
             .entries()
             .iter()
-            .map(|entry| entry.message.as_str())
+            .map(|entry| entry.message_string())
             .collect::<Vec<_>>();
         assert_eq!(
             messages,
@@ -10727,13 +10363,16 @@ mod tests {
         let error = stream
             .get_raw_stream_data()
             .expect_err("a short original source must fail the raw request");
-        assert!(matches!(error, Error::Unsupported(message)
-            if message == "error getting raw stream data"));
+        assert!(matches!(
+            error,
+            Error::QpdfExc(warning)
+                if warning.get_message_detail() == b"error getting raw stream data"
+        ));
         assert!(
             pdf.repair_diagnostics()
                 .entries()
                 .iter()
-                .any(|entry| entry.message == "unexpected EOF reading stream data"),
+                .any(|entry| entry.message_string() == "unexpected EOF reading stream data"),
             "the existing source pipe owns its warning before returning false"
         );
     }
@@ -10804,7 +10443,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
         assert!(messages
             .iter()
@@ -10845,7 +10484,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
         assert_eq!(
             messages,
@@ -10991,11 +10630,9 @@ mod tests {
             pdf.repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
                 .collect::<Vec<_>>(),
-            vec![
-                "(object 2 0, offset 55): expected dictionary key but found non-name object; inserting key /QPDFFake1"
-            ]
+            vec!["object 2 0, offset 55: expected dictionary key but found non-name object; inserting key /QPDFFake1"]
         );
     }
 
@@ -11146,9 +10783,9 @@ mod tests {
             pdf.repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.as_str())
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
                 .collect::<Vec<_>>(),
-            vec![format!("(object 2 0, offset 55): {expected}")]
+            vec![format!("object 2 0, offset 55: {expected}")]
         );
     }
 
@@ -11222,7 +10859,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
             .collect();
         check(&handle, outcome, warnings)
     }
@@ -11252,7 +10889,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
             .collect();
         check(&handle, outcome, warnings)
     }
@@ -11276,7 +10913,7 @@ mod tests {
             );
             assert_eq!(
                 warnings,
-                ["(object 2 0, offset 53): empty object treated as null"],
+                ["object 2 0, offset 53: empty object treated as null"],
                 "qpdf warns and returns before framing the `endobj` token"
             );
         });
@@ -11291,7 +10928,7 @@ mod tests {
         with_second_object(b"2 0 obj\n42\nenddobj\n", |handle, outcome, warnings| {
             outcome.expect("qpdf warns here rather than failing");
             assert_eq!(handle.as_integer(), Some(42));
-            assert_eq!(warnings, ["(object 2 0, offset 56): expected endobj"]);
+            assert_eq!(warnings, ["object 2 0, offset 56: expected endobj"]);
         });
     }
 
@@ -11346,11 +10983,9 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
-        assert!(messages
-            .iter()
-            .any(|message| message == "(object 9 0, offset 185): expected endobj"));
+        assert!(messages.iter().any(|message| message == "expected endobj"));
         assert!(messages
             .iter()
             .any(|message| message.contains("EOF after endobj")));
@@ -11402,7 +11037,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
         assert_eq!(
             messages,
@@ -11466,13 +11101,10 @@ mod tests {
         let warning = diagnostics
             .entries()
             .iter()
-            .find(|entry| entry.message.contains("unexpected )"))
+            .find(|entry| entry.message_string().contains("unexpected )"))
             .expect("qpdf tokenizer warning");
-        assert_eq!(
-            warning.message,
-            format!("(object 2 0, offset {malformed_at}): unexpected )")
-        );
-        assert_eq!(warning.offset, Some(malformed_at as u64));
+        assert_eq!(warning.get_message_detail(), b"unexpected )");
+        assert_eq!(warning.get_file_position(), malformed_at as i64);
     }
 
     #[test]
@@ -11499,11 +11131,11 @@ mod tests {
             .iter()
             .find(|entry| {
                 entry
-                    .message
+                    .message_string()
                     .contains("integer out of range converting 2147483648")
             })
             .expect("the caught parse failure must be warned");
-        assert_eq!(warning.offset, Some(malformed_at as u64));
+        assert_eq!(warning.get_file_position(), malformed_at as i64);
     }
 
     #[test]
@@ -11517,11 +11149,33 @@ mod tests {
             .expect("the offsetless warning should reach the document sink");
 
         let diagnostics = resolver.repair_diagnostics();
-        assert_eq!(diagnostics.entries()[0].offset, None);
+        assert_eq!(diagnostics.entries()[0].get_file_position(), 0);
         assert_eq!(
-            diagnostics.entries()[0].message,
-            "unsupported PDF feature: unfilterable object stream"
+            diagnostics.entries()[0].message_string(),
+            "unfilterable object stream"
         );
+    }
+
+    #[test]
+    fn caught_resolution_warning_formats_each_error_family() {
+        let errors = [
+            Error::Parse {
+                offset: 4,
+                message: "parse failure".to_owned(),
+            },
+            Error::Internal("internal failure".to_owned()),
+            Error::Unsupported("unsupported failure".to_owned()),
+            Error::SystemBytes(b"system bytes\0tail".to_vec()),
+            Error::System("system failure\0tail".to_owned()),
+            Error::Io(std::io::Error::other("io failure")),
+        ];
+        for error in errors {
+            let resolver = bare_resolver();
+            resolver
+                .push_caught_resolution_warning(error, ObjectRef::new(7, 0))
+                .expect("caught resolution diagnostics should be emitted");
+            assert_eq!(resolver.repair_diagnostics().len(), 1);
+        }
     }
 
     /// A recoverable diagnostic raised *inside* the body's parse reaches the
@@ -11554,7 +11208,7 @@ mod tests {
                 );
                 assert_eq!(
                     warnings,
-                    ["(object 2 0, offset 56): name with stray # will not work with PDF >= 1.2"]
+                    ["object 2 0, offset 56: name with stray # will not work with PDF >= 1.2"]
                 );
             },
         );
@@ -11566,8 +11220,8 @@ mod tests {
                 assert_eq!(
                     warnings,
                     [
-                        "(object 2 0, offset 56): name with stray # will not work with PDF >= 1.2",
-                        "(object 2 0, offset 67): expected endobj",
+                        "object 2 0, offset 56: name with stray # will not work with PDF >= 1.2",
+                        "object 2 0, offset 67: expected endobj",
                     ]
                 );
             },
@@ -11601,7 +11255,7 @@ mod tests {
             assert!(handle.as_dictionary().is_some());
             assert_eq!(
                 warnings,
-                ["(object 2 0, offset 56): name with stray # will not work with PDF >= 1.2"],
+                ["object 2 0, offset 56: name with stray # will not work with PDF >= 1.2"],
                 "one diagnostic per object, not one per scan_forward attempt"
             );
         });
@@ -11695,16 +11349,16 @@ mod tests {
                 .repair_diagnostics()
                 .entries()
                 .iter()
-                .map(|entry| entry.message.clone())
+                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
                 .collect();
             assert_eq!(
                 messages,
                 vec![
-                    format!("(object 2 0, offset {header_offset}): {expected_length_warning}"),
+                    format!("object 2 0, offset {header_offset}: {expected_length_warning}"),
                     format!(
-                        "(object 2 0, offset {stream_offset}): attempting to recover stream length"
+                        "object 2 0, offset {stream_offset}: attempting to recover stream length"
                     ),
-                    format!("(object 2 0, offset {stream_offset}): recovered stream length: 4"),
+                    format!("object 2 0, offset {stream_offset}: recovered stream length: 4"),
                 ]
             );
         }
@@ -11854,8 +11508,8 @@ mod tests {
         );
         let diagnostics = resolver.repair_diagnostics();
         let diagnostic = diagnostics.entries().last().expect("recorded warning");
-        assert!(diagnostic.is_object_warning());
-        assert_eq!(diagnostic.offset, Some(trailing_offset as u64));
+        assert!(!diagnostic.get_object().is_empty());
+        assert_eq!(diagnostic.get_file_position(), trailing_offset as i64);
     }
 
     #[test]
@@ -12056,10 +11710,13 @@ mod tests {
             let diagnostics = pdf.repair_diagnostics();
             assert_eq!(diagnostics.entries().len(), 1);
             assert_eq!(
-                diagnostics.entries()[0].message,
-                format!("(object 2 0, offset {header_offset}): {expected_message}")
+                String::from_utf8_lossy(diagnostics.entries()[0].what_bytes()),
+                format!("object 2 0, offset {header_offset}: {expected_message}")
             );
-            assert_eq!(diagnostics.entries()[0].offset, Some(header_offset));
+            assert_eq!(
+                diagnostics.entries()[0].get_file_position(),
+                header_offset as i64
+            );
         }
     }
 
@@ -12156,13 +11813,6 @@ mod tests {
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             body.clone(),
         ]);
-        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
-        let stream_offset = body_offset
-            + body
-                .windows(b"stream\n".len())
-                .position(|window| window == b"stream\n")
-                .expect("stream keyword")
-            + b"stream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -12182,10 +11832,11 @@ mod tests {
                 .as_slice(),
             b"abc\n"
         );
-        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
-            entry.message
-                == format!("(object 2 0, offset {stream_offset}): recovered stream length: 4")
-        }));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| { entry.message_string() == "recovered stream length: 4" }));
     }
 
     #[test]
@@ -12218,17 +11869,17 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
         assert!(messages
             .iter()
-            .any(|message| message == "(object 2 0, offset 76): expected endstream"));
-        assert!(messages.iter().any(|message| {
-            message == "(object 2 0, offset 76): attempting to recover stream length"
-        }));
+            .any(|message| message == "expected endstream"));
         assert!(messages
             .iter()
-            .any(|message| { message == "(object 2 0, offset 76): recovered stream length: 2" }));
+            .any(|message| { message == "attempting to recover stream length" }));
+        assert!(messages
+            .iter()
+            .any(|message| { message == "recovered stream length: 2" }));
     }
 
     #[test]
@@ -12238,13 +11889,6 @@ mod tests {
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             body.clone(),
         ]);
-        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
-        let stream_offset = body_offset
-            + body
-                .windows(b"stream\n".len())
-                .position(|window| window == b"stream\n")
-                .expect("stream keyword")
-            + b"stream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -12264,10 +11908,11 @@ mod tests {
                 .as_slice(),
             b"abc\n"
         );
-        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
-            entry.message
-                == format!("(object 2 0, offset {stream_offset}): recovered stream length: 4")
-        }));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| { entry.message_string() == "recovered stream length: 4" }));
     }
 
     #[test]
@@ -12278,8 +11923,6 @@ mod tests {
         body.extend_from_slice(&payload);
         body.extend_from_slice(b"endstream\nendobj\n");
         let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
-        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
-        let stream_offset = body_offset + b"2 0 obj\n<< /Length 0 >>\nstream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -12299,10 +11942,11 @@ mod tests {
                 .as_slice(),
             payload.as_slice()
         );
-        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
-            entry.message
-                == format!("(object 2 0, offset {stream_offset}): recovered stream length: 20")
-        }));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| { entry.message_string() == "recovered stream length: 20" }));
     }
 
     #[test]
@@ -12343,8 +11987,6 @@ mod tests {
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             b"2 0 obj\n<< /Length 0 >>\nstream\n(\nendstream\nendobj\n".to_vec(),
         ]);
-        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
-        let stream_offset = body_offset + b"2 0 obj\n<< /Length 0 >>\nstream\n".len();
         let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
         let path = directory.path().join("malformed-stream-framing.pdf");
         fs::write(&path, &bytes).expect("write qpdf fixture");
@@ -12387,16 +12029,14 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
         assert_eq!(
             flpdf_diagnostics,
             vec![
-                format!("(object 2 0, offset {stream_offset}): expected endstream"),
-                format!(
-                    "(object 2 0, offset {stream_offset}): attempting to recover stream length"
-                ),
-                format!("(object 2 0, offset {stream_offset}): recovered stream length: 2"),
+                format!("expected endstream"),
+                format!("attempting to recover stream length"),
+                format!("recovered stream length: 2"),
             ]
         );
     }
@@ -12430,14 +12070,11 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| (entry.message.clone(), entry.offset))
+            .map(|entry| (entry.message_string(), entry.get_file_position()))
             .collect();
         assert_eq!(
             diagnostics.first(),
-            Some(&(
-                format!("(object 2 0, offset {attempted_offset}): expected endstream"),
-                Some(attempted_offset)
-            ))
+            Some(&("expected endstream".to_string(), attempted_offset as i64))
         );
     }
 
@@ -12474,14 +12111,11 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| (entry.message.clone(), entry.offset))
+            .map(|entry| (entry.message_string(), entry.get_file_position()))
             .collect();
         assert_eq!(
             diagnostics.first(),
-            Some(&(
-                format!("(object 2 0, offset {attempted_offset}): expected endstream"),
-                Some(attempted_offset)
-            ))
+            Some(&("expected endstream".to_string(), attempted_offset as i64))
         );
     }
 
@@ -12594,7 +12228,7 @@ mod tests {
                         .as_slice(),
                     &b"abc"[..]
                 );
-                assert_eq!(warnings, ["(object 2 0, offset 90): expected endobj"]);
+                assert_eq!(warnings, ["object 2 0, offset 90: expected endobj"]);
             },
         );
     }
@@ -12618,17 +12252,17 @@ mod tests {
             (
                 b"\r",
                 b"abc",
-                &["stream keyword followed by carriage return only"][..],
+                &["offset 76: stream keyword followed by carriage return only"][..],
             ),
             (
                 b" \n",
                 b"abc",
-                &["stream keyword followed by extraneous whitespace"][..],
+                &["offset 75: stream keyword followed by extraneous whitespace"][..],
             ),
             (
                 b"",
                 b"(abc)",
-                &["stream keyword not followed by proper line terminator"][..],
+                &["offset 75: stream keyword not followed by proper line terminator"][..],
             ),
         ] {
             let mut body = format!("2 0 obj\n<< /Length {} >>\nstream", payload.len()).into_bytes();
@@ -12737,7 +12371,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
         assert!(messages
             .iter()
@@ -12792,18 +12426,17 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|entry| entry.message.clone())
+            .map(|entry| entry.message_string())
             .collect();
-        assert!(messages
-            .iter()
-            .any(|message| message == "(object 9 0, offset 191): expected endobj"));
+        assert!(messages.iter().any(|message| message == "expected endobj"));
         assert!(messages
             .iter()
             .any(|message| message.contains("EOF after endobj")));
     }
 
-    /// An input source that starts failing part-way through a resolution
-    /// propagates the failure instead of truncating the object.
+    /// An input source failure raised during the resolution dispatch is caught
+    /// like qpdf's `std::exception` catch and resolves the requested object to
+    /// null after recording a warning.
     #[test]
     fn an_input_source_that_fails_mid_resolution_propagates_the_error() {
         struct Breakable {
@@ -12834,14 +12467,14 @@ mod tests {
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolver.with_reader_mut(|reader| reader.broken = true);
 
-        let error = pdf
-            .resolve(&handle)
-            .expect_err("a dead input source cannot resolve anything");
-
-        assert!(
-            matches!(&error, Error::Io(_)),
-            "the I/O failure must reach the caller unchanged, got {error:?}"
-        );
+        pdf.resolve(&handle)
+            .expect("dispatch I/O failure is caught like qpdf");
+        assert!(handle.is_null());
+        assert!(pdf.repair_diagnostics().entries().iter().any(|warning| {
+            warning
+                .get_message_detail()
+                .starts_with(b"object 1/0: error reading object: ")
+        }));
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "and must not leave the reference marked in progress"
@@ -12888,16 +12521,21 @@ mod tests {
         let handle: ObjectHandle = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolver.with_reader_mut(|reader| reader.broken = true);
 
-        let error = pdf
-            .resolve(&handle)
-            .expect_err("a named source read failure must be reported");
-        let Error::SystemBytes(message) = error else {
-            panic!("expected qpdf-shaped read failure, got {error:?}"); // cov:ignore: the assertion covers the defensive variant split
-        };
-        let rendered = String::from_utf8_lossy(&message);
-        assert!(rendered.starts_with("input.pdf"), "{rendered}");
-        assert!(rendered.contains(": read "), "{rendered}");
-        assert!(rendered.ends_with(" bytes"), "{rendered}");
+        pdf.resolve(&handle)
+            .expect("qpdf catches std::exception, warns, and resolves to null");
+        assert!(handle.is_null());
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|warning| {
+                warning
+                    .get_message_detail()
+                    .starts_with(b"object 1/0: error reading object: ")
+            })
+            .expect("the caught source failure must become a typed warning");
+        assert_eq!(warning.get_filename(), b"input.pdf");
+        assert_eq!(warning.get_file_position(), 0);
     }
 
     /// A described source that reaches EOF but cannot perform qpdf's
@@ -13256,7 +12894,7 @@ mod tests {
                     .entries()
                     .iter()
                     .any(|diagnostic| diagnostic
-                        .message
+                        .message_string()
                         .contains("/Length key in stream dictionary is not an integer")));
             })
             .expect("spawn")
@@ -13458,7 +13096,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|d| d.message.clone())
+            .map(|d| d.message_string())
             .collect();
         assert!(
             warnings.iter().any(|w| w.contains("file is damaged")),
@@ -13692,11 +13330,6 @@ mod tests {
     #[test]
     fn public_resolve_recovers_a_malformed_stream_after_xref_reconstruction() {
         let bytes = synthetic_malformed_recovery_mismatch_pdf();
-        let stream_offset = bytes
-            .windows(b"stream\n".len())
-            .position(|window| window == b"stream\n")
-            .expect("stream keyword")
-            + b"stream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -13717,10 +13350,11 @@ mod tests {
                 .as_slice(),
             b"abc\n"
         );
-        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
-            entry.message
-                == format!("(object 1 0, offset {stream_offset}): recovered stream length: 4")
-        }));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| { entry.message_string() == "recovered stream length: 4" }));
     }
 
     #[test]
@@ -13742,7 +13376,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|entry| entry.message.contains("expected 1 0 obj")));
+            .any(|entry| entry.message_string().contains("expected 1 0 obj")));
         assert!(!pdf.reconstructed_xref());
     }
 
@@ -13768,7 +13402,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|d| d.message.clone())
+            .map(|d| d.message_string())
             .collect();
         assert!(
             warnings.iter().any(|w| w
@@ -13813,7 +13447,8 @@ mod tests {
         );
         assert!(
             pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-                diagnostic.offset == Some(0) && diagnostic.message == "object has offset 0"
+                diagnostic.get_file_position() == 0
+                    && diagnostic.message_string() == "object has offset 0"
             }),
             "offset-zero resolution must emit qpdf's warning"
         );
@@ -14145,7 +13780,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|entry| entry.message.contains("input ended before")));
+            .any(|entry| entry.message_string().contains("input ended before")));
     }
 
     #[test]
@@ -14350,7 +13985,7 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("supposed object stream 9 is not a stream")));
     }
 }

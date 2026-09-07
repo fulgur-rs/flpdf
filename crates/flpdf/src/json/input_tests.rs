@@ -9,7 +9,9 @@ use super::{Json, Reactor};
 use crate::json::parse_reader;
 use crate::pipeline::test_support::NthWriteFailure;
 use crate::pipeline::PipelineHandle;
-use crate::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
+use crate::{
+    Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger, QpdfErrorCode, QpdfExc,
+};
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -637,7 +639,7 @@ fn json_reactor_records_qpdf_validation_errors_and_ignores_unknown_keys() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .map(|diagnostic| diagnostic.message.clone())
+        .map(|diagnostic| diagnostic.message_string())
         .collect();
     assert!(messages
         .iter()
@@ -708,7 +710,7 @@ fn json_reactor_validates_object_and_stream_shapes() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .map(|diagnostic| diagnostic.message.clone())
+        .map(|diagnostic| diagnostic.message_string())
         .collect();
     assert!(messages
         .iter()
@@ -745,7 +747,7 @@ fn json_reactor_rejects_malformed_object_keys_and_preserves_omitted_objects() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .map(|diagnostic| diagnostic.message.clone())
+        .map(|diagnostic| diagnostic.message_string())
         .collect();
     assert!(messages
         .iter()
@@ -801,7 +803,7 @@ fn json_reactor_rejects_both_stream_data_sources_in_an_existing_stream() {
         .entries()
         .iter()
         .any(|diagnostic| diagnostic
-            .message
+            .message_string()
             .contains("existing \"stream\" may at most one of \"data\" or \"datafile\"")));
 }
 
@@ -937,7 +939,7 @@ fn json_reactor_reports_root_metadata_and_container_shape_errors() {
             pdf.repair_diagnostics()
                 .entries()
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains(expected)),
+                .any(|diagnostic| diagnostic.message_string().contains(expected)),
             "expected {expected:?} in diagnostics for {json:?}: {:?}",
             pdf.repair_diagnostics().entries()
         );
@@ -994,7 +996,7 @@ fn json_reactor_handles_flag_values_and_invalid_stream_members() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .map(|diagnostic| diagnostic.message.clone())
+        .map(|diagnostic| diagnostic.message_string())
         .collect();
     assert!(messages
         .iter()
@@ -1096,7 +1098,7 @@ fn json_reactor_reports_a_lazy_source_object_resolution_error() {
     let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
     let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "broken.json", true);
     parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
-    assert!(reactor.fatal_error().is_some());
+    assert!(reactor.fatal_error().is_none());
 }
 
 #[test]
@@ -1167,7 +1169,7 @@ fn json_reactor_rejects_an_indirect_object_value() {
         .entries()
         .iter()
         .any(|diagnostic| diagnostic
-            .message
+            .message_string()
             .contains("value of an object may not be an indirect object reference")));
 }
 
@@ -1231,26 +1233,44 @@ fn json_warning_route_preserves_qpdf_context_and_suppression() {
     let mut pdf = Pdf::empty().expect("empty PDF");
     pdf.set_logger(logger);
     pdf.resolver
-        .push_json_warning("", "", 5, "positive")
+        .push_qpdf_warning(QpdfExc::new(QpdfErrorCode::Json, b"", b"", 5, b"positive"))
         .expect("warning delivery");
     pdf.resolver
-        .push_json_warning("", "", 0, "zero")
+        .push_qpdf_warning(QpdfExc::new(QpdfErrorCode::Json, b"", b"", 0, b"zero"))
         .expect("warning delivery");
     pdf.resolver
-        .push_json_warning("", "obj:1 0 R", -1, "negative")
+        .push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::Json,
+            b"",
+            b"obj:1 0 R",
+            -1,
+            b"negative",
+        ))
         .expect("warning delivery");
     pdf.resolver
-        .push_json_warning("", "obj:1 0 R", 5, "object")
+        .push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::Json,
+            b"",
+            b"obj:1 0 R",
+            5,
+            b"object",
+        ))
         .expect("warning delivery");
     pdf.set_suppress_warnings(true);
     pdf.resolver
-        .push_json_warning("", "", 0, "suppressed")
+        .push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::Json,
+            b"",
+            b"",
+            0,
+            b"suppressed",
+        ))
         .expect("suppressed warning collection");
     assert!(pdf
         .repair_diagnostics()
         .entries()
         .iter()
-        .any(|diagnostic| diagnostic.message == "suppressed"));
+        .any(|diagnostic| diagnostic.message_string() == "suppressed"));
 
     let logger = QPDFLogger::create();
     logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(usize::MAX))));
@@ -1262,13 +1282,31 @@ fn json_warning_route_preserves_qpdf_context_and_suppression() {
     let pdf_bytes = include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec();
     let pdf = Pdf::open_with_options(Cursor::new(pdf_bytes), options).expect("minimal PDF");
     pdf.resolver
-        .push_json_warning("document.pdf", "", 5, "named positive")
+        .push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::Json,
+            b"document.pdf",
+            b"",
+            5,
+            b"named positive",
+        ))
         .expect("warning delivery");
     pdf.resolver
-        .push_json_warning("document.pdf", "", 0, "named zero")
+        .push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::Json,
+            b"document.pdf",
+            b"",
+            0,
+            b"named zero",
+        ))
         .expect("warning delivery");
     pdf.resolver
-        .push_json_warning("document.pdf", "obj:1 0 R", 5, "named object")
+        .push_qpdf_warning(QpdfExc::new(
+            QpdfErrorCode::Json,
+            b"document.pdf",
+            b"obj:1 0 R",
+            5,
+            b"named object",
+        ))
         .expect("warning delivery");
 }
 

@@ -739,7 +739,7 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("unexpected reference to /Pages object while copying foreign object")));
     }
 
@@ -1523,7 +1523,7 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.clone())
+            .map(|diagnostic| diagnostic.message_string())
             .collect();
         assert!(
             target_messages
@@ -1536,9 +1536,9 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| {
-                diagnostic.offset == Some(expected_offset)
+                diagnostic.get_file_position() == expected_offset as i64
                     && diagnostic
-                        .message
+                        .message_string()
                         .contains("unexpected EOF reading stream data")
             }));
         assert!(source.repair_diagnostics().entries().is_empty());

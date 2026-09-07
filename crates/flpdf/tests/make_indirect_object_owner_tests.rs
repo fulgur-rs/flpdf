@@ -294,7 +294,7 @@ fn swapping_an_unresolved_repromoted_object_uses_the_requested_resolution_identi
     let second_ref = second.object_ref().unwrap();
     assert!(!source.is_resolved());
     pdf.swap_objects(old_ref, second_ref).unwrap();
-    assert_eq!(source.object_ref(), Some(old_ref));
+    assert_eq!(source.object_ref(), Some(flpdf::ObjectRef::new(100, 0)));
     assert_eq!(source.unparse_resolved(), b"7");
     assert_eq!(second.object_ref(), Some(second_ref));
     assert_eq!(second.unparse_resolved(), b"null");

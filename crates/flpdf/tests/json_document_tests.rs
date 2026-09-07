@@ -405,7 +405,10 @@ fn import_aggregates_semantic_errors_after_incremental_parsing() {
         .repair_diagnostics()
         .entries()
         .iter()
-        .any(|diagnostic| diagnostic.message.contains("exactly one of")));
+        .any(
+            |diagnostic| String::from_utf8_lossy(diagnostic.get_message_detail())
+                .contains("exactly one of")
+        ));
 }
 
 #[test]
@@ -434,5 +437,8 @@ fn create_from_json_wraps_a_semantic_failure_with_its_accumulated_diagnostics() 
     assert!(diagnostics
         .entries()
         .iter()
-        .any(|diagnostic| diagnostic.message.contains("exactly one of")));
+        .any(
+            |diagnostic| String::from_utf8_lossy(diagnostic.get_message_detail())
+                .contains("exactly one of")
+        ));
 }

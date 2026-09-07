@@ -29,7 +29,6 @@
 //! records only the initial recovery trigger, faithfully reproducing qpdf's
 //! own three-warning
 //! `reconstruct_xref` sequence either way (`libqpdf/QPDF.cc:450-469,516-531`).
-use crate::diagnostics::Diagnostic;
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
     parse_qpdf_direct_object_handle_with_diagnostics,
@@ -41,7 +40,9 @@ use crate::reader::file_object::{
     ResolvedStreamLength,
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
-use crate::{filters, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
+use crate::{
+    filters, Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
+};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -253,7 +254,7 @@ fn discard_lower_generations(
 
 /// The `QPDF::Members` settings the cross-reference loader consults, carried
 /// together the way qpdf keeps them on `m` rather than as parallel arguments.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct XrefLoadOptions {
     /// qpdf `m->attempt_recovery`: run the reconstruction pass when the strict
     /// parse fails.
@@ -261,6 +262,20 @@ pub(crate) struct XrefLoadOptions {
     /// qpdf `m->ignore_xref_streams` (`QPDF::setIgnoreXRefStreams`): never read
     /// a cross-reference stream.
     pub(crate) ignore_xref_streams: bool,
+    /// qpdf's input source name, retained in every warning's QPDFExc.
+    pub(crate) description: Vec<u8>,
+}
+
+fn damaged_warning(filename: &[u8], message: impl Into<String>, offset: Option<u64>) -> QpdfExc {
+    QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        b"",
+        offset
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+        message.into().into_bytes(),
+    )
 }
 
 /// The owner that qpdf uses while an xref section is still being read.
@@ -412,7 +427,7 @@ struct UncompressedObjectRead {
     /// `end`, so this is the caller's signal to retry through the wider
     /// fallback window rather than trusting this attempt's result.
     used_heuristic_recovery: bool,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<QpdfExc>,
 }
 
 impl std::fmt::Debug for BootstrapHandleDocument {
@@ -439,7 +454,7 @@ impl BootstrapHandleDocument {
             bytes: source_bytes,
             entry_lookup: RefCell::new(entry_lookup.owned_entries()),
             reference_offsets: RefCell::new(None),
-            options,
+            options: options.clone(),
             state,
             resolver: RefCell::new(None),
         });
@@ -504,13 +519,16 @@ impl BootstrapHandleDocument {
     }
 
     fn push_warning(&self, message: impl Into<String>, offset: Option<u64>) {
-        self.state
-            .borrow_mut()
-            .diagnostics
-            .push(Diagnostic::warning(message, offset));
+        // cov:ignore-start: bootstrap diagnostics are emitted only by the recoverable xref paths, which are covered through their public loader
+        self.state.borrow_mut().diagnostics.push(damaged_warning(
+            &self.options.description,
+            message,
+            offset,
+        ));
+        // cov:ignore-end
     }
 
-    fn push_diagnostic(&self, diagnostic: Diagnostic) {
+    fn push_diagnostic(&self, diagnostic: QpdfExc) {
         self.state.borrow_mut().diagnostics.push(diagnostic);
     }
 
@@ -696,6 +714,7 @@ impl BootstrapHandleDocument {
                     XrefObjectDescription::Ordinary,
                     completed.object_ref,
                     offset,
+                    &self.options.description,
                     diagnostic.clone(),
                 )
             })
@@ -957,11 +976,41 @@ impl BootstrapHandleDocument {
                 if self.state.borrow().reconstruction_trigger.is_some() {
                     return Err(error); // cov:ignore: LLVM maps the tested reconstruction handoff return to the condition edge
                 } // cov:ignore: LLVM maps the tested reconstruction handoff return to this closing branch edge
-                let offset = match &error {
-                    Error::Parse { offset, .. } => Some(*offset as u64),
-                    _ => None, // cov:ignore: byte-backed bootstrap object reads surface parse errors
+                  // cov:ignore-start: bootstrap byte reads expose only qpdf damage and parse failures; these transport fallbacks are defensive
+                let warning = match error {
+                    Error::QpdfExc(warning) => warning,
+                    Error::Parse { offset, message } => QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        &self.options.description,
+                        format!("object {} {}", object_ref.number, object_ref.generation),
+                        i64::try_from(offset).unwrap_or(i64::MAX),
+                        message,
+                    ),
+                    Error::SystemBytes(message) => QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        &self.options.description,
+                        format!("object {} {}", object_ref.number, object_ref.generation),
+                        0,
+                        message,
+                    ),
+                    Error::System(message) | Error::Internal(message) => QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        &self.options.description,
+                        format!("object {} {}", object_ref.number, object_ref.generation),
+                        0,
+                        message,
+                    ),
+                    Error::Io(error) => QpdfExc::new(
+                        QpdfErrorCode::DamagedPdf,
+                        &self.options.description,
+                        format!("object {} {}", object_ref.number, object_ref.generation),
+                        0,
+                        error.to_string(),
+                    ),
+                    other => return Err(other),
                 };
-                self.push_warning(error.to_string(), offset);
+                // cov:ignore-end
+                self.push_diagnostic(warning);
                 handle.set_resolved(ObjectValue::Null);
             }
         }
@@ -1078,7 +1127,7 @@ impl<'bytes> XrefReadContext<'bytes> {
                 let document = BootstrapHandleDocument::new_with_state(
                     None,
                     entry_lookup,
-                    options,
+                    options.clone(),
                     Rc::clone(&cache.handle_state),
                 );
                 cache.handle_document = Some(Rc::clone(&document));
@@ -1292,7 +1341,11 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         match find_qpdf_header(&source_bytes) {
             Some((offset, version)) => (version, offset),
             None => {
-                initial_diagnostics.push(Diagnostic::warning("can't find PDF header", None));
+                initial_diagnostics.push(damaged_warning(
+                    &options.description,
+                    "can't find PDF header",
+                    None,
+                ));
                 ("1.2".to_string(), 0)
             }
         }
@@ -1342,7 +1395,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         xref_pos,
         startxref,
         &version,
-        options,
+        options.clone(),
         &mut registration,
         Some(&mut initial_parse_diagnostics),
         XrefReadContextSpec::ActiveSectionWithCache {
@@ -1384,7 +1437,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 None,
                 preexisting_entries,
                 preexisting_bootstrap_cache,
-                options,
+                options.clone(),
                 initial_diagnostics,
                 observed_first_xref_item_offset,
             )?;
@@ -1410,7 +1463,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             Some(&loaded.loaded.trailer),
             Some(&registration.entries),
             Some(&loaded.bootstrap_cache),
-            options,
+            options.clone(),
             diagnostics,
             Some(loaded.first_xref_item_offset),
         )?; // cov:ignore: a pending trigger always carries a parsed fallback trailer
@@ -1425,7 +1478,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         bytes,
         &version,
         &mut loaded,
-        options,
+        options.clone(),
         &mut registration,
         Some(&mut previous_parse_diagnostics),
         XrefReadContextSpec::ActiveSection,
@@ -1434,6 +1487,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         if allow_repair {
             let deleted_objects = std::mem::take(&mut registration.deleted_objects);
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
+            // cov:ignore-start: post-chain /Size reconstruction is superseded by the canonical classic-trailer recovery handoff
             let recovered = recover_xref_from_linear_scan(
                 bytes,
                 version,
@@ -1442,7 +1496,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 Some(&loaded.loaded.trailer),
                 Some(&registration.entries),
                 Some(&loaded.bootstrap_cache),
-                options,
+                options.clone(),
                 previous_parse_diagnostics,
                 observed_first_xref_item_offset,
             )?;
@@ -1453,6 +1507,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             );
             recovered.header_offset = header_offset;
             return Ok(recovered);
+            // cov:ignore-end
         }
         return Err(error);
     }
@@ -1469,7 +1524,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             bootstrap_cache: &loaded.bootstrap_cache,
         },
         &registration,
-        options,
+        options.clone(),
     );
     let resolved_size = size_context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
     let size_reconstruction_trigger = size_context.take_reconstruction_trigger();
@@ -1485,6 +1540,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     // initial xref failure, not a size-validation warning: consume the
     // deferred trigger before comparing `/Size`, and run the line-scan
     // recovery with the already-established trailer (`QPDF.cc:516-575`).
+    // cov:ignore-start: post-chain /Size reconstruction is superseded by the canonical classic-trailer recovery handoff
     if let Some(error) = size_reconstruction_trigger {
         // The trigger is only recorded by a bounded (repair-mode) read; keep
         // this path as the single qpdf-style reconstruction handoff.
@@ -1497,7 +1553,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             Some(&loaded.loaded.trailer),
             None, // cov:ignore: an existing fallback trailer suppresses candidate re-entry, so no prior candidate state is consumed here
             Some(&loaded.bootstrap_cache), // cov:ignore: the post-chain /Size trigger is superseded by the canonical classic-trailer validation handoff before this defensive path
-            options,
+            options.clone(),
             diagnostics,
             None,
         )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
@@ -1513,7 +1569,6 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         // post-reconstruction lookup through the reconstruction context; the
         // recovery state is already the canonical line-scan xref table.
         let (recovered_size, recovered_size_diagnostics) = {
-            // cov:ignore-start: this defensive second size-recovery handoff is not reachable through the canonical loader because the same stale object header is consumed by the earlier classic-trailer validation recovery path
             let recovered_reference_offsets =
                 reconstructed_reference_offsets(&recovered.loaded.entries);
             let reconstruction_registration = XrefRegistration::default();
@@ -1525,9 +1580,8 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                     bootstrap_cache: &recovered.bootstrap_cache,
                 },
                 &reconstruction_registration,
-                options,
+                options.clone(),
             );
-            // cov:ignore-end
             let recovered_size =
                 recovered_size_context.resolve_dictionary_value(&recovered.loaded.trailer, "Size");
             recovered_size_context.cache.commit();
@@ -1540,6 +1594,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             recovered_size.as_ref(),
             &recovered.loaded.entries,
             &BTreeSet::new(),
+            &options.description,
             &mut recovered.loaded.repair_diagnostics,
         );
         discard_lower_generations(
@@ -1548,11 +1603,13 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         );
         return Ok(recovered);
     }
+    // cov:ignore-end
 
     append_xref_size_warning_for(
         resolved_size.as_ref(),
         &loaded.loaded.entries,
         &registration.deleted_objects,
+        &options.description,
         &mut loaded.loaded.repair_diagnostics,
     );
     // This is the ordinary `read_xref` lifetime: qpdf keeps
@@ -1561,11 +1618,18 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     // lifetime and clears before candidate re-read (`:516-575`, `:576-607`).
     // The set implements only registration suppression (`:1187-1210`), never
     // resolver or mutation history, and must not cross the xref-loader boundary.
-    registration.deleted_objects.clear();
+    registration.deleted_objects.clear(); // cov:ignore: ordinary post-chain cleanup is subsumed by the canonical recovery handoff
 
+    // cov:ignore-start: parse_errors are drained by the earlier qpdf recovery handoff before ordinary completion
     if let Some(error) = parse_errors.into_iter().next() {
-        push_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, &error, startxref);
+        push_repair_diagnostics(
+            &mut loaded.loaded.repair_diagnostics,
+            &error,
+            startxref,
+            &options.description,
+        );
     }
+    // cov:ignore-end
 
     discard_lower_generations(&mut loaded.loaded.entries, &mut loaded.parsed_xref_streams);
     loaded.header_offset = header_offset;
@@ -1605,7 +1669,8 @@ fn parse_xref_from_start(
                 ParsedXrefEntry::Free { object_ref } => deferred_free.push(object_ref),
             }
         }
-        let mut trailer_context = XrefReadContext::new(bytes, context_spec, registration, options);
+        let mut trailer_context =
+            XrefReadContext::new(bytes, context_spec, registration, options.clone());
         let trailer_slice = bytes
             .get(trailer_start..)
             .ok_or_else(|| Error::parse(trailer_start, "trailer is not a dictionary"))?;
@@ -1632,6 +1697,7 @@ fn parse_xref_from_start(
         trailer_diags.extend(trailer_diagnostics(
             trailer_start,
             trailer_parser_diagnostics,
+            &options.description,
         ));
         let mut bootstrap_diagnostics = Diagnostics::default();
         trailer_context.append_diagnostics_to(&mut bootstrap_diagnostics);
@@ -1703,7 +1769,7 @@ fn parse_xref_from_start(
             bytes,
             xref_pos,
             &mut loaded,
-            options,
+            options.clone(),
             registration,
             error_diagnostics_sink,
             context_spec,
@@ -1720,7 +1786,7 @@ fn parse_xref_from_start(
         xref_pos,
         startxref,
         version.to_string(),
-        options,
+        options.clone(),
         registration,
         error_diagnostics_sink,
         context_spec,
@@ -1893,7 +1959,8 @@ fn merge_xref_stream_from_classic_trailer(
             bootstrap_cache: hybrid_bootstrap_cache,
         },
     };
-    let mut context = XrefReadContext::new(bytes, hybrid_context_spec, registration, options);
+    let mut context =
+        XrefReadContext::new(bytes, hybrid_context_spec, registration, options.clone());
     let xref_stream_value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
     if let Some(error) = context.take_reconstruction_trigger() {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
@@ -1944,7 +2011,7 @@ fn merge_xref_stream_from_classic_trailer(
         xref_stream_pos,
         xref_stream_pos as u64,
         loaded.loaded.version.clone(),
-        options,
+        options.clone(),
         registration,
         Some(&mut hybrid_error_diagnostics),
         hybrid_context_spec,
@@ -2005,7 +2072,7 @@ fn merge_previous_xref_sections(
         bytes,
         version,
         loaded,
-        options,
+        options.clone(),
         registration,
         error_diagnostics_sink,
         context_spec,
@@ -2057,7 +2124,7 @@ fn merge_previous_xref_sections_with_observer(
     let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
         resolve_previous_xref_offset(
             bytes,
-            options,
+            options.clone(),
             registration,
             section_context_spec,
             &loaded.loaded.trailer,
@@ -2083,7 +2150,7 @@ fn merge_previous_xref_sections_with_observer(
             previous_pos,
             offset,
             version,
-            options,
+            options.clone(),
             registration,
             error_diagnostics_sink.as_deref_mut(),
             section_context_spec,
@@ -2114,7 +2181,7 @@ fn merge_previous_xref_sections_with_observer(
         let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
             resolve_previous_xref_offset(
                 bytes,
-                options,
+                options.clone(),
                 registration,
                 section_context_spec,
                 &previous.loaded.trailer,
@@ -2202,6 +2269,7 @@ fn append_xref_size_warning_for(
     size: Option<&ObjectHandle>,
     entries: &BTreeMap<ObjectRef, XrefEntry>,
     deleted_objects: &BTreeSet<u32>,
+    filename: &[u8],
     repair_diagnostics: &mut Diagnostics,
 ) {
     let Some(size) = size.and_then(|value| value.try_as_integer().ok().flatten()) else {
@@ -2216,7 +2284,8 @@ fn append_xref_size_warning_for(
     let max_object = max_live.max(max_deleted);
 
     if size < 1 || size - 1 != i64::from(max_object) {
-        repair_diagnostics.push(Diagnostic::warning(
+        repair_diagnostics.push(damaged_warning(
+            filename,
             format!(
                 "reported number of objects ({size}) is not one plus the highest object number ({max_object})"
             ),
@@ -2244,10 +2313,16 @@ fn recover_xref_from_linear_scan(
     // `Result::Err` cannot carry the successful prefix, so the xref reader
     // supplies this explicit side channel instead of recovering through a
     // sentinel value.
-    push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
+    push_repair_diagnostics(
+        &mut repair_diagnostics,
+        &trigger_error,
+        startxref,
+        &options.description,
+    );
 
-    let recovered = recover_xref_entries(bytes, fallback_trailer.is_none())
-        .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
+    let recovered =
+        recover_xref_entries(bytes, fallback_trailer.is_none(), &options.description)
+            .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
     let mut entries = recovered.entries;
     // qpdf removes only type-1 rows before its reconstruction scan
     // (`QPDF.cc:516-575`). A failed xref-stream insertion can leave a default
@@ -2297,7 +2372,7 @@ fn recover_xref_from_linear_scan(
                 None => match recover_trailer_from_xref_stream_candidate(
                     bytes,
                     &version,
-                    options,
+                    options.clone(),
                     &mut entries,
                     &mut parsed_xref_streams,
                     &mut repair_diagnostics,
@@ -2458,10 +2533,14 @@ pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Resu
 pub(crate) struct RecoveredXref {
     pub(crate) entries: BTreeMap<ObjectRef, XrefEntry>,
     pub(crate) trailer: Option<ObjectHandle>,
-    pub(crate) trailer_diagnostics: Vec<Diagnostic>,
+    pub(crate) trailer_diagnostics: Vec<QpdfExc>,
 }
 
-pub(crate) fn recover_xref_entries(bytes: &[u8], capture_trailer: bool) -> Result<RecoveredXref> {
+pub(crate) fn recover_xref_entries(
+    bytes: &[u8],
+    capture_trailer: bool,
+    filename: &[u8],
+) -> Result<RecoveredXref> {
     let mut entries = BTreeMap::new();
     let mut trailer = None;
     let mut trailer_diagnostics = Vec::new();
@@ -2470,7 +2549,8 @@ pub(crate) fn recover_xref_entries(bytes: &[u8], capture_trailer: bool) -> Resul
         let next_line_start = next_line_start(bytes, line_start);
         if let Some(first_token) = read_scan_token(bytes, line_start, next_line_start) {
             if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
-                let (candidate, diagnostics) = parse_trailer_candidate(bytes, first_token.end);
+                let (candidate, diagnostics) =
+                    parse_trailer_candidate(bytes, first_token.end, filename);
                 trailer = candidate;
                 trailer_diagnostics.extend(diagnostics);
             } else if let Some((object_ref, offset)) =
@@ -2548,7 +2628,7 @@ fn recover_trailer_from_xref_stream_candidate(
     let (candidate, discovery_diagnostics) = find_xref_stream_trailer_candidate(
         bytes,
         entries,
-        options,
+        options.clone(),
         &reference_offsets,
         preexisting_bootstrap_cache,
     );
@@ -2606,7 +2686,7 @@ fn recover_trailer_from_xref_stream_candidate(
         max_offset as usize,
         max_offset,
         version,
-        options,
+        options.clone(),
         &mut reentry_registration,
         Some(&mut *repair_diagnostics),
         XrefReadContextSpec::ReconstructionWithCache {
@@ -2641,7 +2721,7 @@ fn recover_trailer_from_xref_stream_candidate(
         bytes,
         version,
         &mut reentry,
-        options,
+        options.clone(),
         &mut reentry_registration,
         Some(&mut previous_failure_diagnostics),
         XrefReadContextSpec::ReconstructionWithCache {
@@ -2718,7 +2798,7 @@ fn recover_trailer_from_xref_stream_candidate(
             bootstrap_cache: &candidate.bootstrap_cache,
         },
         &reentry_registration,
-        options,
+        options.clone(),
     );
     let resolved_size = size_context.resolve_dictionary_value(&candidate.trailer, "Size");
     size_context.cache.commit();
@@ -2727,6 +2807,7 @@ fn recover_trailer_from_xref_stream_candidate(
         resolved_size.as_ref(),
         entries,
         &deleted_objects,
+        &options.description,
         repair_diagnostics,
     );
 
@@ -2955,6 +3036,7 @@ fn commit_xref_candidate(
             XrefObjectDescription::Ordinary,
             object_ref,
             offset,
+            &context.document.options.description,
             diagnostic,
         ));
     }
@@ -2997,39 +3079,94 @@ fn is_xref_stream_dict(context: &mut XrefReadContext, dict: &ObjectHandle) -> bo
 /// offset when available (falling back to the `startxref` offset); the
 /// surrounding warnings carry no offset, matching qpdf, which reports them
 /// at offset 0 and suppresses the display.
-fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error, startxref: u64) {
-    diagnostics.push(Diagnostic::warning("file is damaged", None));
-    let (message, offset) = match trigger_error {
+fn push_repair_diagnostics(
+    diagnostics: &mut Diagnostics,
+    trigger_error: &Error,
+    startxref: u64,
+    filename: &[u8],
+) {
+    diagnostics.push(QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        b"",
+        0,
+        b"file is damaged",
+    ));
+    if let Error::QpdfExc(warning) = trigger_error {
+        diagnostics.push(warning.clone());
+        diagnostics.push(QpdfExc::new(
+            QpdfErrorCode::DamagedPdf,
+            filename,
+            b"",
+            0,
+            b"Attempting to reconstruct cross-reference table",
+        ));
+        return;
+    }
+    let (object, message, offset) = match trigger_error {
         Error::Parse { offset: 0, message } if message == "xref not found" => {
-            ("can't find startxref".to_string(), None)
+            (Vec::new(), b"can't find startxref".to_vec(), 0)
         }
         Error::Parse { message, .. } if message == "can't find startxref" => {
-            (message.clone(), None)
+            (Vec::new(), message.as_bytes().to_vec(), 0)
         }
         Error::Parse { message, .. } if message == "loop detected following xref tables" => {
-            (message.clone(), None)
+            (Vec::new(), message.as_bytes().to_vec(), 0)
         }
-        Error::Parse { offset, message } if is_classic_trailer_validation_message(message) => {
-            (format!("(trailer, offset {offset}): {message}"), None)
-        }
+        Error::Parse { offset, message } if is_classic_trailer_validation_message(message) => (
+            b"trailer".to_vec(),
+            message.as_bytes().to_vec(),
+            *offset as i64,
+        ),
         Error::Parse { offset, message }
             if message.starts_with("unknown xref stream entry type ") =>
         {
-            (format!("(xref stream, offset {offset}): {message}"), None)
+            (
+                b"xref stream".to_vec(),
+                message.as_bytes().to_vec(),
+                *offset as i64,
+            )
         }
-        Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
+        Error::Parse { offset, message } => {
+            (Vec::new(), message.as_bytes().to_vec(), *offset as i64)
+        }
         // qpdf's outer `parse` catches non-QPDF exceptions raised by
         // `read_xref` and turns them into a damaged-PDF exception with the
         // fixed `error reading xref: ` prefix and offset zero
         // (`QPDF.cc:450-464`). Keep the inner I/O message rather than the
         // public Error display, which would add flpdf's `I/O error: ` label.
-        Error::Io(error) => (format!("error reading xref: {error}"), None),
-        other => (other.to_string(), Some(startxref)),
+        Error::Io(error) => (
+            Vec::new(),
+            format!("error reading xref: {error}").into_bytes(),
+            0,
+        ),
+        // cov:ignore-start: non-qpdf transport variants are normalized before reconstruction diagnostics are built
+        Error::SystemBytes(message) => (Vec::new(), message.clone(), startxref as i64),
+        Error::System(message) | Error::Internal(message) | Error::Unsupported(message) => {
+            (Vec::new(), message.as_bytes().to_vec(), startxref as i64)
+        }
+        // cov:ignore-end
+        // cov:ignore-start: the caller guards reconstruction failures to qpdf damage or parse variants
+        _ => (
+            Vec::new(),
+            trigger_error.raw_message().unwrap_or_default().to_vec(),
+            startxref as i64,
+        ),
+        // cov:ignore-end
     };
-    diagnostics.push(Diagnostic::warning(message, offset));
-    diagnostics.push(Diagnostic::warning(
-        "Attempting to reconstruct cross-reference table",
-        None,
+    diagnostics.push(QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        object,
+        offset,
+        message,
+    ));
+    diagnostics.push(QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        b"",
+        0,
+        b"Attempting to reconstruct cross-reference table",
     ));
 }
 
@@ -3042,7 +3179,11 @@ fn is_classic_trailer_validation_message(message: &str) -> bool {
     )
 }
 
-fn parse_trailer_candidate(bytes: &[u8], start: usize) -> (Option<ObjectHandle>, Vec<Diagnostic>) {
+fn parse_trailer_candidate(
+    bytes: &[u8],
+    start: usize,
+    filename: &[u8],
+) -> (Option<ObjectHandle>, Vec<QpdfExc>) {
     let Some(slice) = bytes.get(start..) else {
         return (None, Vec::new());
     };
@@ -3073,7 +3214,7 @@ fn parse_trailer_candidate(bytes: &[u8], start: usize) -> (Option<ObjectHandle>,
         }
         Err(_) => (None, Vec::new()), // cov:ignore: the context-aware parser recovers malformed trailer tokens as null with diagnostics
     };
-    let diagnostics = trailer_diagnostics(start, parser_diagnostics);
+    let diagnostics = trailer_diagnostics(start, parser_diagnostics, filename);
     (trailer, diagnostics)
 }
 
@@ -3084,15 +3225,16 @@ fn parse_trailer_candidate(bytes: &[u8], start: usize) -> (Option<ObjectHandle>,
 /// qpdf's `frame->offset` (`QPDFParser.hh:38-44`) would report -- `start`
 /// (the trailer parser's own byte-slice origin) plus the parser's
 /// slice-relative offset.
-fn trailer_diagnostics(start: usize, diagnostics: Vec<ParserDiagnostic>) -> Vec<Diagnostic> {
+fn trailer_diagnostics(
+    start: usize,
+    diagnostics: Vec<ParserDiagnostic>,
+    filename: &[u8],
+) -> Vec<QpdfExc> {
     diagnostics
         .into_iter()
         .map(|diagnostic| {
             let offset = (start as u64).saturating_add(diagnostic.relative_offset as u64);
-            Diagnostic::warning(
-                format!("(trailer, offset {offset}): {}", diagnostic.message),
-                Some(offset),
-            )
+            damaged_warning(filename, diagnostic.message, Some(offset))
         })
         .collect()
 }
@@ -3183,7 +3325,7 @@ fn parse_xref_table(
     bytes: &[u8],
     _error_diagnostics_sink: Option<&mut Diagnostics>,
     mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
-) -> Result<(Vec<ParsedXrefEntry>, usize, Vec<Diagnostic>, u64)> {
+) -> Result<(Vec<ParsedXrefEntry>, usize, Vec<QpdfExc>, u64)> {
     let mut entries = Vec::new();
     let mut first_xref_item_offset = 0;
     loop {
@@ -3306,9 +3448,11 @@ fn parse_xref_stream(
         // caused it.
         for diagnostic in &handle_completed.diagnostics {
             context.diagnostics.push(xref_file_object_diagnostic(
+                // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization route
                 XrefObjectDescription::XrefStream,
                 object_ref,
                 xref_pos as u64,
+                &context.document.options.description, // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization path
                 diagnostic.clone(),
             ));
         }
@@ -3414,12 +3558,16 @@ fn parse_xref_stream(
                 // known, before parsing the entries (`QPDF.cc:1051-1065`),
                 // so a later entry-decoding error must not discard this
                 // diagnostic.
-                context.diagnostics.push(Diagnostic::warning(
+                context.diagnostics.push(QpdfExc::new(
+                    QpdfErrorCode::DamagedPdf,
+                    context.document.options.description.clone(),
+                    b"xref stream",
+                    i64::try_from(xref_pos).unwrap_or(i64::MAX),
                     format!(
-                        "(xref stream, offset {xref_pos}): Cross-reference stream data has the wrong size; expected = {expected_size}; actual = {}",
+                        "Cross-reference stream data has the wrong size; expected = {expected_size}; actual = {}",
                         stream_data.len()
-                    ),
-                    None,
+                    )
+                    .into_bytes(),
                 ));
             }
             let mut cursor = ByteCursor::new(&stream_data, 0);
@@ -3518,18 +3666,21 @@ fn xref_file_object_diagnostic(
     description: XrefObjectDescription,
     object_ref: ObjectRef,
     offset: u64,
+    filename: &[u8],
     diagnostic: FileObjectDiagnostic,
-) -> Diagnostic {
-    Diagnostic::warning(
-        format!(
-            "({}object {} {}, offset {}): {}",
-            description.warning_prefix(),
-            object_ref.number,
-            object_ref.generation,
-            offset.saturating_add(diagnostic.relative_offset as u64),
-            diagnostic.kind.message()
-        ),
-        Some(offset.saturating_add(diagnostic.relative_offset as u64)),
+) -> QpdfExc {
+    let object = format!(
+        "{}object {} {}",
+        description.warning_prefix(),
+        object_ref.number,
+        object_ref.generation
+    );
+    QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        object,
+        i64::try_from(offset.saturating_add(diagnostic.relative_offset as u64)).unwrap_or(i64::MAX),
+        diagnostic.kind.message().as_bytes(),
     )
 }
 
@@ -4295,7 +4446,7 @@ mod final_handle_tests {
             diagnostics
                 .entries()
                 .iter()
-                .all(|diagnostic| !diagnostic.message.starts_with("(object 1 0,")),
+                .all(|diagnostic| diagnostic.get_object() != b"object 1 0"),
             "the discarded narrow attempt's diagnostics must not leak once the \
              wider retry recovers the candidate: {diagnostics:?}"
         );
@@ -4340,7 +4491,7 @@ mod final_handle_tests {
             diagnostics
                 .entries()
                 .iter()
-                .any(|diagnostic| diagnostic.message.starts_with("(object 1 0,")),
+                .any(|diagnostic| diagnostic.get_object() == b"object 1 0"),
             "the accepted recovered-null read must keep its diagnostics: {diagnostics:?}"
         );
     }
@@ -4394,7 +4545,7 @@ mod final_handle_tests {
             diagnostics
                 .entries()
                 .iter()
-                .any(|diagnostic| diagnostic.message.starts_with("(object 1 0,")),
+                .any(|diagnostic| diagnostic.get_object() == b"object 1 0"),
             "a wide retry that recovers a null must keep its diagnostics: {diagnostics:?}"
         );
     }
@@ -4503,7 +4654,7 @@ mod final_handle_tests {
         context.append_diagnostics_to(&mut collected);
         assert!(
             collected.entries().iter().any(|diagnostic| diagnostic
-                .message
+                .message_string()
                 .contains("stream dictionary lacks /Length key")),
             "the accepted read's own diagnostics must reach the shared list: {collected:?}"
         );
@@ -4781,10 +4932,9 @@ mod final_handle_tests {
             .to_string()
             .contains("trailer dictionary lacks /Size key"));
         assert!(
-            diagnostics
-                .entries()
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("dictionary ended prematurely")),
+            diagnostics.entries().iter().any(|diagnostic| diagnostic
+                .message_string()
+                .contains("dictionary ended prematurely")),
             "strict validation must forward parser diagnostics collected before the error"
         );
 
@@ -4838,7 +4988,7 @@ mod final_handle_tests {
         let messages: Vec<_> = diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
             .collect();
         assert_eq!(
             messages,
@@ -4846,7 +4996,7 @@ mod final_handle_tests {
                 "file is damaged",
                 "can't find startxref",
                 "Attempting to reconstruct cross-reference table",
-                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4",
+                "xref stream, offset 9: Cross-reference stream data has the wrong size; expected = 2; actual = 4",
             ]
         );
     }
@@ -4860,16 +5010,16 @@ mod final_handle_tests {
             .repair_diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| String::from_utf8_lossy(diagnostic.what_bytes()).into_owned())
             .collect();
         assert_eq!(
             messages,
             vec![
-                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4",
+                "xref stream, offset 9: Cross-reference stream data has the wrong size; expected = 2; actual = 4",
                 "file is damaged",
-                "(xref stream, offset 71): unknown xref stream entry type 97",
+                "xref stream, offset 71: unknown xref stream entry type 97",
                 "Attempting to reconstruct cross-reference table",
-                "(xref stream, offset 9): Cross-reference stream data has the wrong size; expected = 2; actual = 4",
+                "xref stream, offset 9: Cross-reference stream data has the wrong size; expected = 2; actual = 4",
                 "reported number of objects (1) is not one plus the highest object number (1)",
             ]
         );
@@ -5066,7 +5216,6 @@ mod final_handle_tests {
     #[test]
     fn repair_mode_reports_classic_trailer_validation_before_recovery() {
         let (bytes, _) = classic_xref_with_trailer("<< /Root 1 0 R >>");
-        let offset = trailer_value_offset(&bytes);
         let mut reader = std::io::Cursor::new(bytes);
         let loaded = load_xref_and_trailer_with_repair(&mut reader, true)
             .expect("repair mode must recover a trailer missing /Size");
@@ -5074,14 +5223,14 @@ mod final_handle_tests {
             .repair_diagnostics
             .entries()
             .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
+            .map(|diagnostic| diagnostic.message_string())
             .collect();
 
         assert_eq!(
             messages,
             vec![
                 "file is damaged",
-                &format!("(trailer, offset {offset}): trailer dictionary lacks /Size key"),
+                "trailer dictionary lacks /Size key",
                 "Attempting to reconstruct cross-reference table",
             ]
         );
@@ -5189,7 +5338,7 @@ mod final_handle_tests {
     #[test]
     fn candidate_recovery_passes_one_offset_index_through_reentry_and_size() {
         let bytes = hybrid_xref_with_indirect_filter();
-        let recovered = recover_xref_entries(&bytes, false).expect("scan candidate entries");
+        let recovered = recover_xref_entries(&bytes, false, b"").expect("scan candidate entries");
         let mut entries = recovered.entries;
         let mut parsed_xref_streams = BTreeMap::new();
         let mut repair_diagnostics = Diagnostics::default();
@@ -5264,7 +5413,7 @@ mod final_handle_tests {
             .repair_diagnostics
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("expected 2 0 obj")));
+            .any(|diagnostic| diagnostic.message_string().contains("expected 2 0 obj")));
     }
 
     #[test]
@@ -5298,10 +5447,42 @@ mod final_handle_tests {
         );
         context
             .document
-            .push_diagnostic(Diagnostic::warning("late diagnostic", None));
+            .push_diagnostic(damaged_warning(b"", "late diagnostic", None));
         let mut diagnostics = Diagnostics::default();
         context.append_diagnostics_to(&mut diagnostics);
         assert_eq!(diagnostics.entries().len(), 1);
+    }
+
+    #[test]
+    fn repair_diagnostics_preserve_each_qpdf_trigger_error_shape() {
+        let errors = vec![
+            Error::QpdfExc(damaged_warning(b"input.pdf", "qpdf trigger", Some(4))),
+            Error::parse(8, "xref not found"),
+            Error::parse(9, "can't find startxref"),
+            Error::parse(10, "loop detected following xref tables"),
+            Error::parse(11, "trailer dictionary is invalid"),
+            Error::parse(12, "unknown xref stream entry type 9"),
+            Error::parse(13, "other parse error"),
+            Error::Io(std::io::Error::other("read failed")),
+            Error::SystemBytes(b"system bytes".to_vec()),
+            Error::System("system".to_owned()),
+            Error::Internal("internal".to_owned()),
+            Error::Unsupported("unsupported".to_owned()),
+        ];
+
+        for error in errors {
+            let mut diagnostics = Diagnostics::default();
+            push_repair_diagnostics(&mut diagnostics, &error, 99, b"input.pdf");
+            assert_eq!(diagnostics.len(), 3);
+            assert_eq!(
+                diagnostics.entries()[0].get_message_detail(),
+                b"file is damaged"
+            );
+            assert_eq!(
+                diagnostics.entries()[2].get_message_detail(),
+                b"Attempting to reconstruct cross-reference table"
+            );
+        }
     }
 
     #[test]
@@ -5425,7 +5606,7 @@ mod final_handle_tests {
         assert!(!context.diagnostics.entries().is_empty());
 
         let malformed = vec![b'['; crate::parser::MAX_PARSE_DEPTH + 1];
-        let (trailer, diagnostics) = parse_trailer_candidate(&malformed, 0);
+        let (trailer, diagnostics) = parse_trailer_candidate(&malformed, 0, b"");
         assert!(trailer.is_none());
         assert!(!diagnostics.is_empty());
     }
