@@ -1854,6 +1854,31 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn qpdf_exception_conversion_preserves_structured_display() {
+        let check_error =
+            LinearizationCheckError::from(crate::Error::QpdfExc(crate::QpdfExc::new(
+                crate::QpdfErrorCode::DamagedPdf,
+                b"input.pdf",
+                b"trailer",
+                7,
+                b"broken trailer",
+            )));
+
+        assert!(matches!(
+            &check_error,
+            LinearizationCheckError::QpdfExc(error)
+                if error.get_filename() == b"input.pdf"
+                    && error.get_object() == b"trailer"
+                    && error.get_file_position() == 7
+                    && error.get_message_detail() == b"broken trailer"
+        ));
+        assert_eq!(
+            check_error.to_string(),
+            "input.pdf (trailer, offset 7): broken trailer"
+        );
+    }
+
+    #[test]
     fn length_next_n_rejects_object_number_wrap() {
         let mut pdf = Pdf::empty().expect("empty PDF");
         let mut warnings = Vec::new();
