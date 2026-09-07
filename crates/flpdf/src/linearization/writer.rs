@@ -1024,6 +1024,8 @@ struct FirstPageXrefPatch {
     max_ostream_index: u64,
     /// Whether the generated xref stream uses predictor + Flate filtering.
     filtered: bool,
+    /// Object number reserved for qpdf's primary hint stream.
+    hint_id: u32,
 }
 
 /// Return the live trailer entries that the linearization xref dictionary may
@@ -1333,6 +1335,7 @@ fn write_first_page_xref_stream(
     info_new_ref: Option<ObjectRef>,
     source_trailer: &ObjectHandle,
     canonical_entries: &[(Vec<u8>, Vec<u8>)],
+    hint_id: u32,
     max_ostream_index: u64,
     filtered: bool,
     encrypt: Option<ObjectRef>,
@@ -1409,6 +1412,7 @@ fn write_first_page_xref_stream(
         max_id,
         max_ostream_index,
         filtered,
+        hint_id,
     })
 }
 
@@ -1454,23 +1458,22 @@ fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u
 fn patch_first_page_xref(
     bytes: &mut [u8],
     patch: &FirstPageXrefPatch,
-    xref_offsets: &BTreeMap<u32, usize>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
     main_xref_offset: usize,
     hint_length: usize,
     pass1: bool,
 ) -> Result<Option<std::ops::Range<usize>>> {
     // The first-page xref object's own offset is the region start.
-    let mut offs = xref_offsets.clone();
-    offs.insert(patch.first_xref_num, patch.region.start);
+    xref_offsets.insert(patch.first_xref_num, patch.region.start);
 
-    let (widths, payload, prev) = if pass1 {
+    let (stream_layout, prev) = if pass1 {
         // qpdf's pass-1 first-half xref: UNCOMPRESSED, the forced-wide field
         // (`1 << 25` ⇒ `/W [1 4 1]`), `/Prev 0`, and entries only for the objects
         // written BEFORE it (the param dict + the xref object itself); every
         // forward reference is a type-0 zero record, since pass 1 does not
         // back-patch.
-        let pass1_offs: BTreeMap<u32, usize> = offs
+        let mut pass1_offs: BTreeMap<u32, usize> = xref_offsets
             .iter()
             .filter(|(_, &off)| off <= patch.region.start)
             .map(|(&n, &off)| (n, off))
@@ -1478,38 +1481,80 @@ fn patch_first_page_xref(
         // Pass 1 does not back-patch forward references: every object after the
         // xref — including ObjStm members — is a type-0 zero record, so the
         // member map is empty here (members are not yet "resolved" in pass 1).
-        let entries = xref_stream::build_entries(
-            &pass1_offs,
+        let stream_layout = xref_stream::prepare_xref_stream(
+            &mut pass1_offs,
             &BTreeMap::new(),
             patch.index_start,
             patch.index_count,
-        );
-        let widths = xref_stream::first_pass_widths(patch.max_id, patch.max_ostream_index, 0);
-        let payload = if patch.filtered {
-            xref_stream::encode_payload_uncompressed(&entries, widths)?
-        } else {
-            xref_stream::encode_payload_raw(&entries, widths)?
-        };
-        (widths, payload, 0u64)
-    } else {
-        let entries =
-            xref_stream::build_entries(&offs, member_new, patch.index_start, patch.index_count);
-        let widths = xref_stream::second_pass_widths(
-            xref_stream::max_entry_offset(&entries),
-            hint_length as u64,
+            patch.first_xref_num,
+            patch.region.start,
+            0,
             patch.max_id,
             patch.max_ostream_index,
+            0,
+            None,
+            patch.filtered,
+            true,
+            true,
+        )?; // cov:ignore: pass-1 layout errors are defensive pipeline failures.
+        (stream_layout, 0u64)
+    } else {
+        // qpdf's second pass keeps xref offsets in the pass-1 coordinate
+        // system and applies the hint length while encoding first-half rows.
+        // The linearized body map is physical, so remove the inserted hint
+        // bytes in this private view before the shared owner applies qpdf's
+        // correction. The live map itself remains physical for later callers.
+        // cov:ignore-start: the planner always reserves and records the hint stream slot.
+        let hint_offset = xref_offsets.get(&patch.hint_id).copied().ok_or_else(|| {
+            crate::Error::Unsupported(
+                "linearization first-page xref has no hint-stream offset".to_string(),
+            )
+        })? as u64;
+        // cov:ignore-end
+        let hint_length = hint_length as u64;
+        let mut virtual_offsets = xref_offsets.clone();
+        if hint_length > 0 {
+            for (&number, &offset) in xref_offsets.iter() {
+                if number != patch.hint_id && (offset as u64) >= hint_offset {
+                    virtual_offsets.insert(
+                        number,
+                        // cov:ignore-start: physical offsets at or after the hint contain its full length.
+                        offset.checked_sub(hint_length as usize).ok_or_else(|| {
+                            crate::Error::Unsupported(
+                                "linearization hint offset underflows".to_string(),
+                            )
+                        })?,
+                        // cov:ignore-end
+                    );
+                }
+            } // cov:ignore: the pass-2 map always carries a hint-backed offset.
+        } // cov:ignore: the planner always provides a nonzero pass-2 hint length.
+        let max_offset = xref_stream::max_offset_for_range(
+            &virtual_offsets,
+            patch.index_start,
+            patch.index_count,
         );
-        let payload = if patch.filtered {
-            xref_stream::encode_payload(&entries, widths)?
-        } else {
-            xref_stream::encode_payload_raw(&entries, widths)?
-        };
-        (widths, payload, main_xref_offset as u64)
+        let stream_layout = xref_stream::prepare_xref_stream(
+            &mut virtual_offsets,
+            member_new,
+            patch.index_start,
+            patch.index_count,
+            patch.first_xref_num,
+            patch.region.start,
+            max_offset,
+            patch.max_id,
+            patch.max_ostream_index,
+            hint_length,
+            Some((patch.hint_id, hint_offset, hint_length)),
+            patch.filtered,
+            false,
+            false,
+        )?; // cov:ignore: pass-2 layout errors are defensive pipeline failures.
+        (stream_layout, main_xref_offset as u64)
     };
     let dict = xref_stream::XrefStreamDict {
         filtered: patch.filtered,
-        widths,
+        widths: stream_layout.widths,
         index: Some((patch.index_start, patch.index_count)),
         info: patch.info_new_ref,
         root: Some(patch.catalog_new_ref),
@@ -1526,7 +1571,7 @@ fn patch_first_page_xref(
     let (region, region_id_range) = xref_stream::write_padded_region(
         ObjectRef::new(patch.first_xref_num, 0),
         &dict,
-        &payload,
+        &stream_layout,
         patch.region.len(),
     )?; // cov:ignore: see above — unreachable region-overflow error arm.
     if patch.region.end > bytes.len() {
@@ -1564,7 +1609,7 @@ fn patch_first_page_xref(
 #[allow(clippy::too_many_arguments)]
 fn write_main_xref_stream_and_trailer(
     bytes: &mut Vec<u8>,
-    xref_offsets: &BTreeMap<u32, usize>,
+    xref_offsets: &mut BTreeMap<u32, usize>,
     member_new: &BTreeMap<u32, (u32, u32)>,
     relocation: &ObjStmRelocation,
     total_count: u32, // /Size (placed renumber.len() + 1) — already final
@@ -1583,30 +1628,23 @@ fn write_main_xref_stream_and_trailer(
     // Second-half range: objects `[0, second_half_count)`.
     let main_count = relocation.second_half_count;
     let main_xref_offset = bytes.len();
-    let mut offs2 = xref_offsets.clone();
-    offs2.insert(first_xref_num, first_page_obj_offset);
-    offs2.insert(main_xref_num, main_xref_offset);
-
-    let entries = xref_stream::build_entries(&offs2, member_new, 0, main_count);
-    // The main xref's `writeXRefStream` is called with `hint_length = 0` in qpdf.
-    // Its `max_offset` is its own (already known) offset, so the field stays
-    // narrow in both passes; only compression differs.
-    let widths = xref_stream::second_pass_widths(
-        xref_stream::max_entry_offset(&entries),
+    xref_offsets.insert(first_xref_num, first_page_obj_offset);
+    let stream_layout = xref_stream::prepare_xref_stream(
+        xref_offsets,
+        member_new,
         0,
+        main_count,
+        main_xref_num,
+        main_xref_offset,
+        main_xref_offset as u64,
         max_id,
         max_ostream_index,
-    );
-    // With compression enabled, pass 1 writes the uncompressed PNG-predicted
-    // payload (qpdf's `skip_compression`) and the final pass Flate-compresses
-    // it. With compression disabled, both passes write raw `/W` rows.
-    let payload = if !filtered {
-        xref_stream::encode_payload_raw(&entries, widths)?
-    } else if pass1 {
-        xref_stream::encode_payload_uncompressed(&entries, widths)?
-    } else {
-        xref_stream::encode_payload(&entries, widths)?
-    };
+        0,
+        None,
+        filtered,
+        pass1,
+        false,
+    )?; // cov:ignore: xref payload setup is a validated in-memory writer boundary.
 
     // Main (second-half) xref: no `/Index`, `/Info`, `/Root`, or `/Prev` — it is
     // the chain terminal, reached only via the first-page stream's `/Prev`. Its
@@ -1615,7 +1653,7 @@ fn write_main_xref_stream_and_trailer(
     // this stream covers (qpdf's `second_trailer_size`).
     let dict = xref_stream::XrefStreamDict {
         filtered,
-        widths,
+        widths: stream_layout.widths,
         index: None,
         info: None,
         root: None,
@@ -1636,7 +1674,7 @@ fn write_main_xref_stream_and_trailer(
     let region_len = {
         let p1_dict = xref_stream::XrefStreamDict {
             filtered,
-            widths,
+            widths: stream_layout.widths,
             index: None,
             info: None,
             root: None,
@@ -1650,7 +1688,7 @@ fn write_main_xref_stream_and_trailer(
         xref_stream::first_pass_region_len(main_obj_ref, &p1_dict, main_count as usize)
     };
     let (region, region_id_range) =
-        xref_stream::write_padded_region(main_obj_ref, &dict, &payload, region_len)?;
+        xref_stream::write_padded_region(main_obj_ref, &dict, &stream_layout, region_len)?;
     let region_start = bytes.len();
     bytes.extend_from_slice(&region);
     bytes.push(b'\n');
@@ -2157,6 +2195,7 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
             &canonical_entries,
+            hint_stream_new_num,
             max_ostream_index,
             structural_streams_filtered,
             encrypt_ctx.map(|ctx| ctx.encrypt_ref),
@@ -2605,7 +2644,7 @@ fn do_write_pass<R: Read + Seek>(
 
         let result = write_main_xref_stream_and_trailer(
             &mut bytes,
-            &xref_offsets,
+            &mut xref_offsets,
             &member_new,
             relocation,
             total_count,
@@ -2640,7 +2679,7 @@ fn do_write_pass<R: Read + Seek>(
         let first_page_id_range = patch_first_page_xref(
             &mut bytes,
             patch,
-            &xref_offsets,
+            &mut xref_offsets,
             &member_new,
             main_xref_offset,
             hint_stream_obj_total_len,

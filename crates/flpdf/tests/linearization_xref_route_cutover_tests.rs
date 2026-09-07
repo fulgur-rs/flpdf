@@ -17,6 +17,13 @@ fn linearization_xref_stream_has_one_canonical_owner() {
 
     let writer_source = include_str!("../src/linearization/writer.rs");
     assert!(writer_source.contains("serialize::xref_stream"));
+    assert!(writer_source.contains("prepare_xref_stream"));
+    assert!(!writer_source.contains("encode_payload_uncompressed(&entries"));
+    assert!(!writer_source.contains("encode_payload_raw(&entries"));
+
+    let plain_source = include_str!("../src/writer/plain/xref.rs");
+    assert!(plain_source.contains("prepare_xref_stream"));
+    assert!(!plain_source.contains("field3 = u64::from(generation)"));
 
     let module_index = include_str!("../../../docs/qpdf-module-doc-index.md");
     assert!(!module_index.contains(&alias_path));
