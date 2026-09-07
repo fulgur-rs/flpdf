@@ -2675,6 +2675,21 @@ impl QPDFJob {
                         format!("{}: wrote file {}\n", self.message_prefix, output.display());
                     self.logger.info(message)?;
                 }
+                // qpdf's `writeOutfile` performs the replace-input rename
+                // itself, after the verbose message and unconditionally for
+                // every caller that reaches it (`libqpdf/QPDFJob.cc:3057-3086`),
+                // not only when driven through `run()`. `check_configuration`
+                // rejects `--replace-input` together with `--split-pages` or
+                // `--json` (`libqpdf/QPDFJob.cc:572-579`, mirrored at
+                // `Self::check_configuration`), so this branch and the
+                // `splitting`/JSON branches above are mutually exclusive.
+                if self.configuration.replace_input {
+                    // qpdf closes the input source before renaming because
+                    // POSIX/Windows both refuse to rename an open file
+                    // reliably (`libqpdf/QPDFJob.cc:3068-3069`).
+                    pdf.close_input_source();
+                    self.finish_replace_input()?;
+                }
                 self.complete(true)
             }
             Err(error) => {
@@ -2704,13 +2719,12 @@ impl QPDFJob {
         if configuration.report_memory_usage && status != JobExitCode::Error {
             self.report_memory_usage()?;
         }
-        if configuration.replace_input {
-            if status == JobExitCode::Error {
-                self.remove_replace_input_temp();
-            } else {
-                self.finish_replace_input()?;
-            }
-        }
+        // The replace-input rename is `write_qpdf`'s own responsibility now
+        // (mirroring qpdf's `writeOutfile`, `libqpdf/QPDFJob.cc:3057-3086`):
+        // every `run_document_stages` path with `replace_input` set is
+        // required by `check_configuration` to end at `write_qpdf`, so it has
+        // already run by the time `status` is available here. Do not repeat
+        // it -- the source file has already moved.
         Ok(status)
     }
 
@@ -3309,12 +3323,30 @@ impl QPDFJob {
             .map(|path| path_with_suffix(path, ".~qpdf-temp#"))
     }
 
-    fn remove_replace_input_temp(&self) {
-        if let Some(path) = self.replace_input_path() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
+    /// Complete a `--replace-input` write: rename the original input to a
+    /// backup and the temporary output over the original input path.
+    ///
+    /// This is qpdf's `writeOutfile` replace-input tail
+    /// (`libqpdf/QPDFJob.cc:3068-3086`), which keeps the backup (and logs a
+    /// message) when `pdf.anyWarnings()` is true at this point, or deletes it
+    /// otherwise. flpdf uses the job-level `self.warnings` flag here instead
+    /// of a live query against `pdf`: `self.warnings` is set from
+    /// `Pdf::repair_diagnostics()`, which only reflects *open-time*
+    /// diagnostics, whereas qpdf's `anyWarnings()` reflects the *whole*
+    /// lifecycle including any warning raised while writing. This can pick a
+    /// different backup filename (`.~qpdf-orig` vs `.~qpdf-orig#`) than qpdf
+    /// would for a document whose only warnings occurred during the write
+    /// itself (for example, from an overlay/underlay source or attachment
+    /// donor opened with warnings after the main document was already
+    /// clean). The whole-lifecycle warning drain is tracked separately
+    /// (`flpdf-3yn9.48.26`); this function is not the place to fix it.
+    ///
+    /// qpdf's `writeOutfile` performs this rename for every caller that
+    /// reaches it, with no cleanup path if writing itself fails first (the
+    /// temporary output, if partially written, is simply left behind when
+    /// the exception unwinds past `run()`). flpdf matches that: there is no
+    /// corresponding "delete the temporary file" helper for the failure
+    /// case.
     fn finish_replace_input(&self) -> Result<()> {
         let input = self.configuration.input_file.as_ref().ok_or_else(|| {
             // cov:ignore-start: successful replace-input completion has the validated input path
