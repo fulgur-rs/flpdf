@@ -1635,7 +1635,14 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(ObjectRef::new(next_number, 0))
     }
 
-    pub(crate) fn unique_id(&self) -> u64 {
+    /// This document's stable per-instance identity.
+    ///
+    /// This is qpdf's `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
+    /// `libqpdf/QPDF.cc:2294-2296`): constructed once when the document is
+    /// created and never changes for the life of this [`Pdf`]. Compare it
+    /// against [`ObjectHandle::owning_pdf_unique_id`] to test whether a
+    /// handle is still owned by this document.
+    pub fn unique_id(&self) -> u64 {
         self.unique_id
     }
 

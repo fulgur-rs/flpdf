@@ -1843,7 +1843,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// required when opening fails before a `Pdf` exists.
     pub(crate) fn disconnect_all(&self) {
         for handle in self.core.borrow().object_cache.values() {
-            handle.disconnect();
+            handle.disconnect_and_destroy();
         }
     }
 

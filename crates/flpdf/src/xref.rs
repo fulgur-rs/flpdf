@@ -169,7 +169,7 @@ impl Drop for BootstrapCache {
             }
             let handles: Vec<_> = state.borrow().handles.values().cloned().collect();
             for handle in handles {
-                handle.disconnect();
+                handle.disconnect_and_destroy();
             }
         }
     }
