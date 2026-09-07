@@ -663,7 +663,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                 // Sort by original object number: qpdf assigns first-page slots in
                 // ascending original-number order regardless of dict key alphabetical
                 // order (empirically verified; see discriminator-fixture analysis).
-                refs_raw.sort_by_key(|(r, _)| pdf.linearization_object_order_key(*r));
+                refs_raw.sort_by_key(|(r, _)| pdf.writer_object_order_key(*r));
                 for (r, va) in refs_raw {
                     if !visited.contains(&r) {
                         queue.push_back((r, va));
@@ -686,7 +686,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
             // Same number-ordering rule as the page-dict loop above: qpdf enqueues
             // a non-page object's children in ascending original-object-number order,
             // not in dict-key (alphabetical) order.
-            refs.sort_by_key(|(r, _)| pdf.linearization_object_order_key(*r));
+            refs.sort_by_key(|(r, _)| pdf.writer_object_order_key(*r));
             for (r, va) in refs {
                 if !visited.contains(&r) {
                     queue.push_back((r, va));
@@ -705,10 +705,10 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
     // Sorting only order[1..] satisfies both invariants simultaneously.
     // A multi-source page-selection target carries qpdf's source/discovery
     // order separately from its fresh references (see
-    // `Pdf::linearization_object_order_key`); ordinary documents resolve to
+    // `Pdf::writer_object_order_key`); ordinary documents resolve to
     // the same ascending original-number order as before.
     if order.len() > 1 {
-        order[1..].sort_by_key(|r| pdf.linearization_object_order_key(*r));
+        order[1..].sort_by_key(|r| pdf.writer_object_order_key(*r));
     }
     // Deferred resurrectable refs: now that the full BFS is complete and
     // seen_as_array is exhaustive, admit those that turn out to be reachable
@@ -1388,17 +1388,14 @@ impl LinearizationPlan {
         // back to their live references. This is also the order used by qpdf's
         // `std::set<QPDFObjGen>` part-6 packing after the primary/foreign
         // provenance has been accounted for.
-        part3_objects.sort_unstable_by_key(|r| pdf.linearization_object_order_key(*r));
+        part3_objects.sort_unstable_by_key(|r| pdf.writer_object_order_key(*r));
         // qpdf numbers the first-page section (qpdf part6) as: the first-page
         // object first, then the remaining first-page-private objects in
         // source/discovery order. Pin the page dict first (qpdf pushes the
         // first-page object explicitly), then apply that order key rather than
         // the fresh merge target's allocation number.
         part2_objects.sort_unstable_by_key(|r| {
-            (
-                Some(*r) != first_page_ref,
-                pdf.linearization_object_order_key(*r),
-            )
+            (Some(*r) != first_page_ref, pdf.writer_object_order_key(*r))
         });
 
         // ----------------------------------------------------------------

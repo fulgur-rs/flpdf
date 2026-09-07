@@ -683,7 +683,11 @@ impl ObjectStreamRenumber {
                     "object-stream renumber: group {gi} has no members"
                 )));
             }
-            sorted.sort_unstable_by_key(|r| (r.number, r.generation));
+            if pdf.writer_object_order.is_some() {
+                sorted.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+            } else {
+                sorted.sort_unstable_by_key(|r| (r.number, r.generation));
+            }
             for &m in &sorted {
                 if let Some(previous) = member_to_group.insert(m, gi) {
                     return Err(Error::Unsupported(format!(

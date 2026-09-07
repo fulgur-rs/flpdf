@@ -3,6 +3,7 @@
 //! groups, and applies writer reachability and output-placement policies.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek};
 use std::num::NonZeroUsize;
 
 use super::eligibility::{
@@ -361,6 +362,12 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         !length_exclusions.contains(member)
             && reachable.is_none_or(|reachable| reachable.contains(member))
     });
+    // A fresh multi-source page target has new local ObjectRefs for both the
+    // primary and foreign graphs. qpdf keeps primary objects in source-number
+    // order while copyForeignObject assigns foreign objects in discovery
+    // order; the merge records that provenance on Pdf so generated ObjStm
+    // members can use the same order without changing ordinary documents.
+    sort_compressible_for_writer_order(pdf, &mut compressible.eligible);
     let batches = even_split_into_streams_with_cap(&compressible.eligible, config.batch_size_cap);
 
     Ok(PackingPlan {
@@ -369,9 +376,23 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     })
 }
 
+fn sort_compressible_for_writer_order<R: Read + Seek + 'static>(
+    pdf: &crate::Pdf<R>,
+    eligible: &mut [ObjectRef],
+) {
+    if pdf.writer_object_order.is_some() {
+        eligible.sort_unstable_by_key(|object_ref| pdf.writer_object_order_key(*object_ref));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP};
+    use super::{
+        sort_compressible_for_writer_order, ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP,
+    };
+    use crate::pdf::WriterObjectOrderKey;
+    use crate::ObjectRef;
+    use std::collections::BTreeMap;
 
     #[test]
     fn planner_config_default_uses_qpdf_defaults() {
@@ -379,5 +400,21 @@ mod tests {
         assert_eq!(config.mode, ObjectStreamMode::Preserve);
         assert_eq!(config.batch_size_cap, DEFAULT_BATCH_SIZE_CAP);
         assert!(!config.preserve_unreferenced_objects);
+    }
+
+    #[test]
+    fn generated_merge_candidates_use_primary_then_foreign_writer_order() {
+        let mut pdf = crate::Pdf::empty().expect("create merge target");
+        let primary = ObjectRef::new(17, 0);
+        let foreign = ObjectRef::new(3, 0);
+        let mut order = BTreeMap::new();
+        order.insert(primary, WriterObjectOrderKey::primary(ObjectRef::new(4, 0)));
+        order.insert(foreign, WriterObjectOrderKey::foreign(ObjectRef::new(2, 0)));
+        pdf.set_writer_object_order(order);
+
+        let mut eligible = vec![foreign, primary];
+        sort_compressible_for_writer_order(&pdf, &mut eligible);
+
+        assert_eq!(eligible, [primary, foreign]);
     }
 }

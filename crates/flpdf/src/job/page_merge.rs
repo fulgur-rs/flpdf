@@ -41,7 +41,7 @@ use crate::object_copy::copy_foreign_object_for_preserve;
 use crate::page_extract::{append_selection_kids, null_copied_removed_pages, target_pages_root};
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
-use crate::pdf::LinearizationObjectOrderKey;
+use crate::pdf::WriterObjectOrderKey;
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::{
     AcroFormDocumentHelper, Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper,
@@ -881,8 +881,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
 
     let mut target = Pdf::empty()?;
     let pages_root_ref = target_pages_root(&mut target)?;
-    let mut linearization_object_order: BTreeMap<ObjectRef, LinearizationObjectOrderKey> =
-        BTreeMap::new();
+    let mut writer_object_order: BTreeMap<ObjectRef, WriterObjectOrderKey> = BTreeMap::new();
 
     // Output `/Kids`, accumulated across inputs in input/selection order.
     let mut kids: Vec<ObjectRef> = Vec::new();
@@ -1109,11 +1108,11 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
         // intentionally absent and use the planner's fresh-object fallback.
         for (&source_ref, &target_ref) in &map {
             let order_key = if is_primary {
-                LinearizationObjectOrderKey::primary(source_ref)
+                WriterObjectOrderKey::primary(source_ref)
             } else {
-                LinearizationObjectOrderKey::foreign(target_ref)
+                WriterObjectOrderKey::foreign(target_ref)
             };
-            linearization_object_order.insert(target_ref, order_key);
+            writer_object_order.insert(target_ref, order_key);
         }
 
         null_copied_removed_pages(&mut target, &all, &seen, &map)?;
@@ -1240,7 +1239,7 @@ pub(crate) fn merge_documents_with_resource_decisions_and_preserve_primary<R: Re
         target.page_labels().write_reconstructed_labels(&folded)?;
     }
 
-    target.set_linearization_object_order(linearization_object_order);
+    target.set_writer_object_order(writer_object_order);
 
     Ok(target)
 }
