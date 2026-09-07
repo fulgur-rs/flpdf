@@ -2464,11 +2464,14 @@ impl ObjectHandle {
         // reached, not just the active path, so a direct DAG — an array holding
         // the same child twice is enough — is walked once per node rather than
         // once per path.
-        let mut visited: std::collections::HashSet<ObjectHandleIdentity> =
-            std::collections::HashSet::new();
+        // Key on the raw allocation address rather than on a handle: the slot
+        // contains interior mutability, which clippy's `mutable_key_type`
+        // rightly rejects as a set key. Identity here is `Rc` identity, exactly
+        // what `is_same_object_as` compares, so the pointer is the whole key.
+        let mut visited: BTreeSet<*const RefCell<ObjectSlot>> = BTreeSet::new();
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
-            if !visited.insert(handle.identity_key()) {
+            if !visited.insert(Rc::as_ptr(&handle.0)) {
                 continue;
             }
             {
