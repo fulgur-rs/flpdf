@@ -153,6 +153,10 @@ impl From<RawArg> for OsString {
 pub(crate) struct ParsedArgs {
     pub(crate) residual_args: Vec<OsString>,
     pub(crate) raw_residual_args: Vec<RawArg>,
+    /// Residual argv with the original spelling retained. The canonical
+    /// projection above is for clap; qpdf keeps `o_arg` separately so usage
+    /// diagnostics can echo a single-dash spelling verbatim.
+    pub(crate) original_residual_args: Vec<RawArg>,
     pub(crate) named_segments: Vec<NamedSegment>,
     pub(crate) raw_named_segments: Vec<RawNamedSegment>,
     /// Whether the first expanded argv token is a native clap subcommand.
@@ -162,6 +166,9 @@ pub(crate) struct ParsedArgs {
     /// partitioning. qpdf checks `argc == 2` at this point for sole help
     /// options (`QPDFArgParser.cc:437,478-483`).
     pub(crate) expanded_arg_count: usize,
+    /// First unknown option in the canonical qpdf-compatible residual
+    /// grammar, together with its residual index and original spelling.
+    pub(crate) first_unknown_option: Option<(usize, RawArg)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -295,17 +302,18 @@ impl ArgParser {
         // Commands section from `flpdf --help` / `flpdf help` and break
         // `flpdf help <subcommand>`. qpdf has no such surface to preserve, so
         // this only covers flpdf's own native help, not a qpdf-flat operand.
-        let native_subcommand_mode = args.get(1).is_some_and(|arg| {
-            self.is_subcommand_token(arg)
-                || matches!(arg.as_bytes(), b"help" | b"--help" | b"-help" | b"-h")
-        });
+        let native_subcommand_mode = args
+            .get(1)
+            .is_some_and(|arg| self.is_subcommand_token(arg) || arg.as_bytes() == b"help");
         let mut iter = args.into_iter().peekable();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());
         };
-        let mut residual_args = vec![program];
+        let mut residual_args = vec![program.clone()];
+        let mut original_residual_args = vec![program];
         let mut named_segments = Vec::new();
         let mut first_add_attachment = true;
+        let mut first_unknown_option = None;
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
@@ -314,8 +322,11 @@ impl ArgParser {
                 // it only when native mode was selected up front, where it
                 // belongs to clap's subcommand grammar.
                 if native_subcommand_mode {
+                    original_residual_args.push(arg.clone());
                     residual_args.push(arg);
-                    residual_args.extend(iter);
+                    let remaining: Vec<_> = iter.collect();
+                    original_residual_args.extend(remaining.iter().cloned());
+                    residual_args.extend(remaining);
                     break;
                 }
                 // Otherwise this is qpdf's main-table section reset: consume
@@ -325,8 +336,15 @@ impl ArgParser {
                 continue;
             }
 
-            let canonical = self.canonical_top_level_option(arg);
+            let canonical = self.canonical_top_level_option(arg.clone());
             let Some(option) = option_name(canonical.as_os_str()) else {
+                record_unknown_option(
+                    &mut first_unknown_option,
+                    residual_args.len(),
+                    self.is_unrecognized_qpdf_option(&arg),
+                    arg.clone(),
+                );
+                original_residual_args.push(arg);
                 residual_args.push(canonical);
                 continue;
             };
@@ -349,6 +367,13 @@ impl ArgParser {
                 }
             }
             let Some(kind) = SegmentKind::from_option(&option) else {
+                record_unknown_option(
+                    &mut first_unknown_option,
+                    residual_args.len(),
+                    self.is_unrecognized_qpdf_option(&arg),
+                    arg.clone(),
+                );
+                original_residual_args.push(arg);
                 residual_args.push(canonical);
                 continue;
             };
@@ -378,9 +403,16 @@ impl ArgParser {
                 first_add_attachment = false;
             }
             if retain {
-                residual_args.push(RawArg::from_bytes(format!("--{option}").into_bytes()));
+                let marker = RawArg::from_bytes(format!("--{option}").into_bytes());
+                residual_args.push(marker.clone());
+                // The marker is canonical by construction so the main-table
+                // diagnostic scan still recognizes a retained segment even
+                // when the user wrote its option with one leading dash.
+                original_residual_args.push(marker);
                 residual_args.extend(segment.tokens.iter().cloned());
+                original_residual_args.extend(segment.tokens.iter().cloned());
                 residual_args.push(RawArg::from_bytes(b"--".to_vec()));
+                original_residual_args.push(RawArg::from_bytes(b"--".to_vec()));
             }
             named_segments.push(RawNamedSegment {
                 option: segment.option,
@@ -410,11 +442,46 @@ impl ArgParser {
         Ok(ParsedArgs {
             residual_args,
             raw_residual_args,
+            original_residual_args,
             named_segments,
             raw_named_segments,
             native_subcommand_mode,
             expanded_arg_count,
+            first_unknown_option,
         })
+    }
+
+    /// Return whether a residual token is an option that qpdf's main table
+    /// does not know. Keep this scan separate from canonicalization: qpdf
+    /// echoes the original token when it reports the usage failure.
+    fn is_unrecognized_qpdf_option(&self, arg: &RawArg) -> bool {
+        let bytes = arg.as_bytes();
+        if bytes.len() <= 1 || bytes[0] != b'-' || bytes == b"-" || bytes == b"--" {
+            return false;
+        }
+
+        let mut name = &bytes[1..];
+        if name.first() == Some(&b'-') {
+            name = &name[1..];
+        }
+        if name.is_empty() || name[0] == b'-' || name[0].is_ascii_digit() {
+            return false;
+        }
+        let end = name
+            .iter()
+            .position(|byte| *byte == b'=')
+            .unwrap_or(name.len());
+        let Ok(name) = std::str::from_utf8(&name[..end]) else {
+            return true;
+        };
+
+        // These are registered in qpdf's separate help option table rather
+        // than the main clap-derived option set. `-h` is intentionally left
+        // for the qpdf help gate to report with its original spelling.
+        if matches!(name, "help" | "h" | "version" | "copyright") {
+            return false;
+        }
+        !self.known_long_options.contains(name) && !self.bare_long_options.contains(name)
     }
 
     fn canonical_top_level_option(&self, arg: RawArg) -> RawArg {
@@ -484,6 +551,17 @@ impl ArgParser {
         } else {
             token
         }
+    }
+}
+
+fn record_unknown_option(
+    first_unknown_option: &mut Option<(usize, RawArg)>,
+    index: usize,
+    is_unknown: bool,
+    arg: RawArg,
+) {
+    if is_unknown && first_unknown_option.is_none() {
+        *first_unknown_option = Some((index, arg));
     }
 }
 
@@ -1051,6 +1129,28 @@ mod tests {
             .expect("raw argv should remain a residual positional");
 
         assert_eq!(parsed.residual_args[1], input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_records_a_non_utf8_unknown_option_with_its_raw_spelling() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let input = OsString::from_vec(b"--unknown-\xff".to_vec());
+        let parsed = ArgParser::from_command(clap::Command::new("flpdf"))
+            .parse_os(vec![OsString::from("flpdf"), input.clone()])
+            .expect("unknown raw option should remain available to the usage boundary");
+
+        let (index, argument) = parsed
+            .first_unknown_option
+            .as_ref()
+            .expect("non-UTF-8 option should be recorded as unknown");
+        assert_eq!(*index, 1);
+        assert_eq!(argument.as_bytes(), input.as_bytes());
+        assert_eq!(
+            parsed.original_residual_args[1].as_bytes(),
+            input.as_bytes()
+        );
     }
 
     #[cfg(unix)]
