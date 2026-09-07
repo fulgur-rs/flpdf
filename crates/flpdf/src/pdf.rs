@@ -653,12 +653,7 @@ mod tests {
                 String::from_utf8_lossy(entry.what_bytes())
                     .contains("requested value of integer is too big; returning INT_MAX")
             }),
-            "clamping must carry qpdf's warning: {:?}",
-            pdf.repair_diagnostics()
-                .entries()
-                .iter()
-                .map(|entry| String::from_utf8_lossy(entry.what_bytes()).into_owned())
-                .collect::<Vec<_>>()
+            "clamping must carry qpdf's warning"
         );
     }
 
