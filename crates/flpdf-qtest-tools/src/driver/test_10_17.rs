@@ -709,7 +709,16 @@ mod tests {
         linearization::show_linearization_bytes, DecodeLevel, PageDocumentHelper, Pdf,
         PdfOpenOptions, Pipeline,
     };
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+
+    struct CurrentDirGuard(PathBuf);
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore current directory");
+        }
+    }
 
     #[test]
     fn captured_pipeline_implements_the_qpdf_sink_lifecycle() {
@@ -981,20 +990,23 @@ mod tests {
     /// existing canonical `/Contents`, leaving the new page's real content,
     /// parent, and the page-tree's incremented count unreachable through the
     /// canonical keys every other accessor (and `QPDFWriter`) reads.
-    /// Serializes tests that change the process-wide current directory so
-    /// `run_test_16`'s hardcoded relative `"a.pdf"` write (matching qpdf's
-    /// own `QPDFWriter w(pdf, "a.pdf")`, `test_driver.cc:769`) lands in an
-    /// isolated scratch directory instead of the crate's working tree.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn manual_page_insert_replaces_contents_parent_and_count_on_the_canonical_keys() {
-        let _cwd_guard = CWD_LOCK
+        // `run_test_16` writes the hardcoded relative `"a.pdf"` (matching
+        // qpdf's own `QPDFWriter w(pdf, "a.pdf")`, `test_driver.cc:769`), so
+        // this isolates that write in a scratch directory and serializes
+        // against every other test in this crate that also changes the
+        // process-wide current directory, using the same shared lock and
+        // restore-on-drop guard those tests use (`driver::CURRENT_DIR_LOCK`,
+        // `test_42_49.rs`'s `CurrentDirGuard`).
+        let _lock = super::super::CURRENT_DIR_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let scratch_dir = tempfile::tempdir().expect("scratch directory for a.pdf");
-        let original_dir = std::env::current_dir().expect("current directory");
+        let previous = std::env::current_dir().expect("current directory");
         std::env::set_current_dir(scratch_dir.path()).expect("enter scratch directory");
+        let _restore = CurrentDirGuard(previous);
         // `set_current_dir`'s argument may contain a symlink component (e.g.
         // a `/tmp` mount alias on some CI runners); ask the OS for the
         // directory it actually entered instead of trusting `scratch_dir`'s
@@ -1007,16 +1019,15 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
-        let result = run_test_16(
+        run_test_16(
             &mut pdf,
             b"fixture.pdf",
             None,
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
-        );
-        std::env::set_current_dir(&original_dir).expect("restore working directory");
-        result.expect("run_test_16 must succeed against a well-formed 10-page fixture");
+        )
+        .expect("run_test_16 must succeed against a well-formed 10-page fixture");
         assert!(entered_dir.join("a.pdf").is_file());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
