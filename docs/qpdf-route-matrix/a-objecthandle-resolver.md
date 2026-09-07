@@ -230,6 +230,24 @@ CLI（`flpdf-cli/src/main.rs:7146`）・qtest metadata
 （`flpdf-qtest-tools/src/metadata.rs:261,286`）はE27の対象consumerのため
 引き続き未移行（`.25`/`.37`/`.44` が追跡）。
 
+2026-09-08（`flpdf-3yn9.48.31`、Job/CLI JSON section cohort）: qpdfの
+`QPDFJob::doJSONPages`/`doJSONEncrypt`（`QPDFJob.cc:1030-1093,1206-1279`）に
+対応する `crates/flpdf/src/job/json_sections.rs` の production 区画を
+`ObjectHandle` resolving accessorへ切り替えた。`collect_content_refs` と
+`image_to_json` は `try_dereference`/`try_as_*` を直接使い、encrypt dictionary
+projection は `try_as_dictionary`/`try_as_integer`/`try_as_name` と
+`effective_length_bits` の canonical resolverへ委譲する。旧 production 区画を
+`rg -n '\.resolve(?:_handle|_handle_ref)?\s*\('` と
+`rg -n '\.(as_dictionary|as_array|as_integer|as_name|get_key|has_key|is_null)\s*\('`
+（最初の `#[cfg(test)]` 行 1226 より前）で再計測した結果、bridge/accessor
+caller はそれぞれ **0 / 0**（変更前は 15 / 16）。streamの辞書viewだけは
+qpdfの `getDict`（`QPDFObjectHandle.cc:1257-1262`）に相当する
+`try_dereference` 後の `as_stream_dict` として残る。失敗は `Result` のまま
+伝播し、qpdfのsection order・helper ownership・JSON出力は変更しない。
+残る Job/CLI の他consumer（`job/acroform_field_prune.rs`、`attachments.rs`、
+`page_merge.rs`、`rotate.rs`、`page_split.rs`、`json_sections.rs`外のJSON/CLI
+caller等）は次の限定sliceで再計測する。
+
 ## unknown / probe
 
 本領域は 24 行すべてを source と実行済み probe で分類できたため、`unknown` に落ちた行は無い。
