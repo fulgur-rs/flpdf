@@ -602,6 +602,44 @@ fn json_job_run_applies_relative_rotation_to_a_real_page() {
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
 }
 
+/// qpdf leaves `createQPDF` before any stage when the job only reports
+/// encryption status: the `check_is_encrypted || check_requires_password`
+/// early return (`libqpdf/QPDFJob.cc:455-456`) sits ahead of `updateFromJSON`
+/// (`:462`) and `handleRotations` (`:470`). Configure both a rotation and an
+/// update file that does not exist: without the guard the update would fail
+/// the call outright, and a document meant only for inspection would come
+/// back rotated.
+#[test]
+fn create_qpdf_skips_the_stages_for_an_encryption_status_job() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "inputFile": fixture,
+        "jsonInput": "",
+        "isEncrypted": "",
+        "updateFromJson": tempdir.path().join("missing-update.json"),
+        "rotate": "+90"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .expect("a status-only job must not fail on the unread update file")
+        .expect("createQPDF should still return the document");
+
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert_eq!(
+        page.try_get_key(b"/Rotate").unwrap().as_integer(),
+        None,
+        "an encryption-status job must not rotate the document it only inspects"
+    );
+}
+
 #[test]
 fn create_qpdf_returns_the_primary_after_rotation_transformation() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
