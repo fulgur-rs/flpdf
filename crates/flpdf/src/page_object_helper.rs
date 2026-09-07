@@ -442,7 +442,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// PageObjectHelper targets.
     fn resolved_attribute_target(&mut self) -> Result<(ObjectHandle, bool)> {
         let description = self.target_description();
-        resolve_attribute_target(self.pdf, self.object.clone(), &description)
+        resolve_attribute_target(self.object.clone(), &description)
     }
 
     /// Return the live canonical handle for this page after validating its
@@ -1917,7 +1917,7 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     description: &str,
     min_size: usize,
 ) -> Result<()> {
-    let (target, is_form) = resolve_attribute_target(pdf, object, description)?;
+    let (target, is_form) = resolve_attribute_target(object, description)?;
     let resources =
         get_attribute_for_target(pdf, target.clone(), b"/Resources", true, description)?;
 
@@ -2196,12 +2196,14 @@ fn matrix_from_handle<R: Read + Seek>(
     Ok(Some(Matrix::from(values)))
 }
 
-fn resolve_attribute_target<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn resolve_attribute_target(
     object: ObjectHandle,
     description: &str,
 ) -> Result<(ObjectHandle, bool)> {
-    pdf.resolve(&object)?;
+    // `is_form_xobject` already dereferences `object` on its way to reading
+    // its type code, so `object` is resolved by the time it reaches the
+    // non-resolving `as_dictionary`/`has_key` checks below regardless of
+    // which branch is taken.
     if object.is_form_xobject()? {
         return Ok((object, true));
     }
@@ -2212,8 +2214,7 @@ fn resolve_attribute_target<R: Read + Seek>(
     }
 
     let page_type = object.try_get_key(b"/Type")?;
-    pdf.resolve(&page_type)?;
-    match page_type.as_name() {
+    match page_type.try_as_name()? {
         Some(name) if name.as_slice() == b"Page" => Ok((object, false)),
         Some(name) => Err(Error::Unsupported(format!(
             "object {description} has /Type /{}, expected /Page",
@@ -2235,7 +2236,7 @@ fn get_attribute_for_target<R: Read + Seek>(
     copy_if_shared: bool,
     description: &str,
 ) -> Result<ObjectHandle> {
-    let (object, is_form) = resolve_attribute_target(pdf, object, description)?;
+    let (object, is_form) = resolve_attribute_target(object, description)?;
     let dict = if is_form {
         // cov:ignore-start: resolve_attribute_target classifies a Form only
         // after is_form_xobject confirms that its stream dictionary exists.
@@ -2247,10 +2248,10 @@ fn get_attribute_for_target<R: Read + Seek>(
         object.clone()
     };
     let inheritable = !is_form && is_inheritable_page_attribute(key);
-    let mut result = pdf.resolve_handle(&dict.try_get_key(key)?)?;
+    let mut result = dict.try_get_key(key)?;
     let mut inherited = false;
 
-    if result.is_null() && inheritable {
+    if result.try_is_null()? && inheritable {
         // qpdf's own loop (`QPDFPageObjectHelper.cc:236-247`) checks the
         // leaf's key once before the loop, then its `while (seen.add(node)
         // && node.hasKey("/Parent")) { node = node.getKey("/Parent"); result
@@ -2333,8 +2334,7 @@ pub(crate) fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
         }
 
         let parent = current.try_get_key(b"/Parent")?;
-        parent.try_dereference()?;
-        if parent.as_dictionary().is_none() {
+        if parent.try_as_dictionary()?.is_none() {
             return Ok(0);
         }
         current = parent;
