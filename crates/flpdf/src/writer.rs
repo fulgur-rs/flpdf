@@ -6829,8 +6829,15 @@ mod final_handle_writer_tests {
         let map = |object_ref| Ok(object_ref);
         let removed = BTreeSet::new();
         let mut output = Vec::new();
-        root.write_root_object_with_ref_map_and_removed(&mut output, &map, &removed, "1.7", 8)
-            .expect("root output succeeds");
+        root.write_root_object_with_ref_map_and_removed(
+            &mut output,
+            &map,
+            &removed,
+            "1.7",
+            8,
+            true,
+        )
+        .expect("root output succeeds");
         assert_eq!(
             extensions
                 .try_get_key(b"/ADBE")
@@ -6843,8 +6850,15 @@ mod final_handle_writer_tests {
         );
 
         output.clear();
-        root.write_root_object_with_ref_map_and_removed(&mut output, &map, &removed, "1.7", 0)
-            .expect("root output succeeds");
+        root.write_root_object_with_ref_map_and_removed(
+            &mut output,
+            &map,
+            &removed,
+            "1.7",
+            0,
+            true,
+        )
+        .expect("root output succeeds");
         assert!(extensions.try_get_key(b"/ADBE").unwrap().is_null());
         assert_eq!(
             extensions
@@ -6874,6 +6888,7 @@ mod final_handle_writer_tests {
             &BTreeSet::new(),
             "1.7",
             8,
+            true,
         );
         assert!(result.is_err());
         assert_eq!(
@@ -6903,8 +6918,15 @@ mod final_handle_writer_tests {
         let mut output = Vec::new();
         let map = |object_ref| Ok(object_ref);
         let removed = BTreeSet::new();
-        root.write_root_object_with_ref_map_and_removed(&mut output, &map, &removed, "1.7", 8)
-            .expect("root output succeeds");
+        root.write_root_object_with_ref_map_and_removed(
+            &mut output,
+            &map,
+            &removed,
+            "1.7",
+            8,
+            true,
+        )
+        .expect("root output succeeds");
 
         assert!(output
             .windows(b"/ADBE".len())

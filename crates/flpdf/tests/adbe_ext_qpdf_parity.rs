@@ -277,6 +277,58 @@ fn suppressed_preserve_restores_output_only_adbe_on_live_catalog() {
     suppressed_mode_restores_output_only_adbe_on_live_catalog(flpdf::ObjectStreamMode::Preserve);
 }
 
+#[test]
+fn direct_root_adbe_survives_forced_version_in_plain_disable_output() {
+    for force_version in ["1.4", "1.7", "2.0"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/direct-root-adbe.pdf");
+        let file = std::fs::File::open(&path).expect("open direct-root Extensions fixture");
+        let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("open fixture");
+        let settings = WriterTestSettings {
+            object_streams: flpdf::ObjectStreamMode::Disable,
+            force_version: Some(force_version.to_owned()),
+            static_id: true,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterTestSettings::default()
+        };
+
+        let mut output = Vec::new();
+        write_with_settings(&mut pdf, &mut output, &settings).expect("rewrite succeeds");
+
+        let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("reopen rewritten PDF");
+        let extensions = rewritten
+            .root_handle()
+            .expect("rewritten PDF has a Catalog")
+            .try_get_key(b"/Extensions")
+            .expect("read rewritten /Extensions");
+        assert!(
+            extensions
+                .try_is_dictionary()
+                .expect("inspect rewritten /Extensions"),
+            "force {force_version}: rewritten Catalog keeps /Extensions"
+        );
+        let adbe = extensions
+            .try_get_key(b"/ADBE")
+            .expect("read rewritten /ADBE");
+        assert!(
+            adbe.try_is_dictionary().expect("inspect rewritten /ADBE"),
+            "force {force_version}: rewritten /Extensions keeps /ADBE"
+        );
+        assert_eq!(
+            adbe.try_get_key(b"/BaseVersion")
+                .expect("read rewritten ADBE version")
+                .as_name(),
+            Some(b"1.7".to_vec())
+        );
+        assert_eq!(
+            adbe.try_get_key(b"/ExtensionLevel")
+                .expect("read rewritten ADBE level")
+                .as_integer(),
+            Some(8)
+        );
+    }
+}
+
 mod common;
 #[allow(unused_imports)]
 use common::{
