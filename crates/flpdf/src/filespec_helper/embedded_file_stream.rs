@@ -1,7 +1,6 @@
 //! qpdf correspondence: QPDFEFStreamObjectHelper.cc.
 
 use super::shared::{ensure_indirect_handle_belongs_to_pdf, qpdf_style_open_error};
-use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::object_handle::{canonical_dictionary_key, StreamDataProvider};
 use crate::pdf_string::utf8_value;
 use crate::pipeline::count::Count;
@@ -236,15 +235,27 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         self.resolved_key(&params, key)
     }
 
-    /// Decode and return the payload bytes.
+    /// Decode and return the payload bytes through the canonical qpdf stream
+    /// pipeline.
     ///
-    /// Applies the stream's full filter chain (e.g. `/FlateDecode`) via
-    /// [`crate::filters::decode_stream_data`].
+    /// This is `QPDFObjectHandle::getStreamData`
+    /// (`libqpdf/QPDFObjectHandle.cc:1289-1292`) over
+    /// `QPDF_Stream::getStreamData` (`libqpdf/QPDF_Stream.cc:344-360`),
+    /// applied to the `/EmbeddedFile` stream at the `qpdf_dl_all` decode
+    /// level, matching `QPDFJob::doShowAttachment`
+    /// (`libqpdf/QPDFJob.cc:914-926`). Because this goes through
+    /// [`ObjectHandle::pipe_stream_data`](crate::ObjectHandle::pipe_stream_data)
+    /// rather than decoding the `/Filter` chain directly, it also applies any
+    /// registered token filters and reads provider-backed or replaced
+    /// payloads the same way as every other stream data consumer.
     ///
     /// # Errors
     ///
-    /// Propagates any error from the filter decoder (unsupported filter,
-    /// corrupt data, etc.).
+    /// Returns [`Error::Unsupported`] when the resolved handle is not a
+    /// stream. Returns [`Error::QpdfExc`] with
+    /// [`QpdfErrorCode::Unsupported`](crate::QpdfErrorCode::Unsupported)
+    /// when the stream itself has no usable filter branch or filtering
+    /// fails, matching qpdf's `getStreamData` throw contract.
     ///
     /// # Examples
     ///
@@ -255,22 +266,18 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
     /// # let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     /// if let Some(mut ef) = fs.embedded_file()? {
-    ///     let data: Vec<u8> = ef.payload()?;
+    ///     let data = ef.payload()?;
     ///     assert!(!data.is_empty());
     /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn payload(&self) -> Result<Vec<u8>> {
-        let Some((stream, stream_dict, _)) = self.resolved_stream()? else {
+    pub fn payload(&self) -> Result<Rc<Vec<u8>>> {
+        let Some((stream, _, _)) = self.resolved_stream()? else {
             return Err(Error::Unsupported(
                 "expected an /EmbeddedFile stream object".to_string(),
             ));
         };
-        // The dictionary describes the encoded stream, while raw data goes
-        // through the stream primitive so it works for both parsed original
-        // source bytes and replacement buffers.
-        let data = stream.get_raw_stream_data()?;
-        decode_stream_data_from_handle(&stream_dict, data.as_ref(), DecodeLimits::default())
+        stream.get_stream_data(DecodeLevel::All)
     }
 
     /// Pipe the decoded payload through the canonical qpdf stream pipeline.

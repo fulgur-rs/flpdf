@@ -709,7 +709,7 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
             String::from_utf8_lossy(key),
         ))
     })?;
-    ef.payload()
+    Ok((*ef.payload()?).clone())
 }
 
 /// Write the decoded payload of attachment `key` to `out`.
