@@ -4258,19 +4258,29 @@ fn parse_xref_stream_with_canonical_owner(
         match owner.read_xref_stream_at_offset(xref_pos as u64, Some(b"xref stream".to_vec())) {
             Ok(read) => read,
             Err(error) => {
+                // Only this context's own diagnostics reach the sink. Anything
+                // the owner recorded is already on the document — it logs and
+                // records in one step — and `engine.rs` installs this sink onto
+                // that same document, so forwarding them here would deliver one
+                // repair twice (qpdf reconstructs, and warns, once per
+                // document: `libqpdf/QPDF.cc:518-522`).
                 let mut diagnostics = Diagnostics::default();
                 context.append_diagnostics_to(&mut diagnostics);
                 if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                    // cov:ignore-start: the canonical context records no
+                    // diagnostics of its own on this read-failure path, so the
+                    // loop body has no input; the branch itself is exercised.
                     for diagnostic in diagnostics.entries() {
                         sink.push(diagnostic.clone());
                     }
-                } // cov:ignore: LLVM maps the covered canonical read-error sink branch to its closing brace
-                  // `QPDF::read_xrefStream` catches the QPDFExc raised by
-                  // `readObjectAtOffset` and then reports its own
-                  // `damagedPDF(xref_offset, "xref not found")` below
-                  // (`QPDF.cc:956-969`). Header/body parse failures are the Rust
-                  // equivalent of that caught QPDFExc; transport and warning-sink
-                  // failures must retain their original error class.
+                    // cov:ignore-end
+                }
+                // `QPDF::read_xrefStream` catches the QPDFExc raised by
+                // `readObjectAtOffset` and then reports its own
+                // `damagedPDF(xref_offset, "xref not found")` below
+                // (`QPDF.cc:956-969`). Header/body parse failures are the Rust
+                // equivalent of that caught QPDFExc; transport and warning-sink
+                // failures must retain their original error class.
                 return Err(match error {
                     Error::Parse { .. } => Error::parse(xref_pos, "xref not found"),
                     other => other,
