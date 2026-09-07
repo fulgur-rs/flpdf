@@ -6312,6 +6312,78 @@ impl ObjectHandle {
         Ok(decode_level)
     }
 
+    /// Return qpdf's extended stream JSON representation.
+    ///
+    /// This is `QPDFObjectHandle::getStreamJSON` and
+    /// `QPDF_Stream::getStreamJSON` (`include/qpdf/QPDFObjectHandle.hh:1235`,
+    /// `libqpdf/QPDF_Stream.cc:96-107`). `None` returns only the stream
+    /// dictionary, `File` writes payload bytes to the supplied pipeline, and
+    /// `Inline` attaches a lazy JSON blob that retains this stream handle until
+    /// the returned JSON value is serialized. The owning [`crate::Pdf`] must
+    /// remain alive until that serialization, matching qpdf's source-lifetime
+    /// contract for `StreamBlobProvider`.
+    pub fn get_stream_json(
+        &self,
+        json_version: i32,
+        json_data: QpdfStreamJsonData,
+        decode_level: DecodeLevel,
+        pipeline: Option<&mut dyn Pipeline>,
+        data_filename: impl AsRef<[u8]>,
+    ) -> std::result::Result<Json, ObjectJsonError> {
+        let data_filename = data_filename.as_ref();
+        let no_data_key = matches!(json_data, QpdfStreamJsonData::Inline);
+        let mut output = Buffer::new("stream JSON", None);
+        let effective_decode_level = self.write_stream_json(
+            json_version,
+            &mut output,
+            json_data,
+            decode_level,
+            pipeline,
+            data_filename,
+            no_data_key,
+            0,
+        )?; // cov:ignore: the validated canonical writer call has no independent LLVM terminator counter
+        output.finish().map_err(ObjectJsonError::Pipeline)?;
+        let bytes = output.take_buffer().map_err(ObjectJsonError::Pipeline)?;
+        let result =
+            Json::parse(&bytes).map_err(|error| ObjectJsonError::Json(error.to_string()))?;
+        if matches!(json_data, QpdfStreamJsonData::Inline) {
+            let stream = self.clone();
+            let blob = Json::make_blob(move |sink| {
+                let mut filtering_attempted = false;
+                let succeeded = stream
+                    .pipe_stream_data(
+                        sink,
+                        &mut filtering_attempted,
+                        0,
+                        effective_decode_level,
+                        false,
+                        false,
+                    )
+                    // qpdf's StreamBlobProvider forwards whatever
+                    // `pipeStreamData` throws without catching it
+                    // (`QPDF_Stream.cc:104-107`), so a `logic_error` must stay
+                    // a logic error. `Error::Internal` is this crate's
+                    // `std::logic_error`, so map it back to the logic category
+                    // instead of flattening every failure to runtime.
+                    .map_err(|error| match error {
+                        crate::Error::Internal(message) => PipelineError::logic(message),
+                        other => PipelineError::runtime(other.to_string()),
+                    })?;
+                if succeeded {
+                    Ok(())
+                } else {
+                    Err(PipelineError::runtime("error getting decoded stream data"))
+                    // cov:ignore: retry-failure provider test exercises this branch
+                }
+            });
+            result
+                .add_dictionary_member(b"data", blob)
+                .map_err(|error| ObjectJsonError::Json(error.to_string()))?;
+        }
+        Ok(result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pipe_stream_data_inner(
         &self,
@@ -7216,7 +7288,7 @@ fn reserved_clone_error() -> Error {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QpdfStreamJsonData {
+pub enum QpdfStreamJsonData {
     /// qpdf's `qpdf_sj_none`: emit only the stream dictionary.
     None,
     /// qpdf's `qpdf_sj_inline`: emit payload as a base64 JSON string unless
@@ -7234,7 +7306,7 @@ pub(crate) enum QpdfStreamJsonData {
 /// those failures so get_json and document JSON can preserve their existing
 /// conversion/error classifications.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ObjectJsonError {
+pub enum ObjectJsonError {
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
     #[error("non-finite float cannot be serialized as JSON")]

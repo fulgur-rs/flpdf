@@ -364,16 +364,16 @@ qtest parity harness 専用であることを注記する。
 
 | # | qpdf responsibility owner | qpdf evidence | flpdf current entrypoint | callers (prod / test) | classification | canonical owner | remaining bridge callers / notes |
 |---|---|---|---|---|---|---|---|
-| C44 | `QPDFObjectHandle::getStreamJSON` / `QPDF_Stream::getStreamJSON` の inline blob 供給（`StreamBlobProvider`） | `include/qpdf/QPDFObjectHandle.hh:1235-1240`, `libqpdf/QPDFObjectHandle.cc:1649-1657`, `libqpdf/QPDF_Stream.cc:96-107,186-204` | 対応 entrypoint 無し（public `getStreamJSON` 未実装） | prod: 0 / test: 0（未実装 API のため。C24 の caller は含めない） | mixed | Rust 側 canonical owner 未実装 | API 欠落を追跡する行。従来は別責務の `write_stream_json` をこの API の代替として混同していた。C24 の `write_stream_json` は canonical であり、二重 pipe へ修正する対象ではない。欠落 `getStreamJSON` / deferred `StreamBlobProvider` は別 primitive として移植する |
+| C44 | `QPDFObjectHandle::getStreamJSON` / `QPDF_Stream::getStreamJSON` の inline blob 供給（`StreamBlobProvider`） | `include/qpdf/QPDFObjectHandle.hh:1235-1240`, `libqpdf/QPDFObjectHandle.cc:1649-1657`, `libqpdf/QPDF_Stream.cc:96-107,186-204` | `crates/flpdf/src/object_handle.rs::ObjectHandle::get_stream_json`（`pub`） → canonical `write_stream_json` + lazy `Json::make_blob` | prod: 0 / test: `crates/flpdf/tests/stream_json_get_tests.rs`（none/inline/file/lifetime） | mixed | `ObjectHandle::get_stream_json` | C24 の `write_stream_json` は canonical であり二重 pipe へ変更しない。public facade は qpdf と同じ effective decode level で inline blob を遅延 pipe し、owner の `Pdf` が blob serialization まで存続する契約を持つ |
 
-C44 は未実装の public 責務を追跡する行として保持する（2026-09-06 再監査）。
+C44 は public facade と deferred blob provider の責務を追跡する行として保持する。
 `write_stream_json` の責務は C24 の `QPDF_Stream::writeStreamJSON` であり、qpdf 自身も
 `libqpdf/QPDF_Stream.cc:243-295` で payload を buffer 化して inline base64 を書く。
-これは `getStreamJSON` の不完全な実装ではない。独立した public API
+これは `writeStreamJSON` の代替ではない。独立した public API
 `QPDFObjectHandle::getStreamJSON`（`include/qpdf/QPDFObjectHandle.hh:1235-1240`,
 `libqpdf/QPDFObjectHandle.cc:1649-1657`）と `StreamBlobProvider`
-（`libqpdf/QPDF_Stream.cc:96-107,186-204`）には現在 Rust 側の対応 entrypoint が無い。
-この欠落は別の primitive 移植対象であり、既存 `write_stream_json` を二重 pipe 化してはならない。
+（`libqpdf/QPDF_Stream.cc:96-107,186-204`）を Rust の `get_stream_json` と
+`Json::make_blob` で分担する。既存 `write_stream_json` を二重 pipe 化してはならない。
 
 ### 2026-09-06 consumer 再監査
 
@@ -458,7 +458,7 @@ U3 は「分類は決まっているが、残る実装差と出力への影響�
 `unknown` 行にはせず、対応する mixed 行（C22）から参照している。U4 は C17/C18 の
 shared primitive 統合と oracle vector 検証が完了しているため、未完了 probe としては扱わない。
 旧 U2 は `writeStreamJSON` と未実装 `getStreamJSON` の責務を取り違えていたため除外した。
-C44 はその API 欠落を追跡し、既存 C24 の不一致とは扱わない。
+C44 はその API を追跡する枠で、既存 C24 の不一致とは扱わない。`.48.47` で public `get_stream_json` と deferred blob が実装され API 欠落は解消したため、C-U2 に残るのは provider 回数と lifetime の harness probe のみである。
 
 `bridge` の判定基準は README §3 の通り **経路（route）に qpdf 対応物が無いこと** で、
 責務（responsibility）に qpdf 対応物があるかどうかとは別に問う。本領域の 2 行はこの区別で読む:
