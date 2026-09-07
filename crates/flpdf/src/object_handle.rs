@@ -6662,14 +6662,18 @@ impl ObjectHandle {
         Ok(success)
     }
 
-    /// Report a warning raised by `QPDF_Stream::pipeStreamData` with the
-    /// stream-data location, not the generic object-warning description.
+    /// Report a warning raised by `QPDF_Stream` itself (filter-plan
+    /// validation, `pipeStreamData`) with the stream-data location, not the
+    /// generic object-warning description.
     ///
-    /// qpdf's `QPDF_Stream::warn` (`libqpdf/QPDF_Stream.cc:695-698`) routes
-    /// these messages through `QPDF::warn(..., parsed_offset, ...)`, so a
-    /// parsed stream warning is rendered as `file (offset N): message` and
-    /// retains that offset in the document warning collection. Programmatic
-    /// streams have no parsed offset; they retain the ordinary
+    /// qpdf's `QPDF_Stream::warn` (`libqpdf/QPDF_Stream.cc:695-698`) is the
+    /// single private helper every in-class warning shares — `filterable`'s
+    /// malformed `/Filter`/`/DecodeParms` warnings (`QPDF_Stream.cc:413,459`)
+    /// as well as `pipeStreamData`'s codec and content-normalization
+    /// warnings — and routes them through `QPDF::warn(..., parsed_offset,
+    /// ...)`, so a parsed stream warning is rendered as `file (offset N):
+    /// message` and retains that offset in the document warning collection.
+    /// Programmatic streams have no parsed offset; they retain the ordinary
     /// `QPDFObjectHandle::objectWarning` fallback.
     fn stream_data_warning(&self, message: &str) -> Result<()> {
         let offset = self.get_parsed_offset();
@@ -6714,12 +6718,12 @@ impl ObjectHandle {
                 }
             }
             if malformed {
-                self.object_warning(FILTER_TYPE_ERROR)?;
+                self.stream_data_warning(FILTER_TYPE_ERROR)?;
                 return Ok(None);
             }
             names
         } else {
-            self.object_warning(FILTER_TYPE_ERROR)?;
+            self.stream_data_warning(FILTER_TYPE_ERROR)?;
             return Ok(None);
         };
 
@@ -6752,7 +6756,7 @@ impl ObjectHandle {
                 vec![ObjectHandle::null(); filter_names.len()]
             } else {
                 if count != filter_names.len() {
-                    self.object_warning(DECODE_PARMS_LENGTH_ERROR)?;
+                    self.stream_data_warning(DECODE_PARMS_LENGTH_ERROR)?;
                     return Ok(None);
                 }
                 let mut handles = Vec::with_capacity(count);
@@ -14545,7 +14549,7 @@ mod mutation_tests {
         assert_eq!(sink.take_buffer().unwrap(), raw);
         assert_eq!(
             resolver.warnings.borrow().as_slice(),
-            &["object 20 0: stream /DecodeParms length is inconsistent with filters"]
+            &["offset 9: stream /DecodeParms length is inconsistent with filters"]
         );
     }
 
@@ -14982,7 +14986,7 @@ mod mutation_tests {
         assert_eq!(sink.take_buffer().unwrap(), raw);
         assert_eq!(
             resolver.warnings.borrow().as_slice(),
-            &["object 20 0: stream filter type is not name or array"]
+            &["offset 9: stream filter type is not name or array"]
         );
     }
 
@@ -15033,7 +15037,7 @@ mod mutation_tests {
         assert_eq!(sink.take_buffer().unwrap(), raw);
         assert_eq!(
             resolver.warnings.borrow().as_slice(),
-            &["object 20 0: stream filter type is not name or array"]
+            &["offset 9: stream filter type is not name or array"]
         );
     }
 
