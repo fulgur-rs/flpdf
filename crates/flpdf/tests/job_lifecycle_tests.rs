@@ -602,6 +602,73 @@ fn json_job_run_applies_relative_rotation_to_a_real_page() {
     assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
 }
 
+/// qpdf leaves `createQPDF` before any stage when the job only reports
+/// encryption status: the `check_is_encrypted || check_requires_password`
+/// early return (`libqpdf/QPDFJob.cc:455-456`) sits ahead of `updateFromJSON`
+/// (`:462`) and `handleRotations` (`:470`). Configure both a rotation and an
+/// update file that does not exist: without the guard the update would fail
+/// the call outright, and a document meant only for inspection would come
+/// back rotated.
+#[test]
+fn create_qpdf_skips_the_stages_for_an_encryption_status_job() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "inputFile": fixture,
+        "jsonInput": "",
+        "isEncrypted": "",
+        "updateFromJson": tempdir.path().join("missing-update.json"),
+        "rotate": "+90"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .expect("a status-only job must not fail on the unread update file")
+        .expect("createQPDF should still return the document");
+
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert_eq!(
+        page.try_get_key(b"/Rotate").unwrap().as_integer(),
+        None,
+        "an encryption-status job must not rotate the document it only inspects"
+    );
+}
+
+#[test]
+fn create_qpdf_returns_the_primary_after_rotation_transformation() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+    let update = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/update.json");
+    let tempdir = tempfile::tempdir().unwrap();
+    let json = serde_json::json!({
+        "inputFile": fixture,
+        "jsonInput": "",
+        "outputFile": tempdir.path().join("later.pdf"),
+        "updateFromJson": update,
+        "rotate": "+90"
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(&json).unwrap();
+    let mut pdf = job
+        .create_qpdf()
+        .unwrap()
+        .expect("createQPDF should return the transformed document");
+
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page).unwrap();
+    assert_eq!(page.try_get_key(b"/Rotate").unwrap().as_integer(), Some(90));
+}
+
 /// qpdf keys its opened-source cache by filename alone
 /// (`page_spec_qpdfs.count(page_spec.filename) == 0`, `QPDFJob.cc:2389`),
 /// reusing the same already-open QPDF for a repeated literal path rather
@@ -2317,7 +2384,8 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
     let missing_update_json = serde_json::json!({
         "inputFile": minimal,
         "outputFile": missing_update_output,
-        "updateFromJson": missing_update
+        "updateFromJson": missing_update,
+        "pages": [{"file": "."}]
     })
     .to_string();
     let mut missing_update_job = QPDFJob::new();
@@ -2325,6 +2393,48 @@ fn json_job_json_input_and_replace_input_cover_success_and_failure_boundaries() 
         .initialize_from_json(&missing_update_json)
         .unwrap();
     assert_eq!(missing_update_job.run().unwrap(), JobExitCode::Error);
+
+    let missing_update_primary = serde_json::json!({
+        "inputFile": minimal,
+        "outputFile": tempdir.path().join("missing-update-primary.pdf"),
+        "updateFromJson": missing_update
+    })
+    .to_string();
+    let mut missing_update_primary_job = QPDFJob::new();
+    missing_update_primary_job
+        .initialize_from_json(&missing_update_primary)
+        .unwrap();
+    assert_eq!(
+        missing_update_primary_job.run().unwrap(),
+        JobExitCode::Error
+    );
+
+    let json_primary = tempdir.path().join("json-primary.json");
+    std::fs::write(&json_primary, COMPLETE_JSON).unwrap();
+    let json_missing_update = serde_json::json!({
+        "inputFile": json_primary,
+        "jsonInput": "",
+        "outputFile": tempdir.path().join("json-missing-update.pdf"),
+        "updateFromJson": missing_update
+    })
+    .to_string();
+    let mut json_missing_update_job = QPDFJob::new();
+    json_missing_update_job
+        .initialize_from_json(&json_missing_update)
+        .unwrap();
+    assert_eq!(json_missing_update_job.run().unwrap(), JobExitCode::Error);
+
+    let empty_missing_update = serde_json::json!({
+        "empty": "",
+        "outputFile": tempdir.path().join("empty-missing-update.pdf"),
+        "updateFromJson": missing_update
+    })
+    .to_string();
+    let mut empty_missing_update_job = QPDFJob::new();
+    empty_missing_update_job
+        .initialize_from_json(&empty_missing_update)
+        .unwrap();
+    assert_eq!(empty_missing_update_job.run().unwrap(), JobExitCode::Error);
 
     let replace_input = tempdir.path().join("replace.pdf");
     std::fs::copy(&minimal, &replace_input).unwrap();
