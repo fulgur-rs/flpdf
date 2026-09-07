@@ -1171,6 +1171,27 @@ mod live_input_tests {
         );
     }
 
+    // The ObjStm member route reaches the parser through
+    // `OffsetHandleResolver`, which rebases offsets and forwards every other
+    // resolver method. qpdf holds the guard on that route too:
+    // `QPDF::readObjectInStream` constructs the parser with `this` as its
+    // context (`libqpdf/QPDF.cc:1459`), exactly as `readObject` does. An
+    // adapter that forwarded the handle methods but not the guard would let
+    // this one route parse unguarded.
+    #[test]
+    fn the_rebasing_adapter_forwards_the_parse_guard() {
+        let resolver = GuardSpyResolver {
+            events: RefCell::new(Vec::new()),
+            reject_entry: false,
+        };
+        let mut resolver = resolver;
+
+        super::parse_qpdf_direct_object_handle_with_diagnostics(b"42", 0, None, &mut resolver)
+            .expect("the object parses");
+
+        assert_eq!(*resolver.events.borrow(), vec!["begin", "end"]);
+    }
+
     // qpdf's `QPDF::ParseGuard` is a stack-local RAII object
     // (`include/qpdf/QPDF.hh:797-816`): its destructor runs on every exit
     // from `QPDFParser::parse`, a thrown exception included.
@@ -1908,6 +1929,19 @@ impl HandleResolver for OffsetHandleResolver<'_> {
 
     fn description_template(&self) -> Option<Vec<u8>> {
         self.resolver.description_template()
+    }
+
+    fn begin_parse(&self) -> Result<()> {
+        // Forward the guard like every other method: this adapter only rebases
+        // offsets. Falling back to the no-op default would drop the guard for
+        // the one route that reaches the parser through it -- ObjStm member
+        // parsing -- where qpdf does hold it, since `QPDF::readObjectInStream`
+        // passes `this` as the parser's context (`libqpdf/QPDF.cc:1459`).
+        self.resolver.begin_parse()
+    }
+
+    fn end_parse(&self) {
+        self.resolver.end_parse();
     }
 }
 
