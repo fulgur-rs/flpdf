@@ -2517,56 +2517,57 @@ impl LinearizationPlan {
         &self,
         pdf: &mut Pdf<R>,
         _config: &PlannerConfig,
-        ctx: &crate::writer::object_streams::EligibilityContext,
-        length_exclusions: &BTreeSet<ObjectRef>,
+        _ctx: &crate::writer::object_streams::EligibilityContext,
+        _length_exclusions: &BTreeSet<ObjectRef>,
         optimization: &crate::optimization::Optimization,
     ) -> crate::Result<ObjStmBatchPlan> {
-        use crate::XrefEntry;
-
-        let entries = pdf.source_xref_entries();
-
-        // Build source ObjStm groups: container_number → [(index, ref)]
-        let mut groups: BTreeMap<u32, Vec<(u32, ObjectRef)>> = BTreeMap::new();
-        for (obj_ref, offset) in &entries {
-            if let XrefEntry::Compressed { stream, index } = offset {
-                groups.entry(*stream).or_default().push((*index, *obj_ref));
-            }
-        }
-
+        // QPDFWriter::preserveObjectStreams is the shared owner of source
+        // membership. It captures the document map before the compressible walk,
+        // applies preserve-unreferenced policy, and retains source-container
+        // identity for every group. Linearization only adds its output-sensitive
+        // page/Catalog/signature/assigned filtering and part routing below.
+        let source_plan =
+            crate::writer::object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                pdf,
+                _config.preserve_unreferenced_objects,
+            )?; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
         let assigned = self.renumber_assigned_refs();
-        let page_dicts: BTreeSet<ObjectRef> = crate::pages::page_refs(pdf)?.into_iter().collect();
-        let catalog = self.root_ref;
         let mut containers: Vec<Vec<ObjectRef>> = Vec::new();
-        let mut source_container_numbers: Vec<u32> = Vec::new();
+        let mut source_container_refs: Vec<Option<ObjectRef>> = Vec::new();
 
-        // Iterate containers in ascending source-container number and retain
-        // their member-index order. qpdf erases page dictionaries and the
-        // Catalog from the source mapping, but otherwise classifies the
-        // surviving container as a unit.
-        for (container_num, mut members) in groups {
-            members.sort_by_key(|(idx, _)| *idx);
+        for group in source_plan.groups {
+            let crate::writer::object_streams::ObjectStreamGroup::SourceBacked { source, members } =
+                group
+            else {
+                // cov:ignore-start: the shared Preserve planner returns SourceBacked groups only.
+                return Err(crate::Error::Internal(
+                    "linearized Preserve planner returned a generated ObjStm group".to_string(),
+                )); // cov:ignore: defensive invariant rejects an impossible generated group
+                    // cov:ignore-end
+            };
             let mut surviving = Vec::new();
-            for (_idx, obj_ref) in members {
-                if page_dicts.contains(&obj_ref) || Some(obj_ref) == catalog {
+            for obj_ref in members {
+                if !assigned.contains(&obj_ref) {
                     continue;
                 }
-                if length_exclusions.contains(&obj_ref) || !assigned.contains(&obj_ref) {
-                    continue;
-                }
-                let eligible = {
-                    let obj = pdf.get_object_handle(obj_ref);
-                    is_eligible_for_objstm_handle(obj_ref, &obj, ctx)?
-                };
                 let obj = pdf.get_object_handle(obj_ref);
-                if eligible && !crate::writer::object_streams::is_qpdf_signature_dict(pdf, &obj)? {
+                if !crate::writer::object_streams::is_qpdf_signature_dict(pdf, &obj)? {
                     surviving.push(obj_ref);
                 }
             }
             if !surviving.is_empty() {
-                source_container_numbers.push(container_num);
+                source_container_refs.push(Some(source));
                 containers.push(surviving);
             }
         }
+
+        crate::writer::object_streams::filter_objstm_batches_for_output(
+            pdf,
+            &mut containers,
+            &mut source_container_refs,
+            true,
+            false,
+        )?; // cov:ignore: LLVM attributes this covered multiline exclusion terminator to the call setup
 
         let routes = route_objstm_containers(
             optimization,
@@ -2581,11 +2582,14 @@ impl LinearizationPlan {
         let mut part4_shared = Vec::new();
         let mut part4_rest = Vec::new();
 
-        for ((members, route), source_container_number) in containers
+        for ((members, route), source_container_ref) in containers
             .into_iter()
             .zip(routes)
-            .zip(source_container_numbers)
+            .zip(source_container_refs)
         {
+            let source_container_number = source_container_ref
+                .expect("Preserve ObjStm batch retains its source container")
+                .number;
             push_routed_objstm_batch(
                 members,
                 route,
@@ -2763,26 +2767,20 @@ pub(crate) fn objstm_membership_linearized_with_eligibility<R: Read + Seek>(
     };
     // Drop refs without a renumber slot before the split (see doc above).
     eligible.retain(|r| assigned.contains(r));
-    let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
+    let mut streams = crate::writer::object_streams::even_split_into_streams(&eligible);
 
-    // Erase set: every page dictionary plus the root Catalog. qpdf cannot place
-    // a page dict in an ObjStm (the linearization layout addresses pages by
-    // file offset) and never compresses the Catalog in a linearized file.
-    let mut erase: BTreeSet<ObjectRef> = crate::pages::page_refs(pdf)?.into_iter().collect();
-    if let Some(root) = pdf.root_ref() {
-        erase.insert(root);
-    }
-
-    Ok(streams
-        .into_iter()
-        .map(|stream| {
-            stream
-                .into_iter()
-                .filter(|r| !erase.contains(r))
-                .collect::<Vec<ObjectRef>>()
-        })
-        .filter(|container| !container.is_empty())
-        .collect())
+    // qpdf's setup removes every page dictionary and the Catalog after
+    // membership is selected. Keep that exclusion in the shared writer owner
+    // used by specialized Preserve so Generate and Preserve cannot drift.
+    let mut source_containers = vec![None; streams.len()];
+    crate::writer::object_streams::filter_objstm_batches_for_output(
+        pdf,
+        &mut streams,
+        &mut source_containers,
+        true,
+        false,
+    )?; // cov:ignore: LLVM attributes this covered multiline exclusion terminator to the call setup
+    Ok(streams)
 }
 
 /// Catalog keys qpdf treats as `open_document_keys` in
