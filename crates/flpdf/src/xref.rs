@@ -6010,6 +6010,7 @@ mod final_handle_tests {
     struct FailingCanonicalOwner {
         transport_error: bool,
         diagnostics: RefCell<Diagnostics>,
+        recovered_eol: Option<crate::parser::RecoveredStreamEol>,
     }
 
     impl CanonicalTrailerOwner for FailingCanonicalOwner {
@@ -6061,7 +6062,7 @@ mod final_handle_tests {
             &self,
             _object_ref: ObjectRef,
         ) -> Option<crate::parser::RecoveredStreamEol> {
-            None
+            self.recovered_eol
         }
     }
 
@@ -6069,6 +6070,9 @@ mod final_handle_tests {
     fn canonical_xref_context_handles_direct_and_malformed_stream_data() {
         let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 3);
         let mut context = CanonicalXrefContext::new(resolver.as_ref(), Vec::new());
+        assert!(context
+            .resolve_dictionary_value(&ObjectHandle::uninitialized(), "Type")
+            .is_none());
         let direct = ObjectHandle::integer(1);
         assert!(matches!(
             XrefObjectContext::raw_stream_data(&mut context, ObjectRef::new(1, 0), &direct),
@@ -6123,6 +6127,27 @@ mod final_handle_tests {
             &mut registration,
         )
         .is_err());
+
+        let owner = FailingCanonicalOwner {
+            transport_error: false,
+            diagnostics: RefCell::new(Diagnostics::default()),
+            recovered_eol: Some(crate::parser::RecoveredStreamEol::Lf),
+        };
+        let mut recovered_context = CanonicalXrefContext::new(&owner, Vec::new());
+        let recovered_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"payload".to_vec()),
+        );
+        let recovered_data = XrefObjectContext::raw_stream_data(
+            &mut recovered_context,
+            ObjectRef::new(4, 0),
+            &recovered_stream,
+        )
+        .expect("stream data");
+        assert_eq!(
+            recovered_data.as_ref().map(|data| data.as_slice()),
+            Some(b"payload".as_slice())
+        );
     }
 
     #[test]
@@ -6209,7 +6234,16 @@ mod final_handle_tests {
             let owner = FailingCanonicalOwner {
                 transport_error,
                 diagnostics: RefCell::new(Diagnostics::default()),
+                recovered_eol: None,
             };
+            let _ = owner.indirect_handle(ObjectRef::new(1, 0));
+            let _ = owner.direct_handle(ObjectValue::Integer(1));
+            owner.install_xref_entries(BTreeMap::new());
+            owner.set_header_offset(0);
+            assert!(owner
+                .read_object_at_offset(0, ObjectRef::new(1, 0), None)
+                .is_err());
+            assert!(owner.recovered_stream_eol(ObjectRef::new(1, 0)).is_none());
             let mut registration = XrefRegistration::default();
             let mut sink = Diagnostics::default();
             let error = parse_xref_stream_with_canonical_owner(
@@ -6232,6 +6266,34 @@ mod final_handle_tests {
             }
             assert_eq!(sink.entries().len(), 1);
         }
+    }
+
+    #[test]
+    fn canonical_xref_builder_failure_forwards_payload_warning() {
+        let mut bytes =
+            b"1 0 obj\n<< /Type /XRef /W [1 0 0] /Size 1 /Length 2 >>\nstream\n".to_vec();
+        bytes.extend_from_slice(&[9, 0]);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n%tail\n");
+        let resolver = canonical_test_resolver(bytes, BTreeMap::new(), false, 7);
+        let mut registration = XrefRegistration::default();
+        let mut sink = Diagnostics::default();
+        let error = parse_xref_stream_with_canonical_owner(
+            0,
+            0,
+            "1.4".to_owned(),
+            XrefLoadOptions::default(),
+            &mut registration,
+            Some(&mut sink),
+            resolver.as_ref(),
+        )
+        .expect_err("an unknown xref entry type must fail the canonical build");
+
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. } if message == "unknown xref stream entry type 9"
+        ));
+        assert_eq!(sink.entries().len(), 1);
+        assert!(sink.entries()[0].message_string().contains("wrong size"));
     }
 
     #[test]
