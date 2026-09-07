@@ -223,7 +223,7 @@ mod tests {
     use super::*;
     use crate::embedded_files::insert_embedded_file;
     use crate::filespec_helper::{encode_utf16be, FileParamDates, FileSpecBuilder};
-    use crate::job::QPDFJob;
+    use crate::job::{JobExitCode, QPDFJob};
     use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
     use crate::{Error, ObjectHandle, ObjectRef, Pdf, QPDFLogger};
     use std::io::{Cursor, Read, Seek};
@@ -442,7 +442,10 @@ mod tests {
         params
     }
 
-    fn run_listing<R: Read + Seek>(pdf: &mut Pdf<R>, verbose: bool) -> Result<Vec<u8>> {
+    fn run_listing_with_status<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        verbose: bool,
+    ) -> Result<(Vec<u8>, JobExitCode)> {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let logger = QPDFLogger::create();
         logger.set_info(Some(PipelineHandle::new(InfoCapture {
@@ -453,12 +456,16 @@ mod tests {
         let mut job = QPDFJob::new();
         job.set_logger(logger);
         job.set_input_name("test.pdf");
-        job.list_attachments(pdf, verbose)?;
+        let status = job.list_attachments(pdf, verbose)?;
         let captured = bytes
             .lock()
             .map_err(|_| Error::Internal("attachment-list capture mutex poisoned".to_owned()))?
             .clone();
-        Ok(captured)
+        Ok((captured, status))
+    }
+
+    fn run_listing<R: Read + Seek>(pdf: &mut Pdf<R>, verbose: bool) -> Result<Vec<u8>> {
+        run_listing_with_status(pdf, verbose).map(|(bytes, _status)| bytes)
     }
 
     fn listing<R: Read + Seek>(pdf: &mut Pdf<R>, verbose: bool) -> Vec<u8> {
@@ -684,31 +691,18 @@ mod tests {
         filespec.insert("F", ObjectHandle::string(b"c.txt".to_vec()));
         attach(&mut pdf, b"c.txt", filespec);
 
+        let (listed, status) = run_listing_with_status(&mut pdf, true).expect("list attachments");
         assert_eq!(
-            as_text(&listing(&mut pdf, true)),
+            as_text(&listed),
             "c.txt -> 0,0\n  preferred name: c.txt\n  all names:\n    /F -> c.txt\n  \
              all data streams:\n",
             "a missing /EF still prints the header and both section labels"
         );
-
-        let diagnostics = pdf.repair_diagnostics();
-        let warnings: Vec<_> = diagnostics
-            .entries()
-            .iter()
-            .filter(|diagnostic| {
-                diagnostic
-                    .message_string()
-                    .contains("operation for dictionary attempted on object of type null")
-            })
-            .collect();
-        assert_eq!(
-            warnings.len(),
-            2,
-            "qpdf ditems() asks the missing /EF null for keys at begin and end"
+        assert_eq!(status, JobExitCode::Warning);
+        assert!(
+            !pdf.any_warnings(),
+            "Job completion drains document warnings"
         );
-        assert!(warnings
-            .iter()
-            .all(|diagnostic| diagnostic.message_string().contains("treating as empty")));
     }
 
     #[test]
@@ -830,37 +824,31 @@ mod tests {
         // on with empty values rather than failing the listing.
         let mut direct_pdf = Pdf::open(Cursor::new(inline_non_dictionary_filespec_pdf_bytes()))
             .expect("open direct non-dictionary Filespec fixture");
+        let (direct_listed, direct_status) =
+            run_listing_with_status(&mut direct_pdf, true).expect("list direct Filespec");
         assert_eq!(
-            as_text(&listing(&mut direct_pdf, true)),
+            as_text(&direct_listed),
             "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
         );
+        assert_eq!(direct_status, JobExitCode::Warning);
         assert!(
-            direct_pdf
-                .repair_diagnostics()
-                .entries()
-                .iter()
-                .any(|diagnostic| diagnostic
-                    .message_string()
-                    .contains("Embedded file object is not a dictionary")),
-            "QPDFFileSpecObjectHelper must warn for a direct non-dictionary Filespec"
+            !direct_pdf.any_warnings(),
+            "Job completion drains document warnings"
         );
 
         let mut dangling_pdf = open_minimal();
         let dangling = object_ref(&mut dangling_pdf, ObjectRef::new(4096, 0));
         attach_raw_tree_value(&mut dangling_pdf, b"k.txt", dangling);
+        let (dangling_listed, dangling_status) =
+            run_listing_with_status(&mut dangling_pdf, true).expect("list dangling Filespec");
         assert_eq!(
-            as_text(&listing(&mut dangling_pdf, true)),
+            as_text(&dangling_listed),
             "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
         );
+        assert_eq!(dangling_status, JobExitCode::Warning);
         assert!(
-            dangling_pdf
-                .repair_diagnostics()
-                .entries()
-                .iter()
-                .any(|diagnostic| diagnostic
-                    .message_string()
-                    .contains("Embedded file object is not a dictionary")),
-            "QPDFFileSpecObjectHelper must warn for a dangling Filespec"
+            !dangling_pdf.any_warnings(),
+            "Job completion drains document warnings"
         );
     }
 
