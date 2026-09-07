@@ -721,6 +721,17 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     pdf_unique_id: Cell<u64>,
 }
 
+impl<R: Read + Seek> Drop for ResolverHandle<R> {
+    /// Mirror qpdf's `QPDF::~QPDF` teardown (`libqpdf/QPDF.cc:215-235`) even
+    /// when opening fails before a [`crate::Pdf`] has taken ownership of the
+    /// resolver. The canonical cache is the owner of resolved object handles;
+    /// disconnecting it here breaks cycles before the resolver allocation is
+    /// dropped.
+    fn drop(&mut self) {
+        self.disconnect_all();
+    }
+}
+
 /// The `QPDF::StringDecrypter` qpdf binds to one indirect object immediately
 /// before `QPDFParser::parse` (`libqpdf/QPDF.cc:1331-1340`).
 struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
@@ -1796,8 +1807,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// resolved object graph forms.
     ///
     /// qpdf `QPDF::~QPDF` walks `m->obj_cache` and replaces each object with
-    /// `QPDF_Destroyed` for the same reason. `Pdf::drop` is the sole caller;
-    /// see its own comment for why the cycles exist.
+    /// `QPDF_Destroyed` for the same reason. Both `Pdf::drop` and the resolver's
+    /// own Drop implementation use this idempotent operation; the latter is
+    /// required when opening fails before a `Pdf` exists.
     pub(crate) fn disconnect_all(&self) {
         for handle in self.core.borrow().object_cache.values() {
             handle.disconnect();
@@ -5019,6 +5031,42 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
             0,
         )
+    }
+
+    #[test]
+    fn dropping_a_resolver_breaks_canonical_cache_cycles_without_a_pdf_owner() {
+        let resolver = bare_resolver();
+        let first = resolver.get_object_handle(ObjectRef::new(1, 0));
+        let second = resolver.get_object_handle(ObjectRef::new(2, 0));
+        first.set_resolved(ObjectValue::Dictionary(
+            [(b"Peer".to_vec(), second.clone())].into_iter().collect(),
+        ));
+        second.set_resolved(ObjectValue::Dictionary(
+            [(b"Back".to_vec(), first.clone())].into_iter().collect(),
+        ));
+        assert_eq!(
+            first.strong_count(),
+            3,
+            "cache, test, and second value hold first"
+        );
+        assert_eq!(
+            second.strong_count(),
+            3,
+            "cache, test, and first value hold second"
+        );
+
+        drop(resolver);
+
+        assert_eq!(
+            first.strong_count(),
+            1,
+            "only the test handle should hold first"
+        );
+        assert_eq!(
+            second.strong_count(),
+            1,
+            "only the test handle should hold second"
+        );
     }
 
     #[test]
