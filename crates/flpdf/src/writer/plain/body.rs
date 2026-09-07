@@ -753,8 +753,8 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     if original.generation != 0 {
                         out.extend_from_slice(format!(" {}", original.generation).as_bytes());
                     }
-                    // cov:ignore-end
                 }
+                // cov:ignore-end
                 out.push(b'\n');
                 qdf_marker_starts.push(marker_start);
                 qdf_marker_lengths.push(out.len() - marker_start);
