@@ -6213,7 +6213,6 @@ impl ObjectHandle {
             decode_level,
             suppress_warnings,
             will_retry,
-            false,
         )
     }
 
@@ -6490,7 +6489,6 @@ impl ObjectHandle {
         decode_level: DecodeLevel,
         suppress_warnings: bool,
         will_retry: bool,
-        recover_codec_errors: bool,
     ) -> Result<bool> {
         self.try_dereference()?;
         let token_filters = {
@@ -6537,7 +6535,6 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
-                false,
             );
         }
 
@@ -6550,7 +6547,6 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
-                false,
             );
         };
         if (plan.lossy_compression && decode_level < DecodeLevel::All)
@@ -6564,7 +6560,6 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
-                false,
             );
         }
 
@@ -6639,7 +6634,6 @@ impl ObjectHandle {
                 &mut head,
                 suppress_warnings,
                 will_retry,
-                recover_codec_errors,
             )
             .map_err(|error| warning_delivery_error.borrow_mut().take().unwrap_or(error))?;
         if let Some(error) = warning_delivery_error.borrow_mut().take() {
@@ -6852,7 +6846,6 @@ impl ObjectHandle {
             pipeline,
             false,
             false,
-            false,
         )
     }
 
@@ -6866,15 +6859,10 @@ impl ObjectHandle {
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
-        recover_codec_errors: bool,
     ) -> Result<bool> {
         if let Some(stream_data) = stream_data {
-            pipeline
-                .write(&stream_data)
-                .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
-            pipeline
-                .finish()
-                .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
+            pipeline.write(&stream_data)?;
+            pipeline.finish()?;
             return Ok(true);
         }
 
@@ -6955,18 +6943,6 @@ impl ObjectHandle {
             suppress_warnings,
             will_retry,
         )
-    }
-
-    fn map_stream_pipeline_error(error: PipelineError, recover_codec_errors: bool) -> Error {
-        if recover_codec_errors {
-            if let PipelineError::Runtime(message) = error {
-                return Error::Unsupported(format!(
-                    "error decoding stream data: {}",
-                    message.into_string_lossy()
-                ));
-            }
-        }
-        error.into()
     }
 
     /// The value as raw operator bytes if this handle's value — its own if
@@ -14107,18 +14083,6 @@ mod mutation_tests {
         assert!(success);
         assert!(filtering_attempted);
         assert_eq!(sink.take_buffer().unwrap(), b"hello");
-    }
-
-    #[test]
-    fn stream_pipeline_error_mapping_keeps_non_codec_errors_fatal() {
-        assert!(matches!(
-            ObjectHandle::map_stream_pipeline_error(PipelineError::logic("sink failed"), true),
-            Error::Internal(message) if message == "sink failed"
-        ));
-        assert!(matches!(
-            ObjectHandle::map_stream_pipeline_error(PipelineError::runtime("sink failed"), false),
-            Error::System(message) if message == "sink failed"
-        ));
     }
 
     #[test]

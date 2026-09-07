@@ -9307,6 +9307,74 @@ mod tests {
     }
 
     #[test]
+    fn an_object_stream_provider_failure_is_caught_by_dispatch() {
+        struct FailingProvider;
+
+        impl crate::StreamDataProvider for FailingProvider {
+            fn provide_stream_data(
+                &self,
+                _object_ref: ObjectRef,
+                _pipeline: &mut dyn crate::pipeline::Pipeline,
+            ) -> crate::Result<()> {
+                Err(Error::System("provider codec failure".to_owned()))
+            }
+        }
+
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, Vec::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: None,
+                stream_length: 0,
+                stream_provider: Some(Rc::new(FailingProvider)),
+                filter_on_write: true,
+            });
+
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("qpdf catches provider exceptions at resolve");
+        assert!(member.is_null());
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("error reading object: provider codec failure")));
+    }
+
+    #[test]
     fn an_object_stream_with_wrong_type_warns_and_still_resolves() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
