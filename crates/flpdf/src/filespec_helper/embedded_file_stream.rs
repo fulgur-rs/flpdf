@@ -258,9 +258,13 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// Returns [`Error::QpdfExc`] with
     /// [`QpdfErrorCode::Unsupported`](crate::QpdfErrorCode::Unsupported)
     /// when the stream itself has no usable filter branch, matching qpdf's
-    /// `getStreamData` throw contract. A filter stage that is reached but
-    /// fails at run time — a registered token filter or a fatal codec error —
-    /// propagates as [`Error::System`], this crate's `std::runtime_error`.
+    /// `getStreamData` throw contract — this is also what a document-backed
+    /// attachment reports when its decoder fails fatally, because that path
+    /// downgrades the codec failure to a warning and an unsuccessful pipe
+    /// rather than an error. A run-time failure that does propagate out of
+    /// the pipeline itself, such as a registered token filter or a sink that
+    /// errors, surfaces as [`Error::System`], this crate's
+    /// `std::runtime_error`.
     ///
     /// # Examples
     ///
