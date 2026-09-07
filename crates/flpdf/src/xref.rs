@@ -5581,6 +5581,23 @@ mod final_handle_tests {
     }
 
     #[test]
+    fn classic_trailer_parse_errors_propagate_through_both_owner_routes() {
+        let (bytes, _) = classic_xref_with_trailer("<< /Size 999999999999999999999999 >>");
+        let error = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes.clone()),
+            XrefLoadOptions::default(),
+        )
+        .expect_err("an overflowing trailer integer must fail the owner-less parser");
+        assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 9);
+        let error =
+            load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
+                .expect_err("an overflowing trailer integer must fail the canonical parser");
+        assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+    }
+
+    #[test]
     fn reconstructed_read_trailer_attributes_empty_candidate_to_trailer() {
         let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
         let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
