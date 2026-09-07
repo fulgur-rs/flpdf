@@ -85,20 +85,41 @@ fn collect_live_seed_handles<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
     found: &mut Vec<ObjectHandle>,
+    depth: usize,
 ) -> crate::Result<()> {
     if handle.object_ref().is_some() {
         found.push(handle.clone());
         return Ok(());
     }
+    // The parser bounds nesting in parsed input, but a library-built inline
+    // root or trailer value could nest arbitrarily (or form a direct cycle).
+    // Bound the direct-seed recursion the same way the parser does rather than
+    // overflow the stack.
+    if depth > crate::parser::MAX_PARSE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "plain live writer: direct seed nesting exceeds maximum of {}",
+            crate::parser::MAX_PARSE_DEPTH
+        )));
+    }
     pdf.resolve(handle)?;
     if let Some(items) = handle.try_as_array()? {
         for item in items {
-            collect_live_seed_handles(pdf, &item, found)?;
+            collect_live_seed_handles(pdf, &item, found, depth + 1)?;
+        }
+    } else if let Some(stream_dict) = handle.as_stream_dict() {
+        // A direct stream reaches the live queue through the indirect children
+        // of its dictionary, matching qpdf's enqueueObject direct recursion
+        // (`QPDFWriter.cc:1129-1147`). `try_as_dictionary` does not view a
+        // stream as a dictionary, so descend the stream dictionary explicitly.
+        for (_, value) in stream_dict.try_as_dictionary()?.unwrap_or_default() {
+            if !value.try_is_null()? {
+                collect_live_seed_handles(pdf, &value, found, depth + 1)?;
+            }
         }
     } else if let Some(entries) = handle.try_as_dictionary()? {
         for (_, value) in entries {
             if !value.try_is_null()? {
-                collect_live_seed_handles(pdf, &value, found)?;
+                collect_live_seed_handles(pdf, &value, found, depth + 1)?;
             }
         }
     }
@@ -125,7 +146,7 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
 
     let root = pdf.root_handle()?;
     let mut root_seeds = Vec::new();
-    collect_live_seed_handles(pdf, &root, &mut root_seeds)?;
+    collect_live_seed_handles(pdf, &root, &mut root_seeds, 0)?;
     for handle in root_seeds {
         queue.enqueue_handle(pdf, handle)?;
     }
@@ -136,6 +157,7 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
         if matches!(
             key.as_slice(),
             b"/ID"
+                | b"/Size"
                 | b"/Encrypt"
                 | b"/Prev"
                 | b"/Root"
@@ -151,7 +173,7 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
             continue;
         }
         let mut handles = Vec::new();
-        collect_live_seed_handles(pdf, &value, &mut handles)?;
+        collect_live_seed_handles(pdf, &value, &mut handles, 0)?;
         for handle in handles {
             queue.enqueue_handle(pdf, handle)?;
         }
