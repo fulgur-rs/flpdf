@@ -42,6 +42,7 @@ use crate::reader::file_object::{
 };
 use crate::reader::resolver::ResolverHandle;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
+use crate::writer::DecodeLevel;
 use crate::{
     filters, Diagnostics, Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefEntry,
 };
@@ -97,10 +98,6 @@ pub(crate) trait CanonicalTrailerOwner {
         description: Option<Vec<u8>>,
     ) -> Result<(ObjectHandle, Option<u64>)>;
     fn repair_diagnostics(&self) -> Diagnostics;
-    fn recovered_stream_eol(
-        &self,
-        object_ref: ObjectRef,
-    ) -> Option<crate::parser::RecoveredStreamEol>;
 }
 
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
@@ -149,13 +146,6 @@ impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
 
     fn repair_diagnostics(&self) -> Diagnostics {
         ResolverHandle::repair_diagnostics(self)
-    }
-
-    fn recovered_stream_eol(
-        &self,
-        object_ref: ObjectRef,
-    ) -> Option<crate::parser::RecoveredStreamEol> {
-        ResolverHandle::recovered_stream_eol(self, object_ref)
     }
 }
 
@@ -1359,11 +1349,24 @@ trait XrefObjectContext {
         dictionary: &ObjectHandle,
         key: &str,
     ) -> Option<ObjectHandle>;
-    fn raw_stream_data(
+    /// The xref stream's fully filter-decoded entry table.
+    ///
+    /// qpdf reads this in one call, `xref_obj.getStreamData(qpdf_dl_specialized)`
+    /// (`libqpdf/QPDF.cc:1051`), over `QPDFObjectHandle::getStreamData`
+    /// (`QPDFObjectHandle.cc:1289-1292`). The bootstrap context has no
+    /// persistent resolver to replay that canonical pipe against later, so it
+    /// keeps its own materialize-then-decode path; the canonical-owner
+    /// context has a real resolver-backed handle and calls the same
+    /// `get_stream_data` other already-migrated consumers use
+    /// (`page_object_helper.rs`, `overlay_appearance_stream.rs`,
+    /// `json_inspect.rs`).
+    fn decoded_xref_stream_data(
         &mut self,
         object_ref: ObjectRef,
+        stream_dict: &ObjectHandle,
         object: &ObjectHandle,
-    ) -> Result<Option<Rc<Vec<u8>>>>;
+        xref_pos: usize,
+    ) -> Result<Vec<u8>>;
     fn sync_handle_diagnostics(&mut self);
     fn append_diagnostics_to(&mut self, diagnostics: &mut Diagnostics);
     fn take_reconstruction_trigger(&mut self) -> Option<Error>;
@@ -1384,12 +1387,21 @@ impl XrefObjectContext for XrefReadContext<'_> {
         Self::resolve_dictionary_value(self, dictionary, key)
     }
 
-    fn raw_stream_data(
+    fn decoded_xref_stream_data(
         &mut self,
         _object_ref: ObjectRef,
+        stream_dict: &ObjectHandle,
         object: &ObjectHandle,
-    ) -> Result<Option<Rc<Vec<u8>>>> {
-        Ok(object.as_stream_data())
+        xref_pos: usize,
+    ) -> Result<Vec<u8>> {
+        let stream_data = object
+            .as_stream_data()
+            .ok_or_else(|| Error::parse(xref_pos, "xref stream has no data"))?;
+        filters::decode_stream_data_from_handle(
+            stream_dict,
+            &stream_data,
+            filters::DecodeLimits::default(),
+        )
     }
 
     fn sync_handle_diagnostics(&mut self) {
@@ -1476,27 +1488,16 @@ impl XrefObjectContext for CanonicalXrefContext<'_> {
         Some(value)
     }
 
-    fn raw_stream_data(
+    fn decoded_xref_stream_data(
         &mut self,
-        object_ref: ObjectRef,
+        _object_ref: ObjectRef,
+        _stream_dict: &ObjectHandle,
         object: &ObjectHandle,
-    ) -> Result<Option<Rc<Vec<u8>>>> {
-        if object.as_stream_dict().is_none() {
-            return Ok(None);
-        }
-        let data = object.get_raw_stream_data();
+        _xref_pos: usize,
+    ) -> Result<Vec<u8>> {
+        let data = object.get_stream_data(DecodeLevel::Specialized);
         self.sync_owner_diagnostics();
-        let data = data?;
-        let Some(eol) = self.owner.recovered_stream_eol(object_ref) else {
-            return Ok(Some(data));
-        };
-        let suffix = eol.as_bytes();
-        if !data.ends_with(suffix) {
-            return Ok(Some(data));
-        }
-        let mut trimmed = (*data).clone();
-        trimmed.truncate(trimmed.len() - suffix.len());
-        Ok(Some(Rc::new(trimmed)))
+        Ok((*data?).clone())
     }
 
     fn sync_handle_diagnostics(&mut self) {
@@ -4201,13 +4202,10 @@ fn build_xref_stream(
     let index = parse_xref_index_handle(context, &handle_stream_dict, size)?;
     let ranges = build_xref_ranges(index)?;
     let has_first_xref_item = ranges.iter().any(|&(start, count)| start == 0 && count > 0);
-    let handle_stream_data = context
-        .raw_stream_data(object_ref, &handle_object)?
-        .ok_or_else(|| Error::parse(xref_pos, "xref stream has no data"))?;
-    // `decode_stream_data_from_handle` is a generic filter-decoding entry
-    // point shared with non-bootstrap callers. The context preparation above
-    // ensures that indirect `/Filter` and `/DecodeParms` values are already
-    // available before this function asks the handle decoder to inspect them.
+    // The bootstrap context's decoder inspects `/Filter`/`/DecodeParms`
+    // itself and needs any indirect value staged first; the canonical-owner
+    // context's `ensure_source_for_resolution` is a no-op since its resolver
+    // reads indirect values live through `get_stream_data`.
     let stream_dictionary = handle_stream_dict.as_dictionary();
     if let Some(filter) = stream_dictionary
         .as_ref()
@@ -4221,10 +4219,11 @@ fn build_xref_stream(
     {
         context.ensure_source_for_resolution(decode_parms);
     }
-    let stream_data = filters::decode_stream_data_from_handle(
+    let stream_data = context.decoded_xref_stream_data(
+        object_ref,
         &handle_stream_dict,
-        &handle_stream_data,
-        filters::DecodeLimits::default(),
+        &handle_object,
+        xref_pos,
     )?;
     let entry_size = widths
         .0
@@ -6186,7 +6185,6 @@ mod final_handle_tests {
     struct FailingCanonicalOwner {
         transport_error: bool,
         diagnostics: RefCell<Diagnostics>,
-        recovered_eol: Option<crate::parser::RecoveredStreamEol>,
     }
 
     impl CanonicalTrailerOwner for FailingCanonicalOwner {
@@ -6240,27 +6238,15 @@ mod final_handle_tests {
         fn repair_diagnostics(&self) -> Diagnostics {
             self.diagnostics.borrow().clone()
         }
-
-        fn recovered_stream_eol(
-            &self,
-            _object_ref: ObjectRef,
-        ) -> Option<crate::parser::RecoveredStreamEol> {
-            self.recovered_eol
-        }
     }
 
     #[test]
-    fn canonical_xref_context_handles_direct_and_malformed_stream_data() {
+    fn canonical_xref_context_rejects_malformed_stream_data() {
         let resolver = canonical_test_resolver(Vec::new(), BTreeMap::new(), false, 3);
         let mut context = CanonicalXrefContext::new(resolver.as_ref(), Vec::new());
         assert!(context
             .resolve_dictionary_value(&ObjectHandle::uninitialized(), "Type")
             .is_none());
-        let direct = ObjectHandle::integer(1);
-        assert!(matches!(
-            XrefObjectContext::raw_stream_data(&mut context, ObjectRef::new(1, 0), &direct),
-            Ok(None)
-        ));
 
         let dictionary = |extra: Option<ObjectHandle>, size: i64| {
             let mut entries = vec![
@@ -6310,31 +6296,18 @@ mod final_handle_tests {
             &mut registration,
         )
         .is_err());
-
-        let owner = FailingCanonicalOwner {
-            transport_error: false,
-            diagnostics: RefCell::new(Diagnostics::default()),
-            recovered_eol: Some(crate::parser::RecoveredStreamEol::Lf),
-        };
-        let mut recovered_context = CanonicalXrefContext::new(&owner, Vec::new());
-        let recovered_stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(Vec::new()),
-            Rc::new(b"payload".to_vec()),
-        );
-        let recovered_data = XrefObjectContext::raw_stream_data(
-            &mut recovered_context,
-            ObjectRef::new(4, 0),
-            &recovered_stream,
-        )
-        .expect("stream data");
-        assert_eq!(
-            recovered_data.as_ref().map(|data| data.as_slice()),
-            Some(b"payload".as_slice())
-        );
     }
 
     #[test]
-    fn canonical_xref_stream_trims_a_recovered_payload_eol() {
+    fn canonical_xref_stream_reports_qpdfs_wrong_size_warning_for_a_recovered_payload_eol() {
+        // qpdf's own recovered length (`recoverStreamLength`, `QPDF.cc:1482-1497`)
+        // spans every byte up to the "endstream" it finds, which includes the
+        // EOL that conventionally precedes that keyword. `getStreamData`
+        // decodes exactly that span with no separate trim, so a real qpdf run
+        // on this fixture warns "wrong size; expected = 1; actual = 2"
+        // (verified against qpdf 11.9.0). The canonical-owner path now
+        // reports the same warning instead of silently trimming the EOL
+        // before the size comparison.
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let xref_pos = bytes.len();
         bytes.extend_from_slice(
@@ -6354,13 +6327,21 @@ mod final_handle_tests {
             None,
             resolver.as_ref(),
         )
-        .expect("a recovered canonical xref stream should parse after trimming its EOL");
+        .expect("a recovered canonical xref stream should still parse its one free entry");
 
         assert_eq!(
             resolver.recovered_stream_eol(ObjectRef::new(1, 0)),
             Some(crate::parser::RecoveredStreamEol::Lf)
         );
         assert!(state.loaded.entries.is_empty());
+        assert!(state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message_string()
+                .contains("wrong size; expected = 1; actual = 2")));
     }
 
     #[test]
@@ -6417,7 +6398,6 @@ mod final_handle_tests {
             let owner = FailingCanonicalOwner {
                 transport_error,
                 diagnostics: RefCell::new(Diagnostics::default()),
-                recovered_eol: None,
             };
             let _ = owner.indirect_handle(ObjectRef::new(1, 0));
             let _ = owner.direct_handle(ObjectValue::Integer(1));
@@ -6428,7 +6408,6 @@ mod final_handle_tests {
             assert!(owner
                 .read_object_at_offset(0, ObjectRef::new(1, 0), None)
                 .is_err());
-            assert!(owner.recovered_stream_eol(ObjectRef::new(1, 0)).is_none());
             let mut registration = XrefRegistration::default();
             let mut sink = Diagnostics::default();
             let error = parse_xref_stream_with_canonical_owner(

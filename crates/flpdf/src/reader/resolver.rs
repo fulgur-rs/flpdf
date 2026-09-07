@@ -5292,7 +5292,7 @@ mod tests {
             .expect("canonical stream read");
 
         assert!(read.as_stream_dict().is_some());
-        assert!(owner.recovered_stream_eol(object_ref).is_some());
+        assert!(resolver.recovered_stream_eol(object_ref).is_some());
         assert!(owner
             .repair_diagnostics()
             .entries()
