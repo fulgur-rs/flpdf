@@ -1148,6 +1148,39 @@ fn qdf_subcommand_rewrites_output() {
 }
 
 #[test]
+fn qpdf_compat_reset_keeps_a_subcommand_named_input_before_later_options() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("qdf");
+    let qpdf_output = temp.path().join("qpdf-out.pdf");
+    let flpdf_output = temp.path().join("flpdf-out.pdf");
+    std::fs::copy("../../tests/fixtures/minimal.pdf", &input).unwrap();
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .current_dir(temp.path())
+        .args(["--", "qdf", "--static-id", "qpdf-out.pdf"])
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(
+        qpdf.status.success(),
+        "qpdf probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["--", "qdf", "--static-id", "flpdf-out.pdf"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "qpdf-compatible reset must keep a subcommand-named input in the flat grammar"
+    );
+}
+
+#[test]
 fn qdf_repaired_input_keeps_output_and_exits_three_with_output_summary() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("repaired.qdf.pdf");
