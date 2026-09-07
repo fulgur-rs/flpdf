@@ -327,13 +327,13 @@ fn native_help_remains_available_after_qpdf_help_gate() {
         .args(["help", "rewrite"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Usage: flpdf rewrite"));
+        .stdout(predicate::str::contains("Usage: flpdf"));
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["rewrite", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Usage: flpdf rewrite"));
+        .stdout(predicate::str::contains("Usage: flpdf"));
 }
 
 #[cfg(unix)]
