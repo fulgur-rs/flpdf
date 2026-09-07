@@ -442,25 +442,25 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Walk qpdf's `/Root` -> `/Extensions` -> `/ADBE` -> `/ExtensionLevel`
-    /// chain and return the final handle, resolved.
+    /// chain and return the final handle.
     ///
     /// This is the shared body of `QPDF::getExtensionLevel`
     /// (`libqpdf/QPDF.cc:2329-2345`); the callers differ only in what they do
-    /// with the value, so the walk itself lives here once.
+    /// with the value, so the walk itself lives here once. Both callers read
+    /// the returned handle through a resolving accessor
+    /// (`ObjectHandle::try_as_integer`/`try_get_int_value_as_int`), so this
+    /// walk does not need to resolve it itself.
     fn extension_level_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let catalog = self.root_handle()?;
         let extensions = catalog.try_get_key(b"/Extensions")?;
-        self.resolve(&extensions)?;
         if extensions.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
         let adbe = extensions.try_get_key(b"/ADBE")?;
-        self.resolve(&adbe)?;
         if adbe.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
         let level = adbe.try_get_key(b"/ExtensionLevel")?;
-        self.resolve(&level)?;
         Ok(Some(level))
     }
 
@@ -575,12 +575,11 @@ impl<R: Read + Seek> Pdf<R> {
             .as_ref()
             .unwrap_or(&self.trailer)
             .try_get_key(b"/Root")?;
-        if !candidate.is_null() {
+        if !candidate.try_is_null()? {
             self.root_handle_memo = Some(candidate.clone());
         }
-        self.resolve(&candidate)?;
         let root = candidate;
-        if root.as_dictionary().is_none() {
+        if root.try_as_dictionary()?.is_none() {
             let message = "unable to find /Root dictionary";
             let filename = if self.resolver.input_source_closed() {
                 CLOSED_INPUT_SOURCE_NAME.as_bytes().to_vec()
