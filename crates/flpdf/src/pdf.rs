@@ -441,17 +441,24 @@ impl<R: Read + Seek> Pdf<R> {
     /// The Adobe extension level, clamped like qpdf's own integer read.
     ///
     /// Ports `QPDF::getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`): the
-    /// `/Extensions /ADBE /ExtensionLevel` value from
-    /// [`Self::adobe_extension_level`], clamped to `i32` range the way
-    /// `QPDFObjectHandle::getIntValueAsInt` clamps every other integer read
-    /// through it (`libqpdf/QPDFObjectHandle.cc:527-542`) -- unlike
-    /// [`Self::adobe_extension_level`] itself, which keeps the full 64-bit
-    /// value. qpdf's `getIntValueAsInt` also warns when the clamp changes
-    /// the value; that warning is not reproduced here.
+    /// `/Extensions /ADBE /ExtensionLevel` value read through
+    /// [`ObjectHandle::try_get_int_value_as_int`], which clamps to `i32` range
+    /// the way `QPDFObjectHandle::getIntValueAsInt` does
+    /// (`libqpdf/QPDFObjectHandle.cc:527-542`) -- unlike
+    /// [`Self::adobe_extension_level`], which keeps the full 64-bit value.
+    ///
+    /// A clamp is observable: it records the same warning qpdf emits,
+    /// `requested value of integer is too small; returning INT_MIN` or
+    /// `requested value of integer is too big; returning INT_MAX`, retrievable
+    /// through [`Self::repair_diagnostics`]. A non-integer `/ExtensionLevel`
+    /// yields `0` with no diagnostic, because qpdf checks `isInteger()` before
+    /// reading the value (`libqpdf/QPDF.cc:2337-2341`).
     ///
     /// # Errors
     ///
-    /// Propagates [`Self::adobe_extension_level`]'s errors.
+    /// Propagates the errors of the `/Root` walk, and — when the value is
+    /// clamped — any failure to deliver the accompanying warning to the
+    /// document's diagnostic sink.
     pub fn get_extension_level(&mut self) -> Result<i32> {
         let Some(level) = self.extension_level_handle()? else {
             return Ok(0);
