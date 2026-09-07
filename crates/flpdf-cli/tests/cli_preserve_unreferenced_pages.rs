@@ -630,8 +630,9 @@ fn multi_source_pages_default_rebuilds_source_object_stream_container() {
 /// through the ordinary foreign copier, and the container walk must reuse that
 /// copy rather than allocate a second identity — `writeObjectStream` knows a
 /// single `old_og` per container (`QPDFWriter.cc:1626-1629`).
-#[test]
-fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
+fn assert_merging_a_container_without_the_objstm_type_key_matches_qpdf(
+    preserve_unreferenced: bool,
+) {
     if !qpdf_available() {
         if std::env::var_os("CI").is_some() {
             panic!("qpdf 11.9.0 is required for this parity test on CI");
@@ -648,9 +649,11 @@ fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
 
     let primary_arg = primary.to_str().unwrap();
     let foreign_arg = foreign.to_str().unwrap();
-    let qpdf_run = run_qpdf(&[
-        "--static-id",
-        "--newline-before-endstream=n",
+    let mut qpdf_args = vec!["--static-id", "--newline-before-endstream=n"];
+    if preserve_unreferenced {
+        qpdf_args.push("--preserve-unreferenced");
+    }
+    qpdf_args.extend_from_slice(&[
         primary_arg,
         "--pages",
         ".",
@@ -660,21 +663,16 @@ fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
         "--",
         qpdf_output.to_str().unwrap(),
     ]);
+    let qpdf_status = run_qpdf(&qpdf_args).status.code();
 
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_flpdf"));
+    command.env("FLPDF_PROGNAME", "qpdf");
+    command.args(["--static-id", "--newline-before-endstream=n"]);
+    if preserve_unreferenced {
+        command.arg("--preserve-unreferenced");
+    }
     command
-        .env("FLPDF_PROGNAME", "qpdf")
-        .args([
-            "--static-id",
-            "--newline-before-endstream=n",
-            primary_arg,
-            "--pages",
-            ".",
-            "1",
-            foreign_arg,
-            "1",
-            "--",
-        ])
+        .args([primary_arg, "--pages", ".", "1", foreign_arg, "1", "--"])
         .arg(&flpdf_output);
     let output = command.output().expect("flpdf should spawn");
     // Both tools finish with the warning exit status: the wrong-typed container
@@ -682,7 +680,7 @@ fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
     // expanding the members), not a fatal error.
     assert_eq!(
         output.status.code(),
-        qpdf_run.status.code(),
+        qpdf_status,
         "flpdf must merge a container that lacks /Type /ObjStm the way qpdf does: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -714,4 +712,18 @@ fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
         normalized_qdf_objects(&qpdf_qdf),
         "the merged objects must match qpdf's for a container without /Type /ObjStm"
     );
+}
+
+#[test]
+fn merging_a_container_without_the_objstm_type_key_matches_qpdf() {
+    assert_merging_a_container_without_the_objstm_type_key_matches_qpdf(false);
+}
+
+/// With `--preserve-unreferenced` the primary's live objects are copied up
+/// front, and a container that lacks `/Type /ObjStm` is not filtered out of
+/// that sweep, so the container walk meets a container the canonical copier
+/// already owns.
+#[test]
+fn merging_a_container_without_the_objstm_type_key_preserving_unreferenced_matches_qpdf() {
+    assert_merging_a_container_without_the_objstm_type_key_matches_qpdf(true);
 }
