@@ -82,8 +82,7 @@ pub(crate) struct LiveBodyOutput {
     pub(crate) old_to_new: BTreeMap<ObjectRef, ObjectRef>,
 }
 
-fn collect_live_seed_handles<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn collect_live_seed_handles(
     handle: &ObjectHandle,
     found: &mut Vec<ObjectHandle>,
     depth: usize,
@@ -104,10 +103,9 @@ fn collect_live_seed_handles<R: Read + Seek>(
         )));
         // cov:ignore-end
     }
-    pdf.resolve(handle)?;
     if let Some(items) = handle.try_as_array()? {
         for item in items {
-            collect_live_seed_handles(pdf, &item, found, depth + 1)?;
+            collect_live_seed_handles(&item, found, depth + 1)?;
         }
     } else if let Some(stream_dict) = handle.as_stream_dict() {
         // A direct stream reaches the live queue through the indirect children
@@ -117,14 +115,14 @@ fn collect_live_seed_handles<R: Read + Seek>(
         // cov:ignore-start: defensive descent into a direct stream's dictionary -- parsed streams are indirect (taken by the base case above) and an in-memory stream surfaces its dictionary through the `try_as_dictionary` arm below, so this body is unreachable from the corpus.
         for (_, value) in stream_dict.try_as_dictionary()?.unwrap_or_default() {
             if !value.try_is_null()? {
-                collect_live_seed_handles(pdf, &value, found, depth + 1)?;
+                collect_live_seed_handles(&value, found, depth + 1)?;
             }
         }
         // cov:ignore-end
     } else if let Some(entries) = handle.try_as_dictionary()? {
         for (_, value) in entries {
             if !value.try_is_null()? {
-                collect_live_seed_handles(pdf, &value, found, depth + 1)?;
+                collect_live_seed_handles(&value, found, depth + 1)?;
             }
         }
     }
@@ -151,7 +149,7 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
 
     let root = pdf.root_handle()?;
     let mut root_seeds = Vec::new();
-    collect_live_seed_handles(pdf, &root, &mut root_seeds, 0)?;
+    collect_live_seed_handles(&root, &mut root_seeds, 0)?;
     for handle in root_seeds {
         queue.enqueue_handle(pdf, handle)?;
     }
@@ -181,7 +179,7 @@ pub(crate) fn emit_live_disable<R: Read + Seek + 'static>(
             continue;
         }
         let mut handles = Vec::new();
-        collect_live_seed_handles(pdf, &value, &mut handles, 0)?;
+        collect_live_seed_handles(&value, &mut handles, 0)?;
         for handle in handles {
             queue.enqueue_handle(pdf, handle)?;
         }
@@ -712,7 +710,6 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
         let mut handles = Vec::with_capacity(members.len());
         for member in members {
             let handle = pdf.get_object_handle(member.source);
-            pdf.resolve(&handle)?;
             handles.push((member.output, handle));
         }
         let mut qdf_marker_starts = Vec::new();
@@ -871,7 +868,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
         let extends = match origin {
             crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
                 let source_handle = pdf.get_object_handle(*source);
-                pdf.resolve(&source_handle)?;
+                source_handle.try_dereference()?;
                 if let Some(source_dict) = source_handle.as_stream_dict() {
                     let extends = source_dict.try_get_key(b"/Extends")?;
                     match extends.object_ref() {
@@ -1758,7 +1755,7 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
         };
         for member in members {
             let member_handle = pdf.get_object_handle(member.source);
-            pdf.resolve(&member_handle)?;
+            member_handle.try_dereference()?;
             let is_signature = object_streams::is_qpdf_signature_dict(pdf, &member_handle)?;
             let violation = planned_member_body_violation(
                 member.source,
@@ -2241,7 +2238,7 @@ mod object_emitter_tests {
 
         let direct_array = ObjectHandle::array(vec![child.clone(), ObjectHandle::null()]);
         let mut seeds = Vec::new();
-        collect_live_seed_handles(&mut local_pdf, &direct_array, &mut seeds, 0)?;
+        collect_live_seed_handles(&direct_array, &mut seeds, 0)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
         let direct_dictionary = ObjectHandle::dictionary(vec![
@@ -2249,7 +2246,7 @@ mod object_emitter_tests {
             (b"/Null".to_vec(), ObjectHandle::null()),
         ]);
         seeds.clear();
-        collect_live_seed_handles(&mut local_pdf, &direct_dictionary, &mut seeds, 0)?;
+        collect_live_seed_handles(&direct_dictionary, &mut seeds, 0)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 
@@ -2258,7 +2255,7 @@ mod object_emitter_tests {
             Rc::new(b"seed".to_vec()),
         );
         seeds.clear();
-        collect_live_seed_handles(&mut local_pdf, &direct_stream, &mut seeds, 0)?;
+        collect_live_seed_handles(&direct_stream, &mut seeds, 0)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 

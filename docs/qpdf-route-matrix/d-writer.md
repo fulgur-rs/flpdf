@@ -348,6 +348,16 @@ to the plain physical writer. Specialized/PCLm/legacy xref-stream and
 linearized callers remain explicit follow-up consumers; they must not recreate
 the semantic trailer loop.
 
+**A6/A7/A8 first writer cohort (2026-09-08, `.48.32`):** production
+`writer/plain/{body,plan}.rs` no longer uses `Pdf::resolve` as a separate
+prelude. Direct-seed traversal uses the resolving `try_*` accessors, and
+emission-only handles use the canonical handle resolver directly before the
+existing writer serializer. `python3 scripts/qpdf-route-callers.py` reports
+no production `Pdf::resolve` caller in `writer/plain`; linearization and the
+other writer cohorts remain explicit follow-up scope. This preserves qpdf's
+accessor ordering (`libqpdf/QPDFObjectHandle.cc:240-446,965-989`) without a
+workspace-wide mechanical conversion.
+
 ## WriterOptions と route の対応
 
 dispatch は 2 段。まず `PdfWriter::write`（`crates/flpdf/src/writer.rs:719-798`）が
