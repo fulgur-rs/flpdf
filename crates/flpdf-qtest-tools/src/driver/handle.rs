@@ -122,7 +122,7 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
 ) -> flpdf::Result<ResolvedStreamDictionary> {
     pdf.resolve(source)?;
     let source = source.clone();
-    let filter_value = source.get_key(b"/Filter");
+    let filter_value = source.try_get_key(b"/Filter")?;
     let filter = if filter_value.is_null() {
         None
     } else {
@@ -133,7 +133,7 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
         .as_deref()
         .is_none_or(|names| names.iter().all(|name| qpdf_filter_factory_exists(name)));
 
-    let decode_params_value = source.get_key(b"/DecodeParms");
+    let decode_params_value = source.try_get_key(b"/DecodeParms")?;
     let mut decode_parms_sources = Vec::new();
     let resolved_decode_params = if filterable {
         match filter_names.as_deref() {
@@ -164,7 +164,7 @@ pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
     if filterable {
         if let Some(names) = filter_names.as_deref() {
             let params =
-                aligned_decode_params_handle(pdf, &resolved.get_key(b"/DecodeParms"), names)?;
+                aligned_decode_params_handle(pdf, &resolved.try_get_key(b"/DecodeParms")?, names)?;
             for (filter_index, (filter_name, params)) in names.iter().zip(params).enumerate() {
                 let normalized = normalized_filter_name(filter_name);
                 if params.as_ref().is_some_and(|params| !params.is_null())
@@ -377,7 +377,7 @@ fn remove_identity_crypt_stages_handle(
     if crypt_indices.is_empty() {
         return Ok(());
     }
-    let filter = dictionary.get_key(b"/Filter");
+    let filter = dictionary.try_get_key(b"/Filter")?;
     if filter
         .as_name()
         .is_some_and(|name| normalized_filter_name(&name) == b"Crypt")
@@ -395,7 +395,7 @@ fn remove_identity_crypt_stages_handle(
             ),
         )?;
     }
-    let decode_params = dictionary.get_key(b"/DecodeParms");
+    let decode_params = dictionary.try_get_key(b"/DecodeParms")?;
     if let Some(values) = decode_params.as_array() {
         let values = values
             .into_iter()
