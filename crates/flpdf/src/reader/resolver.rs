@@ -2461,8 +2461,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     0,
                     error.to_string().into_bytes(),
                 ))
-            }
-            // cov:ignore-end
+            } // cov:ignore-end
         }
     }
 
@@ -11168,7 +11167,7 @@ mod tests {
             Error::Unsupported("unsupported failure".to_owned()),
             Error::SystemBytes(b"system bytes\0tail".to_vec()),
             Error::System("system failure\0tail".to_owned()),
-            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "io failure")),
+            Error::Io(std::io::Error::other("io failure")),
         ];
         for error in errors {
             let resolver = bare_resolver();

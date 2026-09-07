@@ -835,8 +835,9 @@ fn show_with_pdf<R: Read + Seek>(
                         detail: message.to_owned(),
                     });
                 }
-                // cov:ignore: the parameter checker has no generic I/O path after the source snapshot is installed
+                // cov:ignore-start: the parameter checker has no generic I/O path after the source snapshot is installed
                 Err(error) => return Err(ShowTablesError::Other(error.into())),
+                // cov:ignore-end
             }
             // 3. Locate, resolve, and decompress the hint stream object at /H[0].
             //
@@ -2607,13 +2608,24 @@ mod tests {
         bytes[h..=end].copy_from_slice(replacement);
         let file = tempfile::NamedTempFile::new().expect("temporary H3 PDF");
         std::fs::write(file.path(), &bytes).expect("write H3 PDF");
-        let qpdf = std::process::Command::new("/usr/bin/qpdf")
+        // cov:ignore-start: qpdf 11.9.0 is optional on CI; the Rust canonical H3 assertion below is cross-platform.
+        let version = match std::process::Command::new("qpdf").arg("--version").output() {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("qpdf 11.9.0 unavailable; skipping external H3 oracle");
+                return;
+            }
+            Err(error) => panic!("failed to run qpdf --version: {error}"),
+        };
+        if !version.contains("11.9.0") {
+            eprintln!("qpdf 11.9.0 unavailable; found {version:?}; skipping external H3 oracle");
+            return;
+        }
+        let qpdf = std::process::Command::new("qpdf")
             .arg("--show-linearization")
             .arg(file.path())
             .output()
             .expect("qpdf 11.9.0 oracle");
-        std::fs::write("/tmp/h3-qpdf-seekable.stdout", &qpdf.stdout).expect("save qpdf stdout");
-        std::fs::write("/tmp/h3-qpdf-seekable.stderr", &qpdf.stderr).expect("save qpdf stderr");
         assert_eq!(qpdf.status.code(), Some(3));
         assert_eq!(qpdf.stdout, b"");
         let expected_qpdf_stderr = format!(
@@ -2621,7 +2633,9 @@ mod tests {
             file.path().display(),
             file.path().display()
         );
-        assert_eq!(qpdf.stderr, expected_qpdf_stderr.as_bytes());
+        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("\r\n", "\n");
+        assert_eq!(qpdf_stderr.as_bytes(), expected_qpdf_stderr.as_bytes());
+        // cov:ignore-end
         let result = show_linearization_bytes_with_warnings(&bytes, "h3.pdf")
             .expect("qpdf catches malformed H as a warning");
         assert!(result.dump.is_empty());

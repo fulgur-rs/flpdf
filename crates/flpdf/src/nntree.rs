@@ -2694,10 +2694,8 @@ mod tests {
         assert!(!tree
             .kid_has_tree_shape(&mut pdf, &ObjectHandle::integer(1))
             .expect("scalar shape probe"));
-        let kids = ObjectHandle::dictionary(vec![(
-            b"Kids".to_vec(),
-            ObjectHandle::array(Vec::new()),
-        )]);
+        let kids =
+            ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::array(Vec::new()))]);
         assert!(tree
             .kid_has_tree_shape(&mut pdf, &kids)
             .expect("Kids shape probe"));

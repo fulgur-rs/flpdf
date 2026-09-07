@@ -976,7 +976,7 @@ impl BootstrapHandleDocument {
                 if self.state.borrow().reconstruction_trigger.is_some() {
                     return Err(error); // cov:ignore: LLVM maps the tested reconstruction handoff return to the condition edge
                 } // cov:ignore: LLVM maps the tested reconstruction handoff return to this closing branch edge
-                // cov:ignore-start: bootstrap byte reads expose only qpdf damage and parse failures; these transport fallbacks are defensive
+                  // cov:ignore-start: bootstrap byte reads expose only qpdf damage and parse failures; these transport fallbacks are defensive
                 let warning = match error {
                     Error::QpdfExc(warning) => warning,
                     Error::Parse { offset, message } => QpdfExc::new(
@@ -3447,11 +3447,12 @@ fn parse_xref_stream(
         // report the recovery notice before the resolution warning that
         // caused it.
         for diagnostic in &handle_completed.diagnostics {
-            context.diagnostics.push(xref_file_object_diagnostic( // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization route
+            context.diagnostics.push(xref_file_object_diagnostic(
+                // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization route
                 XrefObjectDescription::XrefStream,
                 object_ref,
                 xref_pos as u64,
-                &context.document.options.description,
+                &context.document.options.description, // cov:ignore: stream framing diagnostics are synchronized by the canonical finalization path
                 diagnostic.clone(),
             ));
         }
@@ -5462,10 +5463,7 @@ mod final_handle_tests {
             Error::parse(11, "trailer dictionary is invalid"),
             Error::parse(12, "unknown xref stream entry type 9"),
             Error::parse(13, "other parse error"),
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "read failed",
-            )),
+            Error::Io(std::io::Error::other("read failed")),
             Error::SystemBytes(b"system bytes".to_vec()),
             Error::System("system".to_owned()),
             Error::Internal("internal".to_owned()),
