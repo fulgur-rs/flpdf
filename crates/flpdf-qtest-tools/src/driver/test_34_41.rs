@@ -108,62 +108,19 @@ fn root_handle<R: Read + Seek>(
     Ok(resolved)
 }
 
-/// Mirrors `QPDF::getVersionAsPDFVersion`'s leading-prefix regex match
-/// (`std::regex` `^[[:space:]]*([0-9]+)\.([0-9]+)`, `libqpdf/QPDF.cc:2305-2320`):
-/// skip leading whitespace, take the leading run of digits, a literal `.`,
-/// and the following run of digits; default to major 1, minor 3 if the
-/// header string doesn't start that way. This does not use
-/// `flpdf::PdfVersion::parse`: that method requires the *entire* string to
-/// be exactly `M.m` (via `str::split_once` + full-string integer parses),
-/// while qpdf's regex only needs a matching *prefix* and tolerates leading
-/// whitespace -- a real divergence for a malformed header, not just a
-/// stylistic difference.
-fn version_prefix_major_minor(version: &str) -> (i64, i64) {
-    let bytes = version.as_bytes();
-    let mut index = 0;
-    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-        index += 1;
-    }
-    let major_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
-    }
-    if index == major_start || bytes.get(index) != Some(&b'.') {
-        return (1, 3);
-    }
-    let major_str = &version[major_start..index];
-    index += 1; // skip '.'
-    let minor_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
-    }
-    if index == minor_start {
-        return (1, 3);
-    }
-    let minor_str = &version[minor_start..index];
-    // qpdf's `QUtil::string_to_int` throws on overflow (an uncaught
-    // exception, since these captured groups are pure ASCII digits with no
-    // sign); a version header with a digit run wide enough to overflow
-    // `i64` is not exercised by any fixture this driver ships, so this
-    // falls back rather than aborting the process.
-    let major = major_str.parse::<i64>().unwrap_or(1);
-    let minor = minor_str.parse::<i64>().unwrap_or(3);
-    (major, minor)
-}
-
 /// `QPDF::getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`): walk
 /// `/Extensions /ADBE /ExtensionLevel` from `root`, resolving indirect
 /// references at each step, defaulting to `0` whenever a link in that chain
-/// is absent or the wrong type. This does not reuse `Pdf::adobe_extension_level`:
-/// that convenience method starts from `self.trailer_dictionary().get_ref("Root")`,
-/// which requires `/Root` to be a *literal* indirect reference in the
-/// trailer and silently returns `None` (defaulting to `0`) for a direct
-/// `/Root` dictionary -- unlike qpdf's own `getRoot()`, and unlike
-/// `root_handle` above, both of which accept `/Root` either way. Using the
-/// convenience method here would make `run_test_34` internally
-/// inconsistent: `extension level: 0` from a direct `/Root` on the same
-/// line whose very next line prints a real, non-empty `/Extensions`
-/// dictionary read through `root_handle`.
+/// is absent or the wrong type. This does not reuse the canonical
+/// `Pdf::get_extension_level`/`Pdf::adobe_extension_level`: those walk the
+/// same chain through plain `try_get_key`/`resolve` calls without emitting
+/// this driver's own per-hop diagnostics (`resolved_key`'s
+/// `emit_new_diagnostics` call after each dereference, mirroring qpdf's
+/// synchronous per-dereference warning emission to stderr). This function's
+/// own first hop is `run_test_34`'s only diagnostics-emitting read of this
+/// chain, so it keeps that fidelity; `run_test_34` reuses its result rather
+/// than re-deriving the extension level from the canonical method for the
+/// `As PDFVersion:` line below.
 #[allow(clippy::too_many_arguments)]
 fn catalog_extension_level<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -209,9 +166,9 @@ fn catalog_extension_level<R: Read + Seek>(
     // qpdf reads this with `getIntValueAsInt()`, which clamps an
     // out-of-`int`-range value to `INT_MIN`/`INT_MAX` (and warns) rather
     // than keeping the full 64-bit value (`QPDFObjectHandle::getIntValueAsInt`,
-    // `libqpdf/QPDFObjectHandle.cc:527-542`); the clamp is reproduced here,
-    // but the accompanying `warnIfPossible` is not -- see this file's own
-    // caveats.
+    // `libqpdf/QPDFObjectHandle.cc:527-542`); the clamp is reproduced here
+    // (matching `Pdf::get_extension_level`'s own clamp), but the
+    // accompanying `warnIfPossible` is not.
     Ok(level
         .as_integer()
         .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
@@ -260,8 +217,20 @@ pub(crate) fn run_test_34<R: Read + Seek>(
     write_bytes(stdout, &extensions.unparse())?;
     writeln!(stdout)?;
 
-    let (major, minor) = version_prefix_major_minor(pdf.version());
-    writeln!(stdout, "As PDFVersion: {major}.{minor}/{extension_level}")?;
+    // `get_version_as_pdf_version` independently recomputes the extension
+    // level via `get_extension_level`, but the `/Extensions` chain is
+    // already resolved from the read above, so this second read produces no
+    // new diagnostics (matching qpdf's own object cache, which does not
+    // re-warn on an already-resolved dereference) -- reuse the
+    // diagnostics-emitting `extension_level` already printed above rather
+    // than the one this call recomputes.
+    let version = pdf.get_version_as_pdf_version()?;
+    writeln!(
+        stdout,
+        "As PDFVersion: {}.{}/{extension_level}",
+        version.major(),
+        version.minor()
+    )?;
     Ok(())
 }
 

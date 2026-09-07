@@ -5,6 +5,7 @@ use crate::cache::ObjectCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
+use crate::pdf_version::{leading_major_minor, PdfVersion};
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::InputSourceControl;
 use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefForm};
@@ -407,6 +408,20 @@ impl<R: Read + Seek> Pdf<R> {
     /// `/Extensions /ADBE /ExtensionLevel` chain, including logger delivery
     /// failures raised while resolving a damaged object.
     pub fn adobe_extension_level(&mut self) -> Result<Option<i64>> {
+        Ok(self
+            .extension_level_handle()?
+            .map(|level| level.try_as_integer())
+            .transpose()?
+            .flatten())
+    }
+
+    /// Walk qpdf's `/Root` -> `/Extensions` -> `/ADBE` -> `/ExtensionLevel`
+    /// chain and return the final handle, resolved.
+    ///
+    /// This is the shared body of `QPDF::getExtensionLevel`
+    /// (`libqpdf/QPDF.cc:2329-2345`); the callers differ only in what they do
+    /// with the value, so the walk itself lives here once.
+    fn extension_level_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let catalog = self.root_handle()?;
         let extensions = catalog.try_get_key(b"/Extensions")?;
         self.resolve(&extensions)?;
@@ -420,7 +435,64 @@ impl<R: Read + Seek> Pdf<R> {
         }
         let level = adbe.try_get_key(b"/ExtensionLevel")?;
         self.resolve(&level)?;
-        level.try_as_integer()
+        Ok(Some(level))
+    }
+
+    /// The Adobe extension level, clamped like qpdf's own integer read.
+    ///
+    /// Ports `QPDF::getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`): the
+    /// `/Extensions /ADBE /ExtensionLevel` value read through
+    /// [`ObjectHandle::try_get_int_value_as_int`], which clamps to `i32` range
+    /// the way `QPDFObjectHandle::getIntValueAsInt` does
+    /// (`libqpdf/QPDFObjectHandle.cc:527-542`) -- unlike
+    /// [`Self::adobe_extension_level`], which keeps the full 64-bit value.
+    ///
+    /// A clamp is observable: it records the same warning qpdf emits,
+    /// `requested value of integer is too small; returning INT_MIN` or
+    /// `requested value of integer is too big; returning INT_MAX`, retrievable
+    /// through [`Self::repair_diagnostics`]. A non-integer `/ExtensionLevel`
+    /// yields `0` with no diagnostic, because qpdf checks `isInteger()` before
+    /// reading the value (`libqpdf/QPDF.cc:2337-2341`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the errors of the `/Root` walk, and — when the value is
+    /// clamped — any failure to deliver the accompanying warning to the
+    /// document's diagnostic sink.
+    pub fn get_extension_level(&mut self) -> Result<i32> {
+        let Some(level) = self.extension_level_handle()? else {
+            return Ok(0);
+        };
+        // qpdf guards with `isInteger()` and only then calls
+        // `getIntValueAsInt` (`libqpdf/QPDF.cc:2337-2341`), so a non-integer
+        // `/ExtensionLevel` yields 0 without any diagnostic. Going through
+        // `try_get_int_value_as_int` unguarded would emit the
+        // `returning 0` type warning qpdf never produces here.
+        if level.try_as_integer()?.is_none() {
+            return Ok(0);
+        }
+        // Clamping is qpdf's `getIntValueAsInt`, which warns
+        // "requested value of integer is too small/too big" on the way
+        // (`libqpdf/QPDFObjectHandle.cc:527-543`). Reproducing the clamp by
+        // hand would drop that warning.
+        level.try_get_int_value_as_int()
+    }
+
+    /// The header version paired with the Adobe extension level, as a
+    /// [`PdfVersion`].
+    ///
+    /// Ports `QPDF::getVersionAsPDFVersion` (`libqpdf/QPDF.cc:2305-2320`):
+    /// [`Self::version`]'s leading `M.m` digit-run prefix (defaulting to
+    /// `1.3` when the header does not start that way) paired with
+    /// [`Self::get_extension_level`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::get_extension_level`]'s errors.
+    pub fn get_version_as_pdf_version(&mut self) -> Result<PdfVersion> {
+        let extension_level = self.get_extension_level()?;
+        let (major, minor) = leading_major_minor(self.version());
+        Ok(PdfVersion::new(major, minor, i64::from(extension_level)))
     }
 
     /// The live trailer dictionary as an [`ObjectHandle`].
@@ -523,8 +595,96 @@ impl<R: Read + Seek> Pdf<R> {
 #[cfg(test)]
 mod tests {
     use super::{Pdf, WriterObjectOrderKey};
-    use crate::ObjectRef;
+    use crate::{ObjectRef, PdfOpenOptions};
     use std::collections::BTreeMap;
+
+    fn open_recoverable(bytes: &[u8]) -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let options = PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
+        Pdf::open_mem_owned_with_options(bytes.to_vec(), options).expect("open fixture")
+    }
+
+    #[test]
+    fn get_version_as_pdf_version_reads_header_prefix_and_extension_level() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        let version = pdf
+            .get_version_as_pdf_version()
+            .expect("read version and extension level");
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 7);
+        assert_eq!(version.extension_level(), 8);
+    }
+
+    #[test]
+    fn get_version_as_pdf_version_defaults_extension_level_without_extensions() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+              2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        let version = pdf
+            .get_version_as_pdf_version()
+            .expect("read version without an /Extensions chain");
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 4);
+        assert_eq!(version.extension_level(), 0);
+    }
+
+    #[test]
+    fn get_extension_level_clamps_a_value_outside_i32_range() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel 5000000000 >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        assert_eq!(
+            pdf.get_extension_level().expect("read extension level"),
+            i32::MAX
+        );
+        // qpdf clamps inside getIntValueAsInt, which warns on the way
+        // (`libqpdf/QPDFObjectHandle.cc:527-543`); a hand-written clamp would
+        // return the same number silently.
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|entry| {
+                String::from_utf8_lossy(entry.what_bytes())
+                    .contains("requested value of integer is too big; returning INT_MAX")
+            }),
+            "clamping must carry qpdf's warning"
+        );
+    }
+
+    #[test]
+    fn get_extension_level_is_silent_for_a_non_integer_level() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel /Foo >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        // qpdf guards with `isInteger()` before calling `getIntValueAsInt`
+        // (`libqpdf/QPDF.cc:2337-2341`), so a name here yields 0 and no
+        // diagnostic at all -- not the "returning 0" type warning an
+        // unguarded accessor would emit.
+        assert_eq!(pdf.get_extension_level().expect("read extension level"), 0);
+        assert!(
+            !pdf.repair_diagnostics().entries().iter().any(|entry| {
+                String::from_utf8_lossy(entry.what_bytes()).contains("returning 0")
+            }),
+            "a non-integer extension level must not warn"
+        );
+    }
 
     #[test]
     fn writer_order_uses_source_mapped_and_fresh_keys() {
