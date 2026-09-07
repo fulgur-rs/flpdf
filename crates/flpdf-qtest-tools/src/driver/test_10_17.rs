@@ -194,7 +194,7 @@ pub(crate) fn run_test_11<R: Read + Seek>(
         .root_ref()
         .ok_or_else(|| Error::Internal("test 11 requires a document catalog".to_string()))?;
     let root = pdf.get_object_handle(root_ref);
-    let qstream = root.get_key(b"/QStream");
+    let qstream = root.try_get_key(b"/QStream")?;
 
     let filtered = qstream.get_stream_data(DecodeLevel::Generalized)?;
     if filtered.as_slice() == b"potato\n" {
@@ -293,16 +293,16 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     let orig_page3_ref = pages[2];
     let orig_page2 = pdf.get_object_handle(orig_page2_ref);
     let orig_page3 = pdf.get_object_handle(orig_page3_ref);
-    assert_eq!(orig_page2.get_key(b"/OrigPage").as_integer(), Some(2));
-    assert_eq!(orig_page3.get_key(b"/OrigPage").as_integer(), Some(3));
+    assert_eq!(orig_page2.try_get_key(b"/OrigPage")?.as_integer(), Some(2));
+    assert_eq!(orig_page3.try_get_key(b"/OrigPage")?.as_integer(), Some(3));
 
     pdf.swap_objects(orig_page2_ref, orig_page3_ref)?;
-    assert_eq!(orig_page2.get_key(b"/OrigPage").as_integer(), Some(3));
-    assert_eq!(orig_page3.get_key(b"/OrigPage").as_integer(), Some(2));
+    assert_eq!(orig_page2.try_get_key(b"/OrigPage")?.as_integer(), Some(3));
+    assert_eq!(orig_page3.try_get_key(b"/OrigPage")?.as_integer(), Some(2));
 
     let trailer = pdf.trailer();
-    let qdict = trailer.get_key(b"/QDict");
-    let qarray = trailer.get_key(b"/QArray");
+    let qdict = trailer.try_get_key(b"/QDict")?;
+    let qarray = trailer.try_get_key(b"/QArray")?;
     let qdict_ref = qdict
         .object_ref()
         .ok_or_else(|| Error::Internal("test 14 /QDict is not indirect".to_owned()))?;
@@ -321,7 +321,7 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     writeln!(
         stdout,
         "old dict: {}",
-        qdict.get_key(b"/NewDict").try_get_int_value()?
+        qdict.try_get_key(b"/NewDict")?.try_get_int_value()?
     )?;
 
     pdf.swap_objects(qdict_ref, qarray_ref)?;
@@ -334,7 +334,7 @@ pub(crate) fn run_test_14<R: Read + Seek>(
     writeln!(
         stdout,
         "new dict: {}",
-        qarray.get_key(b"/NewDict").try_get_int_value()?
+        qarray.try_get_key(b"/NewDict")?.try_get_int_value()?
     )?;
 
     let qdict = pdf.get_object_handle(qdict_ref);
@@ -380,7 +380,7 @@ fn check_page_contents<R: Read + Seek>(
     stdout: &mut dyn Write,
 ) -> flpdf::Result<()> {
     let page = pdf.get_object_handle(page_ref);
-    let contents_handle = page.get_key(b"/Contents");
+    let contents_handle = page.try_get_key(b"/Contents")?;
     let contents = contents_handle.get_stream_data(DecodeLevel::Generalized)?;
     let contents_string = String::from_utf8_lossy(&contents);
     if !contents_string.contains(wanted) {
@@ -611,8 +611,8 @@ pub(crate) fn run_test_16<R: Read + Seek>(
         .root_ref()
         .ok_or_else(|| Error::Internal("test 16 requires a document catalog".to_string()))?;
     let root = pdf.get_object_handle(root_ref);
-    let pages_dict = root.get_key(b"/Pages");
-    let kids = pages_dict.get_key(b"/Kids");
+    let pages_dict = root.try_get_key(b"/Pages")?;
+    let kids = pages_dict.try_get_key(b"/Kids")?;
     page.replace_key(b"/Parent", pages_dict.clone())?;
     pages_dict.replace_key(
         b"/Count",
@@ -662,8 +662,8 @@ pub(crate) fn run_test_17<R: Read + Seek>(
         .root_ref()
         .ok_or_else(|| Error::Internal("test 17 requires a document catalog".to_string()))?;
     let root = pdf.get_object_handle(root_ref);
-    let pages_dict = root.get_key(b"/Pages");
-    let page_kids = pages_dict.get_key(b"/Kids");
+    let pages_dict = root.try_get_key(b"/Pages")?;
+    let page_kids = pages_dict.try_get_key(b"/Kids")?;
     let kids_items = page_kids
         .as_array()
         .ok_or_else(|| Error::Internal("test 17 /Pages /Kids is not an array".to_string()))?;
@@ -680,8 +680,8 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     assert_eq!(pages.len(), 3);
     assert_ne!(pages[0], pages[1]);
 
-    let page0_contents_ref = pdf.get_object_handle(pages[0]).get_key(b"/Contents");
-    let page1_contents_ref = pdf.get_object_handle(pages[1]).get_key(b"/Contents");
+    let page0_contents_ref = pdf.get_object_handle(pages[0]).try_get_key(b"/Contents")?;
+    let page1_contents_ref = pdf.get_object_handle(pages[1]).try_get_key(b"/Contents")?;
     assert_eq!(
         page0_contents_ref.object_ref(),
         page1_contents_ref.object_ref()
@@ -692,7 +692,7 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     assert_eq!(pages.len(), 2);
 
     let remaining = pdf.get_object_handle(pages[0]);
-    let contents_handle = remaining.get_key(b"/Contents");
+    let contents_handle = remaining.try_get_key(b"/Contents")?;
     let contents = contents_handle.get_stream_data(DecodeLevel::Generalized)?;
     let contents_string = String::from_utf8_lossy(&contents);
     assert!(contents_string.contains("page 0"));
