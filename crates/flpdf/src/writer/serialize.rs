@@ -264,6 +264,30 @@ pub(crate) mod xref_stream {
         Ok(sink.take_buffer()?)
     }
 
+    /// Encode the payload for qpdf's stream-compression policy.
+    ///
+    /// `filtered` is the effective `compress_streams && !qdf_mode` decision
+    /// that is also reflected in the emitted dictionary. A linearization
+    /// pass-1 call sets `skip_compression`: qpdf still emits the PNG predictor
+    /// and advertises `/FlateDecode`, but deliberately leaves the predictor
+    /// bytes uncompressed while it sizes the fixed region. Keeping that
+    /// policy in the shared owner prevents plain and linearized callers from
+    /// growing subtly different codec branches.
+    pub(crate) fn encode_payload_for_policy(
+        entries: &[XrefStreamEntry],
+        widths: XrefWidths,
+        filtered: bool,
+        skip_compression: bool,
+    ) -> Result<Vec<u8>> {
+        if !filtered {
+            encode_payload_raw(entries, widths)
+        } else if skip_compression {
+            encode_payload_uncompressed(entries, widths)
+        } else {
+            encode_payload(entries, widths)
+        }
+    }
+
     #[cfg(test)]
     #[test]
     fn dictionary_key_preserves_qpdf_first_byte() {
@@ -493,42 +517,20 @@ pub(crate) mod xref_stream {
         write_object_internal(out, object, dict, payload, false, None)
     }
 
-    /// QDF-formatted variant of [`write_object`].
-    pub(crate) fn write_object_qdf(
+    /// Write one prepared xref-stream object through the shared dictionary and
+    /// framing owner. The returned `space_before_zero` is qpdf's
+    /// `xref_offset - 1` value used by linearization's `/T` calculation.
+    pub(crate) fn write_xref_stream(
         out: &mut Vec<u8>,
         object: ObjectRef,
         dict: &XrefStreamDict,
-        payload: &[u8],
-    ) -> Option<std::ops::Range<usize>> {
-        write_object_internal(out, object, dict, payload, true, None)
-    }
-
-    /// Like [`write_object`] but writes the trailer `/ID` via `id_writer` at its
-    /// fixed position (after `/Size`/`/Prev`), so a content-derived deterministic
-    /// `/ID` can be computed from the bytes written up to the array's `[`. The
-    /// `id_writer` must emit the full `[<hex0><hex1>]` array value. `dict.id` is
-    /// ignored. Used by the non-linearized generate writer for `--deterministic-id`
-    /// (which is not byte-parity with qpdf for xref-stream form, but must be
-    /// self-stable).
-    pub(crate) fn write_object_with_id_writer(
-        out: &mut Vec<u8>,
-        object: ObjectRef,
-        dict: &XrefStreamDict,
-        payload: &[u8],
-        id_writer: &mut dyn FnMut(&mut Vec<u8>),
-    ) {
-        write_object_internal(out, object, dict, payload, false, Some(id_writer));
-    }
-
-    /// QDF-formatted variant of [`write_object_with_id_writer`].
-    pub(crate) fn write_object_with_id_writer_qdf(
-        out: &mut Vec<u8>,
-        object: ObjectRef,
-        dict: &XrefStreamDict,
-        payload: &[u8],
-        id_writer: &mut dyn FnMut(&mut Vec<u8>),
-    ) {
-        write_object_internal(out, object, dict, payload, true, Some(id_writer));
+        layout: &XrefStreamLayout,
+        qdf: bool,
+        id_writer: Option<crate::pdf_syntax::TrailerIdWriter<'_>>,
+    ) -> (usize, Option<std::ops::Range<usize>>) {
+        let xref_offset = out.len();
+        let id_range = write_object_internal(out, object, dict, &layout.payload, qdf, id_writer);
+        (xref_offset.saturating_sub(1), id_range)
     }
 
     // ---------------------------------------------------------------------------
@@ -659,16 +661,120 @@ pub(crate) mod xref_stream {
             .collect()
     }
 
-    /// Maximum byte offset among a stream's entries (field 2 of its type-1 rows);
-    /// type-2 rows carry small container numbers, so this is the file-offset
-    /// magnitude that sizes field 2.
-    pub(crate) fn max_entry_offset(entries: &[XrefStreamEntry]) -> u64 {
-        entries
+    /// Build a stream range after registering the stream's own type-1 entry.
+    ///
+    /// qpdf stores `xref_id` in its live xref map *before* it serializes any
+    /// rows (`QPDFWriter.cc:2411-2415`). This helper performs the same mutation
+    /// on the caller's live offset map before building the requested range. A
+    /// type-1 row always carries field 3 zero; only type-2 rows use that field
+    /// for an object-stream member index.
+    pub(crate) fn build_entries_with_self(
+        offs: &mut BTreeMap<u32, usize>,
+        member_new: &BTreeMap<u32, (u32, u32)>,
+        start: u32,
+        count: u32,
+        xref_id: u32,
+        xref_offset: usize,
+    ) -> Vec<XrefStreamEntry> {
+        // This mutation is the Rust equivalent of qpdf's
+        // `m->xref[xref_id] = QPDFXRefEntry(...)` before the row loop
+        // (`QPDFWriter.cc:2411-2415`). The range may intentionally omit the
+        // stream object; qpdf still registers it in the live map and simply
+        // does not visit it while iterating `first..=last`.
+        offs.insert(xref_id, xref_offset);
+        build_entries(offs, member_new, start, count)
+    }
+
+    /// Apply qpdf's linearization hint-offset correction to type-1 rows.
+    ///
+    /// The first-half `writeXRefStream` receives `hint_id`, `hint_offset`, and
+    /// `hint_length`; every type-1 offset at or after the hint object is
+    /// shifted by the final hint object's length, except the hint row itself
+    /// (`QPDFWriter.cc:2432-2436`). Callers that already hold physical
+    /// post-hint offsets pass `None` instead of applying this correction twice.
+    pub(crate) fn apply_hint_offset(
+        entries: &mut [XrefStreamEntry],
+        first: u32,
+        hint_id: u32,
+        hint_offset: u64,
+        hint_length: u64,
+    ) -> Result<()> {
+        if hint_length == 0 {
+            return Ok(());
+        }
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let number = first
+                // cov:ignore-start: a slice cannot contain more than u32::MAX rows on supported targets.
+                .checked_add(u32::try_from(index).map_err(|_| {
+                    crate::Error::Unsupported("xref stream row index overflows u32".into())
+                })?)
+                // cov:ignore-end
+                .ok_or_else(|| crate::Error::Unsupported("xref stream row overflows u32".into()))?;
+            if entry.entry_type == 1 && number != hint_id && entry.field2 >= hint_offset {
+                entry.field2 = entry.field2.checked_add(hint_length).ok_or_else(|| {
+                    crate::Error::Unsupported("xref stream hint offset overflows u64".into())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Maximum offset in an encoded object-number range, used for qpdf's
+    /// caller-supplied `max_offset` argument when the range is assembled from
+    /// a live offset map rather than a completed row vector.
+    pub(crate) fn max_offset_for_range(
+        offsets: &BTreeMap<u32, usize>,
+        start: u32,
+        count: u32,
+    ) -> u64 {
+        let end = start.saturating_add(count);
+        offsets
             .iter()
-            .filter(|e| e.entry_type == 1)
-            .map(|e| e.field2)
+            .filter(|&(&number, _)| number >= start && number < end)
+            .map(|(_, &offset)| offset as u64)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Prepared layout and payload for one qpdf `writeXRefStream` call.
+    pub(crate) struct XrefStreamLayout {
+        pub widths: XrefWidths,
+        pub payload: Vec<u8>,
+    }
+
+    /// Build rows, field widths, and payload under one shared xref-stream
+    /// policy. Consumer-specific code supplies only the range, offset maps,
+    /// and pass-1 wide-field flag; self-entry registration and the raw versus
+    /// predictor/Flate choice stay in this owner.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_xref_stream(
+        offsets: &mut BTreeMap<u32, usize>,
+        member_new: &BTreeMap<u32, (u32, u32)>,
+        start: u32,
+        count: u32,
+        xref_id: u32,
+        xref_offset: usize,
+        max_offset: u64,
+        max_id: u32,
+        max_ostream_index: u64,
+        hint_length: u64,
+        hint: Option<(u32, u64, u64)>,
+        filtered: bool,
+        skip_compression: bool,
+        force_wide_field2: bool,
+    ) -> Result<XrefStreamLayout> {
+        let mut entries =
+            build_entries_with_self(offsets, member_new, start, count, xref_id, xref_offset);
+        if let Some((hint_id, hint_offset, hint_length)) = hint {
+            apply_hint_offset(&mut entries, start, hint_id, hint_offset, hint_length)?;
+        }
+        let widths = if force_wide_field2 {
+            first_pass_widths(max_id, max_ostream_index, hint_length)
+        } else {
+            second_pass_widths(max_offset, hint_length, max_id, max_ostream_index)
+        };
+        let payload = encode_payload_for_policy(&entries, widths, filtered, skip_compression)?;
+        Ok(XrefStreamLayout { widths, payload })
     }
 
     /// Encode a cross-reference stream object and pad it with trailing spaces to
@@ -689,11 +795,11 @@ pub(crate) mod xref_stream {
     pub(crate) fn write_padded_region(
         object: ObjectRef,
         dict: &XrefStreamDict,
-        payload: &[u8],
+        layout: &XrefStreamLayout,
         region_len: usize,
     ) -> Result<(Vec<u8>, Option<std::ops::Range<usize>>)> {
         let mut buf = Vec::with_capacity(region_len);
-        let id_range = write_object(&mut buf, object, dict, payload);
+        let (_, id_range) = write_xref_stream(&mut buf, object, dict, layout, false, None);
         if buf.len() > region_len {
             return Err(crate::Error::Unsupported(format!(
                 "linearized xref stream object ({} bytes) exceeds its reserved region \
@@ -703,5 +809,120 @@ pub(crate) mod xref_stream {
         }
         buf.resize(region_len, b' ');
         Ok((buf, id_range))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn build_entries_with_self_registers_a_zero_generation_type1_row() {
+            let mut offsets = BTreeMap::new();
+            offsets.insert(1, 12usize);
+            let mut members = BTreeMap::new();
+            members.insert(2, (4, 7));
+
+            let entries = build_entries_with_self(&mut offsets, &members, 0, 3, 1, 99);
+
+            assert_eq!(offsets.get(&1), Some(&99));
+            assert_eq!(entries[0].entry_type, 0);
+            assert_eq!(entries[1].entry_type, 1);
+            assert_eq!(entries[1].field2, 99);
+            assert_eq!(entries[1].field3, 0);
+            assert_eq!(entries[2].entry_type, 2);
+            assert_eq!(entries[2].field2, 4);
+            assert_eq!(entries[2].field3, 7);
+        }
+
+        #[test]
+        fn build_entries_with_self_registers_even_when_the_range_omits_self() {
+            let mut offsets = BTreeMap::new();
+            let members = BTreeMap::new();
+
+            let entries = build_entries_with_self(&mut offsets, &members, 0, 1, 1, 0);
+            assert_eq!(offsets.get(&1), Some(&0));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].entry_type, 0);
+        }
+
+        #[test]
+        fn payload_policy_selects_raw_predictor_and_flate_paths() {
+            let entries = [XrefStreamEntry {
+                entry_type: 1,
+                field2: 12,
+                field3: 0,
+            }];
+            let widths = [1, 1, 1];
+
+            let raw =
+                encode_payload_for_policy(&entries, widths, false, false).expect("raw payload");
+            let predictor = encode_payload_for_policy(&entries, widths, true, true)
+                .expect("pass-1 predictor payload");
+            let flate = encode_payload_for_policy(&entries, widths, true, false)
+                .expect("compressed payload");
+
+            assert_eq!(raw.len(), 3);
+            assert_eq!(predictor.len(), 4);
+            assert_ne!(flate, predictor);
+        }
+
+        #[test]
+        fn hint_offsets_and_explicit_max_offset_follow_qpdf_layout_inputs() {
+            let mut entries = [
+                XrefStreamEntry {
+                    entry_type: 1,
+                    field2: 49,
+                    field3: 0,
+                },
+                XrefStreamEntry {
+                    entry_type: 1,
+                    field2: 50,
+                    field3: 0,
+                },
+                XrefStreamEntry {
+                    entry_type: 1,
+                    field2: 60,
+                    field3: 0,
+                },
+            ];
+            apply_hint_offset(&mut entries, 0, 1, 50, 5).expect("hint correction");
+            assert_eq!(entries[0].field2, 49);
+            assert_eq!(entries[1].field2, 50);
+            assert_eq!(entries[2].field2, 65);
+            apply_hint_offset(&mut entries, 0, 1, 50, 0).expect("zero-length hint is a no-op");
+
+            let mut overflow = [XrefStreamEntry {
+                entry_type: 1,
+                field2: u64::MAX,
+                field3: 0,
+            }];
+            let error = apply_hint_offset(&mut overflow, 0, 99, 0, 1)
+                .expect_err("hint addition must not wrap");
+            assert!(
+                matches!(error, crate::Error::Unsupported(message) if message.contains("overflows"))
+            );
+
+            let mut offsets = BTreeMap::new();
+            offsets.insert(1, 65_536usize);
+            let layout = prepare_xref_stream(
+                &mut offsets,
+                &BTreeMap::new(),
+                0,
+                2,
+                0,
+                0,
+                65_536,
+                0,
+                0,
+                0,
+                None,
+                false,
+                false,
+                false,
+            )
+            .expect("explicit max offset");
+            assert_eq!(layout.widths, [1, 3, 0]);
+            assert_eq!(max_offset_for_range(&offsets, 0, 2), 65_536);
+        }
     }
 }
