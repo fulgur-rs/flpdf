@@ -291,17 +291,23 @@ impl ArgParser {
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
+                // clap dispatches a native subcommand only from the command
+                // position: the first residual token after the program name.
+                // Only there does a following `--` belong to clap (its
+                // end-of-options marker) rather than qpdf's main-table section
+                // reset (`QPDFArgParser.cc:437-560`); qpdf has no positional
+                // subcommands. A subcommand-named token that merely appears
+                // inside a retained qpdf segment (e.g. `rewrite` as an
+                // `--encrypt` password) must not trip this, so match only
+                // `residual_args[1]`, not any residual token.
                 if residual_args
-                    .iter()
-                    .skip(1)
-                    .any(|pushed| self.is_subcommand_token(pushed))
+                    .get(1)
+                    .is_some_and(|pushed| self.is_subcommand_token(pushed))
                 {
                     // A native clap subcommand (e.g. `flpdf rewrite -- -in.pdf`)
-                    // already owns this argv, so its `--` is clap's
-                    // end-of-options marker, not qpdf's main-table section
-                    // reset. qpdf has no such subcommands; preserve the marker
-                    // and hand the remaining tokens to clap verbatim so
-                    // dash-prefixed positional paths keep working.
+                    // owns this argv; preserve the marker and hand the
+                    // remaining tokens to clap verbatim so dash-prefixed
+                    // positional paths keep working.
                     residual_args.push(arg);
                     residual_args.extend(iter);
                     break;
