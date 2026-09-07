@@ -165,7 +165,7 @@ struct StreamInput<R: Read + Seek + 'static> {
     /// deferred foreign-stream provider retains the source it captured before
     /// `QPDF::closeInputSource` (`libqpdf/QPDF.cc:278-281,2265-2273`).
     reader: Option<Rc<RefCell<R>>>,
-    header_offset: usize,
+    header_offset: Cell<usize>,
     last_offset: Cell<u64>,
 }
 
@@ -173,7 +173,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     fn new(reader: R, header_offset: usize) -> Self {
         Self {
             reader: Some(Rc::new(RefCell::new(reader))),
-            header_offset,
+            header_offset: Cell::new(header_offset),
             last_offset: Cell::new(0),
         }
     }
@@ -181,7 +181,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     fn invalid() -> Self {
         Self {
             reader: None,
-            header_offset: 0,
+            header_offset: Cell::new(0),
             last_offset: Cell::new(0),
         }
     }
@@ -197,7 +197,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     }
 
     fn seek(&self, offset: u64) -> Result<()> {
-        let physical = (self.header_offset as u64).saturating_add(offset);
+        let physical = (self.header_offset.get() as u64).saturating_add(offset);
         self.active_reader()?
             .borrow_mut()
             .seek(SeekFrom::Start(physical))?;
@@ -209,7 +209,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
             .active_reader()?
             .borrow_mut()
             .stream_position()?
-            .saturating_sub(self.header_offset as u64))
+            .saturating_sub(self.header_offset.get() as u64))
     }
 
     fn source_length(&self) -> Result<u64> {
@@ -217,7 +217,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         let position = reader.stream_position()?;
         let end = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(position))?;
-        Ok(end.saturating_sub(self.header_offset as u64))
+        Ok(end.saturating_sub(self.header_offset.get() as u64))
     }
 
     fn seek_relative(&self, delta: u64) -> Result<()> {
@@ -261,7 +261,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
                 .seek(SeekFrom::End(0))
                 .map_err(|error| StreamReadError::Operation(error.into()))?;
             self.last_offset
-                .set(end.saturating_sub(self.header_offset as u64));
+                .set(end.saturating_sub(self.header_offset.get() as u64));
         }
         Ok(filled)
     }
@@ -289,7 +289,7 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     /// 84-155,159-245`).
     fn read_logical_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = self.read_underlying_bytes()?;
-        let header_offset = self.header_offset.min(bytes.len());
+        let header_offset = self.header_offset.get().min(bytes.len());
         bytes.drain(..header_offset);
         Ok(bytes)
     }
@@ -451,6 +451,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     encryption_parameters: Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResolverWarningOptions {
     logger: crate::QPDFLogger,
     suppress_warnings: bool,
@@ -1716,8 +1717,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.fixed_dangling_refs = false;
         }
 
-        // Push repair warnings (QPDF.cc:528-530)
-        self.push_warning("file is damaged")?;
+        // Push repair warnings (QPDF.cc:528-530). qpdf builds both bracketing
+        // warnings with `damagedPDF("", 0, ...)`, i.e. an explicit offset of 0,
+        // so neither carries a file position; only the triggering exception in
+        // between reports one. Using the input's last offset here would attach a
+        // position qpdf never prints.
+        self.push_warning_at(0, "file is damaged")?;
 
         match trigger_error {
             Error::QpdfExc(warning) => self.push_qpdf_warning(warning)?,
@@ -1733,7 +1738,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
             _ => unreachable!("guard above ensures a qpdf damage variant"), // cov:ignore: unreachable after guard
         }
-        self.push_warning("Attempting to reconstruct cross-reference table")?;
+        self.push_warning_at(0, "Attempting to reconstruct cross-reference table")?;
 
         // Read logical bytes (header_offset already consumed), matching qpdf's
         // OffsetInputSource which seeks to logical-0 at QPDF.cc:543.
@@ -2811,6 +2816,67 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// initial xref/trailer snapshot has been loaded outside the resolver.
     pub(crate) fn set_last_offset(&self, offset: u64) {
         self.core.borrow().input.borrow().last_offset.set(offset);
+    }
+
+    /// Install the logical header offset chosen by the document's initial
+    /// header scan.  The source is already owned by this resolver before the
+    /// scan starts; changing the offset here is the Rust equivalent of qpdf's
+    /// `OffsetInputSource` wrapper (`QPDF.cc:406-409`).
+    pub(crate) fn set_header_offset(&self, offset: usize) {
+        let mut core = self.core.borrow_mut();
+        core.header_offset = offset;
+        core.input.borrow().header_offset.set(offset);
+    }
+
+    /// Replace the source xref table after the initial section has been read.
+    ///
+    /// The document exists before xref parsing, so a classic trailer can mint
+    /// its indirect children in this same resolver cache.  Later xref sections
+    /// update that one table as they are discovered; no trailer rebind is
+    /// required at the handoff boundary.
+    pub(crate) fn install_source_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>) {
+        let mut core = self.core.borrow_mut();
+        if core.reconstructed_xref {
+            // The document reconstructed its own table while the loader was
+            // still resolving the trailer, so the loader's table is the stale
+            // one. qpdf keeps the repaired offsets in the same place it repairs
+            // them: `reconstruct_xref` rewrites `m->xref_table` in situ
+            // (`QPDF.cc:518-620`) and the caller resumes against that table
+            // rather than reinstating what it had read.
+            return;
+        }
+        core.source_xref_entries = entries;
+        core.fixed_dangling_refs = false;
+    }
+
+    /// Carry the open-time reconstruction bit into the resolver that owned
+    /// the document during xref parsing.
+    pub(crate) fn set_reconstructed_xref(&self, value: bool) {
+        // Never clear the flag: qpdf reconstructs at most once per document
+        // (`QPDF.cc:518-522` returns immediately when `reconstructed_xref` is
+        // already set), so a loader that did not observe the reconstruction
+        // must not reopen that door.
+        let mut core = self.core.borrow_mut();
+        core.reconstructed_xref |= value;
+    }
+
+    /// Install diagnostics collected by the xref reader without replaying
+    /// them to the logger.  The document warning collection remains the single
+    /// source after the pre-parse handoff.
+    pub(crate) fn install_repair_diagnostics(&self, diagnostics: Diagnostics) {
+        let mut core = self.core.borrow_mut();
+        if core.repair_diagnostics.is_empty() {
+            core.repair_diagnostics = diagnostics;
+            return;
+        }
+        // Warnings the document already recorded during the trailer resolution
+        // come first, matching the order they reached the logger; the loader's
+        // own set is appended rather than replacing them, since qpdf
+        // accumulates every warning on one document
+        // (`QPDF::warn` pushes onto `m->warnings`, `QPDF.cc:1250-1258`).
+        for warning in diagnostics.entries() {
+            core.repair_diagnostics.push(warning.clone());
+        }
     }
 
     /// Return the logical source bytes while restoring the resolver's current

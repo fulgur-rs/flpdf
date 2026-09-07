@@ -8,7 +8,7 @@ use crate::cache::ObjectCache;
 use crate::error::EncryptedError;
 use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::{PdfOpenOptions, ReopenableFile};
-use crate::xref::{load_xref_state_with_options, XrefLoadOptions};
+use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
 #[allow(unused_imports)]
 use crate::{Error, ObjectHandle, XrefForm};
 use crate::{Pdf, Result};
@@ -62,6 +62,19 @@ fn qpdf_initial_read_error(description: &[u8], read_attempted: bool, error: Erro
     let mut message = description.to_vec();
     message.extend_from_slice(b": read 1024 bytes");
     Error::SystemBytes(message)
+}
+
+fn read_initial_source<R: Read + Seek>(reader: &mut R, description: &[u8]) -> Result<Vec<u8>> {
+    let mut tracked = BootstrapReadTracker::new(reader);
+    let result = (|| {
+        tracked.seek(std::io::SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        tracked.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    result.map_err(|error: std::io::Error| {
+        qpdf_initial_read_error(description, tracked.read_attempted, error.into())
+    })
 }
 
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
@@ -228,35 +241,52 @@ impl<R: Read + Seek> Pdf<R> {
             options.suppress_warnings,
             options.description.clone(),
         );
-        let loaded_state = {
-            let mut bootstrap_reader = BootstrapReadTracker::new(&mut reader);
-            match load_xref_state_with_options(
-                &mut bootstrap_reader,
-                XrefLoadOptions {
-                    allow_repair: options.repair,
-                    ignore_xref_streams: options.ignore_xref_streams,
-                    description: options.description.clone(),
-                },
-            ) {
-                Ok(state) => state,
-                Err(error) => {
-                    let error = qpdf_initial_read_error(
-                        &options.description,
-                        bootstrap_reader.read_attempted,
-                        error,
-                    );
-                    if let Some((_, diagnostics)) = error.open_failure() {
-                        warning_options.replay_warnings(diagnostics)?;
-                    }
-                    return Err(error);
+        // Read the source through the same input boundary that will be owned
+        // by the document resolver.  The document itself is constructed before
+        // xref parsing below; only this byte snapshot is a scan aid for the
+        // existing xref/recovery code.
+        let source_bytes = match read_initial_source(&mut reader, &options.description) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Some((_, diagnostics)) = error.open_failure() {
+                    // cov:ignore: read_initial_source only returns source transport errors, never an OpenFailure
+                    warning_options.replay_warnings(diagnostics)?; // cov:ignore: read_initial_source only returns source transport errors, never an OpenFailure
                 }
+                return Err(error);
             }
         };
-        // Keep the temporary bootstrap resolver alive until every returned
-        // handle has been rebound to this Pdf's canonical resolver. Its Drop
-        // intentionally disconnects the temporary cache to break cycles, so
-        // allowing a partial-move drop here would invalidate `loaded.trailer`
-        // before the rebind below.
+        let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
+        let resolver = ResolverHandle::new_shared(
+            reader,
+            0,
+            BTreeMap::new(),
+            options.repair,
+            false,
+            crate::Diagnostics::default(),
+            warning_options.clone(),
+            unique_id,
+        );
+        let loaded_state = match load_xref_state_from_bytes(
+            &source_bytes,
+            XrefLoadOptions {
+                allow_repair: options.repair,
+                ignore_xref_streams: options.ignore_xref_streams,
+                description: options.description.clone(),
+            },
+            Some(resolver.as_ref()),
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some((_, diagnostics)) = error.open_failure() {
+                    warning_options.replay_warnings(diagnostics)?;
+                }
+                return Err(error);
+            }
+        };
+        // Xref-stream/ObjStm parsing still has a temporary bootstrap owner in
+        // this slice.  The classic trailer itself was parsed by `resolver`;
+        // keep that distinction explicit until the follow-up cutover removes
+        // the remaining bootstrap handoff.
         let bootstrap_cache = loaded_state.bootstrap_cache;
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
@@ -276,45 +306,40 @@ impl<R: Read + Seek> Pdf<R> {
         sorted_object_offsets.sort_unstable();
         sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
-        // Hoisted out of the struct literal because the resolver needs the
-        // same id: it stamps `pdf_unique_id` onto every canonical handle it
-        // mints, which `ObjectHandle::belongs_to_pdf` answers on.
-        let unique_id = unique_id.unwrap_or_else(|| NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed));
         let initial_diagnostics = loaded.repair_diagnostics.clone();
-        let resolver = ResolverHandle::new_shared(
-            reader,
-            header_offset,
-            source_xref_entries,
-            options.repair,
-            already_reconstructed,
-            loaded.repair_diagnostics,
-            warning_options,
-            unique_id,
-        );
+        resolver.set_header_offset(header_offset);
+        resolver.install_source_xref_entries(source_xref_entries);
+        resolver.set_reconstructed_xref(already_reconstructed);
+        resolver.install_repair_diagnostics(loaded.repair_diagnostics.clone());
         // QPDF's parser registers indirect references while reading every
         // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
-        // Transfer that existing bootstrap parse result into the canonical
-        // cache before any count/allocation or encryption consumer can run.
-        // These cache-only entries stay unresolved until an accessor needs them.
+        // The initial classic trailer already used this resolver; retain the
+        // same cache-only registration step for xref-stream/recovery handles
+        // until their bootstrap cutover lands.
         for object_ref in trailer_references {
             if object_ref.number != 0 && object_ref.generation != u16::MAX {
                 resolver.get_object_handle(object_ref);
             }
         }
-        // qpdf's readTrailer resets InputSource::last_offset to the xref
-        // read position before initializeEncryption runs
-        // (QPDF.cc:1313-1327). Xref loading happens in a byte snapshot before
-        // the canonical resolver is constructed, so seed its shared input
-        // source with the same logical startxref position.
+        // qpdf's readTrailer resets InputSource::last_offset to the xref read
+        // position before initializeEncryption runs (QPDF.cc:1313-1327).
         resolver.set_last_offset(loaded.startxref);
         resolver.replay_warnings(&initial_diagnostics)?;
-        let trailer = resolver.direct_object_handle(crate::reader::rebind_handle_value(
-            &resolver,
-            &loaded.trailer,
-        )?); // cov:ignore: bootstrap xref loading guarantees this direct value boundary
-             // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
-             // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
-             // separate copy kept in sync.
+        let trailer = if loaded
+            .trailer
+            .owning_pdf_unique_id()
+            .is_some_and(|owner| owner == unique_id)
+        {
+            loaded.trailer
+        } else {
+            resolver.direct_object_handle(crate::reader::rebind_handle_value(
+                &resolver,
+                &loaded.trailer,
+            )?) // cov:ignore: xref-stream/recovery bootstrap trailers remain until their follow-up cutover
+        };
+        // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
+        // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
+        // separate copy kept in sync.
         let encryption = resolver.encryption_parameters();
         let mut pdf = Self {
             unique_id,
@@ -690,8 +715,44 @@ impl Pdf<Cursor<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::{Pdf, EMPTY_PDF_BYTES};
-    use crate::{Error, PdfOpenOptions};
-    use std::io::{Read, Seek, SeekFrom};
+    use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
+    use crate::xref::{load_xref_state_from_bytes, XrefLoadOptions};
+    use crate::{Error, ObjectRef, PdfOpenOptions, QPDFLogger};
+    use std::collections::BTreeMap;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    #[test]
+    fn classic_trailer_children_are_canonical_before_open_handoff() {
+        let unique_id = 0x12_34_56;
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(EMPTY_PDF_BYTES.to_vec()),
+            0,
+            BTreeMap::new(),
+            true,
+            false,
+            crate::Diagnostics::default(),
+            ResolverWarningOptions::new(QPDFLogger::default_logger(), false, Vec::new()),
+            unique_id,
+        );
+        let loaded = load_xref_state_from_bytes(
+            EMPTY_PDF_BYTES,
+            XrefLoadOptions::default(),
+            Some(resolver.as_ref()),
+        )
+        .expect("classic xref should load through the canonical owner");
+
+        let trailer_root = loaded
+            .loaded
+            .trailer
+            .try_get_key(b"/Root")
+            .expect("trailer /Root lookup");
+        let cached_root = resolver.get_object_handle(ObjectRef::new(1, 0));
+        assert!(
+            trailer_root.is_same_object_as(&cached_root),
+            "classic trailer indirect children must be the canonical cache slot"
+        );
+        assert_eq!(trailer_root.owning_pdf_unique_id(), Some(unique_id));
+    }
 
     #[test]
     fn initial_seek_failure_is_not_reported_as_a_read_failure() {
