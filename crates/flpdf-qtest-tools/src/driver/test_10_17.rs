@@ -574,24 +574,16 @@ pub(crate) fn run_test_15<R: Read + Seek>(
 ///
 /// Inserts a page manually by mutating the `/Pages` tree directly rather
 /// than through `QPDFPageDocumentHelper`, then calls
-/// `QPDF::updateAllPagesCache` to refresh the cache `getAllPages` reads.
-/// This function ports every step up through the manual `/Kids` append and
-/// the pre-update page-count assertion, all of which use only available
-/// primitives, then stops.
+/// [`flpdf::Pdf::update_all_pages_cache`] (`QPDF::updateAllPagesCache`) to
+/// refresh the cache `get_all_pages` reads.
 ///
-/// GAP(`QPDF::updateAllPagesCache`): no flpdf primitive refreshes a
-/// `getAllPages`-style live cache after a manual page-tree edit —
-/// [`PageDocumentHelper::get_all_pages`] always recomputes from scratch and
-/// has no cache to invalidate (`crates/flpdf/src/page_document_helper.rs`'s
-/// own doc). The three asserts after this call and the final `a.pdf` write
-/// depend on `updateAllPagesCache`'s specific cache-refresh semantics
-/// (`libqpdf/QPDF_pages.cc`) and so are not ported.
-///
-/// `everCalledGetAllPages()` is available as
-/// [`flpdf::Pdf::ever_called_get_all_pages`]; nothing in this crate's own
-/// open/repair path calls `get_all_pages` before a test body runs, so the
-/// leading `assert(!pdf.everCalledGetAllPages())` is expected to hold here
-/// exactly as in qpdf.
+/// qpdf's `getAllPages()` returns a live reference into its own cache, so
+/// its test rereads the refreshed vector through the same binding.
+/// [`PageDocumentHelper::get_all_pages`] returns an owned snapshot instead
+/// (`crates/flpdf/src/page_document_helper.rs`'s own doc notes a later
+/// mutation requires a fresh call), so this port calls it again after
+/// [`flpdf::Pdf::update_all_pages_cache`] to observe the same refreshed
+/// state.
 pub(crate) fn run_test_16<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -609,6 +601,9 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     let page0 = pdf.get_object_handle(page0_ref);
     let page_copy = page0.shallow_copy()?;
     let page = pdf.make_indirect_object_handle(page_copy)?;
+    let page_ref = page
+        .object_ref()
+        .ok_or_else(|| Error::Internal("test 16 new page has no indirect identity".to_string()))?;
     page.replace_key(b"/Contents", contents)?;
 
     // Insert the page manually.
@@ -633,6 +628,16 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     // qpdf requires updateAllPagesCache after direct /Pages manipulation;
     // refresh the canonical page-list cache before the remaining assertions.
     pdf.update_all_pages_cache()?;
+    assert!(pdf.ever_called_get_all_pages());
+    let refreshed_pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    assert_eq!(refreshed_pages.len(), 11);
+    assert_eq!(refreshed_pages.last().copied(), Some(page_ref));
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_static_id(true);
+    writer.set_stream_data_mode(StreamDataMode::Preserve);
+    writer.write()?;
     Ok(())
 }
 
@@ -976,22 +981,37 @@ mod tests {
     /// existing canonical `/Contents`, leaving the new page's real content,
     /// parent, and the page-tree's incremented count unreachable through the
     /// canonical keys every other accessor (and `QPDFWriter`) reads.
+    /// Serializes tests that change the process-wide current directory so
+    /// `run_test_16`'s hardcoded relative `"a.pdf"` write (matching qpdf's
+    /// own `QPDFWriter w(pdf, "a.pdf")`, `test_driver.cc:769`) lands in an
+    /// isolated scratch directory instead of the crate's working tree.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn manual_page_insert_replaces_contents_parent_and_count_on_the_canonical_keys() {
+        let _cwd_guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scratch_dir = tempfile::tempdir().expect("scratch directory for a.pdf");
+        let original_dir = std::env::current_dir().expect("current directory");
+        std::env::set_current_dir(scratch_dir.path()).expect("enter scratch directory");
+
         let mut pdf = Pdf::open_mem_owned_with_options(ten_page_pdf(), PdfOpenOptions::default())
             .expect("open ten-page fixture");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
-        run_test_16(
+        let result = run_test_16(
             &mut pdf,
             b"fixture.pdf",
             None,
             &mut stdout,
             &mut stderr,
             &mut diagnostics_written,
-        )
-        .expect("run_test_16 must succeed against a well-formed 10-page fixture");
+        );
+        std::env::set_current_dir(&original_dir).expect("restore working directory");
+        result.expect("run_test_16 must succeed against a well-formed 10-page fixture");
+        assert!(scratch_dir.path().join("a.pdf").is_file());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
 
@@ -1035,14 +1055,13 @@ mod tests {
             "/Parent must point back at the page tree, not stay absent"
         );
 
-        // `run_test_16`'s own `all_pages.len()` (its local snapshot, taken
-        // before the manual edit) stays 10, matching qpdf's *stale* cached
-        // `all_pages` reference before `updateAllPagesCache()` runs
-        // (`test_driver.cc:761`, this function's own GAP note). A *fresh*
-        // `PageDocumentHelper::get_all_pages()` call, unlike qpdf's cache,
-        // always recomputes from the live tree (`PageDocumentHelper::
-        // get_all_pages`'s own doc), so it already sees the eleventh page
-        // this test just proved was correctly wired up.
+        // `run_test_16`'s own local `all_pages` snapshot (taken before the
+        // manual edit) stays 10, matching qpdf's *stale* `all_pages`
+        // reference before `updateAllPagesCache()` runs (`test_driver.cc:761`).
+        // A fresh `PageDocumentHelper::get_all_pages()` call after that
+        // already sees the eleventh page this test just proved was correctly
+        // wired up -- `run_test_16` itself makes the same call and asserts
+        // the same count.
         let pages = PageDocumentHelper::new(&mut pdf)
             .get_all_pages()
             .expect("get_all_pages");
