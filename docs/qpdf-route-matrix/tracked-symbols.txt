@@ -199,7 +199,6 @@ crates/flpdf/src/writer/rewrite_renumber.rs::CanonicalCatalogFirstRenumber  # D3
 crates/flpdf/src/writer/object_streams/planning.rs::plan_object_streams_with_reachability  # D6 legacy
 crates/flpdf/src/linearization/plan.rs::objstm_membership_linearized_with_eligibility      # D6/D23
 crates/flpdf/src/writer/object_streams/eligibility.rs::get_compressible_objgens            # D8 薄い層
-crates/flpdf/src/writer.rs::source_objstm_container_for_batch            # D9 呼び出し側の再実装
 crates/flpdf/src/writer/object.rs::write_trailer_with_ref_map            # D14 第 2 の trailer 書き出し
 crates/flpdf/src/linearization/writer.rs::write_linearized               # D19 test-only 入口
 crates/flpdf/src/writer.rs::snapshot_catalog_extensions                  # D25 qpdf 非対応の復元機構

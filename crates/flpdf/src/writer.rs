@@ -3335,21 +3335,6 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     Ok(trailer)
 }
 
-/// Recover the source ObjStm identity qpdf obtains from a compressed xref
-/// entry, rather than from the source stream's dictionary type
-/// (`QPDF.cc:2381-2390`).
-fn source_objstm_container_for_batch(
-    batch: &[ObjectRef],
-    source_xref_entries: &BTreeMap<ObjectRef, XrefEntry>,
-) -> Option<ObjectRef> {
-    batch
-        .iter()
-        .find_map(|member| match source_xref_entries.get(member) {
-            Some(XrefEntry::Compressed { stream, .. }) => Some(ObjectRef::new(*stream, 0)),
-            Some(XrefEntry::Free { .. } | XrefEntry::Uncompressed { .. }) | None => None,
-        })
-}
-
 /// Translate a source ObjStm's `/Extends` target into the output container
 /// number. qpdf resolves this relation through the source object-stream map;
 /// only when the target is not itself preserved does it fall back to the
@@ -4218,7 +4203,23 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // object-stream planning: encrypted output keeps the Catalog plain, while
     // linearized output also keeps page dictionaries plain. This legacy route
     // does not produce linearized output, so only output encryption applies.
-    object_streams::filter_objstm_batches_for_output(pdf, &mut plan.batches, false, encrypting)?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
+    object_streams::filter_objstm_batches_for_output(
+        pdf,
+        &mut plan.batches,
+        &mut plan.source_containers,
+        false,
+        encrypting,
+    )?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
+
+    // Preserve mode retains source-container identity from the document-owned
+    // qpdf membership map. The planner captured it before the compressible walk;
+    // the output filter above keeps the parallel vectors aligned when it erases
+    // a root or an encrypted batch.
+    let source_container_for_batch = if options.object_streams == ObjectStreamMode::Preserve {
+        plan.source_containers.clone()
+    } else {
+        vec![None; plan.batches.len()]
+    };
 
     // qpdf's non-linearized standard writer assigns generated ObjStm numbers
     // during the normal enqueue walk. This applies to a source-encrypted PDF
@@ -4235,20 +4236,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         qpdf_generate_removed_refs.extend(plan.removed_refs.iter().copied());
     }
 
-    // Preserve mode retains source-container identity from compressed xref
-    // entries. The specialized non-QDF route must use the same container-first
-    // numbering as qpdf's standard writer, including when an encrypted source
-    // is being rewritten as a plain output by test13.
-    let source_xref_entries = pdf.source_xref_entries();
-    let source_container_for_batch: Vec<Option<ObjectRef>> =
-        if options.object_streams == ObjectStreamMode::Preserve {
-            plan.batches
-                .iter()
-                .map(|batch| source_objstm_container_for_batch(batch, &source_xref_entries))
-                .collect()
-        } else {
-            vec![None; plan.batches.len()]
-        };
     let qpdf_preserve_source_objstm =
         options.object_streams == ObjectStreamMode::Preserve && !plan.batches.is_empty();
 

@@ -8,11 +8,10 @@ use std::num::NonZeroUsize;
 
 use super::eligibility::{
     compressible_objgens_qpdf_plan, eligibility_context, even_split_into_streams_with_cap,
-    is_eligible_for_objstm_handle, EligibilityContext,
+    is_eligible_for_objstm_handle,
 };
 use crate::writer::WriterOptions;
 use crate::ObjectRef;
-use crate::XrefEntry;
 // ── Packing planner types ────────────────────────────────────────────────────
 
 /// Controls how the ObjStm packing planner groups objects into batches.
@@ -66,6 +65,9 @@ impl Default for PlannerConfig {
 pub(crate) struct PackingPlan {
     /// Each inner `Vec` is one ObjStm batch, members in deterministic order.
     pub batches: Vec<Vec<ObjectRef>>,
+    /// Source ObjStm identity for each batch. `None` denotes a generated
+    /// batch; Preserve batches carry qpdf's source container ObjGen.
+    pub source_containers: Vec<Option<ObjectRef>>,
     /// Exact stale generations removed by qpdf's compressible-object walk.
     ///
     /// Standard enqueue does not remove these references. Generate and
@@ -163,7 +165,6 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
         return Ok(PackingPlan::default());
     }
 
-    let ctx = eligibility_context(pdf)?;
     let length_exclusions =
         if config.mode == ObjectStreamMode::Preserve && config.preserve_unreferenced_objects {
             // QPDFWriter::preserveObjectStreams keeps every source member when
@@ -178,7 +179,34 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
         ObjectStreamMode::Disable => {
             unreachable!() // cov:ignore: the early Disable return makes this arm unreachable
         }
-        ObjectStreamMode::Preserve => plan_preserve(pdf, &ctx, &length_exclusions),
+        ObjectStreamMode::Preserve => {
+            let source_plan = plan_qpdf_preserve_object_streams_with_unreferenced(
+                pdf,
+                config.preserve_unreferenced_objects,
+            )?; // cov:ignore: LLVM attributes this covered multiline planner terminator to the call setup
+            let mut batches = Vec::with_capacity(source_plan.groups.len());
+            let mut source_containers = Vec::with_capacity(source_plan.groups.len());
+            for group in source_plan.groups {
+                match group {
+                    ObjectStreamGroup::SourceBacked { source, members } => {
+                        source_containers.push(Some(source));
+                        batches.push(members);
+                    }
+                    ObjectStreamGroup::Synthetic { .. } | ObjectStreamGroup::Generated { .. } => {
+                        // cov:ignore-start: the shared Preserve planner returns SourceBacked groups only.
+                        return Err(crate::Error::Internal(
+                            "Preserve planner returned a generated ObjStm group".to_string(),
+                        )); // cov:ignore: defensive invariant rejects an impossible generated group
+                            // cov:ignore-end
+                    }
+                }
+            }
+            Ok(PackingPlan {
+                batches,
+                source_containers,
+                removed_refs: source_plan.removed_refs,
+            })
+        }
         ObjectStreamMode::Generate => plan_generate(pdf, config, &length_exclusions, reachable),
     }
 }
@@ -192,6 +220,7 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
 pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     batches: &mut Vec<Vec<ObjectRef>>,
+    source_containers: &mut Vec<Option<ObjectRef>>,
     output_linearized: bool,
     output_encrypted: bool,
 ) -> crate::Result<()> {
@@ -204,10 +233,17 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
         BTreeSet::new()
     };
 
-    for batch in batches.iter_mut() {
+    let mut retained_batches = Vec::with_capacity(batches.len());
+    let mut retained_sources = Vec::with_capacity(source_containers.len());
+    for (mut batch, source) in batches.drain(..).zip(source_containers.drain(..)) {
         batch.retain(|member| root != Some(*member) && !page_refs.contains(member));
+        if !batch.is_empty() {
+            retained_batches.push(batch);
+            retained_sources.push(source);
+        }
     }
-    batches.retain(|batch| !batch.is_empty());
+    *batches = retained_batches;
+    *source_containers = retained_sources;
     Ok(())
 }
 
@@ -302,58 +338,6 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
 /// qpdf hides dictionary entries whose values resolve to null, but retains
 /// indirect identities reached from arrays even when they are missing, free,
 /// or real-null objects.
-/// Preserve mode: reconstruct source ObjStm grouping.
-fn plan_preserve<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    ctx: &EligibilityContext,
-    length_exclusions: &BTreeSet<ObjectRef>,
-) -> crate::Result<PackingPlan> {
-    let entries = pdf.source_xref_entries();
-
-    // Group members by (container_number, index) so we can reconstruct order.
-    // Key: container object number; Value: list of (index, ObjectRef).
-    let mut groups: BTreeMap<u32, Vec<(u32, ObjectRef)>> = BTreeMap::new();
-
-    for (obj_ref, offset) in &entries {
-        if let XrefEntry::Compressed { stream, index } = offset {
-            groups.entry(*stream).or_default().push((*index, *obj_ref));
-        }
-    }
-
-    let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
-
-    // Iterate containers in ascending container-number order.
-    for (_container_num, mut members) in groups {
-        // Sort by index within the container to get deterministic order.
-        members.sort_by_key(|(idx, _)| *idx);
-
-        // Filter ineligible members.
-        let mut eligible: Vec<ObjectRef> = Vec::new();
-        for (_idx, obj_ref) in members {
-            if length_exclusions.contains(&obj_ref) {
-                continue;
-            }
-            let eligible_for_objstm = {
-                let obj = pdf.get_object_handle(obj_ref);
-                is_eligible_for_objstm_handle(obj_ref, &obj, ctx)?
-            };
-            if !eligible_for_objstm {
-                continue;
-            }
-            eligible.push(obj_ref);
-        }
-
-        if !eligible.is_empty() {
-            batches.push(eligible);
-        }
-    }
-
-    Ok(PackingPlan {
-        batches,
-        removed_refs: BTreeSet::new(),
-    })
-}
-
 /// Generate mode: follow qpdf's live compressible-object traversal and evenly
 /// split it across the minimum number of object streams.
 fn plan_generate<R: std::io::Read + std::io::Seek>(
@@ -378,9 +362,11 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     // members can use the same order without changing ordinary documents.
     sort_compressible_for_writer_order(pdf, &mut compressible.eligible);
     let batches = even_split_into_streams_with_cap(&compressible.eligible, config.batch_size_cap);
+    let source_containers = vec![None; batches.len()];
 
     Ok(PackingPlan {
         batches,
+        source_containers,
         removed_refs: compressible.removed_refs,
     })
 }
@@ -397,11 +383,13 @@ fn sort_compressible_for_writer_order<R: Read + Seek + 'static>(
 #[cfg(test)]
 mod tests {
     use super::{
-        sort_compressible_for_writer_order, ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP,
+        plan_object_streams_with_reachability, sort_compressible_for_writer_order,
+        ObjectStreamMode, PlannerConfig, DEFAULT_BATCH_SIZE_CAP,
     };
     use crate::pdf::WriterObjectOrderKey;
-    use crate::ObjectRef;
+    use crate::{ObjectRef, Pdf};
     use std::collections::BTreeMap;
+    use std::io::Cursor;
 
     #[test]
     fn planner_config_default_uses_qpdf_defaults() {
@@ -425,5 +413,22 @@ mod tests {
         sort_compressible_for_writer_order(&pdf, &mut eligible);
 
         assert_eq!(eligible, [primary, foreign]);
+    }
+
+    #[test]
+    fn preserve_plan_keeps_qpdf_source_container_identity() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf").to_vec(),
+        ))
+        .expect("open ObjStm fixture");
+        let config = PlannerConfig::default();
+        let plan = plan_object_streams_with_reachability(&mut pdf, &config, None)
+            .expect("build Preserve plan");
+
+        assert_eq!(
+            plan.source_containers,
+            vec![Some(ObjectRef::new(1, 0))],
+            "specialized Preserve must carry the source ObjStm identity from qpdf's map"
+        );
     }
 }
