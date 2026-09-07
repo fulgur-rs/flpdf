@@ -11,9 +11,10 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
+use flpdf::pipeline::{FlateAction, PlFlate};
 use flpdf::{
     DecodeLevel, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter,
-    TokenFilter, TokenFilterOutput,
+    Pipeline, PipelineResult, TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
@@ -279,6 +280,43 @@ pub(crate) fn run_test_34<R: Read + Seek>(
 // restructuring of qpdf's own two-function shape).
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
+struct FlateBuffer {
+    bytes: Vec<u8>,
+}
+
+impl Pipeline for FlateBuffer {
+    fn identifier(&self) -> &str {
+        "buffer"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+/// Pipe raw bytes through qpdf's direct `Pl_Flate(a_inflate)` stage.
+///
+/// The qpdf test-driver deliberately passes `qpdf_dl_none` to
+/// `pipeStreamData` and supplies a bare codec, so the stream's own filter
+/// dictionary and decode parameters are not consulted. This helper keeps that
+/// raw `write`/`finish` pipeline boundary instead of constructing a synthetic
+/// dictionary for the whole-buffer decoder.
+fn inflate_with_pipeline(raw: &[u8]) -> flpdf::Result<Vec<u8>> {
+    let mut sink = FlateBuffer::default();
+    {
+        let mut flate = PlFlate::new("compress", &mut sink, FlateAction::Inflate)?;
+        flate.write(raw)?;
+        flate.finish()?;
+    }
+    Ok(sink.bytes)
+}
+
 /// `item.isDictionary() && item.getKey("/Type").isName() &&
 /// (item.getKey("/Type").getName() == "/Filespec") &&
 /// item.getKey("/EF").isDictionary() && item.getKey("/EF").getKey("/F").isStream()`
@@ -508,15 +546,9 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         // `/DecodeParms` (in particular any predictor) entirely.
         // `get_raw_stream_data` is `QPDF_Stream::getRawStreamData`, the same
         // undecoded source `pipeStreamData(dl_none)` reads
-        // (`ObjectHandle::get_raw_stream_data`'s own doc), and a synthetic
-        // one-filter `/FlateDecode` dictionary with no `/DecodeParms`
-        // reproduces a bare raw-inflate stage with no predictor applied.
+        // (`ObjectHandle::get_raw_stream_data`'s own doc).
         let raw = ef_f.get_raw_stream_data()?;
-        let synthetic_filter = ObjectHandle::dictionary(vec![(
-            b"/Filter".to_vec(),
-            ObjectHandle::name(b"FlateDecode".to_vec()),
-        )]);
-        let data = flpdf::filters::decode_stream_data(&synthetic_filter, &raw)?;
+        let data = inflate_with_pipeline(raw.as_ref())?;
 
         let dict_handle = ef_f
             .as_stream_dict()
@@ -802,8 +834,20 @@ pub(crate) fn run_test_41<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolved_terminal, run_test_37, run_test_39};
+    use super::{inflate_with_pipeline, resolved_terminal, run_test_37, run_test_39};
     use flpdf::{Pdf, PdfOpenOptions};
+
+    #[test]
+    fn test_36_inflate_stage_matches_qpdf_pipeline_output() {
+        let compressed = [
+            0x78, 0x9c, 0xcb, 0x4b, 0x2d, 0x57, 0x48, 0x49, 0x2c, 0x49, 0x54, 0x48, 0xcb, 0x2f,
+            0x52, 0x28, 0x2e, 0x29, 0x4a, 0x4d, 0xcc, 0xe5, 0x02, 0x00, 0x4c, 0xc9, 0x07, 0x22,
+        ];
+        assert_eq!(
+            inflate_with_pipeline(&compressed).expect("qpdf-shaped Pl_Flate inflate stage"),
+            b"new data for stream\n"
+        );
+    }
 
     fn pdf_with_image_xobject() -> Vec<u8> {
         let objects: &[(u32, &[u8])] = &[

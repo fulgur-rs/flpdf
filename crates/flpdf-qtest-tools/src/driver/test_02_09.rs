@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
+use flpdf::pipeline::{FlateAction, PlFlate};
 use flpdf::{
     DecodeLevel, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter,
     Pipeline, PipelineError, PipelineResult, StreamDataMode, StreamDataProvider,
@@ -352,6 +353,22 @@ impl Pipeline for ByteSink {
     }
 }
 
+/// Pipe a payload through qpdf's direct `Pl_Flate(a_deflate)` stage.
+///
+/// `qpdf/test_driver.cc:test_8` constructs this stage itself instead of
+/// asking a stream dictionary to encode a complete buffer. Keeping that
+/// boundary here preserves the stage's write/finish calls and its exception
+/// contract for the provider fixture.
+fn deflate_with_pipeline(data: &[u8]) -> flpdf::Result<Vec<u8>> {
+    let mut sink = ByteSink::default();
+    {
+        let mut flate = PlFlate::new("compress", &mut sink, FlateAction::Deflate)?;
+        flate.write(data)?;
+        flate.finish()?;
+    }
+    Ok(sink.bytes)
+}
+
 /// qpdf source: `qpdf/test_driver.cc:422-439` (`test_6`).
 ///
 /// `metadata.pipeStreamData(&bufpl, 0, qpdf_dl_none)` decrypts (decode level
@@ -509,11 +526,7 @@ pub(crate) fn run_test_8<R: Read + Seek>(
         ));
     }
 
-    let filter_dict = ObjectHandle::dictionary(vec![(
-        b"/Filter".to_vec(),
-        ObjectHandle::name(b"FlateDecode".to_vec()),
-    )]);
-    let compressed = flpdf::filters::encode_stream_data(&filter_dict, b"new data for stream\n")?;
+    let compressed = deflate_with_pipeline(b"new data for stream\n")?;
     let provider = Rc::new(LengthBugProvider {
         data: Rc::new(compressed),
         bad_length: Cell::new(false),
@@ -590,13 +603,26 @@ pub(crate) fn run_test_9<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::{run_test_3, run_test_5, StdoutPipeline};
+    use super::{deflate_with_pipeline, run_test_3, run_test_5, StdoutPipeline};
     use flpdf::{ObjectHandle, Pdf, Pipeline};
     use std::collections::BTreeMap;
     use std::io::{self, Write};
     use std::rc::Rc;
 
     struct FailAfterHeader;
+
+    #[test]
+    fn test_8_deflate_stage_matches_qpdf_pipeline_bytes() {
+        let compressed = deflate_with_pipeline(b"new data for stream\n")
+            .expect("qpdf-shaped Pl_Flate deflate stage");
+        assert_eq!(
+            compressed,
+            [
+                0x78, 0x9c, 0xcb, 0x4b, 0x2d, 0x57, 0x48, 0x49, 0x2c, 0x49, 0x54, 0x48, 0xcb, 0x2f,
+                0x52, 0x28, 0x2e, 0x29, 0x4a, 0x4d, 0xcc, 0xe5, 0x02, 0x00, 0x4c, 0xc9, 0x07, 0x22,
+            ]
+        );
+    }
 
     impl Write for FailAfterHeader {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
