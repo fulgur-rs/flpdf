@@ -358,15 +358,14 @@ crates/flpdf/src/object_handle.rs::pipe_stream_data_for_object_stream: prod 1 (1
     crates/flpdf/src/reader/resolver.rs 1
 crates/flpdf/src/stream_filter.rs::decode_filter_specs_from_handle: prod 3 (1 files) / test 0
     crates/flpdf/src/filters.rs 3
-crates/flpdf/src/filters.rs::decode_stream_data: prod 3 (2 files) / test 1
-    crates/flpdf-qtest-tools/src/compare.rs 2, crates/flpdf-qtest-tools/src/driver/test_34_41.rs 1
+crates/flpdf/src/filters.rs::decode_stream_data: prod 2 (1 file) / test 1
+    crates/flpdf-qtest-tools/src/compare.rs 2
 crates/flpdf/src/filters.rs::decode_stream_data_from_handle: prod 4 (3 files) / test 0
     crates/flpdf/src/xref.rs 2, crates/flpdf/src/filespec_helper/embedded_file_stream.rs 1, crates/flpdf/src/resources.rs 1
 crates/flpdf/src/filters.rs::decode_stream_data_recovering: prod 0 (0 files) / test 1
 crates/flpdf/src/filters.rs::decode_stream_data_recovering_with_limits: prod 2 (2 files) / test 2
     crates/flpdf-qtest-tools/src/driver/test_0_1.rs 1, crates/flpdf/src/filters.rs 1
-crates/flpdf/src/filters.rs::encode_stream_data: prod 1 (1 files) / test 3
-    crates/flpdf-qtest-tools/src/driver/test_02_09.rs 1
+crates/flpdf/src/filters.rs::encode_stream_data: prod 0 (0 files) / test 3
 crates/flpdf/src/filters.rs::encode_stream_data_from_handle: prod 4 (3 files) / test 0
     crates/flpdf/src/overlay_appearance_stream.rs 2, crates/flpdf/src/filters.rs 1, crates/flpdf/src/writer/object_streams/emission.rs 1
 crates/flpdf/src/filters.rs::is_decoded_filter: prod 1 (1 files) / test 0
