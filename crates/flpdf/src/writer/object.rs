@@ -7,7 +7,7 @@
 //! and emission-time string policy.  Keeping this boundary in `writer/`
 //! prevents the object model from growing a second writer responsibility.
 
-use crate::object_handle::{legacy_dictionary_key, ObjectHandle, ObjectValue};
+use crate::object_handle::{ObjectHandle, ObjectValue};
 use crate::{Error, ObjectRef, Result};
 use std::collections::BTreeSet;
 
@@ -364,9 +364,9 @@ fn destroyed_unparse_error() -> Error {
 }
 
 fn write_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
-    if key.starts_with(b"/") {
+    if let Some(key) = key.strip_prefix(b"/") {
         out.push(b'/');
-        crate::pdf_syntax::write_name_escaped(out, legacy_dictionary_key(key));
+        crate::pdf_syntax::write_name_escaped(out, key);
     } else {
         // QPDF_Name::normalizeName preserves the first byte of a raw qpdf
         // dictionary key (`libqpdf/QPDF_Name.cc:27-50`). In particular,
@@ -3967,6 +3967,16 @@ mod tests {
         out.push(b' ');
         write_dictionary_key(&mut out, b"Raw");
         assert_eq!(out, b"/Canonical Raw");
+    }
+
+    #[test]
+    fn writer_name_emission_uses_canonical_keys_without_the_legacy_bridge() {
+        let source = include_str!("object.rs");
+        let legacy_name = ["legacy", "dictionary_key"].join("_");
+        assert!(
+            !source.contains(&legacy_name),
+            "writer name emission must consume canonical slash-prefixed keys directly"
+        );
     }
 
     #[test]
