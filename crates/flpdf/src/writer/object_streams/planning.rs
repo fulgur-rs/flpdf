@@ -165,16 +165,6 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
         return Ok(PackingPlan::default());
     }
 
-    let length_exclusions =
-        if config.mode == ObjectStreamMode::Preserve && config.preserve_unreferenced_objects {
-            // QPDFWriter::preserveObjectStreams keeps every source member when
-            // preserveUnreferencedObjects is set; it does not run the
-            // getCompressibleObjGens intersection in that branch.
-            BTreeSet::new()
-        } else {
-            compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs
-        };
-
     match config.mode {
         ObjectStreamMode::Disable => {
             unreachable!() // cov:ignore: the early Disable return makes this arm unreachable
@@ -207,7 +197,20 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
                 removed_refs: source_plan.removed_refs,
             })
         }
-        ObjectStreamMode::Generate => plan_generate(pdf, config, &length_exclusions, reachable),
+        ObjectStreamMode::Generate => {
+            // Only Generate consumes the `/Length` exclusions, and only
+            // QPDFWriter::generateObjectStreams calls getCompressibleObjGens
+            // unconditionally. Preserve must not run the walk here: qpdf reads
+            // the source membership map first and only then intersects it with
+            // the compressible set (`QPDFWriter.cc:1941-1957`), an order the
+            // shared Preserve planner already reproduces internally. Running
+            // the walk up front inverted it, because the walk can drop stale
+            // generations from the document xref that the membership map is
+            // about to be read from.
+            let length_exclusions =
+                compressible_objgens_qpdf_plan(pdf)?.indirect_objstm_length_refs;
+            plan_generate(pdf, config, &length_exclusions, reachable)
+        }
     }
 }
 

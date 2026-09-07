@@ -4194,10 +4194,24 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // drops the orphan from every container; the main emit loop already only
     // emits objects present in the renumber map, so the orphan disappears
     // cleanly (qpdf-consistent, matching flpdf's qdf/disable paths).
-    for batch in &mut plan.batches {
+    // Prune the batches and their source-container identities in lockstep:
+    // `filter_objstm_batches_for_output` below zips the two vectors, and `zip`
+    // silently truncates, so dropping an emptied batch here without dropping
+    // its identity would shift every later batch onto the preceding source
+    // ObjStm. qpdf cannot hit this class of bug because the identity lives in
+    // the membership map itself (`QPDFWriter.cc:2164-2170` inserts into
+    // `object_stream_to_objects[stream]`) rather than in a parallel vector.
+    let mut retained_batches = Vec::with_capacity(plan.batches.len());
+    let mut retained_sources = Vec::with_capacity(plan.source_containers.len());
+    for (mut batch, source) in plan.batches.drain(..).zip(plan.source_containers.drain(..)) {
         batch.retain(|member| renumber.new_for_original(*member).is_some());
+        if !batch.is_empty() {
+            retained_batches.push(batch);
+            retained_sources.push(source);
+        }
     }
-    plan.batches.retain(|batch| !batch.is_empty());
+    plan.batches = retained_batches;
+    plan.source_containers = retained_sources;
 
     // QPDFWriter.cc:2141-2160 removes output-sensitive members only after
     // object-stream planning: encrypted output keeps the Catalog plain, while
