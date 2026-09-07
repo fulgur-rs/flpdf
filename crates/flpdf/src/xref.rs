@@ -77,9 +77,25 @@ pub(crate) trait CanonicalTrailerOwner {
     fn direct_handle(&self, value: ObjectValue) -> ObjectHandle;
     fn install_xref_entries(&self, entries: BTreeMap<ObjectRef, XrefEntry>);
     fn set_header_offset(&self, offset: usize);
+    /// Enter the document's parse guard, mirroring qpdf's `QPDF::readTrailer`
+    /// constructing its parser with `this` as the context
+    /// (`libqpdf/QPDF.cc:1317`), which is what arms `QPDF::ParseGuard`.
+    fn begin_parse(&self) -> crate::Result<()>;
+    /// Leave that guard, mirroring `ParseGuard`'s destructor.
+    fn end_parse(&self);
 }
 
 impl<R: Read + Seek + 'static> CanonicalTrailerOwner for ResolverHandle<R> {
+    fn begin_parse(&self) -> crate::Result<()> {
+        self.in_parse(true)
+    }
+
+    fn end_parse(&self) {
+        // Mirrors `ChildHandles`: `begin_parse` set the flag, so the symmetric
+        // "already false" branch cannot be observed from here.
+        let _ = self.in_parse(false);
+    }
+
     fn indirect_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
         self.get_object_handle(object_ref)
     }
@@ -932,6 +948,18 @@ impl HandleResolver for CanonicalTrailerParser<'_> {
 
     fn description_template(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    fn begin_parse(&self) -> Result<()> {
+        // The classic trailer is parsed by the document-owned resolver, and
+        // qpdf holds the guard there: `QPDF::readTrailer` builds its parser
+        // with `this` (`libqpdf/QPDF.cc:1317`), exactly as `readObject` and
+        // `readObjectInStream` do.
+        self.owner.begin_parse()
+    }
+
+    fn end_parse(&self) {
+        self.owner.end_parse();
     }
 }
 

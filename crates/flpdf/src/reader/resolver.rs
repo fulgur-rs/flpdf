@@ -996,7 +996,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// invoking it with `true`/`false` respectively;
     /// [`crate::parser::HandleResolver`]'s `begin_parse`/`end_parse` on
     /// [`ChildHandles`] are the flpdf equivalents.
-    fn in_parse(&self, value: bool) -> Result<()> {
+    pub(crate) fn in_parse(&self, value: bool) -> Result<()> {
         let mut core = self.core.borrow_mut();
         if core.in_parse == value {
             return Err(Error::Internal(REENTRANT_PARSE_ERROR.to_owned()));
