@@ -798,6 +798,89 @@ fn qdf_split_pages_preserves_foreign_original_object_ids() {
 }
 
 #[test]
+fn top_level_double_dash_resets_to_main_options_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let input = fixture_with_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_before_input = temp.path().join("qpdf-before-input.pdf");
+    let flpdf_before_input = temp.path().join("flpdf-before-input.pdf");
+    let qpdf_after_input = temp.path().join("qpdf-after-input.pdf");
+    let flpdf_after_input = temp.path().join("flpdf-after-input.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--", "--qdf", "--static-id"])
+        .arg(input.path())
+        .arg(&qpdf_before_input)
+        .output()
+        .expect("qpdf top-level section reset should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf top-level section reset failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .args(["--", "--qdf", "--static-id"])
+        .arg(input.path())
+        .arg(&flpdf_before_input)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf top-level section reset failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg(input.path())
+        .args(["--", "--qdf", "--static-id"])
+        .arg(&qpdf_after_input)
+        .output()
+        .expect("qpdf post-input section reset should spawn");
+    assert!(
+        qpdf.status.success(),
+        "qpdf post-input section reset failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_STATIC_ID_QUIET", "1")
+        .arg(input.path())
+        .args(["--", "--qdf", "--static-id"])
+        .arg(&flpdf_after_input)
+        .output()
+        .unwrap();
+    assert!(
+        flpdf.status.success(),
+        "flpdf post-input section reset failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    let qpdf_bytes = std::fs::read(&qpdf_before_input).unwrap();
+    assert_eq!(
+        qpdf_bytes,
+        std::fs::read(&qpdf_after_input).unwrap(),
+        "qpdf must treat top-level -- consistently before and after the input"
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_before_input).unwrap(),
+        qpdf_bytes,
+        "flpdf must match qpdf after consuming a top-level --"
+    );
+    assert_eq!(
+        std::fs::read(&flpdf_after_input).unwrap(),
+        qpdf_bytes,
+        "flpdf must match qpdf when top-level -- follows the input"
+    );
+}
+
+#[test]
 fn split_pages_reapplies_stream_data_policy_to_every_chunk() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();

@@ -280,9 +280,12 @@ impl ArgParser {
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
-                residual_args.push(arg);
-                residual_args.extend(iter);
-                break;
+                // At the top level qpdf treats `--` as a section reset and
+                // continues parsing the following arguments with the main
+                // option table (`QPDFArgParser.cc:437-560`). Terminators for
+                // named segments are consumed by the inner loop below and
+                // remain in the residual argv for clap's segment boundary.
+                continue;
             }
 
             let canonical = self.canonical_top_level_option(arg);
