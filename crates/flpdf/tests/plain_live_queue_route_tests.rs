@@ -1,3 +1,5 @@
+use flpdf::{ObjectStreamMode, Pdf, PdfWriter};
+use std::io::Cursor;
 use std::path::Path;
 
 #[test]
@@ -10,4 +12,26 @@ fn plain_disable_uses_the_live_queue_consumer() {
     assert!(body.contains("struct LiveQueue"));
     assert!(body.contains("emit_live_disable"));
     assert!(body.contains("enqueue_handle"));
+}
+
+#[test]
+fn plain_disable_reconciles_direct_adbe_before_live_child_enqueue() {
+    // qpdf 11.9.0: QPDFWriter.cc:1418-1430 replaces stale /ADBE before
+    // unparseChild can enqueue the obsolete indirect /URL value.
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/compat/adbe-orphan-url.pdf").to_vec(),
+    ))
+    .expect("open direct ADBE fixture");
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.force_pdf_version("1.7", 8);
+    writer.set_static_id(true);
+    writer.set_output_memory().expect("configure memory output");
+    writer.write().expect("write live queue output");
+    let output = writer.get_buffer().expect("read memory output");
+    let expected = include_bytes!("../../../tests/fixtures/compat/golden/adbe-orphan-url.qpdf.pdf");
+    assert_eq!(
+        output, expected,
+        "direct ADBE replacement must drop orphan URL"
+    );
 }
