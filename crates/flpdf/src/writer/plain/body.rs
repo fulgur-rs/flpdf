@@ -96,10 +96,12 @@ fn collect_live_seed_handles<R: Read + Seek>(
     // Bound the direct-seed recursion the same way the parser does rather than
     // overflow the stack.
     if depth > crate::parser::MAX_PARSE_DEPTH {
+        // cov:ignore-start: defensive stack bound; parsed input is parser-capped and factory-built seed trees are acyclic, so this overflow arm is unreachable from the corpus.
         return Err(crate::Error::Unsupported(format!(
             "plain live writer: direct seed nesting exceeds maximum of {}",
             crate::parser::MAX_PARSE_DEPTH
         )));
+        // cov:ignore-end
     }
     pdf.resolve(handle)?;
     if let Some(items) = handle.try_as_array()? {
@@ -1819,6 +1821,15 @@ mod object_emitter_tests {
         ]);
         seeds.clear();
         collect_live_seed_handles(&mut local_pdf, &direct_dictionary, &mut seeds, 0)?;
+        assert_eq!(seeds.len(), 1);
+        assert!(seeds[0].is_same_object_as(&child));
+
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Child".to_vec(), child.clone())]),
+            Rc::new(b"seed".to_vec()),
+        );
+        seeds.clear();
+        collect_live_seed_handles(&mut local_pdf, &direct_stream, &mut seeds, 0)?;
         assert_eq!(seeds.len(), 1);
         assert!(seeds[0].is_same_object_as(&child));
 
