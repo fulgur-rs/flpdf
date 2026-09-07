@@ -2441,6 +2441,43 @@ fn json_job_replace_input_keeps_original_when_input_has_warnings() {
     assert!(Path::new(&format!("{}.~qpdf-orig", input.display())).exists());
 }
 
+#[test]
+fn write_qpdf_completes_replace_input_without_run() {
+    let minimal = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("direct-replace.pdf");
+    std::fs::copy(&minimal, &input).unwrap();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "replaceInput": "",
+        "staticId": ""
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    // Bypass `run()` deliberately: qpdf's `writeOutfile` completes the
+    // replace-input rename itself for every caller that reaches it
+    // (`libqpdf/QPDFJob.cc:3057-3086`), so a consumer using the public
+    // `create_qpdf()`/`write_qpdf()` two-stage contract directly must see
+    // the same completed rename `run()` would have produced.
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Success);
+
+    assert!(
+        input.exists(),
+        "the temporary output must be renamed onto the input path"
+    );
+    assert!(
+        !Path::new(&format!("{}.~qpdf-temp#", input.display())).exists(),
+        "the temporary output must be renamed away, not left behind"
+    );
+    assert!(
+        !Path::new(&format!("{}.~qpdf-orig", input.display())).exists(),
+        "a warning-free replace-input deletes its backup"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn job_json_input_file_opens_a_literal_non_utf8_path() {
