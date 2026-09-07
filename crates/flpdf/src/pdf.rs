@@ -5,6 +5,7 @@ use crate::cache::ObjectCache;
 use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::object_handle::DocumentResolver;
 use crate::pages::repair::PreparedPages;
+use crate::pdf_version::{leading_major_minor, PdfVersion};
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::InputSourceControl;
 use crate::{Error, ObjectHandle, ObjectRef, QpdfErrorCode, QpdfExc, Result, XrefForm};
@@ -423,6 +424,44 @@ impl<R: Read + Seek> Pdf<R> {
         level.try_as_integer()
     }
 
+    /// The Adobe extension level, clamped like qpdf's own integer read.
+    ///
+    /// Ports `QPDF::getExtensionLevel` (`libqpdf/QPDF.cc:2328-2346`): the
+    /// `/Extensions /ADBE /ExtensionLevel` value from
+    /// [`Self::adobe_extension_level`], clamped to `i32` range the way
+    /// `QPDFObjectHandle::getIntValueAsInt` clamps every other integer read
+    /// through it (`libqpdf/QPDFObjectHandle.cc:527-542`) -- unlike
+    /// [`Self::adobe_extension_level`] itself, which keeps the full 64-bit
+    /// value. qpdf's `getIntValueAsInt` also warns when the clamp changes
+    /// the value; that warning is not reproduced here.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::adobe_extension_level`]'s errors.
+    pub fn get_extension_level(&mut self) -> Result<i64> {
+        Ok(self
+            .adobe_extension_level()?
+            .unwrap_or(0)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
+    }
+
+    /// The header version paired with the Adobe extension level, as a
+    /// [`PdfVersion`].
+    ///
+    /// Ports `QPDF::getVersionAsPDFVersion` (`libqpdf/QPDF.cc:2305-2320`):
+    /// [`Self::version`]'s leading `M.m` digit-run prefix (defaulting to
+    /// `1.3` when the header does not start that way) paired with
+    /// [`Self::get_extension_level`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::get_extension_level`]'s errors.
+    pub fn get_version_as_pdf_version(&mut self) -> Result<PdfVersion> {
+        let extension_level = self.get_extension_level()?;
+        let (major, minor) = leading_major_minor(self.version());
+        Ok(PdfVersion::new(major, minor, extension_level))
+    }
+
     /// The live trailer dictionary as an [`ObjectHandle`].
     pub fn trailer(&mut self) -> ObjectHandle {
         if let Some(handle) = &self.trailer_handle_memo {
@@ -523,8 +562,64 @@ impl<R: Read + Seek> Pdf<R> {
 #[cfg(test)]
 mod tests {
     use super::{Pdf, WriterObjectOrderKey};
-    use crate::ObjectRef;
+    use crate::{ObjectRef, PdfOpenOptions};
     use std::collections::BTreeMap;
+
+    fn open_recoverable(bytes: &[u8]) -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let options = PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
+        Pdf::open_mem_owned_with_options(bytes.to_vec(), options).expect("open fixture")
+    }
+
+    #[test]
+    fn get_version_as_pdf_version_reads_header_prefix_and_extension_level() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        let version = pdf
+            .get_version_as_pdf_version()
+            .expect("read version and extension level");
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 7);
+        assert_eq!(version.extension_level(), 8);
+    }
+
+    #[test]
+    fn get_version_as_pdf_version_defaults_extension_level_without_extensions() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+              2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        let version = pdf
+            .get_version_as_pdf_version()
+            .expect("read version without an /Extensions chain");
+        assert_eq!(version.major(), 1);
+        assert_eq!(version.minor(), 4);
+        assert_eq!(version.extension_level(), 0);
+    }
+
+    #[test]
+    fn get_extension_level_clamps_a_value_outside_i32_range() {
+        let mut pdf = open_recoverable(
+            b"%PDF-1.7\n1 0 obj\n\
+              << /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /ExtensionLevel 5000000000 >> >> >>\n\
+              endobj\n2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n\
+              trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n",
+        );
+
+        assert_eq!(
+            pdf.get_extension_level().expect("read extension level"),
+            i64::from(i32::MAX)
+        );
+    }
 
     #[test]
     fn writer_order_uses_source_mapped_and_fresh_keys() {
