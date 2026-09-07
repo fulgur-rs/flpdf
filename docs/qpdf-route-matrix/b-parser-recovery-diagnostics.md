@@ -327,6 +327,8 @@ objectが空・offsetが負値なら `filename (): message` を生成する。`.
 このfilename-only/negative-offset形はpinned C++ probeの`case=filename-only`
 出力（`what_cstr=662028293a206d`）でも確認済みである。
 
+2026-09-08に `.48.68` の回帰を qpdf 11.9.0 と照合した。`startxref` が欠落・不正、または値 `0` の場合、qpdf は `QPDF.cc:450-452` で `read_xref` を呼ばず、`QPDF.cc:516-575` の `reconstruct_xref` へ直接進む。flpdf も `load_xref_state_from_bytes` で同じ分岐にし、logical offset 0 の speculative read が先頭の旧 object を canonical cache に登録することを止めた。これにより同一 generation を再利用する Catalog の後発 `/PageLabels` number tree が writer traversal に残り、qpdf の `append-page-content-damaged.pdf` に対する `--static-id -qdf --no-original-object-ids` 出力と 16484 bytes で byte-identical になった。flpdf-authored の `tests/fixtures/compat/recovered-catalog-pagelabels.pdf` と `reader_tests.rs` の `/PageLabels`/`/Nums` 回帰も追加した。
+
 ### 分類集計
 
 | 分類 | 件数 | 行 |

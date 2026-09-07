@@ -22,15 +22,11 @@
 //! `damagedPDF("can't find startxref")` immediately and never calls
 //! `read_xref` at all, whether the zero came from a missing/malformed
 //! `startxref` or a syntactically valid `startxref` that explicitly names
-//! offset 0. `load_xref_state_with_options` instead still attempts a real
-//! parse at logical (header-relative) offset 0 -- index 0 of the already
-//! header-shifted `bytes` slice, not necessarily physical byte 0 of the
-//! original input when repair skipped leading junk -- as a fallback before
-//! recovery in both cases; qpdf has no counterpart for this retry detour,
-//! see the marker comment there. `push_repair_diagnostics` deliberately
-//! records only the initial recovery trigger, faithfully reproducing qpdf's
-//! own three-warning
-//! `reconstruct_xref` sequence either way (`libqpdf/QPDF.cc:450-469,516-531`).
+//! offset 0. `load_xref_state_from_bytes` preserves that boundary and enters
+//! the line-scan recovery directly, so an object at logical offset 0 cannot
+//! enter the canonical cache as a speculative xref read before
+//! `reconstruct_xref` chooses the effective occurrence
+//! (`libqpdf/QPDF.cc:450-469,516-531`).
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
@@ -1717,6 +1713,32 @@ pub(crate) fn load_xref_state_from_bytes(
         // cov:ignore-end
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")), // cov:ignore: the same u64-to-usize overflow is unrepresentable on the supported target
     };
+
+    if allow_repair && startxref == 0 {
+        let trigger = parse_errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Error::parse(0, "can't find startxref"));
+        let mut recovered = recover_xref_from_linear_scan(
+            bytes,
+            version,
+            startxref,
+            trigger,
+            None,
+            None,
+            None,
+            options.clone(),
+            initial_diagnostics,
+            None,
+            canonical_trailer_owner,
+        )?;
+        discard_lower_generations(
+            &mut recovered.loaded.entries,
+            &mut recovered.parsed_xref_streams,
+        );
+        recovered.header_offset = header_offset;
+        return Ok(recovered);
+    }
 
     let mut registration = XrefRegistration::default();
     let mut initial_parse_diagnostics = Diagnostics::default();
