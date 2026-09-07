@@ -102,8 +102,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
 
     /// Resolve `self.annot` and return the key's resolved child handle.
     fn resolved_key(&mut self, key: &[u8]) -> Result<ObjectHandle> {
-        self.pdf.resolve(&self.annot)?;
-        let child = self.annot.get_key(key);
+        let child = self.annot.try_get_key(key)?;
         self.pdf.resolve(&child)?;
         Ok(child)
     }
@@ -190,33 +189,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// ```
     pub fn get_rect(&mut self) -> Result<PageBox> {
         let rect = self.resolved_key(b"/Rect")?;
-        self.array_as_rectangle(&rect)
-    }
-
-    /// Resolve `handle` as a 4-element numeric array into a [`PageBox`],
-    /// mirroring `QPDFObjectHandle::getArrayAsRectangle`.
-    fn array_as_rectangle(&mut self, handle: &ObjectHandle) -> Result<PageBox> {
-        let zero = PageBox::new(0.0, 0.0, 0.0, 0.0);
-        let Some(items) = handle.as_array() else {
-            return Ok(zero);
-        };
-        if items.len() != 4 {
-            return Ok(zero);
-        }
-        let mut nums = [0.0f64; 4];
-        for (i, item) in items.iter().enumerate() {
-            self.pdf.resolve(item)?;
-            let Some(n) = as_number(item) else {
-                return Ok(zero);
-            };
-            nums[i] = n;
-        }
-        Ok(PageBox::new(
-            nums[0].min(nums[2]),
-            nums[1].min(nums[3]),
-            nums[0].max(nums[2]),
-            nums[1].max(nums[3]),
-        ))
+        array_as_rectangle(&rect)
     }
 
     // -----------------------------------------------------------------------
@@ -307,7 +280,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     ) -> Result<ObjectHandle> {
         let ap = self.get_appearance_dictionary()?;
         if ap.as_dictionary().is_some() {
-            let ap_sub = ap.get_key(&dict_key(which));
+            let ap_sub = ap.try_get_key(&dict_key(which))?;
             self.pdf.resolve(&ap_sub)?;
             if ap_sub.as_stream_dict().is_some() {
                 // A direct appearance stream disregards state entirely
@@ -325,7 +298,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
                     _ => self.get_appearance_state()?,
                 };
                 if !desired_state.is_empty() {
-                    let ap_sub_val = ap_sub.get_key(&dict_key(&desired_state));
+                    let ap_sub_val = ap_sub.try_get_key(&dict_key(&desired_state))?;
                     self.pdf.resolve(&ap_sub_val)?;
                     if ap_sub_val.as_stream_dict().is_some() {
                         return Ok(ap_sub_val);
@@ -391,15 +364,15 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         // (`QPDFAnnotationObjectHelper.cc:161-163`) short-circuits: `/BBox`
         // is dereferenced first, and a malformed `/BBox` means `/Rect` is
         // never touched at all.
-        let bbox_handle = appearance_dict.get_key(b"/BBox");
-        let Some(bbox) = self.rectangle_from_handle(&bbox_handle)? else {
+        let bbox_handle = appearance_dict.try_get_key(b"/BBox")?;
+        let Some(bbox) = rectangle_from_handle(&bbox_handle)? else {
             return Ok(Vec::new());
         };
         let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
             return Ok(Vec::new());
         };
-        let matrix_handle = appearance_dict.get_key(b"/Matrix");
-        let matrix = self.matrix_from_handle(&matrix_handle)?.unwrap_or_default();
+        let matrix_handle = appearance_dict.try_get_key(b"/Matrix")?;
+        let matrix = matrix_from_handle(&matrix_handle)?.unwrap_or_default();
 
         let do_rotate = rotate != 0 && (flags & 0x10) != 0;
         let (rect, matrix) = if do_rotate {
@@ -461,52 +434,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// Return a normalized rectangle for a required numeric array key.
     fn rectangle_for_key(&mut self, key: &[u8]) -> Result<Option<Rectangle>> {
         let handle = self.resolved_key(key)?;
-        self.rectangle_from_handle(&handle)
-    }
-
-    /// Return a normalized rectangle when `handle` is a valid four-number array.
-    fn rectangle_from_handle(&mut self, handle: &ObjectHandle) -> Result<Option<Rectangle>> {
-        self.pdf.resolve(handle)?;
-        let Some(items) = handle.as_array() else {
-            return Ok(None);
-        };
-        if items.len() != 4 {
-            return Ok(None);
-        }
-        let mut numbers = [0.0; 4];
-        for (index, item) in items.iter().enumerate() {
-            self.pdf.resolve(item)?;
-            let Some(number) = as_number(item) else {
-                return Ok(None);
-            };
-            numbers[index] = number;
-        }
-        Ok(Some(Rectangle::new(
-            numbers[0].min(numbers[2]),
-            numbers[1].min(numbers[3]),
-            numbers[0].max(numbers[2]),
-            numbers[1].max(numbers[3]),
-        )))
-    }
-
-    /// Return a six-number matrix, or `None` when qpdf would use identity.
-    fn matrix_from_handle(&mut self, handle: &ObjectHandle) -> Result<Option<Matrix>> {
-        self.pdf.resolve(handle)?;
-        let Some(items) = handle.as_array() else {
-            return Ok(None);
-        };
-        if items.len() != 6 {
-            return Ok(None);
-        }
-        let mut numbers = [0.0; 6];
-        for (index, item) in items.iter().enumerate() {
-            self.pdf.resolve(item)?;
-            let Some(number) = as_number(item) else {
-                return Ok(None);
-            };
-            numbers[index] = number;
-        }
-        Ok(Some(Matrix::from(numbers)))
+        rectangle_from_handle(&handle)
     }
 }
 
@@ -525,11 +453,78 @@ fn dict_key(name: &[u8]) -> Vec<u8> {
     key
 }
 
-/// Coerce a resolved [`ObjectHandle`] to `f64` if it is an integer or real,
+/// Resolve `handle` and coerce it to `f64` if it is an integer or real,
 /// mirroring `QPDFObjectHandle::getValueAsNumber`.
-fn as_number(handle: &ObjectHandle) -> Option<f64> {
-    handle
+fn as_number(handle: &ObjectHandle) -> Result<Option<f64>> {
+    handle.try_dereference()?;
+    Ok(handle
         .as_integer()
         .map(|n| n as f64)
-        .or_else(|| handle.as_real())
+        .or_else(|| handle.as_real()))
+}
+
+/// Resolve `handle` as a 4-element numeric array into a [`PageBox`],
+/// mirroring `QPDFObjectHandle::getArrayAsRectangle`.
+fn array_as_rectangle(handle: &ObjectHandle) -> Result<PageBox> {
+    let zero = PageBox::new(0.0, 0.0, 0.0, 0.0);
+    let Some(items) = handle.as_array() else {
+        return Ok(zero);
+    };
+    if items.len() != 4 {
+        return Ok(zero);
+    }
+    let mut nums = [0.0f64; 4];
+    for (i, item) in items.iter().enumerate() {
+        let Some(n) = as_number(item)? else {
+            return Ok(zero);
+        };
+        nums[i] = n;
+    }
+    Ok(PageBox::new(
+        nums[0].min(nums[2]),
+        nums[1].min(nums[3]),
+        nums[0].max(nums[2]),
+        nums[1].max(nums[3]),
+    ))
+}
+
+/// Return a normalized rectangle when `handle` is a valid four-number array.
+fn rectangle_from_handle(handle: &ObjectHandle) -> Result<Option<Rectangle>> {
+    let Some(items) = handle.try_as_array()? else {
+        return Ok(None);
+    };
+    if items.len() != 4 {
+        return Ok(None);
+    }
+    let mut numbers = [0.0; 4];
+    for (index, item) in items.iter().enumerate() {
+        let Some(number) = as_number(item)? else {
+            return Ok(None);
+        };
+        numbers[index] = number;
+    }
+    Ok(Some(Rectangle::new(
+        numbers[0].min(numbers[2]),
+        numbers[1].min(numbers[3]),
+        numbers[0].max(numbers[2]),
+        numbers[1].max(numbers[3]),
+    )))
+}
+
+/// Return a six-number matrix, or `None` when qpdf would use identity.
+fn matrix_from_handle(handle: &ObjectHandle) -> Result<Option<Matrix>> {
+    let Some(items) = handle.try_as_array()? else {
+        return Ok(None);
+    };
+    if items.len() != 6 {
+        return Ok(None);
+    }
+    let mut numbers = [0.0; 6];
+    for (index, item) in items.iter().enumerate() {
+        let Some(number) = as_number(item)? else {
+            return Ok(None);
+        };
+        numbers[index] = number;
+    }
+    Ok(Some(Matrix::from(numbers)))
 }
