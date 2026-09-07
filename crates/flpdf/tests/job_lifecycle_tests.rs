@@ -1661,6 +1661,74 @@ fn job_open_installs_logger_before_open_warnings() {
 }
 
 #[test]
+fn document_warning_api_drains_without_logger_redelivery() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let (logger, state) = logger_with_warning_sink();
+    let pdf = Pdf::open_with_options(
+        BufReader::new(File::open(path).unwrap()),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("repairable input should open");
+    let logged_before_drain = state.lock().unwrap().bytes.clone();
+
+    assert!(pdf.any_warnings());
+    assert!(pdf.num_warnings() > 0);
+    let drained = pdf.get_warnings();
+    assert!(!drained.is_empty());
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        logged_before_drain,
+        "get_warnings must drain collection without replaying logger output"
+    );
+    assert!(!pdf.any_warnings());
+    assert_eq!(pdf.num_warnings(), 0);
+    assert!(pdf.get_warnings().is_empty());
+}
+
+#[test]
+fn inspection_completion_drains_document_warnings_into_job_state() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let (logger, state) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    let mut pdf = job
+        .open(
+            BufReader::new(File::open(path).unwrap()),
+            "repairable.pdf",
+            PdfOpenOptions {
+                repair: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("repairable input should open");
+    assert!(pdf.any_warnings());
+
+    let status = job
+        .inspect(&mut pdf, |_| -> flpdf::Result<()> { Ok(()) })
+        .expect("inspection completion");
+
+    assert_eq!(status, JobExitCode::Warning);
+    assert!(!pdf.any_warnings());
+    assert_eq!(pdf.num_warnings(), 0);
+    let summary = b"qpdf: operation succeeded with warnings\n";
+    let bytes = state.lock().unwrap().bytes.clone();
+    assert_eq!(
+        bytes
+            .windows(summary.len())
+            .filter(|window| *window == summary)
+            .count(),
+        1,
+        "completion must emit one summary after draining document warnings"
+    );
+}
+
+#[test]
 fn inspection_completes_through_the_shared_warning_boundary() {
     let mut job = QPDFJob::new();
     let (logger, state) = logger_with_warning_sink();

@@ -79,6 +79,7 @@ impl QPDFJob {
         pdf: &mut Pdf<R>,
     ) -> Result<JobExitCode> {
         self.check_linearization_report(pdf)?;
+        self.drain_document_warnings(pdf);
         self.complete(false)
     }
 
@@ -149,6 +150,7 @@ impl QPDFJob {
         pdf: &mut Pdf<R>,
     ) -> std::result::Result<JobExitCode, CheckError> {
         self.run_check_report(pdf)?;
+        self.drain_document_warnings(pdf);
         Ok(self.complete(false)?)
     }
 

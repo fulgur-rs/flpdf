@@ -6,12 +6,14 @@
 //! therefore stores [`crate::QpdfExc`] directly. Fatal operation results belong
 //! to [`crate::Error`] or a job-specific error, not to this warning collection.
 
-/// The document-owned, append-only qpdf warning collection.
+/// The document-owned, ordered qpdf warning collection.
 ///
 /// Every entry retains qpdf's independent error code, source filename, object
-/// description, signed file position, and detail bytes. Callers that need the
-/// logger-visible representation must use [`crate::QpdfExc::what_bytes`]; it
-/// intentionally stops at the first NUL just like C++ `what()` consumers.
+/// description, signed file position, and detail bytes. `push` appends in
+/// warning order and `drain` transfers the current batch, matching qpdf's
+/// `getWarnings` lifecycle. Callers that need the logger-visible
+/// representation must use [`crate::QpdfExc::what_bytes`]; it intentionally
+/// stops at the first NUL just like C++ `what()` consumers.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Diagnostics {
     entries: Vec<crate::QpdfExc>,
@@ -36,6 +38,15 @@ impl Diagnostics {
     /// Return whether no warnings have been collected.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Move the ordered warnings out of this collection and leave it empty.
+    ///
+    /// This is the Rust collection operation behind qpdf's
+    /// `QPDF::getWarnings` (`include/qpdf/QPDF.hh:261-266`): draining does not
+    /// replay logger output and a later warning starts a new drain batch.
+    pub(crate) fn drain(&mut self) -> Self {
+        std::mem::take(self)
     }
 }
 
@@ -108,5 +119,22 @@ mod tests {
         diagnostics.push(QpdfExc::new(QpdfErrorCode::Object, b"", b"", 0, b"warning"));
         assert!(!diagnostics.is_empty());
         assert_eq!(diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn warning_collection_drain_returns_only_warnings_since_the_previous_drain() {
+        let first = QpdfExc::new(QpdfErrorCode::Object, b"", b"", 0, b"first");
+        let second = QpdfExc::new(QpdfErrorCode::System, b"", b"", 0, b"second");
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.push(first.clone());
+
+        let drained = diagnostics.drain();
+        assert_eq!(drained.entries(), &[first]);
+        assert!(diagnostics.is_empty());
+
+        diagnostics.push(second.clone());
+        let drained = diagnostics.drain();
+        assert_eq!(drained.entries(), &[second]);
+        assert!(diagnostics.is_empty());
     }
 }

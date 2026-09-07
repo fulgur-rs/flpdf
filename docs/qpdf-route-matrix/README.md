@@ -171,7 +171,7 @@ D19/D30はcanonical ownerへ委譲するbyte-neutral test scaffolding、D27は�
 
 追跡対象の symbol manifest は [tracked-symbols.txt](tracked-symbols.txt)。現行の bridge / mixed は97行だが、
 manifest は行集合の完全な機械変換ではなく、削除済みsymbolの0確認とcanonical側の分母も保持する。
-B7 は未実装ownerに追跡すべきRust symbolがなく、C44 は `ObjectHandle::get_stream_json` を owner とする。B29 は既存 `num_warnings` と未実装drainを区別する。
+B7 は未実装ownerに追跡すべきRust symbolがなく、C44 は `ObjectHandle::get_stream_json` を owner とする。B29 は `Pdf::get_warnings` / `any_warnings` / `num_warnings` の canonical API と、後続移行対象の `repair_diagnostics` snapshot を区別する。
 symbol数はmanifestの非comment・非空行から数え、行数と同一視しない。
 数え方の正本は `scripts/qpdf-route-callers.py` の module docstring と実装である。
 
@@ -666,7 +666,7 @@ A11 を A10 の後に置く理由で、facade の `next_available_object_ref` �
    xref ByteCursorのfalseを一律trueにしない。B5のdocument-owned ParseGuard（再入拒否・guard復元）は
    `flpdf-3yn9.48.17`（2026-09-07）で移植済み。
 2. **B29** — 既存warning collectionへgetWarningsのdrain / anyWarningsを移植し、Job完了consumerから移す。
-   `num_warnings` は既存。loggerへ表示済みのwarningをdrain時に再出力しない。
+   `Pdf::get_warnings` / `any_warnings` / `num_warnings` と Job completion の bounded cutover は実装済み。loggerへ表示済みのwarningをdrain時に再出力しない。残る `repair_diagnostics` snapshot/bookmark consumer は後続で caller-zero を確認する。
 3. **B8〜B13 / B34** — canonical file-object/header/stream/trailer責務へbootstrap consumerを移す。
    B10のEOL warning、B11のrecovery、B13のreadTrailer、B34のfallback撤去をbounded sliceに分ける。
 4. **B22 / B25 / B20** — canonical reconstructと3種のxref登録primitiveへconsumerを順次移行する。
@@ -973,7 +973,7 @@ B29 / D31 / E-28はsourceでmixedと判定した。E-28の未照合case/APIは�
 | B-P2 | consumer調査 | B20 | 初段parse失敗handoffのdeleted_objects状態と登録primitiveの抑止をoracle fixtureで照合する。 |
 | B-P3 | 未観測 | B22 | 再構築後compressed entryのresolveを比較し、qpdfのwarn/nullとRustの例外境界を固定する。 |
 | B-P4 | 未観測 | B27 | bootstrap handleとxref双方のwarningを出すfixtureでcollection/delivery順を比較する。 |
-| B-P6 | owner確認済み | B29 | QPDF.cc:345-363のdrain/anyWarningsを同じdocument collectionへ移植し、Job完了から移す。num_warningsは既存。 |
+| B-P6 | bounded cutover済み | B29 | QPDF.cc:345-363のdrain/anyWarningsを同じdocument collectionへ移植し、Job完了（inspect/write JSON/write/check/linearization）から移行済み。num_warningsも公開queryへ昇格。残るsnapshot/bookmark consumerは後続移行でcaller-zeroを確認する。 |
 | B-P7 | owner対応確認済み | B7 | ObjStm headerの2 token読取をQPDF::readTokenへ対応付ける。classic xrefのByteCursorはreadLine/parse_xrefEntry責務であり一律trueへ変えない。 |
 | B-P8 | 一部旧記述訂正 | B13/B17 | unknown xref stream entry typeは現src/testに存在する。stream keyword found in trailer等の残条件を個別fixtureで照合する。 |
 | C-U1 | 既存sliceで解決 | C42 | flpdf-zvjf/flpdf-hj7vのrecovered full-length pipe/show-streamを維持する。dump-objectのframing metadataは別責務。 |

@@ -2031,24 +2031,35 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `Pdf::repair_diagnostics`, which is the public door onto this and
     /// carries the trade-off.
     ///
-    /// **A snapshot is interchangeable with the borrow it replaced**, which is
-    /// what lets callers keep comparing a length captured earlier against a
-    /// later one and iterating with `.skip(start)` — `flpdf-cli`'s
-    /// `finish_lazy_warnings` and `emit_warnings_since`
-    /// (`crates/flpdf-cli/src/main.rs:5341-5364`) do exactly that.
-    /// [`Diagnostics`] is append-only: `push` is its
-    /// only mutators and its entry vector is private, so an index valid in one
-    /// snapshot names the same entry in every later one. Nothing replaces the
-    /// collection wholesale either — `xref.rs` does that only on `LoadedXref`,
-    /// before the document exists. Were either to change, every
-    /// `diagnostics_start` in the CLI would quietly start meaning something
-    /// else.
+    /// Snapshot callers may compare a length captured earlier against a later
+    /// snapshot and iterate with `.skip(start)` while no consumer drains the
+    /// collection — `flpdf-cli`'s `finish_lazy_warnings` and
+    /// `emit_warnings_since` (`crates/flpdf-cli/src/main.rs:5341-5364`) do
+    /// exactly that. The canonical `get_warnings` boundary intentionally
+    /// clears the collection; callers using that boundary must not reuse a
+    /// snapshot index after the drain.
     pub(crate) fn repair_diagnostics(&self) -> Diagnostics {
         self.core.borrow().repair_diagnostics.clone()
     }
 
+    /// Drain the document warning collection without replaying logger output.
+    ///
+    /// This is qpdf's `QPDF::getWarnings` (`include/qpdf/QPDF.hh:261-266`):
+    /// the warning sink has already delivered each entry when it was emitted,
+    /// so this boundary only transfers ownership and clears the live list.
+    pub(crate) fn get_warnings(&self) -> Diagnostics {
+        self.core.borrow_mut().repair_diagnostics.drain()
+    }
+
+    /// Return whether the document has warnings without clearing them.
+    ///
+    /// This is qpdf's `QPDF::anyWarnings` (`include/qpdf/QPDF.hh:268-270`).
+    pub(crate) fn any_warnings(&self) -> bool {
+        !self.core.borrow().repair_diagnostics.is_empty()
+    }
+
     /// qpdf's `QPDF::numWarnings` (`libqpdf/QPDF.cc:360-363`): the size of
-    /// the warning collection without copying it.
+    /// the currently undrained warning collection without copying it.
     pub(crate) fn num_warnings(&self) -> usize {
         self.core.borrow().repair_diagnostics.entries().len()
     }

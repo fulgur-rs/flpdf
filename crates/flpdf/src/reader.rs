@@ -315,8 +315,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.set_attempt_recovery(attempt_recovery);
     }
 
-    /// Diagnostics emitted while opening the document — typically warnings from the
-    /// xref/trailer recovery path. Always non-empty when the parse hit a soft failure.
+    /// Snapshot the document's currently undrained diagnostics — typically warnings from the
+    /// xref/trailer recovery path when called immediately after opening.
     ///
     /// Returns an owned snapshot. The collection is qpdf's `m->warnings` and
     /// lives on the crate-private resolver core rather than on this struct,
@@ -327,15 +327,37 @@ impl<R: Read + Seek> Pdf<R> {
     /// the copy but leaks [`std::cell::Ref`] into the public API and lets a
     /// caller holding one across a resolving call hit a `BorrowMutError` at
     /// run time. The copy is cheap: the collection is empty for a document
-    /// that opened cleanly.
+    /// that opened cleanly or after [`Self::get_warnings`] has drained it.
     pub fn repair_diagnostics(&self) -> Diagnostics {
         self.resolver.repair_diagnostics()
     }
 
+    /// Return and clear the document's ordered qpdf warnings.
+    ///
+    /// This is qpdf's `QPDF::getWarnings` (`include/qpdf/QPDF.hh:261-266`,
+    /// `libqpdf/QPDF.cc:345-352`). Warning logger delivery happens when the
+    /// warning is recorded, so draining this collection never emits the same
+    /// warning a second time. Warnings raised after this call appear in the
+    /// next returned collection.
+    pub fn get_warnings(&self) -> Diagnostics {
+        self.resolver.get_warnings()
+    }
+
+    /// Return whether this document currently has undrained warnings.
+    ///
+    /// This is qpdf's `QPDF::anyWarnings` (`include/qpdf/QPDF.hh:268-270`): it
+    /// does not clear the collection and remains true until [`Self::get_warnings`]
+    /// drains it.
+    #[must_use]
+    pub fn any_warnings(&self) -> bool {
+        self.resolver.any_warnings()
+    }
+
     /// The number of warnings recorded so far, without copying the
     /// collection: qpdf's `QPDF::numWarnings` (`libqpdf/QPDF.cc:360-363`),
-    /// which consumers snapshot around a parse to detect new warnings.
-    pub(crate) fn num_warnings(&self) -> usize {
+    /// which reports the number since the last [`Self::get_warnings`] drain.
+    #[must_use]
+    pub fn num_warnings(&self) -> usize {
         self.resolver.num_warnings()
     }
 
@@ -2096,6 +2118,34 @@ mod final_handle_tests {
         let mut resolver = SourceFramingHandles;
         let handle = resolver.indirect_handle(ObjectRef::new(17, 0));
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(17, 0)));
+    }
+}
+
+#[cfg(test)]
+mod warning_api_tests {
+    use super::Pdf;
+
+    #[test]
+    fn warning_api_drains_without_replaying_and_retains_suppressed_warnings() {
+        let mut pdf =
+            Pdf::open_mem_owned(crate::engine::EMPTY_PDF_BYTES.to_vec()).expect("empty PDF opens");
+        pdf.set_suppress_warnings(true);
+
+        pdf.push_warning("first warning").unwrap();
+        assert!(pdf.any_warnings());
+        assert_eq!(pdf.num_warnings(), 1);
+
+        let first = pdf.get_warnings();
+        assert_eq!(first.len(), 1);
+        assert!(!pdf.any_warnings());
+        assert_eq!(pdf.num_warnings(), 0);
+        assert!(pdf.get_warnings().is_empty());
+
+        pdf.push_warning("second warning").unwrap();
+        let second = pdf.get_warnings();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second.entries()[0].get_message_detail(), b"second warning");
+        assert!(!pdf.any_warnings());
     }
 }
 
