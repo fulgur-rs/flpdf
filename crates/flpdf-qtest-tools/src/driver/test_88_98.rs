@@ -714,19 +714,12 @@ pub(crate) fn run_test_97<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let container = pdf.trailer_key_handle(b"Nulls");
-    pdf.resolve(&container)?;
-    let container_items = container
-        .as_array()
-        .expect("many-nulls.pdf's /Nulls trailer entry is an array");
-    // GAP(QPDFObjectHandle::getArrayItem): see `run_test_89`'s own GAP
-    // comment for the missing single-item read-with-dereference-and-warning
-    // accessor; `container_items.first()` substitutes the whole-array read
-    // this crate does provide, and the canonical resolver below performs the
-    // same one-hop dereference qpdf's own `getArrayItem` performs internally.
-    let first_item = container_items
-        .first()
-        .cloned()
-        .expect("many-nulls.pdf's /Nulls trailer array has at least one element");
+    // qpdf test_driver.cc:3417 chains getKey("/Nulls").getArrayItem(0)
+    // directly; `try_get_array_item` dereferences the receiver and applies
+    // qpdf's out-of-bounds/non-array warning boundary internally
+    // (`libqpdf/QPDFObjectHandle.cc:770-785`), so no separate resolve of
+    // `container` is needed before indexing.
+    let first_item = container.try_get_array_item(0)?;
     pdf.resolve(&first_item)?;
     let items = first_item
         .as_array()
