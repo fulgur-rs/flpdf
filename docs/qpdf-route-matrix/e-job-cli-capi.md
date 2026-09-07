@@ -379,7 +379,7 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 | 95 | `qpdf/test_driver.cc:3374-3399` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_95` | canonical | ローカル `is_scalar` は `ObjectHandle::type_code()`（`pub`）をラップするのみ、ギャップなし。 |
 | 96 | `qpdf/test_driver.cc:3400-3414` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_96` | canonical | `ObjectHandle::parse` + `pdf_string::unparse_binary`（`pub`）、ギャップなし。 |
 | 97 | `qpdf/test_driver.cc:3415-3424` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_97` | mixed | `ObjectHandle::try_get_array_item`（`pub`、`crates/flpdf/src/object_handle.rs:3230`）が receiver dereference と範囲外 warning を内包しており、`run_test_89`（`test_88_98.rs:211`）も既にこれを使っている。`flpdf-cm84` の cutover で `run_test_97` も同 accessor へ移行済み。残り（`trailer_key_handle`/`resolve`/`shallow_copy`/`unparse`）は canonical。 |
-| 98 | `qpdf/test_driver.cc:3425-3450` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_98` | bridge | **未追跡ギャップ、`flpdf-wkju` で追跡開始**: 関数本体が `Ok(())` のみの完全未実行 stub。`ObjectHandle::get_stream_json`（`pub`、`object_handle.rs:6325`）は C44 が `QPDFObjectHandle::getStreamJSON` の facade として追跡しており、case 98 の getStreamJSON 部分は現行 API で移植可能。未到達なのは per-object の `ObjectHandle::write_json`/`get_json`/`write_stream_json`（`object_handle.rs:6957,6981,6173`、いずれも `pub(crate)`）を要する残りの assertion で、`flpdf-wkju` の前提はその範囲に限られる |
+| 98 | `qpdf/test_driver.cc:3425-3450` | `crates/flpdf-qtest-tools/src/driver/test_88_98.rs::run_test_98` | bridge | **移植済み（`flpdf-wkju`）**: `ObjectHandle::write_json`/`get_json` を `pub` にし（qpdf 側も public — `include/qpdf/QPDFObjectHandle.hh:1198,1205`、`pub` 境界規則の根拠 1）、qpdf の 2 部構成をそのまま移した。前半は全 6 オブジェクトで `writeJSON` と `getJSON(...).write(...)` の等価性（qpdf 自身が `QPDFObjectHandle.hh:1200-1202` で保証すると明記）を確認し、後半は content stream の辞書を変更してから `get_stream_json`（`pub`、`object_handle.rs:6325`、C44 が facade として追跡）の encode 結果を qpdf の期待バイト列と比較する。fixture `tests/fixtures/qpdf-test98-minimal.pdf` は qpdf の `examples/qtest/npages/minimal.pdf` と byte 一致（763 B）。分類は `bridge` のまま — A7 が owner の `Pdf::resolve` を 2 箇所で呼ぶため。 |
 
 **range 別サマリ**（98 行 = 99 ケース、0/1 統合）:
 
@@ -478,7 +478,7 @@ D1 `writer.write()` の両方を呼ぶ）は、逸脱の重い側である `brid
 | `E-28` | `flpdf-jzj1` | case 86: `utf8_to_pdf_doc`相当が不在。`utf8_to_ascii`は`flpdf::qutil::utf8_to_ascii`（`pub`）として実在し、qpdfの2引数版が返すrepresentabilityの`bool`だけがsignature上落ちている |
 | `E-28` | `flpdf-6f6h` | case 92: `owning_pdf_unique_id`（`pub`）が所有文書identityを公開しており同一性assertは移植可能。残るのは`unparse`のthrow挙動 |
 | `E-28` | `flpdf-cm84` | case 97: **解決済み** — `ObjectHandle::try_get_array_item`（`pub`）へ移行済み |
-| `E-28` | `flpdf-wkju` | case 98: per-objectの`write_json`/`get_json`/`write_stream_json`が`pub(crate)`限定。ただし`get_stream_json`（`pub`、C44 facade）でgetStreamJSON部分は移植可能 |
+| `E-28` | `flpdf-wkju` | case 98: **解決済み** — `write_json`/`get_json` を `pub` 化し test_98 を移植（qpdf 側も public）。`write_stream_json` は `get_stream_json` facade 経由で到達 |
 | `E-27` | `flpdf-3yn9.48.25` | test0 cutover後にsource metadata再parse・window・64回retry budgetを撤去する |
 | `E-19` | `flpdf-3yn9.48.26` | QPDF::getWarnings drain・anyWarningsを移植しJob完了consumerを移行する |
 | `E-27` | `flpdf-3yn9.48.28` | getParsedOffsetをlazy dereference契約へ揃えcheck consumerを移行する |
