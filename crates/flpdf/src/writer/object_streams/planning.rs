@@ -81,20 +81,29 @@ pub(crate) enum ObjectStreamGroup {
         source: ObjectRef,
         members: Vec<ObjectRef>,
     },
-    /// A Generate group whose container has no source identity.
+    /// A legacy Generate group whose consumer has no source identity yet.
     Synthetic { members: Vec<ObjectRef> },
+    /// A Generate group backed by qpdf's newly minted indirect null container.
+    Generated {
+        source: ObjectRef,
+        members: Vec<ObjectRef>,
+    },
 }
 
 impl ObjectStreamGroup {
     pub(crate) fn members(&self) -> &[ObjectRef] {
         match self {
-            Self::SourceBacked { members, .. } | Self::Synthetic { members } => members,
+            Self::SourceBacked { members, .. }
+            | Self::Synthetic { members }
+            | Self::Generated { members, .. } => members,
         }
     }
 
     pub(crate) fn members_mut(&mut self) -> &mut Vec<ObjectRef> {
         match self {
-            Self::SourceBacked { members, .. } | Self::Synthetic { members } => members,
+            Self::SourceBacked { members, .. }
+            | Self::Synthetic { members } // cov:ignore: LLVM maps this shared pattern continuation to the generated arm counter.
+            | Self::Generated { members, .. } => members,
         }
     }
 }

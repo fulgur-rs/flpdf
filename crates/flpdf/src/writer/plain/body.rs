@@ -44,7 +44,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
             .iter()
             .filter_map(|planned| match planned {
                 PlannedIndirectObject::ObjectStream {
-                    origin: origin @ PlannedObjectStreamOrigin::SourceBacked(source),
+                    origin:
+                        origin @ (PlannedObjectStreamOrigin::SourceBacked(source)
+                        | PlannedObjectStreamOrigin::Generated(source)),
                     output,
                     members,
                 } => Some((source.number, (origin, *output, members.as_slice()))),
@@ -66,7 +68,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 emitter.write_object(&handle, None)?;
             }
             PlannedIndirectObject::ObjectStream {
-                origin: PlannedObjectStreamOrigin::SourceBacked(source),
+                origin:
+                    PlannedObjectStreamOrigin::SourceBacked(source)
+                    | PlannedObjectStreamOrigin::Generated(source),
                 ..
             } => {
                 let handle = emitter.pdf.get_object_handle(*source);
@@ -77,9 +81,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 output,
                 members,
             } => {
-                // Generated containers have no canonical source identity yet.
-                // Keep their existing owner until the allocation/queue cutover;
-                // never fabricate a source identity from the output number.
+                // Legacy Synthetic containers have no canonical source identity;
+                // Generated containers carry qpdf's minted null placeholder.
                 emitter.emit_planned_object_stream(origin, *output, members)?;
             }
         }
@@ -249,6 +252,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     None
                 }
             }
+            crate::writer::plain::plan::PlannedObjectStreamOrigin::Generated(_) => None,
             crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
         };
         serialize::write_objstm_stream_with_extends(

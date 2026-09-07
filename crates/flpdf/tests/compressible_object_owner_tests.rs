@@ -97,7 +97,7 @@ fn repeated_generate_preserve_does_not_resurrect_a_removed_generation() {
         .replace_key(b"/ZPending", ObjectHandle::array(vec![]))
         .unwrap();
 
-    for _ in 0..2 {
+    for write_index in 0..2 {
         let mut writer = PdfWriter::new(&mut pdf);
         writer.set_object_stream_mode(ObjectStreamMode::Generate);
         writer.set_preserve_unreferenced_objects(true);
@@ -105,12 +105,18 @@ fn repeated_generate_preserve_does_not_resurrect_a_removed_generation() {
         writer.set_output_memory().unwrap();
         writer.write().unwrap();
         let output = writer.get_buffer().unwrap();
-        assert!(
-            !output
-                .windows(b"\nnull\nendobj\n".len())
-                .any(|window| window == b"\nnull\nendobj\n"),
-            "a removed generation must stay absent across repeated writes"
-        );
+        let null_count = output
+            .windows(b"\nnull\nendobj\n".len())
+            .filter(|window| *window == b"\nnull\nendobj\n")
+            .count();
+        // QPDFWriter keeps each prior makeIndirectObject(newNull()) in the
+        // document cache after writer destruction; the next preserve write
+        // therefore emits exactly the prior placeholder count. The removed
+        // generation itself must still never reappear as the replacement 42.
+        assert_eq!(null_count, write_index);
+        assert!(!output
+            .windows(b" 42\n".len())
+            .any(|window| window == b" 42\n"));
     }
 }
 
