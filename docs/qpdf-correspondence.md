@@ -967,6 +967,15 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` | 3164 | `flpdf-cli/src/arg_parser.rs` + clap | ⚪。QPDFJobの使用エラー分類は [`UsageError`](../crates/flpdf/src/error.rs) + `Error::Usage` として job lifecycle から CLI の `usage_exit` へ伝播し、`QPDFUsage` の別catch経路（`qpdf/qpdf.cc:10-23,34-39`）を再現する。CLI の入口は `std::env::args_os()` とし、qpdf argv grammar の residual/segment tokens、`--pages`/`--overlay`/attachment の path、`QPDFJob` の input description を `OsString`/raw bytes のまま保持する。UTF-8 が必要な selector・range・日付などだけを各 option parser の境界で検証し、非UTF-8 argv を `std::env::args()` の unwrap で失わない。`flpdf-v1xw` では argv token を raw bytes と `OsString` 投影の二重キャリア `RawArg` で運び、clap の parse 後に `raw_option_value` / `apply_raw_overrides` が byte-oriented な値（password 系）を raw 側で上書きする。qpdf は argv を 1 度しか走査しない（`QPDFArgParser.cc:433-494`）ので、この 2 度目の走査は clap を介在させるための (B) の入れ物の差であり、受理するコマンドラインと出力は qpdf と同じ。 |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
+`QPDFArgParser` の help-table 境界は、`flpdf-cli/src/arg_parser.rs` の raw/canonical 二重 argv と
+`flpdf-cli/src/main.rs` の `qpdf_sole_help_topic` / `qpdf_compat_help_usage_error` に接続した。
+`QPDFArgParser.cc:433-555` と `qpdf/qpdf.cc:10-39` に対応し、qpdf 互換の top-level では
+`--help=usage` / `--help=exit-status` の source-derived body、expanded argv の sole-option
+判定、first unknown の argv 順、single-dash の原文診断を保持する。`flpdf help <subcommand>` と
+`flpdf rewrite --help` は native clap surface として別の dispatch 境界に残す。help topic の
+related-option と footer は `libqpdf/qpdf/auto_job_help.hh`（qpdf 11.9.0 pin）に対応し、未移植の
+topic body は後続の parity slice として扱う。
+
 qpdf の CLI は `qpdf/qpdf.cc:27-60` の native `char* argv[]` を
 `QPDFJob::initializeFromArgv`（`QPDFJob_argv.cc:418-427`）へ渡し、
 `QPDFArgParser.cc:12-29,438-502` は argv token を `std::string` として扱う。

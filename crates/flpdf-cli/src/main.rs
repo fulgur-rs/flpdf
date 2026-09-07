@@ -2412,8 +2412,10 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
 
     Ok(PreprocessedArgs {
         residual_args: parsed.residual_args,
+        original_residual_args: parsed.original_residual_args,
         native_subcommand_mode: parsed.native_subcommand_mode,
         expanded_arg_count: parsed.expanded_arg_count,
+        first_unknown_option: parsed.first_unknown_option,
         overlay_specs,
         attachment_segments,
         raw_overrides: RawCliOverrides {
@@ -2621,6 +2623,101 @@ continue to consider qpdf to be licensed under those terms. Please\n\
     ));
 }
 
+/// Render the native top-level help without letting clap decide whether a
+/// qpdf-compatible argv token is a command-position help request. The help
+/// text remains the existing flpdf surface; only the qpdf topic forms below
+/// use qpdf's generated topic bodies.
+fn print_flpdf_help() {
+    let mut command = cli_command();
+    emit_logger_info(command.render_help().to_string());
+}
+
+/// Render the qpdf 11.9.0 generated bodies for the topics that are currently
+/// part of the qpdf-compatible help contract. The related-option lists and
+/// footer are copied from `libqpdf/qpdf/auto_job_help.hh`.
+fn qpdf_help_topic_body(topic: &[u8]) -> Option<Vec<u8>> {
+    let who = progname();
+    match topic {
+        b"usage" => Some(
+            format!(
+                r#"Read a PDF file, apply transformations or modifications, and write
+a new PDF file.
+
+Usage: {who} [infile] [options] [outfile]
+   OR  {who} --help[={{topic|--option}}]
+
+- infile, options, and outfile may be in any order as long as infile
+  precedes outfile.
+- Use --empty in place of an input file for a zero-page, empty input
+- Use --replace-input in place of an output file to overwrite the
+  input file with the output
+- outfile may be - to write to stdout; reading from stdin is not supported
+- @filename is an argument file; each line is treated as a separate
+  command-line argument
+- @- may be used to read arguments from stdin
+- Later options may override earlier options if contradictory
+
+Related options:
+  --empty: use empty file as input
+  --job-json-file: job JSON file
+  --replace-input: overwrite input with output
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#
+            )
+            .into_bytes(),
+        ),
+        b"exit-status" => Some(
+            br#"Meaning of exit codes:
+
+- 0: no errors or warnings
+- 1: not used by qpdf but may be used by the shell if unable to invoke qpdf
+- 2: errors detected
+- 3: warnings detected, unless --warning-exit-0 is given
+
+Related options:
+  --warning-exit-0: exit 0 even with warnings
+
+For detailed help, visit the qpdf manual: https://qpdf.readthedocs.io
+"#
+            .to_vec(),
+        ),
+        _ => None,
+    }
+}
+
+/// Return the value of a sole top-level qpdf help option, preserving raw
+/// bytes so an unknown topic can be sent through the qpdf usage boundary.
+/// `None` means plain `--help`/`-help`; `Some(bytes)` means `--help=...`.
+fn qpdf_sole_help_topic(preprocessed: &PreprocessedArgs) -> Option<Option<Vec<u8>>> {
+    if preprocessed.expanded_arg_count != 2 || preprocessed.original_residual_args.len() != 2 {
+        return None;
+    }
+    let bytes = preprocessed.original_residual_args[1].as_bytes();
+    if bytes == b"--help" || bytes == b"-help" {
+        return Some(None);
+    }
+    bytes
+        .strip_prefix(b"--help=")
+        .or_else(|| bytes.strip_prefix(b"-help="))
+        .map(|topic| Some(topic.to_vec()))
+}
+
+fn unknown_help_option_error(topic: &[u8]) -> UsageError {
+    let mut message = b"unknown help option".to_vec();
+    if !topic.is_empty() {
+        message.push(b' ');
+        message.extend_from_slice(topic);
+    }
+    UsageError::new(message)
+}
+
+fn unrecognized_argument_error(argument: &[u8]) -> UsageError {
+    let mut message = b"unrecognized argument ".to_vec();
+    message.extend_from_slice(argument);
+    UsageError::new(message)
+}
+
 fn qpdf_compat_help_usage_error(preprocessed: &PreprocessedArgs) -> Option<UsageError> {
     if preprocessed.native_subcommand_mode {
         return None;
@@ -2628,6 +2725,8 @@ fn qpdf_compat_help_usage_error(preprocessed: &PreprocessedArgs) -> Option<Usage
 
     let sole_option = preprocessed.expanded_arg_count == 2 && preprocessed.residual_args.len() == 2;
     let args = &preprocessed.residual_args;
+    let original_args = &preprocessed.original_residual_args;
+    debug_assert_eq!(args.len(), original_args.len());
     let mut index = 1;
     while index < args.len() {
         let bytes = arg_parser::os_bytes(&args[index]);
@@ -2640,16 +2739,26 @@ fn qpdf_compat_help_usage_error(preprocessed: &PreprocessedArgs) -> Option<Usage
             continue;
         }
 
-        let is_help_table_option = bytes == b"-h"
-            || bytes == b"--help"
-            || bytes.starts_with(b"--help=")
-            || bytes == b"--version"
-            || bytes == b"--copyright";
-        if is_help_table_option && (!sole_option || bytes == b"-h") {
-            return Some(UsageError::new(format!(
-                "unrecognized argument {}",
-                args[index].to_string_lossy()
-            )));
+        let original_bytes = original_args[index].as_bytes();
+        if preprocessed
+            .first_unknown_option
+            .as_ref()
+            .is_some_and(|(unknown_index, _)| *unknown_index == index)
+        {
+            return Some(unrecognized_argument_error(original_bytes));
+        }
+
+        let is_help_table_option = original_bytes == b"-h"
+            || original_bytes == b"--help"
+            || original_bytes == b"-help"
+            || original_bytes.starts_with(b"--help=")
+            || original_bytes.starts_with(b"-help=")
+            || original_bytes == b"--version"
+            || original_bytes == b"-version"
+            || original_bytes == b"--copyright"
+            || original_bytes == b"-copyright";
+        if is_help_table_option && (!sole_option || original_bytes == b"-h") {
+            return Some(unrecognized_argument_error(original_bytes));
         }
         index += 1;
     }
@@ -2692,6 +2801,21 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(topic) = qpdf_sole_help_topic(&preprocessed) {
+        match topic {
+            None => {
+                print_flpdf_help();
+                return;
+            }
+            Some(topic) => {
+                if let Some(body) = qpdf_help_topic_body(&topic) {
+                    emit_logger_info(body);
+                    return;
+                }
+                usage_exit(&unknown_help_option_error(&topic));
+            }
+        }
+    }
     if let Some(error) = qpdf_compat_help_usage_error(&preprocessed) {
         usage_exit(&error);
     }
@@ -2701,13 +2825,13 @@ fn main() {
     // (`QPDFArgParser.cc:437,478-483`). Use the expanded count, not the
     // post-strip residual, so e.g. `--overlay f -- --version` is not mistaken
     // for a sole --version.
-    if preprocessed.expanded_arg_count == 2 && preprocessed.residual_args.len() == 2 {
-        match preprocessed.residual_args[1].to_str() {
-            Some("--version") | Some("-version") => {
+    if preprocessed.expanded_arg_count == 2 && preprocessed.original_residual_args.len() == 2 {
+        match preprocessed.original_residual_args[1].as_bytes() {
+            b"--version" | b"-version" => {
                 print_qpdf_version();
                 return;
             }
-            Some("--copyright") | Some("-copyright") => {
+            b"--copyright" | b"-copyright" => {
                 print_qpdf_copyright();
                 return;
             }
@@ -2715,23 +2839,13 @@ fn main() {
         }
     }
     let PreprocessedArgs {
-        mut residual_args,
+        residual_args,
         native_subcommand_mode,
         overlay_specs,
         attachment_segments,
         raw_overrides,
-        expanded_arg_count,
+        ..
     } = preprocessed;
-    if !native_subcommand_mode
-        && expanded_arg_count == 2
-        && residual_args.len() == 2
-        && residual_args[1].to_str() == Some("--help=usage")
-    {
-        // qpdf's usage help is a valid sole help option. Reuse the existing
-        // top-level clap help renderer after the qpdf gate has established
-        // that the option is sole; non-sole --help=... was rejected above.
-        residual_args[1] = OsString::from("--help");
-    }
     let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
@@ -5469,6 +5583,9 @@ struct OverlaySpec {
 
 struct PreprocessedArgs {
     residual_args: Vec<OsString>,
+    /// Raw residual argv before qpdf-to-clap canonicalization. qpdf's usage
+    /// diagnostics echo this spelling, including a single leading dash.
+    original_residual_args: Vec<arg_parser::RawArg>,
     native_subcommand_mode: bool,
     overlay_specs: Vec<OverlaySpec>,
     attachment_segments: Vec<Vec<Vec<u8>>>,
@@ -5476,6 +5593,7 @@ struct PreprocessedArgs {
     /// argv token count after `@argfile` expansion, before named-segment
     /// stripping (qpdf's `m->argc` at the sole-option check).
     expanded_arg_count: usize,
+    first_unknown_option: Option<(usize, arg_parser::RawArg)>,
 }
 
 #[derive(Debug, Default)]

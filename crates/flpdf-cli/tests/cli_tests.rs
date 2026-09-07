@@ -173,13 +173,167 @@ fn qpdf_nonsole_help_table_options_are_usage_errors_after_a_reset() {
 
 #[test]
 fn qpdf_sole_help_table_options_remain_available() {
-    for token in ["--help", "--help=usage", "--version", "--copyright"] {
+    for token in [
+        "--help",
+        "-help",
+        "--help=usage",
+        "--version",
+        "-version",
+        "--copyright",
+        "-copyright",
+    ] {
         Command::cargo_bin("flpdf")
             .unwrap()
             .arg(token)
             .assert()
             .success();
     }
+}
+
+#[test]
+fn qpdf_unknown_help_topic_uses_the_usage_boundary() {
+    if !qpdf_available() {
+        eprintln!(
+            "skipping qpdf unknown-help differential: {EXPECTED_QPDF_VERSION} is not available"
+        );
+        return;
+    }
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .arg("--help=unknown")
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--help=unknown")
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf.status.code(), Some(2));
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert!(flpdf.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf.stderr),
+        String::from_utf8_lossy(&qpdf.stderr).replace("qpdf", "flpdf")
+    );
+}
+
+#[test]
+fn qpdf_help_topics_render_their_source_topics() {
+    if !qpdf_available() {
+        eprintln!(
+            "skipping qpdf help-topic differential: {EXPECTED_QPDF_VERSION} is not available"
+        );
+        return;
+    }
+
+    for (topic, expected_marker) in [
+        (
+            "usage",
+            "Read a PDF file, apply transformations or modifications",
+        ),
+        ("exit-status", "Meaning of exit codes:"),
+    ] {
+        let argument = format!("--help={topic}");
+        let qpdf = ProcessCommand::new("qpdf")
+            .arg(&argument)
+            .output()
+            .expect("qpdf 11.9.0 must be available");
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg(&argument)
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), Some(0), "qpdf topic {topic:?}");
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "topic {topic:?}");
+        assert!(qpdf.stderr.is_empty(), "qpdf topic {topic:?} wrote stderr");
+        assert!(
+            flpdf.stderr.is_empty(),
+            "flpdf topic {topic:?} wrote stderr"
+        );
+        assert!(
+            String::from_utf8_lossy(&qpdf.stdout).contains(expected_marker),
+            "qpdf topic {topic:?} lost its source body"
+        );
+        assert!(
+            String::from_utf8_lossy(&flpdf.stdout).contains(expected_marker),
+            "flpdf topic {topic:?} did not render its own body: {}",
+            String::from_utf8_lossy(&flpdf.stdout)
+        );
+
+        let mut expected = String::from_utf8_lossy(&qpdf.stdout).into_owned();
+        if topic == "usage" {
+            expected = expected
+                .replace("Usage: qpdf [infile]", "Usage: flpdf [infile]")
+                .replace("OR  qpdf --help", "OR  flpdf --help");
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&flpdf.stdout),
+            expected,
+            "flpdf topic {topic:?} must preserve qpdf's source body and related options"
+        );
+    }
+}
+
+#[test]
+fn qpdf_help_table_gate_matches_command_position_and_first_error_order() {
+    if !qpdf_available() {
+        eprintln!(
+            "skipping qpdf help-table differential: {EXPECTED_QPDF_VERSION} is not available"
+        );
+        return;
+    }
+
+    for arguments in [
+        vec!["--help", "extra.pdf"],
+        vec!["-h"],
+        vec!["--bogus", "--help"],
+        vec!["--help", "--bogus"],
+        vec!["--", "-help"],
+        vec!["--", "-version"],
+        vec!["--", "-copyright"],
+    ] {
+        let qpdf = ProcessCommand::new("qpdf")
+            .args(&arguments)
+            .output()
+            .expect("qpdf 11.9.0 must be available");
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(&arguments)
+            .output()
+            .unwrap();
+
+        assert_eq!(qpdf.status.code(), Some(2), "qpdf arguments {arguments:?}");
+        assert_eq!(
+            flpdf.status.code(),
+            qpdf.status.code(),
+            "flpdf arguments {arguments:?} must preserve qpdf's usage exit"
+        );
+        assert!(flpdf.stdout.is_empty(), "flpdf arguments {arguments:?}");
+        let expected_stderr = String::from_utf8_lossy(&qpdf.stderr).replace("qpdf", "flpdf");
+        assert_eq!(
+            String::from_utf8_lossy(&flpdf.stderr),
+            expected_stderr,
+            "flpdf arguments {arguments:?} must preserve qpdf's first-error spelling/order"
+        );
+    }
+}
+
+#[test]
+fn native_help_remains_available_after_qpdf_help_gate() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["help", "rewrite"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: flpdf rewrite"));
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: flpdf rewrite"));
 }
 
 #[cfg(unix)]
