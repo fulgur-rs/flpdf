@@ -290,7 +290,14 @@ impl ArgParser {
         // every other invocation remains in qpdf's flat grammar. In
         // particular, a leading qpdf `--` must not expose its following
         // subcommand-named input to native dispatch.
-        let native_subcommand_mode = args.get(1).is_some_and(|arg| self.is_subcommand_token(arg));
+        // A help request also needs clap's ordinary schema: hiding the
+        // generated subcommands for the qpdf-compat parse would drop the
+        // Commands section from `flpdf --help` / `flpdf help` and break
+        // `flpdf help <subcommand>`. qpdf has no such surface to preserve, so
+        // this only covers flpdf's own native help, not a qpdf-flat operand.
+        let native_subcommand_mode = args.get(1).is_some_and(|arg| {
+            self.is_subcommand_token(arg) || matches!(arg.as_bytes(), b"help" | b"--help" | b"-h")
+        });
         let mut iter = args.into_iter().peekable();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());

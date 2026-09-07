@@ -17,6 +17,17 @@ use common::{first_widget_ref, page_annotation_handles};
 mod eol;
 use eol::EOL;
 
+/// `true` when the qpdf oracle binary is runnable, mirroring the optional
+/// oracle gate the other differential suites use so a machine without qpdf
+/// still runs the rest of this suite.
+fn qpdf_available() -> bool {
+    ProcessCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 /// `true` when `needle` appears as a contiguous byte subslice of `hay`.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
@@ -1154,6 +1165,14 @@ fn qpdf_compat_reset_keeps_a_subcommand_named_input_before_later_options() {
     let qpdf_output = temp.path().join("qpdf-out.pdf");
     let flpdf_output = temp.path().join("flpdf-out.pdf");
     std::fs::copy("../../tests/fixtures/minimal.pdf", &input).unwrap();
+
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf is required for the qpdf-compat reset oracle on CI");
+        }
+        eprintln!("skipping qpdf-compat reset oracle: qpdf not available");
+        return;
+    }
 
     let qpdf = ProcessCommand::new("qpdf")
         .current_dir(temp.path())
