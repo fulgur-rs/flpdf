@@ -573,16 +573,24 @@ fn distinct_pages_pdf(n: usize) -> tempfile::NamedTempFile {
     f
 }
 
-/// Sorted list of split output basenames matching `<stem>-*.pdf` in `dir`.
-fn split_outputs(dir: &Path) -> Vec<String> {
+/// Sorted list of split output basenames matching `<stem>-*` in `dir`.
+fn split_output_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".pdf") && n.contains('-'))
+        .filter(|n| n.contains('-'))
         .collect();
     names.sort();
     names
+}
+
+/// Sorted list of PDF split output basenames matching `<stem>-*.pdf`.
+fn split_outputs(dir: &Path) -> Vec<String> {
+    split_output_names(dir)
+        .into_iter()
+        .filter(|name| name.ends_with(".pdf"))
+        .collect()
 }
 
 fn assert_qpdf_cleartext_chunk(path: &Path) {
@@ -1197,6 +1205,39 @@ fn split_pages_two_filenames_match_qpdf() {
         "--split-pages=2",
     ]);
     assert_eq!(split_outputs(fdir.path()), vec!["o-1-2.pdf", "o-3-3.pdf"]);
+}
+
+#[test]
+fn split_pages_non_pdf_template_matches_qpdf() {
+    // qpdf 11.9.0 treats only a trailing case-insensitive .pdf as an
+    // extension. Any other suffix remains part of the template filename:
+    // out.txt-1-2 and out.txt-3-3.
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let src = fixture_abs(THREE_PAGE);
+
+    if qpdf_available() {
+        run_qpdf(&[
+            src.to_str().unwrap(),
+            "--split-pages=2",
+            qdir.path().join("o.txt").to_str().unwrap(),
+        ]);
+        assert_eq!(
+            split_output_names(qdir.path()),
+            vec!["o.txt-1-2", "o.txt-3-3"],
+            "qpdf non-PDF-template baseline"
+        );
+    }
+    flpdf_ok(&[
+        src.to_str().unwrap(),
+        fdir.path().join("o.txt").to_str().unwrap(),
+        "--split-pages=2",
+    ]);
+    assert_eq!(
+        split_output_names(fdir.path()),
+        vec!["o.txt-1-2", "o.txt-3-3"],
+        "flpdf must preserve non-PDF extension text in the template"
+    );
 }
 
 #[test]
