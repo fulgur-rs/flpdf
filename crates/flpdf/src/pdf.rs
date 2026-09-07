@@ -37,6 +37,7 @@ pub(crate) struct CompressedMemberProvenance {
 pub(crate) struct WriterObjectOrderKey {
     group: u8,
     object_ref: ObjectRef,
+    original_object_ref: Option<ObjectRef>,
 }
 
 impl WriterObjectOrderKey {
@@ -44,6 +45,7 @@ impl WriterObjectOrderKey {
         Self {
             group: 0,
             object_ref,
+            original_object_ref: Some(object_ref),
         }
     }
 
@@ -51,6 +53,18 @@ impl WriterObjectOrderKey {
         Self {
             group: 1,
             object_ref,
+            original_object_ref: None,
+        }
+    }
+
+    pub(crate) const fn foreign_with_original(
+        object_ref: ObjectRef,
+        original_object_ref: ObjectRef,
+    ) -> Self {
+        Self {
+            group: 1,
+            object_ref,
+            original_object_ref: Some(original_object_ref),
         }
     }
 
@@ -58,6 +72,7 @@ impl WriterObjectOrderKey {
         Self {
             group: 2,
             object_ref,
+            original_object_ref: None,
         }
     }
 }
@@ -272,6 +287,17 @@ impl<R: Read + Seek> Pdf<R> {
         order: BTreeMap<ObjectRef, WriterObjectOrderKey>,
     ) {
         self.writer_object_order = Some(order);
+    }
+
+    /// Return the source ObjGen used for a QDF `Original object ID` comment.
+    /// Fresh merge targets retain their copied source identity separately from
+    /// the destination reference used for writer ordering.
+    pub(crate) fn writer_original_object_ref(&self, object_ref: ObjectRef) -> ObjectRef {
+        self.writer_object_order
+            .as_ref()
+            .and_then(|order| order.get(&object_ref))
+            .and_then(|key| key.original_object_ref)
+            .unwrap_or(object_ref)
     }
 
     /// Close the current qpdf input source while retaining the document's

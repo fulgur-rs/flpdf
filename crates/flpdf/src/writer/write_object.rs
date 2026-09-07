@@ -17,6 +17,10 @@ pub(crate) struct QdfObjectInfo {
     pub(crate) page_sequence: Option<usize>,
     pub(crate) contents_sequence: Option<usize>,
     pub(crate) suppress_original_object_ids: bool,
+    /// Source ObjGen to display in the QDF provenance comment. A fresh merge
+    /// target may have a different local reference from qpdf's in-place
+    /// primary document; `None` falls back to the current object identity.
+    pub(crate) original_object_id: Option<ObjectRef>,
 }
 
 /// Current stream fields used when `direct_stream_lengths` is false.
@@ -111,9 +115,12 @@ pub(crate) trait WriteObject {
 
         if object_stream_index.is_none() {
             if qdf.is_some_and(|info| !info.suppress_original_object_ids) {
+                let original_object = qdf
+                    .and_then(|info| info.original_object_id)
+                    .unwrap_or(old_og);
                 let comment = format!(
                     "%% Original object ID: {} {}\n",
-                    old_og.number, old_og.generation
+                    original_object.number, original_object.generation
                 );
                 self.write_bytes(comment.as_bytes())?;
             }
@@ -344,6 +351,7 @@ mod tests {
             page_sequence: Some(1),
             contents_sequence: Some(2),
             suppress_original_object_ids: false,
+            original_object_id: None,
         });
         writer.direct_stream_lengths = false;
         writer.write_object(&object, None).unwrap();
@@ -364,6 +372,7 @@ mod tests {
             page_sequence: None,
             contents_sequence: None,
             suppress_original_object_ids: true,
+            original_object_id: None,
         });
         writer.direct_stream_lengths = false;
         writer.write_object(&object, None).unwrap();
@@ -379,6 +388,7 @@ mod tests {
             page_sequence: None,
             contents_sequence: None,
             suppress_original_object_ids: true,
+            original_object_id: None,
         });
         writer.write_object(&object, None).unwrap();
         assert_eq!(writer.bytes, b"1 0 obj\n42\nendobj\n\n");
@@ -478,6 +488,7 @@ mod tests {
             page_sequence: None,
             contents_sequence: None,
             suppress_original_object_ids: true,
+            original_object_id: None,
         });
         writer.write_object(&object, None).unwrap();
         let reference = format!("/Peer {} {} R", peer_id.number, peer_id.generation);
@@ -500,6 +511,7 @@ mod tests {
             page_sequence: None,
             contents_sequence: None,
             suppress_original_object_ids: true,
+            original_object_id: None,
         });
         assert!(writer.write_object(&object, None).is_err());
         assert!(writer.encryption.current_data_key().is_some());
