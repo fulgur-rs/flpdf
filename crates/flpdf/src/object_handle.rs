@@ -6423,7 +6423,16 @@ impl ObjectHandle {
                         false,
                         false,
                     )
-                    .map_err(|error| PipelineError::runtime(error.to_string()))?;
+                    // qpdf's StreamBlobProvider forwards whatever
+                    // `pipeStreamData` throws without catching it
+                    // (`QPDF_Stream.cc:104-107`), so a `logic_error` must stay
+                    // a logic error. `Error::Internal` is this crate's
+                    // `std::logic_error`, so map it back to the logic category
+                    // instead of flattening every failure to runtime.
+                    .map_err(|error| match error {
+                        crate::Error::Internal(message) => PipelineError::logic(message),
+                        other => PipelineError::runtime(other.to_string()),
+                    })?;
                 if succeeded {
                     Ok(())
                 } else {
