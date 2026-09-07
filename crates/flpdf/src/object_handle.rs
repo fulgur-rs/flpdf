@@ -5653,8 +5653,8 @@ impl ObjectHandle {
         );
         let mut token_pipeline = QpdfTokenizer::new(description, filter, next);
         let mut filtering_attempted = false;
-        // qpdf's legacy filterAsContents overload returns only whether
-        // filtering was attempted; it deliberately ignores the newer
+        // qpdf's legacy pipeStreamData overload returns only whether
+        // filtering was attempted; filterAsContents deliberately ignores the newer
         // overall-success bool. Provider/source/sink errors still propagate
         // through `?`, while an ordinary false result is not an exception.
         self.pipe_stream_data(
