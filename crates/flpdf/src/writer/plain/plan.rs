@@ -497,9 +497,15 @@ impl PlainWritePlan {
                 // Same reasoning as the indirect root in `body.rs`: qpdf's ADBE
                 // arbitration is guarded by `is_root`, not by mode
                 // (`QPDFWriter.cc:1396-1436`), so the QDF layout must serialize
-                // the arbitrated copy rather than the raw Catalog.
-                let arbitrated =
-                    root_handle.output_root_copy_with_adbe(&version, final_extension_level)?;
+                // the arbitrated copy rather than the raw Catalog. A direct
+                // Catalog is not `is_root` for qpdf either — the test is
+                // `old_og == m->root_og` (`:1374`) and a direct dictionary has
+                // no object identity — so arbitration stays off here.
+                let arbitrated = root_handle.output_root_copy_with_adbe(
+                    &version,
+                    final_extension_level,
+                    false,
+                )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
                 arbitrated.write_object_qdf_with_ref_map_and_removed(
                     &mut bytes,
                     0,
@@ -513,6 +519,7 @@ impl PlainWritePlan {
                     &placement.removed_refs,
                     &version,
                     final_extension_level,
+                    false,
                 )?; // cov:ignore: the direct Catalog serializer is exercised; LLVM maps this call terminator to a zero-count continuation region.
             }
             Some(bytes)

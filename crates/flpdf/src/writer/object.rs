@@ -99,6 +99,7 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
         final_extension_level: i64,
+        apply_adbe_reconciliation: bool,
     ) -> Result<()>;
     // cov:ignore-start: only the live ObjectHandle owner implements this
     // surface; planned emitters never call the defensive defaults.
@@ -106,8 +107,13 @@ pub(crate) trait ObjectWriterEmission {
         &self,
         final_pdf_version: &str,
         final_extension_level: i64,
+        apply_adbe_reconciliation: bool,
     ) -> Result<ObjectHandle> {
-        let _ = (final_pdf_version, final_extension_level);
+        let _ = (
+            final_pdf_version,
+            final_extension_level,
+            apply_adbe_reconciliation,
+        );
         Err(Error::Internal(
             "root output copy is unavailable for this emission owner".into(),
         ))
@@ -133,6 +139,7 @@ pub(crate) trait ObjectWriterEmission {
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
         final_extension_level: i64,
+        apply_adbe_reconciliation: bool,
     ) -> Result<()> {
         let _ = (
             out,
@@ -140,6 +147,7 @@ pub(crate) trait ObjectWriterEmission {
             removed_refs,
             final_pdf_version,
             final_extension_level,
+            apply_adbe_reconciliation,
         );
         Err(Error::Internal(
             "dynamic root writer map is unavailable for this emission owner".into(),
@@ -522,8 +530,14 @@ impl ObjectWriterEmission for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
         final_extension_level: i64,
+        apply_adbe_reconciliation: bool,
     ) -> Result<()> {
-        let root = root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)?;
+        let root = root_output_copy_with_adbe(
+            self,
+            final_pdf_version,
+            final_extension_level,
+            apply_adbe_reconciliation,
+        )?; // cov:ignore: LLVM attributes this fallible root-copy call terminator to an uncovered continuation; the helper's success and error paths are covered by the root emission tests.
         unparse_object_walk_with_ref_map(&root, out, map, removed_refs)
     }
 
@@ -543,8 +557,14 @@ impl ObjectWriterEmission for ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
         final_pdf_version: &str,
         final_extension_level: i64,
+        apply_adbe_reconciliation: bool,
     ) -> Result<()> {
-        let root = root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)?;
+        let root = root_output_copy_with_adbe(
+            self,
+            final_pdf_version,
+            final_extension_level,
+            apply_adbe_reconciliation,
+        )?; // cov:ignore: LLVM attributes this fallible root-copy call terminator to an uncovered continuation; the helper's success and error paths are covered by the live-queue root emission tests.
         unparse_object_walk_with_dynamic_ref_map(&root, out, map, removed_refs)
     }
 
@@ -552,8 +572,14 @@ impl ObjectWriterEmission for ObjectHandle {
         &self,
         final_pdf_version: &str,
         final_extension_level: i64,
+        apply_adbe_reconciliation: bool,
     ) -> Result<ObjectHandle> {
-        root_output_copy_with_adbe(self, final_pdf_version, final_extension_level)
+        root_output_copy_with_adbe(
+            self,
+            final_pdf_version,
+            final_extension_level,
+            apply_adbe_reconciliation,
+        )
     }
 
     fn write_stream_body_with_dynamic_ref_map(
@@ -1884,8 +1910,19 @@ fn root_output_copy_with_adbe(
     source: &ObjectHandle,
     final_pdf_version: &str,
     final_extension_level: i64,
+    apply_adbe_reconciliation: bool,
 ) -> Result<ObjectHandle> {
     let root = source.unsafe_shallow_copy()?;
+    // qpdf's special /Extensions handling is guarded by
+    // `old_og == m->root_og` (`QPDFWriter.cc:1374`). The live writer passes
+    // false for a direct Catalog, whose unparse call has no root object
+    // identity, and true for the actual indirect Catalog. Keep this context
+    // explicit instead of inferring it from the handle: low-level writer
+    // tests also use synthetic direct dictionaries that exercise the
+    // reconciliation primitive without representing a document root.
+    if !apply_adbe_reconciliation {
+        return Ok(root);
+    }
     let mut extensions = if root.try_has_key(b"/Extensions")?
         && root.try_get_key(b"/Extensions")?.try_is_dictionary()?
     {

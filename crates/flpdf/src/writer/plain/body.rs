@@ -450,6 +450,7 @@ impl<'a, R: Read + Seek + 'static> crate::writer::write_object::WriteObject
                 &self.removed_refs,
                 self.version,
                 self.final_extension_level,
+                true,
             )?; // cov:ignore: LLVM attributes root emission's call terminator to callback cleanup.
         } else if object.as_stream_dict().is_some() {
             let (dict, data, dictionary_options) = canonical_stream_output(object, self.options)?;
@@ -570,9 +571,12 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 // `m->qdf_mode ? 0 : 1` precisely because the branch runs in
                 // both (`QPDFWriter.cc:1396-1436`). Serialize the arbitrated
                 // copy with the QDF layout instead of skipping arbitration.
+                // `true`: this is the indirect Catalog, which is `is_root` for
+                // qpdf (`old_og == m->root_og`, `QPDFWriter.cc:1374`).
                 let arbitrated = handle.output_root_copy_with_adbe(
                     &self.plan.version,
                     self.plan.final_extension_level,
+                    true,
                 )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
                 return arbitrated.write_object_qdf_with_ref_map_and_removed(
                     self.bytes,
@@ -587,6 +591,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 &self.plan.removed_refs,
                 &self.plan.version,
                 self.plan.final_extension_level,
+                true,
             );
         }
 
@@ -768,8 +773,11 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                 // output mode (`QPDFWriter.cc:1396-1436`), so it applies here
                 // exactly as it does to an uncompressed root.
                 if handle.object_ref() == plan.root_source {
-                    let arbitrated = handle
-                        .output_root_copy_with_adbe(&plan.version, plan.final_extension_level)?;
+                    let arbitrated = handle.output_root_copy_with_adbe(
+                        &plan.version,
+                        plan.final_extension_level,
+                        true,
+                    )?; // cov:ignore: LLVM attributes this covered multiline call terminator to the call setup
                     arbitrated.write_object_qdf_with_ref_map_and_removed(
                         out,
                         0,
@@ -791,6 +799,7 @@ impl<R: Read + Seek + 'static> PlainObjectEmitter<'_, R> {
                     &plan.removed_refs,
                     &plan.version,
                     plan.final_extension_level,
+                    true,
                 )
             } else {
                 handle.write_object_with_ref_map_and_removed(out, &map, &plan.removed_refs)

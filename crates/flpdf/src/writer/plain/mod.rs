@@ -77,7 +77,7 @@ fn write_plain_live_disable<R: Read + Seek, W: Write>(
     }
     let direct_root_output = direct_root
         .as_ref()
-        .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level))
+        .map(|root| root.output_root_copy_with_adbe(&version, final_extension_level, false))
         .transpose()?;
     let max_output = body.layout.uncompressed.keys().copied().max().unwrap_or(0);
     let trailer_size = usize::try_from(max_output)
