@@ -2456,42 +2456,52 @@ impl ObjectHandle {
     /// (`object_copy.rs`) -- so that possibility can't stack-overflow a
     /// `Pdf` drop.
     pub(crate) fn disconnect(&self) {
-        let mut visiting = Vec::new();
-        self.disconnect_visiting(&mut visiting);
-    }
-
-    fn disconnect_visiting(&self, visiting: &mut Vec<ObjectHandle>) {
-        if visiting.iter().any(|active| active.is_same_object_as(self)) {
-            return;
-        }
-        visiting.push(self.clone());
-        {
-            let slot = self.0.borrow();
-            let state = slot.state.borrow();
-            match &*state {
-                ObjectValue::Array(items) => {
-                    for item in items {
-                        if item.object_ref().is_none() {
-                            item.disconnect_visiting(visiting);
-                        }
-                    }
-                }
-                ObjectValue::Dictionary(entries) => {
-                    for value in entries.values() {
-                        if value.object_ref().is_none() {
-                            value.disconnect_visiting(visiting);
-                        }
-                    }
-                }
-                ObjectValue::Stream { stream_dict, .. } if stream_dict.object_ref().is_none() => {
-                    stream_dict.disconnect_visiting(visiting);
-                }
-                _ => {}
+        // An explicit heap worklist rather than recursion, for the same reason
+        // `drain_owned_descendants` uses one: a direct object graph's depth is
+        // bounded only by what the public `ObjectHandle` API allows a caller to
+        // build, and this module's own `drop_tests` pin stack independence at
+        // `DEEP_DROP_DEPTH` (100,000). The visited set records every allocation
+        // reached, not just the active path, so a direct DAG — an array holding
+        // the same child twice is enough — is walked once per node rather than
+        // once per path.
+        let mut visited: std::collections::HashSet<ObjectHandleIdentity> =
+            std::collections::HashSet::new();
+        let mut pending = vec![self.clone()];
+        while let Some(handle) = pending.pop() {
+            if !visited.insert(handle.identity_key()) {
+                continue;
             }
+            {
+                let slot = handle.0.borrow();
+                let state = slot.state.borrow();
+                match &*state {
+                    ObjectValue::Array(items) => {
+                        pending.extend(
+                            items
+                                .iter()
+                                .filter(|item| item.object_ref().is_none())
+                                .cloned(),
+                        );
+                    }
+                    ObjectValue::Dictionary(entries) => {
+                        pending.extend(
+                            entries
+                                .values()
+                                .filter(|value| value.object_ref().is_none())
+                                .cloned(),
+                        );
+                    }
+                    ObjectValue::Stream { stream_dict, .. }
+                        if stream_dict.object_ref().is_none() =>
+                    {
+                        pending.push(stream_dict.clone());
+                    }
+                    _ => {}
+                }
+            }
+            *handle.0.borrow().identity.borrow_mut() = ValueIdentity::default();
+            handle.0.borrow_mut().tree_pdf_unique_id = None;
         }
-        visiting.pop();
-        *self.0.borrow().identity.borrow_mut() = ValueIdentity::default();
-        self.0.borrow_mut().tree_pdf_unique_id = None;
     }
 
     /// [`Self::disconnect`] this top-level indirect object, then replace its
@@ -19571,6 +19581,53 @@ mod drop_tests {
             handle = ObjectHandle::array(vec![handle]);
         }
         drop(handle);
+    }
+
+    #[test]
+    fn deep_direct_disconnect_is_stack_independent() {
+        assert_drop_probe_succeeds(
+            "object_handle::drop_tests::deep_direct_disconnect_probe",
+            "FLPDF_DEEP_DIRECT_DISCONNECT_PROBE",
+        );
+    }
+
+    /// `disconnect` walks the same direct graph `Drop` does, so it owes the
+    /// same stack independence: qpdf's teardown reaches every direct child
+    /// (`QPDF_Dictionary.cc:50-56`, `QPDF_Array.cc:103-118`) and this module
+    /// pins the depth contract at `DEEP_DROP_DEPTH`.
+    #[test]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
+    fn deep_direct_disconnect_probe() {
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_DIRECT_DISCONNECT_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..DEEP_DROP_DEPTH {
+            handle = ObjectHandle::array(vec![handle]);
+        }
+        handle.disconnect();
+        drop(handle);
+    }
+
+    /// A direct DAG: every level holds the same child twice. Walking once per
+    /// path would visit 2^depth nodes, so a visited set that only tracks the
+    /// active path turns a 28-level graph into hundreds of millions of visits.
+    /// Recording every allocation reached keeps this linear.
+    #[test]
+    fn direct_dag_disconnect_visits_each_node_once() {
+        let mut handle = ObjectHandle::integer(0);
+        for _ in 0..28 {
+            handle = ObjectHandle::array(vec![handle.clone(), handle]);
+        }
+
+        let start = std::time::Instant::now();
+        handle.disconnect();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "disconnect must not walk a direct DAG once per path"
+        );
     }
 
     #[test]
