@@ -281,7 +281,7 @@ impl ArgParser {
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
         let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
         let expanded_arg_count = args.len();
-        let mut iter = args.into_iter();
+        let mut iter = args.into_iter().peekable();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());
         };
@@ -291,32 +291,43 @@ impl ArgParser {
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
-                // clap dispatches a native subcommand only from the command
-                // position: the first residual token after the program name.
-                // Only there does a following `--` belong to clap (its
-                // end-of-options marker) rather than qpdf's main-table section
-                // reset (`QPDFArgParser.cc:437-560`); qpdf has no positional
-                // subcommands. A subcommand-named token that merely appears
-                // inside a retained qpdf segment (e.g. `rewrite` as an
-                // `--encrypt` password) must not trip this, so match only
-                // `residual_args[1]`, not any residual token.
-                if residual_args
+                // qpdf has no positional subcommands, so its top-level `--`
+                // is always a main-table section reset
+                // (`QPDFArgParser.cc:437-560`). flpdf adds native clap
+                // subcommands, and clap dispatches one only from the command
+                // position (the first residual token after the program). This
+                // `--` therefore belongs to clap -- as its end-of-options
+                // marker rather than qpdf's reset -- in exactly two shapes,
+                // both of which put a native subcommand at clap's dispatch
+                // slot:
+                //   (a) a subcommand already occupies the command position
+                //       (`flpdf rewrite -- -in.pdf`), or
+                //   (b) this is the leading reset and the next token is a
+                //       subcommand-named positional that the reset would
+                //       otherwise expose to clap's dispatch (`flpdf -- qdf
+                //       out` for a file literally named `qdf`).
+                // In both, preserve the marker and hand the rest to clap
+                // verbatim so the operand keeps its input/output identity and
+                // dash-prefixed paths survive. A subcommand-named token inside
+                // a retained qpdf segment (e.g. `rewrite` as an `--encrypt`
+                // password) never reaches clap's dispatch slot, so it must not
+                // trip either case.
+                let subcommand_dispatched = residual_args
                     .get(1)
-                    .is_some_and(|pushed| self.is_subcommand_token(pushed))
-                {
-                    // A native clap subcommand (e.g. `flpdf rewrite -- -in.pdf`)
-                    // owns this argv; preserve the marker and hand the
-                    // remaining tokens to clap verbatim so dash-prefixed
-                    // positional paths keep working.
+                    .is_some_and(|pushed| self.is_subcommand_token(pushed));
+                let leading_reset_hides_subcommand = residual_args.len() == 1
+                    && iter
+                        .peek()
+                        .is_some_and(|next| self.is_subcommand_token(next));
+                if subcommand_dispatched || leading_reset_hides_subcommand {
                     residual_args.push(arg);
                     residual_args.extend(iter);
                     break;
                 }
-                // At the top level qpdf treats `--` as a section reset and
-                // continues parsing the following arguments with the main
-                // option table (`QPDFArgParser.cc:437-560`). Terminators for
-                // named segments are consumed by the inner loop below and
-                // remain in the residual argv for clap's segment boundary.
+                // Otherwise this is qpdf's main-table section reset: consume
+                // the marker and continue parsing with the main option table.
+                // Named-segment terminators are consumed by the inner loop
+                // below and remain in the residual argv for clap's boundary.
                 continue;
             }
 
@@ -821,6 +832,32 @@ mod tests {
             parsed.residual_args,
             ["flpdf", "rewrite", "--", "-qdf", "output.pdf"]
         );
+    }
+
+    #[test]
+    fn leading_reset_before_a_subcommand_named_file_preserves_the_terminator() {
+        // `flpdf -- qdf output.pdf` for a file literally named `qdf`: qpdf's
+        // leading section reset resumes the main positional grammar, so `qdf`
+        // is the input operand, not a native subcommand. Consuming the marker
+        // would drop `qdf` into clap's dispatch slot and select the `qdf`
+        // subcommand; preserve it so clap sees `qdf`/`output.pdf` as
+        // end-of-options positionals. An option after the reset (the core
+        // `flpdf -- --qdf in out` fix) is unaffected because the next token
+        // is not a subcommand name.
+        let command = clap::Command::new("flpdf")
+            .subcommand(clap::Command::new("qdf"))
+            .arg(clap::Arg::new("qdf-mode").long("qdf"));
+
+        let parsed = ArgParser::from_command(command)
+            .parse(vec![
+                "flpdf".into(),
+                "--".into(),
+                "qdf".into(),
+                "output.pdf".into(),
+            ])
+            .expect("leading reset before a subcommand-named file should parse");
+
+        assert_eq!(parsed.residual_args, ["flpdf", "--", "qdf", "output.pdf"]);
     }
 
     #[test]
