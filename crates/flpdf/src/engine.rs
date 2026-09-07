@@ -283,10 +283,10 @@ impl<R: Read + Seek> Pdf<R> {
                 return Err(error);
             }
         };
-        // Xref-stream/ObjStm parsing still has a temporary bootstrap owner in
-        // this slice.  The classic trailer itself was parsed by `resolver`;
-        // keep that distinction explicit until the follow-up cutover removes
-        // the remaining bootstrap handoff.
+        // The production xref loader was given this resolver as its canonical
+        // owner, so xref-stream handles and all metadata they resolve are
+        // already in the live cache. The owner-less loader still returns the
+        // temporary bootstrap handoff for its standalone API/tests.
         let bootstrap_cache = loaded_state.bootstrap_cache;
         let parsed_xref_streams = loaded_state.parsed_xref_streams;
         let trailer_references = loaded_state.trailer_references;
@@ -313,9 +313,9 @@ impl<R: Read + Seek> Pdf<R> {
         resolver.install_repair_diagnostics(loaded.repair_diagnostics.clone());
         // QPDF's parser registers indirect references while reading every
         // trailer, including historical /Prev sections (QPDFParser.cc:168-175).
-        // The initial classic trailer already used this resolver; retain the
-        // same cache-only registration step for xref-stream/recovery handles
-        // until their bootstrap cutover lands.
+        // Canonical xref loading has already minted those handles in this
+        // resolver; retain this idempotent registration for owner-less state
+        // handoffs and trailer references collected during recovery.
         for object_ref in trailer_references {
             if object_ref.number != 0 && object_ref.generation != u16::MAX {
                 resolver.get_object_handle(object_ref);
@@ -335,7 +335,7 @@ impl<R: Read + Seek> Pdf<R> {
             resolver.direct_object_handle(crate::reader::rebind_handle_value(
                 &resolver,
                 &loaded.trailer,
-            )?) // cov:ignore: xref-stream/recovery bootstrap trailers remain until their follow-up cutover
+            )?) // cov:ignore: owner-less standalone xref loading may still return a foreign trailer
         };
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
         // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
