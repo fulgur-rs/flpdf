@@ -8749,6 +8749,60 @@ mod tests {
         assert!(first.is_same_object_as(&member));
     }
 
+    /// `ObjectHandle::try_get_parsed_offset` must force resolution itself
+    /// (`QPDFObjectHandle::getParsedOffset`'s `dereference()` call,
+    /// `libqpdf/QPDFObjectHandle.cc:1874-1881`) for both a never-touched
+    /// uncompressed object and a never-touched ObjStm member -- unlike
+    /// `get_parsed_offset`, which only sees whatever a prior caller already
+    /// resolved.
+    #[test]
+    fn try_get_parsed_offset_resolves_untouched_uncompressed_and_objstm_handles() {
+        let (bytes, stream_offset) = compressed_object_stream_fixture();
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let entries = BTreeMap::from([
+            (
+                stream_ref,
+                XrefEntry::Uncompressed {
+                    offset: stream_offset,
+                },
+            ),
+            (
+                member_ref,
+                XrefEntry::Compressed {
+                    stream: stream_ref.number,
+                    index: 0,
+                },
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            entries,
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, b"input.pdf".to_vec()),
+            0,
+        );
+
+        let stream = resolver.get_object_handle(stream_ref);
+        assert!(!stream.is_resolved());
+        let forced_stream_offset = stream.try_get_parsed_offset().unwrap();
+        assert!(stream.is_resolved());
+        assert!(forced_stream_offset >= 0);
+        assert_eq!(
+            forced_stream_offset,
+            stream.get_parsed_offset(),
+            "the forcing accessor must agree with the offset resolution actually recorded"
+        );
+
+        let member = resolver.get_object_handle(member_ref);
+        assert!(!member.is_resolved());
+        assert_eq!(member.try_get_parsed_offset().unwrap(), 9);
+        assert!(member.is_resolved());
+    }
+
     #[test]
     fn an_objstm_duplicate_header_keeps_the_last_offset_like_qpdfs_map() {
         let stream_ref = ObjectRef::new(4, 0);
