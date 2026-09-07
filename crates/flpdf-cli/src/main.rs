@@ -2,7 +2,9 @@
 
 mod arg_parser;
 
-use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{
+    ArgGroup, Args as ClapArgs, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use flpdf::fix_qdf;
 use flpdf::job::{
     copy_duplicate_page_annotations, flatten_rotation_on_pages,
@@ -2410,6 +2412,7 @@ fn preprocess_qpdf_args<T: Into<OsString>>(args: Vec<T>) -> CliResult<Preprocess
 
     Ok(PreprocessedArgs {
         residual_args: parsed.residual_args,
+        native_subcommand_mode: parsed.native_subcommand_mode,
         expanded_arg_count: parsed.expanded_arg_count,
         overlay_specs,
         attachment_segments,
@@ -2549,11 +2552,43 @@ fn cli_command() -> clap::Command {
     )
 }
 
+#[cfg(test)]
 fn cli_parse_from(args: Vec<OsString>) -> Cli {
+    cli_parse_from_mode(args, true)
+}
+
+fn cli_parse_from_mode(args: Vec<OsString>, native_subcommand_mode: bool) -> Cli {
     stacker::maybe_grow(
         CLI_COMMAND_STACK_RED_ZONE,
         CLI_COMMAND_STACK_GROWTH_SIZE,
-        || Cli::parse_from(args),
+        || {
+            if native_subcommand_mode {
+                return Cli::parse_from(args);
+            }
+
+            // clap has no public operation that removes generated
+            // subcommands from a Command. Rename and hide them for the
+            // qpdf-compat parse only, retaining the same generated argument
+            // schema while making every positional obey qpdf's flat grammar.
+            let mut disabled_index = 0;
+            let command = cli_command().mut_subcommands(|subcommand| {
+                let disabled_name: &'static str = Box::leak(
+                    format!("__flpdf_qpdf_compat_native_subcommand_{disabled_index}")
+                        .into_boxed_str(),
+                );
+                disabled_index += 1;
+                subcommand
+                    .name(disabled_name)
+                    .hide(true)
+                    .alias(None)
+                    .visible_alias(None)
+                    .short_flag(None)
+                    .short_flag_alias(None)
+                    .visible_short_flag_alias(None)
+            });
+            let matches = command.get_matches_from(args);
+            Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+        },
     )
 }
 
@@ -2643,12 +2678,13 @@ fn main() {
     }
     let PreprocessedArgs {
         residual_args,
+        native_subcommand_mode,
         overlay_specs,
         attachment_segments,
         raw_overrides,
         expanded_arg_count: _,
     } = preprocessed;
-    let mut args = cli_parse_from(residual_args);
+    let mut args = cli_parse_from_mode(residual_args, native_subcommand_mode);
     apply_raw_overrides(&mut args, raw_overrides);
     // qpdf keeps --verbose on QPDFJob rather than on the password parser, but
     // the reader owns the authentication retry boundary in flpdf. Carry the
@@ -5385,6 +5421,7 @@ struct OverlaySpec {
 
 struct PreprocessedArgs {
     residual_args: Vec<OsString>,
+    native_subcommand_mode: bool,
     overlay_specs: Vec<OverlaySpec>,
     attachment_segments: Vec<Vec<Vec<u8>>>,
     raw_overrides: RawCliOverrides,

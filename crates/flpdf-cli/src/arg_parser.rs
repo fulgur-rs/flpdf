@@ -155,6 +155,9 @@ pub(crate) struct ParsedArgs {
     pub(crate) raw_residual_args: Vec<RawArg>,
     pub(crate) named_segments: Vec<NamedSegment>,
     pub(crate) raw_named_segments: Vec<RawNamedSegment>,
+    /// Whether the first expanded argv token is a native clap subcommand.
+    /// Otherwise the invocation stays in qpdf's flat compatibility grammar.
+    pub(crate) native_subcommand_mode: bool,
     /// Number of argv tokens after `@argfile` expansion, before named-segment
     /// partitioning. qpdf checks `argc == 2` at this point for sole help
     /// options (`QPDFArgParser.cc:437,478-483`).
@@ -281,6 +284,21 @@ impl ArgParser {
     pub(crate) fn parse_os(&self, args: Vec<OsString>) -> CliResult<ParsedArgs> {
         let args = expand_arg_files(args.into_iter().map(RawArg::from_os).collect())?;
         let expanded_arg_count = args.len();
+        // qpdf has no subcommands. Since flpdf adds a native clap surface, fix
+        // the dispatch mode once from the first expanded token: a bare native
+        // subcommand at the command position selects clap's native grammar;
+        // every other invocation remains in qpdf's flat grammar. In
+        // particular, a leading qpdf `--` must not expose its following
+        // subcommand-named input to native dispatch.
+        // A help request also needs clap's ordinary schema: hiding the
+        // generated subcommands for the qpdf-compat parse would drop the
+        // Commands section from `flpdf --help` / `flpdf help` and break
+        // `flpdf help <subcommand>`. qpdf has no such surface to preserve, so
+        // this only covers flpdf's own native help, not a qpdf-flat operand.
+        let native_subcommand_mode = args.get(1).is_some_and(|arg| {
+            self.is_subcommand_token(arg)
+                || matches!(arg.as_bytes(), b"help" | b"--help" | b"-help" | b"-h")
+        });
         let mut iter = args.into_iter().peekable();
         let Some(program) = iter.next() else {
             return Err("qpdf argument vector is empty".into());
@@ -291,35 +309,11 @@ impl ArgParser {
 
         while let Some(arg) = iter.next() {
             if arg.as_bytes() == b"--" {
-                // qpdf has no positional subcommands, so its top-level `--`
-                // is always a main-table section reset
-                // (`QPDFArgParser.cc:437-560`). flpdf adds native clap
-                // subcommands, and clap dispatches one only from the command
-                // position (the first residual token after the program). This
-                // `--` therefore belongs to clap -- as its end-of-options
-                // marker rather than qpdf's reset -- in exactly two shapes,
-                // both of which put a native subcommand at clap's dispatch
-                // slot:
-                //   (a) a subcommand already occupies the command position
-                //       (`flpdf rewrite -- -in.pdf`), or
-                //   (b) this is the leading reset and the next token is a
-                //       subcommand-named positional that the reset would
-                //       otherwise expose to clap's dispatch (`flpdf -- qdf
-                //       out` for a file literally named `qdf`).
-                // In both, preserve the marker and hand the rest to clap
-                // verbatim so the operand keeps its input/output identity and
-                // dash-prefixed paths survive. A subcommand-named token inside
-                // a retained qpdf segment (e.g. `rewrite` as an `--encrypt`
-                // password) never reaches clap's dispatch slot, so it must not
-                // trip either case.
-                let subcommand_dispatched = residual_args
-                    .get(1)
-                    .is_some_and(|pushed| self.is_subcommand_token(pushed));
-                let leading_reset_hides_subcommand = residual_args.len() == 1
-                    && iter
-                        .peek()
-                        .is_some_and(|next| self.is_subcommand_token(next));
-                if subcommand_dispatched || leading_reset_hides_subcommand {
+                // qpdf's top-level `--` is a main-table section reset, not a
+                // final option terminator (`QPDFArgParser.cc:437-560`). Keep
+                // it only when native mode was selected up front, where it
+                // belongs to clap's subcommand grammar.
+                if native_subcommand_mode {
                     residual_args.push(arg);
                     residual_args.extend(iter);
                     break;
@@ -418,6 +412,7 @@ impl ArgParser {
             raw_residual_args,
             named_segments,
             raw_named_segments,
+            native_subcommand_mode,
             expanded_arg_count,
         })
     }
@@ -832,18 +827,18 @@ mod tests {
             parsed.residual_args,
             ["flpdf", "rewrite", "--", "-qdf", "output.pdf"]
         );
+        assert!(parsed.native_subcommand_mode);
     }
 
     #[test]
-    fn leading_reset_before_a_subcommand_named_file_preserves_the_terminator() {
+    fn qpdf_mode_consumes_a_leading_reset_before_a_subcommand_named_file() {
         // `flpdf -- qdf output.pdf` for a file literally named `qdf`: qpdf's
         // leading section reset resumes the main positional grammar, so `qdf`
         // is the input operand, not a native subcommand. Consuming the marker
-        // would drop `qdf` into clap's dispatch slot and select the `qdf`
-        // subcommand; preserve it so clap sees `qdf`/`output.pdf` as
-        // end-of-options positionals. An option after the reset (the core
-        // `flpdf -- --qdf in out` fix) is unaffected because the next token
-        // is not a subcommand name.
+        // is correct because mode selection happens before clap dispatch and
+        // qpdf-compatible parsing has no native subcommands. An option after
+        // the reset (the core `flpdf -- --qdf in out` fix) follows the same
+        // flat grammar.
         let command = clap::Command::new("flpdf")
             .subcommand(clap::Command::new("qdf"))
             .arg(clap::Arg::new("qdf-mode").long("qdf"));
@@ -855,9 +850,10 @@ mod tests {
                 "qdf".into(),
                 "output.pdf".into(),
             ])
-            .expect("leading reset before a subcommand-named file should parse");
+            .expect("qpdf-compatible reset before a subcommand-named file should parse");
 
-        assert_eq!(parsed.residual_args, ["flpdf", "--", "qdf", "output.pdf"]);
+        assert!(!parsed.native_subcommand_mode);
+        assert_eq!(parsed.residual_args, ["flpdf", "qdf", "output.pdf"]);
     }
 
     #[test]

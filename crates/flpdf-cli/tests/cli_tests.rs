@@ -17,6 +17,26 @@ use common::{first_widget_ref, page_annotation_handles};
 mod eol;
 use eol::EOL;
 
+const EXPECTED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+/// `true` when the pinned qpdf oracle is runnable, mirroring the optional
+/// oracle gate the other differential suites use so a machine without qpdf
+/// still runs the rest of this suite. The version is pinned because a
+/// differential assertion against a different qpdf is not a parity result.
+fn qpdf_available() -> bool {
+    ProcessCommand::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == EXPECTED_QPDF_VERSION)
+        })
+        .unwrap_or(false)
+}
+
 /// `true` when `needle` appears as a contiguous byte subslice of `hay`.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
@@ -1145,6 +1165,47 @@ fn qdf_subcommand_rewrites_output() {
     assert!(has(b"\nxref\n"), "expected a classic `xref` table");
     assert!(!has(b"/Type /XRef"), "QDF must not use an xref stream");
     assert!(!has(b"/Type /ObjStm"), "QDF must not use object streams");
+}
+
+#[test]
+fn qpdf_compat_reset_keeps_a_subcommand_named_input_before_later_options() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("qdf");
+    let qpdf_output = temp.path().join("qpdf-out.pdf");
+    let flpdf_output = temp.path().join("flpdf-out.pdf");
+    std::fs::copy("../../tests/fixtures/minimal.pdf", &input).unwrap();
+
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("{EXPECTED_QPDF_VERSION} is required for the qpdf-compat reset oracle on CI");
+        }
+        eprintln!("skipping qpdf-compat reset oracle: {EXPECTED_QPDF_VERSION} is not available");
+        return;
+    }
+
+    let qpdf = ProcessCommand::new("qpdf")
+        .current_dir(temp.path())
+        .args(["--", "qdf", "--static-id", "qpdf-out.pdf"])
+        .output()
+        .expect("qpdf 11.9.0 must be available");
+    assert!(
+        qpdf.status.success(),
+        "qpdf probe failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["--", "qdf", "--static-id", "flpdf-out.pdf"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "qpdf-compatible reset must keep a subcommand-named input in the flat grammar"
+    );
 }
 
 #[test]
