@@ -551,7 +551,7 @@ fn parse_page_contents_can_stop_on_the_inline_image_event() {
 }
 
 #[test]
-fn filter_as_contents_reports_failed_stream_decoding() {
+fn filter_as_contents_ignores_failed_stream_decoding_like_qpdf() {
     let pdf = Pdf::open_mem_owned(indirect_content_shape_pdf()).unwrap();
     let failing = pdf.new_stream().unwrap();
     failing
@@ -559,12 +559,29 @@ fn filter_as_contents_reports_failed_stream_decoding() {
         .unwrap();
     let mut filter = RecordingFilter::default();
 
+    failing
+        .filter_as_contents(&mut filter, None)
+        .expect("qpdf ignores an unsuccessful specialized stream pipe");
+    assert_eq!(filter.eof_calls, 0);
+}
+
+#[test]
+fn filter_as_contents_propagates_provider_errors() {
+    let pdf = Pdf::open_mem_owned(indirect_content_shape_pdf()).unwrap();
+    let failing = pdf.new_stream().unwrap();
+    failing
+        .replace_stream_data_with_callback(
+            |_| Err(flpdf::Error::System("provider failure".to_owned())),
+            None,
+            None,
+        )
+        .unwrap();
+    let mut filter = RecordingFilter::default();
+
     let error = failing
         .filter_as_contents(&mut filter, None)
-        .expect_err("qpdf must report an unsuccessful specialized stream pipe");
-    assert!(error
-        .to_string()
-        .contains("errors while decoding content stream"));
+        .expect_err("provider exceptions must cross filterAsContents");
+    assert_eq!(error.to_string(), "provider failure");
 }
 
 #[test]

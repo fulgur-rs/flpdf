@@ -5653,23 +5653,19 @@ impl ObjectHandle {
         );
         let mut token_pipeline = QpdfTokenizer::new(description, filter, next);
         let mut filtering_attempted = false;
-        let success = self.pipe_stream_data(
+        // qpdf's legacy pipeStreamData overload returns only whether
+        // filtering was attempted; filterAsContents deliberately ignores the newer
+        // overall-success bool. Provider/source/sink errors still propagate
+        // through `?`, while an ordinary false result is not an exception.
+        self.pipe_stream_data(
             &mut token_pipeline,
             &mut filtering_attempted,
             0,
             DecodeLevel::Specialized,
             false,
             false,
-        );
-        let success = success?;
-        if success {
-            Ok(())
-        } else {
-            Err(Error::Unsupported(format!(
-                "object {}: errors while decoding content stream",
-                object_generation_description(self)
-            )))
-        }
+        )?;
+        Ok(())
     }
 
     /// The normalized page content streams plus the qpdf description used by
