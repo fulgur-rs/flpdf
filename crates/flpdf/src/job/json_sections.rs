@@ -39,8 +39,7 @@ use std::io::{Read, Seek};
 ///
 /// In every variant the function emits the *original* reference strings, not
 /// the wrapper array's ref number — that matches qpdf's `contents` output.
-pub(crate) fn collect_content_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+pub(crate) fn collect_content_refs(
     content_handle: &ObjectHandle,
 ) -> Result<Vec<String>, ConvertError> {
     fn ref_string(r: ObjectRef) -> String {
@@ -62,36 +61,36 @@ pub(crate) fn collect_content_refs<R: Read + Seek>(
         // Resolve to see whether the indirect object is a Stream (in which
         // case this ref itself is the content) or an Array of Stream refs
         // (in which case its elements are the content).
-        pdf.resolve(content_handle)?;
+        content_handle.try_dereference()?;
         if content_handle.as_stream_dict().is_some() {
             return Ok(vec![ref_string(r)]);
         }
-        return match content_handle.as_array() {
+        return match content_handle.try_as_array()? {
             Some(elems) => Ok(refs_in_direct_array(&elems)),
             // /Contents pointing at anything else (Null, missing) → empty.
             None => Ok(vec![]),
         };
     }
 
-    match content_handle.as_array() {
+    match content_handle.try_as_array()? {
         Some(elems) => Ok(refs_in_direct_array(&elems)),
         // Null, missing, or direct Stream — emit empty list.
         None => Ok(vec![]),
     }
 }
 
-fn image_to_json<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn image_to_json(
     name: &[u8],
     image: &ObjectHandle,
     version: i32,
     decode_level: DecodeLevel,
 ) -> Result<Json, ConvertError> {
     let image = image.clone();
-    pdf.resolve(&image)?;
+    image.try_dereference()?;
     let stream_dict = image
         .as_stream_dict()
-        .and_then(|dict| dict.as_dictionary())
+        .ok_or_else(|| ConvertError::PdfError("image XObject is not a stream".to_owned()))?
+        .try_as_dictionary()?
         .ok_or_else(|| ConvertError::PdfError("image XObject is not a stream".to_owned()))?;
 
     let value_for = |key: &[u8]| {
@@ -101,17 +100,17 @@ fn image_to_json<R: Read + Seek>(
             .unwrap_or_else(ObjectHandle::null)
     };
     let filter = value_for(b"/Filter");
-    pdf.resolve(&filter)?;
-    let filter_count = filter.as_array().map_or(1, |items| items.len());
-    let filter = if filter.as_array().is_some() {
+    let filter_items = filter.try_as_array()?;
+    let filter_count = filter_items.as_ref().map_or(1, Vec::len);
+    let filter = if filter_items.is_some() {
         pdf_object_to_json_with_version(&filter, version)?
     } else {
         json_array([pdf_object_to_json_with_version(&filter, version)?])?
     };
 
     let decode_parms = value_for(b"/DecodeParms");
-    pdf.resolve(&decode_parms)?;
-    let decode_parms = if decode_parms.as_array().is_some() {
+    let decode_parm_items = decode_parms.try_as_array()?;
+    let decode_parms = if decode_parm_items.is_some() {
         pdf_object_to_json_with_version(&decode_parms, version)?
     } else {
         json_array(
@@ -260,11 +259,10 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
 
         // Resolve the page dict to extract /Contents.
         let page_handle = pdf.get_object_handle(page_ref);
-        pdf.resolve(&page_handle)?;
-        let page_dict = page_handle.as_dictionary().unwrap_or_default();
+        let page_dict = page_handle.try_as_dictionary()?.unwrap_or_default();
         let contents_handle = page_dict.get(b"/Contents".as_slice());
         let contents: Vec<Json> = match contents_handle {
-            Some(c) => collect_content_refs(pdf, c)?
+            Some(c) => collect_content_refs(c)?
                 .into_iter()
                 .map(Json::make_string)
                 .collect(),
@@ -281,7 +279,7 @@ pub(crate) fn build_pages_section_with_options<R: Read + Seek>(
         };
         let images: Vec<Json> = image_handles
             .into_iter()
-            .map(|(name, image)| image_to_json(pdf, &name, &image, version, decode_level))
+            .map(|(name, image)| image_to_json(&name, &image, version, decode_level))
             .collect::<Result<Vec<_>, ConvertError>>()?;
 
         // Build page entry with keys in strict alphabetical order:
@@ -924,20 +922,15 @@ pub(crate) fn build_attachments_section_with_version<R: Read + Seek>(
 /// - `/R >= 5` → `"AESv3"`
 /// - `/R == 4` → `"AESv2"`
 /// - everything else (legacy) → `"RC4"`
-pub(crate) fn cf_method_string<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+pub(crate) fn cf_method_string(
     encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     selector: Option<&str>,
 ) -> Result<&'static str, ConvertError> {
-    fn revision_default<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
+    fn revision_default(
         encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     ) -> Result<&'static str, ConvertError> {
         let r = match encrypt.get(b"/R".as_slice()) {
-            Some(handle) => {
-                pdf.resolve(handle)?;
-                handle.as_integer()
-            }
+            Some(handle) => handle.try_as_integer()?,
             None => None,
         };
         Ok(match r {
@@ -948,38 +941,29 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
     }
 
     let Some(selector) = selector else {
-        return revision_default(pdf, encrypt);
+        return revision_default(encrypt);
     };
     if selector == "Identity" {
         return Ok("none");
     }
     // Look up the CFM entry inside /CF/<selector>
     let cf = match encrypt.get(b"/CF".as_slice()) {
-        Some(handle) => {
-            pdf.resolve(handle)?;
-            handle.as_dictionary()
-        }
+        Some(handle) => handle.try_as_dictionary()?,
         None => None,
     };
     let Some(cf) = cf else {
-        return revision_default(pdf, encrypt);
+        return revision_default(encrypt);
     };
     let selector = crate::object_handle::canonical_dictionary_key(selector.as_bytes());
     let filter = match cf.get(&selector) {
-        Some(handle) => {
-            pdf.resolve(handle)?;
-            handle.as_dictionary()
-        }
+        Some(handle) => handle.try_as_dictionary()?,
         None => None,
     };
     let Some(filter) = filter else {
-        return revision_default(pdf, encrypt);
+        return revision_default(encrypt);
     };
     let cfm = match filter.get(b"/CFM".as_slice()) {
-        Some(handle) => {
-            pdf.resolve(handle)?;
-            handle.as_name()
-        }
+        Some(handle) => handle.try_as_name()?,
         None => None,
     };
     Ok(match cfm {
@@ -988,9 +972,9 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
             b"AESV3" => "AESv3",
             b"V2" => "RC4",
             b"None" => "none",
-            _ => revision_default(pdf, encrypt)?,
+            _ => revision_default(encrypt)?,
         },
-        None => revision_default(pdf, encrypt)?,
+        None => revision_default(encrypt)?,
     })
 }
 
@@ -999,8 +983,7 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
 /// Returns `None` if the key is absent, the value is not a name, or the
 /// name's bytes are not valid UTF-8 (matching the strict, non-lossy
 /// decoding the original raw lookup used).
-fn dict_name_str<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn dict_name_str(
     dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
 ) -> Result<Option<String>, ConvertError> {
@@ -1008,9 +991,8 @@ fn dict_name_str<R: Read + Seek>(
     let Some(handle) = dict.get(&key) else {
         return Ok(None);
     };
-    pdf.resolve(handle)?;
     Ok(handle
-        .as_name()
+        .try_as_name()?
         .and_then(|bytes| String::from_utf8(bytes).ok()))
 }
 
@@ -1111,14 +1093,13 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
     // inline-object bound, which would incorrectly report an otherwise-valid
     // /Encrypt entry as absent (plaintext). `trailer_key_handle` lifts only
     // this key's own value, so a deeply-nested sibling can't erase it.
-    // `resolve` is a no-op for a direct (inline) dictionary and
-    // resolves an indirect reference in place, so a single call covers both
-    // shapes; a present but non-dictionary value (any type, including an
-    // unresolved reference) falls out of `as_dictionary()` as `None`,
-    // matching the prior explicit dictionary/reference/catch-all arms.
+    // The resolving dictionary accessor is a no-op for a direct (inline)
+    // dictionary and resolves an indirect reference in place, so a single
+    // call covers both shapes; a present but non-dictionary value (any type,
+    // including an unresolved reference) falls out as `None`, matching the
+    // prior explicit dictionary/reference/catch-all arms.
     let encrypt_handle = pdf.trailer_key_handle(b"Encrypt");
-    pdf.resolve(&encrypt_handle)?;
-    let encrypt_dict = encrypt_handle.as_dictionary();
+    let encrypt_dict = encrypt_handle.try_as_dictionary()?;
 
     let is_encrypted = pdf.is_encrypted();
 
@@ -1152,31 +1133,21 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
             // et al.) transparently follow indirect references, so these
             // lookups resolve too rather than guarding against it.
             let v = match enc.get(b"/V".as_slice()) {
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle.as_integer().unwrap_or(0)
-                }
+                Some(handle) => handle.try_as_integer()?.unwrap_or(0),
                 None => 0,
             };
             let r = match enc.get(b"/R".as_slice()) {
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle.as_integer().unwrap_or(0)
-                }
+                Some(handle) => handle.try_as_integer()?.unwrap_or(0),
                 None => 0,
             };
             let p_raw = match enc.get(b"/P".as_slice()) {
-                Some(handle) => {
-                    pdf.resolve(handle)?;
-                    handle.as_integer().map(|n| n as i32).unwrap_or(0)
-                }
+                Some(handle) => handle.try_as_integer()?.map(|n| n as i32).unwrap_or(0),
                 None => 0,
             };
             let length_handle = enc
                 .get(b"/Length".as_slice())
                 .cloned()
                 .unwrap_or_else(ObjectHandle::null);
-            pdf.resolve(&length_handle)?;
             let dictionary_bits = effective_length_bits(v, &length_handle)?;
             // qpdf reports the derived file-key length, not a raw `/Length`
             // spelling. The initialized encryption snapshot is therefore the
@@ -1186,14 +1157,14 @@ pub(crate) fn build_encrypt_section_with_options<R: Read + Seek>(
             let bits = pdf.encryption_length_bits().unwrap_or(dictionary_bits);
 
             // Determine method strings from /StmF, /StrF, /EFF selectors.
-            let stmf = dict_name_str(pdf, enc, "StmF")?;
-            let strf = dict_name_str(pdf, enc, "StrF")?;
-            let eff = dict_name_str(pdf, enc, "EFF")?;
+            let stmf = dict_name_str(enc, "StmF")?;
+            let strf = dict_name_str(enc, "StrF")?;
+            let eff = dict_name_str(enc, "EFF")?;
 
             let (streammethod, stringmethod, filemethod) = if v >= 4 {
-                let sm = cf_method_string(pdf, enc, stmf.as_deref())?;
-                let st = cf_method_string(pdf, enc, strf.as_deref())?;
-                let fm = cf_method_string(pdf, enc, eff.as_deref().or(stmf.as_deref()))?;
+                let sm = cf_method_string(enc, stmf.as_deref())?;
+                let st = cf_method_string(enc, strf.as_deref())?;
+                let fm = cf_method_string(enc, eff.as_deref().or(stmf.as_deref()))?;
                 (sm, st, fm)
             } else if v == 1 || v == 2 {
                 ("RC4", "RC4", "RC4")
@@ -1259,6 +1230,31 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
 
+    #[test]
+    fn json_section_production_uses_resolving_handle_accessors() {
+        let source = include_str!("json_sections.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("json section production source");
+
+        assert!(
+            !production.contains("pdf.resolve("),
+            "JSON section production must resolve through ObjectHandle accessors"
+        );
+        for forbidden in [
+            ".as_dictionary()",
+            ".as_array()",
+            ".as_integer()",
+            ".as_name()",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "JSON section production must not use non-resolving {forbidden}"
+            );
+        }
+    }
+
     fn one_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/compat/one-page.pdf");
@@ -1295,8 +1291,8 @@ mod tests {
         let image = image_handle(filter, ObjectHandle::null());
         pdf.replace_object(image_ref, image).expect("install image");
         let handle = pdf.get_object_handle(image_ref);
-        let result = image_to_json(&mut pdf, b"/Im0", &handle, 2, DecodeLevel::None)
-            .expect("image descriptor");
+        let result =
+            image_to_json(b"/Im0", &handle, 2, DecodeLevel::None).expect("image descriptor");
         assert!(result.is_dictionary());
 
         let filter = ObjectHandle::array(vec![
@@ -1308,7 +1304,7 @@ mod tests {
         pdf.replace_object(image_ref, image_handle(filter, decode_parms))
             .expect("install second image");
         let handle = pdf.get_object_handle(image_ref);
-        image_to_json(&mut pdf, b"/Im1", &handle, 1, DecodeLevel::All)
+        image_to_json(b"/Im1", &handle, 1, DecodeLevel::All)
             .expect("image descriptor with array decode parameters");
     }
 

@@ -1276,6 +1276,30 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 | `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |
 | `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | ✅ |
 
+### A6/A7/A8 Job/CLI JSON accessor cohort `flpdf-3yn9.48.31` (2026-09-08)
+
+The first bounded Job/CLI cohort keeps the existing `QPDFJob::doJSONPages` and
+`doJSONEncrypt` section ownership (`QPDFJob.cc:1030-1093,1206-1279`) while
+removing the caller-side `Pdf::resolve` bridge from
+`crates/flpdf/src/job/json_sections.rs`. `collect_content_refs` and
+`image_to_json` use the canonical `ObjectHandle::try_dereference` and
+`try_as_*` accessors; the encryption projection uses `try_as_dictionary`,
+`try_as_integer`, and `try_as_name`, with `effective_length_bits` retaining its
+resolver-owned integer inspection.
+
+This follows qpdf's accessor order: `as*`/`is*` dereference on entry
+(`QPDFObjectHandle.cc:240-446`), `getKey`/`hasKey` resolve the dictionary holder
+and preserve qpdf's type-warning fallback (`QPDFObjectHandle.cc:965-989`), and
+warning or exception delivery remains at the object-handle boundary
+(`QPDFObjectHandle.cc:2168-2212`). The production区画 of
+`json_sections.rs` now has zero `Pdf::resolve`/`resolve_handle` calls and zero
+non-resolving `.as_dictionary()`/`.as_array()`/`.as_integer()`/`.as_name()`/
+`.get_key()`/`.has_key()`/`.is_null()` calls; the two stream dictionary views
+remain after the resolving step as the qpdf `getDict` equivalent
+(`QPDFObjectHandle.cc:1257-1262`). JSON section order, helper ownership, and
+`Result` error propagation are unchanged. Remaining Job/CLI files are tracked
+as later bounded cohorts under `flpdf-3yn9.48.31`.
+
 ### `qpdfjob-c` wrapper のエラー境界
 
 qpdf の `wrap_qpdfjob`（`libqpdf/qpdfjob-c.cc:32-40`）は、
