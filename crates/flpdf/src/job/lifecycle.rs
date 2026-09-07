@@ -2512,6 +2512,30 @@ impl QPDFJob {
         Ok(pdf)
     }
 
+    /// Finish qpdf's creation boundary for a single primary document.
+    ///
+    /// qpdf applies `updateFromJSON` and `handleRotations` before
+    /// `createQPDF` returns. Page-spec jobs retain their source-owned route
+    /// until the page-source cutover can return the merged erased document.
+    fn finish_created_document(&mut self, mut pdf: JobDocument) -> Result<JobDocument> {
+        let configuration = self.configuration.clone();
+        if !configuration.page_specs.is_empty() {
+            return Ok(pdf);
+        }
+        if let Some(update_path) = configuration.update_from_json.as_deref() {
+            let update_file = File::open(update_path).map_err(|error| {
+                Error::file_io("open update JSON", update_path.to_path_buf(), error)
+            })?;
+            self.update_from_json(
+                &mut pdf,
+                BufReader::new(update_file),
+                path_description_bytes(update_path),
+            )?; // cov:ignore: llvm-cov attributes the successful update continuation to the parser call's opening expressions
+        }
+        self.apply_configured_rotations(&mut pdf, &configuration)?;
+        Ok(pdf)
+    }
+
     /// Create the configured input document, returning `None` after qpdf-style
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<JobDocument>> {
@@ -2524,7 +2548,14 @@ impl QPDFJob {
             }
         }
         if self.configuration.empty_input {
-            return self.create_empty_document().map(Some);
+            let pdf = self.create_empty_document()?;
+            return match self.finish_created_document(pdf) {
+                Ok(pdf) => Ok(Some(pdf)),
+                Err(error) => {
+                    self.report_job_error(&error)?;
+                    Ok(None)
+                }
+            };
         }
         let Some(input) = self.configuration.input_file.clone() else {
             let error = Error::Unsupported("qpdfjob input file is not configured".to_owned());
@@ -2541,7 +2572,13 @@ impl QPDFJob {
         };
         if self.configuration.json_input {
             return match self.create_from_json_document(file, path_description_bytes(&input)) {
-                Ok(pdf) => Ok(Some(pdf)),
+                Ok(pdf) => match self.finish_created_document(pdf) {
+                    Ok(pdf) => Ok(Some(pdf)),
+                    Err(error) => {
+                        self.report_job_error(&error)?;
+                        Ok(None)
+                    }
+                },
                 Err(error) => {
                     self.report_job_error(&error)?;
                     Ok(None)
@@ -2553,7 +2590,13 @@ impl QPDFJob {
             path_description_bytes(&input),
             self.configured_open_options(self.configuration.password.clone()),
         ) {
-            Ok(pdf) => Ok(Some(pdf)),
+            Ok(pdf) => match self.finish_created_document(pdf) {
+                Ok(pdf) => Ok(Some(pdf)),
+                Err(error) => {
+                    self.report_job_error(&error)?;
+                    Ok(None)
+                }
+            },
             Err(error) => {
                 self.report_job_error(&error)?;
                 Ok(None)
@@ -2801,21 +2844,19 @@ impl QPDFJob {
         mut primary: JobDocument,
         configuration: &JobConfiguration,
     ) -> Result<JobExitCode> {
-        if let Some(update_path) = configuration.update_from_json.as_deref() {
-            let update_file = File::open(update_path).map_err(|error| {
-                Error::file_io("open update JSON", update_path.to_path_buf(), error)
-            })?;
-            self.update_from_json(
-                &mut primary,
-                BufReader::new(update_file),
-                path_description_bytes(update_path),
-            )?; // cov:ignore: llvm-cov attributes this successful update continuation to its opening call lines
-        }
-
         if configuration.page_specs.is_empty() {
-            self.apply_configured_rotations(&mut primary, configuration)?;
             self.run_document_stages(&mut primary, configuration)
         } else {
+            if let Some(update_path) = configuration.update_from_json.as_deref() {
+                let update_file = File::open(update_path).map_err(|error| {
+                    Error::file_io("open update JSON", update_path.to_path_buf(), error)
+                })?;
+                self.update_from_json(
+                    &mut primary,
+                    BufReader::new(update_file),
+                    path_description_bytes(update_path),
+                )?; // cov:ignore: llvm-cov attributes this successful update continuation to its opening call lines
+            }
             let mut page_sources = vec![primary];
             // qpdf keys its opened-source cache by filename alone
             // (`page_spec_qpdfs.count(page_spec.filename) == 0`,
