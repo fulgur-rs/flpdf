@@ -4266,15 +4266,16 @@ fn parse_xref_stream_with_canonical_owner(
                 // document: `libqpdf/QPDF.cc:518-522`).
                 let mut diagnostics = Diagnostics::default();
                 context.append_diagnostics_to(&mut diagnostics);
+                // cov:ignore-start: the canonical context records no diagnostics
+                // of its own on this read-failure path, so the loop body has no
+                // input. The whole construct is wrapped because llvm-cov moves
+                // the uncovered region to the enclosing closing brace.
                 if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
-                    // cov:ignore-start: the canonical context records no
-                    // diagnostics of its own on this read-failure path, so the
-                    // loop body has no input; the branch itself is exercised.
                     for diagnostic in diagnostics.entries() {
                         sink.push(diagnostic.clone());
                     }
-                    // cov:ignore-end
                 }
+                // cov:ignore-end
                 // `QPDF::read_xrefStream` catches the QPDFExc raised by
                 // `readObjectAtOffset` and then reports its own
                 // `damagedPDF(xref_offset, "xref not found")` below
