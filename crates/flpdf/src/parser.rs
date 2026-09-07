@@ -1176,7 +1176,9 @@ mod live_input_tests {
     // from `QPDFParser::parse`, a thrown exception included.
     #[test]
     fn parse_restores_the_guard_even_when_the_body_fails() {
-        let mut input = CountingInput::new(b"(ciphertext)");
+        // The leading `1 0 R` also exercises `GuardSpyResolver::indirect_handle`
+        // before the trailing string reaches the failing decrypter.
+        let mut input = CountingInput::new(b"[1 0 R (ciphertext)]");
         let mut resolver = GuardSpyResolver {
             events: RefCell::new(Vec::new()),
             reject_entry: false,
