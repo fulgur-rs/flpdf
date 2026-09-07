@@ -527,6 +527,25 @@ qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的�
 経路にしか入らない構造的リスクがここに集中している。`emit_canonical_pdf_inner`
 は単独で約 1,250 行。
 
+### `writeXRefStream` layout owner (`flpdf-3yn9.48.58`, 2026-09-07)
+
+qpdf 11.9.0 の `QPDFWriter::writeXRefStream`（`QPDFWriter.cc:2392-2495`）は、
+`xref_id` を payload 作成前に xref map へ登録し、`f1 = max(bytesNeeded(max_offset +
+hint_length), bytesNeeded(max_id))`、`f2 = bytesNeeded(max_ostream_index)`、
+`esize = 1 + f1 + f2` を一度だけ決める。type 1 行の第 3 field は常に 0 で、type 2
+だけが ObjStm member index を持つ。`skip_compression` は linearization の pass 1
+だけに適用され、PNG predictor と `/FlateDecode` の辞書宣言を残したまま Flate
+圧縮を省略する（`QPDFWriter.cc:2418-2432`）。
+
+flpdf はこれを `writer/serialize.rs::xref_stream` の
+`build_entries_with_self` と `encode_payload_for_policy` に集約した。plain writer、
+linearized first-half、linearized second-half はこの owner から同じ self-entry、
+field width、type 0/1/2 row、raw/predictor/Flate payload を受け取り、linearization
+固有の `/Index`、`/Prev`、固定 region padding、`startxref` だけを consumer 側に残す。
+plain 側で source generation を field 3 や width の計算へ流し込む旧経路は削除した。
+`QPDFWriter::calculateXrefStreamPadding`（`:2498-2507`）に対応する region sizing は
+既存の同じ serializer module が引き続き所有する。
+
 `flpdf-3yn9.12` の stream encryption 対応は、`QPDFWriter.cc:935-999` の
 `PipelinePopper`/`pushEncryptionFilter`/`adjustAESStreamLength` を
 `writer.rs::run_writer_pipeline`、`pipe_writer_stream_payload`、

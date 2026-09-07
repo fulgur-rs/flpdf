@@ -89,9 +89,10 @@ pub(crate) fn append_xref_and_trailer(
     }
 }
 
-/// Append a plain xref section while sourcing classic trailer bytes from the
-/// live qpdf-shaped `ObjectHandle` owner. The xref-stream form remains with
-/// the existing physical dictionary writer until its D13 consumer slice.
+/// Append a plain xref section from the writer-owned trailer plan. The classic
+/// handle route delegates trailer emission to the shared `ObjectHandle` owner;
+/// the stream route consumes the plan's already-canonical trailer entries and
+/// uses the shared xref-stream serializer.
 pub(crate) fn append_xref_and_trailer_with_handle(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
@@ -133,42 +134,36 @@ fn append_xref_stream_and_trailer(
         .iter()
         .map(|(&number, &(_, offset))| (number, offset))
         .collect();
-    offsets.insert(xref_number, xref_offset);
     let members: BTreeMap<u32, (u32, u32)> = layout
         .compressed
         .iter()
         .map(|(&number, location)| (number, (location.container, location.index)))
         .collect();
-    let mut entries = xref_stream::build_entries(&offsets, &members, 0, size);
-    for (&number, &(generation, _)) in &layout.uncompressed {
-        entries[number as usize].field3 = u64::from(generation);
-    }
-    let max_generation = layout
-        .uncompressed
-        .values()
-        .map(|&(generation, _)| u64::from(generation))
-        .max()
-        .unwrap_or(0);
     let max_member_index = members
         .values()
         .map(|&(_, index)| u64::from(index))
         .max()
         .unwrap_or(0);
-    let widths = xref_stream::second_pass_widths(
-        xref_stream::max_entry_offset(&entries),
+    let stream_layout = xref_stream::prepare_xref_stream(
+        &mut offsets,
+        &members,
         0,
-        max_number,
-        max_generation.max(max_member_index),
-    );
-    let payload = if trailer.structural_filtered {
-        xref_stream::encode_payload(&entries, widths)?
-    } else {
-        xref_stream::encode_payload_raw(&entries, widths)?
-    };
+        size,
+        xref_number,
+        xref_offset,
+        xref_offset as u64,
+        xref_number,
+        max_member_index,
+        0,
+        None,
+        trailer.structural_filtered,
+        false,
+        false,
+    )?; // cov:ignore: plain xref payload setup is a validated in-memory writer boundary.
 
     let dictionary = xref_stream::XrefStreamDict {
         filtered: trailer.structural_filtered,
-        widths,
+        widths: stream_layout.widths,
         index: None,
         info: None,
         root: trailer.root,
@@ -187,9 +182,23 @@ fn append_xref_stream_and_trailer(
                 .map(|(id0, id1)| (id0.as_slice(), id1.as_slice()));
             let dictionary = xref_stream::XrefStreamDict { id, ..dictionary };
             if trailer.qdf {
-                xref_stream::write_object_qdf(bytes, xref_ref, &dictionary, &payload);
+                xref_stream::write_xref_stream(
+                    bytes,
+                    xref_ref,
+                    &dictionary,
+                    &stream_layout,
+                    true,
+                    None,
+                );
             } else {
-                xref_stream::write_object(bytes, xref_ref, &dictionary, &payload);
+                xref_stream::write_xref_stream(
+                    bytes,
+                    xref_ref,
+                    &dictionary,
+                    &stream_layout,
+                    false,
+                    None,
+                );
             }
         }
         IdPlan::Deterministic {
@@ -200,20 +209,22 @@ fn append_xref_stream_and_trailer(
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
             if trailer.qdf {
-                xref_stream::write_object_with_id_writer_qdf(
+                xref_stream::write_xref_stream(
                     bytes,
                     xref_ref,
                     &dictionary,
-                    &payload,
-                    &mut id_writer,
+                    &stream_layout,
+                    true,
+                    Some(&mut id_writer),
                 );
             } else {
-                xref_stream::write_object_with_id_writer(
+                xref_stream::write_xref_stream(
                     bytes,
                     xref_ref,
                     &dictionary,
-                    &payload,
-                    &mut id_writer,
+                    &stream_layout,
+                    false,
+                    Some(&mut id_writer),
                 );
             }
         }
@@ -813,6 +824,51 @@ mod tests {
         assert!(!bytes
             .windows(b"0000000012 00007 n \n".len())
             .any(|window| { window == b"0000000012 00007 n \n" }));
+    }
+
+    #[test]
+    fn xref_stream_type1_rows_keep_zero_field3_and_width_from_member_indices() {
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (256, 12));
+        layout.compressed.insert(
+            2,
+            CompressedLocation {
+                container: 4,
+                index: 12,
+            },
+        );
+        let mut trailer = trailer();
+        trailer.form = XrefForm::Stream;
+        let mut bytes = Vec::new();
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer)
+            .expect("xref stream emits a type-1 row");
+
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("/W [ 1 1 1 ]"),
+            "type-1 generation must not widen the object-stream index field: {text:?}"
+        );
+        let stream = bytes
+            .windows(b"\nstream\n".len())
+            .position(|window| window == b"\nstream\n")
+            .expect("xref stream framing")
+            + b"\nstream\n".len();
+        assert_eq!(&bytes[stream + 3..stream + 6], &[1, 12, 0]);
+    }
+
+    #[test]
+    fn xref_stream_width_accounts_for_the_xref_object_number() {
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(255, (0, 12));
+        let mut trailer = trailer();
+        trailer.form = XrefForm::Stream;
+        let mut bytes = Vec::new();
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer)
+            .expect("xref stream emits the high-numbered range");
+
+        assert!(String::from_utf8_lossy(&bytes).contains("/W [ 1 2 0 ]"));
     }
 
     #[test]
