@@ -196,6 +196,35 @@ the qtest driver's `QPDFExc::createWhat` boundary; repair-enabled opens retain
 the qpdf warning sequence before reconstruction. `error-condition 9-11` is the
 consumer coverage for these three paths.
 
+### Shared xref trailer and previous-section route (2026-09-08)
+
+qpdf's `QPDF::read_xref` inserts the initial `xref_offset` into a local
+`visited` set before reading either a classic table or an xref stream, then
+checks the returned `/Prev` offset before the next section is read
+(`libqpdf/QPDF.cc:626-719`). `read_xrefTable` and `reconstruct_xref` both call
+the same `readTrailer` (`QPDF.cc:894` and `QPDF.cc:565`), so parser warnings,
+empty-object handling, and the post-dictionary `stream` lookahead have one
+owner (`QPDF.cc:1312-1328`).
+
+`flpdf-3yn9.48.18` routes both classic owner variants and reconstruction
+candidate discovery through `crates/flpdf/src/xref.rs::read_trailer`. It uses
+the existing handle-producing parser so indirect trailer children retain the
+caller-provided document identity, converts parser diagnostics to
+`QpdfExc { object: "trailer" }`, appends qpdf's empty-object warning, and uses
+`Tokenizer::read_token(true, 0)` only for the dictionary-followed-by-`stream`
+lookahead. The classic fixed-width xref reader remains on its own
+`ByteCursor`/`readLine`-equivalent route. The `/Prev` merge helper seeds its
+local visitor with the already-read nonzero `LoadedXref.startxref`, so a
+self-referential initial `/Prev` is rejected before the section is parsed a
+second time.
+
+Live qpdf 11.9.0 probes and the xref regression tests record the observable
+contract: a dictionary followed by `stream` reports
+`(trailer, offset 134): stream keyword found in trailer`; an empty trailer
+candidate reports `(trailer, offset 53): empty object treated as null`; and a
+self-`/Prev` section retains one three-warning recovery sequence. The warning
+detail, object attribution, offset, and order match the Rust route.
+
 ### Input-source lifecycle (2026-09-03)
 
 qpdf constructs a `QPDF` with an `InvalidInputSource`, leaves its trailer

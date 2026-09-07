@@ -33,7 +33,6 @@
 //! `reconstruct_xref` sequence either way (`libqpdf/QPDF.cc:450-469,516-531`).
 use crate::object_handle::{DocumentResolver, ObjectValue};
 use crate::parser::{
-    parse_qpdf_direct_object_handle_with_diagnostics,
     parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, ParserDiagnostic,
 };
 use crate::reader::file_object::{
@@ -2056,9 +2055,6 @@ fn parse_xref_from_start_with_owner(
         let mut trailer_context = canonical_trailer_owner
             .is_none()
             .then(|| XrefReadContext::new(bytes, context_spec, registration, options.clone()));
-        let trailer_slice = bytes
-            .get(trailer_start..)
-            .ok_or_else(|| Error::parse(trailer_start, "trailer is not a dictionary"))?;
         // The initial classic subsection is already known when qpdf calls
         // readTrailer, so parser-created indirect children belong to the
         // document's one obj_cache. The owner-less standalone loader is the
@@ -2066,53 +2062,34 @@ fn parse_xref_from_start_with_owner(
         if let Some(owner) = canonical_trailer_owner {
             owner.install_xref_entries(registration.snapshot());
         }
-        let (trailer_value, _, trailer_parser_diagnostics) =
-            if let Some(owner) = canonical_trailer_owner {
-                let mut trailer_parser = CanonicalTrailerParser { owner };
-                parse_qpdf_direct_object_handle_with_diagnostics(
-                    trailer_slice,
-                    i64::try_from(trailer_start).unwrap_or(i64::MAX),
-                    None,
-                    &mut trailer_parser,
-                )
-                .map_err(|error| error.rebase_offset(trailer_start))?
-            } else {
-                let mut trailer_parser = BootstrapHandleParser {
-                    document: &trailer_context
-                        .as_ref()
-                        .expect("owner-less classic trailer has a bootstrap context")
-                        .document,
-                    description: XrefObjectDescription::Ordinary,
-                };
-                parse_qpdf_direct_object_handle_with_diagnostics(
-                    trailer_slice,
-                    i64::try_from(trailer_start).unwrap_or(i64::MAX),
-                    None,
-                    &mut trailer_parser,
-                )
-                .map_err(|error| error.rebase_offset(trailer_start))?
+        let (trailer, trailer_parser_diagnostics) = if let Some(owner) = canonical_trailer_owner {
+            let mut trailer_parser = CanonicalTrailerParser { owner };
+            read_trailer(
+                bytes,
+                trailer_start,
+                &options.description,
+                &mut trailer_parser,
+            )?
+        } else {
+            let mut trailer_parser = BootstrapHandleParser {
+                document: &trailer_context
+                    .as_ref()
+                    .expect("owner-less classic trailer has a bootstrap context")
+                    .document,
+                description: XrefObjectDescription::Ordinary,
             };
-        let trailer = canonical_trailer_owner
-            .map(|owner| owner.direct_handle(trailer_value.clone()))
-            .unwrap_or_else(|| {
-                ObjectHandle::from_parsed_value_with_resolver(
-                    trailer_value,
-                    trailer_context
-                        .as_ref()
-                        .expect("owner-less classic trailer has a bootstrap context")
-                        .document
-                        .resolver_weak(),
-                )
-            });
+            read_trailer(
+                bytes,
+                trailer_start,
+                &options.description,
+                &mut trailer_parser,
+            )?
+        };
         if !trailer.try_is_dictionary()? {
             return Err(Error::parse(trailer_start, "trailer is not a dictionary"));
         }
         let mut trailer_diags = table_diagnostics;
-        trailer_diags.extend(trailer_diagnostics(
-            trailer_start,
-            trailer_parser_diagnostics,
-            &options.description,
-        ));
+        trailer_diags.extend(trailer_parser_diagnostics);
         let mut bootstrap_diagnostics = Diagnostics::default();
         if let Some(context) = trailer_context.as_mut() {
             context.append_diagnostics_to(&mut bootstrap_diagnostics);
@@ -2537,6 +2514,9 @@ fn merge_previous_xref_sections_with_observer(
     canonical_trailer_owner: Option<&dyn CanonicalTrailerOwner>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
+    if loaded.loaded.startxref != 0 {
+        visited.insert(loaded.loaded.startxref);
+    }
     let chain_bootstrap_cache = match context_spec {
         XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
             Rc::clone(&loaded.bootstrap_cache)
@@ -3710,14 +3690,62 @@ fn is_classic_trailer_validation_message(message: &str) -> bool {
     )
 }
 
+/// Read a trailer through the same parser boundary used by qpdf's
+/// `QPDF::readTrailer` (`QPDF.cc:1312-1328`). The parser-created handle stays
+/// owned by the supplied resolver, while the post-parse lookahead uses qpdf's
+/// `readToken` contract (`allow_bad = true`) only to detect an unexpected
+/// `stream` keyword.
+fn read_trailer(
+    input: &[u8],
+    start: usize,
+    filename: &[u8],
+    resolver: &mut dyn HandleResolver,
+) -> Result<(ObjectHandle, Vec<QpdfExc>)> {
+    let slice = input
+        .get(start..)
+        .ok_or_else(|| Error::parse(start, "trailer is not a dictionary"))?;
+    let parsed = parse_qpdf_file_object_handle_with_diagnostics(
+        slice,
+        i64::try_from(start).unwrap_or(i64::MAX),
+        None,
+        resolver,
+    )
+    .map_err(|error| error.rebase_offset(start))?;
+    let mut diagnostics = trailer_diagnostics(start, parsed.diagnostics, filename);
+    if let Some(empty_offset) = parsed.empty_offset {
+        diagnostics.push(trailer_warning(
+            filename,
+            "empty object treated as null",
+            Some(start.saturating_add(empty_offset) as u64),
+        ));
+    } else if parsed.value.try_is_dictionary()? {
+        let mut tokenizer = Tokenizer::new(slice);
+        tokenizer.allow_eof();
+        tokenizer
+            .set_position(parsed.next_offset)
+            .map_err(|error| error.rebase_offset(start))?;
+        let token = tokenizer
+            .read_token(true, 0)
+            .map_err(|error| error.rebase_offset(start))?;
+        if token.is_word_value(b"stream") {
+            diagnostics.push(trailer_warning(
+                filename,
+                "stream keyword found in trailer",
+                Some(start.saturating_add(tokenizer.position()) as u64),
+            ));
+        }
+    }
+    Ok((parsed.value, diagnostics))
+}
+
 fn parse_trailer_candidate(
     bytes: &[u8],
     start: usize,
     filename: &[u8],
 ) -> (Option<ObjectHandle>, Vec<QpdfExc>) {
-    let Some(slice) = bytes.get(start..) else {
+    if bytes.get(start..).is_none() {
         return (None, Vec::new());
-    };
+    }
     let mut resolver = XrefDetachedHandles;
     // qpdf's reconstruct_xref calls readTrailer() unconditionally and only
     // rejects a non-dictionary result afterward ("Oh well.  It was worth a
@@ -3725,27 +3753,18 @@ fn parse_trailer_candidate(
     // building that rejected candidate still reaches `m->warnings`. Extract
     // diagnostics regardless of whether the parse ultimately produced a
     // dictionary, a different object, or an error.
-    let result = parse_qpdf_direct_object_handle_with_diagnostics(
-        slice,
-        i64::try_from(start).unwrap_or(i64::MAX),
-        None,
-        &mut resolver,
-    );
-    let (trailer, parser_diagnostics) = match result {
-        Ok((value, _, diagnostics)) => {
-            let handle = ObjectHandle::from_value(value);
-            (
-                handle
-                    .try_is_dictionary()
-                    .ok()
-                    .filter(|is_dict| *is_dict)
-                    .map(|_| handle),
-                diagnostics,
-            )
-        }
+    let result = read_trailer(bytes, start, filename, &mut resolver);
+    let (trailer, diagnostics) = match result {
+        Ok((handle, diagnostics)) => (
+            handle
+                .try_is_dictionary()
+                .ok()
+                .filter(|is_dict| *is_dict)
+                .map(|_| handle),
+            diagnostics,
+        ),
         Err(_) => (None, Vec::new()), // cov:ignore: the context-aware parser recovers malformed trailer tokens as null with diagnostics
     };
-    let diagnostics = trailer_diagnostics(start, parser_diagnostics, filename);
     (trailer, diagnostics)
 }
 
@@ -3765,9 +3784,21 @@ fn trailer_diagnostics(
         .into_iter()
         .map(|diagnostic| {
             let offset = (start as u64).saturating_add(diagnostic.relative_offset as u64);
-            damaged_warning(filename, b"trailer", diagnostic.message, Some(offset))
+            trailer_warning(filename, diagnostic.message, Some(offset))
         })
         .collect()
+}
+
+fn trailer_warning(filename: &[u8], message: impl Into<String>, offset: Option<u64>) -> QpdfExc {
+    QpdfExc::new(
+        QpdfErrorCode::DamagedPdf,
+        filename,
+        b"trailer",
+        offset
+            .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+        message.into().into_bytes(),
+    )
 }
 
 /// Return the offset just past the next end-of-line at or after `from`, or
@@ -5483,6 +5514,121 @@ mod final_handle_tests {
         bytes.extend_from_slice(xref.to_string().as_bytes());
         bytes.extend_from_slice(b"\n%%EOF\n");
         (bytes, xref)
+    }
+
+    #[test]
+    fn classic_read_trailer_reports_qpdf_stream_warning_once() {
+        let (mut bytes, _) = classic_xref_with_trailer("<< /Size 1 >> stream");
+        bytes.extend_from_slice(b"\n");
+        let warning_offset = bytes
+            .windows(b"stream".len())
+            .rposition(|window| window == b"stream")
+            .expect("stream token")
+            + b"stream".len();
+        let mut reader = std::io::Cursor::new(bytes);
+        let state = load_xref_state_with_options(
+            &mut reader,
+            XrefLoadOptions {
+                description: b"stream-trailer.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+        )
+        .expect("a valid classic trailer with an extra stream token loads");
+        let warnings: Vec<_> = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].get_object(), b"trailer");
+        assert_eq!(warnings[0].get_file_position(), warning_offset as i64);
+    }
+
+    #[test]
+    fn canonical_classic_read_trailer_reports_qpdf_stream_warning() {
+        let (mut bytes, _) = classic_xref_with_trailer("<< /Size 1 >> stream");
+        bytes.extend_from_slice(b"\n");
+        let warning_offset = bytes
+            .windows(b"stream".len())
+            .rposition(|window| window == b"stream")
+            .expect("stream token")
+            + b"stream".len();
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 8);
+        let state = load_xref_state_from_bytes(
+            &bytes,
+            XrefLoadOptions {
+                description: b"canonical-stream-trailer.pdf".to_vec(),
+                ..XrefLoadOptions::default()
+            },
+            Some(resolver.as_ref()),
+        )
+        .expect("the canonical owner must use the shared classic trailer route");
+        let warning = state
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .find(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
+            .expect("canonical stream warning");
+        assert_eq!(warning.get_object(), b"trailer");
+        assert_eq!(warning.get_file_position(), warning_offset as i64);
+    }
+
+    #[test]
+    fn classic_trailer_parse_errors_propagate_through_both_owner_routes() {
+        let (bytes, _) = classic_xref_with_trailer("<< /Size 999999999999999999999999 >>");
+        let error = load_xref_state_with_options(
+            &mut std::io::Cursor::new(bytes.clone()),
+            XrefLoadOptions::default(),
+        )
+        .expect_err("an overflowing trailer integer must fail the owner-less parser");
+        assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+
+        let resolver = canonical_test_resolver(bytes.clone(), BTreeMap::new(), false, 9);
+        let error =
+            load_xref_state_from_bytes(&bytes, XrefLoadOptions::default(), Some(resolver.as_ref()))
+                .expect_err("an overflowing trailer integer must fail the canonical parser");
+        assert!(matches!(error, Error::Parse { message, .. } if message == "invalid integer"));
+    }
+
+    #[test]
+    fn reconstructed_read_trailer_attributes_empty_candidate_to_trailer() {
+        let bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n";
+        let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+            .expect("the later dictionary candidate is recoverable");
+        let warning = loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .find(|warning| warning.get_message_detail() == b"empty object treated as null")
+            .expect("empty trailer warning");
+        assert_eq!(warning.get_object(), b"trailer");
+        assert_eq!(warning.get_file_position(), 53);
+    }
+
+    #[test]
+    fn initial_prev_loop_does_not_reparse_the_initial_section() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Prev {xref} >> stream\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let loaded = load_xref_and_trailer_with_repair(&mut std::io::Cursor::new(bytes), true)
+            .expect("repair mode keeps the parsed trailer after reporting the loop");
+        assert_eq!(
+            loaded
+                .repair_diagnostics
+                .entries()
+                .iter()
+                .filter(|warning| warning.get_message_detail() == b"stream keyword found in trailer")
+                .count(),
+            1
+        );
     }
 
     fn trailer_value_offset(bytes: &[u8]) -> usize {
