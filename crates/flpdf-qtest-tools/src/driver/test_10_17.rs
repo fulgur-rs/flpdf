@@ -995,6 +995,12 @@ mod tests {
         let scratch_dir = tempfile::tempdir().expect("scratch directory for a.pdf");
         let original_dir = std::env::current_dir().expect("current directory");
         std::env::set_current_dir(scratch_dir.path()).expect("enter scratch directory");
+        // `set_current_dir`'s argument may contain a symlink component (e.g.
+        // a `/tmp` mount alias on some CI runners); ask the OS for the
+        // directory it actually entered instead of trusting `scratch_dir`'s
+        // own unresolved path, so the later existence check looks in the
+        // same place `run_test_16`'s relative `"a.pdf"` write lands in.
+        let entered_dir = std::env::current_dir().expect("entered scratch directory");
 
         let mut pdf = Pdf::open_mem_owned_with_options(ten_page_pdf(), PdfOpenOptions::default())
             .expect("open ten-page fixture");
@@ -1011,7 +1017,7 @@ mod tests {
         );
         std::env::set_current_dir(&original_dir).expect("restore working directory");
         result.expect("run_test_16 must succeed against a well-formed 10-page fixture");
-        assert!(scratch_dir.path().join("a.pdf").is_file());
+        assert!(entered_dir.join("a.pdf").is_file());
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
 
