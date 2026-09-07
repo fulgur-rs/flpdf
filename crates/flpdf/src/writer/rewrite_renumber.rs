@@ -639,9 +639,9 @@ impl ObjectStreamRenumber {
     }
 
     /// Iterate `(new_ref, old_ref)` pairs for every reachable input object.
-    /// Source-backed containers, object-stream members, and plain objects are
-    /// included. Synthetic containers have no original ref; obtain their numbers
-    /// via [`Self::container_number`]. Yield order is unspecified (backed by a
+    /// Source-backed/generated containers, object-stream members, and plain
+    /// objects are included. Legacy Synthetic containers have no original ref;
+    /// obtain their numbers via [`Self::container_number`]. Yield order is unspecified (backed by a
     /// hash map); callers that need ordering sort by the new number.
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
         self.old_to_new.iter().map(|(&old, &new)| (new, old))
@@ -691,7 +691,9 @@ impl ObjectStreamRenumber {
                     )));
                 }
             }
-            if let ObjectStreamGroup::SourceBacked { source, .. } = group {
+            if let ObjectStreamGroup::SourceBacked { source, .. }
+            | ObjectStreamGroup::Generated { source, .. } = group
+            {
                 if let Some(previous) = source_to_group.insert(*source, gi) {
                     return Err(Error::Unsupported(format!(
                         "object-stream renumber: source container {source} occurs in groups {previous} and {gi}"
@@ -708,6 +710,15 @@ impl ObjectStreamRenumber {
                 "object-stream renumber: source container {source} is also a member"
             )));
         }
+        let generated_container_sources: BTreeSet<ObjectRef> = groups
+            .iter()
+            .filter_map(|group| match group {
+                ObjectStreamGroup::Generated { source, .. } => Some(*source),
+                ObjectStreamGroup::SourceBacked { .. } | ObjectStreamGroup::Synthetic { .. } => {
+                    None
+                }
+            })
+            .collect();
 
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut container_new: Vec<Option<u32>> = vec![None; groups.len()];
@@ -738,7 +749,10 @@ impl ObjectStreamRenumber {
         let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
             pdf.live_object_refs()
                 .into_iter()
-                .filter(|object_ref| !removed_refs.contains(object_ref))
+                .filter(|object_ref| {
+                    !removed_refs.contains(object_ref)
+                        && !generated_container_sources.contains(object_ref)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -908,7 +922,8 @@ fn enqueue_object_stream(
             *next += 1;
 
             let source = match &groups[gi] {
-                ObjectStreamGroup::SourceBacked { source, .. } => {
+                ObjectStreamGroup::SourceBacked { source, .. }
+                | ObjectStreamGroup::Generated { source, .. } => {
                     old_to_new.insert(*source, ObjectRef::new(container, 0));
                     Some(*source)
                 }

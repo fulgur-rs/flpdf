@@ -17,12 +17,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     generated_id: Option<&crate::ObjectHandle>,
 ) -> crate::Result<WriterResult> {
     let plan = plan::PlainWritePlan::build_with_generated_id(pdf, options, generated_id)?;
-    crate::writer::configure_progress_for_pdf(
-        pdf,
-        options,
-        plan.generated_object_stream_count(),
-        false,
-    )?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
+    crate::writer::configure_progress_for_pdf(pdf, options, 0, false)?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
     write_planned(pdf, out, options, &plan)
 }
 

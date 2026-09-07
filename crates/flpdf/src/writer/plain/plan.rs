@@ -13,7 +13,7 @@ use crate::writer::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber, StreamParametersRemoved,
 };
 use crate::writer::{ObjectWriterEmission, WriterOptions};
-use crate::{CompressStreams, ObjectRef, Pdf, XrefEntry, XrefForm};
+use crate::{CompressStreams, ObjectHandle, ObjectRef, Pdf, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -24,6 +24,7 @@ pub(crate) struct PlannedMember {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedObjectStreamOrigin {
     SourceBacked(ObjectRef),
+    Generated(ObjectRef),
     Synthetic,
 }
 
@@ -101,21 +102,6 @@ pub(crate) struct PlainWritePlan {
 }
 
 impl PlainWritePlan {
-    pub(crate) fn generated_object_stream_count(&self) -> usize {
-        self.objects
-            .iter()
-            .filter(|object| {
-                matches!(
-                    object,
-                    PlannedIndirectObject::ObjectStream {
-                        origin: PlannedObjectStreamOrigin::Synthetic,
-                        ..
-                    }
-                )
-            })
-            .count()
-    }
-
     #[cfg(test)]
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
@@ -242,11 +228,18 @@ impl PlainWritePlan {
                 removed_refs.extend(explicitly_removed.iter().copied());
                 eligible.retain(|member| !removed_refs.contains(member));
                 let groups = object_streams::even_split_into_streams(&eligible);
-                let mut renumber_groups: Vec<ObjectStreamGroup> = groups
-                    .iter()
-                    .cloned()
-                    .map(|members| ObjectStreamGroup::Synthetic { members })
-                    .collect();
+                let mut renumber_groups = Vec::with_capacity(groups.len());
+                for members in groups {
+                    let container = pdf.make_indirect_object_handle(ObjectHandle::null())?;
+                    // cov:ignore-start: make_indirect_object_handle always returns an indirect handle.
+                    let source = container.object_ref().ok_or_else(|| {
+                        crate::Error::Internal(
+                            "generated object-stream container lost its indirect identity".into(),
+                        )
+                    })?;
+                    // cov:ignore-end
+                    renumber_groups.push(ObjectStreamGroup::Generated { source, members });
+                }
                 let removed = &removed_refs;
                 // qpdf's Generate pass only puts its reachable compressible set
                 // into synthetic ObjStms (`QPDFWriter.cc:1970-2007`), while
@@ -453,7 +446,9 @@ impl PlainWritePlan {
                 } => {
                     has_object_stream = true;
                     require_unique_output(&mut outputs, *output)?;
-                    if let PlannedObjectStreamOrigin::SourceBacked(source) = origin {
+                    if let PlannedObjectStreamOrigin::SourceBacked(source)
+                    | PlannedObjectStreamOrigin::Generated(source) = origin
+                    {
                         // A removed source container still owns the preserved
                         // membership and output identity. qpdf reconstructs it
                         // from a null placeholder while treating ordinary
@@ -759,7 +754,8 @@ fn build_container_aware(
     let container_sources: BTreeSet<ObjectRef> = groups
         .iter()
         .filter_map(|group| match group {
-            ObjectStreamGroup::SourceBacked { source, .. } => Some(*source),
+            ObjectStreamGroup::SourceBacked { source, .. }
+            | ObjectStreamGroup::Generated { source, .. } => Some(*source),
             ObjectStreamGroup::Synthetic { .. } => None,
         })
         .collect();
@@ -801,6 +797,9 @@ fn build_container_aware(
         let origin = match group {
             ObjectStreamGroup::SourceBacked { source, .. } => {
                 PlannedObjectStreamOrigin::SourceBacked(*source)
+            }
+            ObjectStreamGroup::Generated { source, .. } => {
+                PlannedObjectStreamOrigin::Generated(*source)
             }
             ObjectStreamGroup::Synthetic { .. } => PlannedObjectStreamOrigin::Synthetic,
         };
@@ -1788,13 +1787,37 @@ mod tests {
                 _ => None, // cov:ignore: this fixture deliberately packs every planned source
             })
             .collect();
+        assert_eq!(containers.len(), 2);
         assert_eq!(
-            containers,
-            vec![
-                (PlannedObjectStreamOrigin::Synthetic, 66),
-                (PlannedObjectStreamOrigin::Synthetic, 66),
-            ]
+            containers.iter().map(|(_, size)| *size).collect::<Vec<_>>(),
+            [66, 66]
         );
+        assert!(containers
+            .iter()
+            .all(|(origin, _)| matches!(origin, PlannedObjectStreamOrigin::Generated(_))));
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn generate_plan_mints_qpdf_null_container_handles() {
+        let path = fixture_path("objstm-gen-nostream-130rev.pdf");
+        let mut pdf =
+            Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Generate)).unwrap();
+        let containers: Vec<_> = plan
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                PlannedIndirectObject::ObjectStream { origin, .. } => Some(origin),
+                PlannedIndirectObject::Source { .. } => None, // cov:ignore: this fixture packs every planned source.
+            })
+            .collect();
+        assert!(!containers.is_empty());
+        for origin in containers {
+            if let PlannedObjectStreamOrigin::Generated(source) = origin {
+                assert!(pdf.get_object_handle(*source).is_null());
+            } // cov:ignore: LLVM maps this generated-identity test branch terminator to the assertion line.
+        }
     }
 }
