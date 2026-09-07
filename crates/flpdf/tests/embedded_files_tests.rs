@@ -21,13 +21,18 @@
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
 use flpdf::{
-    delete_embedded_file, insert_embedded_file, list_embedded_files, EmbeddedFileDocumentHelper,
-    EmbeddedFileStream, Error, FileSpec, ObjectHandle, ObjectRef, Pdf, Pipeline, Result,
-    StreamDataProvider, LEAF_MAX,
+    delete_embedded_file, insert_embedded_file, list_embedded_files, ContentToken,
+    EmbeddedFileDocumentHelper, EmbeddedFileStream, EncryptParams, Error, FileSpec,
+    FileSpecBuilder, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline, QpdfErrorCode, Result,
+    StreamDataProvider, TokenFilter, TokenFilterOutput, LEAF_MAX,
 };
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::rc::Rc;
+
+mod common;
+use common::{write_with_settings, WriterTestSettings};
 
 // ── PDF byte builder helpers ──────────────────────────────────────────────────
 
@@ -1912,7 +1917,7 @@ fn create_ef_stream_from_provider_finalizes_the_deferred_payload() {
 
     let wrapper = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
     assert_eq!(
-        wrapper.payload().expect("decode payload"),
+        wrapper.payload().expect("decode payload").as_slice(),
         b"deferred payload"
     );
     assert_eq!(wrapper.get_size().expect("computed /Params /Size"), 16);
@@ -1947,4 +1952,274 @@ fn setting_embedded_file_date_creates_missing_params_dictionary() {
         embedded_file.creation_date().expect("read creation date"),
         Some(b"D:20260101000000Z".to_vec())
     );
+}
+
+// ── payload(): canonical stream-pipeline consumer migration ────────────────
+//
+// `EmbeddedFileStream::payload` used to decode the `/Filter` chain directly
+// over `get_raw_stream_data` (a whole-buffer decode with no knowledge of
+// registered token filters). It now goes through
+// `ObjectHandle::get_stream_data`, qpdf's `QPDF_Stream::getStreamData`
+// (`libqpdf/QPDF_Stream.cc:344-360`) over the same `pipeStreamData` source
+// used by `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:914-926`). These
+// tests exercise the categories that matter for that consumer swap: an
+// encrypted, compressed attachment round trip (both `get_raw_stream_data`
+// and `get_stream_data` decrypt at the same shared source boundary, so this
+// is a regression guard rather than a behavior change), registered token
+// filters (the one category that genuinely differs -- confirmed by
+// reverting this migration and observing the token-filter test fail while
+// the others still pass), re-invocation, a specialized (DCT) codec already
+// reachable at `qpdf_dl_all` under the old path too, and the
+// unfilterable-stream error boundary.
+//
+// A registered token filter on an `/EmbeddedFile` stream has no qpdf CLI
+// surface to compare against (qpdf's own `QPDFObjectHandle::addTokenFilter`
+// is a library-only API with no `--` flag), so this category is verified
+// against the pinned qpdf source that defines the contract
+// (`libqpdf/QPDF_Stream.cc:544-550`, which wraps every registered token
+// filter around the decode pipeline before dispatch) rather than an oracle
+// binary comparison.
+
+/// A Flate-compressed `/EmbeddedFile` stream in an encrypted document.
+/// `get_raw_stream_data` and `get_stream_data` both decrypt at the same
+/// shared `pipe_stream_source` boundary for a document-backed (parsed from
+/// the reopened file) stream, so this does not catch a decrypt-ordering
+/// regression -- it guards the migrated consumer's encrypted-attachment
+/// round trip going forward.
+#[test]
+fn payload_round_trips_an_encrypted_compressed_attachment() {
+    let plaintext: Vec<u8> = b"attachment payload that must round-trip through decrypt-then-decode ordering, repeated repeated repeated so flate has something worth compressing"
+        .repeat(4);
+
+    let mut pdf = open(build_no_names_pdf());
+    let filespec_ref = FileSpecBuilder::new("secret.bin", plaintext.clone())
+        .build(&mut pdf)
+        .expect("build filespec");
+    insert_embedded_file(&mut pdf, b"secret.bin", filespec_ref).expect("insert into name tree");
+
+    let mut encrypted = Vec::new();
+    write_with_settings(
+        &mut pdf,
+        &mut encrypted,
+        &WriterTestSettings {
+            encrypt: Some(EncryptParams::v4_aes128(
+                b"user-pw".to_vec(),
+                b"owner-pw".to_vec(),
+            )),
+            ..WriterTestSettings::default()
+        },
+    )
+    .expect("encrypted write");
+
+    let mut reopened = Pdf::open_with_options(
+        Cursor::new(encrypted),
+        PdfOpenOptions {
+            password: b"user-pw".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("reopen encrypted output with user password");
+
+    let entries = list_embedded_files(&mut reopened).expect("list embedded files");
+    let (_, filespec_ref) = entries
+        .into_iter()
+        .find(|(key, _)| key == b"secret.bin")
+        .expect("secret.bin entry present after write");
+
+    let mut fs = FileSpec::new(reopened.get_object_handle(filespec_ref), &mut reopened)
+        .expect("wrap filespec");
+
+    // Sanity: the writer really did compress the stream, so a decode that
+    // skips decryption would not simply happen to match by producing
+    // identical bytes unfiltered.
+    let stream_handle = fs
+        .get_embedded_file_stream("")
+        .expect("resolve /EF stream handle");
+    let stream_dict = stream_handle.as_stream_dict().expect("stream dictionary");
+    assert_eq!(
+        stream_dict.get_key(b"/Filter").as_name().as_deref(),
+        Some(b"FlateDecode".as_slice()),
+        "fixture must exercise a compressed, encrypted stream"
+    );
+
+    let ef = fs
+        .embedded_file()
+        .expect("embedded file lookup")
+        .expect("embedded file stream present");
+    assert_eq!(
+        ef.payload()
+            .expect("decrypt-then-decode payload")
+            .as_slice(),
+        plaintext.as_slice()
+    );
+}
+
+/// A registered `add_token_filter` callback used to be silently bypassed:
+/// the whole-buffer decoder never constructed a tokenizer stage. Going
+/// through `pipe_stream_data` installs it, matching qpdf's
+/// `QPDF_Stream::pipeStreamData` (`libqpdf/QPDF_Stream.cc:544-550`), which
+/// wraps every registered token filter around the decode pipeline before the
+/// source is dispatched.
+struct ReplaceAllWithMarker;
+
+impl TokenFilter for ReplaceAllWithMarker {
+    fn handle_token(
+        &mut self,
+        _token: &ContentToken,
+        _output: &mut TokenFilterOutput<'_>,
+    ) -> flpdf::PipelineResult<()> {
+        Ok(())
+    }
+
+    fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> flpdf::PipelineResult<()> {
+        output.write(b"TOKEN-FILTERED")
+    }
+}
+
+#[test]
+fn payload_applies_registered_token_filter() {
+    let mut pdf = open(build_no_names_pdf());
+    let stream =
+        EmbeddedFileStream::create_ef_stream(&mut pdf, b"hello world").expect("create ef stream");
+    stream
+        .add_token_filter(Rc::new(RefCell::new(ReplaceAllWithMarker)))
+        .expect("register token filter");
+
+    let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+    assert_eq!(
+        ef.payload().expect("filtered payload").as_slice(),
+        b"TOKEN-FILTERED"
+    );
+}
+
+/// Calling `payload()` twice must return the same bytes both times: the
+/// canonical pipeline reads the stream's decode source afresh on each call
+/// rather than consuming shared state.
+#[test]
+fn payload_is_idempotent_across_repeated_calls() {
+    let mut pdf = open(build_no_names_pdf());
+    let stream = EmbeddedFileStream::create_ef_stream(&mut pdf, b"repeatable payload")
+        .expect("create ef stream");
+    let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+
+    let first = ef.payload().expect("first payload call");
+    let second = ef.payload().expect("second payload call");
+    assert_eq!(first.as_slice(), b"repeatable payload");
+    assert_eq!(first, second);
+}
+
+/// `/DCTDecode` is specialized *and* lossy compression, so qpdf's
+/// `QPDF_Stream::filterable` only admits it at `qpdf_dl_all`
+/// (`libqpdf/QPDF_Stream.cc:490-497`) -- the decode level `payload()` uses,
+/// matching `doShowAttachment`. Locks in that the migrated consumer still
+/// reaches the real `DctStreamFilter` decode stage at that level.
+#[test]
+fn payload_decodes_a_dct_stream_through_the_canonical_pipeline() {
+    let jpeg = libjpeg_turbo_rs::compress(
+        &[0_u8, 64, 128, 255],
+        2,
+        2,
+        libjpeg_turbo_rs::PixelFormat::Grayscale,
+        90,
+        libjpeg_turbo_rs::Subsampling::S444,
+    )
+    .expect("encode a minimal grayscale JPEG");
+
+    let mut pdf = open(build_no_names_pdf());
+    let stream = pdf.new_stream().expect("stream object");
+    stream.replace_stream_data(
+        Rc::new(jpeg.clone()),
+        Some(ObjectHandle::name(b"DCTDecode".to_vec())),
+        Some(ObjectHandle::null()),
+    );
+    let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+
+    let decoded = ef.payload().expect("decode DCT payload");
+    // A real pixel decode never reproduces the compressed JPEG bytes and is
+    // non-empty; exact pixel values are covered by the dedicated `PlDct`
+    // decoder tests.
+    assert!(!decoded.is_empty());
+    assert_ne!(decoded.as_slice(), jpeg.as_slice());
+}
+
+/// A filter chain longer than the whole-buffer decoder's `MAX_FILTER_CHAIN_LEN`
+/// (16) now decodes instead of failing: the canonical pipeline carries no
+/// chain-length budget, matching qpdf, which imposes no such limit
+/// (`DecodeLimits` is a flpdf-only hardening budget with no qpdf counterpart --
+/// see route-matrix C27/C28). This is the second observable delta of routing
+/// `payload()` through `pipe_stream_data`, alongside token-filter application.
+#[test]
+fn payload_decodes_a_filter_chain_longer_than_the_whole_buffer_budget() {
+    /// Encode one ASCIIHex stage, including qpdf's `>` end-of-data marker.
+    fn ascii_hex_stage(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() * 2 + 1);
+        for byte in data {
+            out.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        out.push(b'>');
+        out
+    }
+
+    // 17 stages is one past the retired whole-buffer budget of 16.
+    const STAGES: usize = 17;
+    let payload = b"c";
+    let mut encoded = payload.to_vec();
+    for _ in 0..STAGES {
+        encoded = ascii_hex_stage(&encoded);
+    }
+
+    let mut pdf = open(build_no_names_pdf());
+    let stream = pdf.new_stream().expect("stream object");
+    stream.replace_stream_data(
+        Rc::new(encoded),
+        Some(ObjectHandle::array(vec![
+            ObjectHandle::name(
+                b"ASCIIHexDecode".to_vec()
+            );
+            STAGES
+        ])),
+        Some(ObjectHandle::null()),
+    );
+    let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+
+    assert_eq!(
+        ef.payload()
+            .expect("a 17-stage chain decodes through the canonical pipeline")
+            .as_slice(),
+        payload
+    );
+}
+
+/// An unrecognized `/Filter` name leaves the stream unfilterable, matching
+/// qpdf's `getStreamData` throw ("getStreamData called on unfilterable
+/// stream", `libqpdf/QPDF_Stream.cc:350-356`) when `pipeStreamData` cannot
+/// construct a usable decode branch. The `qpdf_e_unsupported` classification
+/// is the same one the whole-buffer decoder reported for an unknown codec;
+/// the concrete Rust error type is [`Error::QpdfExc`] with
+/// [`QpdfErrorCode::Unsupported`] rather than a bare [`Error::Unsupported`]
+/// string because `get_stream_data`'s unfilterable-stream error carries
+/// structured qpdf exception context (filename/offset/message), independent
+/// of this migration.
+#[test]
+fn payload_errors_on_an_unrecognized_filter_name() {
+    let mut pdf = open(build_no_names_pdf());
+    let stream = pdf.new_stream().expect("stream object");
+    stream.replace_stream_data(
+        Rc::new(b"opaque bytes".to_vec()),
+        Some(ObjectHandle::name(b"NoSuchDecode".to_vec())),
+        Some(ObjectHandle::null()),
+    );
+    let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+
+    let error = ef.payload().expect_err("unknown filter must not decode");
+    match error {
+        Error::QpdfExc(exc) => {
+            assert_eq!(exc.get_error_code(), QpdfErrorCode::Unsupported);
+            assert_eq!(
+                exc.get_message_detail(),
+                b"getStreamData called on unfilterable stream"
+            );
+        }
+        other => panic!("expected Error::QpdfExc(Unsupported), got {other:?}"),
+    }
 }

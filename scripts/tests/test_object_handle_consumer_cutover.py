@@ -33,13 +33,13 @@ class ObjectHandleConsumerCutoverTests(unittest.TestCase):
             "Dictionary",
             ".materialize()",
             "decode_stream_data(",
+            "decode_stream_data_from_handle(",
             "pdf.resolve_object(",
             "pdf.resolve_borrowed(",
             "pdf.set_object(",
         ):
             self.assertNotIn(legacy, source, f"filespec production still uses {legacy}")
 
-        self.assertIn("decode_stream_data_from_handle", source)
         self.assertIn("ObjectHandle::dictionary", source)
 
     def test_job_check_production_uses_canonical_handle_content_streams(self):

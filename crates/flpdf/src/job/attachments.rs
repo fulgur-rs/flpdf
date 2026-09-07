@@ -9,6 +9,7 @@ use crate::qpdf_time::default_pdf_date;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 fn path_bytes(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
@@ -709,7 +710,10 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
             String::from_utf8_lossy(key),
         ))
     })?;
-    ef.payload()
+    // `payload` hands back a fresh `Rc`, so unwrap it instead of copying the
+    // whole decoded attachment; the clone is only the fallback for a payload
+    // that someone else still holds.
+    Ok(Rc::try_unwrap(ef.payload()?).unwrap_or_else(|shared| (*shared).clone()))
 }
 
 /// Write the decoded payload of attachment `key` to `out`.
