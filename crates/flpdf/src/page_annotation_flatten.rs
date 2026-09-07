@@ -2357,6 +2357,24 @@ mod tests {
         out
     }
 
+    /// Build a Form XObject candidate without `/Subtype` so flattening must
+    /// install qpdf's required `/Subtype /Form` mutation.
+    fn make_xobj_stream_without_subtype(bbox: [f64; 4], content: &[u8]) -> Vec<u8> {
+        let inner = format!(
+            "<< /Type /XObject /BBox [{} {} {} {}] /Length {} >>",
+            bbox[0],
+            bbox[1],
+            bbox[2],
+            bbox[3],
+            content.len()
+        );
+        let mut out = inner.into_bytes();
+        out.extend_from_slice(b"\nstream\n");
+        out.extend_from_slice(content);
+        out.extend_from_slice(b"\nendstream\n");
+        out
+    }
+
     /// Wrap raw stream bytes with object header/footer.
     fn obj_wrap(num: u32, body: Vec<u8>) -> (u32, Vec<u8>) {
         let header = format!("{num} 0 obj\n").into_bytes();
@@ -2842,6 +2860,45 @@ mod tests {
         // Content must contain Do.
         let content = page_content_bytes(&mut pdf2, pages[0]).unwrap();
         assert!(content.windows(2).any(|w| w == b"Do"));
+    }
+
+    #[test]
+    fn flatten_annotations_writes_form_subtype_for_indirect_appearance() {
+        let xobj_body =
+            make_xobj_stream_without_subtype([0.0, 0.0, 100.0, 20.0], b"0.5 g 0 0 100 20 re f");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [50 50 150 70] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        assert!(!appearance
+            .as_stream_dict()
+            .expect("fixture appearance must be a stream")
+            .has_key(b"/Subtype"));
+
+        assert_eq!(
+            flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap(),
+            1
+        );
+
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
+        let appearance = pdf2.get_object_handle(ObjectRef::new(5, 0));
+        pdf2.resolve(&appearance).unwrap();
+        let appearance_dict = appearance
+            .as_stream_dict()
+            .expect("written appearance must remain a stream");
+        let subtype = appearance_dict
+            .try_get_key(b"/Subtype")
+            .expect("flattening must write /Subtype");
+        pdf2.resolve(&subtype).unwrap();
+        assert_eq!(subtype.as_name(), Some(b"Form".to_vec()));
     }
 
     // -----------------------------------------------------------------------
