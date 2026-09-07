@@ -2142,6 +2142,54 @@ fn payload_decodes_a_dct_stream_through_the_canonical_pipeline() {
     assert_ne!(decoded.as_slice(), jpeg.as_slice());
 }
 
+/// A filter chain longer than the whole-buffer decoder's `MAX_FILTER_CHAIN_LEN`
+/// (16) now decodes instead of failing: the canonical pipeline carries no
+/// chain-length budget, matching qpdf, which imposes no such limit
+/// (`DecodeLimits` is a flpdf-only hardening budget with no qpdf counterpart --
+/// see route-matrix C27/C28). This is the second observable delta of routing
+/// `payload()` through `pipe_stream_data`, alongside token-filter application.
+#[test]
+fn payload_decodes_a_filter_chain_longer_than_the_whole_buffer_budget() {
+    /// Encode one ASCIIHex stage, including qpdf's `>` end-of-data marker.
+    fn ascii_hex_stage(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len() * 2 + 1);
+        for byte in data {
+            out.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        out.push(b'>');
+        out
+    }
+
+    // 17 stages is one past the retired whole-buffer budget of 16.
+    const STAGES: usize = 17;
+    let payload = b"c";
+    let mut encoded = payload.to_vec();
+    for _ in 0..STAGES {
+        encoded = ascii_hex_stage(&encoded);
+    }
+
+    let mut pdf = open(build_no_names_pdf());
+    let stream = pdf.new_stream().expect("stream object");
+    stream.replace_stream_data(
+        Rc::new(encoded),
+        Some(ObjectHandle::array(vec![
+            ObjectHandle::name(
+                b"ASCIIHexDecode".to_vec()
+            );
+            STAGES
+        ])),
+        Some(ObjectHandle::null()),
+    );
+    let ef = EmbeddedFileStream::new(stream, &mut pdf).expect("wrap stream");
+
+    assert_eq!(
+        ef.payload()
+            .expect("a 17-stage chain decodes through the canonical pipeline")
+            .as_slice(),
+        payload
+    );
+}
+
 /// An unrecognized `/Filter` name leaves the stream unfilterable, matching
 /// qpdf's `getStreamData` throw ("getStreamData called on unfilterable
 /// stream", `libqpdf/QPDF_Stream.cc:350-356`) when `pipeStreamData` cannot

@@ -251,8 +251,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Unsupported`] when the resolved handle is not a
-    /// stream. Returns [`Error::QpdfExc`] with
+    /// Returns [`Error::Unsupported`] when the embedded-file entry resolves to
+    /// a null object, and [`Error::System`] when it resolves to a non-null
+    /// object that is not a stream — the latter is qpdf's `asStreamWithAssert`
+    /// runtime error (`libqpdf/QPDFObjectHandle.cc:319-324,2215-2223`).
+    /// Returns [`Error::QpdfExc`] with
     /// [`QpdfErrorCode::Unsupported`](crate::QpdfErrorCode::Unsupported)
     /// when the stream itself has no usable filter branch or filtering
     /// fails, matching qpdf's `getStreamData` throw contract.
