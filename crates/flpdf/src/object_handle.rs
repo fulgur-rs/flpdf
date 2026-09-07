@@ -12568,8 +12568,7 @@ mod unparse_object_tests {
     }
 
     #[test]
-    fn unparse_stream_body_refiltered_does_not_resolve_a_would_error_indirect_filter_or_decodeparms(
-    ) {
+    fn unparse_stream_body_refiltered_removes_filter_parameters_before_visibility() {
         // Refiltered output must exclude these entries before visibility
         // checks:
         // `visible_dict_entries` previously ran over every entry --
@@ -12582,15 +12581,12 @@ mod unparse_object_tests {
         // `:1488-1491`) -- it never calls `isNull()` on a key it is about
         // to discard anyway.
         //
-        // An indirect `/Filter`/`/DecodeParms` whose resolver would error,
-        // with `refiltered == true`, must now succeed without ever calling
-        // that resolver -- proving the values are excluded before
-        // suppression ever inspects them, not merely skipped during the
-        // write loop after being resolved (which would have propagated
-        // `ErrorResolver`'s error through `visible_dict_entries`'s
-        // `try_is_null()` call before this fix).
+        // An indirect `/Filter` whose resolver would error, with
+        // `refiltered == true`, must be excluded before suppression inspects
+        // it. `/DecodeParms` is a direct empty array here so qpdf's earlier
+        // empty-array probe is exercised without changing that error boundary.
         let (filter, _filter_resolver) = error_resolving_handle(ObjectRef::new(40, 0));
-        let (decode_parms, _decode_parms_resolver) = error_resolving_handle(ObjectRef::new(41, 0));
+        let decode_parms = ObjectHandle::array(Vec::new());
         let dict = ObjectHandle::dictionary(vec![
             (b"Filter".to_vec(), filter),
             (b"DecodeParms".to_vec(), decode_parms),
@@ -12618,6 +12614,24 @@ mod unparse_object_tests {
         ]);
         let mut out = Vec::new();
         assert!(dict.write_stream_body(&mut out, false).is_err());
+    }
+
+    #[test]
+    fn refiltered_stream_still_probes_an_indirect_decode_parms_before_removal() {
+        let (decode_parms, _resolver) = error_resolving_handle(ObjectRef::new(43, 0));
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+            ),
+            (b"DecodeParms".to_vec(), decode_parms),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut out = Vec::new();
+        let error = dict
+            .write_stream_body(&mut out, true)
+            .expect_err("qpdf probes DecodeParms before the filtered removal branch");
+        assert_eq!(error.to_string(), "resolver failed");
     }
 
     #[test]

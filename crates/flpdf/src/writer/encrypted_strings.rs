@@ -4,7 +4,9 @@ use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncr
 use crate::object_handle::ObjectHandle;
 use crate::pdf_syntax::{write_hex_string, write_name_escaped, write_string_value};
 use crate::writer::encryption_state::WriterEncryptionState;
-use crate::writer::{EncryptionContext, ObjectWriterEmission, WriteCipher, WriterOptions};
+use crate::writer::{
+    EncryptionContext, ObjectWriterEmission, StreamDictionaryOptions, WriteCipher, WriterOptions,
+};
 use crate::ObjectRef;
 
 type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
@@ -12,15 +14,19 @@ type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
 #[derive(Clone, Copy)]
 pub(crate) struct StreamDictOptions {
     qdf: bool,
-    refiltered: bool,
+    dictionary: StreamDictionaryOptions,
     encrypt_strings: bool,
 }
 
 impl StreamDictOptions {
-    pub(crate) const fn new(qdf: bool, refiltered: bool, encrypt_strings: bool) -> Self {
+    pub(crate) const fn new(
+        qdf: bool,
+        dictionary: StreamDictionaryOptions,
+        encrypt_strings: bool,
+    ) -> Self {
         Self {
             qdf,
-            refiltered,
+            dictionary,
             encrypt_strings,
         }
     }
@@ -175,17 +181,19 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         if !options.encrypt_strings {
             if options.qdf {
-                return dict.write_stream_body_qdf_with_ref_map_and_removed_and_length(
-                    out,
-                    0,
-                    map,
-                    removed_refs,
-                    length_ref,
-                );
+                return dict
+                    .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                        out,
+                        0,
+                        map,
+                        removed_refs,
+                        length_ref,
+                        options.dictionary,
+                    );
             }
-            return dict.write_stream_body_with_ref_map_and_removed(
+            return dict.write_stream_body_with_ref_map_and_removed_with_options(
                 out,
-                options.refiltered,
+                options.dictionary,
                 map,
                 removed_refs,
             );
@@ -207,18 +215,19 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if options.qdf {
-                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer_with_options(
                         out,
                         0,
                         map,
                         removed_refs,
                         length_ref,
+                        options.dictionary,
                         &mut write_string,
                     )
                 } else {
-                    dict.write_stream_body_with_ref_map_and_removed_with_string_writer(
+                    dict.write_stream_body_with_ref_map_and_removed_with_options_and_string_writer(
                         out,
-                        options.refiltered,
+                        options.dictionary,
                         map,
                         removed_refs,
                         &mut write_string,
@@ -338,4 +347,56 @@ pub(crate) fn write_encryption_dictionary_handle(
     }
     out.extend_from_slice(b" >>");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encryption::standard::ObjectKeyAlg;
+    use crate::writer::{StreamDictionaryOptions, WriteCipher};
+    use std::collections::BTreeSet;
+    use std::rc::Rc;
+
+    #[test]
+    fn unencrypted_qdf_stream_dict_uses_the_shared_dictionary_policy() {
+        let context = EncryptionContext {
+            encrypt_dict: ObjectHandle::dictionary(Vec::new()),
+            file_key: vec![1; 5],
+            cipher: WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+            encryption_v: 2,
+            encryption_r: 3,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: b"id".to_vec(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let dict = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                ),
+                (b"/Length".to_vec(), ObjectHandle::integer(3)),
+            ]),
+            Rc::new(b"abc".to_vec()),
+        );
+        let mut output = Vec::new();
+        emitter
+            .write_handle_stream_dict_with_ref_map(
+                &mut output,
+                ObjectRef::new(3, 0),
+                None,
+                &dict,
+                StreamDictOptions::new(true, StreamDictionaryOptions::new(true, true), false),
+                &|object_ref| Ok(object_ref), // cov:ignore: identity reference map callback is a test-only no-op closure; the writer branch is covered below
+                &BTreeSet::new(),
+                None,
+            )
+            .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("/Filter /FlateDecode"));
+        assert!(!text.contains("ASCIIHexDecode"));
+    }
 }

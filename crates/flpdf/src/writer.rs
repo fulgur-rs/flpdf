@@ -18,7 +18,7 @@ pub(crate) mod serialize;
 mod settings;
 #[path = "writer/write_object.rs"]
 pub(crate) mod write_object;
-pub(crate) use object::ObjectWriterEmission;
+pub(crate) use object::{ObjectWriterEmission, StreamDictionaryOptions};
 pub use object_streams::ObjectStreamMode;
 pub use serialize::write_stream_to_buf;
 pub use settings::DecodeLevel;
@@ -3717,13 +3717,14 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 };
                 if source_handle.as_stream_dict().is_some() {
                     let data = source_handle.get_raw_stream_data()?;
-                    source_handle.write_stream_body_with_ref_map_and_removed_and_length(
-                        &mut bytes,
-                        false,
-                        &map,
-                        &removed,
-                        data.len(),
-                    )?; // cov:ignore: PCLm stream emission is covered by the filtered and recovered-stream fixtures; LLVM attributes this continuation to cleanup-only code.
+                    source_handle
+                        .write_stream_body_with_ref_map_and_removed_and_length_with_options(
+                            &mut bytes,
+                            StreamDictionaryOptions::preserve(),
+                            &map,
+                            &removed,
+                            data.len(),
+                        )?; // cov:ignore: PCLm stream emission is covered by the filtered and recovered-stream fixtures; LLVM attributes this continuation to cleanup-only code.
                     serialize::write_stream_payload(
                         &mut bytes,
                         data.as_ref(),
@@ -4094,11 +4095,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             if let Some(parameters_removed) = cached_stream_outputs
                 .borrow()
                 .get(&source)
-                .map(|cached| cached.parameters_removed)
+                .map(|cached| cached.dictionary_options.remove_filter_parameters)
             {
                 return Ok(parameters_removed); // The catalog-first and ObjStm-aware walks share this cache.
             }
-            let (dict, data, refiltered, parameters_removed) =
+            let (dict, data, dictionary_options) =
                 plain::body::canonical_stream_output_for_rewrite_with_status(
                     handle,
                     options,
@@ -4109,12 +4110,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 plain::plan::CachedStreamOutput {
                     dict,
                     data,
-                    refiltered,
-                    parameters_removed,
+                    dictionary_options,
                     fingerprint: plain::plan::stream_cache_fingerprint(handle)?,
                 },
             );
-            return Ok(parameters_removed);
+            return Ok(dictionary_options.remove_filter_parameters);
         }
         plain::body::canonical_stream_will_be_refiltered(handle, options)
     };
@@ -4931,9 +4931,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             let cached = cached_stream_outputs
                 .borrow_mut()
                 .remove(old_ref)
-                .map(|cached| (cached.dict, cached.data, cached.refiltered));
-            let (stream_dict, stream_data, refiltered) = if let Some(cached) = cached {
-                cached
+                .map(|cached| (cached.dict, cached.data, cached.dictionary_options));
+            let (stream_dict, stream_data, dictionary_options) = if let Some(cached) = cached {
+                (cached.0, cached.1, cached.2)
             } else {
                 plain::body::canonical_stream_output_for_rewrite(
                     &object_handle,
@@ -4977,8 +4977,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             } else {
                 None
             };
-            let stream_options =
-                encrypted_strings::StreamDictOptions::new(options.qdf, refiltered, encrypt_stream);
+            let stream_options = encrypted_strings::StreamDictOptions::new(
+                options.qdf,
+                dictionary_options,
+                encrypt_stream,
+            );
             if let Some(emitter) = encrypted_strings.as_mut() {
                 emitter.write_handle_stream_dict_with_ref_map(
                     &mut bytes,
@@ -4991,17 +4994,19 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     holder_ref,
                 )?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
             } else if options.qdf {
-                stream_dict.write_stream_body_qdf_with_ref_map_and_removed_and_length(
-                    &mut bytes,
-                    0,
-                    &map,
-                    &removed_refs,
-                    holder_ref,
-                )?; // cov:ignore: handle-native QDF stream dictionary route; LLVM maps the call continuation here
+                stream_dict
+                    .write_stream_body_qdf_with_ref_map_and_removed_and_length_with_options(
+                        &mut bytes,
+                        0,
+                        &map,
+                        &removed_refs,
+                        holder_ref,
+                        dictionary_options,
+                    )?; // cov:ignore: handle-native QDF stream dictionary route; LLVM maps the call continuation here
             } else {
-                stream_dict.write_stream_body_with_ref_map_and_removed(
+                stream_dict.write_stream_body_with_ref_map_and_removed_with_options(
                     &mut bytes,
-                    refiltered,
+                    dictionary_options,
                     &map,
                     &removed_refs,
                 )?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
